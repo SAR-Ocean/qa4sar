@@ -63,6 +63,11 @@ class CollocatedPoint:
     val_id: Optional[str] = None
     collocation_type: str = "point_vs_layer"  # point_vs_layer | trajectory_vs_layer | layer_vs_layer
 
+    # Pixel indices — used by patch_extractor to retrieve a spatial neighbourhood
+    sar_y_idx: int = 0
+    sar_x_idx: int = 0
+    sar_scene_name: str = ""
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "sar_lon":                   self.sar_lon,
@@ -78,6 +83,9 @@ class CollocatedPoint:
             "val_source":                self.val_source,
             "val_id":                    self.val_id,
             "collocation_type":          self.collocation_type,
+            "sar_y_idx":                 self.sar_y_idx,
+            "sar_x_idx":                 self.sar_x_idx,
+            "sar_scene_name":            self.sar_scene_name,
         }
 
 
@@ -220,6 +228,7 @@ class PointLayerCollocation:
         sar_time: np.ndarray,
         val_data: pd.DataFrame,
         val_source: str,
+        sar_scene_name: str = "",
     ) -> List[CollocatedPoint]:
         """
         Match validation point observations to the SAR grid.
@@ -238,6 +247,9 @@ class PointLayerCollocation:
             column is used to populate ``CollocatedPoint.val_id``.
         val_source : str
             Label for the validation source (e.g. ``"buoy"``).
+        sar_scene_name : str
+            Name of the SAR scene node in the DataTree (used to retrieve
+            patches later).  Defaults to an empty string.
 
         Returns
         -------
@@ -245,6 +257,43 @@ class PointLayerCollocation:
         """
         sar_times = _to_datetime_array(sar_time)
         collocations: List[CollocatedPoint] = []
+
+        # Fast pre-filters — eliminate rows that cannot possibly match
+        # before entering the expensive per-row Haversine loop.
+
+        # 1. Spatial bounding-box filter (1° ≈ 55–111 km; 55 is conservative)
+        deg_buf = self.spatial_tolerance_km / 55.0
+        lon_min = float(sar_lon.min()) - deg_buf
+        lon_max = float(sar_lon.max()) + deg_buf
+        lat_min = float(sar_lat.min()) - deg_buf
+        lat_max = float(sar_lat.max()) + deg_buf
+        spatial_mask = (
+            (val_data["lon"] >= lon_min) & (val_data["lon"] <= lon_max) &
+            (val_data["lat"] >= lat_min) & (val_data["lat"] <= lat_max)
+        )
+        val_data = val_data[spatial_mask]
+        if val_data.empty:
+            return collocations
+
+        # 2. Temporal window filter
+        from datetime import timedelta as _td
+        t_min = min(sar_times) - _td(minutes=self.time_tolerance_minutes)
+        t_max = max(sar_times) + _td(minutes=self.time_tolerance_minutes)
+        if hasattr(t_min, "tzinfo") and t_min.tzinfo is not None:
+            t_min = t_min.replace(tzinfo=None)
+            t_max = t_max.replace(tzinfo=None)
+        val_times_pd = pd.to_datetime(val_data["time"].values)
+        if val_times_pd.tz is not None:
+            val_times_pd = val_times_pd.tz_localize(None)
+        temporal_mask = (val_times_pd >= t_min) & (val_times_pd <= t_max)
+        val_data = val_data[temporal_mask]
+        if val_data.empty:
+            return collocations
+
+        logger.debug(
+            "Pre-filters kept %d validation rows (spatial bbox + temporal window)",
+            len(val_data),
+        )
 
         for _, val_row in val_data.iterrows():
             v_lon = float(val_row["lon"])
@@ -307,6 +356,9 @@ class PointLayerCollocation:
                                 val_source=val_source,
                                 val_id=val_row.get("platform_id"),
                                 collocation_type=self.collocation_type,
+                                sar_y_idx=y_idx,
+                                sar_x_idx=x_idx,
+                                sar_scene_name=sar_scene_name,
                             )
                         )
 
@@ -491,6 +543,7 @@ def run_collocation(
                     sar_time=sar_time_arr,
                     val_data=df,
                     val_source=source_label,
+                    sar_scene_name=sar_name,
                 )
                 all_collocations.extend(matches)
                 logger.info(
@@ -510,6 +563,12 @@ def run_collocation(
         "Collocation results saved to %s (%d matches total)",
         out_path, len(all_collocations),
     )
+
+    # Step 4a: optional SAR patch extraction
+    patch_size = getattr(coll_cfg, "patch_size", 0)
+    if patch_size and patch_size > 0:
+        from .patch_extractor import run_patch_extraction
+        run_patch_extraction(result_ds, datatree, patch_size, base_dir)
 
     return result_ds
 

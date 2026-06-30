@@ -107,6 +107,33 @@ class DataTreeConverter:
 
         df["time"] = pd.to_datetime(df["time"])
 
+        # ------------------------------------------------------------------
+        # Copernicus Marine in-situ files use a long format where each row
+        # holds one variable code ("WSPD", "EWCT", …) in a ``variable``
+        # column and the measurement in a ``value`` column.  Pivot to wide
+        # format so that each variable code becomes its own column — this is
+        # what the collocation and statistics modules expect.
+        # ------------------------------------------------------------------
+        if "variable" in df.columns and "value" in df.columns:
+            pivot_id_cols = [
+                c for c in ("platform_id", "time", "lon", "lat", "depth")
+                if c in df.columns
+            ]
+            df = (
+                df.pivot_table(
+                    index=pivot_id_cols,
+                    columns="variable",
+                    values="value",
+                    aggfunc="first",
+                )
+                .reset_index()
+            )
+            df.columns.name = None  # remove the "variable" MultiIndex label
+            logger.debug(
+                "Pivoted in-situ CSV to wide format; variable columns: %s",
+                [c for c in df.columns if c not in pivot_id_cols],
+            )
+
         coord_cols = {"lon", "lat", "time", "platform_id"}
         data_cols  = [c for c in df.columns if c not in coord_cols]
 
@@ -233,6 +260,11 @@ class DataTreeConverter:
             "collocation",
             [c.collocation_type for c in collocations],
         )
+
+        # Pixel indices — needed by patch_extractor to slice SAR arrays
+        data["sar_y_idx"] = ("collocation", [c.sar_y_idx for c in collocations])
+        data["sar_x_idx"] = ("collocation", [c.sar_x_idx for c in collocations])
+        data["sar_scene_name"] = ("collocation", [c.sar_scene_name for c in collocations])
 
         coords = {
             "time":     ("collocation", [c.sar_time  for c in collocations]),

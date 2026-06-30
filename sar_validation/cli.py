@@ -129,6 +129,16 @@ Examples:
         help="Run collocation between SAR and validation data (step 3); implies --convert",
     )
     parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Compute validation statistics (step 4b — bias, RMSE, correlation); implies --collocate",
+    )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Generate validation plots (step 5 — scatter, geographic, statistics, residuals); implies --stats",
+    )
+    parser.add_argument(
         "--output-dir",
         metavar="DIR",
         help="Override the output directory specified in the recipe",
@@ -163,8 +173,10 @@ Examples:
             args.recipe,
             dry_run=args.dry_run,
             output_dir=args.output_dir,
-            convert=args.convert or args.collocate,
-            collocate=args.collocate,
+            convert=args.convert or args.collocate or args.stats or args.plot,
+            collocate=args.collocate or args.stats or args.plot,
+            stats=args.stats or args.plot,
+            plot=args.plot,
         )
     else:
         parser.print_help()
@@ -305,6 +317,8 @@ def _execute_recipe(
     output_dir: str = None,
     convert: bool = False,
     collocate: bool = False,
+    stats: bool = False,
+    plot: bool = False,
 ) -> None:
     from .core.recipe import Recipe
     from .core.orchestrator import DataOrchestrator
@@ -355,6 +369,12 @@ def _execute_recipe(
 
     if collocate:
         _collocate_data(recipe, orchestrator.base_dir)
+
+    if stats or plot:
+        _compute_stats(recipe, orchestrator.base_dir)
+
+    if plot:
+        _generate_plots(recipe, orchestrator.base_dir)
 
 
 def _is_already_downloaded(base_dir: Path) -> bool:
@@ -407,3 +427,63 @@ def _collocate_data(recipe, base_dir: Path) -> None:
     else:
         n = result.sizes.get("collocation", 0)
         print(f"  {n} collocated pair(s) saved to {base_dir / 'collocation_results.nc'}")
+
+
+def _compute_stats(recipe, base_dir: Path) -> None:
+    """Run step 4b: compute validation statistics from collocation_results.nc."""
+    import xarray as xr
+    from .core.statistics import run_statistics
+
+    coll_path = base_dir / "collocation_results.nc"
+    if not coll_path.exists():
+        print("  collocation_results.nc not found — statistics skipped.")
+        return
+
+    print("\nStep 4b: Computing validation statistics…")
+    collocation_ds = xr.open_dataset(str(coll_path))
+    results = run_statistics(collocation_ds, recipe, base_dir)
+    if not results:
+        print("  No statistics produced (check that variable names match the recipe).")
+    else:
+        for key in results:
+            print(f"  Statistics saved: validation_statistics_{key}.nc/.csv")
+
+
+def _generate_plots(recipe, base_dir: Path) -> None:
+    """Run step 5: generate validation plots and save to <base_dir>/plots/."""
+    import xarray as xr
+    from .core.visualization import validation_report
+    from .core.statistics import run_statistics
+
+    coll_path = base_dir / "collocation_results.nc"
+    datatree_path = base_dir / "datatree.nc"
+
+    if not coll_path.exists():
+        print("  collocation_results.nc not found — plotting skipped.")
+        return
+    if not datatree_path.exists():
+        print("  datatree.nc not found — plotting skipped.")
+        return
+
+    print("\nStep 5: Generating validation plots…")
+    collocation_ds = xr.open_dataset(str(coll_path))
+    datatree = xr.open_datatree(str(datatree_path), engine="netcdf4")
+
+    # Load pre-computed statistics if available
+    from .core._variable_map import infer_variable_pairs
+    stats_ds_map = {}
+    try:
+        pairs = infer_variable_pairs(recipe.config.variable)
+        for sar_var, val_var in pairs:
+            key = f"{sar_var}_vs_{val_var}"
+            stats_path = base_dir / f"validation_statistics_{key}.nc"
+            if stats_path.exists():
+                stats_ds_map[key] = xr.open_dataset(str(stats_path))
+    except KeyError:
+        pass
+
+    validation_report(collocation_ds, datatree, recipe,
+                      stats_ds_map=stats_ds_map or None,
+                      out_dir=base_dir)
+    plots_dir = base_dir / "plots"
+    print(f"  Plots saved to {plots_dir}")

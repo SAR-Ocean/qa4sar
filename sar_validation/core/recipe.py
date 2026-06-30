@@ -98,6 +98,14 @@ class CollocationType:
     time_tolerance_minutes: int = 60
     spatial_tolerance_km: float = 50.0
     interpolation_method: str = "nearest"  # nearest | linear | cubic
+    patch_size: int = 0
+    """
+    Side length (in pixels) of the SAR patch extracted around each matched pixel.
+
+    ``0`` disables patch extraction (default).  Must be a positive odd integer
+    when enabled (e.g. 3, 5, 7, 9).  Even values are rounded up to the next
+    odd integer with a warning.
+    """
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

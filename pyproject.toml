@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-plot = ["matplotlib", "cartopy", "cmocean"]
+plot = ["matplotlib", "cartopy", "cmocean", "plotly", "folium"]
 eumdac = ["eumdac"]
 test = ["pytest", "pytest-cov"]
 dev = [
@@ -30,6 +30,8 @@ dev = [
     "matplotlib",
     "cartopy",
     "cmocean",
+    "plotly",
+    "folium",
     "eumdac",
 ]
 
