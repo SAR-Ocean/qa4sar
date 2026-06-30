@@ -1,0 +1,69 @@
+# Wind Validation Recipe
+# Validates Sentinel-1 IW/EW mode wind speed and direction against
+# in-situ observations (moorings, buoys) and ASCAT scatterometer.
+#
+# Usage:
+#   sar-validate --recipe examples/wind_validation_example.yaml --dry-run
+#   sar-validate --recipe examples/wind_validation_example.yaml
+
+name: "Wind Validation — European West Coast"
+description: |
+  Validate Sentinel-1 IW and EW mode wind speed and direction
+  against moorings, buoys, and ASCAT scatterometer data.
+
+  Geographic region: European West Coast
+  Time period: 2026-05-01 to 2026-05-02
+
+version: "1.0"
+
+variable: "wind"
+variable_specs:
+  components:
+    - speed
+    - direction
+
+geographic_bounds:
+  min_lon: -20
+  max_lon:   0
+  min_lat:  35
+  max_lat:  60
+
+temporal_bounds:
+  start: "2026-05-01"
+  end:   "2026-05-02"
+
+sar_data:
+  satellite: Sentinel-1
+  product_level: L2_OCN
+  swath_mode:
+    - IW
+    - EW
+  # max_downloads: 10  # uncomment to limit the number of SAR files
+
+validation_sources:
+  - source_type: mooring
+    min_depth: -20
+    max_depth:  20
+    collocation_kwargs:
+      time_tolerance_minutes: 60
+      spatial_tolerance_km: 50
+
+  - source_type: buoy
+    min_depth: -20
+    max_depth:  20
+    collocation_kwargs:
+      time_tolerance_minutes: 60
+      spatial_tolerance_km: 50
+
+  - source_type: scatterometer   # ASCAT MetOp-B/C via EUMETSAT EUMDAC
+    collocation_kwargs:
+      time_tolerance_minutes: 120
+      spatial_tolerance_km: 100
+
+# Collocation strategy
+# Options: point_vs_layer | trajectory_vs_layer | layer_vs_layer
+collocation:
+  type: point_vs_layer
+  time_tolerance_minutes: 60
+  spatial_tolerance_km: 50
+  interpolation_method: nearest

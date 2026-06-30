@@ -1,0 +1,267 @@
+"""
+Download HF radar surface current data from Copernicus Marine.
+
+Data source: INSITU_GLO_PHYBGCWAV_DISCRETE_MYNRT_013_030
+    Dataset ID: cmems_obs-ins_glo_phybgcwav_mynrt_na_irr
+    Platform type: HF (HF radar station)
+
+HF radar measures surface currents (EWCT, NSCT) at high spatial and temporal
+resolution along coastlines.
+
+Library usage::
+
+    from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+    dl = HFRadarDownloader(output_dir=Path("data/run1/hf_radar"))
+    dl.download(min_lon=-20, max_lon=0, min_lat=35, max_lat=60,
+                start="2026-01-01", end="2026-01-02")
+
+CLI usage::
+
+    python -m sar_validation.downloaders.hf_radar_downloader \\
+        --min-lon -20 --max-lon 0 --min-lat 35 --max-lat 60 \\
+        --start 2026-01-01 --end 2026-01-02
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+
+from .base import normalize_datetime, build_output_dir
+
+__all__ = ["HFRadarDownloader"]
+
+# ---------------------------------------------------------------------------
+# Dataset constants
+# ---------------------------------------------------------------------------
+
+DATASET_ID     = "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr"
+HF_RADAR_VARS  = ["EWCT", "NSCT", "HCDT", "HCSP"]
+PLATFORM_CODE  = "HF"   # HF Radar platform type in Copernicus in-situ dataset
+
+
+def _build_csv_filename(
+    min_lon: float, max_lon: float,
+    min_lat: float, max_lat: float,
+    start_dt: str, end_dt: str,
+    min_depth: float, max_depth: float,
+) -> str:
+    lon_sfx = lambda v: "W" if v < 0 else "E"
+    lat_sfx = lambda v: "S" if v < 0 else "N"
+    vars_str = "-".join(HF_RADAR_VARS)
+    start_d = start_dt.split("T")[0]
+    end_d   = end_dt.split("T")[0]
+    date_str = start_d if start_d == end_d else f"{start_d}-{end_d}"
+    depth_str = f"{abs(min_depth):.2f}-{abs(max_depth):.2f}m"
+    return (
+        f"{DATASET_ID}_{vars_str}_"
+        f"{abs(min_lon):.2f}{lon_sfx(min_lon)}-{abs(max_lon):.2f}{lon_sfx(max_lon)}_"
+        f"{abs(min_lat):.2f}{lat_sfx(min_lat)}-{abs(max_lat):.2f}{lat_sfx(max_lat)}_"
+        f"{depth_str}_{date_str}.csv"
+    )
+
+
+class HFRadarDownloader:
+    """
+    Download HF radar surface current data from Copernicus Marine.
+
+    HF radar data is part of the global in-situ dataset. This downloader
+    downloads only the current-relevant variables (EWCT, NSCT, HCDT, HCSP)
+    and filters the result to platform type 'HF'.
+
+    Parameters
+    ----------
+    output_dir : Path
+        Directory to save downloaded files.
+    dry_run : bool
+        If True, print what would be downloaded without actually downloading.
+    min_depth, max_depth : float
+        Depth range (HF radar measures surface, so defaults are near-surface).
+    """
+
+    def __init__(
+        self,
+        output_dir: Path,
+        dry_run: bool = False,
+        min_depth: float = -2.0,
+        max_depth: float = 2.0,
+    ) -> None:
+        self.output_dir = Path(output_dir)
+        self.dry_run = dry_run
+        self.min_depth = min_depth
+        self.max_depth = max_depth
+
+    def download(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+    ) -> Optional[Path]:
+        """
+        Download HF radar observations and save to a CSV.
+
+        Returns
+        -------
+        Path or None
+            Path to the downloaded CSV, or None in dry-run mode.
+        """
+        try:
+            import copernicusmarine
+        except ImportError as exc:
+            raise ImportError(
+                "copernicusmarine is required for HF radar downloads.\n"
+                "Install it with:  pip install copernicusmarine"
+            ) from exc
+
+        start_dt = normalize_datetime(start)
+        end_dt   = normalize_datetime(end)
+
+        expected_filename = _build_csv_filename(
+            min_lon, max_lon, min_lat, max_lat,
+            start_dt, end_dt, self.min_depth, self.max_depth,
+        )
+        dest_path = self.output_dir / expected_filename
+
+        if self.dry_run:
+            print(
+                f"[DRY RUN] Would download HF radar data to:\n  {dest_path}"
+            )
+            return None
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        print("Downloading HF radar surface current data …")
+        print(f"  Region: lon [{min_lon}, {max_lon}] lat [{min_lat}, {max_lat}]")
+        print(f"  Time:   {start_dt} → {end_dt}")
+        print(f"  Depth:  {self.min_depth} to {self.max_depth} m")
+        print(f"  Variables: {', '.join(HF_RADAR_VARS)}")
+
+        copernicusmarine.subset(
+            dataset_id=DATASET_ID,
+            dataset_part="monthly",
+            variables=HF_RADAR_VARS,
+            minimum_longitude=min_lon,
+            maximum_longitude=max_lon,
+            minimum_latitude=min_lat,
+            maximum_latitude=max_lat,
+            start_datetime=start_dt,
+            end_datetime=end_dt,
+            minimum_depth=self.min_depth,
+            maximum_depth=self.max_depth,
+            force_download=False,
+        )
+
+        # Move file from CWD to output_dir
+        if Path(expected_filename).exists():
+            shutil.move(str(expected_filename), str(dest_path))
+        elif dest_path.exists():
+            pass  # already there
+        else:
+            # Search for the most recently created CSV
+            candidates = sorted(
+                Path(".").glob(f"{DATASET_ID}*.csv"),
+                key=os.path.getmtime,
+                reverse=True,
+            )
+            if candidates:
+                shutil.move(str(candidates[0]), str(dest_path))
+            else:
+                raise FileNotFoundError(
+                    f"HF radar download completed but output CSV not found.\n"
+                    f"Expected: {expected_filename}"
+                )
+
+        # Filter to HF radar platform type only
+        df = pd.read_csv(dest_path)
+        if "platform_type" in df.columns:
+            df_hf = df[df["platform_type"] == PLATFORM_CODE]
+            if df_hf.empty:
+                print(
+                    f"  WARNING: No HF radar stations (platform_type='{PLATFORM_CODE}') "
+                    f"found in the downloaded data for this region/period."
+                )
+            else:
+                df_hf.to_csv(dest_path, index=False)
+                print(f"  Filtered to {len(df_hf)} HF radar observations")
+        else:
+            print("  WARNING: 'platform_type' column not found; keeping all data.")
+
+        print(f"  Saved to {dest_path}")
+        return dest_path
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def _parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="Download HF radar surface current data from Copernicus Marine.",
+    )
+    p.add_argument("--params-file", metavar="FILE")
+    p.add_argument("--min-lon", type=float)
+    p.add_argument("--max-lon", type=float)
+    p.add_argument("--min-lat", type=float)
+    p.add_argument("--max-lat", type=float)
+    p.add_argument("--start")
+    p.add_argument("--end")
+    p.add_argument("--min-depth", type=float, default=-2.0)
+    p.add_argument("--max-depth", type=float, default=2.0)
+    p.add_argument("--output-dir", default=None)
+    p.add_argument("--dry-run", action="store_true")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+
+    if args.params_file:
+        with open(args.params_file) as f:
+            params = json.load(f)
+        min_lon   = params["minimum_longitude"]
+        max_lon   = params["maximum_longitude"]
+        min_lat   = params["minimum_latitude"]
+        max_lat   = params["maximum_latitude"]
+        start     = params["start_datetime"]
+        end       = params["end_datetime"]
+        min_depth = params.get("minimum_depth", -2.0)
+        max_depth = params.get("maximum_depth",  2.0)
+    else:
+        for attr in ("min_lon", "max_lon", "min_lat", "max_lat", "start", "end"):
+            if getattr(args, attr) is None:
+                print(f"Error: --{attr.replace('_','-')} is required (or use --params-file)")
+                sys.exit(1)
+        min_lon, max_lon = args.min_lon, args.max_lon
+        min_lat, max_lat = args.min_lat, args.max_lat
+        start, end = args.start, args.end
+        min_depth, max_depth = args.min_depth, args.max_depth
+
+    output_dir = Path(args.output_dir) if args.output_dir else (
+        build_output_dir(start, end, min_lon, max_lon, min_lat, max_lat) / "hf_radar"
+    )
+
+    dl = HFRadarDownloader(
+        output_dir=output_dir,
+        dry_run=args.dry_run,
+        min_depth=min_depth,
+        max_depth=max_depth,
+    )
+    dl.download(
+        min_lon=min_lon, max_lon=max_lon,
+        min_lat=min_lat, max_lat=max_lat,
+        start=start, end=end,
+    )
+
+
+if __name__ == "__main__":
+    main()

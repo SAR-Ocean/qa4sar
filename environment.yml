@@ -1,0 +1,22 @@
+name: sar_validation
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - xarray>=2024.1
+  - numpy
+  - pandas
+  - pyyaml
+  - requests
+  - copernicusmarine>=2.0
+  - eumdac
+  # plotting (optional but recommended)
+  - matplotlib
+  - cartopy
+  - cmocean
+  # testing
+  - pytest
+  - pytest-cov
+  - pip
+  - pip:
+    - -e .

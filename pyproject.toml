@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "sar-l2-validation-toolbox"
+version = "0.1.0"
+description = "SAR Level 2 Ocean Data Validation Toolbox for wind, currents, and waves"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["SAR", "Sentinel-1", "ocean", "validation", "remote sensing"]
+
+dependencies = [
+    "xarray>=2024.1",
+    "numpy",
+    "pandas",
+    "pyyaml",
+    "requests",
+    "copernicusmarine>=2.0",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib", "cartopy", "cmocean"]
+eumdac = ["eumdac"]
+test = ["pytest", "pytest-cov"]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "matplotlib",
+    "cartopy",
+    "cmocean",
+    "eumdac",
+]
+
+[project.scripts]
+sar-validate = "sar_validation.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sar_validation*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
