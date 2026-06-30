@@ -10,6 +10,9 @@ dependencies:
   - requests
   - copernicusmarine>=2.0
   - eumdac
+  - scipy
+  - netcdf4
+  - ipykernel
   # plotting (optional but recommended)
   - matplotlib
   - cartopy

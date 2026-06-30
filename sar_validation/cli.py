@@ -48,6 +48,8 @@ Examples:
   sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65 --start 2026-03-01 --end 2026-03-31 --recipe-name north_sea_march_2026
   sar-validate --recipe recipes/wind_validation.yaml --dry-run
   sar-validate --recipe recipes/wind_validation.yaml
+  sar-validate --recipe recipes/wind_validation.yaml --convert
+  sar-validate --recipe recipes/wind_validation.yaml --convert --collocate
         """,
     )
 
@@ -117,6 +119,16 @@ Examples:
         help="Show what will be downloaded without actually downloading",
     )
     parser.add_argument(
+        "--convert",
+        action="store_true",
+        help="Convert downloaded data to xarray.DataTree (step 2)",
+    )
+    parser.add_argument(
+        "--collocate",
+        action="store_true",
+        help="Run collocation between SAR and validation data (step 3); implies --convert",
+    )
+    parser.add_argument(
         "--output-dir",
         metavar="DIR",
         help="Override the output directory specified in the recipe",
@@ -147,7 +159,13 @@ Examples:
             recipe_name=args.recipe_name,
         )
     elif args.recipe:
-        _execute_recipe(args.recipe, dry_run=args.dry_run, output_dir=args.output_dir)
+        _execute_recipe(
+            args.recipe,
+            dry_run=args.dry_run,
+            output_dir=args.output_dir,
+            convert=args.convert or args.collocate,
+            collocate=args.collocate,
+        )
     else:
         parser.print_help()
         sys.exit(1)
@@ -285,6 +303,8 @@ def _execute_recipe(
     recipe_path: str,
     dry_run: bool = False,
     output_dir: str = None,
+    convert: bool = False,
+    collocate: bool = False,
 ) -> None:
     from .core.recipe import Recipe
     from .core.orchestrator import DataOrchestrator
@@ -303,14 +323,87 @@ def _execute_recipe(
         recipe.config.output_dir = output_dir
 
     orchestrator = DataOrchestrator(recipe, dry_run=dry_run)
-    success = orchestrator.download_all()
 
-    if dry_run:
-        print("\nDry run complete — no data was downloaded.")
-        print(f"Would write to: {orchestrator.base_dir}")
-    elif success:
-        print("\nAll downloads completed.")
-        print(f"Data directory: {orchestrator.base_dir}")
+    # Skip download if data was already downloaded successfully
+    if not dry_run and _is_already_downloaded(orchestrator.base_dir):
+        logger.info(
+            "Data already downloaded in %s — skipping Step 1.",
+            orchestrator.base_dir,
+        )
+        print(f"Step 1 skipped — data already present in {orchestrator.base_dir}")
+        success = True
     else:
-        print("\nOne or more downloads failed. Check download_metadata.json for details.")
-        sys.exit(1)
+        success = orchestrator.download_all()
+
+        if dry_run:
+            print("\nDry run complete — no data was downloaded.")
+            print("No data directories or files were created.")
+            return
+        elif not success:
+            print("\nOne or more downloads failed. Check download_metadata.json for details.")
+            sys.exit(1)
+        else:
+            print("\nAll downloads completed.")
+            print(f"Data directory: {orchestrator.base_dir}")
+
+    if convert:
+        datatree_path = orchestrator.base_dir / "datatree.nc"
+        if not datatree_path.exists():
+            _convert_data(recipe, orchestrator.base_dir)
+        else:
+            print("Step 2 skipped — DataTree already exists")
+
+    if collocate:
+        _collocate_data(recipe, orchestrator.base_dir)
+
+
+def _is_already_downloaded(base_dir: Path) -> bool:
+    """Return True if *base_dir* has a download_metadata.json with no errors."""
+    import json as _json
+    meta_path = base_dir / "download_metadata.json"
+    if not meta_path.exists():
+        return False
+    try:
+        with open(meta_path) as f:
+            meta = _json.load(f)
+        return meta.get("errors", ["placeholder"]) == []
+    except Exception:
+        return False
+
+
+def _convert_data(recipe, base_dir: Path) -> "xr.DataTree | None":
+    """Run step 2: convert downloaded files to a DataTree."""
+    from .core.datatree_converter import DataTreeConverter
+
+    print("\nStep 2: Converting data to DataTree…")
+    tree = DataTreeConverter.convert_downloaded_data(base_dir)
+    if tree is None:
+        print("  No data files found — nothing to convert.")
+        return None
+    print(f"  DataTree saved to {base_dir / 'datatree.nc'}")
+    return tree
+
+
+def _collocate_data(recipe, base_dir: Path) -> None:
+    """Run step 3: load DataTree and run collocation."""
+    import xarray as xr
+    from .core.collocation import run_collocation
+
+    datatree_path = base_dir / "datatree.nc"
+    if not datatree_path.exists():
+        # datatree wasn't produced yet (shouldn't happen since --collocate implies --convert)
+        print("  DataTree not found — running conversion first.")
+        tree = _convert_data(recipe, base_dir)
+        if tree is None:
+            print("  Conversion produced no output — collocation skipped.")
+            return
+    else:
+        tree = xr.open_datatree(str(datatree_path), engine='netcdf4')
+
+    print("\nStep 3: Running collocation…")
+    result = run_collocation(recipe, tree, base_dir)
+    if result is None:
+        print("  No collocated pairs found.")
+    else:
+        n = result.sizes.get("collocation", 0)
+        print(f"  {n} collocated pair(s) saved to {base_dir / 'collocation_results.nc'}")

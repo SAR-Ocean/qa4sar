@@ -16,6 +16,9 @@ from sar_validation.core.collocation import (
     _haversine_distance,
     _haversine_distance_grid,
     _to_datetime_array,
+    _detect_collocation_type,
+    TRAJECTORY_PLATFORM_TYPES,
+    LAYER_DATA_TYPES,
 )
 
 
@@ -212,6 +215,18 @@ class TestPointLayerCollocation:
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "mooring")
         assert len(results) > 0
 
+    def test_collocated_point_has_collocation_type(self):
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            WSPD=[8.0],
+        )
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "mooring")
+        assert len(results) > 0
+        assert results[0].collocation_type == "point_vs_layer"
+
     def test_invalid_interpolation_method(self):
         with pytest.raises(ValueError, match="interpolation_method"):
             PointLayerCollocation(interpolation_method="bilinear")
@@ -233,14 +248,133 @@ class TestPointLayerCollocation:
 
 
 # ---------------------------------------------------------------------------
-# Stub collocation types
+# TrajectoryLayerCollocation
 # ---------------------------------------------------------------------------
 
-class TestStubs:
-    def test_trajectory_raises(self):
-        with pytest.raises(NotImplementedError):
-            TrajectoryLayerCollocation().collocate()
+class TestTrajectoryLayerCollocation:
+    def test_finds_match_and_labels_correctly(self):
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        # Simulate a short ferrybox track crossing the SAR scene
+        val = _make_val_dataframe(
+            lons=[-0.5, 0.0, 0.5],
+            lats=[51.5, 52.0, 52.5],
+            times=[
+                datetime(2026, 1, 1, 11, 55, 0),
+                datetime(2026, 1, 1, 12,  0, 0),
+                datetime(2026, 1, 1, 12,  5, 0),
+            ],
+            EWCT=[0.3, 0.4, 0.5],
+            NSCT=[0.1, 0.2, 0.1],
+        )
+        colloc = TrajectoryLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "ferrybox")
 
-    def test_layer_raises(self):
-        with pytest.raises(NotImplementedError):
-            LayerLayerCollocation().collocate()
+        assert len(results) > 0
+        assert all(r.collocation_type == "trajectory_vs_layer" for r in results)
+        assert all(r.val_source == "ferrybox" for r in results)
+
+    def test_no_match_outside_tolerance(self):
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        val = _make_val_dataframe(
+            lons=[30.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            EWCT=[0.5],
+        )
+        colloc = TrajectoryLayerCollocation(spatial_tolerance_km=10, time_tolerance_minutes=60)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "drifter")
+        assert results == []
+
+    def test_inherits_from_point_layer(self):
+        assert issubclass(TrajectoryLayerCollocation, PointLayerCollocation)
+
+
+# ---------------------------------------------------------------------------
+# LayerLayerCollocation
+# ---------------------------------------------------------------------------
+
+class TestLayerLayerCollocation:
+    def test_finds_match_and_labels_correctly(self):
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        # Simulate a coarse scatterometer swath overlapping the SAR grid
+        scat_lons = np.linspace(-1.5, 1.5, 8)
+        scat_lats = np.linspace(50.5, 53.5, 6)
+        mg_lon, mg_lat = np.meshgrid(scat_lons, scat_lats)
+        val = _make_val_dataframe(
+            lons=mg_lon.ravel().tolist(),
+            lats=mg_lat.ravel().tolist(),
+            times=[datetime(2026, 1, 1, 12, 0, 0)] * mg_lon.size,
+            wind_speed=[8.5] * mg_lon.size,
+            wind_dir=[230.0] * mg_lon.size,
+        )
+        colloc = LayerLayerCollocation(spatial_tolerance_km=100, time_tolerance_minutes=60)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
+
+        assert len(results) > 0
+        assert all(r.collocation_type == "layer_vs_layer" for r in results)
+        assert all(r.val_source == "scatterometer" for r in results)
+
+    def test_no_match_outside_time_tolerance(self):
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 18, 0, 0)],  # 6 h after SAR
+            wind_speed=[7.0],
+        )
+        colloc = LayerLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
+        assert results == []
+
+    def test_inherits_from_point_layer(self):
+        assert issubclass(LayerLayerCollocation, PointLayerCollocation)
+
+
+# ---------------------------------------------------------------------------
+# _detect_collocation_type
+# ---------------------------------------------------------------------------
+
+class TestDetectCollocationTypeImport:
+    def test_point_by_default(self):
+        import xarray as xr
+        ds = xr.Dataset()
+        assert _detect_collocation_type(ds, "validation/mooring") == "point_vs_layer"
+
+    def test_trajectory_by_platform_type(self):
+        import xarray as xr
+        for pt in TRAJECTORY_PLATFORM_TYPES:
+            ds = xr.Dataset(attrs={"platform_type": pt})
+            assert _detect_collocation_type(ds, "val/x") == "trajectory_vs_layer", pt
+
+    def test_layer_by_data_type(self):
+        import xarray as xr
+        for dt in LAYER_DATA_TYPES:
+            ds = xr.Dataset(attrs={"data_type": dt})
+            assert _detect_collocation_type(ds, "val/x") == "layer_vs_layer", dt
+
+    def test_layer_by_path_fragment(self):
+        import xarray as xr
+        ds = xr.Dataset()
+        assert _detect_collocation_type(ds, "validation/osi_saf_winds/file") == "layer_vs_layer"
+        assert _detect_collocation_type(ds, "validation/scatterometer/file") == "layer_vs_layer"
+
+
+# ---------------------------------------------------------------------------
+# Former stub tests (now verify classes are functional)
+# ---------------------------------------------------------------------------
+
+class TestAllTypesWork:
+    def test_all_three_classes_return_results(self):
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            wind_speed=[8.0],
+        )
+        for cls, expected_type in (
+            (PointLayerCollocation,      "point_vs_layer"),
+            (TrajectoryLayerCollocation, "trajectory_vs_layer"),
+            (LayerLayerCollocation,      "layer_vs_layer"),
+        ):
+            colloc = cls(spatial_tolerance_km=200, time_tolerance_minutes=60)
+            results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "test")
+            assert len(results) > 0
+            assert results[0].collocation_type == expected_type

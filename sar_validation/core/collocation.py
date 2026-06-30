@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,11 @@ __all__ = [
     "PointLayerCollocation",
     "TrajectoryLayerCollocation",
     "LayerLayerCollocation",
+    "run_collocation",
+    "_detect_collocation_type",
+    "TRAJECTORY_PLATFORM_TYPES",
+    "LAYER_DATA_TYPES",
+    "LAYER_SOURCE_PATHS",
 ]
 
 
@@ -55,6 +61,7 @@ class CollocatedPoint:
     # Provenance
     val_source: str              # e.g. "mooring", "buoy", "scatterometer"
     val_id: Optional[str] = None
+    collocation_type: str = "point_vs_layer"  # point_vs_layer | trajectory_vs_layer | layer_vs_layer
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -70,6 +77,7 @@ class CollocatedPoint:
             "temporal_distance_minutes": self.temporal_distance_minutes,
             "val_source":                self.val_source,
             "val_id":                    self.val_id,
+            "collocation_type":          self.collocation_type,
         }
 
 
@@ -126,6 +134,40 @@ def _to_datetime_array(time_array) -> np.ndarray:
 # 1. Point vs. Layer
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Source-type dispatch helpers
+# ---------------------------------------------------------------------------
+
+# platform_type attribute values that indicate a moving trajectory source
+TRAJECTORY_PLATFORM_TYPES = {"ferrybox", "fb", "drifter", "ad"}
+# data_type attribute values that indicate a gridded layer source
+LAYER_DATA_TYPES = {"scatterometer"}
+# path-fragment fallbacks when attributes are absent
+LAYER_SOURCE_PATHS = {"osi_saf_winds", "scatterometer"}
+
+
+def _detect_collocation_type(val_ds: "xr.Dataset", source_path: str) -> str:
+    """
+    Infer the appropriate collocation class name from a validation Dataset.
+
+    Checks (in order):
+    1. ``platform_type`` attribute  → trajectory or default
+    2. ``data_type`` attribute      → layer or default
+    3. Source path fragment         → layer or default
+    """
+    platform_type = val_ds.attrs.get("platform_type", "").lower()
+    data_type = val_ds.attrs.get("data_type", "").lower()
+
+    if platform_type in TRAJECTORY_PLATFORM_TYPES:
+        return "trajectory_vs_layer"
+    if data_type in LAYER_DATA_TYPES:
+        return "layer_vs_layer"
+    for fragment in LAYER_SOURCE_PATHS:
+        if fragment in source_path.lower():
+            return "layer_vs_layer"
+    return "point_vs_layer"
+
+
 class PointLayerCollocation:
     """
     Match fixed-point (or slowly-moving) validation observations with a
@@ -146,6 +188,9 @@ class PointLayerCollocation:
         - ``"linear"``   — bilinear interpolation (TODO)
         - ``"cubic"``    — bicubic interpolation (TODO)
     """
+
+    #: Collocation type label stored on each CollocatedPoint result.
+    collocation_type: str = "point_vs_layer"
 
     def __init__(
         self,
@@ -239,12 +284,14 @@ class PointLayerCollocation:
                         spatial_dist  <= self.spatial_tolerance_km
                         and temporal_dist <= self.time_tolerance_minutes
                     ):
-                        val_point = {
-                            col: float(val_row[col])
-                            for col in val_data.columns
-                            if col not in {"lon", "lat", "time", "platform_id"}
-                            and pd.notna(val_row[col])
-                        }
+                        val_point = {}
+                        for col in val_data.columns:
+                            if col not in {"lon", "lat", "time", "platform_id"} and pd.notna(val_row[col]):
+                                try:
+                                    val_point[col] = float(val_row[col])
+                                except (ValueError, TypeError):
+                                    # Skip non-numeric columns
+                                    pass
                         collocations.append(
                             CollocatedPoint(
                                 sar_lon=s_lon,
@@ -259,6 +306,7 @@ class PointLayerCollocation:
                                 temporal_distance_minutes=temporal_dist,
                                 val_source=val_source,
                                 val_id=val_row.get("platform_id"),
+                                collocation_type=self.collocation_type,
                             )
                         )
 
@@ -293,40 +341,215 @@ class PointLayerCollocation:
 
 
 # ---------------------------------------------------------------------------
-# 2. Trajectory vs. Layer  (stub)
+# High-level pipeline helper (step 3)
 # ---------------------------------------------------------------------------
 
-class TrajectoryLayerCollocation:
+def run_collocation(
+    recipe,
+    datatree: "xr.DataTree",
+    base_dir: Union[str, Path],
+) -> Optional["xr.Dataset"]:
+    """
+    Run all three collocation passes between SAR and validation nodes in
+    *datatree* and save the combined results to
+    ``<base_dir>/collocation_results.nc``.
+
+    Pass order
+    ----------
+    1. **point_vs_layer**      — moorings, buoys, tidal gauges, HF radar
+    2. **trajectory_vs_layer** — ferryboxes, drifters
+    3. **layer_vs_layer**      — scatterometer swaths, OSI-SAF winds
+
+    Each validation source is auto-assigned to a pass based on its
+    ``platform_type`` / ``data_type`` Dataset attribute (see
+    :func:`_detect_collocation_type`).
+
+    The collocation parameters (tolerances, interpolation method) are taken
+    from ``recipe.config.collocation``.
+
+    DataTree layout expected
+    ------------------------
+    - ``/sar/<scene-name>``              — one node per SAR SAFE file
+    - ``/validation/<source-name>``      — point-observation Datasets
+      (may be nested one level deeper for satellite products)
+
+    Each SAR node must have ``lon`` and ``lat`` as 2-D ``(y, x)`` coordinates
+    and a scalar ``time`` coordinate.  Each validation node must use a flat
+    ``point`` dimension with ``lon``, ``lat``, and ``time`` coordinates.
+
+    Parameters
+    ----------
+    recipe : Recipe
+        Recipe object; its ``config.collocation`` field provides tolerances
+        and the interpolation method.
+    datatree : xr.DataTree
+        DataTree produced by :func:`DataTreeConverter.convert_downloaded_data`.
+    base_dir : str or Path
+        Directory where ``collocation_results.nc`` will be written.
+
+    Returns
+    -------
+    xr.Dataset or None
+        Dataset of collocated pairs, or None if no matches were found.
+    """
+    import xarray as xr
+    from pathlib import Path as _Path
+    from .datatree_converter import DataTreeConverter
+
+    base_dir = _Path(base_dir)
+    coll_cfg = recipe.config.collocation
+
+    _COLLOC_CLASSES = {
+        "point_vs_layer":       PointLayerCollocation,
+        "trajectory_vs_layer":  TrajectoryLayerCollocation,
+        "layer_vs_layer":       LayerLayerCollocation,
+    }
+
+    # Collect SAR nodes (one Dataset per SAR scene)
+    sar_scenes: Dict[str, Any] = {}
+    if "sar" in datatree.children:
+        for name, node in datatree["sar"].children.items():
+            sar_scenes[name] = node.to_dataset()
+
+    if not sar_scenes:
+        logger.warning("No SAR nodes found in DataTree — nothing to collocate.")
+        return None
+
+    # Collect validation nodes (flatten up to two levels deep) and bucket
+    # each by its auto-detected collocation type.
+    buckets: Dict[str, Dict[str, Any]] = {t: {} for t in _COLLOC_CLASSES}
+
+    if "validation" in datatree.children:
+        for name, node in datatree["validation"].children.items():
+            ds = node.to_dataset()
+            if "point" in ds.dims and len(ds.data_vars) > 0:
+                ctype = _detect_collocation_type(ds, name)
+                buckets[ctype][name] = ds
+            # One level deeper (e.g. validation/osi_saf_winds/<file>)
+            for subname, subnode in node.children.items():
+                sub_ds = subnode.to_dataset()
+                if "point" in sub_ds.dims and len(sub_ds.data_vars) > 0:
+                    path = f"{name}/{subname}"
+                    ctype = _detect_collocation_type(sub_ds, path)
+                    buckets[ctype][path] = sub_ds
+
+    total_sources = sum(len(v) for v in buckets.values())
+    if total_sources == 0:
+        logger.warning("No validation nodes with 'point' dimension found — nothing to collocate.")
+        return None
+
+    for ctype, sources in buckets.items():
+        if sources:
+            logger.info(
+                "Collocation pass '%s': %d source(s): %s",
+                ctype, len(sources), list(sources),
+            )
+
+    all_collocations: List[CollocatedPoint] = []
+
+    for sar_name, sar_ds in sar_scenes.items():
+        if "lon" not in sar_ds.coords or "lat" not in sar_ds.coords:
+            logger.warning("SAR node '%s' missing lon/lat coordinates — skipping.", sar_name)
+            continue
+        if "time" not in sar_ds.coords:
+            logger.warning("SAR node '%s' missing time coordinate — skipping.", sar_name)
+            continue
+
+        sar_lon = sar_ds["lon"].values           # (y, x)
+        sar_lat = sar_ds["lat"].values           # (y, x)
+        acq_time = pd.Timestamp(sar_ds["time"].values).to_pydatetime()
+        sar_time_arr = np.array([acq_time])
+
+        # Expand each variable to (1, y, x) for collocate()
+        sar_data_3d: Dict[str, np.ndarray] = {
+            var: sar_ds[var].values[np.newaxis, :, :]
+            for var in sar_ds.data_vars
+            if sar_ds[var].dims == ("y", "x")
+        }
+
+        if not sar_data_3d:
+            logger.warning("SAR node '%s' has no (y, x) variables — skipping.", sar_name)
+            continue
+
+        # Run the three passes in order
+        for ctype, sources in buckets.items():
+            if not sources:
+                continue
+            colloc = _COLLOC_CLASSES[ctype](
+                spatial_tolerance_km=coll_cfg.spatial_tolerance_km,
+                time_tolerance_minutes=coll_cfg.time_tolerance_minutes,
+                interpolation_method=coll_cfg.interpolation_method,
+            )
+            for val_name, val_ds in sources.items():
+                df = val_ds.to_dataframe().reset_index(drop=True)
+                source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
+
+                matches = colloc.collocate(
+                    sar_data=sar_data_3d,
+                    sar_lon=sar_lon,
+                    sar_lat=sar_lat,
+                    sar_time=sar_time_arr,
+                    val_data=df,
+                    val_source=source_label,
+                )
+                all_collocations.extend(matches)
+                logger.info(
+                    "SAR '%s' × validation '%s' [%s]: %d match(es)",
+                    sar_name, val_name, ctype, len(matches),
+                )
+
+    if not all_collocations:
+        logger.warning("Collocation complete — no matches found.")
+        return None
+
+    result_ds = DataTreeConverter.from_collocations(all_collocations)
+
+    out_path = base_dir / "collocation_results.nc"
+    result_ds.to_netcdf(out_path)
+    logger.info(
+        "Collocation results saved to %s (%d matches total)",
+        out_path, len(all_collocations),
+    )
+
+    return result_ds
+
+
+# ---------------------------------------------------------------------------
+# 2. Trajectory vs. Layer
+# ---------------------------------------------------------------------------
+
+class TrajectoryLayerCollocation(PointLayerCollocation):
     """
     Match a moving trajectory (ferrybox, drifter) to a SAR layer.
 
-    Not yet implemented.  The collocation must account for the platform
-    moving during the SAR overpass; the matching logic should interpolate
-    the trajectory to the SAR acquisition time.
+    Each observation is matched independently: its individual ``lon``, ``lat``,
+    and ``time`` are checked against the SAR grid.  This is equivalent to
+    ``PointLayerCollocation`` but produces results labelled
+    ``collocation_type="trajectory_vs_layer"``.
+
+    Typical use cases: ferrybox transects, drifting buoys.
     """
 
-    def collocate(self, *args, **kwargs):
-        raise NotImplementedError(
-            "TrajectoryLayerCollocation is not yet implemented."
-        )
+    collocation_type: str = "trajectory_vs_layer"
 
 
 # ---------------------------------------------------------------------------
-# 3. Layer vs. Layer  (stub)
+# 3. Layer vs. Layer
 # ---------------------------------------------------------------------------
 
-class LayerLayerCollocation:
+class LayerLayerCollocation(PointLayerCollocation):
     """
-    Match two gridded products (e.g. scatterometer vs. SAR).
+    Match a gridded validation product (e.g. scatterometer swath) to a SAR
+    layer cell-by-cell.
 
-    Not yet implemented.  Key considerations:
-      - Resample both grids to a common resolution before matching.
-      - The temporal tolerance applies to the centre of each grid's
-        acquisition window.
-      - Store per-cell spatial and temporal offsets.
+    The validation dataset is flattened to individual (lon, lat, time)
+    observations before matching — each grid cell is treated as an
+    independent point and checked against the SAR grid with the same
+    Haversine + temporal tolerance logic as ``PointLayerCollocation``.
+
+    Results are labelled ``collocation_type="layer_vs_layer"``.
+
+    Typical use cases: ASCAT scatterometer swaths, OSI-SAF wind products.
     """
 
-    def collocate(self, *args, **kwargs):
-        raise NotImplementedError(
-            "LayerLayerCollocation is not yet implemented."
-        )
+    collocation_type: str = "layer_vs_layer"

@@ -71,8 +71,9 @@ class DataOrchestrator:
                 b.min_lon, b.max_lon, b.min_lat, b.max_lat,
             )
 
-        base.mkdir(parents=True, exist_ok=True)
-        logger.info("Base directory: %s", base)
+        if not self.dry_run:
+            base.mkdir(parents=True, exist_ok=True)
+            logger.info("Base directory: %s", base)
         return base
 
     # ------------------------------------------------------------------
@@ -116,7 +117,8 @@ class DataOrchestrator:
             if not self._dispatch_source(source):
                 ok = False
 
-        self._save_metadata()
+        if not self.dry_run:
+            self._save_metadata()
         return ok
 
     # ------------------------------------------------------------------
