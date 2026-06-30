@@ -42,8 +42,12 @@ def main(argv=None) -> None:
 Examples:
   sar-validate --list-recipes
   sar-validate --create-recipe wind
-  sar-validate --recipe examples/wind_validation_example.yaml --dry-run
-  sar-validate --recipe examples/wind_validation_example.yaml
+  sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65
+  sar-validate --create-recipe wind --start 2026-03-01 --end 2026-03-31
+  sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65 --start 2026-03-01 --end 2026-03-31
+  sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65 --start 2026-03-01 --end 2026-03-31 --recipe-name north_sea_march_2026
+  sar-validate --recipe recipes/wind_validation.yaml --dry-run
+  sar-validate --recipe recipes/wind_validation.yaml
         """,
     )
 
@@ -69,6 +73,45 @@ Examples:
         help="Limit SAR downloads to first N files (used with --create-recipe)",
     )
     parser.add_argument(
+        "--min-lon",
+        type=float,
+        metavar="DEG",
+        help="Western bound in decimal degrees (used with --create-recipe)",
+    )
+    parser.add_argument(
+        "--max-lon",
+        type=float,
+        metavar="DEG",
+        help="Eastern bound in decimal degrees (used with --create-recipe)",
+    )
+    parser.add_argument(
+        "--min-lat",
+        type=float,
+        metavar="DEG",
+        help="Southern bound in decimal degrees (used with --create-recipe)",
+    )
+    parser.add_argument(
+        "--max-lat",
+        type=float,
+        metavar="DEG",
+        help="Northern bound in decimal degrees (used with --create-recipe)",
+    )
+    parser.add_argument(
+        "--start",
+        metavar="DATE",
+        help="Start of time window, ISO-8601 (used with --create-recipe), e.g. 2026-01-01",
+    )
+    parser.add_argument(
+        "--end",
+        metavar="DATE",
+        help="End of time window, ISO-8601 (used with --create-recipe), e.g. 2026-01-02",
+    )
+    parser.add_argument(
+        "--recipe-name",
+        metavar="LABEL",
+        help="Custom name for the recipe (sets the 'name' field and output filename)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what will be downloaded without actually downloading",
@@ -92,7 +135,17 @@ Examples:
     if args.list_recipes:
         _list_recipes()
     elif args.create_recipe:
-        _create_recipe(args.create_recipe, limit=args.limit)
+        _create_recipe(
+            args.create_recipe,
+            limit=args.limit,
+            min_lon=args.min_lon,
+            max_lon=args.max_lon,
+            min_lat=args.min_lat,
+            max_lat=args.max_lat,
+            start=args.start,
+            end=args.end,
+            recipe_name=args.recipe_name,
+        )
     elif args.recipe:
         _execute_recipe(args.recipe, dry_run=args.dry_run, output_dir=args.output_dir)
     else:
@@ -117,10 +170,20 @@ def _list_recipes() -> None:
         print(f"  {f.name}")
 
 
-def _create_recipe(name: str, limit: int = None) -> None:
+def _create_recipe(
+    name: str,
+    limit: int = None,
+    min_lon: float = None,
+    max_lon: float = None,
+    min_lat: float = None,
+    max_lat: float = None,
+    start: str = None,
+    end: str = None,
+    recipe_name: str = None,
+) -> None:
     from .core.recipe import (
-        RecipeConfig, GeographicBounds, TemporalBounds,
-        SARDataSpec, ValidationDataSource, CollocationType, Recipe,
+        Recipe, RecipeConfig, GeographicBounds, TemporalBounds,
+        SARDataSpec, ValidationDataSource, CollocationType,
     )
 
     templates = {
@@ -189,11 +252,33 @@ def _create_recipe(name: str, limit: int = None) -> None:
         print(f"Unknown recipe type '{name}'. Choose from: {', '.join(templates)}")
         sys.exit(1)
 
-    recipe = Recipe(templates[name])
-    out_path = Path("recipes") / f"{name}_validation.yaml"
+    cfg = templates[name]
+
+    # Override geographic bounds if any bound flag was supplied
+    if any(v is not None for v in (min_lon, max_lon, min_lat, max_lat)):
+        cfg.geographic_bounds = GeographicBounds(
+            min_lon=min_lon if min_lon is not None else cfg.geographic_bounds.min_lon,
+            max_lon=max_lon if max_lon is not None else cfg.geographic_bounds.max_lon,
+            min_lat=min_lat if min_lat is not None else cfg.geographic_bounds.min_lat,
+            max_lat=max_lat if max_lat is not None else cfg.geographic_bounds.max_lat,
+        )
+
+    # Override temporal bounds if either date flag was supplied
+    if start is not None or end is not None:
+        cfg.temporal_bounds = TemporalBounds(
+            start=start if start is not None else cfg.temporal_bounds.start,
+            end=end   if end   is not None else cfg.temporal_bounds.end,
+        )
+
+    if recipe_name:
+        cfg.name = recipe_name
+
+    recipe = Recipe(cfg)
+    slug = recipe_name.lower().replace(" ", "_") if recipe_name else f"{name}_validation"
+    out_path = Path("recipes") / f"{slug}.yaml"
     recipe.to_yaml(out_path)
     print(f"Recipe created: {out_path}")
-    print("Edit the file to set your region, time window, and data sources.")
+    print("Edit the file to adjust data sources and collocation settings.")
 
 
 def _execute_recipe(
@@ -220,7 +305,10 @@ def _execute_recipe(
     orchestrator = DataOrchestrator(recipe, dry_run=dry_run)
     success = orchestrator.download_all()
 
-    if success:
+    if dry_run:
+        print("\nDry run complete — no data was downloaded.")
+        print(f"Would write to: {orchestrator.base_dir}")
+    elif success:
         print("\nAll downloads completed.")
         print(f"Data directory: {orchestrator.base_dir}")
     else:

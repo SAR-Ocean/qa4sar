@@ -18,6 +18,9 @@ env/
 # Downloaded data (can be large)
 data/
 
+# Created recipes
+*.yaml
+
 # Jupyter notebooks checkpoints
 .ipynb_checkpoints/
 
