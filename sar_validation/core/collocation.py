@@ -341,6 +341,33 @@ class PointLayerCollocation:
                                 except (ValueError, TypeError):
                                     # Skip non-numeric columns
                                     pass
+
+                        # =========== RVL Projection ===========
+                        # If SAR has rvlRadVel and validation has EWCT/NSCT, project validation
+                        # currents to radial velocity for comparison
+                        if (
+                            "rvlRadVel" in sar_point
+                            and "rvlHeading" in sar_data
+                            and "EWCT" in val_point
+                            and "NSCT" in val_point
+                        ):
+                            try:
+                                # Get rvlHeading value at this point
+                                heading_deg = sar_data["rvlHeading"][t_idx, y_idx, x_idx]
+                                if not np.isnan(heading_deg):
+                                    # Convert heading to radians
+                                    heading_rad = np.radians(float(heading_deg) - 90.0)
+                                    
+                                    # Project EWCT (eastward) and NSCT (northward) onto LOS
+                                    ewct = float(val_point["EWCT"])
+                                    nsct = float(val_point["NSCT"])
+                                    radial_vel = ewct * np.cos(heading_rad) + nsct * np.sin(heading_rad)
+                                    
+                                    # Store projected radial velocity
+                                    val_point["rvlRadVel_projection"] = radial_vel
+                            except (KeyError, ValueError, TypeError) as e:
+                                logger.debug("RVL projection failed: %s", e)
+
                         collocations.append(
                             CollocatedPoint(
                                 sar_lon=s_lon,
@@ -395,6 +422,53 @@ class PointLayerCollocation:
 # ---------------------------------------------------------------------------
 # High-level pipeline helper (step 3)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Helper to load RVL data on-demand for currents validation
+# ---------------------------------------------------------------------------
+
+def _load_rvl_for_collocation(
+    sar_datasets: Dict[str, Any],
+    base_dir: Path,
+) -> None:
+    """
+    Load RVL (Radial Velocity Linesight) data from WV mode SAFE files and
+    add to SAR datasets for currents validation.
+
+    Creates separate dataset entries for RVL data (named `{scene}_rvl`)
+    so it can be processed independently.
+
+    Modifies sar_datasets in-place to add RVL datasets where available.
+
+    Parameters
+    ----------
+    sar_datasets : dict
+        Mapping of SAR scene names to Datasets (will be modified)
+    base_dir : Path
+        Base directory containing S1_L2_OCN/ subdirectory
+    """
+    from .datatree_converter import DataTreeConverter
+
+    sar_dir = base_dir / "S1_L2_OCN"
+    if not sar_dir.exists():
+        return
+
+    # Scan for WV mode SAFE directories and extract RVL
+    for safe_dir in sorted(d for d in sar_dir.iterdir()
+                          if d.is_dir() and d.suffix == ".SAFE"):
+        safe_name = safe_dir.name.upper()
+        if "WV" not in safe_name:
+            continue
+
+        try:
+            rvl_ds = DataTreeConverter._extract_rvl_from_wv_safe(safe_dir)
+            if rvl_ds is not None:
+                # Add as a separate dataset entry with _rvl suffix
+                sar_datasets[f"{safe_dir.name}_rvl"] = rvl_ds
+                logger.info("Loaded RVL data for SAR scene %s", safe_dir.name)
+        except Exception as e:
+            logger.debug("Could not load RVL for %s: %s", safe_dir.name, e)
+
 
 def run_collocation(
     recipe,
@@ -467,6 +541,9 @@ def run_collocation(
         logger.warning("No SAR nodes found in DataTree — nothing to collocate.")
         return None
 
+    # Load RVL data on-demand for currents validation
+    _load_rvl_for_collocation(sar_scenes, base_dir)
+
     # Collect validation nodes (flatten up to two levels deep) and bucket
     # each by its auto-detected collocation type.
     buckets: Dict[str, Dict[str, Any]] = {t: {} for t in _COLLOC_CLASSES}
@@ -507,49 +584,113 @@ def run_collocation(
             logger.warning("SAR node '%s' missing time coordinate — skipping.", sar_name)
             continue
 
-        sar_lon = sar_ds["lon"].values           # (y, x)
-        sar_lat = sar_ds["lat"].values           # (y, x)
-        acq_time = pd.Timestamp(sar_ds["time"].values).to_pydatetime()
-        sar_time_arr = np.array([acq_time])
+        # Detect SAR data type: grid (y, x) or point-based (WV mode)
+        is_wv_mode = "point" in sar_ds.dims and "y" not in sar_ds.dims
 
-        # Expand each variable to (1, y, x) for collocate()
-        sar_data_3d: Dict[str, np.ndarray] = {
-            var: sar_ds[var].values[np.newaxis, :, :]
-            for var in sar_ds.data_vars
-            if sar_ds[var].dims == ("y", "x")
-        }
+        if is_wv_mode:
+            # =========== WV MODE (Point-based) ===========
+            # Extract point measurements and iterate over each point
+            sar_lons = sar_ds["lon"].values   # (point,)
+            sar_lats = sar_ds["lat"].values   # (point,)
+            sar_times = sar_ds["time"].values # (point,) as datetime64
 
-        if not sar_data_3d:
-            logger.warning("SAR node '%s' has no (y, x) variables — skipping.", sar_name)
-            continue
+            # Get all point variables
+            sar_point_vars = {
+                var: sar_ds[var].values  # (point,)
+                for var in sar_ds.data_vars
+                if sar_ds[var].dims == ("point",)
+            }
 
-        # Run the three passes in order
-        for ctype, sources in buckets.items():
-            if not sources:
+            if not sar_point_vars:
+                logger.warning("SAR node '%s' (WV mode) has no point variables — skipping.", sar_name)
                 continue
-            colloc = _COLLOC_CLASSES[ctype](
-                spatial_tolerance_km=coll_cfg.spatial_tolerance_km,
-                time_tolerance_minutes=coll_cfg.time_tolerance_minutes,
-                interpolation_method=coll_cfg.interpolation_method,
-            )
-            for val_name, val_ds in sources.items():
-                df = val_ds.to_dataframe().reset_index(drop=True)
-                source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
 
-                matches = colloc.collocate(
-                    sar_data=sar_data_3d,
-                    sar_lon=sar_lon,
-                    sar_lat=sar_lat,
-                    sar_time=sar_time_arr,
-                    val_data=df,
-                    val_source=source_label,
-                    sar_scene_name=sar_name,
+            # For each SAR point, convert to 1×1 grid format and collocate
+            n_points = len(sar_lons)
+            logger.info("SAR node '%s' is WV mode with %d point measurements", sar_name, n_points)
+
+            for point_idx in range(n_points):
+                # Extract single point and reshape to 1×1 grid
+                lon_1x1 = np.array([[sar_lons[point_idx]]])
+                lat_1x1 = np.array([[sar_lats[point_idx]]])
+                acq_time = pd.Timestamp(sar_times[point_idx]).to_pydatetime()
+                sar_time_arr = np.array([acq_time])
+
+                # Create 1×1 grid for each variable
+                sar_data_3d: Dict[str, np.ndarray] = {
+                    var: np.array([[[sar_point_vars[var][point_idx]]]])
+                    for var in sar_point_vars
+                }
+
+                # Run the three passes in order
+                for ctype, sources in buckets.items():
+                    if not sources:
+                        continue
+                    colloc = _COLLOC_CLASSES[ctype](
+                        spatial_tolerance_km=coll_cfg.spatial_tolerance_km,
+                        time_tolerance_minutes=coll_cfg.time_tolerance_minutes,
+                        interpolation_method=coll_cfg.interpolation_method,
+                    )
+                    for val_name, val_ds in sources.items():
+                        df = val_ds.to_dataframe().reset_index(drop=True)
+                        source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
+
+                        matches = colloc.collocate(
+                            sar_data=sar_data_3d,
+                            sar_lon=lon_1x1,
+                            sar_lat=lat_1x1,
+                            sar_time=sar_time_arr,
+                            val_data=df,
+                            val_source=source_label,
+                            sar_scene_name=sar_name,
+                        )
+                        all_collocations.extend(matches)
+
+        else:
+            # =========== IW/EW MODE (Grid-based) ===========
+            sar_lon = sar_ds["lon"].values           # (y, x)
+            sar_lat = sar_ds["lat"].values           # (y, x)
+            acq_time = pd.Timestamp(sar_ds["time"].values).to_pydatetime()
+            sar_time_arr = np.array([acq_time])
+
+            # Expand each variable to (1, y, x) for collocate()
+            sar_data_3d: Dict[str, np.ndarray] = {
+                var: sar_ds[var].values[np.newaxis, :, :]
+                for var in sar_ds.data_vars
+                if sar_ds[var].dims == ("y", "x")
+            }
+
+            if not sar_data_3d:
+                logger.warning("SAR node '%s' has no (y, x) variables — skipping.", sar_name)
+                continue
+
+            # Run the three passes in order
+            for ctype, sources in buckets.items():
+                if not sources:
+                    continue
+                colloc = _COLLOC_CLASSES[ctype](
+                    spatial_tolerance_km=coll_cfg.spatial_tolerance_km,
+                    time_tolerance_minutes=coll_cfg.time_tolerance_minutes,
+                    interpolation_method=coll_cfg.interpolation_method,
                 )
-                all_collocations.extend(matches)
-                logger.info(
-                    "SAR '%s' × validation '%s' [%s]: %d match(es)",
-                    sar_name, val_name, ctype, len(matches),
-                )
+                for val_name, val_ds in sources.items():
+                    df = val_ds.to_dataframe().reset_index(drop=True)
+                    source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
+
+                    matches = colloc.collocate(
+                        sar_data=sar_data_3d,
+                        sar_lon=sar_lon,
+                        sar_lat=sar_lat,
+                        sar_time=sar_time_arr,
+                        val_data=df,
+                        val_source=source_label,
+                        sar_scene_name=sar_name,
+                    )
+                    all_collocations.extend(matches)
+                    logger.info(
+                        "SAR '%s' × validation '%s' [%s]: %d match(es)",
+                        sar_name, val_name, ctype, len(matches),
+                    )
 
     if not all_collocations:
         logger.warning("Collocation complete — no matches found.")

@@ -521,13 +521,13 @@ class DataTreeConverter:
         safe_dir: Union[str, Path],
     ) -> Optional[xr.Dataset]:
         """
-        Open the OWI (Ocean Wind field Inversion) data from one Sentinel-1
-        SAFE directory and return a standardised Dataset.
+        Open SAR L2 OCN data from one Sentinel-1 SAFE directory and return a
+        standardised Dataset.
 
-        The merged OCN file (``*-ocn-*``, not OSW subswath files) is used.
-        Longitude and latitude are promoted to named coordinates ``lon`` and
-        ``lat``; acquisition time is read from the ``firstMeasurementTime``
-        global attribute (falling back to the filename timestamp).
+        Automatically detects mode by inspecting the SAFE directory name:
+        - If directory name contains "WV": reads WV mode oswHs point measurements
+        - Otherwise: attempts to extract RVL data (keeping 2D grid structure);
+          returns None if RVL not available
 
         Parameters
         ----------
@@ -537,7 +537,43 @@ class DataTreeConverter:
         Returns
         -------
         xr.Dataset or None
-            None if no suitable measurement file is found or opening fails.
+            Dataset with oswHs points (WV) or RVL grids (IW/EW/SM), or None if
+            no suitable data found.
+        """
+        safe_dir = Path(safe_dir)
+        safe_name = safe_dir.name.upper()
+
+        # Detect mode from SAFE directory name
+        if "WV" in safe_name:
+            return DataTreeConverter.from_sar_l2_ocn_wv_safe(safe_dir)
+        else:
+            return DataTreeConverter._from_sar_l2_ocn_iw_safe(safe_dir)
+
+    @staticmethod
+    def from_sar_l2_ocn_wv_safe(
+        safe_dir: Union[str, Path],
+    ) -> Optional[xr.Dataset]:
+        """
+        Open Wave Mode (WV) data from one Sentinel-1 SAFE directory and extract
+        oswHs (Ocean Surface Wave Height) point measurements.
+
+        The WV mode produces multiple measurement files (~16 per SAFE product),
+        each containing a 1×1 oswHs point measurement. This method extracts
+        oswHs from all .nc files in the measurement folder and creates a
+        point-geometry Dataset with dimension ``point``.
+
+        Each point's time is extracted from the filename timestamp; coordinates
+        are oswLat/oswLon (promoting them to named dimensions).
+
+        Parameters
+        ----------
+        safe_dir : str or Path
+            Path to a WV mode ``*.SAFE`` directory.
+
+        Returns
+        -------
+        xr.Dataset or None
+            None if no measurement files are found or opening fails.
         """
         safe_dir = Path(safe_dir)
         measurement_dir = safe_dir / "measurement"
@@ -545,55 +581,417 @@ class DataTreeConverter:
             logger.warning("No measurement/ directory in %s", safe_dir)
             return None
 
-        # Pick the merged OCI file (contains "-ocn-"; OSW subswaths have "-osw-")
-        ocn_files = sorted(f for f in measurement_dir.glob("*.nc") if "-ocn-" in f.name)
-        if not ocn_files:
-            logger.warning("No OCN measurement file found in %s", measurement_dir)
+        # List all WV measurement files (pattern: s1a-wv*-ocn-*.nc or s1b-wv*-ocn-*.nc)
+        wv_files = sorted(
+            f for f in measurement_dir.glob("*.nc")
+            if ("-wv" in f.name.lower() or "-wv" in safe_dir.name.lower())
+            and "-ocn-" in f.name
+        )
+        if not wv_files:
+            logger.warning("No WV measurement files found in %s", measurement_dir)
             return None
 
-        nc_path = ocn_files[0]
-        try:
-            ds_raw = xr.open_dataset(nc_path)
-        except Exception as exc:
-            logger.warning("Could not open %s: %s", nc_path, exc)
+        # Extract oswHs point measurements from all files
+        point_lons = []
+        point_lats = []
+        point_hs = []
+        point_times = []
+        file_names = []
+
+        for nc_path in wv_files:
+            try:
+                ds_raw = xr.open_dataset(nc_path)
+            except Exception as exc:
+                logger.warning("Could not open %s: %s", nc_path, exc)
+                continue
+
+            try:
+                # Extract coordinates as scalars (1×1 grid)
+                lon = float(ds_raw["oswLon"].values.item())
+                lat = float(ds_raw["oswLat"].values.item())
+
+                # Extract oswHs from first partition
+                hs_val = ds_raw["oswHs"].isel(oswPartitions=0).values.item()
+                hs = float(hs_val) if np.isfinite(hs_val) else np.nan
+
+                # Acquisition time from filename (format: YYYYMMDDtHHMMSS)
+                m = re.search(r"(\d{8}t\d{6})", nc_path.stem, re.IGNORECASE)
+                if m:
+                    acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S")
+                else:
+                    # Fallback to global attribute
+                    time_str = ds_raw.attrs.get("firstMeasurementTime")
+                    acq_time = pd.to_datetime(time_str) if time_str else None
+
+                if acq_time is not None:
+                    point_lons.append(lon)
+                    point_lats.append(lat)
+                    point_hs.append(hs)
+                    point_times.append(np.datetime64(
+                        acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
+                    ))
+                    file_names.append(nc_path.name)
+
+            except Exception as exc:
+                logger.debug("Could not extract oswHs from %s: %s", nc_path.name, exc)
+            finally:
+                ds_raw.close()
+
+        if not point_hs:
+            logger.warning("No valid oswHs data extracted from %s", measurement_dir)
             return None
 
-        # Acquisition time
-        time_str = ds_raw.attrs.get("firstMeasurementTime")
-        if time_str:
-            acq_time = pd.to_datetime(time_str)
-        else:
-            m = re.search(r"(\d{8}t\d{6})", nc_path.stem, re.IGNORECASE)
-            acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S") if m else None
-
-        # Collect all OWI variables on the (owiAzSize, owiRaSize) grid
-        owi_dims = ("owiAzSize", "owiRaSize")
+        # Create Dataset with point dimension
         data_vars = {
-            k: (["y", "x"], ds_raw[k].values)
-            for k in ds_raw.data_vars
-            if ds_raw[k].dims == owi_dims and k not in ("owiLon", "owiLat")
+            "oswHs": (["point"], point_hs),
         }
 
-        if not data_vars:
-            logger.warning("No OWI grid variables found in %s", nc_path.name)
-            return None
-
-        coords: Dict = {
-            "lon":  (["y", "x"], ds_raw["owiLon"].values),
-            "lat":  (["y", "x"], ds_raw["owiLat"].values),
+        coords = {
+            "lon": (["point"], point_lons),
+            "lat": (["point"], point_lats),
+            "time": (["point"], point_times),
+            "filename": (["point"], file_names),
         }
-        if acq_time is not None:
-            coords["time"] = np.datetime64(acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns")
 
         ds = xr.Dataset(data_vars, coords=coords)
         ds.attrs["data_type"] = "sar_l2_ocn"
         ds.attrs["source"] = "Sentinel-1"
         ds.attrs["safe_dir"] = safe_dir.name
-        if time_str:
-            ds.attrs["firstMeasurementTime"] = time_str
+        ds.attrs["swath_mode"] = "WV"
+        ds.attrs["measurement_type"] = "oswHs"
+        ds.attrs["num_points"] = len(point_hs)
 
-        ds_raw.close()
+        logger.info(
+            "Extracted %d oswHs points from WV product %s",
+            len(point_hs), safe_dir.name
+        )
         return ds
+
+    @staticmethod
+    def _extract_rvl_grid_data(
+        measurement_dir: Path,
+        safe_dir: Union[str, Path],
+        flatten_to_points: bool = False,
+    ) -> Optional[xr.Dataset]:
+        """
+        Extract RVL (Radial Velocity Linesight) data from measurement directory.
+
+        RVL is a 13×13 grid measurement in SAR products. By default, this function
+        keeps the grid structure (rvlLat × rvlLon dimensions). If flatten_to_points=True,
+        the grid is flattened to points (169 points per file) for collocation.
+
+        Parameters
+        ----------
+        measurement_dir : Path
+            Path to the measurement/ directory within a SAFE archive.
+        safe_dir : str or Path
+            Path to the SAFE directory (used for logging and attributes).
+        flatten_to_points : bool, optional
+            If True, flatten 13×13 grids to 169 points with point dimension (default: False).
+            If False, keep 2D grid structure with (rvlLat, rvlLon) dimensions.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with RVL variables and coordinates, or None if no RVL data found.
+        """
+        safe_dir = Path(safe_dir)
+
+        # Discover measurement files containing RVL data
+        # Pattern: files with "-ocn-" and optionally "-wv" (works for all modes)
+        rvl_files = sorted(
+            f for f in measurement_dir.glob("*.nc")
+            if "-ocn-" in f.name
+        )
+        if not rvl_files:
+            return None
+
+        if not flatten_to_points:
+            # Extract RVL data in 2D grid form (for IW/EW/SM modes)
+            try:
+                ds_raw = xr.open_dataset(rvl_files[0])
+            except Exception as exc:
+                logger.debug("Could not open %s: %s", rvl_files[0], exc)
+                return None
+
+            try:
+                # Check if RVL data exists
+                if "rvlRadVel" not in ds_raw:
+                    ds_raw.close()
+                    return None
+
+                # Extract RVL grid arrays (keep as 2D)
+                rvl_radvel_full = ds_raw["rvlRadVel"].values  # May be (rvlLat, rvlLon) or (rvlLat, rvlLon, swath)
+                rvl_lats_full = ds_raw["rvlLat"].values
+                rvl_lons_full = ds_raw["rvlLon"].values
+
+                # If 3D data (with swaths), use first swath only for collocation compatibility
+                if rvl_radvel_full.ndim == 3:
+                    rvl_radvel = rvl_radvel_full[:, :, 0]
+                    rvl_lats = rvl_lats_full[:, :, 0]
+                    rvl_lons = rvl_lons_full[:, :, 0]
+                else:
+                    rvl_radvel = rvl_radvel_full
+                    rvl_lats = rvl_lats_full
+                    rvl_lons = rvl_lons_full
+
+                rvl_heading_full = (
+                    ds_raw["rvlHeading"].values
+                    if "rvlHeading" in ds_raw
+                    else None
+                )
+                if rvl_heading_full is not None:
+                    rvl_heading = (
+                        rvl_heading_full[:, :, 0] if rvl_heading_full.ndim == 3
+                        else rvl_heading_full
+                    )
+                else:
+                    rvl_heading = np.full_like(rvl_radvel, np.nan)
+
+                rvl_incidence_full = (
+                    ds_raw["rvlIncidenceAngle"].values
+                    if "rvlIncidenceAngle" in ds_raw
+                    else None
+                )
+                if rvl_incidence_full is not None:
+                    rvl_incidence = (
+                        rvl_incidence_full[:, :, 0] if rvl_incidence_full.ndim == 3
+                        else rvl_incidence_full
+                    )
+                else:
+                    rvl_incidence = np.full_like(rvl_radvel, np.nan)
+
+                # Get acquisition time (scalar for grid)
+                time_str = ds_raw.attrs.get("firstMeasurementTime")
+                if time_str:
+                    acq_time = pd.to_datetime(time_str)
+                    acq_time_ns = np.datetime64(
+                        acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
+                    )
+                else:
+                    m = re.search(r"(\d{8}t\d{6})", rvl_files[0].stem, re.IGNORECASE)
+                    if m:
+                        acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S")
+                        acq_time_ns = np.datetime64(
+                            acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
+                        )
+                    else:
+                        acq_time_ns = np.datetime64("NaT", "ns")
+
+                # Infer dimension names from rvlLat shape
+                dims = ds_raw["rvlLat"].dims if hasattr(ds_raw["rvlLat"], "dims") else ("rvlLat", "rvlLon")
+
+                # Create Dataset with 2D grid structure
+                data_vars = {
+                    "rvlRadVel": (dims, rvl_radvel),
+                    "rvlHeading": (dims, rvl_heading),
+                    "rvlIncidenceAngle": (dims, rvl_incidence),
+                }
+
+                coords = {
+                    "lon": (dims, rvl_lons),
+                    "lat": (dims, rvl_lats),
+                    "time": acq_time_ns,
+                }
+
+                ds = xr.Dataset(data_vars, coords=coords)
+                ds.attrs["data_type"] = "sar_l2_ocn"
+                ds.attrs["source"] = "Sentinel-1"
+                ds.attrs["safe_dir"] = safe_dir.name
+                ds.attrs["measurement_type"] = "rvl"
+                ds.attrs["grid_shape"] = rvl_radvel.shape
+
+                logger.info(
+                    "Extracted RVL grid %s from product %s",
+                    rvl_radvel.shape, safe_dir.name
+                )
+                return ds
+
+            except Exception as exc:
+                logger.debug("Could not extract RVL grid from %s: %s", rvl_files[0].name, exc)
+                return None
+            finally:
+                ds_raw.close()
+
+        else:
+            # Flatten RVL grids to points (for WV mode backward compat)
+            point_lons = []
+            point_lats = []
+            point_radvel = []
+            point_heading = []
+            point_incidence = []
+            point_times = []
+            file_names = []
+
+            for nc_path in rvl_files:
+                try:
+                    ds_raw = xr.open_dataset(nc_path)
+                except Exception as exc:
+                    logger.debug("Could not open %s: %s", nc_path, exc)
+                    continue
+
+                try:
+                    # Check if RVL data exists in this file
+                    if "rvlRadVel" not in ds_raw:
+                        continue
+
+                    # Extract RVL grid arrays and flatten to 1D
+                    rvl_radvel = ds_raw["rvlRadVel"].values.ravel()
+                    rvl_lats = ds_raw["rvlLat"].values.ravel()
+                    rvl_lons = ds_raw["rvlLon"].values.ravel()
+
+                    rvl_heading = (
+                        ds_raw["rvlHeading"].values.ravel()
+                        if "rvlHeading" in ds_raw
+                        else np.full_like(rvl_radvel, np.nan)
+                    )
+                    rvl_incidence = (
+                        ds_raw["rvlIncidenceAngle"].values.ravel()
+                        if "rvlIncidenceAngle" in ds_raw
+                        else np.full_like(rvl_radvel, np.nan)
+                    )
+
+                    # Get acquisition time
+                    m = re.search(r"(\d{8}t\d{6})", nc_path.stem, re.IGNORECASE)
+                    if m:
+                        acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S")
+                        acq_time_ns = np.datetime64(
+                            acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
+                        )
+                    else:
+                        acq_time_ns = np.datetime64("NaT", "ns")
+
+                    # Add all RVL points from this file
+                    n_points = len(rvl_lons)
+                    point_lons.extend(rvl_lons)
+                    point_lats.extend(rvl_lats)
+                    point_radvel.extend(rvl_radvel)
+                    point_heading.extend(rvl_heading)
+                    point_incidence.extend(rvl_incidence)
+                    point_times.extend([acq_time_ns] * n_points)
+                    file_names.extend([nc_path.name] * n_points)
+
+                except Exception as exc:
+                    logger.debug("Could not extract RVL from %s: %s", nc_path.name, exc)
+                finally:
+                    ds_raw.close()
+
+            if not point_radvel:
+                logger.debug("No RVL data found in %s", measurement_dir)
+                return None
+
+            # Create Dataset with point dimension (flattened RVL grids)
+            data_vars = {
+                "rvlRadVel": (["point"], point_radvel),
+                "rvlHeading": (["point"], point_heading),
+                "rvlIncidenceAngle": (["point"], point_incidence),
+            }
+
+            coords = {
+                "lon": (["point"], point_lons),
+                "lat": (["point"], point_lats),
+                "time": (["point"], point_times),
+                "filename": (["point"], file_names),
+            }
+
+            ds = xr.Dataset(data_vars, coords=coords)
+            ds.attrs["data_type"] = "sar_l2_ocn"
+            ds.attrs["source"] = "Sentinel-1"
+            ds.attrs["safe_dir"] = safe_dir.name
+            ds.attrs["measurement_type"] = "rvl"
+            ds.attrs["num_points"] = len(point_radvel)
+
+            logger.info(
+                "Extracted %d RVL points from product %s",
+                len(point_radvel), safe_dir.name
+            )
+            return ds
+
+    @staticmethod
+    def _extract_rvl_from_wv_safe(
+        safe_dir: Union[str, Path],
+    ) -> Optional[xr.Dataset]:
+        """
+        Extract RVL (Radial Velocity Linesight) data from WV mode SAFE directory.
+
+        RVL is a 13×13 grid measurement in WV mode products. This function flattens
+        the grid to points (169 points per file) with coordinates lon/lat and variables
+        rvlRadVel, rvlHeading, rvlIncidenceAngle, allowing it to be processed by the
+        point-based collocation algorithm.
+
+        Parameters
+        ----------
+        safe_dir : str or Path
+            Path to a WV mode ``*.SAFE`` directory.
+
+        Returns
+        -------
+        xr.Dataset or None
+            None if no RVL data is found or opening fails.
+        """
+        safe_dir = Path(safe_dir)
+        measurement_dir = safe_dir / "measurement"
+        if not measurement_dir.exists():
+            return None
+
+        # Use helper to extract RVL data, flattened to points for backward compatibility
+        ds = DataTreeConverter._extract_rvl_grid_data(
+            measurement_dir, safe_dir, flatten_to_points=True
+        )
+        
+        if ds is not None:
+            ds.attrs["swath_mode"] = "WV"
+        
+        return ds
+
+
+    @staticmethod
+    def _from_sar_l2_ocn_iw_safe(
+        safe_dir: Union[str, Path],
+    ) -> Optional[xr.Dataset]:
+        """
+        Extract RVL (Radial Velocity Linesight) or OWI data from one Sentinel-1 IW/EW/SM
+        mode SAFE directory and return a standardised Dataset.
+
+        For currents validation, this function prioritizes RVL data (Radial Velocity
+        Linesight), which is a 13×13 grid measurement available in some IW/EW/SM products.
+        RVL is returned as a 2D grid Dataset (rvlLat × rvlLon dimensions).
+
+        If RVL data is not available, returns None (no OWI fallback).
+
+        Parameters
+        ----------
+        safe_dir : str or Path
+            Path to an IW/EW/SM mode ``*.SAFE`` directory.
+
+        Returns
+        -------
+        xr.Dataset or None
+            RVL Dataset if RVL data is found; None otherwise.
+        """
+        safe_dir = Path(safe_dir)
+        measurement_dir = safe_dir / "measurement"
+        if not measurement_dir.exists():
+            logger.debug("No measurement/ directory in %s", safe_dir)
+            return None
+
+        # Attempt to extract RVL data (keeping 2D grid structure)
+        ds_rvl = DataTreeConverter._extract_rvl_grid_data(
+            measurement_dir, safe_dir, flatten_to_points=False
+        )
+
+        if ds_rvl is not None:
+            ds_rvl.attrs["swath_mode"] = "IW/EW/SM"
+            logger.info("Extracted RVL data from IW/EW/SM product %s", safe_dir.name)
+            return ds_rvl
+
+        # No RVL data found; return None (no OWI fallback)
+        logger.debug(
+            "No RVL data found in IW/EW/SM product %s (OWI fallback disabled)",
+            safe_dir.name,
+        )
+        return None
+
 
     @staticmethod
     def convert_downloaded_data(

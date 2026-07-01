@@ -14,7 +14,7 @@ from typing import List, Optional, Union
 import numpy as np
 import xarray as xr
 
-from ._variable_map import infer_variable_pairs
+from ._variable_map import infer_variable_pairs, filter_variable_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +207,7 @@ def run_statistics(
     variable = recipe.config.variable
 
     try:
-        pairs = infer_variable_pairs(variable)
+        pairs = filter_variable_pairs(recipe, collocation_ds)
     except KeyError as exc:
         logger.error("run_statistics: %s", exc)
         return {}
@@ -215,7 +215,23 @@ def run_statistics(
     results = {}
     for sar_var, val_var in pairs:
         logger.info("Computing statistics: %s vs %s …", sar_var, val_var)
-        stats_ds = compute_statistics(collocation_ds, sar_var, val_var)
+
+        # Choose grouping dimension: per-station (val_id) when multiple unique
+        # stations exist, otherwise fall back to per-source (val_source).
+        group_by = ["val_source"]
+        if "val_id" in collocation_ds.coords:
+            unique_ids = [
+                v for v in np.unique(collocation_ds["val_id"].values)
+                if str(v) not in ("unknown", "nan", "")
+            ]
+            if len(unique_ids) > 1:
+                group_by = ["val_id"]
+                logger.info(
+                    "Grouping statistics by val_id (%d unique stations)", len(unique_ids)
+                )
+
+        stats_ds = compute_statistics(collocation_ds, sar_var, val_var,
+                                      group_by=group_by)
         if stats_ds is None:
             continue
         key = f"{sar_var}_vs_{val_var}"

@@ -8,9 +8,10 @@ Four public plot functions:
 * :func:`plot_statistics`   — bar chart of bias / RMSE / correlation per source
 * :func:`plot_residuals`    — histogram / KDE of (SAR − validation) residuals
 
-Plus a convenience wrapper:
+Plus fallback and convenience wrappers:
 
-* :func:`validation_report` — runs all four, infers variable pairs from the recipe,
+* :func:`plot_sar_on_no_collocation` — SAR coverage map (fallback when collocation fails)
+* :func:`validation_report` — runs all four plots, infers variable pairs from the recipe,
   and saves PNG files to ``<out_dir>/plots/``
 
 All functions accept an ``interactive=False`` keyword argument.  When
@@ -36,6 +37,7 @@ __all__ = [
     "plot_geographic",
     "plot_statistics",
     "plot_residuals",
+    "plot_sar_on_no_collocation",
     "validation_report",
 ]
 
@@ -88,6 +90,31 @@ def _sar_field(scene_ds, sar_var: str) -> Optional[np.ndarray]:
     return None
 
 
+def _deduplicate_obs(df, sar_col: str, val_col: str):
+    """
+    Collapse many-SAR-pixel-per-observation rows to one row per observation.
+
+    ``collocate()`` matches **every** SAR pixel within the spatial tolerance to
+    each in-situ observation, so one buoy reading produces N rows — one per
+    matched pixel — all sharing the same validation-side values but with
+    different SAR positions/values.  This helper groups by the observation
+    identity (val_source + val_id + val_time + val_lat + val_lon, whichever
+    columns are present) and aggregates:
+
+    * SAR column → **mean** of matched-pixel values
+    * validation column → **first** (all rows are identical for the same obs)
+    """
+    id_cols = [c for c in ("val_source", "val_id", "val_time", "val_lat", "val_lon")
+               if c in df.columns]
+    if not id_cols:
+        return df
+    agg = {sar_col: "mean", val_col: "first"}
+    for c in df.columns:
+        if c not in agg and c not in id_cols:
+            agg[c] = "first"
+    return df.groupby(id_cols, dropna=False, sort=False).agg(agg).reset_index()
+
+
 # ---------------------------------------------------------------------------
 # 1. Scatter plot
 # ---------------------------------------------------------------------------
@@ -131,13 +158,19 @@ def plot_scatter(
         warnings.warn(f"No valid data for {sar_col} vs {val_col}.")
         return None
 
-    df = collocation_ds[[sar_col, val_col, "val_source"]].to_dataframe().dropna(
-        subset=[sar_col, val_col]
-    )
+    extra_cols = [c for c in ("val_id", "val_lat", "val_lon") if c in collocation_ds]
+    base_cols = [sar_col, val_col, "val_source"] + extra_cols
+    df_raw = collocation_ds[base_cols].to_dataframe()
+    if "val_time" in collocation_ds.coords:
+        df_raw["val_time"] = collocation_ds["val_time"].values
+    df_raw = df_raw.dropna(subset=[sar_col, val_col])
 
-    if df.empty:
+    if df_raw.empty:
         warnings.warn(f"No valid data for {sar_col} vs {val_col}.")
         return None
+
+    # Average many matched SAR pixels → one representative value per observation
+    df = _deduplicate_obs(df_raw, sar_col, val_col)
 
     if interactive:
         _require("plotly")
@@ -190,7 +223,11 @@ def plot_scatter(
 
     ax.set_xlabel(val_var)
     ax.set_ylabel(sar_var)
-    ax.set_title(f"{sar_var} vs {val_var}")
+    n_raw, n_obs = len(df_raw), len(df)
+    if n_raw != n_obs:
+        ax.set_title(f"{sar_var} vs {val_var}  (N={n_obs} obs, avg {n_raw // max(n_obs, 1)} px/obs)")
+    else:
+        ax.set_title(f"{sar_var} vs {val_var}  (N={n_obs})")
     ax.set_xlim(vmin, vmax)
     ax.set_ylim(vmin, vmax)
     ax.set_aspect("equal", "box")
@@ -210,15 +247,22 @@ def plot_geographic(
     datatree,
     collocation_ds,
     sar_var: str,
+    val_var: str = None,
     *,
     ncols: int = 2,
     cmap: str = "viridis",
+    val_cmap: str = "plasma",
+    point_size: int = 40,
+    split_by: str = "collocation_type",
     interactive: bool = False,
 ):
     """
     Geographic overview: SAR field as background + collocated points overlaid.
 
-    One subplot is produced per SAR scene in *datatree*.
+    One subplot per SAR scene.  Observations are **deduplicated** before
+    plotting: when ``collocate()`` has matched multiple SAR pixels to one
+    in-situ observation only one dot is shown, placed at the actual observation
+    position (``val_lat`` / ``val_lon``).
 
     Parameters
     ----------
@@ -227,27 +271,42 @@ def plot_geographic(
     collocation_ds : xr.Dataset
         Step-3 collocations (``collocation_results.nc``).
     sar_var : str
-        SAR variable name *without* ``sar_`` prefix (e.g. ``"owiWindSpeed"``).
+        SAR variable name (e.g. ``"owiWindSpeed"``).
+    val_var : str, optional
+        Validation variable name (e.g. ``"WSPD"``). Points are coloured by
+        their measured value with a dedicated colorbar when provided.
     ncols : int
         Number of subplot columns.
     cmap : str
-        Matplotlib colourmap for the SAR field.
+        Matplotlib colourmap for the SAR background field.
+    val_cmap : str
+        Matplotlib colourmap for the validation scatter points.
+    point_size : int
+        Scatter marker size in points² (matplotlib ``s`` argument).
+    split_by : str or None
+        Variable / coordinate to split collocations into separate figures.
+        Default ``"collocation_type"`` creates one figure for in-situ
+        (``point_vs_layer``) and one for scatterometer (``layer_vs_layer``).
+        Pass ``None`` for a single combined figure.
     interactive : bool
         Return a folium Map instead of matplotlib.
 
     Returns
     -------
-    matplotlib.figure.Figure or folium.Map
+    dict[str, matplotlib.figure.Figure] or folium.Map
+        When *split_by* is not None: a dict keyed by group value, one Figure
+        per group.  When *split_by* is None: a single Figure.
     """
     sar_node = datatree.get("sar")
     if sar_node is None:
         raise ValueError("DataTree has no '/sar' group.")
-
     scene_names = list(sar_node.children.keys())
     if not scene_names:
         raise ValueError("No SAR scenes found in DataTree.")
 
-    sar_col = f"sar_{sar_var}"
+    val_col = f"val_{val_var}" if val_var else None
+    val_col_present = val_col is not None and val_col in collocation_ds
+
     val_sources = (
         collocation_ds["val_source"].values.tolist()
         if "val_source" in collocation_ds
@@ -255,51 +314,60 @@ def plot_geographic(
     )
     source_cmap = _source_color_map(val_sources) if val_sources else {}
 
+    # ── Determine group values for splitting ────────────────────────────────
+    if split_by:
+        if split_by in collocation_ds:
+            group_values = sorted(set(str(v) for v in collocation_ds[split_by].values))
+        elif split_by in collocation_ds.coords:
+            group_values = sorted(set(str(v) for v in collocation_ds.coords[split_by].values))
+        else:
+            group_values = [None]
+    else:
+        group_values = [None]
+
     if interactive:
         _require("folium")
         import folium  # noqa: PLC0415
 
         m = folium.Map(tiles="CartoDB positron")
         bounds_list = []
-
         for scene_name in scene_names:
             scene_ds = sar_node[scene_name].to_dataset()
             if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
                 continue
-
             lon2d = scene_ds["lon"].values
             lat2d = scene_ds["lat"].values
             bounds_list.append([
                 [float(lat2d.min()), float(lon2d.min())],
                 [float(lat2d.max()), float(lon2d.max())],
             ])
-
-            group = folium.FeatureGroup(name=scene_name)
+            fg = folium.FeatureGroup(name=scene_name)
             sub_coll = _filter_by_scene(collocation_ds, scene_name)
-
             if "collocation" in sub_coll.dims and sub_coll.sizes["collocation"] > 0:
-                df_pts = sub_coll[["sar_lon", "sar_lat", "val_source"]].to_dataframe()
+                cols_needed = ["val_lat", "val_lon", "val_source"]
+                if val_col_present:
+                    cols_needed.append(val_col)
+                df_pts = sub_coll[cols_needed].to_dataframe()
                 for _, row in df_pts.iterrows():
                     color = source_cmap.get(str(row.get("val_source", "")), "#1f77b4")
+                    tooltip = (
+                        f"{val_var}: {row[val_col]:.2f}" if val_col_present
+                        else str(row.get("val_source", ""))
+                    )
                     folium.CircleMarker(
-                        location=[float(row["sar_lat"]), float(row["sar_lon"])],
-                        radius=4,
-                        color=color,
-                        fill=True,
-                        fill_opacity=0.8,
-                        tooltip=str(row.get("val_source", "")),
-                    ).add_to(group)
-            group.add_to(m)
-
+                        location=[float(row["val_lat"]), float(row["val_lon"])],
+                        radius=4, color=color, fill=True, fill_opacity=0.8,
+                        tooltip=tooltip,
+                    ).add_to(fg)
+            fg.add_to(m)
         if bounds_list:
             all_lats = [b[0][0] for b in bounds_list] + [b[1][0] for b in bounds_list]
             all_lons = [b[0][1] for b in bounds_list] + [b[1][1] for b in bounds_list]
             m.fit_bounds([[min(all_lats), min(all_lons)], [max(all_lats), max(all_lons)]])
-
         folium.LayerControl().add_to(m)
         return m
 
-    # --- Static matplotlib + cartopy ---
+    # ── Static matplotlib + cartopy ─────────────────────────────────────────
     try:
         import cartopy.crs as ccrs  # noqa: PLC0415
         import cartopy.feature as cfeature  # noqa: PLC0415
@@ -314,89 +382,188 @@ def plot_geographic(
     import matplotlib.pyplot as plt  # noqa: PLC0415
     import matplotlib.colors as mcolors  # noqa: PLC0415
     import matplotlib.cm as mcm  # noqa: PLC0415
-    from mpl_toolkits.axes_grid1 import make_axes_locatable  # noqa: PLC0415
+    import matplotlib.lines as mlines  # noqa: PLC0415
 
-    nrows = math.ceil(len(scene_names) / ncols)
-    subplot_kw = {"projection": ccrs.PlateCarree()} if HAS_CARTOPY else {}
-    fig, axes = plt.subplots(
-        nrows, ncols,
-        figsize=(7 * ncols, 5 * nrows),
-        subplot_kw=subplot_kw,
-        squeeze=False,
-    )
-
-    # Collect global vmin/vmax across all scenes for a shared colourbar
+    # Global SAR colour limits (same across all figures/groups)
     all_field_vals = []
     for scene_name in scene_names:
-        scene_ds = sar_node[scene_name].to_dataset()
-        arr = _sar_field(scene_ds, sar_var)
+        arr = _sar_field(sar_node[scene_name].to_dataset(), sar_var)
         if arr is not None:
             all_field_vals.append(arr[np.isfinite(arr)])
-
     if all_field_vals:
-        all_vals_flat = np.concatenate(all_field_vals)
-        vmin = float(np.nanpercentile(all_vals_flat, 2))
-        vmax = float(np.nanpercentile(all_vals_flat, 98))
+        flat = np.concatenate(all_field_vals)
+        vmin = float(np.nanpercentile(flat, 2))
+        vmax = float(np.nanpercentile(flat, 98))
     else:
         vmin, vmax = 0.0, 1.0
+    sar_norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    sar_sm = mcm.ScalarMappable(cmap=cmap, norm=sar_norm)
+    sar_sm.set_array([])
 
-    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-    sm = mcm.ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
+    # Global validation colour limits (from all collocations, all groups)
+    val_norm = val_sm = None
+    if val_col_present:
+        finite_v = collocation_ds[val_col].values
+        finite_v = finite_v[np.isfinite(finite_v)]
+        if len(finite_v) > 0:
+            val_norm = mcolors.Normalize(
+                vmin=float(np.nanpercentile(finite_v, 2)),
+                vmax=float(np.nanpercentile(finite_v, 98)),
+            )
+            val_sm = mcm.ScalarMappable(cmap=val_cmap, norm=val_norm)
+            val_sm.set_array([])
 
-    for idx, scene_name in enumerate(scene_names):
-        row, col = divmod(idx, ncols)
-        ax = axes[row][col]
+    right_margin = 0.80 if val_sm is not None else 0.88
+    subplot_kw = {"projection": ccrs.PlateCarree()} if HAS_CARTOPY else {}
 
-        scene_ds = sar_node[scene_name].to_dataset()
-        if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
-            ax.set_visible(False)
-            continue
+    def _build_figure(group_coll_ds, group_label):
+        """Build one Figure for a sub-set of collocations."""
+        nrows = math.ceil(len(scene_names) / ncols)
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(7 * ncols, 5 * nrows),
+            subplot_kw=subplot_kw,
+            squeeze=False,
+        )
 
-        lon2d = scene_ds["lon"].values
-        lat2d = scene_ds["lat"].values
-        arr   = _sar_field(scene_ds, sar_var)
+        for idx, scene_name in enumerate(scene_names):
+            r, c = divmod(idx, ncols)
+            ax = axes[r][c]
+            scene_ds = sar_node[scene_name].to_dataset()
 
-        if HAS_CARTOPY:
-            ax.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0)
-            ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=1)
-            ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
-            transform = ccrs.PlateCarree()
+            if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
+                ax.set_visible(False)
+                continue
+
+            if HAS_CARTOPY:
+                ax.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0)
+                ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=1)
+                gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
+                gl.top_labels = False
+                gl.right_labels = False
+                transform = ccrs.PlateCarree()
+            else:
+                transform = None
+
+            arr = _sar_field(scene_ds, sar_var)
+            if arr is not None:
+                kw = {"transform": transform} if transform else {}
+                # Check if data is gridded (2D) or point-based (1D)
+                if arr.ndim == 1:
+                    # Point data (e.g., WV mode) — use scatter
+                    ax.scatter(
+                        scene_ds["lon"].values, scene_ds["lat"].values, c=arr,
+                        cmap=cmap, norm=sar_norm, s=20, edgecolors="none",
+                        zorder=3, **kw,
+                    )
+                else:
+                    # Gridded data (e.g., IW/EW mode) — use pcolormesh
+                    ax.pcolormesh(
+                        scene_ds["lon"].values, scene_ds["lat"].values, arr,
+                        cmap=cmap, norm=sar_norm, shading="auto", zorder=2, **kw,
+                    )
+
+            sub_coll = _filter_by_scene(group_coll_ds, scene_name)
+            n_pts = sub_coll.sizes.get("collocation", 0)
+
+            if n_pts > 0 and "val_lat" in sub_coll and "val_lon" in sub_coll:
+                kw_sc = {"transform": transform, "zorder": 5} if transform else {"zorder": 5}
+
+                # Build a dataframe with observation position + val value
+                col_list = ["val_lat", "val_lon"]
+                if val_col_present:
+                    col_list.append(val_col)
+                if "val_source" in sub_coll:
+                    col_list.append("val_source")
+                df_pts = sub_coll[col_list].to_dataframe()
+                if "val_time" in sub_coll.coords:
+                    df_pts["val_time"] = sub_coll.coords["val_time"].values
+                if "val_id" in sub_coll.coords:
+                    df_pts["val_id"] = sub_coll.coords["val_id"].values
+
+                # Deduplicate: one dot per observation at its actual position
+                if val_col_present and val_norm is not None:
+                    # Use a proxy SAR column so _deduplicate_obs works
+                    _proxy = "__sar_proxy__"
+                    df_pts[_proxy] = np.nan
+                    df_pts = _deduplicate_obs(df_pts, _proxy, val_col)
+                    df_pts = df_pts.drop(columns=[_proxy], errors="ignore")
+                else:
+                    id_cols = [c for c in ("val_source", "val_id", "val_time",
+                                           "val_lat", "val_lon") if c in df_pts.columns]
+                    if id_cols:
+                        df_pts = df_pts.drop_duplicates(subset=id_cols)
+
+                if val_col_present and val_norm is not None:
+                    ax.scatter(
+                        df_pts["val_lon"], df_pts["val_lat"],
+                        c=df_pts[val_col], cmap=val_cmap, norm=val_norm,
+                        s=point_size, edgecolors="black", linewidths=0.4,
+                        **kw_sc,
+                    )
+                    if "val_source" in df_pts.columns:
+                        present = set(df_pts["val_source"].astype(str))
+                        handles = [
+                            mlines.Line2D([], [], marker="o", linestyle="None",
+                                          markerfacecolor=clr, markeredgecolor="black",
+                                          markersize=5, label=s)
+                            for s, clr in source_cmap.items() if s in present
+                        ]
+                        if handles:
+                            ax.legend(handles=handles, fontsize=6,
+                                      loc="lower left", framealpha=0.7)
+                elif "val_source" in df_pts.columns:
+                    for src, grp in df_pts.groupby("val_source"):
+                        color = source_cmap.get(str(src), "#ff0000")
+                        ax.scatter(grp["val_lon"], grp["val_lat"],
+                                   s=point_size, c=color,
+                                   edgecolors="black", linewidths=0.4,
+                                   label=str(src), **kw_sc)
+                    ax.legend(fontsize=6, loc="lower left", framealpha=0.7)
+                else:
+                    ax.scatter(df_pts["val_lon"], df_pts["val_lat"],
+                               s=point_size, c="#ff7f0e",
+                               edgecolors="black", linewidths=0.4, **kw_sc)
+
+            n_dedup = len(df_pts) if n_pts > 0 else 0
+            ax.set_title(
+                f"{scene_name.split('/')[-1]}  ({n_dedup} obs)", fontsize=8
+            )
+
+        # Hide unused axes
+        for idx in range(len(scene_names), nrows * ncols):
+            axes[idx // ncols][idx % ncols].set_visible(False)
+
+        fig.subplots_adjust(right=right_margin)
+        cbar_ax = fig.add_axes([right_margin + 0.01, 0.15, 0.015, 0.70])
+        fig.colorbar(sar_sm, cax=cbar_ax, label=f"SAR {sar_var}")
+        if val_sm is not None:
+            val_cbar_ax = fig.add_axes([right_margin + 0.055, 0.15, 0.015, 0.70])
+            fig.colorbar(val_sm, cax=val_cbar_ax, label=f"In-situ {val_var}")
+
+        title = f"SAR {sar_var}"
+        if val_var:
+            title += f" vs. {val_var}"
+        if group_label is not None:
+            title += f"  [{group_label}]"
+        fig.suptitle(title + " — collocated observations", fontsize=11, y=1.01)
+        return fig
+
+    # ── Build figures ────────────────────────────────────────────────────────
+    if group_values == [None]:
+        return _build_figure(collocation_ds, None)
+
+    figures: Dict[str, object] = {}
+    for gv in group_values:
+        if split_by in collocation_ds:
+            mask = collocation_ds[split_by] == gv
         else:
-            transform = None
-
-        if arr is not None:
-            kw = {"transform": transform} if transform else {}
-            ax.pcolormesh(lon2d, lat2d, arr, cmap=cmap, norm=norm,
-                          shading="auto", zorder=2, **kw)
-
-        # Overlay collocated points for this scene
-        sub_coll = _filter_by_scene(collocation_ds, scene_name)
-        if "collocation" in sub_coll.dims and sub_coll.sizes["collocation"] > 0:
-            df_pts = sub_coll[["sar_lon", "sar_lat", "val_source"]].to_dataframe()
-            for src, grp in df_pts.groupby("val_source"):
-                color = source_cmap.get(str(src), "#ff0000")
-                kw = {"transform": transform, "zorder": 5} if transform else {"zorder": 5}
-                ax.scatter(grp["sar_lon"], grp["sar_lat"],
-                           s=30, c=color, edgecolors="white", linewidths=0.5,
-                           label=str(src), **kw)
-            ax.legend(fontsize=6, loc="lower left", framealpha=0.7)
-
-        ax.set_title(scene_name, fontsize=8)
-
-    # Hide unused axes
-    for idx in range(len(scene_names), nrows * ncols):
-        row, col = divmod(idx, ncols)
-        axes[row][col].set_visible(False)
-
-    # Shared colourbar
-    fig.subplots_adjust(right=0.88)
-    cbar_ax = fig.add_axes([0.90, 0.15, 0.02, 0.70])
-    fig.colorbar(sm, cax=cbar_ax, label=sar_var)
-
-    fig.suptitle(f"SAR {sar_var} with collocated observations", fontsize=11, y=1.01)
-    fig.tight_layout(rect=[0, 0, 0.88, 1])
-    return fig
+            mask = collocation_ds.coords[split_by] == gv
+        group_ds = collocation_ds.isel(collocation=mask)
+        if group_ds.sizes.get("collocation", 0) == 0:
+            continue
+        figures[gv] = _build_figure(group_ds, gv)
+    return figures
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +734,261 @@ def plot_residuals(
 
 
 # ---------------------------------------------------------------------------
+# 4b. SAR data plot (fallback for no-collocation cases)
+# ---------------------------------------------------------------------------
+
+def plot_sar_on_no_collocation(
+    datatree,
+    sar_var: str,
+    recipe_name: str,
+    output_dir: Union[str, Path],
+) -> Union[Path, None]:
+    """
+    Plot SAR data geographic coverage when no collocations are found.
+
+    Creates a map-view figure showing the spatial distribution of SAR measurements
+    for a given variable. This is useful for debugging why collocations failed—
+    it reveals whether the SAR swath simply missed the validation data region
+    spatially or temporally.
+
+    When the requested SAR variable is not available in the dataset, this function
+    attempts to plot an alternative variable with a similar geophysical meaning
+    (e.g., ``owiWindSeaHs`` if ``owiSignificantWaveHeight`` is unavailable).
+
+    Parameters
+    ----------
+    datatree : xr.DataTree
+        Step-2 DataTree (``datatree.nc``).
+    sar_var : str
+        SAR variable name (e.g. ``"owiSignificantWaveHeight"``).
+    recipe_name : str
+        Name of the recipe (for filename/title), e.g., ``"waves_test"``.
+    output_dir : str or Path
+        Directory to save the PNG file.
+
+    Returns
+    -------
+    Path or None
+        Path to the saved PNG file, or None if no SAR data could be plotted.
+    """
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+    import matplotlib.colors as mcolors  # noqa: PLC0415
+    import matplotlib.cm as mcm  # noqa: PLC0415
+
+    output_dir = Path(output_dir)
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    sar_node = datatree.get("sar")
+    if sar_node is None:
+        logger.warning("plot_sar_on_no_collocation: DataTree has no '/sar' group.")
+        return None
+
+    scene_names = list(sar_node.children.keys())
+    if not scene_names:
+        logger.warning("plot_sar_on_no_collocation: No SAR scenes found in DataTree.")
+        return None
+
+    # ── Try to find the requested variable, or a suitable alternative ───
+    actual_var = _find_available_sar_variable(sar_node, sar_var)
+    if actual_var is None:
+        logger.warning(
+            "plot_sar_on_no_collocation: Variable '%s' not found and no "
+            "suitable alternative available.", sar_var
+        )
+        return None
+
+    if actual_var != sar_var:
+        logger.info(
+            "plot_sar_on_no_collocation: Requested variable '%s' not found; "
+            "plotting alternative '%s' instead.", sar_var, actual_var
+        )
+
+    # ── Determine colour limits from all SAR data ────────────────────────
+    all_field_vals = []
+    for scene_name in scene_names:
+        arr = _sar_field(sar_node[scene_name].to_dataset(), actual_var)
+        if arr is not None:
+            all_field_vals.append(arr[np.isfinite(arr)])
+
+    if not all_field_vals:
+        logger.warning(
+            "plot_sar_on_no_collocation: No valid (non-NaN) data found for '%s'.", actual_var
+        )
+        return None
+
+    flat = np.concatenate(all_field_vals)
+    vmin = float(np.nanpercentile(flat, 2))
+    vmax = float(np.nanpercentile(flat, 98))
+    sar_norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    sar_sm = mcm.ScalarMappable(cmap="viridis", norm=sar_norm)
+    sar_sm.set_array([])
+
+    # ── Set up cartopy if available ─────────────────────────────────────
+    try:
+        import cartopy.crs as ccrs  # noqa: PLC0415
+        import cartopy.feature as cfeature  # noqa: PLC0415
+        HAS_CARTOPY = True
+    except ImportError:
+        HAS_CARTOPY = False
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "cartopy not installed — using plain matplotlib axes."
+            )
+
+    subplot_kw = {"projection": ccrs.PlateCarree()} if HAS_CARTOPY else {}
+
+    # ── Create figure with one subplot per SAR scene ────────────────────
+    nrows = max(1, (len(scene_names) + 1) // 2)  # 2 cols by default
+    ncols = 2 if len(scene_names) > 1 else 1
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(10 * ncols, 8 * nrows),
+        subplot_kw=subplot_kw,
+        squeeze=False,
+    )
+    axes_flat = axes.flatten()
+
+    for idx, scene_name in enumerate(scene_names):
+        ax = axes_flat[idx]
+        scene_ds = sar_node[scene_name].to_dataset()
+
+        if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
+            ax.set_visible(False)
+            continue
+
+        # ── Add map features ────────────────────────────────────────────
+        if HAS_CARTOPY:
+            ax.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0)
+            ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=1)
+            gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
+            gl.top_labels = False
+            gl.right_labels = False
+            transform = ccrs.PlateCarree()
+        else:
+            transform = None
+
+        # ── Plot SAR data ───────────────────────────────────────────────
+        arr = _sar_field(scene_ds, actual_var)
+        if arr is not None:
+            kw = {"transform": transform} if transform else {}
+            
+            # Check if this is point-based data (WV mode) or grid data (IW/EW mode)
+            is_point_based = len(arr.shape) == 1 or (len(arr.shape) == 2 and arr.shape[0] == 1)
+            
+            if is_point_based:
+                # Point-based data (WV mode) — use scatter plot
+                lon_1d = scene_ds["lon"].values.flatten()
+                lat_1d = scene_ds["lat"].values.flatten()
+                arr_1d = arr.flatten()
+                
+                # Filter out NaN values
+                valid = np.isfinite(arr_1d)
+                lon_valid = lon_1d[valid]
+                lat_valid = lat_1d[valid]
+                arr_valid = arr_1d[valid]
+                
+                if len(arr_valid) > 0:
+                    scatter = ax.scatter(
+                        lon_valid, lat_valid, c=arr_valid,
+                        cmap="viridis", norm=sar_norm, s=50, zorder=2, **kw,
+                    )
+            else:
+                # Grid-based data (IW/EW mode) — use pcolormesh
+                im = ax.pcolormesh(
+                    scene_ds["lon"].values, scene_ds["lat"].values, arr,
+                    cmap="viridis", norm=sar_norm, shading="auto", zorder=2, **kw,
+                )
+
+        ax.set_title(f"{scene_name.split('/')[-1]} — {actual_var}", fontsize=10)
+
+    # Hide unused subplots
+    for idx in range(len(scene_names), len(axes_flat)):
+        axes_flat[idx].set_visible(False)
+
+    # ── Add colourbar and title ─────────────────────────────────────────
+    fig.subplots_adjust(right=0.88)
+    cbar_ax = fig.add_axes([0.90, 0.15, 0.02, 0.70])
+    fig.colorbar(sar_sm, cax=cbar_ax, label=actual_var)
+
+    fig.suptitle(
+        f"SAR {actual_var} — no collocations found (coverage overview)",
+        fontsize=12, y=0.98,
+    )
+
+    # ── Save to PNG ─────────────────────────────────────────────────────
+    filename = f"sar_no_collocation_{actual_var}_{recipe_name}.png"
+    filepath = plots_dir / filename
+    try:
+        fig.savefig(filepath, dpi=150, bbox_inches="tight")
+        logger.info("Saved fallback SAR coverage plot: %s", filepath)
+        plt.close(fig)
+        return filepath
+    except Exception as exc:
+        logger.error("Failed to save SAR coverage plot: %s", exc)
+        plt.close(fig)
+        return None
+
+
+def _find_available_sar_variable(sar_node, preferred_var: str) -> Optional[str]:
+    """
+    Find an available SAR variable, preferring *preferred_var* but falling
+    back to related alternatives if not found.
+
+    Parameters
+    ----------
+    sar_node : xr.DataTree
+        The '/sar' node of the datatree.
+    preferred_var : str
+        The preferred SAR variable name (e.g., "owiSignificantWaveHeight").
+
+    Returns
+    -------
+    str or None
+        The name of the first available SAR variable, or None if no suitable
+        variable is found in any scene.
+    """
+    if not sar_node.children:
+        return None
+
+    # Get variables from the first SAR scene
+    first_scene_name = next(iter(sar_node.children.keys()))
+    scene_ds = sar_node[first_scene_name].to_dataset()
+    available_vars = list(scene_ds.data_vars)
+
+    # 1. Try the preferred variable first
+    for var in available_vars:
+        if var == preferred_var:
+            return preferred_var
+
+    # 2. Try related variables based on the preferred variable's type
+    # e.g., if preferred is owiSignificantWaveHeight, try owiWindSeaHs, owiWaveHs, etc.
+    wave_related = [v for v in available_vars if "hs" in v.lower() or "wave" in v.lower()]
+    if "wave" in preferred_var.lower() or "hs" in preferred_var.lower():
+        if wave_related:
+            return wave_related[0]
+
+    wind_related = [v for v in available_vars if "wind" in v.lower()]
+    if "wind" in preferred_var.lower():
+        if wind_related:
+            return wind_related[0]
+
+    current_related = [v for v in available_vars if "current" in v.lower()]
+    if "current" in preferred_var.lower():
+        if current_related:
+            return current_related[0]
+
+    # 3. Fallback: use any non-quality/non-metadata variable
+    non_metadata = [v for v in available_vars
+                    if not any(x in v.lower() for x in
+                              ("quality", "mask", "heading", "incidence", "elevation", "ecmwf"))]
+    if non_metadata:
+        return non_metadata[0]
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 5. Validation report (convenience wrapper)
 # ---------------------------------------------------------------------------
 
@@ -579,7 +1001,9 @@ def validation_report(
 ) -> Dict[str, list]:
     """
     Run all four plot functions for every (sar_var, val_var) pair inferred
-    from *recipe* and save PNG files to ``<out_dir>/plots/``.
+    from *recipe*, save individual PNG files to ``<out_dir>/plots/``, and
+    write a combined ``validation_report.pdf`` to *out_dir* (alongside the
+    ``validation_statistics_*.nc`` files).
 
     Parameters
     ----------
@@ -594,28 +1018,35 @@ def validation_report(
         :func:`~.statistics.run_statistics`).  If provided,
         :func:`plot_statistics` is also called for each pair.
     out_dir : str or Path, optional
-        Directory where PNG files are saved.  If None the figures are
-        returned without saving.
+        Base output directory.  PNGs go to ``<out_dir>/plots/``; the
+        combined PDF is written to ``<out_dir>/validation_report.pdf``
+        (alongside the ``validation_statistics_*.nc`` files).
+        If None the figures are returned without saving.
 
     Returns
     -------
     dict[str, list[matplotlib.figure.Figure]]
         ``"<sar_var>_vs_<val_var>"`` → list of Figure objects for that pair.
     """
-    from ._variable_map import infer_variable_pairs  # noqa: PLC0415
+    from ._variable_map import infer_variable_pairs, filter_variable_pairs  # noqa: PLC0415
+    import matplotlib.pyplot as plt  # noqa: PLC0415
 
+    base_dir: Optional[Path] = None
+    plots_dir: Optional[Path] = None
     if out_dir is not None:
-        out_dir = Path(out_dir) / "plots"
-        out_dir.mkdir(parents=True, exist_ok=True)
+        base_dir = Path(out_dir)
+        plots_dir = base_dir / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
 
     variable = recipe.config.variable
     try:
-        pairs = infer_variable_pairs(variable)
+        pairs = filter_variable_pairs(recipe, collocation_ds)
     except KeyError as exc:
         logger.error("validation_report: %s", exc)
         return {}
 
     all_figures: Dict[str, list] = {}
+    pdf_pages: list = []   # (title, Figure) pairs fed into the PDF
 
     for sar_var, val_var in pairs:
         key = f"{sar_var}_vs_{val_var}"
@@ -627,16 +1058,35 @@ def validation_report(
         fig_scatter = plot_scatter(collocation_ds, sar_var, val_var)
         if fig_scatter is not None:
             figs.append(fig_scatter)
-            if out_dir:
-                fig_scatter.savefig(out_dir / f"{key}_scatter.png", dpi=150, bbox_inches="tight")
+            pdf_pages.append((f"{sar_var} vs {val_var} — scatter", fig_scatter))
+            if plots_dir:
+                fig_scatter.savefig(
+                    plots_dir / f"{key}_scatter.png", dpi=150, bbox_inches="tight"
+                )
 
-        # Geographic (one subplot per scene)
+        # Geographic — returns dict[collocation_type, Figure] by default
         try:
-            fig_geo = plot_geographic(datatree, collocation_ds, sar_var)
-            if fig_geo is not None:
-                figs.append(fig_geo)
-                if out_dir:
-                    fig_geo.savefig(out_dir / f"{key}_geographic.png", dpi=150, bbox_inches="tight")
+            geo_result = plot_geographic(datatree, collocation_ds, sar_var, val_var)
+            if isinstance(geo_result, dict):
+                for group, fig_geo in geo_result.items():
+                    if fig_geo is not None:
+                        figs.append(fig_geo)
+                        pdf_pages.append(
+                            (f"{sar_var} vs {val_var} — geographic [{group}]", fig_geo)
+                        )
+                        if plots_dir:
+                            safe_group = str(group).replace("/", "-")
+                            fig_geo.savefig(
+                                plots_dir / f"{key}_geographic_{safe_group}.png",
+                                dpi=150, bbox_inches="tight",
+                            )
+            elif geo_result is not None:
+                figs.append(geo_result)
+                pdf_pages.append((f"{sar_var} vs {val_var} — geographic", geo_result))
+                if plots_dir:
+                    geo_result.savefig(
+                        plots_dir / f"{key}_geographic.png", dpi=150, bbox_inches="tight"
+                    )
         except Exception as exc:
             logger.warning("plot_geographic failed for %s: %s", sar_var, exc)
 
@@ -645,19 +1095,53 @@ def validation_report(
             fig_stats = plot_statistics(stats_ds_map[key])
             if fig_stats is not None:
                 figs.append(fig_stats)
-                if out_dir:
-                    fig_stats.savefig(out_dir / f"{key}_statistics.png", dpi=150, bbox_inches="tight")
+                pdf_pages.append((f"{sar_var} vs {val_var} — statistics", fig_stats))
+                if plots_dir:
+                    fig_stats.savefig(
+                        plots_dir / f"{key}_statistics.png", dpi=150, bbox_inches="tight"
+                    )
 
         # Residuals
         fig_res = plot_residuals(collocation_ds, sar_var, val_var)
         if fig_res is not None:
             figs.append(fig_res)
-            if out_dir:
-                fig_res.savefig(out_dir / f"{key}_residuals.png", dpi=150, bbox_inches="tight")
+            pdf_pages.append((f"{sar_var} vs {val_var} — residuals", fig_res))
+            if plots_dir:
+                fig_res.savefig(
+                    plots_dir / f"{key}_residuals.png", dpi=150, bbox_inches="tight"
+                )
 
         all_figures[key] = figs
 
-    if out_dir:
-        logger.info("Plots saved to %s", out_dir)
+    # Combined PDF — saved alongside the validation_statistics_*.nc files
+    if base_dir is not None and pdf_pages:
+        from matplotlib.backends.backend_pdf import PdfPages  # noqa: PLC0415
+        import datetime as _dt  # noqa: PLC0415
+
+        pdf_path = base_dir / "validation_report.pdf"
+        with PdfPages(pdf_path) as pdf:
+            # Cover page
+            cover = plt.figure(figsize=(11, 8.5))
+            cover.text(
+                0.5, 0.60,
+                f"SAR L2 Validation Report\n{recipe.config.name}",
+                ha="center", va="center", fontsize=20, fontweight="bold",
+            )
+            cover.text(
+                0.5, 0.44,
+                f"Variable: {recipe.config.variable}\n"
+                f"Generated: {_dt.date.today().isoformat()}",
+                ha="center", va="center", fontsize=12,
+            )
+            pdf.savefig(cover, bbox_inches="tight")
+            plt.close(cover)
+
+            for _title, fig in pdf_pages:
+                pdf.savefig(fig, bbox_inches="tight")
+
+        logger.info("PDF report saved to %s", pdf_path)
+
+    if plots_dir:
+        logger.info("PNG plots saved to %s", plots_dir)
 
     return all_figures

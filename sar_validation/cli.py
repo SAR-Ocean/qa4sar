@@ -50,6 +50,8 @@ Examples:
   sar-validate --recipe recipes/wind_validation.yaml
   sar-validate --recipe recipes/wind_validation.yaml --convert
   sar-validate --recipe recipes/wind_validation.yaml --convert --collocate
+  sar-validate --recipe recipes/wind_validation.yaml --stats
+  sar-validate --recipe recipes/wind_validation.yaml --plot
         """,
     )
 
@@ -249,7 +251,7 @@ def _create_recipe(
             variable="currents",
             variable_specs={"components": ["zonal", "meridional"]},
             geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
-            sar_data=SARDataSpec(swath_mode=["WV"], max_downloads=limit),
+            sar_data=SARDataSpec(swath_mode=["WV","IW","EW","SM"], max_downloads=limit),
             validation_sources=[
                 ValidationDataSource(
                     source_type="hf_radar",
@@ -269,7 +271,7 @@ def _create_recipe(
             variable="waves",
             variable_specs={"components": ["significant_wave_height"]},
             geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
-            sar_data=SARDataSpec(swath_mode=["WV"], max_downloads=limit),
+            sar_data=SARDataSpec(swath_mode=["WV","SM"], max_downloads=limit),
             validation_sources=[
                 ValidationDataSource(source_type="mooring"),
                 ValidationDataSource(source_type="altimeter"),
@@ -391,6 +393,39 @@ def _is_already_downloaded(base_dir: Path) -> bool:
         return False
 
 
+def _infer_sar_var_from_recipe(recipe) -> str:
+    """
+    Infer the primary SAR variable name from the recipe's ``variable`` field.
+
+    Parameters
+    ----------
+    recipe : Recipe
+        Recipe object with config.variable (e.g., "wind", "currents", "waves").
+
+    Returns
+    -------
+    str
+        The primary SAR variable name, e.g., "owiWindSpeed", "owiSignificantWaveHeight".
+
+    Raises
+    ------
+    ValueError
+        If variable is not recognised or no SAR variable pair exists.
+    """
+    from .core._variable_map import VARIABLE_PAIRS
+
+    variable = recipe.config.variable
+    if variable not in VARIABLE_PAIRS:
+        raise ValueError(f"Unknown recipe variable: {variable}")
+
+    pairs = VARIABLE_PAIRS[variable]
+    if not pairs:
+        raise ValueError(f"No SAR variable pairs defined for {variable}")
+
+    # Return the first (primary) SAR variable for this variable type
+    return pairs[0][0]
+
+
 def _convert_data(recipe, base_dir: Path) -> "xr.DataTree | None":
     """Run step 2: convert downloaded files to a DataTree."""
     from .core.datatree_converter import DataTreeConverter
@@ -408,6 +443,7 @@ def _collocate_data(recipe, base_dir: Path) -> None:
     """Run step 3: load DataTree and run collocation."""
     import xarray as xr
     from .core.collocation import run_collocation
+    from .core.visualization import plot_sar_on_no_collocation
 
     datatree_path = base_dir / "datatree.nc"
     if not datatree_path.exists():
@@ -424,6 +460,15 @@ def _collocate_data(recipe, base_dir: Path) -> None:
     result = run_collocation(recipe, tree, base_dir)
     if result is None:
         print("  No collocated pairs found.")
+        # Fallback: plot SAR data coverage for debugging
+        try:
+            sar_var = _infer_sar_var_from_recipe(recipe)
+            recipe_name = recipe.config.name or "unknown"
+            png_path = plot_sar_on_no_collocation(tree, sar_var, recipe_name, base_dir)
+            if png_path:
+                print(f"  Generated SAR coverage plot: {png_path.relative_to(base_dir.parent)}")
+        except Exception as exc:
+            print(f"  Could not generate SAR coverage plot: {exc}")
     else:
         n = result.sizes.get("collocation", 0)
         print(f"  {n} collocated pair(s) saved to {base_dir / 'collocation_results.nc'}")
@@ -486,4 +531,7 @@ def _generate_plots(recipe, base_dir: Path) -> None:
                       stats_ds_map=stats_ds_map or None,
                       out_dir=base_dir)
     plots_dir = base_dir / "plots"
-    print(f"  Plots saved to {plots_dir}")
+    pdf_path = base_dir / "validation_report.pdf"
+    print(f"  PNG plots saved to {plots_dir}")
+    if pdf_path.exists():
+        print(f"  PDF report saved to {pdf_path}")
