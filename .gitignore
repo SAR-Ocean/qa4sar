@@ -18,6 +18,9 @@ env/
 # Downloaded data (can be large)
 data/
 
+# Handy notebooks
+handy_notebooks/
+
 # Created recipes
 *.yaml
 

@@ -98,6 +98,14 @@ class CollocationType:
     time_tolerance_minutes: int = 60
     spatial_tolerance_km: float = 50.0
     interpolation_method: str = "nearest"  # nearest | linear | cubic
+    aggregation_window_km: float = 5.0
+    """Circular radius (km) around validation point for SAR aggregation."""
+    validation_temporal_averaging_minutes: int = 30
+    """Window (minutes) for temporal averaging of validation observations."""
+    distance_weighting: str = "gaussian"
+    """Distance weighting: gaussian | inverse_distance | linear | equal"""
+    gaussian_sigma_km: float = 2.0
+    """Gaussian standard deviation (km) for distance weighting."""
     patch_size: int = 0
     """
     Side length (in pixels) of the SAR patch extracted around each matched pixel.
@@ -242,6 +250,11 @@ class Recipe:
                 time_tolerance_minutes=coll.get("time_tolerance_minutes", 60),
                 spatial_tolerance_km=coll.get("spatial_tolerance_km", 50.0),
                 interpolation_method=coll.get("interpolation_method", "nearest"),
+                aggregation_window_km=coll.get("aggregation_window_km", 5.0),
+                validation_temporal_averaging_minutes=coll.get("validation_temporal_averaging_minutes", 30),
+                distance_weighting=coll.get("distance_weighting", "gaussian"),
+                gaussian_sigma_km=coll.get("gaussian_sigma_km", 2.0),
+                patch_size=coll.get("patch_size", 0),
             ),
             output_dir=data.get("output_dir"),
         )

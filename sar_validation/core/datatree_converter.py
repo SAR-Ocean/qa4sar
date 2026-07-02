@@ -519,6 +519,7 @@ class DataTreeConverter:
     @staticmethod
     def from_sar_l2_ocn_safe(
         safe_dir: Union[str, Path],
+        product_type: str = "wind",
     ) -> Optional[xr.Dataset]:
         """
         Open SAR L2 OCN data from one Sentinel-1 SAFE directory and return a
@@ -526,19 +527,26 @@ class DataTreeConverter:
 
         Automatically detects mode by inspecting the SAFE directory name:
         - If directory name contains "WV": reads WV mode oswHs point measurements
-        - Otherwise: attempts to extract RVL data (keeping 2D grid structure);
-          returns None if RVL not available
+        - Otherwise: dispatches to extraction based on product_type:
+          - "wind" (default): extracts OWI (Ocean Wind Index) grid data
+          - "waves": extracts OSW (Ocean Surface Waves) grid data
+          - "currents": extracts RVL (Radial Velocity Linesight) grid data
+          Returns None if no suitable data found.
 
         Parameters
         ----------
         safe_dir : str or Path
             Path to a ``*.SAFE`` directory.
+        product_type : str, optional
+            Type of product to extract: "wind" (OWI), "waves" (OSW), or "currents" (RVL).
+            Only used for IW/EW/SM modes; WV mode always extracts oswHs.
+            Default is "wind".
 
         Returns
         -------
         xr.Dataset or None
-            Dataset with oswHs points (WV) or RVL grids (IW/EW/SM), or None if
-            no suitable data found.
+            Dataset with oswHs points (WV) or product-specific grids (IW/EW/SM),
+            or None if no suitable data found.
         """
         safe_dir = Path(safe_dir)
         safe_name = safe_dir.name.upper()
@@ -547,7 +555,7 @@ class DataTreeConverter:
         if "WV" in safe_name:
             return DataTreeConverter.from_sar_l2_ocn_wv_safe(safe_dir)
         else:
-            return DataTreeConverter._from_sar_l2_ocn_iw_safe(safe_dir)
+            return DataTreeConverter._from_sar_l2_ocn_iw_safe(safe_dir, product_type=product_type)
 
     @staticmethod
     def from_sar_l2_ocn_wv_safe(
@@ -944,30 +952,185 @@ class DataTreeConverter:
         
         return ds
 
+    @staticmethod
+    def _extract_owi_grid_data(
+        measurement_dir: Path,
+        safe_dir: Union[str, Path],
+    ) -> Optional[xr.Dataset]:
+        """
+        Extract OWI (Ocean Wind Index) data from measurement directory.
+
+        OWI is a 2D wind inversion grid measurement in SAR products. This function
+        keeps the grid structure (owiAzSize × owiRaSize dimensions, renamed to y × x)
+        for direct use in collocation.
+
+        Parameters
+        ----------
+        measurement_dir : Path
+            Path to the measurement/ directory within a SAFE archive.
+        safe_dir : str or Path
+            Path to the SAFE directory (used for logging and attributes).
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with OWI variables and coordinates, or None if no OWI data found.
+        """
+        safe_dir = Path(safe_dir)
+
+        # Discover measurement files containing OWI data
+        # Pattern: files with "-ocn-" (all L2 OCN products have OWI)
+        owi_files = sorted(
+            f for f in measurement_dir.glob("*.nc")
+            if "-ocn-" in f.name
+        )
+        if not owi_files:
+            return None
+
+        # Try to extract OWI data from the first file
+        try:
+            ds_raw = xr.open_dataset(owi_files[0])
+        except Exception as exc:
+            logger.debug("Could not open %s: %s", owi_files[0], exc)
+            return None
+
+        try:
+            # Check if OWI data exists
+            if "owiWindSpeed" not in ds_raw:
+                ds_raw.close()
+                logger.debug("No owiWindSpeed found in %s", owi_files[0])
+                return None
+
+            # Extract OWI grid arrays (2D: owiAzSize × owiRaSize)
+            owi_windspeed = ds_raw["owiWindSpeed"].values  # (owiAzSize, owiRaSize)
+            owi_lats = ds_raw["owiLat"].values
+            owi_lons = ds_raw["owiLon"].values
+
+            # Extract other OWI variables if available
+            owi_winddir = (
+                ds_raw["owiWindDirection"].values
+                if "owiWindDirection" in ds_raw
+                else np.full_like(owi_windspeed, np.nan)
+            )
+
+            owi_nrcs = (
+                ds_raw["owiNrcs"].values[:, :, 0]  # Use first polarisation if 3D
+                if "owiNrcs" in ds_raw
+                else np.full_like(owi_windspeed, np.nan)
+            )
+            if owi_nrcs.ndim == 3:
+                owi_nrcs = owi_nrcs[:, :, 0]
+
+            owi_incidence = (
+                ds_raw["owiIncidenceAngle"].values
+                if "owiIncidenceAngle" in ds_raw
+                else np.full_like(owi_windspeed, np.nan)
+            )
+
+            owi_heading = (
+                ds_raw["owiHeading"].values
+                if "owiHeading" in ds_raw
+                else np.full_like(owi_windspeed, np.nan)
+            )
+
+            owi_windquality = (
+                ds_raw["owiWindQuality"].values
+                if "owiWindQuality" in ds_raw
+                else np.full_like(owi_windspeed, np.nan)
+            )
+
+            owi_mask = (
+                ds_raw["owiMask"].values
+                if "owiMask" in ds_raw
+                else np.ones_like(owi_windspeed, dtype=np.int8)
+            )
+
+            # Get acquisition time (scalar for grid)
+            time_str = ds_raw.attrs.get("firstMeasurementTime")
+            if time_str:
+                acq_time = pd.to_datetime(time_str)
+                acq_time_ns = np.datetime64(
+                    acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
+                )
+            else:
+                m = re.search(r"(\d{8}t\d{6})", owi_files[0].stem, re.IGNORECASE)
+                if m:
+                    acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S")
+                    acq_time_ns = np.datetime64(
+                        acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
+                    )
+                else:
+                    acq_time_ns = np.datetime64("NaT", "ns")
+
+            # Infer dimension names from owiLat shape (typically owiAzSize, owiRaSize)
+            dims = ds_raw["owiLat"].dims if hasattr(ds_raw["owiLat"], "dims") else ("y", "x")
+            dims = tuple("y" if d.startswith("owi") or d == "owiAzSize" else "x" if d in ("owiRaSize",) else d for d in dims)
+            # Simplify to standard (y, x) naming
+            dims = ("y", "x")
+
+            # Create Dataset with 2D grid structure
+            data_vars = {
+                "owiWindSpeed": (dims, owi_windspeed),
+                "owiWindDirection": (dims, owi_winddir),
+                "owiNrcs": (dims, owi_nrcs),
+                "owiIncidenceAngle": (dims, owi_incidence),
+                "owiHeading": (dims, owi_heading),
+                "owiWindQuality": (dims, owi_windquality),
+                "owiMask": (dims, owi_mask),
+            }
+
+            coords = {
+                "lon": (dims, owi_lons),
+                "lat": (dims, owi_lats),
+                "time": acq_time_ns,
+            }
+
+            ds = xr.Dataset(data_vars, coords=coords)
+            ds.attrs["data_type"] = "sar_l2_ocn"
+            ds.attrs["source"] = "Sentinel-1"
+            ds.attrs["safe_dir"] = safe_dir.name
+            ds.attrs["measurement_type"] = "owi"
+            ds.attrs["swath_mode"] = "IW/EW/SM"
+
+            logger.info(
+                "Extracted OWI data from product %s (grid shape: %s)",
+                safe_dir.name, owi_windspeed.shape
+            )
+            return ds
+
+        except Exception as exc:
+            logger.debug("Could not extract OWI from %s: %s", owi_files[0], exc)
+            return None
+        finally:
+            ds_raw.close()
 
     @staticmethod
     def _from_sar_l2_ocn_iw_safe(
         safe_dir: Union[str, Path],
+        product_type: str = "wind",
     ) -> Optional[xr.Dataset]:
         """
-        Extract RVL (Radial Velocity Linesight) or OWI data from one Sentinel-1 IW/EW/SM
-        mode SAFE directory and return a standardised Dataset.
+        Extract product-specific data from one Sentinel-1 IW/EW/SM mode SAFE directory.
 
-        For currents validation, this function prioritizes RVL data (Radial Velocity
-        Linesight), which is a 13×13 grid measurement available in some IW/EW/SM products.
-        RVL is returned as a 2D grid Dataset (rvlLat × rvlLon dimensions).
+        Dispatches to the appropriate extraction function based on product_type:
+        - "wind": Extracts OWI (Ocean Wind Index) 2D grid data
+        - "waves": Extracts OSW (Ocean Surface Waves) grid data (currently not implemented; tries OWI as fallback)
+        - "currents": Extracts RVL (Radial Velocity Linesight) 2D grid data
 
-        If RVL data is not available, returns None (no OWI fallback).
+        All returned data maintains 2D grid structure (y, x) for collocation compatibility.
 
         Parameters
         ----------
         safe_dir : str or Path
             Path to an IW/EW/SM mode ``*.SAFE`` directory.
+        product_type : str, optional
+            Type of product to extract: "wind" (OWI), "waves" (OSW), or "currents" (RVL).
+            Default is "wind".
 
         Returns
         -------
         xr.Dataset or None
-            RVL Dataset if RVL data is found; None otherwise.
+            Dataset with product-specific 2D grid data, or None if no suitable data found.
         """
         safe_dir = Path(safe_dir)
         measurement_dir = safe_dir / "measurement"
@@ -975,20 +1138,68 @@ class DataTreeConverter:
             logger.debug("No measurement/ directory in %s", safe_dir)
             return None
 
-        # Attempt to extract RVL data (keeping 2D grid structure)
-        ds_rvl = DataTreeConverter._extract_rvl_grid_data(
-            measurement_dir, safe_dir, flatten_to_points=False
-        )
+        # Dispatch based on product type
+        if product_type.lower() == "wind":
+            # Try OWI extraction for wind products
+            ds = DataTreeConverter._extract_owi_grid_data(measurement_dir, safe_dir)
+            if ds is not None:
+                ds.attrs["swath_mode"] = "IW/EW/SM"
+                logger.info("Extracted OWI data from IW/EW/SM product %s", safe_dir.name)
+                return ds
+            # Fall back to RVL if OWI not available
+            logger.debug("OWI data not found in %s; trying RVL fallback", safe_dir.name)
+            ds_rvl = DataTreeConverter._extract_rvl_grid_data(
+                measurement_dir, safe_dir, flatten_to_points=False
+            )
+            if ds_rvl is not None:
+                ds_rvl.attrs["swath_mode"] = "IW/EW/SM"
+                logger.info("Extracted RVL data (fallback) from IW/EW/SM product %s", safe_dir.name)
+                return ds_rvl
 
-        if ds_rvl is not None:
-            ds_rvl.attrs["swath_mode"] = "IW/EW/SM"
-            logger.info("Extracted RVL data from IW/EW/SM product %s", safe_dir.name)
-            return ds_rvl
+        elif product_type.lower() == "waves":
+            # Try OSW extraction for wave products (future implementation)
+            # For now, try OWI as fallback
+            logger.debug("OSW extraction not yet implemented for %s; trying OWI fallback", safe_dir.name)
+            ds = DataTreeConverter._extract_owi_grid_data(measurement_dir, safe_dir)
+            if ds is not None:
+                ds.attrs["swath_mode"] = "IW/EW/SM"
+                return ds
+            # Try RVL as second fallback
+            ds_rvl = DataTreeConverter._extract_rvl_grid_data(
+                measurement_dir, safe_dir, flatten_to_points=False
+            )
+            if ds_rvl is not None:
+                ds_rvl.attrs["swath_mode"] = "IW/EW/SM"
+                return ds_rvl
 
-        # No RVL data found; return None (no OWI fallback)
+        elif product_type.lower() == "currents":
+            # Try RVL extraction for currents products
+            ds_rvl = DataTreeConverter._extract_rvl_grid_data(
+                measurement_dir, safe_dir, flatten_to_points=False
+            )
+            if ds_rvl is not None:
+                ds_rvl.attrs["swath_mode"] = "IW/EW/SM"
+                logger.info("Extracted RVL data from IW/EW/SM product %s", safe_dir.name)
+                return ds_rvl
+            # Fall back to OWI if RVL not available
+            logger.debug("RVL data not found in %s; trying OWI fallback", safe_dir.name)
+            ds = DataTreeConverter._extract_owi_grid_data(measurement_dir, safe_dir)
+            if ds is not None:
+                ds.attrs["swath_mode"] = "IW/EW/SM"
+                logger.info("Extracted OWI data (fallback) from IW/EW/SM product %s", safe_dir.name)
+                return ds
+
+        else:
+            logger.warning("Unknown product_type: %s; trying wind (OWI) extraction", product_type)
+            ds = DataTreeConverter._extract_owi_grid_data(measurement_dir, safe_dir)
+            if ds is not None:
+                ds.attrs["swath_mode"] = "IW/EW/SM"
+                return ds
+
+        # No data found for any extraction method
         logger.debug(
-            "No RVL data found in IW/EW/SM product %s (OWI fallback disabled)",
-            safe_dir.name,
+            "No %s data found in IW/EW/SM product %s",
+            product_type, safe_dir.name,
         )
         return None
 
@@ -996,6 +1207,7 @@ class DataTreeConverter:
     @staticmethod
     def convert_downloaded_data(
         base_dir: Union[str, Path],
+        product_type: str = "wind",
     ) -> Optional[xr.DataTree]:
         """
         Auto-discover all downloaded files inside *base_dir* and convert them
@@ -1015,6 +1227,9 @@ class DataTreeConverter:
         base_dir : str or Path
             Root directory produced by the download step (contains
             ``download_metadata.json``).
+        product_type : str, optional
+            Type of SAR product to extract: "wind" (OWI), "waves" (OSW), or "currents" (RVL).
+            Default is "wind".
 
         Returns
         -------
@@ -1029,7 +1244,7 @@ class DataTreeConverter:
         if sar_dir.exists():
             for safe_dir in sorted(d for d in sar_dir.iterdir()
                                    if d.is_dir() and d.suffix == ".SAFE"):
-                ds = DataTreeConverter.from_sar_l2_ocn_safe(safe_dir)
+                ds = DataTreeConverter.from_sar_l2_ocn_safe(safe_dir, product_type=product_type)
                 if ds is not None:
                     datasets[f"sar/{safe_dir.name}"] = ds
                     logger.info("Converted SAR SAFE: %s", safe_dir.name)

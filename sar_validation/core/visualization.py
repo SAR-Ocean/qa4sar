@@ -742,18 +742,14 @@ def plot_sar_on_no_collocation(
     sar_var: str,
     recipe_name: str,
     output_dir: Union[str, Path],
+    recipe=None,
 ) -> Union[Path, None]:
     """
     Plot SAR data geographic coverage when no collocations are found.
 
-    Creates a map-view figure showing the spatial distribution of SAR measurements
-    for a given variable. This is useful for debugging why collocations failed—
-    it reveals whether the SAR swath simply missed the validation data region
-    spatially or temporally.
-
-    When the requested SAR variable is not available in the dataset, this function
-    attempts to plot an alternative variable with a similar geophysical meaning
-    (e.g., ``owiWindSeaHs`` if ``owiSignificantWaveHeight`` is unavailable).
+    Creates map-view figures showing SAR measurements with overlaid validation data:
+    - Subplot 1: SAR + in-situ data sources
+    - Subplot 2 (if scatterometer data available): SAR + scatterometer data with time colormap
 
     Parameters
     ----------
@@ -765,6 +761,9 @@ def plot_sar_on_no_collocation(
         Name of the recipe (for filename/title), e.g., ``"waves_test"``.
     output_dir : str or Path
         Directory to save the PNG file.
+    recipe : Recipe, optional
+        Recipe object containing geographic bounds for filtering scatterometer data.
+        If provided, enables scatterometer subplot with geographic filtering.
 
     Returns
     -------
@@ -774,6 +773,7 @@ def plot_sar_on_no_collocation(
     import matplotlib.pyplot as plt  # noqa: PLC0415
     import matplotlib.colors as mcolors  # noqa: PLC0415
     import matplotlib.cm as mcm  # noqa: PLC0415
+    from matplotlib.patches import Patch  # noqa: PLC0415
 
     output_dir = Path(output_dir)
     plots_dir = output_dir / "plots"
@@ -824,6 +824,36 @@ def plot_sar_on_no_collocation(
     sar_sm = mcm.ScalarMappable(cmap="viridis", norm=sar_norm)
     sar_sm.set_array([])
 
+    # ── Extract validation data ─────────────────────────────────────────
+    val_data = _extract_validation_data_for_plot(datatree)
+    has_validation = bool(val_data)
+
+    # ── Separate in-situ and scatterometer data ────────────────────────
+    insitu_data = {}
+    scatterometer_data = {}
+    if has_validation:
+        # Convert to numpy arrays for efficient fancy indexing
+        platform_types = np.array(val_data["platform_types"])
+        insitu_mask = platform_types == "insitu"
+        scatterometer_mask = platform_types == "scatterometer"
+        insitu_idx = np.where(insitu_mask)[0]
+        scatterometer_idx = np.where(scatterometer_mask)[0]
+        
+        if len(insitu_idx) > 0:
+            insitu_data = {
+                "lons": val_data["lons"][insitu_idx],
+                "lats": val_data["lats"][insitu_idx],
+                "platform_types": platform_types[insitu_idx].tolist(),
+            }
+        
+        if len(scatterometer_idx) > 0:
+            scatterometer_data = {
+                "lons": val_data["lons"][scatterometer_idx],
+                "lats": val_data["lats"][scatterometer_idx],
+                "platform_types": platform_types[scatterometer_idx].tolist(),
+                "times": val_data["times"][scatterometer_idx],
+            }
+
     # ── Set up cartopy if available ─────────────────────────────────────
     try:
         import cartopy.crs as ccrs  # noqa: PLC0415
@@ -838,18 +868,35 @@ def plot_sar_on_no_collocation(
 
     subplot_kw = {"projection": ccrs.PlateCarree()} if HAS_CARTOPY else {}
 
-    # ── Create figure with one subplot per SAR scene ────────────────────
-    nrows = max(1, (len(scene_names) + 1) // 2)  # 2 cols by default
-    ncols = 2 if len(scene_names) > 1 else 1
+    # ── Determine number of subplots ────────────────────────────────────
+    # Subplot 1: SAR + in-situ, Subplot 2 (optional): SAR + scatterometer
+    has_scatterometer = bool(scatterometer_data)
+    
+    # Use simplified 2-column layout when scatterometer data present
+    if has_scatterometer:
+        nrows, ncols = 1, 2
+        figsize = (14, 6)
+    else:
+        # Original multi-subplot layout for SAR scenes only
+        nrows = max(1, (len(scene_names) + 1) // 2)
+        ncols = 2 if len(scene_names) > 1 else 1
+        figsize = (10 * ncols, 8 * nrows)
+    
     fig, axes = plt.subplots(
         nrows, ncols,
-        figsize=(10 * ncols, 8 * nrows),
+        figsize=figsize,
         subplot_kw=subplot_kw,
         squeeze=False,
+        dpi=100,  # Reduced DPI for faster rendering
     )
     axes_flat = axes.flatten()
 
+    # ── Plot subplot 1: SAR + in-situ data ──────────────────────────────
     for idx, scene_name in enumerate(scene_names):
+        if has_scatterometer and idx > 0:
+            # When scatterometer plot exists, only plot first SAR scene
+            break
+        
         ax = axes_flat[idx]
         scene_ds = sar_node[scene_name].to_dataset()
 
@@ -859,16 +906,16 @@ def plot_sar_on_no_collocation(
 
         # ── Add map features ────────────────────────────────────────────
         if HAS_CARTOPY:
-            ax.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0)
-            ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=1)
-            gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
+            ax.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0, alpha=0.3)
+            ax.add_feature(cfeature.COASTLINE, linewidth=0.3, zorder=1)
+            gl = ax.gridlines(draw_labels=True, linewidth=0.2, alpha=0.3)
             gl.top_labels = False
             gl.right_labels = False
             transform = ccrs.PlateCarree()
         else:
             transform = None
 
-        # ── Plot SAR data ───────────────────────────────────────────────
+        # ── Plot SAR data (background) ──────────────────────────────────
         arr = _sar_field(scene_ds, actual_var)
         if arr is not None:
             kw = {"transform": transform} if transform else {}
@@ -889,21 +936,96 @@ def plot_sar_on_no_collocation(
                 arr_valid = arr_1d[valid]
                 
                 if len(arr_valid) > 0:
-                    scatter = ax.scatter(
+                    ax.scatter(
                         lon_valid, lat_valid, c=arr_valid,
-                        cmap="viridis", norm=sar_norm, s=50, zorder=2, **kw,
+                        cmap="viridis", norm=sar_norm, s=20, zorder=2, 
+                        rasterized=True, **kw,
                     )
             else:
-                # Grid-based data (IW/EW mode) — use pcolormesh
-                im = ax.pcolormesh(
+                # Grid-based data (IW/EW mode) — use pcolormesh with rasterization
+                ax.pcolormesh(
                     scene_ds["lon"].values, scene_ds["lat"].values, arr,
-                    cmap="viridis", norm=sar_norm, shading="auto", zorder=2, **kw,
+                    cmap="viridis", norm=sar_norm, shading="auto", zorder=2, 
+                    rasterized=True, **kw,
                 )
 
-        ax.set_title(f"{scene_name.split('/')[-1]} — {actual_var}", fontsize=10)
+        # ── Overlay in-situ validation data ──────────────────────────────
+        if insitu_data:
+            source_color_map = _source_color_map(sorted(set(insitu_data["platform_types"])))
+            colors_by_type = [source_color_map[pt] for pt in insitu_data["platform_types"]]
+            
+            kw_val = {"transform": transform} if transform else {}
+            ax.scatter(
+                insitu_data["lons"], insitu_data["lats"], c=colors_by_type, s=100, 
+                marker='D', edgecolors='black', linewidth=0.5, zorder=3, **kw_val,
+            )
+            
+            # Add legend for in-situ platform types
+            legend_elements = [
+                Patch(facecolor=source_color_map[pt], label=pt)
+                for pt in sorted(source_color_map.keys())
+            ]
+            ax.legend(handles=legend_elements, loc='best', fontsize=8, framealpha=0.8)
+
+        ax.set_title(f"{scene_name.split('/')[-1]} — {actual_var} + in-situ", fontsize=10)
+
+    # ── Plot subplot 2: SAR + scatterometer footprint outlines ──────────
+    if has_scatterometer and scatterometer_data:
+        ax_scat = axes_flat[1]  # Use second subplot
+        scene_ds = sar_node[scene_names[0]].to_dataset()  # Use first scene as reference
+
+        if "lon" in scene_ds.coords and "lat" in scene_ds.coords:
+            # ── Add map features (simplified for speed) ─────────────────
+            if HAS_CARTOPY:
+                ax_scat.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0, alpha=0.3)
+                ax_scat.add_feature(cfeature.COASTLINE, linewidth=0.3, zorder=1)
+                gl = ax_scat.gridlines(draw_labels=True, linewidth=0.2, alpha=0.3)
+                gl.top_labels = False
+                gl.right_labels = False
+                transform = ccrs.PlateCarree()
+            else:
+                transform = None
+
+            # ── Plot SAR data (background, rasterized for speed) ────────
+            arr = _sar_field(scene_ds, actual_var)
+            if arr is not None:
+                kw = {"transform": transform} if transform else {}
+                
+                is_point_based = len(arr.shape) == 1 or (len(arr.shape) == 2 and arr.shape[0] == 1)
+                
+                if is_point_based:
+                    lon_1d = scene_ds["lon"].values.flatten()
+                    lat_1d = scene_ds["lat"].values.flatten()
+                    arr_1d = arr.flatten()
+                    valid = np.isfinite(arr_1d)
+                    lon_valid = lon_1d[valid]
+                    lat_valid = lat_1d[valid]
+                    arr_valid = arr_1d[valid]
+                    if len(arr_valid) > 0:
+                        ax_scat.scatter(
+                            lon_valid, lat_valid, c=arr_valid,
+                            cmap="viridis", norm=sar_norm, s=10, zorder=2, 
+                            rasterized=True, **kw,
+                        )
+                else:
+                    ax_scat.pcolormesh(
+                        scene_ds["lon"].values, scene_ds["lat"].values, arr,
+                        cmap="viridis", norm=sar_norm, shading="auto", zorder=2, 
+                        rasterized=True, **kw,
+                    )
+
+            # ── Extract and plot scatterometer footprints ──────────────
+            if recipe is not None:
+                overpasses = _extract_scatterometer_overpasses(datatree, recipe)
+                _plot_scatterometer_footprints(ax_scat, overpasses, fig, transform)
+            else:
+                ax_scat.text(0.5, 0.5, "No geographic bounds (recipe not provided)",
+                            ha='center', va='center', transform=ax_scat.transAxes, fontsize=10)
+
+            ax_scat.set_title(f"{actual_var} + scatterometer footprints (entry/exit times)", fontsize=10)
 
     # Hide unused subplots
-    for idx in range(len(scene_names), len(axes_flat)):
+    for idx in range(len(scene_names) + (1 if has_scatterometer else 0), len(axes_flat)):
         axes_flat[idx].set_visible(False)
 
     # ── Add colourbar and title ─────────────────────────────────────────
@@ -928,6 +1050,118 @@ def plot_sar_on_no_collocation(
         logger.error("Failed to save SAR coverage plot: %s", exc)
         plt.close(fig)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Helpers for no-collocation plot with validation data
+# ---------------------------------------------------------------------------
+
+def _extract_validation_data_for_plot(datatree):
+    """
+    Extract all validation observations and their metadata from DataTree.
+
+    Includes in-situ data (mooring, buoy, altimeter, HF radar) and scatterometer
+    data (osi_saf_winds, etc.). Handles nested structures (e.g., osi_saf_winds/swath_name/).
+
+    Returns dict with structure:
+    {
+        'lons': array of all lon values,
+        'lats': array of all lat values,
+        'times': array of all time values,
+        'sources': list of source names (e.g., 'mooring', 'osi_saf_winds'),
+        'platform_types': list of platform types (e.g., 'buoy', 'scatterometer'),
+        'source_to_data': {source_name: Dataset},
+        'all_measurements': dict mapping variable_name -> array of values,
+    }
+
+    Returns empty dict if no validation data found.
+    """
+    val_node = datatree.get("validation")
+    if val_node is None or not val_node.children:
+        return {}
+
+    all_lons = []
+    all_lats = []
+    all_times = []
+    all_sources = []
+    all_platform_types = []
+    source_to_data = {}
+    all_measurements = {}
+
+    def process_node(node, source_name):
+        """Recursively process a validation node."""
+        ds = node.to_dataset()
+        
+        # If this node has lon/lat, process it
+        if "lon" in ds.coords and "lat" in ds.coords:
+            lons = ds["lon"].values
+            lats = ds["lat"].values
+            times = ds.coords.get("time", None)
+            if times is not None:
+                times = times.values
+            else:
+                times = np.full(len(lons), None, dtype=object)
+
+            # Flatten if needed
+            if len(lons.shape) > 1:
+                lons = lons.flatten()
+            if len(lats.shape) > 1:
+                lats = lats.flatten()
+            if len(times.shape) > 1:
+                times = times.flatten()
+
+            # Determine platform type from attributes and source name
+            platform_type = ds.attrs.get("platform_type", None)
+            if platform_type is None:
+                data_type = ds.attrs.get("data_type", "")
+                if data_type:
+                    platform_type = data_type
+                elif "osi_saf" in source_name:
+                    platform_type = "scatterometer"
+                else:
+                    platform_type = source_name.replace("_", " ").title()
+
+            # Accumulate observations using vectorized operations
+            n = len(lons)
+            all_lons.extend(lons)
+            all_lats.extend(lats)
+            all_times.extend(times)
+            all_sources.extend([source_name] * n)
+            all_platform_types.extend([platform_type] * n)
+
+            # Collect measurement variables
+            for var_name in ds.data_vars:
+                if var_name not in all_measurements:
+                    all_measurements[var_name] = []
+                var_data = ds[var_name].values
+                if len(var_data.shape) > 1:
+                    var_data = var_data.flatten()
+                # Use extend with array directly (more efficient than tolist())
+                all_measurements[var_name].extend(var_data)
+
+            source_to_data[source_name] = ds
+        
+        # If this node doesn't have data but has children, recurse
+        elif node.children:
+            for child_name, child_node in node.children.items():
+                process_node(child_node, source_name)
+
+    # Process all top-level validation sources
+    for source_name, source_node in val_node.children.items():
+        process_node(source_node, source_name)
+
+    if not all_lons:
+        return {}
+
+    return {
+        "lons": np.array(all_lons),
+        "lats": np.array(all_lats),
+        "times": np.array(all_times, dtype=object),
+        "sources": all_sources,
+        "platform_types": all_platform_types,
+        "source_to_data": source_to_data,
+        "all_measurements": all_measurements,
+    }
 
 
 def _find_available_sar_variable(sar_node, preferred_var: str) -> Optional[str]:
@@ -986,6 +1220,189 @@ def _find_available_sar_variable(sar_node, preferred_var: str) -> Optional[str]:
         return non_metadata[0]
 
     return None
+
+
+def _extract_scatterometer_overpasses(datatree, recipe):
+    """
+    Extract scatterometer overpass footprints with entry/exit times.
+
+    For each scatterometer file (= one satellite overpass), calculates the
+    geographic boundary of points within the recipe's geographic bounds and
+    extracts entry/exit times.
+
+    Parameters
+    ----------
+    datatree : xr.DataTree
+        Step-2 DataTree with validation data.
+    recipe : Recipe
+        Recipe containing geographic_bounds for filtering.
+
+    Returns
+    -------
+    list of dict
+        Each dict contains: {
+            'file_name': str,
+            'entry_time': datetime64 or None,
+            'exit_time': datetime64 or None,
+            'boundary_lons': array of lon values defining boundary,
+            'boundary_lats': array of lat values defining boundary,
+            'num_points_in_bounds': int,
+        }
+        Returns empty list if no scatterometer data or no in-bounds points.
+    """
+    from scipy.spatial import ConvexHull  # noqa: PLC0415
+    import pandas as pd  # noqa: PLC0415
+
+    val_node = datatree.get("validation")
+    if val_node is None:
+        return []
+
+    osi_node = val_node.get("osi_saf_winds")
+    if osi_node is None:
+        return []
+
+    overpasses = []
+    bounds = recipe.config.geographic_bounds
+
+    def process_overpass_node(node, file_name):
+        """Process a single scatterometer file node."""
+        ds = node.to_dataset()
+
+        if "lon" not in ds.coords or "lat" not in ds.coords:
+            return
+
+        lons = ds["lon"].values.flatten()
+        lats = ds["lat"].values.flatten()
+        times = ds.coords.get("time", None)
+        if times is not None:
+            times = times.values.flatten()
+        else:
+            times = np.full(len(lons), None, dtype=object)
+
+        # Filter by geographic bounds
+        mask = (
+            (lons >= bounds.min_lon) & (lons <= bounds.max_lon) &
+            (lats >= bounds.min_lat) & (lats <= bounds.max_lat)
+        )
+        in_bounds_lons = lons[mask]
+        in_bounds_lats = lats[mask]
+        in_bounds_times = times[mask]
+
+        if len(in_bounds_lons) == 0:
+            return  # No points in bounds for this overpass
+
+        # Calculate entry/exit times
+        valid_times = in_bounds_times[in_bounds_times != None]
+        if len(valid_times) > 0:
+            entry_time = valid_times.min()
+            exit_time = valid_times.max()
+        else:
+            entry_time = None
+            exit_time = None
+
+        # Calculate boundary via ConvexHull
+        try:
+            if len(in_bounds_lons) >= 3:
+                points = np.column_stack((in_bounds_lons, in_bounds_lats))
+                hull = ConvexHull(points)
+                boundary_indices = hull.vertices
+                boundary_lons = in_bounds_lons[boundary_indices]
+                boundary_lats = in_bounds_lats[boundary_indices]
+                # Close the polygon
+                boundary_lons = np.append(boundary_lons, boundary_lons[0])
+                boundary_lats = np.append(boundary_lats, boundary_lats[0])
+            else:
+                # Too few points for ConvexHull; just use the points as-is
+                boundary_lons = in_bounds_lons
+                boundary_lats = in_bounds_lats
+        except Exception as e:
+            logger.warning("Failed to calculate ConvexHull for overpass %s: %s", file_name, e)
+            return
+
+        overpasses.append({
+            "file_name": file_name,
+            "entry_time": entry_time,
+            "exit_time": exit_time,
+            "boundary_lons": boundary_lons,
+            "boundary_lats": boundary_lats,
+            "num_points_in_bounds": len(in_bounds_lons),
+        })
+
+    # Recursively process all nodes under osi_saf_winds
+    def process_node_tree(node, file_name):
+        """Recursively traverse DataTree nodes."""
+        ds = node.to_dataset()
+        if "lon" in ds.coords and "lat" in ds.coords:
+            # This node has data; process it as an overpass
+            process_overpass_node(node, file_name)
+        else:
+            # No data in this node; recurse into children
+            for child_name, child_node in node.children.items():
+                process_node_tree(child_node, f"{file_name}/{child_name}")
+
+    # Process all children of osi_saf_winds
+    for stem_name, stem_node in osi_node.children.items():
+        process_node_tree(stem_node, stem_name)
+
+    logger.info("Extracted %d scatterometer overpasses with in-bounds coverage", len(overpasses))
+    return overpasses
+
+
+def _plot_scatterometer_footprints(ax, overpasses, fig, transform=None):
+    """
+    Plot scatterometer footprint outlines with entry/exit time annotations.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes to draw into.
+    overpasses : list of dict
+        Output from _extract_scatterometer_overpasses().
+    fig : matplotlib.figure.Figure
+        Figure object for adding annotations.
+    transform : cartopy.crs.CRS, optional
+        Cartopy transform for plotting (ccrs.PlateCarree()).
+    """
+    import pandas as pd  # noqa: PLC0415
+
+    if not overpasses:
+        ax.text(0.5, 0.5, "No scatterometer coverage in geographic bounds",
+                ha='center', va='center', transform=ax.transAxes, fontsize=10)
+        return
+
+    for idx, overpass in enumerate(overpasses):
+        boundary_lons = overpass["boundary_lons"]
+        boundary_lats = overpass["boundary_lats"]
+
+        kw_plot = {"transform": transform} if transform else {}
+
+        # Draw footprint boundary as red line
+        ax.plot(boundary_lons, boundary_lats, color='red', linewidth=2, zorder=3, **kw_plot)
+
+        # Optional: fill with semi-transparent red
+        ax.fill(boundary_lons, boundary_lats, color='red', alpha=0.1, zorder=2, **kw_plot)
+
+        # Calculate centroid for text placement
+        centroid_lon = np.mean(boundary_lons)
+        centroid_lat = np.mean(boundary_lats)
+
+        # Format entry/exit times
+        if overpass["entry_time"] is not None:
+            entry_dt = pd.Timestamp(overpass["entry_time"]).strftime("%H:%M:%S")
+            exit_dt = pd.Timestamp(overpass["exit_time"]).strftime("%H:%M:%S")
+            time_text = f"In: {entry_dt}\nOut: {exit_dt}"
+        else:
+            time_text = f"Pass {idx + 1}"
+
+        # Add annotation at centroid
+        ax.text(centroid_lon, centroid_lat, time_text, fontsize=8, ha='center',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.7), **kw_plot)
+
+        logger.info(
+            "Plotted scatterometer overpass %d: %s points, entry=%s, exit=%s",
+            idx + 1, overpass["num_points_in_bounds"],
+            overpass["entry_time"], overpass["exit_time"]
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -139,6 +139,107 @@ def _to_datetime_array(time_array) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Distance-weighting functions for SAR aggregation
+# ---------------------------------------------------------------------------
+
+def _gaussian_weights(distances: np.ndarray, sigma_km: float) -> np.ndarray:
+    """
+    Compute normalized Gaussian distance weights.
+    
+    Formula: w_i = exp(-d_i^2 / (2*sigma^2)), normalized so sum = 1.0
+    
+    Parameters
+    ----------
+    distances : np.ndarray
+        Array of distances in km.
+    sigma_km : float
+        Standard deviation in km.
+    
+    Returns
+    -------
+    np.ndarray
+        Normalized weights, same shape as distances.
+    """
+    weights = np.exp(-(distances ** 2) / (2 * sigma_km ** 2))
+    weight_sum = np.sum(weights)
+    if weight_sum > 0:
+        weights = weights / weight_sum
+    return weights
+
+
+def _inverse_distance_weights(distances: np.ndarray, power: float = 2.0) -> np.ndarray:
+    """
+    Compute normalized inverse-distance weights.
+    
+    Formula: w_i = 1 / (d_i^power), normalized so sum = 1.0
+    
+    Parameters
+    ----------
+    distances : np.ndarray
+        Array of distances in km. Must be > 0 for all elements.
+    power : float
+        Exponent for inverse distance (default: 2.0).
+    
+    Returns
+    -------
+    np.ndarray
+        Normalized weights, same shape as distances.
+    """
+    # Avoid division by zero
+    safe_distances = np.maximum(distances, 1e-6)
+    weights = 1.0 / (safe_distances ** power)
+    weight_sum = np.sum(weights)
+    if weight_sum > 0:
+        weights = weights / weight_sum
+    return weights
+
+
+def _linear_weights(distances: np.ndarray, max_distance_km: float) -> np.ndarray:
+    """
+    Compute normalized linear-decay distance weights.
+    
+    Formula: w_i = max(0, 1 - d_i / max_dist), normalized so sum = 1.0
+    
+    Parameters
+    ----------
+    distances : np.ndarray
+        Array of distances in km.
+    max_distance_km : float
+        Maximum distance at which weight becomes zero.
+    
+    Returns
+    -------
+    np.ndarray
+        Normalized weights, same shape as distances.
+    """
+    weights = np.maximum(0.0, 1.0 - distances / max_distance_km)
+    weight_sum = np.sum(weights)
+    if weight_sum > 0:
+        weights = weights / weight_sum
+    return weights
+
+
+def _equal_weights(distances: np.ndarray) -> np.ndarray:
+    """
+    Compute uniform weights (all cells equally weighted).
+    
+    Parameters
+    ----------
+    distances : np.ndarray
+        Array of distances in km (only used for shape).
+    
+    Returns
+    -------
+    np.ndarray
+        Uniform weights, same shape as distances.
+    """
+    n = len(distances)
+    if n > 0:
+        return np.ones(n) / n
+    return np.array([])
+
+
+# ---------------------------------------------------------------------------
 # 1. Point vs. Layer
 # ---------------------------------------------------------------------------
 
@@ -179,22 +280,47 @@ def _detect_collocation_type(val_ds: "xr.Dataset", source_path: str) -> str:
 class PointLayerCollocation:
     """
     Match fixed-point (or slowly-moving) validation observations with a
-    gridded SAR layer.
+    gridded SAR layer using distance-weighted spatial aggregation.
+
+    Aggregation approach
+    --------------------
+    For each validation observation:
+
+    1. **SAR Aggregation**: Find all SAR grid cells within `aggregation_window_km`
+       (circular radius). Compute a distance-weighted average of SAR variables
+       using the selected weighting method (Gaussian, inverse-distance, linear, or equal).
+
+    2. **Validation Aggregation**: Temporally average validation observations
+       within ±`validation_temporal_averaging_minutes` around each observation.
+
+    3. **Output**: Single `CollocatedPoint` per validation observation with
+       aggregated SAR mean vs. aggregated validation mean.
 
     Typical use cases: moorings, in-situ buoys.
 
     Parameters
     ----------
     spatial_tolerance_km : float
-        Maximum great-circle distance between the validation point and the
-        nearest SAR grid cell to accept a match.
+        Maximum great-circle distance for pre-filtering (legacy parameter,
+        now superseded by `aggregation_window_km`).
     time_tolerance_minutes : int
-        Maximum absolute time difference.
+        Maximum absolute time difference for matching SAR acquisitions.
     interpolation_method : str
-        How to extract the SAR value at the validation location:
-        - ``"nearest"``  — use the closest grid cell (default)
-        - ``"linear"``   — bilinear interpolation (TODO)
-        - ``"cubic"``    — bicubic interpolation (TODO)
+        Retained for API compatibility; currently unused (aggregation is fixed).
+    aggregation_window_km : float
+        Circular radius (km) around each validation point for SAR aggregation.
+        Default: 5.0 km.
+    validation_temporal_averaging_minutes : int
+        Half-width (minutes) of temporal window for validation data averaging.
+        Observations within ±this window are averaged. Default: 30 min.
+    distance_weighting : str
+        Distance weighting method for SAR aggregation:
+        - ``"gaussian"`` — Gaussian kernel (default)
+        - ``"inverse_distance"`` — Inverse distance (1/d^2)
+        - ``"linear"`` — Linear decay
+        - ``"equal"`` — Uniform weights
+    gaussian_sigma_km : float
+        Standard deviation (km) for Gaussian weighting. Default: 2.0 km.
     """
 
     #: Collocation type label stored on each CollocatedPoint result.
@@ -205,15 +331,28 @@ class PointLayerCollocation:
         spatial_tolerance_km: float = 50.0,
         time_tolerance_minutes: int = 60,
         interpolation_method: str = "nearest",
+        aggregation_window_km: float = 5.0,
+        validation_temporal_averaging_minutes: int = 30,
+        distance_weighting: str = "gaussian",
+        gaussian_sigma_km: float = 2.0,
     ) -> None:
         self.spatial_tolerance_km = spatial_tolerance_km
         self.time_tolerance_minutes = time_tolerance_minutes
         self.interpolation_method = interpolation_method
+        self.aggregation_window_km = aggregation_window_km
+        self.validation_temporal_averaging_minutes = validation_temporal_averaging_minutes
+        self.distance_weighting = distance_weighting
+        self.gaussian_sigma_km = gaussian_sigma_km
 
         if interpolation_method not in ("nearest", "linear", "cubic"):
             raise ValueError(
                 f"Unknown interpolation_method '{interpolation_method}'. "
                 "Use 'nearest', 'linear', or 'cubic'."
+            )
+        if distance_weighting not in ("gaussian", "inverse_distance", "linear", "equal"):
+            raise ValueError(
+                f"Unknown distance_weighting '{distance_weighting}'. "
+                "Use 'gaussian', 'inverse_distance', 'linear', or 'equal'."
             )
 
     # ------------------------------------------------------------------
@@ -231,7 +370,16 @@ class PointLayerCollocation:
         sar_scene_name: str = "",
     ) -> List[CollocatedPoint]:
         """
-        Match validation point observations to the SAR grid.
+        Match validation observations to the SAR grid using distance-weighted aggregation.
+
+        Algorithm
+        ---------
+        For each validation observation:
+
+        1. Find all SAR cells within ``aggregation_window_km`` (circular radius).
+        2. Compute distance-weighted average of SAR variables using ``distance_weighting`` method.
+        3. Temporally average validation observations within ±``validation_temporal_averaging_minutes``.
+        4. Create single `CollocatedPoint` with aggregated SAR vs. aggregated validation.
 
         Parameters
         ----------
@@ -243,155 +391,194 @@ class PointLayerCollocation:
             SAR acquisition times, shape ``(time,)``.
         val_data : pd.DataFrame
             Validation data with columns ``lon``, ``lat``, ``time``, and
-            any number of variable columns.  An optional ``platform_id``
-            column is used to populate ``CollocatedPoint.val_id``.
+            any number of variable columns.
         val_source : str
             Label for the validation source (e.g. ``"buoy"``).
         sar_scene_name : str
-            Name of the SAR scene node in the DataTree (used to retrieve
-            patches later).  Defaults to an empty string.
+            Name of the SAR scene node in the DataTree.
 
         Returns
         -------
         list[CollocatedPoint]
+            List of collocated matches (one per validation observation).
         """
+        from datetime import timedelta as _td
+
         sar_times = _to_datetime_array(sar_time)
         collocations: List[CollocatedPoint] = []
 
-        # Fast pre-filters — eliminate rows that cannot possibly match
-        # before entering the expensive per-row Haversine loop.
-
-        # 1. Spatial bounding-box filter (1° ≈ 55–111 km; 55 is conservative)
-        deg_buf = self.spatial_tolerance_km / 55.0
+        # Pre-filters: eliminate validation rows that cannot match
+        # Use spatial_tolerance_km for initial bounding box
+        deg_buf = self.aggregation_window_km / 55.0  # Use aggregation window for pre-filter
         lon_min = float(sar_lon.min()) - deg_buf
         lon_max = float(sar_lon.max()) + deg_buf
         lat_min = float(sar_lat.min()) - deg_buf
         lat_max = float(sar_lat.max()) + deg_buf
+
         spatial_mask = (
             (val_data["lon"] >= lon_min) & (val_data["lon"] <= lon_max) &
             (val_data["lat"] >= lat_min) & (val_data["lat"] <= lat_max)
         )
-        val_data = val_data[spatial_mask]
-        if val_data.empty:
+        val_data_filtered = val_data[spatial_mask].copy()
+
+        if val_data_filtered.empty:
+            logger.debug("No validation data within spatial bounds")
             return collocations
 
-        # 2. Temporal window filter
-        from datetime import timedelta as _td
+        # Temporal pre-filter
         t_min = min(sar_times) - _td(minutes=self.time_tolerance_minutes)
         t_max = max(sar_times) + _td(minutes=self.time_tolerance_minutes)
         if hasattr(t_min, "tzinfo") and t_min.tzinfo is not None:
             t_min = t_min.replace(tzinfo=None)
             t_max = t_max.replace(tzinfo=None)
-        val_times_pd = pd.to_datetime(val_data["time"].values)
+
+        val_times_pd = pd.to_datetime(val_data_filtered["time"].values)
         if val_times_pd.tz is not None:
             val_times_pd = val_times_pd.tz_localize(None)
+
         temporal_mask = (val_times_pd >= t_min) & (val_times_pd <= t_max)
-        val_data = val_data[temporal_mask]
-        if val_data.empty:
+        val_data_filtered = val_data_filtered[temporal_mask]
+
+        if val_data_filtered.empty:
+            logger.debug("No validation data within temporal window")
             return collocations
 
         logger.debug(
-            "Pre-filters kept %d validation rows (spatial bbox + temporal window)",
-            len(val_data),
+            "Pre-filters kept %d validation rows (spatial + temporal)",
+            len(val_data_filtered),
         )
 
-        for _, val_row in val_data.iterrows():
+        # Identify numeric columns (for aggregation)
+        numeric_cols = [
+            col for col in val_data_filtered.columns
+            if col not in {"lon", "lat", "time", "platform_id"} and
+            pd.api.types.is_numeric_dtype(val_data_filtered[col])
+        ]
+
+        # Process each validation observation
+        for idx, val_row in val_data_filtered.iterrows():
             v_lon = float(val_row["lon"])
             v_lat = float(val_row["lat"])
             v_time = _to_datetime_array([val_row["time"]])[0]
 
-            nearby_cells = self._nearby_cells(v_lon, v_lat, sar_lon, sar_lat)
-            if not nearby_cells:
+            # Find nearby SAR cells within aggregation window
+            nearby_cells_with_dist = self._nearby_cells_with_distances(
+                v_lon, v_lat, sar_lon, sar_lat, self.aggregation_window_km
+            )
+
+            if not nearby_cells_with_dist:
+                logger.debug(
+                    "No SAR cells within %.1f km of validation point (%.2f, %.2f)",
+                    self.aggregation_window_km, v_lon, v_lat
+                )
                 continue
 
+            # Find nearby SAR times
             nearby_t_idx = self._nearby_times(v_time, sar_times)
-            if len(nearby_t_idx) == 0:
+            if not nearby_t_idx:
+                logger.debug(
+                    "No SAR times within %d minutes of validation time",
+                    self.time_tolerance_minutes
+                )
                 continue
 
+            # Process each nearby SAR time
             for t_idx in nearby_t_idx:
-                for y_idx, x_idx in nearby_cells:
-                    # Extract SAR values at this pixel
-                    sar_point: Dict[str, float] = {}
-                    for var_name, var_arr in sar_data.items():
-                        value = var_arr[t_idx, y_idx, x_idx]
-                        if not np.isnan(value):
-                            sar_point[var_name] = float(value)
+                # Compute aggregated SAR values
+                sar_aggregated = self._compute_aggregated_sar_value(
+                    nearby_cells_with_dist,
+                    sar_data,
+                    t_idx,
+                    weighting_method=self.distance_weighting,
+                    sigma_km=self.gaussian_sigma_km,
+                    agg_window_km=self.aggregation_window_km,
+                )
 
-                    if not sar_point:
-                        continue   # all NaN at this pixel
+                if not sar_aggregated:
+                    logger.debug("No valid SAR values at t_idx=%d", t_idx)
+                    continue
 
-                    s_lon = float(sar_lon[y_idx, x_idx])
-                    s_lat = float(sar_lat[y_idx, x_idx])
-                    s_time = sar_times[t_idx]
+                # Aggregate validation observations temporally
+                val_aggregated = self._average_validation_observations(
+                    val_data_filtered,
+                    v_time,
+                    self.validation_temporal_averaging_minutes,
+                    numeric_cols,
+                )
 
-                    spatial_dist  = _haversine_distance(v_lon, v_lat, s_lon, s_lat)
-                    temporal_dist = abs(
-                        (v_time - s_time).total_seconds() / 60.0
+                # If no temporal aggregation found, use current observation
+                if not val_aggregated:
+                    val_aggregated = {
+                        col: float(val_row[col])
+                        for col in numeric_cols
+                        if pd.notna(val_row[col])
+                    }
+
+                if not val_aggregated:
+                    logger.debug("No valid validation values")
+                    continue
+
+                # Compute SAR position (center of aggregation window or closest cell)
+                closest_idx = np.argmin([d for _, _, d in nearby_cells_with_dist])
+                y_idx, x_idx, _ = nearby_cells_with_dist[closest_idx]
+                s_lon = float(sar_lon[y_idx, x_idx])
+                s_lat = float(sar_lat[y_idx, x_idx])
+                s_time = sar_times[t_idx]
+
+                # Compute distances from validation point to closest SAR cell
+                spatial_dist = _haversine_distance(v_lon, v_lat, s_lon, s_lat)
+                temporal_dist = abs((v_time - s_time).total_seconds() / 60.0)
+
+                # =========== RVL Projection ===========
+                # Project validation currents to radial velocity if applicable
+                if (
+                    "rvlRadVel" in sar_aggregated
+                    and "rvlHeading" in sar_data
+                    and "EWCT" in val_aggregated
+                    and "NSCT" in val_aggregated
+                ):
+                    try:
+                        # Get average rvlHeading value
+                        nearby_headings = np.array([
+                            sar_data["rvlHeading"][t_idx, y, x]
+                            for y, x, _ in nearby_cells_with_dist
+                        ])
+                        valid_headings = nearby_headings[~np.isnan(nearby_headings)]
+                        if len(valid_headings) > 0:
+                            heading_deg = np.nanmean(valid_headings)
+                            heading_rad = np.radians(float(heading_deg) - 90.0)
+                            ewct = float(val_aggregated["EWCT"])
+                            nsct = float(val_aggregated["NSCT"])
+                            radial_vel = ewct * np.cos(heading_rad) + nsct * np.sin(heading_rad)
+                            val_aggregated["rvlRadVel_projection"] = radial_vel
+                    except (KeyError, ValueError, TypeError) as e:
+                        logger.debug("RVL projection failed: %s", e)
+
+                # Create CollocatedPoint
+                collocations.append(
+                    CollocatedPoint(
+                        sar_lon=s_lon,
+                        sar_lat=s_lat,
+                        sar_time=s_time,
+                        sar_data=sar_aggregated,
+                        val_lon=v_lon,
+                        val_lat=v_lat,
+                        val_time=v_time,
+                        val_data=val_aggregated,
+                        spatial_distance_km=spatial_dist,
+                        temporal_distance_minutes=temporal_dist,
+                        val_source=val_source,
+                        val_id=val_row.get("platform_id"),
+                        collocation_type=self.collocation_type,
+                        sar_y_idx=y_idx,
+                        sar_x_idx=x_idx,
+                        sar_scene_name=sar_scene_name,
                     )
-
-                    if (
-                        spatial_dist  <= self.spatial_tolerance_km
-                        and temporal_dist <= self.time_tolerance_minutes
-                    ):
-                        val_point = {}
-                        for col in val_data.columns:
-                            if col not in {"lon", "lat", "time", "platform_id"} and pd.notna(val_row[col]):
-                                try:
-                                    val_point[col] = float(val_row[col])
-                                except (ValueError, TypeError):
-                                    # Skip non-numeric columns
-                                    pass
-
-                        # =========== RVL Projection ===========
-                        # If SAR has rvlRadVel and validation has EWCT/NSCT, project validation
-                        # currents to radial velocity for comparison
-                        if (
-                            "rvlRadVel" in sar_point
-                            and "rvlHeading" in sar_data
-                            and "EWCT" in val_point
-                            and "NSCT" in val_point
-                        ):
-                            try:
-                                # Get rvlHeading value at this point
-                                heading_deg = sar_data["rvlHeading"][t_idx, y_idx, x_idx]
-                                if not np.isnan(heading_deg):
-                                    # Convert heading to radians
-                                    heading_rad = np.radians(float(heading_deg) - 90.0)
-                                    
-                                    # Project EWCT (eastward) and NSCT (northward) onto LOS
-                                    ewct = float(val_point["EWCT"])
-                                    nsct = float(val_point["NSCT"])
-                                    radial_vel = ewct * np.cos(heading_rad) + nsct * np.sin(heading_rad)
-                                    
-                                    # Store projected radial velocity
-                                    val_point["rvlRadVel_projection"] = radial_vel
-                            except (KeyError, ValueError, TypeError) as e:
-                                logger.debug("RVL projection failed: %s", e)
-
-                        collocations.append(
-                            CollocatedPoint(
-                                sar_lon=s_lon,
-                                sar_lat=s_lat,
-                                sar_time=s_time,
-                                sar_data=sar_point,
-                                val_lon=v_lon,
-                                val_lat=v_lat,
-                                val_time=v_time,
-                                val_data=val_point,
-                                spatial_distance_km=spatial_dist,
-                                temporal_distance_minutes=temporal_dist,
-                                val_source=val_source,
-                                val_id=val_row.get("platform_id"),
-                                collocation_type=self.collocation_type,
-                                sar_y_idx=y_idx,
-                                sar_x_idx=x_idx,
-                                sar_scene_name=sar_scene_name,
-                            )
-                        )
+                )
 
         logger.info(
-            "PointLayerCollocation: found %d matches (source=%s)",
-            len(collocations), val_source,
+            "%s: found %d matches from %d validation observations (source=%s)",
+            self.__class__.__name__, len(collocations), len(val_data_filtered), val_source,
         )
         return collocations
 
@@ -417,6 +604,154 @@ class PointLayerCollocation:
             [abs((t - target).total_seconds() / 60.0) for t in time_array]
         )
         return np.where(distances <= self.time_tolerance_minutes)[0].tolist()
+
+    def _nearby_cells_with_distances(
+        self,
+        lon: float, lat: float,
+        grid_lon: np.ndarray, grid_lat: np.ndarray,
+        max_distance_km: float,
+    ) -> List[Tuple[int, int, float]]:
+        """
+        Find SAR cells within max_distance_km and return with distances.
+        
+        Returns
+        -------
+        list of (y_idx, x_idx, distance_km) tuples
+        """
+        distances = _haversine_distance_grid(lon, lat, grid_lon, grid_lat)
+        ys, xs = np.where(distances <= max_distance_km)
+        result = [(y, x, distances[y, x]) for y, x in zip(ys.tolist(), xs.tolist())]
+        return result
+
+    def _compute_aggregated_sar_value(
+        self,
+        nearby_cells_with_dist: List[Tuple[int, int, float]],
+        sar_data: Dict[str, np.ndarray],
+        t_idx: int,
+        weighting_method: str = "gaussian",
+        sigma_km: float = 2.0,
+        agg_window_km: float = 5.0,
+    ) -> Dict[str, float]:
+        """
+        Compute distance-weighted average of SAR values over nearby cells.
+        
+        Parameters
+        ----------
+        nearby_cells_with_dist : list of (y, x, distance_km)
+            Cells and their distances from the validation point.
+        sar_data : dict
+            SAR variables as 3-D arrays with shape (time, y, x).
+        t_idx : int
+            Time index to use.
+        weighting_method : str
+            "gaussian", "inverse_distance", "linear", or "equal".
+        sigma_km : float
+            Gaussian sigma or threshold for linear weighting.
+        agg_window_km : float
+            Aggregation window radius (used for linear weighting).
+        
+        Returns
+        -------
+        dict
+            {var_name: aggregated_value} with aggregated SAR values.
+        """
+        if not nearby_cells_with_dist:
+            return {}
+
+        # Extract distances and cell indices
+        cell_indices = [(y, x) for y, x, _ in nearby_cells_with_dist]
+        distances_arr = np.array([d for _, _, d in nearby_cells_with_dist])
+
+        # Compute weights
+        if weighting_method == "gaussian":
+            weights = _gaussian_weights(distances_arr, sigma_km)
+        elif weighting_method == "inverse_distance":
+            weights = _inverse_distance_weights(distances_arr, power=2.0)
+        elif weighting_method == "linear":
+            weights = _linear_weights(distances_arr, agg_window_km)
+        elif weighting_method == "equal":
+            weights = _equal_weights(distances_arr)
+        else:
+            logger.warning(f"Unknown weighting method '{weighting_method}', using equal weights")
+            weights = _equal_weights(distances_arr)
+
+        # Compute weighted average for each variable
+        result = {}
+        for var_name, var_arr in sar_data.items():
+            values = np.array([var_arr[t_idx, y, x] for y, x in cell_indices])
+            valid_mask = ~np.isnan(values)
+
+            if not np.any(valid_mask):
+                # All NaN, skip this variable
+                continue
+
+            # Use only valid values and renormalize weights
+            valid_values = values[valid_mask]
+            valid_weights = weights[valid_mask]
+            valid_weights = valid_weights / np.sum(valid_weights)  # renormalize
+
+            aggregated = np.sum(valid_values * valid_weights)
+            if not np.isnan(aggregated):
+                result[var_name] = float(aggregated)
+
+        return result
+
+    def _average_validation_observations(
+        self,
+        val_data: pd.DataFrame,
+        center_time: datetime,
+        temporal_window_minutes: int,
+        numeric_cols: List[str],
+    ) -> Dict[str, float]:
+        """
+        Average validation observations within a temporal window around center_time.
+        
+        Parameters
+        ----------
+        val_data : pd.DataFrame
+            Validation data with columns: lon, lat, time, and numeric variables.
+        center_time : datetime
+            Center time for the window.
+        temporal_window_minutes : int
+            Half-width of window (window is ±temporal_window_minutes from center).
+        numeric_cols : list of str
+            Column names to average.
+        
+        Returns
+        -------
+        dict
+            {col: averaged_value} for all numeric_cols.
+        """
+        from datetime import timedelta as _td
+
+        t_min = center_time - _td(minutes=temporal_window_minutes)
+        t_max = center_time + _td(minutes=temporal_window_minutes)
+
+        # Handle timezone-aware datetimes
+        if hasattr(center_time, "tzinfo") and center_time.tzinfo is not None:
+            t_min = t_min.replace(tzinfo=None)
+            t_max = t_max.replace(tzinfo=None)
+
+        val_times_pd = pd.to_datetime(val_data["time"].values)
+        if val_times_pd.tz is not None:
+            val_times_pd = val_times_pd.tz_localize(None)
+
+        temporal_mask = (val_times_pd >= t_min) & (val_times_pd <= t_max)
+        subset = val_data[temporal_mask]
+
+        if subset.empty:
+            # No observations in window, return empty
+            return {}
+
+        result = {}
+        for col in numeric_cols:
+            if col in subset.columns:
+                values = subset[col].values
+                valid_mask = pd.notna(values)
+                if np.any(valid_mask):
+                    result[col] = float(np.nanmean(values[valid_mask]))
+
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +965,10 @@ def run_collocation(
                         spatial_tolerance_km=coll_cfg.spatial_tolerance_km,
                         time_tolerance_minutes=coll_cfg.time_tolerance_minutes,
                         interpolation_method=coll_cfg.interpolation_method,
+                        aggregation_window_km=coll_cfg.aggregation_window_km,
+                        validation_temporal_averaging_minutes=coll_cfg.validation_temporal_averaging_minutes,
+                        distance_weighting=coll_cfg.distance_weighting,
+                        gaussian_sigma_km=coll_cfg.gaussian_sigma_km,
                     )
                     for val_name, val_ds in sources.items():
                         df = val_ds.to_dataframe().reset_index(drop=True)
@@ -672,6 +1011,10 @@ def run_collocation(
                     spatial_tolerance_km=coll_cfg.spatial_tolerance_km,
                     time_tolerance_minutes=coll_cfg.time_tolerance_minutes,
                     interpolation_method=coll_cfg.interpolation_method,
+                    aggregation_window_km=coll_cfg.aggregation_window_km,
+                    validation_temporal_averaging_minutes=coll_cfg.validation_temporal_averaging_minutes,
+                    distance_weighting=coll_cfg.distance_weighting,
+                    gaussian_sigma_km=coll_cfg.gaussian_sigma_km,
                 )
                 for val_name, val_ds in sources.items():
                     df = val_ds.to_dataframe().reset_index(drop=True)

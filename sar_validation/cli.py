@@ -46,8 +46,9 @@ Examples:
   sar-validate --create-recipe wind --start 2026-03-01 --end 2026-03-31
   sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65 --start 2026-03-01 --end 2026-03-31
   sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65 --start 2026-03-01 --end 2026-03-31 --recipe-name north_sea_march_2026
-  sar-validate --recipe recipes/wind_validation.yaml --dry-run
-  sar-validate --recipe recipes/wind_validation.yaml
+  sar-validate --recipe recipes/wind_validation.yaml --dry-run #no data will be downloaded, just show what would be downloaded
+  sar-validate --recipe recipes/wind_validation.yaml # for downloading the data if there is not already a download_metadata.json file in the data folder
+  sar-validate --recipe recipes/wind_validation.yaml --force-download # overrides the download_metadata.json and redownloads the data
   sar-validate --recipe recipes/wind_validation.yaml --convert
   sar-validate --recipe recipes/wind_validation.yaml --convert --collocate
   sar-validate --recipe recipes/wind_validation.yaml --stats
@@ -146,6 +147,11 @@ Examples:
         help="Override the output directory specified in the recipe",
     )
     parser.add_argument(
+        "--force-download",
+        action="store_true",
+        help="Re-download data even if it already exists",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable DEBUG logging",
@@ -175,6 +181,7 @@ Examples:
             args.recipe,
             dry_run=args.dry_run,
             output_dir=args.output_dir,
+            force_download=args.force_download,
             convert=args.convert or args.collocate or args.stats or args.plot,
             collocate=args.collocate or args.stats or args.plot,
             stats=args.stats or args.plot,
@@ -317,6 +324,7 @@ def _execute_recipe(
     recipe_path: str,
     dry_run: bool = False,
     output_dir: str = None,
+    force_download: bool = False,
     convert: bool = False,
     collocate: bool = False,
     stats: bool = False,
@@ -340,8 +348,8 @@ def _execute_recipe(
 
     orchestrator = DataOrchestrator(recipe, dry_run=dry_run)
 
-    # Skip download if data was already downloaded successfully
-    if not dry_run and _is_already_downloaded(orchestrator.base_dir):
+    # Skip download if data was already downloaded successfully and not forcing re-download
+    if not dry_run and not force_download and _is_already_downloaded(orchestrator.base_dir):
         logger.info(
             "Data already downloaded in %s — skipping Step 1.",
             orchestrator.base_dir,
@@ -431,7 +439,9 @@ def _convert_data(recipe, base_dir: Path) -> "xr.DataTree | None":
     from .core.datatree_converter import DataTreeConverter
 
     print("\nStep 2: Converting data to DataTree…")
-    tree = DataTreeConverter.convert_downloaded_data(base_dir)
+    # Extract product type from recipe to guide SAR data extraction
+    product_type = getattr(recipe.config, "variable", "wind")  # Default to "wind" for backward compatibility
+    tree = DataTreeConverter.convert_downloaded_data(base_dir, product_type=product_type)
     if tree is None:
         print("  No data files found — nothing to convert.")
         return None
@@ -464,7 +474,7 @@ def _collocate_data(recipe, base_dir: Path) -> None:
         try:
             sar_var = _infer_sar_var_from_recipe(recipe)
             recipe_name = recipe.config.name or "unknown"
-            png_path = plot_sar_on_no_collocation(tree, sar_var, recipe_name, base_dir)
+            png_path = plot_sar_on_no_collocation(tree, sar_var, recipe_name, base_dir, recipe=recipe)
             if png_path:
                 print(f"  Generated SAR coverage plot: {png_path.relative_to(base_dir.parent)}")
         except Exception as exc:
