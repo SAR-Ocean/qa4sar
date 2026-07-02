@@ -36,7 +36,7 @@ from typing import Optional
 
 import pandas as pd
 
-from .base import normalize_datetime, build_output_dir
+from .base import normalize_datetime, is_date_recent, build_output_dir
 
 __all__ = ["InSituDownloader"]
 
@@ -129,6 +129,7 @@ class InSituDownloader:
         start: str,
         end: str,
         source_types: Optional[list[str]] = None,
+        dataset_part: Optional[str] = None,
     ) -> Optional[Path]:
         """
         Download in-situ observations and save to a CSV.
@@ -138,6 +139,9 @@ class InSituDownloader:
         source_types : list[str], optional
             Filter by platform type(s): mooring, buoy, ferrybox, drifter, tidal_gauge.
             None or empty list means keep all platform types.
+        dataset_part : str, optional
+            Which dataset part to use: "monthly" (historical) or "latest" (recent).
+            If None, auto-detects based on whether end_date is within 30 days.
 
         Returns
         -------
@@ -169,26 +173,46 @@ class InSituDownloader:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Auto-detect dataset_part if not provided
+        if dataset_part is None:
+            dataset_part = "latest" if is_date_recent(end_dt) else "monthly"
+
         # Run the copernicusmarine subset call (downloads to CWD by default)
         print(f"Downloading in-situ data …")
         print(f"  Region: lon [{min_lon}, {max_lon}] lat [{min_lat}, {max_lat}]")
         print(f"  Time:   {start_dt} → {end_dt}")
         print(f"  Depth:  {self.min_depth} to {self.max_depth} m")
+        print(f"  Dataset: {dataset_part}")
 
-        copernicusmarine.subset(
-            dataset_id=DATASET_ID,
-            dataset_part="monthly",
-            variables=ALL_VARIABLES,
-            minimum_longitude=min_lon,
-            maximum_longitude=max_lon,
-            minimum_latitude=min_lat,
-            maximum_latitude=max_lat,
-            start_datetime=start_dt,
-            end_datetime=end_dt,
-            minimum_depth=self.min_depth,
-            maximum_depth=self.max_depth,
-            force_download=False,
-        )
+        # Try initial dataset_part, with fallback if data not available
+        try:
+            self._download_with_part(
+                copernicusmarine,
+                dataset_part,
+                min_lon, max_lon, min_lat, max_lat,
+                start_dt, end_dt,
+            )
+        except Exception as e:
+            error_msg = str(e)
+            # Check if error is about data exceeding coordinates (date outside available range)
+            if "exceed the dataset coordinates" in error_msg or "out of bounds" in error_msg.lower():
+                # Try the opposite dataset_part
+                alt_dataset_part = "monthly" if dataset_part == "latest" else "latest"
+                print(f"  Retrying with dataset_part='{alt_dataset_part}' due to: {error_msg[:100]}…")
+                try:
+                    self._download_with_part(
+                        copernicusmarine,
+                        alt_dataset_part,
+                        min_lon, max_lon, min_lat, max_lat,
+                        start_dt, end_dt,
+                    )
+                    dataset_part = alt_dataset_part
+                except Exception as e2:
+                    # Both failed, raise the second error
+                    raise e2
+            else:
+                # Not a data availability error, re-raise original
+                raise
 
         # Move the file (copernicusmarine writes it to CWD) to our output_dir
         if Path(expected_filename).exists():
@@ -219,6 +243,33 @@ class InSituDownloader:
                     print(f"  Filtered to {len(df)} rows ({', '.join(source_types)})")
 
         return dest_path
+
+    def _download_with_part(
+        self,
+        copernicusmarine,
+        dataset_part: str,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start_dt: str,
+        end_dt: str,
+    ) -> None:
+        """Internal helper to run copernicusmarine.subset() with a specific dataset_part."""
+        copernicusmarine.subset(
+            dataset_id=DATASET_ID,
+            dataset_part=dataset_part,
+            variables=ALL_VARIABLES,
+            minimum_longitude=min_lon,
+            maximum_longitude=max_lon,
+            minimum_latitude=min_lat,
+            maximum_latitude=max_lat,
+            start_datetime=start_dt,
+            end_datetime=end_dt,
+            minimum_depth=self.min_depth,
+            maximum_depth=self.max_depth,
+            force_download=False,
+        )
 
 
 # ---------------------------------------------------------------------------

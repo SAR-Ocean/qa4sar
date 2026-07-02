@@ -26,6 +26,7 @@ __all__ = [
     "authenticate_cdse",
     "authenticate_eumdac",
     "normalize_datetime",
+    "is_date_recent",
     "build_output_dir",
 ]
 
@@ -309,11 +310,61 @@ def authenticate_eumdac(
 # ---------------------------------------------------------------------------
 
 def normalize_datetime(dt_str: str) -> str:
-    """Ensure an ISO datetime string has a T separator (no trailing Z)."""
-    dt_str = dt_str.strip().replace(" ", "T").rstrip("Z").split(".")[0]
-    if len(dt_str) == 10:
+    """
+    Normalize a datetime string to ISO format (YYYY-MM-DDTHH:MM:SS).
+    
+    Accepts:
+    - Date only: "2026-01-01" → "2026-01-01T00:00:00"
+    - With T separator: "2026-01-01T12:34:56" → unchanged
+    - With space separator: "2026-01-01 12:34:56" → "2026-01-01T12:34:56"
+    - With HHMMSS (no colons): "2026-01-01 120000" → "2026-01-01T12:00:00"
+    - With Z suffix: "2026-01-01T12:34:56Z" → "2026-01-01T12:34:56"
+    """
+    dt_str = dt_str.strip().rstrip("Z").split(".")[0]  # Remove Z and milliseconds
+    
+    # Replace space with T if present
+    if " " in dt_str:
+        dt_str = dt_str.replace(" ", "T")
+    
+    # Split date and time parts
+    if "T" in dt_str:
+        date_part, time_part = dt_str.split("T", 1)
+        # Check if time_part is 6 digits (HHMMSS format without colons)
+        if len(time_part) == 6 and time_part.isdigit():
+            # Convert HHMMSS to HH:MM:SS
+            time_part = f"{time_part[0:2]}:{time_part[2:4]}:{time_part[4:6]}"
+        dt_str = f"{date_part}T{time_part}"
+    elif len(dt_str) == 10:
+        # Date only
         dt_str += "T00:00:00"
+    
     return dt_str
+
+
+def is_date_recent(dt_str: str, threshold_days: int = 30) -> bool:
+    """
+    Check if a datetime string is within the recent threshold.
+    
+    Parameters
+    ----------
+    dt_str : str
+        DateTime string (will be normalized to ISO format).
+    threshold_days : int
+        Number of days from today to consider "recent" (default: 30).
+    
+    Returns
+    -------
+    bool
+        True if the date is within threshold_days from today, False otherwise.
+    """
+    dt_norm = normalize_datetime(dt_str)
+    # Parse ISO format: YYYY-MM-DDTHH:MM:SS
+    try:
+        dt_obj = datetime.fromisoformat(dt_norm)
+        days_diff = (datetime.now() - dt_obj).days
+        return 0 <= days_diff <= threshold_days
+    except ValueError:
+        return False
 
 
 def build_output_dir(
