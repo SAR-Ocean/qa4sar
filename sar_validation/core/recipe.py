@@ -95,8 +95,13 @@ class CollocationType:
       trajectory_vs_layer — moving trajectory vs. SAR grid            🚧
       layer_vs_layer      — another gridded product vs. SAR grid      🚧
     """
-    time_tolerance_minutes: int = 60
-    spatial_tolerance_km: float = 50.0
+    time_tolerance_minutes: int = 30
+    """Temporal tolerance (minutes). Based on Abderrahim et al. (hal-04202202):
+       - Point vs layer (buoys, moorings): ±30 min
+       - Per-source overrides can specify different values (e.g., 180 min for scatterometer).
+    """
+    spatial_tolerance_km: float = 12.5
+    """Spatial tolerance (km). Based on Abderrahim et al. (hal-04202202): 12.5 km."""
     interpolation_method: str = "nearest"  # nearest | linear | cubic
     aggregation_window_km: float = 5.0
     """Circular radius (km) around validation point for SAR aggregation."""

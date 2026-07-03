@@ -320,7 +320,7 @@ class PointLayerCollocation:
         - ``"linear"`` — Linear decay
         - ``"equal"`` — Uniform weights
     gaussian_sigma_km : float
-        Standard deviation (km) for Gaussian weighting. Default: 2.0 km.
+        Standard deviation (km) for Gaussian weighting. Default: 5.0 km.
     """
 
     #: Collocation type label stored on each CollocatedPoint result.
@@ -328,13 +328,13 @@ class PointLayerCollocation:
 
     def __init__(
         self,
-        spatial_tolerance_km: float = 50.0,
-        time_tolerance_minutes: int = 60,
+        spatial_tolerance_km: float = 12.5, #based on teh 12.5 km spatial tolerance used in Abderrahim et al. 2019
+        time_tolerance_minutes: int = 30, #based on the 30 min interval for buoys vs SAR in Abderrahim et al. 2019
         interpolation_method: str = "nearest",
         aggregation_window_km: float = 5.0,
         validation_temporal_averaging_minutes: int = 30,
         distance_weighting: str = "gaussian",
-        gaussian_sigma_km: float = 2.0,
+        gaussian_sigma_km: float = 5.0,
     ) -> None:
         self.spatial_tolerance_km = spatial_tolerance_km
         self.time_tolerance_minutes = time_tolerance_minutes
@@ -805,6 +805,30 @@ def _load_rvl_for_collocation(
             logger.debug("Could not load RVL for %s: %s", safe_dir.name, e)
 
 
+def _merge_collocation_kwargs(
+    global_kwargs: Dict[str, Any],
+    per_source_kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Merge global collocation settings with per-source overrides.
+
+    Parameters
+    ----------
+    global_kwargs : dict
+        Global collocation parameters from recipe.config.collocation.
+    per_source_kwargs : dict
+        Per-source overrides from validation_sources[i].collocation_kwargs.
+
+    Returns
+    -------
+    dict
+        Merged kwargs with per_source values overriding globals.
+    """
+    merged = dict(global_kwargs)
+    merged.update(per_source_kwargs)
+    return merged
+
+
 def run_collocation(
     recipe,
     datatree: "xr.DataTree",
@@ -826,7 +850,8 @@ def run_collocation(
     :func:`_detect_collocation_type`).
 
     The collocation parameters (tolerances, interpolation method) are taken
-    from ``recipe.config.collocation``.
+    from ``recipe.config.collocation`` with per-source overrides applied
+    from ``validation_sources[i].collocation_kwargs``.
 
     DataTree layout expected
     ------------------------
@@ -866,6 +891,23 @@ def run_collocation(
         "layer_vs_layer":       LayerLayerCollocation,
     }
 
+    # Build a map of source_type to collocation_kwargs for per-source overrides
+    source_type_overrides: Dict[str, Dict[str, Any]] = {}
+    for src in recipe.config.validation_sources:
+        if src.collocation_kwargs:
+            source_type_overrides[src.source_type] = src.collocation_kwargs
+
+    # Convert global collocation config to dict for easy merging
+    global_coll_kwargs = {
+        "spatial_tolerance_km": coll_cfg.spatial_tolerance_km,
+        "time_tolerance_minutes": coll_cfg.time_tolerance_minutes,
+        "interpolation_method": coll_cfg.interpolation_method,
+        "aggregation_window_km": coll_cfg.aggregation_window_km,
+        "validation_temporal_averaging_minutes": coll_cfg.validation_temporal_averaging_minutes,
+        "distance_weighting": coll_cfg.distance_weighting,
+        "gaussian_sigma_km": coll_cfg.gaussian_sigma_km,
+    }
+
     # Collect SAR nodes (one Dataset per SAR scene)
     sar_scenes: Dict[str, Any] = {}
     if "sar" in datatree.children:
@@ -880,8 +922,9 @@ def run_collocation(
     _load_rvl_for_collocation(sar_scenes, base_dir)
 
     # Collect validation nodes (flatten up to two levels deep) and bucket
-    # each by its auto-detected collocation type.
+    # each by its auto-detected collocation type, tracking source metadata.
     buckets: Dict[str, Dict[str, Any]] = {t: {} for t in _COLLOC_CLASSES}
+    source_metadata: Dict[str, Dict[str, Any]] = {}  # source_name -> {source_type, colloc_kwargs}
 
     if "validation" in datatree.children:
         for name, node in datatree["validation"].children.items():
@@ -889,6 +932,12 @@ def run_collocation(
             if "point" in ds.dims and len(ds.data_vars) > 0:
                 ctype = _detect_collocation_type(ds, name)
                 buckets[ctype][name] = ds
+                # Try to infer source_type from the first matching validation source config
+                source_type = ds.attrs.get("platform_type", name.split("/")[-1])
+                source_metadata[name] = {
+                    "source_type": source_type,
+                    "colloc_kwargs": source_type_overrides.get(source_type, {}),
+                }
             # One level deeper (e.g. validation/osi_saf_winds/<file>)
             for subname, subnode in node.children.items():
                 sub_ds = subnode.to_dataset()
@@ -896,6 +945,12 @@ def run_collocation(
                     path = f"{name}/{subname}"
                     ctype = _detect_collocation_type(sub_ds, path)
                     buckets[ctype][path] = sub_ds
+                    # Use the top-level name as source_type hint
+                    source_type = name
+                    source_metadata[path] = {
+                        "source_type": source_type,
+                        "colloc_kwargs": source_type_overrides.get(source_type, {}),
+                    }
 
     total_sources = sum(len(v) for v in buckets.values())
     if total_sources == 0:
@@ -961,16 +1016,13 @@ def run_collocation(
                 for ctype, sources in buckets.items():
                     if not sources:
                         continue
-                    colloc = _COLLOC_CLASSES[ctype](
-                        spatial_tolerance_km=coll_cfg.spatial_tolerance_km,
-                        time_tolerance_minutes=coll_cfg.time_tolerance_minutes,
-                        interpolation_method=coll_cfg.interpolation_method,
-                        aggregation_window_km=coll_cfg.aggregation_window_km,
-                        validation_temporal_averaging_minutes=coll_cfg.validation_temporal_averaging_minutes,
-                        distance_weighting=coll_cfg.distance_weighting,
-                        gaussian_sigma_km=coll_cfg.gaussian_sigma_km,
-                    )
                     for val_name, val_ds in sources.items():
+                        # Apply per-source kwargs overrides
+                        per_source_kwargs = source_metadata.get(val_name, {}).get("colloc_kwargs", {})
+                        merged_kwargs = _merge_collocation_kwargs(global_coll_kwargs, per_source_kwargs)
+
+                        colloc = _COLLOC_CLASSES[ctype](**merged_kwargs)
+
                         df = val_ds.to_dataframe().reset_index(drop=True)
                         source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
 
@@ -1007,16 +1059,13 @@ def run_collocation(
             for ctype, sources in buckets.items():
                 if not sources:
                     continue
-                colloc = _COLLOC_CLASSES[ctype](
-                    spatial_tolerance_km=coll_cfg.spatial_tolerance_km,
-                    time_tolerance_minutes=coll_cfg.time_tolerance_minutes,
-                    interpolation_method=coll_cfg.interpolation_method,
-                    aggregation_window_km=coll_cfg.aggregation_window_km,
-                    validation_temporal_averaging_minutes=coll_cfg.validation_temporal_averaging_minutes,
-                    distance_weighting=coll_cfg.distance_weighting,
-                    gaussian_sigma_km=coll_cfg.gaussian_sigma_km,
-                )
                 for val_name, val_ds in sources.items():
+                    # Apply per-source kwargs overrides
+                    per_source_kwargs = source_metadata.get(val_name, {}).get("colloc_kwargs", {})
+                    merged_kwargs = _merge_collocation_kwargs(global_coll_kwargs, per_source_kwargs)
+
+                    colloc = _COLLOC_CLASSES[ctype](**merged_kwargs)
+
                     df = val_ds.to_dataframe().reset_index(drop=True)
                     source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
 
@@ -1082,17 +1131,394 @@ class TrajectoryLayerCollocation(PointLayerCollocation):
 
 class LayerLayerCollocation(PointLayerCollocation):
     """
-    Match a gridded validation product (e.g. scatterometer swath) to a SAR
-    layer cell-by-cell.
+    Match a gridded validation product (e.g. ASCAT scatterometer swath) to a SAR
+    layer by aggregating SAR pixels within each scatterometer wind vector cell.
 
-    The validation dataset is flattened to individual (lon, lat, time)
-    observations before matching — each grid cell is treated as an
-    independent point and checked against the SAR grid with the same
-    Haversine + temporal tolerance logic as ``PointLayerCollocation``.
+    Grid-aware aggregation approach
+    --------------------------------
+    Unlike the parent ``PointLayerCollocation``, this class:
 
-    Results are labelled ``collocation_type="layer_vs_layer"``.
+    1. **Detects scatterometer grid structure** — reconstructs spatial cells from 
+       flattened scatterometer data using adaptive clustering based on point spacing.
+    
+    2. **SAR Aggregation**: For each scatterometer cell, finds all SAR grid cells 
+       within ``aggregation_window_km`` (e.g., 12.5 km for ASCAT) and computes a 
+       distance-weighted average of SAR variables.
+    
+    3. **Validation Aggregation**: Temporally averages scatterometer observations 
+       within ±``validation_temporal_averaging_minutes`` around each cell center.
+    
+    4. **Output**: Single ``CollocatedPoint`` per scatterometer cell with aggregated 
+       SAR mean vs. aggregated scatterometer mean.
 
-    Typical use cases: ASCAT scatterometer swaths, OSI-SAF wind products.
+    Typical use cases: ASCAT scatterometer swaths (12.5×12.5 km cells), OSI-SAF wind products.
+
+    Collocation parameters
+    ----------------------
+    See parent class, but LayerLayerCollocation provides different defaults optimized 
+    for scatterometer-SAR comparison:
+
+    - ``aggregation_window_km`` : 12.5 km (ASCAT scatterometer cell size)
+    - ``time_tolerance_minutes`` : 180 min (±3 hours, per hal-04202202)
+    - ``distance_weighting`` : "equal" (uniform weights across regular grid cells)
+    - ``validation_temporal_averaging_minutes`` : 60 min (±1 hour window)
+
+    Reference
+    ---------
+    Collocation methodology follows:
+    - Abderrahim et al. (2019) — paper hal-04202202
+      "Validation of Sentinel-1 wind products against scatterometer measurements"
+    - Spatial tolerance: 12.5 km (ASCAT cell size)
+    - Temporal tolerance: 180 minutes (3-hour match window)
     """
 
     collocation_type: str = "layer_vs_layer"
+
+    def __init__(
+        self,
+        spatial_tolerance_km: float = 12.5,
+        time_tolerance_minutes: int = 180,
+        interpolation_method: str = "nearest",
+        aggregation_window_km: float = 12.5,
+        validation_temporal_averaging_minutes: int = 60,
+        distance_weighting: str = "equal",
+        gaussian_sigma_km: float = 12.5,
+    ) -> None:
+        """
+        Initialize LayerLayerCollocation with scatterometer-optimized defaults.
+
+        Parameters
+        ----------
+        spatial_tolerance_km : float
+            Maximum distance for pre-filtering (12.5 km per ASCAT specification).
+        time_tolerance_minutes : int
+            Maximum time difference for matching (180 min per hal-04202202).
+        interpolation_method : str
+            Retained for compatibility; currently unused.
+        aggregation_window_km : float
+            SAR aggregation radius around each scatterometer cell (12.5 km).
+        validation_temporal_averaging_minutes : int
+            Half-width of temporal window for scatterometer averaging (60 min).
+        distance_weighting : str
+            SAR weighting method: "equal" (default), "gaussian", "inverse_distance", "linear".
+        gaussian_sigma_km : float
+            Gaussian sigma if using Gaussian weighting (12.5 km default).
+        """
+        super().__init__(
+            spatial_tolerance_km=spatial_tolerance_km,
+            time_tolerance_minutes=time_tolerance_minutes,
+            interpolation_method=interpolation_method,
+            aggregation_window_km=aggregation_window_km,
+            validation_temporal_averaging_minutes=validation_temporal_averaging_minutes,
+            distance_weighting=distance_weighting,
+            gaussian_sigma_km=gaussian_sigma_km,
+        )
+        logger.debug(
+            "LayerLayerCollocation initialized: %d min temporal, %.1f km spatial, "
+            "%s weighting, %.1f km aggregation window",
+            self.time_tolerance_minutes,
+            self.spatial_tolerance_km,
+            self.distance_weighting,
+            self.aggregation_window_km,
+        )
+
+    def _infer_scatterometer_grid(
+        self,
+        val_data: pd.DataFrame,
+        linkage_method: str = "complete",
+        distance_threshold_percentile: float = 60.0,
+    ) -> Dict[int, List[int]]:
+        """
+        Reconstruct scatterometer grid structure using hierarchical clustering.
+
+        ASCAT scatterometer data is typically delivered as a 2D swath (e.g., 3168×82 cells)
+        but converted to a flat ``point`` dimension. This method reconstructs the grid
+        by detecting natural spatial clusters using hierarchical clustering on
+        all scatterometer points.
+
+        Algorithm
+        ----------
+        1. Compute pairwise Haversine distances between all scatterometer points.
+        2. Run hierarchical clustering (complete linkage) on the distance matrix.
+        3. Estimate cell size from distance histogram (typically 12.5 km for ASCAT).
+        4. Cut dendrogram at threshold ≈ 0.6 × median_distance to group nearby points into cells.
+        5. Return dictionary mapping cell ID → list of point row indices.
+
+        Parameters
+        ----------
+        val_data : pd.DataFrame
+            Validation data with columns ``lon``, ``lat``, ``time``, and numeric variables.
+        linkage_method : str
+            Hierarchical clustering method: "complete", "average", "single", "ward".
+        distance_threshold_percentile : float
+            Percentile of distance distribution to use as clustering threshold (60th percentile default).
+
+        Returns
+        -------
+        dict
+            Mapping: cell_id (int) → list of point row indices (list of int).
+            If clustering fails, returns {0: list(range(len(val_data)))} (all points in one cell).
+        """
+        from scipy.cluster.hierarchy import linkage, fcluster
+        from scipy.spatial.distance import pdist
+
+        n_points = len(val_data)
+        if n_points < 2:
+            # Single point or empty → treat as one cell
+            return {0: list(range(n_points))}
+
+        # Extract coordinates
+        lons = val_data["lon"].values
+        lats = val_data["lat"].values
+
+        try:
+            # Compute pairwise Haversine distances
+            logger.debug("Computing pairwise distances for %d scatterometer points...", n_points)
+            distances = []
+            for i in range(n_points):
+                for j in range(i + 1, n_points):
+                    d = _haversine_distance(lons[i], lats[i], lons[j], lats[j])
+                    distances.append(d)
+
+            if not distances:
+                logger.warning("No distances computed; falling back to single cell.")
+                return {0: list(range(n_points))}
+
+            distances = np.array(distances)
+
+            # Estimate threshold from distance histogram
+            # ASCAT cell size is ~12.5 km; use percentile of distances as threshold
+            threshold = np.percentile(distances, distance_threshold_percentile)
+            logger.debug(
+                "Distance distribution: min=%.2f, max=%.2f, median=%.2f, threshold=%.2f km",
+                distances.min(), distances.max(), np.median(distances), threshold,
+            )
+
+            # Run hierarchical clustering
+            logger.debug("Running hierarchical clustering with linkage='%s'...", linkage_method)
+            z = linkage(distances, method=linkage_method)
+            cluster_ids = fcluster(z, threshold, criterion="distance")
+
+            # Map cluster IDs to point indices
+            cells: Dict[int, List[int]] = {}
+            for point_idx, cluster_id in enumerate(cluster_ids):
+                if cluster_id not in cells:
+                    cells[cluster_id] = []
+                cells[cluster_id].append(point_idx)
+
+            logger.info(
+                "Grid inference: detected %d cells from %d scatterometer points",
+                len(cells), n_points,
+            )
+            return cells
+
+        except Exception as e:
+            logger.warning("Grid inference failed (%s); using all points as single cell.", e)
+            return {0: list(range(n_points))}
+
+    def collocate(
+        self,
+        sar_data: Dict[str, np.ndarray],
+        sar_lon: np.ndarray,
+        sar_lat: np.ndarray,
+        sar_time: np.ndarray,
+        val_data: pd.DataFrame,
+        val_source: str,
+        sar_scene_name: str = "",
+    ) -> List[CollocatedPoint]:
+        """
+        Match scatterometer cells to SAR grid using spatial/temporal aggregation.
+
+        Algorithm
+        ---------
+        1. Infer scatterometer grid structure (group points into cells).
+        2. For each scatterometer cell:
+           a. Find all SAR cells within aggregation_window_km.
+           b. Average SAR variables (distance-weighted or equal).
+           c. Temporally average scatterometer observations within ±validation_temporal_averaging_minutes.
+           d. Create CollocatedPoint with aggregated SAR vs. aggregated scatterometer.
+
+        Parameters
+        ----------
+        sar_data : dict
+            SAR variables as 3-D arrays with shape ``(time, y, x)``.
+        sar_lon, sar_lat : np.ndarray
+            SAR coordinate grids, shape ``(y, x)``.
+        sar_time : array-like
+            SAR acquisition times, shape ``(time,)``.
+        val_data : pd.DataFrame
+            Scatterometer data with columns ``lon``, ``lat``, ``time``, and
+            any number of variable columns.
+        val_source : str
+            Label for validation source (e.g. ``"scatterometer"``).
+        sar_scene_name : str
+            Name of SAR scene node in DataTree.
+
+        Returns
+        -------
+        list[CollocatedPoint]
+            List of collocated matches (one per scatterometer cell).
+        """
+        from datetime import timedelta as _td
+
+        sar_times = _to_datetime_array(sar_time)
+        collocations: List[CollocatedPoint] = []
+
+        # Pre-filter: spatial and temporal bounds
+        deg_buf = self.aggregation_window_km / 55.0
+        lon_min = float(sar_lon.min()) - deg_buf
+        lon_max = float(sar_lon.max()) + deg_buf
+        lat_min = float(sar_lat.min()) - deg_buf
+        lat_max = float(sar_lat.max()) + deg_buf
+
+        spatial_mask = (
+            (val_data["lon"] >= lon_min) & (val_data["lon"] <= lon_max) &
+            (val_data["lat"] >= lat_min) & (val_data["lat"] <= lat_max)
+        )
+        val_data_filtered = val_data[spatial_mask].copy()
+
+        if val_data_filtered.empty:
+            logger.debug("No scatterometer data within spatial bounds")
+            return collocations
+
+        # Temporal pre-filter
+        t_min = min(sar_times) - _td(minutes=self.time_tolerance_minutes)
+        t_max = max(sar_times) + _td(minutes=self.time_tolerance_minutes)
+        if hasattr(t_min, "tzinfo") and t_min.tzinfo is not None:
+            t_min = t_min.replace(tzinfo=None)
+            t_max = t_max.replace(tzinfo=None)
+
+        val_times_pd = pd.to_datetime(val_data_filtered["time"].values)
+        if val_times_pd.tz is not None:
+            val_times_pd = val_times_pd.tz_localize(None)
+
+        temporal_mask = (val_times_pd >= t_min) & (val_times_pd <= t_max)
+        val_data_filtered = val_data_filtered[temporal_mask]
+
+        if val_data_filtered.empty:
+            logger.debug("No scatterometer data within temporal window")
+            return collocations
+
+        logger.debug(
+            "Pre-filters kept %d scatterometer points (spatial + temporal)",
+            len(val_data_filtered),
+        )
+
+        # **NEW**: Infer scatterometer grid structure
+        cells = self._infer_scatterometer_grid(val_data_filtered)
+        logger.info("LayerLayerCollocation: processing %d scatterometer cells", len(cells))
+
+        # Identify numeric columns
+        numeric_cols = [
+            col for col in val_data_filtered.columns
+            if col not in {"lon", "lat", "time", "platform_id"} and
+            pd.api.types.is_numeric_dtype(val_data_filtered[col])
+        ]
+
+        # Process each scatterometer cell
+        for cell_id, point_indices in cells.items():
+            # Get scatterometer observations in this cell
+            cell_subset = val_data_filtered.iloc[point_indices]
+
+            # Compute cell center (spatial mean)
+            c_lon = float(cell_subset["lon"].mean())
+            c_lat = float(cell_subset["lat"].mean())
+            # Use first observation time as reference (all should be close due to single pass)
+            c_time = _to_datetime_array([cell_subset["time"].iloc[0]])[0]
+
+            # Find nearby SAR cells within aggregation window
+            nearby_cells_with_dist = self._nearby_cells_with_distances(
+                c_lon, c_lat, sar_lon, sar_lat, self.aggregation_window_km
+            )
+
+            if not nearby_cells_with_dist:
+                logger.debug(
+                    "No SAR cells within %.1f km of scatterometer cell (%.2f, %.2f)",
+                    self.aggregation_window_km, c_lon, c_lat,
+                )
+                continue
+
+            # Find nearby SAR times
+            nearby_t_idx = self._nearby_times(c_time, sar_times)
+            if not nearby_t_idx:
+                logger.debug(
+                    "No SAR times within %d minutes of scatterometer cell time",
+                    self.time_tolerance_minutes,
+                )
+                continue
+
+            # Process each nearby SAR time
+            for t_idx in nearby_t_idx:
+                # Compute aggregated SAR values over nearby cells
+                sar_aggregated = self._compute_aggregated_sar_value(
+                    nearby_cells_with_dist,
+                    sar_data,
+                    t_idx,
+                    weighting_method=self.distance_weighting,
+                    sigma_km=self.gaussian_sigma_km,
+                    agg_window_km=self.aggregation_window_km,
+                )
+
+                if not sar_aggregated:
+                    logger.debug("No valid SAR values at t_idx=%d", t_idx)
+                    continue
+
+                # Aggregate scatterometer observations temporally within window
+                val_aggregated = self._average_validation_observations(
+                    cell_subset,
+                    c_time,
+                    self.validation_temporal_averaging_minutes,
+                    numeric_cols,
+                )
+
+                # If no temporal aggregation, use all values in cell averaged
+                if not val_aggregated:
+                    val_aggregated = {}
+                    for col in numeric_cols:
+                        values = cell_subset[col].values
+                        valid_mask = pd.notna(values)
+                        if np.any(valid_mask):
+                            val_aggregated[col] = float(np.nanmean(values[valid_mask]))
+
+                if not val_aggregated:
+                    logger.debug("No valid scatterometer values in cell")
+                    continue
+
+                # Use closest SAR cell for position/indices
+                closest_idx = np.argmin([d for _, _, d in nearby_cells_with_dist])
+                y_idx, x_idx, _ = nearby_cells_with_dist[closest_idx]
+                s_lon = float(sar_lon[y_idx, x_idx])
+                s_lat = float(sar_lat[y_idx, x_idx])
+                s_time = sar_times[t_idx]
+
+                # Compute distances
+                spatial_dist = _haversine_distance(c_lon, c_lat, s_lon, s_lat)
+                temporal_dist = abs((c_time - s_time).total_seconds() / 60.0)
+
+                # Create CollocatedPoint
+                collocations.append(
+                    CollocatedPoint(
+                        sar_lon=s_lon,
+                        sar_lat=s_lat,
+                        sar_time=s_time,
+                        sar_data=sar_aggregated,
+                        val_lon=c_lon,
+                        val_lat=c_lat,
+                        val_time=c_time,
+                        val_data=val_aggregated,
+                        spatial_distance_km=spatial_dist,
+                        temporal_distance_minutes=temporal_dist,
+                        val_source=val_source,
+                        val_id=None,  # Scatterometer cells don't have IDs
+                        collocation_type=self.collocation_type,
+                        sar_y_idx=y_idx,
+                        sar_x_idx=x_idx,
+                        sar_scene_name=sar_scene_name,
+                    )
+                )
+
+        logger.info(
+            "%s: found %d matches from %d scatterometer cells (source=%s)",
+            self.__class__.__name__, len(collocations), len(cells), val_source,
+        )
+        return collocations

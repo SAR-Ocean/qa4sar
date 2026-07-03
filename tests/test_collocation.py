@@ -17,6 +17,10 @@ from sar_validation.core.collocation import (
     _haversine_distance_grid,
     _to_datetime_array,
     _detect_collocation_type,
+    _gaussian_weights,
+    _inverse_distance_weights,
+    _linear_weights,
+    _equal_weights,
     TRAJECTORY_PLATFORM_TYPES,
     LAYER_DATA_TYPES,
 )
@@ -104,7 +108,8 @@ class TestPointLayerCollocation:
             WSPD=[7.5], WDIR=[220.0],
         )
 
-        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60)
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "buoy")
 
         assert len(results) > 0
@@ -139,12 +144,13 @@ class TestPointLayerCollocation:
             WSPD=[8.0],
         )
 
-        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60)
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "mooring")
         assert results == []
 
     def test_multiple_matches_per_point(self):
-        """A single validation point can match multiple SAR grid cells."""
+        """Aggregation produces one match per validation point (not per SAR cell)."""
         grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
 
         val = _make_val_dataframe(
@@ -153,10 +159,12 @@ class TestPointLayerCollocation:
             WSPD=[8.0],
         )
 
-        colloc = PointLayerCollocation(spatial_tolerance_km=500, time_tolerance_minutes=60)
+        colloc = PointLayerCollocation(spatial_tolerance_km=500, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "mooring")
-        # With a 500 km tolerance, the entire small grid should match
-        assert len(results) > 1
+        # Aggregation produces one match per validation point, not multiple for each nearby SAR cell
+        assert len(results) == 1
+        assert "WSPD" in results[0].val_data
 
     def test_collocated_point_fields(self):
         grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
@@ -168,7 +176,8 @@ class TestPointLayerCollocation:
             platform_id=["MO_001"],
         )
 
-        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60)
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "mooring")
 
         assert len(results) > 0
@@ -193,7 +202,8 @@ class TestPointLayerCollocation:
             WSPD=[7.0],
         )
 
-        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60)
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
         results = colloc.collocate(sar_data_nan, grid_lon, grid_lat, sar_time, val, "buoy")
         assert results == []
 
@@ -211,7 +221,8 @@ class TestPointLayerCollocation:
             WSPD=[6.0, 8.0, 10.0],
         )
 
-        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60)
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "mooring")
         assert len(results) > 0
 
@@ -222,7 +233,8 @@ class TestPointLayerCollocation:
             times=[datetime(2026, 1, 1, 12, 0, 0)],
             WSPD=[8.0],
         )
-        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60)
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "mooring")
         assert len(results) > 0
         assert results[0].collocation_type == "point_vs_layer"
@@ -242,7 +254,8 @@ class TestPointLayerCollocation:
             WSPD=[8.0],
         )
 
-        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60)
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time_64, val, "buoy")
         assert len(results) > 0
 
@@ -266,7 +279,8 @@ class TestTrajectoryLayerCollocation:
             EWCT=[0.3, 0.4, 0.5],
             NSCT=[0.1, 0.2, 0.1],
         )
-        colloc = TrajectoryLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60)
+        colloc = TrajectoryLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                             aggregation_window_km=100)
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "ferrybox")
 
         assert len(results) > 0
@@ -280,7 +294,8 @@ class TestTrajectoryLayerCollocation:
             times=[datetime(2026, 1, 1, 12, 0, 0)],
             EWCT=[0.5],
         )
-        colloc = TrajectoryLayerCollocation(spatial_tolerance_km=10, time_tolerance_minutes=60)
+        colloc = TrajectoryLayerCollocation(spatial_tolerance_km=10, time_tolerance_minutes=60,
+                                             aggregation_window_km=20)
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "drifter")
         assert results == []
 
@@ -306,7 +321,8 @@ class TestLayerLayerCollocation:
             wind_speed=[8.5] * mg_lon.size,
             wind_dir=[230.0] * mg_lon.size,
         )
-        colloc = LayerLayerCollocation(spatial_tolerance_km=100, time_tolerance_minutes=60)
+        colloc = LayerLayerCollocation(spatial_tolerance_km=100, time_tolerance_minutes=60,
+                                        aggregation_window_km=80)
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
 
         assert len(results) > 0
@@ -320,12 +336,150 @@ class TestLayerLayerCollocation:
             times=[datetime(2026, 1, 1, 18, 0, 0)],  # 6 h after SAR
             wind_speed=[7.0],
         )
-        colloc = LayerLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60)
+        colloc = LayerLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
         assert results == []
 
     def test_inherits_from_point_layer(self):
         assert issubclass(LayerLayerCollocation, PointLayerCollocation)
+
+    def test_layer_collocation_defaults(self):
+        """Verify LayerLayerCollocation has scatterometer-optimized defaults."""
+        colloc = LayerLayerCollocation()
+        assert colloc.time_tolerance_minutes == 180  # Paper spec: ±3 hours
+        assert colloc.spatial_tolerance_km == 12.5   # ASCAT cell size
+        assert colloc.aggregation_window_km == 12.5  # ASCAT cell size
+        assert colloc.distance_weighting == "equal"  # Uniform for regular grid
+        assert colloc.validation_temporal_averaging_minutes == 60  # ±1 hour window
+
+    def test_grid_inference_single_cell(self):
+        """Test that grid inference groups points into cells correctly."""
+        # Create a cluster of points
+        lons = np.linspace(-0.15, 0.15, 4)
+        lats = np.linspace(51.85, 52.15, 4)
+        mg_lon, mg_lat = np.meshgrid(lons, lats)
+        val = _make_val_dataframe(
+            lons=mg_lon.ravel().tolist(),
+            lats=mg_lat.ravel().tolist(),
+            times=[datetime(2026, 1, 1, 12, 0, 0)] * mg_lon.size,
+            wind_speed=[8.0] * mg_lon.size,
+        )
+        colloc = LayerLayerCollocation()
+        cells = colloc._infer_scatterometer_grid(val)
+        
+        # Should detect at least 1 cell and at most ~N cells
+        assert len(cells) >= 1, f"Expected ≥1 cell, got {len(cells)}"
+        assert len(cells) <= len(val), f"Too many cells: {len(cells)} > {len(val)}"
+        
+        # All points must be assigned
+        total_points = sum(len(indices) for indices in cells.values())
+        assert total_points == len(val), f"Point assignment mismatch: {total_points} != {len(val)}"
+        
+        # Each cell should have a valid list of indices
+        for cell_id, indices in cells.items():
+            assert isinstance(indices, list), f"Cell {cell_id} indices not a list"
+            assert len(indices) > 0, f"Cell {cell_id} is empty"
+            assert all(0 <= idx < len(val) for idx in indices), f"Cell {cell_id} has invalid indices"
+
+    def test_grid_inference_multiple_cells(self):
+        """Test that grid inference separates distant point clusters."""
+        # Create two well-separated clusters (~200 km apart)
+        lons1 = np.linspace(-1.0, -0.5, 3)
+        lats1 = np.linspace(50.0, 50.5, 3)
+        lons2 = np.linspace(1.0, 1.5, 3)
+        lats2 = np.linspace(50.0, 50.5, 3)
+        
+        lons = np.concatenate([lons1, lons2])
+        lats = np.concatenate([lats1, lats2])
+        
+        val = _make_val_dataframe(
+            lons=lons.tolist(),
+            lats=lats.tolist(),
+            times=[datetime(2026, 1, 1, 12, 0, 0)] * len(lons),
+            wind_speed=[8.0] * len(lons),
+        )
+        colloc = LayerLayerCollocation()
+        cells = colloc._infer_scatterometer_grid(val)
+        
+        # Should detect 2 or more clusters
+        assert len(cells) >= 2, f"Expected ≥2 cells for separated clusters, got {len(cells)}"
+
+    def test_grid_inference_single_point(self):
+        """Test that grid inference handles single point gracefully."""
+        val = _make_val_dataframe(
+            lons=[0.0],
+            lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            wind_speed=[8.0],
+        )
+        colloc = LayerLayerCollocation()
+        cells = colloc._infer_scatterometer_grid(val)
+        
+        assert len(cells) == 1
+        assert cells[0] == [0]
+
+    def test_aggregates_sar_within_each_cell(self):
+        """Test that SAR values are aggregated per scatterometer cell."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        
+        # Create 2 scatterometer cells: one overlapping SAR, one outside
+        cell1_lons = [0.0, 0.1, -0.1]
+        cell1_lats = [52.0, 52.1, 52.0]
+        cell2_lons = [5.0, 5.1]  # Far outside SAR grid
+        cell2_lats = [52.0, 52.1]
+        
+        val = _make_val_dataframe(
+            lons=cell1_lons + cell2_lons,
+            lats=cell1_lats + cell2_lats,
+            times=[datetime(2026, 1, 1, 12, 0, 0)] * (len(cell1_lons) + len(cell2_lons)),
+            wind_speed=[8.0] * (len(cell1_lons) + len(cell2_lons)),
+        )
+        
+        colloc = LayerLayerCollocation(
+            spatial_tolerance_km=500, 
+            time_tolerance_minutes=60,
+            aggregation_window_km=50
+        )
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
+        
+        # Should find matches only from cell1 (cell2 is outside)
+        assert len(results) > 0
+        # All matches should have collocation_type = "layer_vs_layer"
+        assert all(r.collocation_type == "layer_vs_layer" for r in results)
+        # SAR and validation locations should be relatively close
+        for r in results:
+            assert r.spatial_distance_km <= colloc.aggregation_window_km + 5  # small tolerance
+
+    def test_temporal_aggregation_within_cell(self):
+        """Test that validation observations within temporal window are averaged."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        
+        # Create scatterometer cell with multiple observations at different times
+        base_time = datetime(2026, 1, 1, 12, 0, 0)
+        times = [base_time + timedelta(minutes=i*10) for i in range(5)]
+        
+        val = _make_val_dataframe(
+            lons=[0.0] * 5,
+            lats=[52.0] * 5,
+            times=times,
+            wind_speed=[7.0, 8.0, 9.0, 8.5, 7.5],  # Varying values
+        )
+        
+        colloc = LayerLayerCollocation(
+            spatial_tolerance_km=500,
+            time_tolerance_minutes=60,
+            aggregation_window_km=50,
+            validation_temporal_averaging_minutes=30  # ±30 min window
+        )
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
+        
+        # Should produce 1 collocation (all points grouped + temporally averaged)
+        assert len(results) > 0
+        # Aggregated wind_speed should be mean of input values within temporal window
+        for r in results:
+            if "wind_speed" in r.val_data:
+                assert 7.0 <= r.val_data["wind_speed"] <= 9.0
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +528,177 @@ class TestAllTypesWork:
             (TrajectoryLayerCollocation, "trajectory_vs_layer"),
             (LayerLayerCollocation,      "layer_vs_layer"),
         ):
-            colloc = cls(spatial_tolerance_km=200, time_tolerance_minutes=60)
+            colloc = cls(spatial_tolerance_km=200, time_tolerance_minutes=60, aggregation_window_km=100)
             results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "test")
             assert len(results) > 0
             assert results[0].collocation_type == expected_type
+
+
+# ---------------------------------------------------------------------------
+# Distance weighting functions (aggregation)
+# ---------------------------------------------------------------------------
+
+class TestDistanceWeightingFunctions:
+    """Test distance weighting functions for SAR aggregation."""
+
+    def test_gaussian_weights_normalize(self):
+        """Gaussian weights should sum to 1.0."""
+        distances = np.array([0.0, 1.0, 2.0, 3.0, 5.0])
+        weights = _gaussian_weights(distances, sigma_km=2.0)
+        assert len(weights) == len(distances)
+        assert np.sum(weights) == pytest.approx(1.0)
+        assert np.all(weights >= 0)
+
+    def test_gaussian_weights_favor_close(self):
+        """Gaussian weights should favor closer distances."""
+        distances = np.array([0.0, 5.0])
+        weights = _gaussian_weights(distances, sigma_km=2.0)
+        assert weights[0] > weights[1]
+
+    def test_inverse_distance_weights_normalize(self):
+        """Inverse distance weights should sum to 1.0."""
+        distances = np.array([0.1, 1.0, 2.0, 3.0, 5.0])
+        weights = _inverse_distance_weights(distances, power=2.0)
+        assert len(weights) == len(distances)
+        assert np.sum(weights) == pytest.approx(1.0)
+        assert np.all(weights >= 0)
+
+    def test_inverse_distance_weights_favor_close(self):
+        """Inverse distance weights should favor closer distances."""
+        distances = np.array([0.5, 5.0])
+        weights = _inverse_distance_weights(distances, power=2.0)
+        assert weights[0] > weights[1]
+
+    def test_linear_weights_normalize(self):
+        """Linear weights should sum to 1.0."""
+        distances = np.array([0.0, 2.0, 4.0, 6.0])
+        weights = _linear_weights(distances, max_distance_km=10.0)
+        assert len(weights) == len(distances)
+        assert np.sum(weights) == pytest.approx(1.0)
+        assert np.all(weights >= 0)
+
+    def test_linear_weights_favor_close(self):
+        """Linear weights should favor closer distances."""
+        distances = np.array([0.0, 8.0])
+        weights = _linear_weights(distances, max_distance_km=10.0)
+        assert weights[0] > weights[1]
+
+    def test_equal_weights_uniform(self):
+        """Equal weights should be uniform."""
+        distances = np.array([0.1, 2.0, 5.0, 10.0])
+        weights = _equal_weights(distances)
+        assert len(weights) == len(distances)
+        assert np.sum(weights) == pytest.approx(1.0)
+        assert np.allclose(weights, 0.25)
+
+    def test_equal_weights_empty(self):
+        """Equal weights should handle empty array."""
+        distances = np.array([])
+        weights = _equal_weights(distances)
+        assert len(weights) == 0
+
+
+# ---------------------------------------------------------------------------
+# Aggregation-based PointLayerCollocation
+# ---------------------------------------------------------------------------
+
+class TestPointLayerCollocationAggregation:
+    """Test aggregation-based collocation functionality."""
+
+    def test_init_with_aggregation_params(self):
+        """PointLayerCollocation should accept aggregation parameters."""
+        colloc = PointLayerCollocation(
+            aggregation_window_km=5.0,
+            validation_temporal_averaging_minutes=30,
+            distance_weighting="gaussian",
+            gaussian_sigma_km=2.0,
+        )
+        assert colloc.aggregation_window_km == 5.0
+        assert colloc.validation_temporal_averaging_minutes == 30
+        assert colloc.distance_weighting == "gaussian"
+        assert colloc.gaussian_sigma_km == 2.0
+
+    def test_invalid_distance_weighting_raises_error(self):
+        """Invalid weighting method should raise ValueError."""
+        with pytest.raises(ValueError, match="Unknown distance_weighting"):
+            PointLayerCollocation(distance_weighting="invalid_method")
+
+    def test_aggregation_single_match(self):
+        """Aggregation should produce single match per validation point."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        # Validation point in the middle of the grid
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            wind_speed=[8.5],
+        )
+
+        colloc = PointLayerCollocation(
+            spatial_tolerance_km=200,
+            time_tolerance_minutes=60,
+            aggregation_window_km=50.0,  # Large enough to include nearby cells
+            distance_weighting="gaussian",
+            gaussian_sigma_km=2.0,
+        )
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "test")
+
+        # Should produce exactly one match (not multiple for each nearby cell)
+        assert len(results) == 1
+        assert results[0].collocation_type == "point_vs_layer"
+        assert "wind_speed" in results[0].sar_data
+        assert "wind_speed" in results[0].val_data
+
+    def test_aggregation_temporal_averaging(self):
+        """Aggregation should average validation data within temporal window."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        # Multiple validation observations at same location, different times
+        val = _make_val_dataframe(
+            lons=[0.0, 0.0, 0.0],
+            lats=[52.0, 52.0, 52.0],
+            times=[
+                datetime(2026, 1, 1, 11, 45, 0),  # 15 min before SAR time
+                datetime(2026, 1, 1, 12, 0, 0),   # SAR time
+                datetime(2026, 1, 1, 12, 15, 0),  # 15 min after SAR time
+            ],
+            wind_speed=[7.0, 8.0, 9.0],
+        )
+
+        colloc = PointLayerCollocation(
+            spatial_tolerance_km=200,
+            time_tolerance_minutes=60,
+            aggregation_window_km=50.0,  # Large enough to include nearby cells
+            validation_temporal_averaging_minutes=30,  # ±30 min window
+            distance_weighting="gaussian",
+            gaussian_sigma_km=2.0,
+        )
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "test")
+
+        # Each validation observation produces a match, with temporal averaging applied
+        # All 3 observations fall within the ±30 min window, so each gets avg of [7,8,9]=8
+        assert len(results) == 3
+        for result in results:
+            assert result.val_data["wind_speed"] == pytest.approx(8.0)
+
+    def test_aggregation_different_weighting_methods(self):
+        """Aggregation should work with all weighting methods."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            wind_speed=[8.5],
+        )
+
+        for method in ["gaussian", "inverse_distance", "linear", "equal"]:
+            colloc = PointLayerCollocation(
+                spatial_tolerance_km=200,
+                time_tolerance_minutes=60,
+                aggregation_window_km=50.0,  # Large enough to include nearby cells
+                distance_weighting=method,
+                gaussian_sigma_km=2.0,
+            )
+            results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "test")
+            assert len(results) == 1, f"Failed for weighting method '{method}'"
+            assert "wind_speed" in results[0].sar_data

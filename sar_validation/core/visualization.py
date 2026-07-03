@@ -743,9 +743,10 @@ def plot_sar_on_no_collocation(
     recipe_name: str,
     output_dir: Union[str, Path],
     recipe=None,
+    has_collocation: bool = False,
 ) -> Union[Path, None]:
     """
-    Plot SAR data geographic coverage when no collocations are found.
+    Plot SAR data geographic coverage with optional validation data overlay.
 
     Creates map-view figures showing SAR measurements with overlaid validation data:
     - Subplot 1: SAR + in-situ data sources
@@ -764,6 +765,9 @@ def plot_sar_on_no_collocation(
     recipe : Recipe, optional
         Recipe object containing geographic bounds for filtering scatterometer data.
         If provided, enables scatterometer subplot with geographic filtering.
+    has_collocation : bool, optional
+        If True, names the plot ``sar_collocation_*.png``. If False (default),
+        names it ``sar_no_collocation_*.png``. Default is False.
 
     Returns
     -------
@@ -869,18 +873,11 @@ def plot_sar_on_no_collocation(
     subplot_kw = {"projection": ccrs.PlateCarree()} if HAS_CARTOPY else {}
 
     # ── Determine number of subplots ────────────────────────────────────
-    # Subplot 1: SAR + in-situ, Subplot 2 (optional): SAR + scatterometer
+    # Each row has: left column = SAR scene + in-situ, right column = scatterometer (row 0 only) or empty
     has_scatterometer = bool(scatterometer_data)
-    
-    # Use simplified 2-column layout when scatterometer data present
-    if has_scatterometer:
-        nrows, ncols = 1, 2
-        figsize = (14, 6)
-    else:
-        # Original multi-subplot layout for SAR scenes only
-        nrows = max(1, (len(scene_names) + 1) // 2)
-        ncols = 2 if len(scene_names) > 1 else 1
-        figsize = (10 * ncols, 8 * nrows)
+    nrows = len(scene_names)
+    ncols = 2
+    figsize = (14, 6 * nrows)
     
     fig, axes = plt.subplots(
         nrows, ncols,
@@ -891,13 +888,9 @@ def plot_sar_on_no_collocation(
     )
     axes_flat = axes.flatten()
 
-    # ── Plot subplot 1: SAR + in-situ data ──────────────────────────────
+    # ── Plot subplot: SAR + in-situ data (left column of each row) ────────
     for idx, scene_name in enumerate(scene_names):
-        if has_scatterometer and idx > 0:
-            # When scatterometer plot exists, only plot first SAR scene
-            break
-        
-        ax = axes_flat[idx]
+        ax = axes_flat[2 * idx]  # Left column (every other subplot)
         scene_ds = sar_node[scene_name].to_dataset()
 
         if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
@@ -952,29 +945,35 @@ def plot_sar_on_no_collocation(
         # ── Overlay in-situ validation data ──────────────────────────────
         if insitu_data:
             source_color_map = _source_color_map(sorted(set(insitu_data["platform_types"])))
-            colors_by_type = [source_color_map[pt] for pt in insitu_data["platform_types"]]
-            
-            kw_val = {"transform": transform} if transform else {}
-            ax.scatter(
-                insitu_data["lons"], insitu_data["lats"], c=colors_by_type, s=100, 
-                marker='D', edgecolors='black', linewidth=0.5, zorder=3, **kw_val,
-            )
-            
-            # Add legend for in-situ platform types
-            legend_elements = [
-                Patch(facecolor=source_color_map[pt], label=pt)
-                for pt in sorted(source_color_map.keys())
-            ]
-            ax.legend(handles=legend_elements, loc='best', fontsize=8, framealpha=0.8)
+            for pt_type in sorted(set(insitu_data["platform_types"])):
+                mask = np.array(insitu_data["platform_types"]) == pt_type
+                pt_lons = np.array(insitu_data["lons"])[mask]
+                pt_lats = np.array(insitu_data["lats"])[mask]
+                kw = {"transform": transform} if transform else {}
+                ax.scatter(
+                    pt_lons, pt_lats, c=source_color_map[pt_type], s=100,
+                    marker='D', edgecolors='black', linewidth=0.5, zorder=3, label=pt_type, **kw,
+                )
+            ax.legend(loc='best', fontsize=8, framealpha=0.8)
 
         ax.set_title(f"{scene_name.split('/')[-1]} — {actual_var} + in-situ", fontsize=10)
 
-    # ── Plot subplot 2: SAR + scatterometer footprint outlines ──────────
+    # ── Plot subplot: SAR + scatterometer footprint outlines (right column, all rows) ──
     if has_scatterometer and scatterometer_data:
-        ax_scat = axes_flat[1]  # Use second subplot
-        scene_ds = sar_node[scene_names[0]].to_dataset()  # Use first scene as reference
+        # Pre-extract scatterometer overpasses once for all rows
+        overpasses = None
+        if recipe is not None:
+            overpasses = _extract_scatterometer_overpasses(datatree, recipe)
+        
+        # Plot scatterometer on every row's right column
+        for idx in range(len(scene_names)):
+            ax_scat = axes_flat[2 * idx + 1]  # Right column of each row
+            scene_ds = sar_node[scene_names[idx]].to_dataset()
 
-        if "lon" in scene_ds.coords and "lat" in scene_ds.coords:
+            if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
+                ax_scat.set_visible(False)
+                continue
+
             # ── Add map features (simplified for speed) ─────────────────
             if HAS_CARTOPY:
                 ax_scat.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0, alpha=0.3)
@@ -1015,8 +1014,7 @@ def plot_sar_on_no_collocation(
                     )
 
             # ── Extract and plot scatterometer footprints ──────────────
-            if recipe is not None:
-                overpasses = _extract_scatterometer_overpasses(datatree, recipe)
+            if overpasses is not None:
                 _plot_scatterometer_footprints(ax_scat, overpasses, fig, transform)
             else:
                 ax_scat.text(0.5, 0.5, "No geographic bounds (recipe not provided)",
@@ -1024,26 +1022,33 @@ def plot_sar_on_no_collocation(
 
             ax_scat.set_title(f"{actual_var} + scatterometer footprints (entry/exit times)", fontsize=10)
 
-    # Hide unused subplots
-    for idx in range(len(scene_names) + (1 if has_scatterometer else 0), len(axes_flat)):
+    # Hide unused subplots (right column for all rows if no scatterometer, plus any trailing subplots)
+    num_used = nrows * ncols
+    for idx in range(num_used, len(axes_flat)):
         axes_flat[idx].set_visible(False)
+    # Right column is not used if has_scatterometer is False
+    if not has_scatterometer:
+        for row in range(nrows):
+            axes_flat[2 * row + 1].set_visible(False)
 
     # ── Add colourbar and title ─────────────────────────────────────────
     fig.subplots_adjust(right=0.88)
     cbar_ax = fig.add_axes([0.90, 0.15, 0.02, 0.70])
     fig.colorbar(sar_sm, cax=cbar_ax, label=actual_var)
 
+    collocation_status = "collocation" if has_collocation else "no collocation"
     fig.suptitle(
-        f"SAR {actual_var} — no collocations found (coverage overview)",
+        f"SAR {actual_var} — {collocation_status} (coverage overview)",
         fontsize=12, y=0.98,
     )
 
     # ── Save to PNG ─────────────────────────────────────────────────────
-    filename = f"sar_no_collocation_{actual_var}_{recipe_name}.png"
+    collocation_prefix = "collocation" if has_collocation else "no_collocation"
+    filename = f"sar_{collocation_prefix}_{actual_var}_{recipe_name}.png"
     filepath = plots_dir / filename
     try:
         fig.savefig(filepath, dpi=150, bbox_inches="tight")
-        logger.info("Saved fallback SAR coverage plot: %s", filepath)
+        logger.info("Saved SAR coverage plot: %s", filepath)
         plt.close(fig)
         return filepath
     except Exception as exc:

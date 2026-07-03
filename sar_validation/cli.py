@@ -242,8 +242,8 @@ def _create_recipe(
                 ValidationDataSource(
                     source_type="scatterometer",
                     collocation_kwargs={
-                        "time_tolerance_minutes": 120,
-                        "spatial_tolerance_km": 100,
+                        "time_tolerance_minutes": 180,  # Layer vs. layer: ±3 hrs (hal-04202202)
+                        "spatial_tolerance_km": 12.5,   # Layer vs. layer: 12.5 km (hal-04202202)
                     },
                 ),
             ],
@@ -482,6 +482,15 @@ def _collocate_data(recipe, base_dir: Path) -> None:
     else:
         n = result.sizes.get("collocation", 0)
         print(f"  {n} collocated pair(s) saved to {base_dir / 'collocation_results.nc'}")
+        # Also generate SAR coverage plot with collocation status
+        try:
+            sar_var = _infer_sar_var_from_recipe(recipe)
+            recipe_name = recipe.config.name or "unknown"
+            png_path = plot_sar_on_no_collocation(tree, sar_var, recipe_name, base_dir, recipe=recipe, has_collocation=True)
+            if png_path:
+                print(f"  Generated SAR coverage plot: {png_path.relative_to(base_dir.parent)}")
+        except Exception as exc:
+            print(f"  Could not generate SAR coverage plot: {exc}")
 
 
 def _compute_stats(recipe, base_dir: Path) -> None:

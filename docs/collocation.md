@@ -67,27 +67,48 @@ sar-validate --recipe recipes/test.yaml --collocate --no-download
 
 ## Recipe configuration
 
+### Paper-standard settings (hal-04202202)
+
+The recommended collocation settings from **Abderrahim et al. (2019)**
+[hal-04202202](https://hal.science/hal-04202202/document) are:
+
+- **Point vs. Layer** (moorings, buoys, tidal gauges):
+  - Temporal offset: **±30 minutes**
+  - Spatial offset: **12.5 km**
+
+- **Layer vs. Layer** (scatterometer, OSI-SAF):
+  - Temporal offset: **±3 hours (180 minutes)**
+  - Spatial offset: **12.5 km**
+
+The default recipe template now uses these values. For an example, see
+[examples/paper-standard-wind-validation.yaml](../examples/paper-standard-wind-validation.yaml).
+
+### Configuration
+
 ```yaml
 collocation:
   type: point_vs_layer          # kept for backward compat; auto-detected per source
-  time_tolerance_minutes: 60    # accept obs within ±60 min of SAR acquisition
-  spatial_tolerance_km: 25.0    # accept obs within 25 km of a SAR grid cell
+  time_tolerance_minutes: 30    # ← paper standard for point-vs-layer
+  spatial_tolerance_km: 12.5    # ← paper standard
   interpolation_method: nearest # only "nearest" is implemented
 
 validation_sources:
   - source_type: mooring        # → point_vs_layer  (auto-detected)
-    collocation_kwargs: {}      # override tolerances for this source only
+    collocation_kwargs: {}      # use global settings
+
   - source_type: ferrybox       # → trajectory_vs_layer  (auto-detected)
     collocation_kwargs:
-      time_tolerance_minutes: 90
+      time_tolerance_minutes: 30  # example: same as point settings
+
   - source_type: scatterometer  # → layer_vs_layer  (auto-detected)
     collocation_kwargs:
-      spatial_tolerance_km: 50
-      time_tolerance_minutes: 120
+      time_tolerance_minutes: 180  # ← paper standard for layer-vs-layer
+      spatial_tolerance_km: 12.5   # ← paper standard
 ```
 
-Per-source `collocation_kwargs` override the global tolerances for that
-source.
+**Per-source `collocation_kwargs` override the global tolerances for that source.**
+This allows different tolerances for different validation platforms (e.g., tighter
+tolerances for scatterometer vs. in-situ buoys)
 
 ---
 
