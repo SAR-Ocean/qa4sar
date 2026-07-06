@@ -438,7 +438,7 @@ def plot_geographic(
 
             if HAS_CARTOPY:
                 ax.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0)
-                ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=1)
+                ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=0)
                 gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
                 gl.top_labels = False
                 gl.right_labels = False
@@ -901,7 +901,7 @@ def plot_sar_on_no_collocation(
         # ── Add map features ────────────────────────────────────────────
         if HAS_CARTOPY:
             ax.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0, alpha=0.3)
-            ax.add_feature(cfeature.COASTLINE, linewidth=0.3, zorder=1)
+            ax.add_feature(cfeature.COASTLINE, linewidth=0.3, zorder=0)
             gl = ax.gridlines(draw_labels=True, linewidth=0.2, alpha=0.3)
             gl.top_labels = False
             gl.right_labels = False
@@ -978,7 +978,7 @@ def plot_sar_on_no_collocation(
             # ── Add map features (simplified for speed) ─────────────────
             if HAS_CARTOPY:
                 ax_scat.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0, alpha=0.3)
-                ax_scat.add_feature(cfeature.COASTLINE, linewidth=0.3, zorder=1)
+                ax_scat.add_feature(cfeature.COASTLINE, linewidth=0.3, zorder=0)
                 gl = ax_scat.gridlines(draw_labels=True, linewidth=0.2, alpha=0.3)
                 gl.top_labels = False
                 gl.right_labels = False
@@ -1058,124 +1058,6 @@ def plot_sar_on_no_collocation(
         return None
 
 # ---------------------------------------------------------------------------
-# 4b. Helper for scatterometer mesh visualization
-# ---------------------------------------------------------------------------
-
-def _plot_scatterometer_mesh(ax, lons, lats, times, color, label, transform, linewidth=0.8, alpha=0.6, time_tolerance_minutes=5):
-    """
-    Plot scatterometer data as a mesh (Delaunay triangulation edges) instead of individual points.
-    
-    Only connects points that are close in both space AND time to avoid connecting different
-    orbital overpasses that may be spatially close but temporally distant.
-    
-    Parameters
-    ----------
-    ax : matplotlib axis
-        Cartopy-enabled axis to plot on.
-    lons, lats : np.ndarray
-        Flattened arrays of scatterometer point coordinates.
-    times : np.ndarray
-        Times corresponding to each point (datetime64 or similar).
-    color : str
-        Color for mesh lines.
-    label : str
-        Label for the legend.
-    transform : ccrs.CRS
-        Cartopy coordinate reference system.
-    linewidth : float, optional
-        Width of mesh lines (default: 0.8).
-    alpha : float, optional
-        Transparency of mesh lines (default: 0.6).
-    time_tolerance_minutes : float, optional
-        Maximum time difference (in minutes) to connect two points (default: 5).
-    
-    Returns
-    -------
-    bool
-        True if mesh was plotted successfully, False otherwise.
-    """
-    from scipy.spatial import Delaunay  # noqa: PLC0415
-    from matplotlib.collections import LineCollection  # noqa: PLC0415
-    
-    if len(lons) < 4:  # Delaunay needs at least 4 points in 2D
-        logger.debug(f"Skipping mesh for {label}: only {len(lons)} points (need ≥4)")
-        return False
-    
-    try:
-        # Convert times to numeric upfront (vectorized, more efficient)
-        times_numeric = np.full(len(times), np.inf, dtype=np.float64)
-        valid_times = []
-        for i, t in enumerate(times):
-            try:
-                if t is not None and t is not np.datetime64('NaT'):
-                    times_numeric[i] = np.datetime64(t).astype('datetime64[m]').astype(np.float64)
-                    valid_times.append(i)
-            except (TypeError, ValueError):
-                pass
-        
-        if len(valid_times) == 0:
-            logger.debug(f"No valid times for {label}, skipping temporal filtering")
-            times_numeric = None
-        
-        # Stack lon/lat into (n, 2) array for Delaunay
-        points = np.column_stack([lons, lats])
-        
-        # Create Delaunay triangulation
-        tri = Delaunay(points)
-        
-        # Extract unique edges from simplices, filtering by time tolerance
-        edges = set()
-        time_tol_mins = time_tolerance_minutes
-        
-        for simplex in tri.simplices:
-            for i in range(3):
-                p1, p2 = simplex[i], simplex[(i + 1) % 3]
-                
-                # Check temporal proximity if times are available
-                if times_numeric is not None:
-                    t1, t2 = times_numeric[p1], times_numeric[p2]
-                    # Skip if either time is NaT/None (represented as inf)
-                    if t1 == np.inf or t2 == np.inf:
-                        continue
-                    time_diff_mins = abs(t1 - t2)
-                    if time_diff_mins > time_tol_mins:
-                        continue  # Skip this edge, points are too far apart in time
-                
-                edge = tuple(sorted([p1, p2]))
-                edges.add(edge)
-        
-        if not edges:
-            logger.debug(f"No temporally-valid edges for {label}")
-            return False
-        
-        # Build line segments for all edges at once (vectorized)
-        segments = np.array([[(lons[p1], lats[p1]), (lons[p2], lats[p2])] for p1, p2 in edges])
-        
-        if len(segments) == 0:
-            return False
-        
-        # Create LineCollection and add to plot
-        line_coll = LineCollection(
-            segments,
-            colors=color,
-            linewidths=linewidth,
-            alpha=alpha,
-            transform=transform,
-            zorder=5,
-        )
-        ax.add_collection(line_coll)
-        
-        # Add a dummy line for legend (LineCollection doesn't support labels directly)
-        ax.plot([], [], color=color, linewidth=linewidth, alpha=alpha, label=label)
-        
-        logger.debug(f"Plotted scatterometer mesh: {len(edges)} edges in '{label}'")
-        return True
-        
-    except Exception as e:
-        logger.debug(f"Failed to create Delaunay triangulation for '{label}': {e}")
-        return False
-
-# ---------------------------------------------------------------------------
 # 4c. Collocation diagnostics plot
 # ---------------------------------------------------------------------------
 
@@ -1186,13 +1068,15 @@ def plot_collocation_diagnostics(
     output_dir: Union[str, Path],
 ) -> Union[Path, None]:
     """
-    Plot collocation diagnostics: SAR scene bounds, matched and unmatched validation points.
+    Plot collocation diagnostics: SAR scene bounds, scatterometer data, matched and unmatched validation points.
 
     Creates a geographic map showing:
+    - Scatterometer data points (light gray dots in background)
     - SAR scene footprints (blue lines for each scene boundary)
     - Matched validation observations (colored dots)
     - Unmatched validation observations (red dots)
     - Statistics in title (total, matched, unmatched counts)
+    - Plot extent expanded ±5 degrees from recipe geographic bounds
 
     Parameters
     ----------
@@ -1280,16 +1164,12 @@ def plot_collocation_diagnostics(
 
     all_val_lons = all_val_data["lons"]
     all_val_lats = all_val_data["lats"]
-    all_val_times = all_val_data["times"]
-    all_val_sources = np.array(all_val_data["sources"])
-    all_val_platform_types = np.array(all_val_data["platform_types"])
     total_points = len(all_val_lons)
 
     # ── Extract matched validation points ───────────────────────────────
     matched_lons = []
     matched_lats = []
     matched_sources = []
-    matched_platform_types = []
     
     if "val_lon" in collocation_ds and "val_lat" in collocation_ds:
         matched_lons = collocation_ds["val_lon"].values
@@ -1298,9 +1178,6 @@ def plot_collocation_diagnostics(
             matched_sources = collocation_ds["val_source"].values
         else:
             matched_sources = np.full(len(matched_lons), "unknown")
-        matched_platform_types = np.full(len(matched_lons), "unknown", dtype=object)
-    else:
-        matched_platform_types = np.array([], dtype=object)
     
     matched_points = len(matched_lons)
     unmatched_points = total_points - matched_points
@@ -1311,69 +1188,98 @@ def plot_collocation_diagnostics(
     
     unmatched_lons = []
     unmatched_lats = []
-    unmatched_platform_types = []
-    for i, (lon, lat) in enumerate(zip(all_val_lons, all_val_lats)):
+    for lon, lat in zip(all_val_lons, all_val_lats):
         if (round(lon, 6), round(lat, 6)) not in matched_set:
             unmatched_lons.append(lon)
             unmatched_lats.append(lat)
-            unmatched_platform_types.append(all_val_platform_types[i])
     
     unmatched_lons = np.array(unmatched_lons)
     unmatched_lats = np.array(unmatched_lats)
-    unmatched_platform_types = np.array(unmatched_platform_types, dtype=object)
+
+    # ── Separate in-situ from scatterometer in unmatched points ──────────
+    # Build a set of (lon, lat) tuples from matched points for fast lookup
+    matched_set = set(zip(np.round(matched_lons, 6), np.round(matched_lats, 6)))
     
-    # Extract unmatched times
-    unmatched_times = []
-    unmatched_indices = []
+    unmatched_lons_insitu = []
+    unmatched_lats_insitu = []
+    platform_types_arr = np.array(all_val_data["platform_types"])
+    
     for i, (lon, lat) in enumerate(zip(all_val_lons, all_val_lats)):
         if (round(lon, 6), round(lat, 6)) not in matched_set:
-            unmatched_times.append(all_val_times[i])
-            unmatched_indices.append(i)
-    unmatched_times = np.array(unmatched_times, dtype=object)
+            # Only keep if it's in-situ, not scatterometer
+            if platform_types_arr[i] != "scatterometer":
+                unmatched_lons_insitu.append(lon)
+                unmatched_lats_insitu.append(lat)
     
-    # Assign platform types to matched points by looking them up in the original data
-    matched_times = []
-    for i, (mlon, mlat) in enumerate(zip(matched_lons, matched_lats)):
-        matched_idx = np.where(
-            (np.round(all_val_lons, 6) == round(mlon, 6)) & 
-            (np.round(all_val_lats, 6) == round(mlat, 6))
-        )[0]
-        if len(matched_idx) > 0:
-            matched_platform_types[i] = all_val_platform_types[matched_idx[0]]
-            matched_times.append(all_val_times[matched_idx[0]])
+    unmatched_lons = np.array(unmatched_lons_insitu)
+    unmatched_lats = np.array(unmatched_lats_insitu)
+
+    # ── Filter matched points to in-situ only ───────────────────────────
+    matched_mask_insitu = []
+    for src in matched_sources:
+        # Exclude scatterometer sources (osi_saf* or "scatterometer")
+        src_str = str(src)
+        if "osi_saf" not in src_str and src_str != "scatterometer":
+            matched_mask_insitu.append(True)
         else:
-            matched_times.append(np.datetime64('NaT'))
-    matched_times = np.array(matched_times, dtype=object)
+            matched_mask_insitu.append(False)
+    
+    matched_mask_insitu = np.array(matched_mask_insitu)
+    matched_lons = matched_lons[matched_mask_insitu]
+    matched_lats = matched_lats[matched_mask_insitu]
+    matched_sources = matched_sources[matched_mask_insitu]
+    matched_points = len(matched_lons)
+
+    # ── Calculate expanded geographic bounds (+5 degrees on all sides) ───
+    bounds = recipe.config.geographic_bounds
+    expanded_min_lon = bounds.min_lon - 5
+    expanded_max_lon = bounds.max_lon + 5
+    expanded_min_lat = bounds.min_lat - 5
+    expanded_max_lat = bounds.max_lat + 5
+
+    # ── Extract and filter scatterometer data to expanded bounds ────────
+    scatterometer_lons = []
+    scatterometer_lats = []
+    
+    # Check if we have platform_types in the validation data
+    if "platform_types" in all_val_data:
+        platform_types_arr = np.array(all_val_data["platform_types"])
+        scatterometer_mask = platform_types_arr == "scatterometer"
+        
+        if scatterometer_mask.any():
+            all_lons_arr = np.array(all_val_data["lons"])
+            all_lats_arr = np.array(all_val_data["lats"])
+            
+            # Extract all scatterometer points (plot extent will clip to visible area)
+            scatterometer_lons = all_lons_arr[scatterometer_mask]
+            scatterometer_lats = all_lats_arr[scatterometer_mask]
 
     # ── Create geographic plot ──────────────────────────────────────────
     fig = plt.figure(figsize=(14, 10), dpi=100)
     ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
 
-    # ── Set geographic bounds from recipe (with +5° padding) ────────────
-    try:
-        geo_bounds = recipe.config.geographic_bounds
-        if geo_bounds:
-            padding = 5.0
-            extent = [
-                geo_bounds.min_lon - padding,
-                geo_bounds.max_lon + padding,
-                geo_bounds.min_lat - padding,
-                geo_bounds.max_lat + padding,
-            ]
-            ax.set_extent(extent, crs=ccrs.PlateCarree())
-            logger.debug(f"Set plot extent to recipe bounds ± {padding}°: {extent}")
-    except Exception as e:
-        logger.debug(f"Could not set extent from recipe bounds: {e}")
-
     # Add coastlines and features
     ax.add_feature(cfeature.LAND, facecolor="lightgray", alpha=0.3, zorder=0)
-    ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=1)
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=0)
     gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
     gl.top_labels = False
     gl.right_labels = False
 
-    # ── Plot SAR scene bounds (blue lines) ──────────────────────────────
+    # ── Set plot extent to expanded bounds ───────────────────────────────
+    ax.set_extent([expanded_min_lon, expanded_max_lon, expanded_min_lat, expanded_max_lat],
+                  crs=ccrs.PlateCarree())
+
+    # ── Plot scatterometer data points (background layer, zorder=1) ──────
     transform = ccrs.PlateCarree()
+    
+    if len(scatterometer_lons) > 0:
+        ax.scatter(
+            scatterometer_lons, scatterometer_lats,
+            s=15, c="#cccccc", alpha=0.5, edgecolors="none",
+            transform=transform, zorder=1, label=f"Scatterometer background ({len(scatterometer_lons)})"
+        )
+
+    # ── Plot SAR scene bounds (blue lines, zorder=2) ──────────────────────
     for i, bounds in enumerate(scene_bounds):
         lon_min, lon_max = bounds["lon_min"], bounds["lon_max"]
         lat_min, lat_max = bounds["lat_min"], bounds["lat_max"]
@@ -1384,49 +1290,23 @@ def plot_collocation_diagnostics(
         ax.plot(lons_box, lats_box, color="blue", linewidth=1.5, 
                 transform=transform, zorder=2, label="SAR scene bounds" if i == 0 else "")
 
-    # ── Plot unmatched validation points (red dots for non-scatterometer) ──
-    # Separate scatterometer from other in-situ data
-    unmatch_scat_mask = unmatched_platform_types == "scatterometer"
-    unmatch_other_lons = unmatched_lons[~unmatch_scat_mask]
-    unmatch_other_lats = unmatched_lats[~unmatch_scat_mask]
-    unmatch_scat_lons = unmatched_lons[unmatch_scat_mask]
-    unmatch_scat_lats = unmatched_lats[unmatch_scat_mask]
-    
-    if len(unmatch_other_lons) > 0:
+    # ── Plot unmatched validation points (red dots, zorder=3) ──────────────────────
+    if len(unmatched_lons) > 0:
         ax.scatter(
-            unmatch_other_lons, unmatch_other_lats,
+            unmatched_lons, unmatched_lats,
             s=20, c="red", alpha=0.6, edgecolors="darkred", linewidths=0.3,
-            transform=transform, zorder=3, label=f"Not matched ({len(unmatch_other_lons)})"
+            transform=transform, zorder=3, label=f"Not matched ({len(unmatched_lons)})"
         )
 
-    # ── Plot unmatched scatterometer mesh (red lines) ──────────────────
-    if len(unmatch_scat_lons) > 0:
-        unmatch_scat_times = unmatched_times[unmatch_scat_mask]
-        _plot_scatterometer_mesh(
-            ax, unmatch_scat_lons, unmatch_scat_lats, unmatch_scat_times,
-            color="red", label="Unmatched scatterometer",
-            transform=transform, linewidth=0.7, alpha=0.4,
-            time_tolerance_minutes=1  # 5-minute tolerance for single overpass
-        )
-
-    # ── Plot matched validation points ─────────────────────────────────
-    # Separate matched scatterometer from other in-situ data
-    match_scat_mask = matched_platform_types == "scatterometer"
-    match_other_lons = matched_lons[~match_scat_mask]
-    match_other_lats = matched_lats[~match_scat_mask]
-    match_other_sources = matched_sources[~match_scat_mask]
-    match_scat_lons = matched_lons[match_scat_mask]
-    match_scat_lats = matched_lats[match_scat_mask]
-
-    # ── Plot matched non-scatterometer points (colored by source) ────────
-    if len(match_other_lons) > 0:
-        if len(np.unique(match_other_sources)) > 1:
+    # ── Plot matched validation points (colored by source, zorder=4) ──────
+    if len(matched_lons) > 0:
+        if len(np.unique(matched_sources)) > 1:
             # Multiple sources: use color map
-            source_map = _source_color_map(list(np.unique(match_other_sources)))
-            for source in np.unique(match_other_sources):
-                source_mask = match_other_sources == source
-                source_lons = match_other_lons[source_mask]
-                source_lats = match_other_lats[source_mask]
+            source_map = _source_color_map(list(np.unique(matched_sources)))
+            for source in np.unique(matched_sources):
+                source_mask = matched_sources == source
+                source_lons = matched_lons[source_mask]
+                source_lats = matched_lats[source_mask]
                 color = source_map.get(str(source), "#ff7f0e")
                 ax.scatter(
                     source_lons, source_lats,
@@ -1434,30 +1314,22 @@ def plot_collocation_diagnostics(
                     transform=transform, zorder=4, label=f"Matched: {source}"
                 )
         else:
-            # Single non-scatterometer source: use green
-            if len(match_other_sources) > 0:
-                ax.scatter(
-                    match_other_lons, match_other_lats,
-                    s=25, c="green", alpha=0.7, edgecolors="black", linewidths=0.3,
-                    transform=transform, zorder=4, label=f"Matched ({len(match_other_lons)})"
-                )
-
-    # ── Plot matched scatterometer mesh (green lines) ──────────────────
-    if len(match_scat_lons) > 0:
-        match_scat_times = np.array(matched_times)[match_scat_mask]
-        _plot_scatterometer_mesh(
-            ax, match_scat_lons, match_scat_lats, match_scat_times,
-            color="green", label="Matched scatterometer",
-            transform=transform, linewidth=0.9, alpha=0.7,
-            time_tolerance_minutes=5  # 5-minute tolerance for single overpass
-        )
+            # Single source: use green
+            ax.scatter(
+                matched_lons, matched_lats,
+                s=25, c="green", alpha=0.7, edgecolors="black", linewidths=0.3,
+                transform=transform, zorder=4, label=f"Matched ({len(matched_lons)})"
+            )
 
     # ── Create title with statistics ────────────────────────────────────
     recipe_name = recipe.config.name or "unknown"
+    unmatched_points = len(unmatched_lons)  # Now only in-situ unmatched points
+    insitu_total = matched_points + unmatched_points  # Total in-situ observations
+    
     title = (
         f"{recipe_name} Collocation Diagnostics\n"
-        f"Total points: {total_points:,}, Matched: {matched_points}, "
-        f"Not matched: {unmatched_points}"
+        f"In-situ observations: {insitu_total:,}, Matched: {matched_points}, Not matched: {unmatched_points} | "
+        f"Scatterometer background: {len(scatterometer_lons)}"
     )
     ax.set_title(title, fontsize=12, fontweight="bold", pad=15)
 
