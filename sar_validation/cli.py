@@ -156,6 +156,11 @@ Examples:
         action="store_true",
         help="Enable DEBUG logging",
     )
+    parser.add_argument(
+        "--collocation-log",
+        action="store_true",
+        help="Enable detailed diagnostic logging and visualization for scatterometer collocation",
+    )
 
     args = parser.parse_args(argv)
 
@@ -186,6 +191,7 @@ Examples:
             collocate=args.collocate or args.stats or args.plot,
             stats=args.stats or args.plot,
             plot=args.plot,
+            collocation_log=args.collocation_log,
         )
     else:
         parser.print_help()
@@ -329,6 +335,7 @@ def _execute_recipe(
     collocate: bool = False,
     stats: bool = False,
     plot: bool = False,
+    collocation_log: bool = False,
 ) -> None:
     from .core.recipe import Recipe
     from .core.orchestrator import DataOrchestrator
@@ -378,7 +385,7 @@ def _execute_recipe(
             print("Step 2 skipped — DataTree already exists")
 
     if collocate:
-        _collocate_data(recipe, orchestrator.base_dir)
+        _collocate_data(recipe, orchestrator.base_dir, emit_diagnostics=collocation_log)
 
     if stats or plot:
         _compute_stats(recipe, orchestrator.base_dir)
@@ -449,11 +456,11 @@ def _convert_data(recipe, base_dir: Path) -> "xr.DataTree | None":
     return tree
 
 
-def _collocate_data(recipe, base_dir: Path) -> None:
+def _collocate_data(recipe, base_dir: Path, emit_diagnostics: bool = False) -> None:
     """Run step 3: load DataTree and run collocation."""
     import xarray as xr
     from .core.collocation import run_collocation
-    from .core.visualization import plot_sar_on_no_collocation
+    from .core.visualization import plot_sar_on_no_collocation, plot_collocation_diagnostics
 
     datatree_path = base_dir / "datatree.nc"
     if not datatree_path.exists():
@@ -467,7 +474,7 @@ def _collocate_data(recipe, base_dir: Path) -> None:
         tree = xr.open_datatree(str(datatree_path), engine='netcdf4')
 
     print("\nStep 3: Running collocation…")
-    result = run_collocation(recipe, tree, base_dir)
+    result = run_collocation(recipe, tree, base_dir, emit_diagnostics=emit_diagnostics)
     if result is None:
         print("  No collocated pairs found.")
         # Fallback: plot SAR data coverage for debugging
@@ -482,6 +489,17 @@ def _collocate_data(recipe, base_dir: Path) -> None:
     else:
         n = result.sizes.get("collocation", 0)
         print(f"  {n} collocated pair(s) saved to {base_dir / 'collocation_results.nc'}")
+        
+        # Generate diagnostic plot if requested
+        if emit_diagnostics and n > 0:
+            try:
+                diag_path = plot_collocation_diagnostics(tree, result, recipe, base_dir)
+                if diag_path:
+                    print(f"  Generated diagnostic plot: {diag_path.relative_to(base_dir.parent)}")
+            except Exception as exc:
+                print(f"  Could not generate diagnostic plot: {exc}")
+                logger.debug("Diagnostic plot error: %s", exc, exc_info=True)
+        
         # Also generate SAR coverage plot with collocation status
         try:
             sar_var = _infer_sar_var_from_recipe(recipe)

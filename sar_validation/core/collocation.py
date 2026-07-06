@@ -335,6 +335,7 @@ class PointLayerCollocation:
         validation_temporal_averaging_minutes: int = 30,
         distance_weighting: str = "gaussian",
         gaussian_sigma_km: float = 5.0,
+        emit_diagnostics: bool = False,
     ) -> None:
         self.spatial_tolerance_km = spatial_tolerance_km
         self.time_tolerance_minutes = time_tolerance_minutes
@@ -833,6 +834,7 @@ def run_collocation(
     recipe,
     datatree: "xr.DataTree",
     base_dir: Union[str, Path],
+    emit_diagnostics: bool = False,
 ) -> Optional["xr.Dataset"]:
     """
     Run all three collocation passes between SAR and validation nodes in
@@ -872,6 +874,9 @@ def run_collocation(
         DataTree produced by :func:`DataTreeConverter.convert_downloaded_data`.
     base_dir : str or Path
         Directory where ``collocation_results.nc`` will be written.
+    emit_diagnostics : bool
+        If True, emit detailed diagnostic logging for scatterometer collocation
+        and generate diagnostic visualization plots.
 
     Returns
     -------
@@ -906,6 +911,7 @@ def run_collocation(
         "validation_temporal_averaging_minutes": coll_cfg.validation_temporal_averaging_minutes,
         "distance_weighting": coll_cfg.distance_weighting,
         "gaussian_sigma_km": coll_cfg.gaussian_sigma_km,
+        "emit_diagnostics": emit_diagnostics,
     }
 
     # Collect SAR nodes (one Dataset per SAR scene)
@@ -1183,6 +1189,7 @@ class LayerLayerCollocation(PointLayerCollocation):
         validation_temporal_averaging_minutes: int = 60,
         distance_weighting: str = "equal",
         gaussian_sigma_km: float = 12.5,
+        emit_diagnostics: bool = False,
     ) -> None:
         """
         Initialize LayerLayerCollocation with scatterometer-optimized defaults.
@@ -1203,6 +1210,8 @@ class LayerLayerCollocation(PointLayerCollocation):
             SAR weighting method: "equal" (default), "gaussian", "inverse_distance", "linear".
         gaussian_sigma_km : float
             Gaussian sigma if using Gaussian weighting (12.5 km default).
+        emit_diagnostics : bool
+            If True, emit detailed per-cell diagnostic logging.
         """
         super().__init__(
             spatial_tolerance_km=spatial_tolerance_km,
@@ -1213,13 +1222,15 @@ class LayerLayerCollocation(PointLayerCollocation):
             distance_weighting=distance_weighting,
             gaussian_sigma_km=gaussian_sigma_km,
         )
+        self.emit_diagnostics = emit_diagnostics
         logger.debug(
             "LayerLayerCollocation initialized: %d min temporal, %.1f km spatial, "
-            "%s weighting, %.1f km aggregation window",
+            "%s weighting, %.1f km aggregation window, diagnostics=%s",
             self.time_tolerance_minutes,
             self.spatial_tolerance_km,
             self.distance_weighting,
             self.aggregation_window_km,
+            self.emit_diagnostics,
         )
 
     def _infer_scatterometer_grid(
@@ -1265,6 +1276,8 @@ class LayerLayerCollocation(PointLayerCollocation):
         n_points = len(val_data)
         if n_points < 2:
             # Single point or empty → treat as one cell
+            if self.emit_diagnostics:
+                logger.info("[GRID] Received %d point(s); treating as single cell", n_points)
             return {0: list(range(n_points))}
 
         # Extract coordinates
@@ -1273,7 +1286,8 @@ class LayerLayerCollocation(PointLayerCollocation):
 
         try:
             # Compute pairwise Haversine distances
-            logger.debug("Computing pairwise distances for %d scatterometer points...", n_points)
+            if self.emit_diagnostics:
+                logger.info("[GRID] Computing pairwise distances for %d scatterometer points...", n_points)
             distances = []
             for i in range(n_points):
                 for j in range(i + 1, n_points):
@@ -1281,6 +1295,8 @@ class LayerLayerCollocation(PointLayerCollocation):
                     distances.append(d)
 
             if not distances:
+                if self.emit_diagnostics:
+                    logger.info("[GRID] No distances computed; treating as single cell")
                 logger.warning("No distances computed; falling back to single cell.")
                 return {0: list(range(n_points))}
 
@@ -1289,13 +1305,17 @@ class LayerLayerCollocation(PointLayerCollocation):
             # Estimate threshold from distance histogram
             # ASCAT cell size is ~12.5 km; use percentile of distances as threshold
             threshold = np.percentile(distances, distance_threshold_percentile)
-            logger.debug(
-                "Distance distribution: min=%.2f, max=%.2f, median=%.2f, threshold=%.2f km",
-                distances.min(), distances.max(), np.median(distances), threshold,
-            )
+            if self.emit_diagnostics:
+                logger.info(
+                    "[GRID] Distance distribution: min=%.2f km, max=%.2f km, median=%.2f km, "
+                    "%d-percentile=%.2f km (threshold)",
+                    distances.min(), distances.max(), np.median(distances), 
+                    int(distance_threshold_percentile), threshold,
+                )
 
             # Run hierarchical clustering
-            logger.debug("Running hierarchical clustering with linkage='%s'...", linkage_method)
+            if self.emit_diagnostics:
+                logger.info("[GRID] Running hierarchical clustering (linkage='%s')...", linkage_method)
             z = linkage(distances, method=linkage_method)
             cluster_ids = fcluster(z, threshold, criterion="distance")
 
@@ -1306,13 +1326,23 @@ class LayerLayerCollocation(PointLayerCollocation):
                     cells[cluster_id] = []
                 cells[cluster_id].append(point_idx)
 
-            logger.info(
-                "Grid inference: detected %d cells from %d scatterometer points",
-                len(cells), n_points,
-            )
+            if self.emit_diagnostics:
+                cell_sizes = [len(indices) for indices in cells.values()]
+                logger.info(
+                    "[GRID] Grid inference SUCCESS: detected %d cells from %d points. "
+                    "Cell sizes: min=%d, max=%d, mean=%.1f",
+                    len(cells), n_points, min(cell_sizes), max(cell_sizes), np.mean(cell_sizes),
+                )
+            else:
+                logger.info(
+                    "Grid inference: detected %d cells from %d scatterometer points",
+                    len(cells), n_points,
+                )
             return cells
 
         except Exception as e:
+            if self.emit_diagnostics:
+                logger.info("[GRID] Grid inference FAILED: %s; using all points as single cell.", type(e).__name__)
             logger.warning("Grid inference failed (%s); using all points as single cell.", e)
             return {0: list(range(n_points))}
 
@@ -1416,6 +1446,11 @@ class LayerLayerCollocation(PointLayerCollocation):
         ]
 
         # Process each scatterometer cell
+        matches_found = 0
+        rejected_spatial = 0
+        rejected_temporal = 0
+        rejected_no_data = 0
+        
         for cell_id, point_indices in cells.items():
             # Get scatterometer observations in this cell
             cell_subset = val_data_filtered.iloc[point_indices]
@@ -1426,26 +1461,60 @@ class LayerLayerCollocation(PointLayerCollocation):
             # Use first observation time as reference (all should be close due to single pass)
             c_time = _to_datetime_array([cell_subset["time"].iloc[0]])[0]
 
+            if self.emit_diagnostics:
+                logger.info(
+                    "[CELL %d] Center: (%.3f°, %.3f°), Time: %s, Observations: %d",
+                    cell_id, c_lon, c_lat, c_time.isoformat(), len(cell_subset),
+                )
+
             # Find nearby SAR cells within aggregation window
             nearby_cells_with_dist = self._nearby_cells_with_distances(
                 c_lon, c_lat, sar_lon, sar_lat, self.aggregation_window_km
             )
 
             if not nearby_cells_with_dist:
+                rejected_spatial += 1
+                if self.emit_diagnostics:
+                    logger.info(
+                        "[CELL %d] REJECTED: No SAR cells within %.1f km",
+                        cell_id, self.aggregation_window_km,
+                    )
                 logger.debug(
                     "No SAR cells within %.1f km of scatterometer cell (%.2f, %.2f)",
                     self.aggregation_window_km, c_lon, c_lat,
                 )
                 continue
 
+            if self.emit_diagnostics:
+                distances_km = [d for _, _, d in nearby_cells_with_dist]
+                logger.info(
+                    "[CELL %d] Found %d SAR cells within %.1f km: distances=[%.2f, %.2f, ..., %.2f] km",
+                    cell_id, len(nearby_cells_with_dist), self.aggregation_window_km,
+                    min(distances_km), np.median(distances_km), max(distances_km),
+                )
+
             # Find nearby SAR times
             nearby_t_idx = self._nearby_times(c_time, sar_times)
             if not nearby_t_idx:
+                rejected_temporal += 1
+                if self.emit_diagnostics:
+                    logger.info(
+                        "[CELL %d] REJECTED: No SAR times within ±%d minutes",
+                        cell_id, self.time_tolerance_minutes,
+                    )
                 logger.debug(
                     "No SAR times within %d minutes of scatterometer cell time",
                     self.time_tolerance_minutes,
                 )
                 continue
+
+            if self.emit_diagnostics:
+                sar_times_nearby = [sar_times[idx] for idx in nearby_t_idx]
+                logger.info(
+                    "[CELL %d] Found %d SAR times within ±%d minutes: %s",
+                    cell_id, len(nearby_t_idx), self.time_tolerance_minutes,
+                    ", ".join(t.isoformat() for t in sar_times_nearby),
+                )
 
             # Process each nearby SAR time
             for t_idx in nearby_t_idx:
@@ -1460,6 +1529,9 @@ class LayerLayerCollocation(PointLayerCollocation):
                 )
 
                 if not sar_aggregated:
+                    rejected_no_data += 1
+                    if self.emit_diagnostics:
+                        logger.info("[CELL %d] t_idx=%d: REJECTED: No valid SAR values", cell_id, t_idx)
                     logger.debug("No valid SAR values at t_idx=%d", t_idx)
                     continue
 
@@ -1481,6 +1553,9 @@ class LayerLayerCollocation(PointLayerCollocation):
                             val_aggregated[col] = float(np.nanmean(values[valid_mask]))
 
                 if not val_aggregated:
+                    rejected_no_data += 1
+                    if self.emit_diagnostics:
+                        logger.info("[CELL %d] t_idx=%d: REJECTED: No valid scatterometer values", cell_id, t_idx)
                     logger.debug("No valid scatterometer values in cell")
                     continue
 
@@ -1494,6 +1569,14 @@ class LayerLayerCollocation(PointLayerCollocation):
                 # Compute distances
                 spatial_dist = _haversine_distance(c_lon, c_lat, s_lon, s_lat)
                 temporal_dist = abs((c_time - s_time).total_seconds() / 60.0)
+
+                if self.emit_diagnostics:
+                    logger.info(
+                        "[CELL %d] t_idx=%d: MATCHED! Spatial dist=%.2f km, Temporal dist=%.1f min",
+                        cell_id, t_idx, spatial_dist, temporal_dist,
+                    )
+
+                matches_found += 1
 
                 # Create CollocatedPoint
                 collocations.append(
@@ -1515,6 +1598,23 @@ class LayerLayerCollocation(PointLayerCollocation):
                         sar_x_idx=x_idx,
                         sar_scene_name=sar_scene_name,
                     )
+                )
+
+        if self.emit_diagnostics:
+            logger.info(
+                "[SUMMARY] LayerLayerCollocation: %d matches from %d cells (spatial_tol=%.1f km, "
+                "temporal_tol=%d min). Rejected: %d spatial, %d temporal, %d no-data.",
+                len(collocations), len(cells), self.spatial_tolerance_km, self.time_tolerance_minutes,
+                rejected_spatial, rejected_temporal, rejected_no_data,
+            )
+            if collocations:
+                spatial_dists = [c.spatial_distance_km for c in collocations]
+                temporal_dists = [c.temporal_distance_minutes for c in collocations]
+                logger.info(
+                    "[DISTANCES] Matched pairs: spatial=[%.2f, %.2f, %.2f] km (min/median/max), "
+                    "temporal=[%.1f, %.1f, %.1f] min (min/median/max)",
+                    np.min(spatial_dists), np.median(spatial_dists), np.max(spatial_dists),
+                    np.min(temporal_dists), np.median(temporal_dists), np.max(temporal_dists),
                 )
 
         logger.info(

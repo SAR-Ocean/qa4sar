@@ -38,6 +38,7 @@ __all__ = [
     "plot_statistics",
     "plot_residuals",
     "plot_sar_on_no_collocation",
+    "plot_collocation_diagnostics",
     "validation_report",
 ]
 
@@ -1056,6 +1057,220 @@ def plot_sar_on_no_collocation(
         plt.close(fig)
         return None
 
+# ---------------------------------------------------------------------------
+# 4c. Collocation diagnostics plot
+# ---------------------------------------------------------------------------
+
+def plot_collocation_diagnostics(
+    datatree,
+    collocation_ds,
+    recipe,
+    output_dir: Union[str, Path],
+) -> Union[Path, None]:
+    """
+    Plot collocation diagnostics: SAR scene bounds, matched and unmatched validation points.
+
+    Creates a geographic map showing:
+    - SAR scene footprints (blue lines for each scene boundary)
+    - Matched validation observations (colored dots)
+    - Unmatched validation observations (red dots)
+    - Statistics in title (total, matched, unmatched counts)
+
+    Parameters
+    ----------
+    datatree : xr.DataTree
+        Step-2 DataTree (``datatree.nc``).
+    collocation_ds : xr.Dataset
+        Step-3 collocation results (``collocation_results.nc``).
+    recipe : Recipe
+        Recipe object containing metadata.
+    output_dir : str or Path
+        Directory to save the PNG file (typically the base_dir).
+
+    Returns
+    -------
+    Path or None
+        Path to the saved PNG file, or None if plot could not be generated.
+    """
+    import xarray as xr  # noqa: PLC0415
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+    from matplotlib.patches import Rectangle, Patch  # noqa: PLC0415
+    import matplotlib.lines as mlines  # noqa: PLC0415
+
+    output_dir = Path(output_dir)
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set up cartopy if available
+    try:
+        import cartopy.crs as ccrs  # noqa: PLC0415
+        import cartopy.feature as cfeature  # noqa: PLC0415
+        HAS_CARTOPY = True
+    except ImportError:
+        HAS_CARTOPY = False
+        logger.debug("cartopy not installed — collocation_diagnostics plot unavailable.")
+        return None
+
+    # ── Extract SAR scene bounds ────────────────────────────────────────
+    sar_node = datatree.get("sar")
+    if sar_node is None or not sar_node.children:
+        logger.warning("plot_collocation_diagnostics: No SAR data found in DataTree.")
+        return None
+
+    scene_bounds = []
+    scene_names = list(sar_node.children.keys())
+    
+    for scene_name in scene_names:
+        scene_ds = sar_node[scene_name].to_dataset()
+        if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
+            continue
+        
+        lons = scene_ds["lon"].values
+        lats = scene_ds["lat"].values
+        
+        # Handle both 2D grids and 1D point arrays
+        if len(lons.shape) > 1:
+            lons_flat = lons.flatten()
+            lats_flat = lats.flatten()
+        else:
+            lons_flat = lons
+            lats_flat = lats
+        
+        valid_mask = np.isfinite(lons_flat) & np.isfinite(lats_flat)
+        if valid_mask.any():
+            lon_min = float(np.nanmin(lons_flat[valid_mask]))
+            lon_max = float(np.nanmax(lons_flat[valid_mask]))
+            lat_min = float(np.nanmin(lats_flat[valid_mask]))
+            lat_max = float(np.nanmax(lats_flat[valid_mask]))
+            scene_bounds.append({
+                "name": scene_name,
+                "lon_min": lon_min,
+                "lon_max": lon_max,
+                "lat_min": lat_min,
+                "lat_max": lat_max,
+            })
+
+    if not scene_bounds:
+        logger.warning("plot_collocation_diagnostics: Could not extract SAR scene bounds.")
+        return None
+
+    # ── Extract all validation data ─────────────────────────────────────
+    all_val_data = _extract_validation_data_for_plot(datatree)
+    if not all_val_data:
+        logger.warning("plot_collocation_diagnostics: No validation data found in DataTree.")
+        return None
+
+    all_val_lons = all_val_data["lons"]
+    all_val_lats = all_val_data["lats"]
+    total_points = len(all_val_lons)
+
+    # ── Extract matched validation points ───────────────────────────────
+    matched_lons = []
+    matched_lats = []
+    matched_sources = []
+    
+    if "val_lon" in collocation_ds and "val_lat" in collocation_ds:
+        matched_lons = collocation_ds["val_lon"].values
+        matched_lats = collocation_ds["val_lat"].values
+        if "val_source" in collocation_ds:
+            matched_sources = collocation_ds["val_source"].values
+        else:
+            matched_sources = np.full(len(matched_lons), "unknown")
+    
+    matched_points = len(matched_lons)
+    unmatched_points = total_points - matched_points
+
+    # ── Identify unmatched points ──────────────────────────────────────
+    # Build a set of (lon, lat) tuples from matched points for fast lookup
+    matched_set = set(zip(np.round(matched_lons, 6), np.round(matched_lats, 6)))
+    
+    unmatched_lons = []
+    unmatched_lats = []
+    for lon, lat in zip(all_val_lons, all_val_lats):
+        if (round(lon, 6), round(lat, 6)) not in matched_set:
+            unmatched_lons.append(lon)
+            unmatched_lats.append(lat)
+    
+    unmatched_lons = np.array(unmatched_lons)
+    unmatched_lats = np.array(unmatched_lats)
+
+    # ── Create geographic plot ──────────────────────────────────────────
+    fig = plt.figure(figsize=(14, 10), dpi=100)
+    ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+
+    # Add coastlines and features
+    ax.add_feature(cfeature.LAND, facecolor="lightgray", alpha=0.3, zorder=0)
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=1)
+    gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
+    gl.top_labels = False
+    gl.right_labels = False
+
+    # ── Plot SAR scene bounds (blue lines) ──────────────────────────────
+    transform = ccrs.PlateCarree()
+    for i, bounds in enumerate(scene_bounds):
+        lon_min, lon_max = bounds["lon_min"], bounds["lon_max"]
+        lat_min, lat_max = bounds["lat_min"], bounds["lat_max"]
+        
+        # Draw rectangle outline for each scene
+        lons_box = [lon_min, lon_max, lon_max, lon_min, lon_min]
+        lats_box = [lat_min, lat_min, lat_max, lat_max, lat_min]
+        ax.plot(lons_box, lats_box, color="blue", linewidth=1.5, 
+                transform=transform, zorder=2, label="SAR scene bounds" if i == 0 else "")
+
+    # ── Plot unmatched validation points (red dots) ──────────────────────
+    if len(unmatched_lons) > 0:
+        ax.scatter(
+            unmatched_lons, unmatched_lats,
+            s=20, c="red", alpha=0.6, edgecolors="darkred", linewidths=0.3,
+            transform=transform, zorder=3, label=f"Not matched ({len(unmatched_lons)})"
+        )
+
+    # ── Plot matched validation points (colored by source) ───────────────
+    if len(matched_lons) > 0:
+        if len(np.unique(matched_sources)) > 1:
+            # Multiple sources: use color map
+            source_map = _source_color_map(list(np.unique(matched_sources)))
+            for source in np.unique(matched_sources):
+                source_mask = matched_sources == source
+                source_lons = matched_lons[source_mask]
+                source_lats = matched_lats[source_mask]
+                color = source_map.get(str(source), "#ff7f0e")
+                ax.scatter(
+                    source_lons, source_lats,
+                    s=25, c=color, alpha=0.7, edgecolors="black", linewidths=0.3,
+                    transform=transform, zorder=4, label=f"Matched: {source}"
+                )
+        else:
+            # Single source: use green
+            ax.scatter(
+                matched_lons, matched_lats,
+                s=25, c="green", alpha=0.7, edgecolors="black", linewidths=0.3,
+                transform=transform, zorder=4, label=f"Matched ({len(matched_lons)})"
+            )
+
+    # ── Create title with statistics ────────────────────────────────────
+    recipe_name = recipe.config.name or "unknown"
+    title = (
+        f"{recipe_name} Collocation Diagnostics\n"
+        f"Total points: {total_points:,}, Matched: {matched_points}, "
+        f"Not matched: {unmatched_points}"
+    )
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=15)
+
+    # ── Add legend ──────────────────────────────────────────────────────
+    ax.legend(loc="lower left", fontsize=9, framealpha=0.9)
+
+    # ── Save figure ─────────────────────────────────────────────────────
+    fig.tight_layout()
+    output_file = plots_dir / f"collocation_diagnostics_{recipe_name}.png"
+    fig.savefig(str(output_file), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    logger.info(
+        "Collocation diagnostics plot saved: %s (%d matched, %d unmatched)",
+        output_file, matched_points, unmatched_points
+    )
+    return output_file
 
 # ---------------------------------------------------------------------------
 # Helpers for no-collocation plot with validation data
