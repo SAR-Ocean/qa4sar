@@ -47,7 +47,12 @@ sar_validation/
 │   ├── recipe.py           # Recipe dataclasses (YAML ↔ Python)
 │   ├── orchestrator.py     # Orchestrates step 1 (download all sources)
 │   ├── datatree_converter.py  # Step 2: convert to xarray.DataTree
-│   └── collocation.py      # Step 3: collocation algorithms
+│   ├── collocation.py      # Step 3: collocation algorithms
+│   ├── patch_extractor.py  # Step 4a: extract pixel neighborhoods around collocations
+│   ├── statistics.py       # Step 4b: compute bias, RMSE, correlation, scatter index
+│   ├── visualization.py    # Step 5: scatter plots, geographic maps, statistics charts, residuals
+│   ├── _variable_map.py    # Variable mapping (wind/currents/waves)
+│   └── __init__.py         # Package exports
 └── downloaders/
     ├── base.py             # Shared credential handling & helpers
     ├── sar_downloader.py   # Sentinel-1 L2_OCN via Copernicus Dataspace
@@ -148,7 +153,7 @@ plt.show()
 |------|---------|--------|
 | Point vs. Layer | mooring/buoy vs. SAR | ✅ implemented |
 | Trajectory vs. Layer | ferrybox/drifter vs. SAR | 🚧 stub |
-| Layer vs. Layer | scatterometer vs. SAR | 🚧 stub |
+| Layer vs. Layer | scatterometer (ASCAT) vs. SAR | ✅ implemented |
 
 ---
 
