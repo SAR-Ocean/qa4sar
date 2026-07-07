@@ -352,6 +352,8 @@ class DataTreeConverter:
 
         n_points = len(lat_arr)
 
+        # Normalize longitude to -180 to +180 range (handle both 0-360 and -180-180 conventions)
+        lon_arr = ((lon_arr + 180) % 360) - 180
         # ------------------------------------------------------------------
         # Extract acquisition time
         # ------------------------------------------------------------------
