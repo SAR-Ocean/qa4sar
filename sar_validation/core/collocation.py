@@ -835,6 +835,7 @@ def run_collocation(
     datatree: "xr.DataTree",
     base_dir: Union[str, Path],
     emit_diagnostics: bool = False,
+    layer_vs_layer_collocation_method: str = "cell-averaging",
 ) -> Optional["xr.Dataset"]:
     """
     Run all three collocation passes between SAR and validation nodes in
@@ -877,6 +878,10 @@ def run_collocation(
     emit_diagnostics : bool
         If True, emit detailed diagnostic logging for scatterometer collocation
         and generate diagnostic visualization plots.
+    layer_vs_layer_collocation_method : str
+        Collocation method for layer-vs-layer (scatterometer) data:
+        'individual' matches each SAR pixel to the closest scatterometer point (allowing reuse), or
+        'cell-averaging' clusters scatterometer into grid cells then aggregates SAR around each cell.
 
     Returns
     -------
@@ -903,16 +908,23 @@ def run_collocation(
             source_type_overrides[src.source_type] = src.collocation_kwargs
 
     # Convert global collocation config to dict for easy merging
+    # Use point_vs_layer as the base for global defaults
+    pvl_cfg = coll_cfg.point_vs_layer
     global_coll_kwargs = {
-        "spatial_tolerance_km": coll_cfg.spatial_tolerance_km,
-        "time_tolerance_minutes": coll_cfg.time_tolerance_minutes,
-        "interpolation_method": coll_cfg.interpolation_method,
-        "aggregation_window_km": coll_cfg.aggregation_window_km,
-        "validation_temporal_averaging_minutes": coll_cfg.validation_temporal_averaging_minutes,
-        "distance_weighting": coll_cfg.distance_weighting,
-        "gaussian_sigma_km": coll_cfg.gaussian_sigma_km,
+        "spatial_tolerance_km": pvl_cfg.spatial_tolerance_km,
+        "time_tolerance_minutes": pvl_cfg.time_tolerance_minutes,
+        "interpolation_method": pvl_cfg.interpolation_method,
+        "aggregation_window_km": pvl_cfg.aggregation_window_km,
+        "validation_temporal_averaging_minutes": pvl_cfg.validation_temporal_averaging_minutes,
+        "distance_weighting": pvl_cfg.distance_weighting,
+        "gaussian_sigma_km": pvl_cfg.gaussian_sigma_km,
         "emit_diagnostics": emit_diagnostics,
     }
+    
+    # Extract layer_vs_layer specs if configured
+    layer_vs_layer_specs = {}
+    if coll_cfg.layer_vs_layer is not None:
+        layer_vs_layer_specs = coll_cfg.layer_vs_layer.layer_type_specs
 
     # Collect SAR nodes (one Dataset per SAR scene)
     sar_scenes: Dict[str, Any] = {}
@@ -1027,6 +1039,31 @@ def run_collocation(
                         per_source_kwargs = source_metadata.get(val_name, {}).get("colloc_kwargs", {})
                         merged_kwargs = _merge_collocation_kwargs(global_coll_kwargs, per_source_kwargs)
 
+                        # For layer_vs_layer, apply layer-type-specific specs from recipe
+                        if ctype == "layer_vs_layer" and layer_vs_layer_specs:
+                            layer_type = val_ds.attrs.get("data_type", "").lower()
+                            if not layer_type:
+                                # Fallback: infer from path (e.g., "osi_saf_winds/...", "scatterometer", "altimeter")
+                                path_parts = val_name.lower().split("/")
+                                if "scatterometer" in path_parts:
+                                    layer_type = "scatterometer"
+                                elif "osi_saf_winds" in path_parts or "winds" in path_parts:
+                                    layer_type = "scatterometer"
+                                elif "altimeter" in path_parts:
+                                    layer_type = "altimeter"
+                                elif "hf_radar" in path_parts:
+                                    layer_type = "hf_radar"
+                            
+                            if layer_type in layer_vs_layer_specs:
+                                merged_kwargs.update(layer_vs_layer_specs[layer_type])
+                                logger.info(
+                                    "Applying layer_vs_layer specs for '%s': %s",
+                                    layer_type, layer_vs_layer_specs[layer_type],
+                                )
+                            
+                            # Add layer-vs-layer collocation method
+                            merged_kwargs["method"] = layer_vs_layer_collocation_method
+
                         colloc = _COLLOC_CLASSES[ctype](**merged_kwargs)
 
                         df = val_ds.to_dataframe().reset_index(drop=True)
@@ -1069,6 +1106,31 @@ def run_collocation(
                     # Apply per-source kwargs overrides
                     per_source_kwargs = source_metadata.get(val_name, {}).get("colloc_kwargs", {})
                     merged_kwargs = _merge_collocation_kwargs(global_coll_kwargs, per_source_kwargs)
+
+                    # For layer_vs_layer, apply layer-type-specific specs from recipe
+                    if ctype == "layer_vs_layer" and layer_vs_layer_specs:
+                        layer_type = val_ds.attrs.get("data_type", "").lower()
+                        if not layer_type:
+                            # Fallback: infer from path (e.g., "osi_saf_winds/...", "scatterometer", "altimeter")
+                            path_parts = val_name.lower().split("/")
+                            if "scatterometer" in path_parts:
+                                layer_type = "scatterometer"
+                            elif "osi_saf_winds" in path_parts or "winds" in path_parts:
+                                layer_type = "scatterometer"
+                            elif "altimeter" in path_parts:
+                                layer_type = "altimeter"
+                            elif "hf_radar" in path_parts:
+                                layer_type = "hf_radar"
+                        
+                        if layer_type in layer_vs_layer_specs:
+                            merged_kwargs.update(layer_vs_layer_specs[layer_type])
+                            logger.info(
+                                "Applying layer_vs_layer specs for '%s': %s",
+                                layer_type, layer_vs_layer_specs[layer_type],
+                            )
+                        
+                        # Add layer-vs-layer collocation method
+                        merged_kwargs["method"] = layer_vs_layer_collocation_method
 
                     colloc = _COLLOC_CLASSES[ctype](**merged_kwargs)
 
@@ -1190,6 +1252,7 @@ class LayerLayerCollocation(PointLayerCollocation):
         distance_weighting: str = "equal",
         gaussian_sigma_km: float = 12.5,
         emit_diagnostics: bool = False,
+        method: str = "cell-averaging",
     ) -> None:
         """
         Initialize LayerLayerCollocation with scatterometer-optimized defaults.
@@ -1212,6 +1275,9 @@ class LayerLayerCollocation(PointLayerCollocation):
             Gaussian sigma if using Gaussian weighting (12.5 km default).
         emit_diagnostics : bool
             If True, emit detailed per-cell diagnostic logging.
+        method : str
+            Collocation method: "cell-averaging" (clusters scatterometer into grid cells, aggregates SAR)
+            or "individual" (matches each SAR pixel to closest scatterometer point, allowing reuse).
         """
         super().__init__(
             spatial_tolerance_km=spatial_tolerance_km,
@@ -1222,6 +1288,7 @@ class LayerLayerCollocation(PointLayerCollocation):
             distance_weighting=distance_weighting,
             gaussian_sigma_km=gaussian_sigma_km,
         )
+        self.method = method
         self.emit_diagnostics = emit_diagnostics
         logger.debug(
             "LayerLayerCollocation initialized: %d min temporal, %.1f km spatial, "
@@ -1346,6 +1413,226 @@ class LayerLayerCollocation(PointLayerCollocation):
             logger.warning("Grid inference failed (%s); using all points as single cell.", e)
             return {0: list(range(n_points))}
 
+    def _collocate_individual(
+        self,
+        sar_data: Dict[str, np.ndarray],
+        sar_lon: np.ndarray,
+        sar_lat: np.ndarray,
+        sar_time: np.ndarray,
+        val_data: pd.DataFrame,
+        val_source: str,
+        sar_scene_name: str = "",
+    ) -> List[CollocatedPoint]:
+        """
+        Match each individual SAR pixel to the closest scatterometer point (individual method).
+
+        For each SAR grid cell at each time step:
+        1. Find closest scatterometer point (by Haversine distance)
+        2. Check spatial tolerance (within spatial_tolerance_km)
+        3. Check temporal match (within time_tolerance_minutes)
+        4. Create CollocatedPoint with SAR as anchor, scatterometer as matched value
+        5. Scatterometer points can be reused across multiple SAR cells
+
+        Returns
+        -------
+        list[CollocatedPoint]
+            List of collocated matches (one per matched SAR cell).
+        """
+        from datetime import timedelta as _td
+
+        sar_times = _to_datetime_array(sar_time)
+        collocations: List[CollocatedPoint] = []
+
+        # Pre-filter scatterometer data: spatial and temporal bounds
+        deg_buf = self.spatial_tolerance_km / 55.0
+        lon_min = float(sar_lon.min()) - deg_buf
+        lon_max = float(sar_lon.max()) + deg_buf
+        lat_min = float(sar_lat.min()) - deg_buf
+        lat_max = float(sar_lat.max()) + deg_buf
+        
+        spatial_mask = (
+            (val_data["lon"] >= lon_min) & (val_data["lon"] <= lon_max) &
+            (val_data["lat"] >= lat_min) & (val_data["lat"] <= lat_max)
+        )
+        val_data_filtered = val_data[spatial_mask].copy()
+
+        if val_data_filtered.empty:
+            logger.debug("No scatterometer data within spatial bounds")
+            return collocations
+
+        # Temporal pre-filter
+        t_min = min(sar_times) - _td(minutes=self.time_tolerance_minutes)
+        t_max = max(sar_times) + _td(minutes=self.time_tolerance_minutes)
+        if hasattr(t_min, "tzinfo") and t_min.tzinfo is not None:
+            t_min = t_min.replace(tzinfo=None)
+            t_max = t_max.replace(tzinfo=None)
+
+        val_times_pd = pd.to_datetime(val_data_filtered["time"].values)
+        if val_times_pd.tz is not None:
+            val_times_pd = val_times_pd.tz_localize(None)
+
+        temporal_mask = (val_times_pd >= t_min) & (val_times_pd <= t_max)
+        val_data_filtered = val_data_filtered[temporal_mask]
+
+        if val_data_filtered.empty:
+            logger.debug("No scatterometer data within temporal window")
+            return collocations
+
+        logger.debug(
+            "Pre-filters kept %d scatterometer points (spatial + temporal)",
+            len(val_data_filtered),
+        )
+
+        # Identify numeric columns in validation data
+        val_numeric_cols = [
+            col for col in val_data_filtered.columns
+            if col not in {"lon", "lat", "time", "platform_id"} and
+            pd.api.types.is_numeric_dtype(val_data_filtered[col])
+        ]
+
+        # Pre-extract scatterometer coordinates and times for vectorized distance computation
+        scat_lons = val_data_filtered["lon"].values
+        scat_lats = val_data_filtered["lat"].values
+        scat_times_pd = pd.to_datetime(val_data_filtered["time"].values)
+        if scat_times_pd.tz is not None:
+            scat_times_pd = scat_times_pd.tz_localize(None)
+        scat_times_objs = np.array([t.to_pydatetime() if hasattr(t, 'to_pydatetime') else t 
+                                    for t in scat_times_pd], dtype=object)
+
+        # Process each SAR time
+        rejected_spatial = 0
+        rejected_temporal = 0
+        rejected_no_data = 0
+
+        for t_idx, sar_t in enumerate(sar_times):
+            # Get SAR data shape (y, x)
+            sar_grid_y, sar_grid_x = sar_lon.shape
+
+            # Process each SAR grid cell
+            for y_idx in range(sar_grid_y):
+                for x_idx in range(sar_grid_x):
+                    # Check if SAR data exists at this cell
+                    sar_aggregated = {}
+                    for var in sar_data.keys():
+                        val = sar_data[var][t_idx, y_idx, x_idx]
+                        if not np.isnan(val):
+                            sar_aggregated[f"sar_{var}"] = float(val)
+
+                    if not sar_aggregated:
+                        rejected_no_data += 1
+                        continue
+
+                    # Get SAR cell position
+                    sar_cell_lon = float(sar_lon[y_idx, x_idx])
+                    sar_cell_lat = float(sar_lat[y_idx, x_idx])
+
+                    # Compute distances to all scatterometer points (vectorized)
+                    distances_to_scat = np.array([
+                        _haversine_distance(sar_cell_lon, sar_cell_lat, scat_lon, scat_lat)
+                        for scat_lon, scat_lat in zip(scat_lons, scat_lats)
+                    ])
+
+                    # Find closest scatterometer point
+                    closest_scat_idx = np.argmin(distances_to_scat)
+                    closest_distance = distances_to_scat[closest_scat_idx]
+
+                    # Check spatial tolerance
+                    if closest_distance > self.spatial_tolerance_km:
+                        rejected_spatial += 1
+                        if self.emit_diagnostics:
+                            logger.debug(
+                                "SAR cell (y=%d, x=%d) at (%.3f°, %.3f°): REJECTED spatial (dist=%.2f km > %.1f km)",
+                                y_idx, x_idx, sar_cell_lon, sar_cell_lat, 
+                                closest_distance, self.spatial_tolerance_km,
+                            )
+                        continue
+
+                    # Get closest scatterometer observation
+                    closest_scat_time = scat_times_objs[closest_scat_idx]
+                    time_diff = abs((sar_t - closest_scat_time).total_seconds() / 60.0)
+
+                    # Check temporal tolerance
+                    if time_diff > self.time_tolerance_minutes:
+                        rejected_temporal += 1
+                        if self.emit_diagnostics:
+                            logger.debug(
+                                "SAR cell (y=%d, x=%d): REJECTED temporal (time_diff=%.1f min > %d min)",
+                                y_idx, x_idx, time_diff, self.time_tolerance_minutes,
+                            )
+                        continue
+
+                    # Extract scatterometer value at closest point
+                    val_aggregated = {}
+                    closest_row = val_data_filtered.iloc[closest_scat_idx]
+                    for col in val_numeric_cols:
+                        if col in closest_row and pd.notna(closest_row[col]):
+                            val_aggregated[col] = float(closest_row[col])
+
+                    if not val_aggregated:
+                        rejected_no_data += 1
+                        if self.emit_diagnostics:
+                            logger.debug(
+                                "SAR cell (y=%d, x=%d): REJECTED (no valid scatterometer values)",
+                                y_idx, x_idx,
+                            )
+                        continue
+
+                    # Get closest scatterometer position
+                    closest_scat_lon = float(scat_lons[closest_scat_idx])
+                    closest_scat_lat = float(scat_lats[closest_scat_idx])
+
+                    if self.emit_diagnostics:
+                        logger.debug(
+                            "SAR cell (%.3f°, %.3f°) MATCHED to scatterometer (%.3f°, %.3f°) "
+                            "at distance=%.2f km, time_diff=%.1f min",
+                            sar_cell_lon, sar_cell_lat, closest_scat_lon, closest_scat_lat,
+                            closest_distance, time_diff,
+                        )
+
+                    # Create CollocatedPoint with SAR as anchor
+                    collocations.append(
+                        CollocatedPoint(
+                            sar_lon=sar_cell_lon,
+                            sar_lat=sar_cell_lat,
+                            sar_time=sar_t,
+                            sar_data=sar_aggregated,
+                            val_lon=closest_scat_lon,
+                            val_lat=closest_scat_lat,
+                            val_time=closest_scat_time,
+                            val_data=val_aggregated,
+                            spatial_distance_km=closest_distance,
+                            temporal_distance_minutes=time_diff,
+                            val_source=val_source,
+                            val_id=None,  # Scatterometer points don't have IDs
+                            collocation_type=self.collocation_type,
+                            sar_y_idx=y_idx,
+                            sar_x_idx=x_idx,
+                            sar_scene_name=sar_scene_name,
+                        )
+                    )
+
+        if self.emit_diagnostics:
+            logger.info(
+                "[SUMMARY] LayerLayerCollocation (SAR-anchor): %d matches from SAR grid. "
+                "Rejected: %d spatial, %d temporal, %d no-data.",
+                len(collocations), rejected_spatial, rejected_temporal, rejected_no_data,
+            )
+            if collocations:
+                spatial_dists = [c.spatial_distance_km for c in collocations]
+                temporal_dists = [c.temporal_distance_minutes for c in collocations]
+                logger.info(
+                    "[DISTANCES] Matched pairs: spatial=[%.2f, %.2f, %.2f] km (min/median/max), "
+                    "temporal=[%.1f, %.1f, %.1f] min (min/median/max)",
+                    np.min(spatial_dists), np.median(spatial_dists), np.max(spatial_dists),
+                    np.min(temporal_dists), np.median(temporal_dists), np.max(temporal_dists),
+                )
+
+        logger.info(
+            "%s (individual/SAR-anchor method): found %d matches from SAR grid (source=%s)",
+            self.__class__.__name__, len(collocations), val_source,
+        )
+        return collocations
+
     def collocate(
         self,
         sar_data: Dict[str, np.ndarray],
@@ -1357,7 +1644,53 @@ class LayerLayerCollocation(PointLayerCollocation):
         sar_scene_name: str = "",
     ) -> List[CollocatedPoint]:
         """
-        Match scatterometer cells to SAR grid using spatial/temporal aggregation.
+        Match scatterometer to SAR using selected collocation method.
+
+        Dispatches to either individual point-to-point or cell-averaging methods
+        based on self.method setting.
+
+        Parameters
+        ----------
+        sar_data : dict
+            SAR variables as 3-D arrays with shape ``(time, y, x)``.
+        sar_lon, sar_lat : np.ndarray
+            SAR coordinate grids, shape ``(y, x)``.
+        sar_time : array-like
+            SAR acquisition times, shape ``(time,)``.
+        val_data : pd.DataFrame
+            Scatterometer data with columns ``lon``, ``lat``, ``time``, and variables.
+        val_source : str
+            Label for validation source.
+        sar_scene_name : str
+            Name of SAR scene node in DataTree.
+
+        Returns
+        -------
+        list[CollocatedPoint]
+            List of collocated matches.
+        """
+        if self.method == "individual":
+            return self._collocate_individual(
+                sar_data, sar_lon, sar_lat, sar_time, val_data, val_source, sar_scene_name
+            )
+        else:
+            # Default to cell-averaging
+            return self._collocate_cell_averaging(
+                sar_data, sar_lon, sar_lat, sar_time, val_data, val_source, sar_scene_name
+            )
+
+    def _collocate_cell_averaging(
+        self,
+        sar_data: Dict[str, np.ndarray],
+        sar_lon: np.ndarray,
+        sar_lat: np.ndarray,
+        sar_time: np.ndarray,
+        val_data: pd.DataFrame,
+        val_source: str,
+        sar_scene_name: str = "",
+    ) -> List[CollocatedPoint]:
+        """
+        Match scatterometer cells to SAR grid using spatial/temporal aggregation (cell-averaging method).
 
         Algorithm
         ---------

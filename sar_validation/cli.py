@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
 )
 logger = logging.getLogger(__name__)
@@ -161,11 +161,22 @@ Examples:
         action="store_true",
         help="Enable detailed diagnostic logging and visualization for scatterometer collocation",
     )
+    parser.add_argument(
+        "--layer-vs-layer-collocation-method",
+        metavar="METHOD",
+        choices=["individual", "cell-averaging"],
+        default="cell-averaging",
+        help="Collocation method for layer-vs-layer (scatterometer) data: "
+             "'individual' matches each SAR pixel to the closest scatterometer point (reusable, many matches), "
+             "'cell-averaging' clusters scatterometer into grid cells then aggregates SAR (~57 matches, default)",
+    )
 
     args = parser.parse_args(argv)
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+    
+        logging.getLogger("matplotlib").setLevel(logging.INFO)
 
     if args.list_recipes:
         _list_recipes()
@@ -192,6 +203,7 @@ Examples:
             stats=args.stats or args.plot,
             plot=args.plot,
             collocation_log=args.collocation_log,
+            layer_vs_layer_collocation_method=args.layer_vs_layer_collocation_method,
         )
     else:
         parser.print_help()
@@ -229,6 +241,7 @@ def _create_recipe(
     from .core.recipe import (
         Recipe, RecipeConfig, GeographicBounds, TemporalBounds,
         SARDataSpec, ValidationDataSource, CollocationType,
+        PointVsLayerCollocation, LayerVsLayerCollocation,
     )
 
     templates = {
@@ -245,15 +258,23 @@ def _create_recipe(
             validation_sources=[
                 ValidationDataSource(source_type="mooring"),
                 ValidationDataSource(source_type="buoy"),
-                ValidationDataSource(
-                    source_type="scatterometer",
-                    collocation_kwargs={
-                        "time_tolerance_minutes": 180,  # Layer vs. layer: ±3 hrs (hal-04202202)
-                        "spatial_tolerance_km": 12.5,   # Layer vs. layer: 12.5 km (hal-04202202)
-                    },
-                ),
+                ValidationDataSource(source_type="ferrybox"),
+                ValidationDataSource(source_type="drifter"),
+                ValidationDataSource(source_type="tidal_gauge"),
+                ValidationDataSource(source_type="scatterometer"),
             ],
-            collocation=CollocationType("point_vs_layer"),
+            collocation=CollocationType(
+                point_vs_layer=PointVsLayerCollocation(),
+                layer_vs_layer=LayerVsLayerCollocation(
+                    layer_type_specs={
+                        "scatterometer": {
+                            "time_tolerance_minutes": 180,
+                            "aggregation_window_km": 12.5,
+                            "distance_weighting": "equal",
+                        }
+                    }
+                ),
+            ),
         ),
         "currents": RecipeConfig(
             name="Ocean Currents Validation",
@@ -272,8 +293,20 @@ def _create_recipe(
                 ),
                 ValidationDataSource(source_type="drifter"),
                 ValidationDataSource(source_type="ferrybox"),
+                ValidationDataSource(source_type="mooring"),
             ],
-            collocation=CollocationType("point_vs_layer"),
+            collocation=CollocationType(
+                point_vs_layer=PointVsLayerCollocation(),
+                layer_vs_layer=LayerVsLayerCollocation(
+                    layer_type_specs={
+                        "hf_radar": {
+                            "time_tolerance_minutes": 60,
+                            "aggregation_window_km": 5.0,
+                            "distance_weighting": "equal",
+                        }
+                    }
+                ),
+            ),
         ),
         "waves": RecipeConfig(
             name="Wave Height Validation",
@@ -289,7 +322,18 @@ def _create_recipe(
                 ValidationDataSource(source_type="mooring"),
                 ValidationDataSource(source_type="altimeter"),
             ],
-            collocation=CollocationType("point_vs_layer"),
+            collocation=CollocationType(
+                point_vs_layer=PointVsLayerCollocation(),
+                layer_vs_layer=LayerVsLayerCollocation(
+                    layer_type_specs={
+                        "altimeter": {
+                            "time_tolerance_minutes": 120,
+                            "aggregation_window_km": 10.0,
+                            "distance_weighting": "equal",
+                        }
+                    }
+                ),
+            ),
         ),
     }
 
@@ -336,6 +380,7 @@ def _execute_recipe(
     stats: bool = False,
     plot: bool = False,
     collocation_log: bool = False,
+    layer_vs_layer_collocation_method: str = "cell-averaging",
 ) -> None:
     from .core.recipe import Recipe
     from .core.orchestrator import DataOrchestrator
@@ -385,7 +430,12 @@ def _execute_recipe(
             print("Step 2 skipped — DataTree already exists")
 
     if collocate:
-        _collocate_data(recipe, orchestrator.base_dir, emit_diagnostics=collocation_log)
+        _collocate_data(
+            recipe,
+            orchestrator.base_dir,
+            emit_diagnostics=collocation_log,
+            layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
+        )
 
     if stats or plot:
         _compute_stats(recipe, orchestrator.base_dir)
@@ -456,7 +506,12 @@ def _convert_data(recipe, base_dir: Path) -> "xr.DataTree | None":
     return tree
 
 
-def _collocate_data(recipe, base_dir: Path, emit_diagnostics: bool = False) -> None:
+def _collocate_data(
+    recipe,
+    base_dir: Path,
+    emit_diagnostics: bool = False,
+    layer_vs_layer_collocation_method: str = "cell-averaging",
+) -> None:
     """Run step 3: load DataTree and run collocation."""
     import xarray as xr
     from .core.collocation import run_collocation
@@ -474,7 +529,13 @@ def _collocate_data(recipe, base_dir: Path, emit_diagnostics: bool = False) -> N
         tree = xr.open_datatree(str(datatree_path), engine='netcdf4')
 
     print("\nStep 3: Running collocation…")
-    result = run_collocation(recipe, tree, base_dir, emit_diagnostics=emit_diagnostics)
+    result = run_collocation(
+        recipe,
+        tree,
+        base_dir,
+        emit_diagnostics=emit_diagnostics,
+        layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
+    )
     if result is None:
         print("  No collocated pairs found.")
         # Fallback: plot SAR data coverage for debugging

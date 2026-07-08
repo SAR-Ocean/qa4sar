@@ -86,42 +86,72 @@ class SARDataSpec:
 
 
 @dataclass
-class CollocationType:
-    """Collocation matching strategy."""
-    type: str = "point_vs_layer"
-    """
-    One of:
-      point_vs_layer      — fixed / slowly-moving point vs. SAR grid  ✅
-      trajectory_vs_layer — moving trajectory vs. SAR grid            🚧
-      layer_vs_layer      — another gridded product vs. SAR grid      🚧
-    """
+class PointVsLayerCollocation:
+    """Collocation config for point vs gridded SAR data (buoys, moorings)."""
     time_tolerance_minutes: int = 30
-    """Temporal tolerance (minutes). Based on Abderrahim et al. (hal-04202202):
-       - Point vs layer (buoys, moorings): ±30 min
-       - Per-source overrides can specify different values (e.g., 180 min for scatterometer).
-    """
     spatial_tolerance_km: float = 12.5
-    """Spatial tolerance (km). Based on Abderrahim et al. (hal-04202202): 12.5 km."""
-    interpolation_method: str = "nearest"  # nearest | linear | cubic
+    interpolation_method: str = "nearest"
     aggregation_window_km: float = 5.0
-    """Circular radius (km) around validation point for SAR aggregation."""
     validation_temporal_averaging_minutes: int = 30
-    """Window (minutes) for temporal averaging of validation observations."""
     distance_weighting: str = "gaussian"
-    """Distance weighting: gaussian | inverse_distance | linear | equal"""
     gaussian_sigma_km: float = 2.0
-    """Gaussian standard deviation (km) for distance weighting."""
     patch_size: int = 0
-    """
-    Side length (in pixels) of the SAR patch extracted around each matched pixel.
 
-    ``0`` disables patch extraction (default).  Must be a positive odd integer
-    when enabled (e.g. 3, 5, 7, 9).  Even values are rounded up to the next
-    odd integer with a warning.
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class LayerVsLayerCollocation:
+    """Collocation config for gridded vs gridded SAR data (scatterometer, altimeter, HF radar).
+    
+    Maps data source types to their specific collocation parameters.
+    Supports two collocation methods: 'cell-averaging' (clusters scatterometer into grid cells)
+    or 'individual' (matches each scatterometer point to nearest SAR pixel).
+    """
+    layer_type_specs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    """
+    Dict mapping layer data source type → collocation parameters.
+    
+    Example:
+        layer_type_specs:
+          scatterometer:
+            time_tolerance_minutes: 180
+            aggregation_window_km: 12.5
+            distance_weighting: equal
+          altimeter:
+            time_tolerance_minutes: 120
+            aggregation_window_km: 10.0
+            distance_weighting: equal
+    """
+    method: str = "cell-averaging"
+    """
+    Collocation method for layer-vs-layer data:
+    - 'cell-averaging': Cluster scatterometer into grid cells (~57 matches from ~3000 points)
+    - 'individual': Match each scatterometer point to nearest SAR pixel (~3000+ matches)
     """
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class CollocationType:
+    """Collocation configuration for SAR validation.
+    
+    Supports both point_vs_layer (buoys, moorings) and layer_vs_layer
+    (scatterometer, altimeter, HF radar) collocation strategies.
+    Per-source overrides in ValidationDataSource.collocation_kwargs take
+    precedence over all recipe defaults.
+    """
+    point_vs_layer: PointVsLayerCollocation = field(default_factory=PointVsLayerCollocation)
+    layer_vs_layer: Optional[LayerVsLayerCollocation] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {"point_vs_layer": self.point_vs_layer.to_dict()}
+        if self.layer_vs_layer is not None:
+            result["layer_vs_layer"] = self.layer_vs_layer.to_dict()
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +187,7 @@ class RecipeConfig:
 
     # --- Collocation ---
     collocation: CollocationType = field(
-        default_factory=lambda: CollocationType("point_vs_layer")
+        default_factory=CollocationType
     )
 
     # --- Output ---
@@ -218,6 +248,27 @@ class Recipe:
         sar = data.get("sar_data", {})
         coll = data.get("collocation", {})
 
+        # Parse point_vs_layer section
+        pvl_config = coll.get("point_vs_layer", {})
+        point_vs_layer = PointVsLayerCollocation(
+            time_tolerance_minutes=pvl_config.get("time_tolerance_minutes", 30),
+            spatial_tolerance_km=pvl_config.get("spatial_tolerance_km", 12.5),
+            interpolation_method=pvl_config.get("interpolation_method", "nearest"),
+            aggregation_window_km=pvl_config.get("aggregation_window_km", 5.0),
+            validation_temporal_averaging_minutes=pvl_config.get("validation_temporal_averaging_minutes", 30),
+            distance_weighting=pvl_config.get("distance_weighting", "gaussian"),
+            gaussian_sigma_km=pvl_config.get("gaussian_sigma_km", 2.0),
+            patch_size=pvl_config.get("patch_size", 0),
+        )
+
+        # Parse layer_vs_layer section if present
+        layer_vs_layer = None
+        if "layer_vs_layer" in coll:
+            lvl_config = coll["layer_vs_layer"]
+            layer_vs_layer = LayerVsLayerCollocation(
+                layer_type_specs=lvl_config.get("layer_type_specs", {}),
+            )
+
         config = RecipeConfig(
             name=data["name"],
             variable=data["variable"],
@@ -251,15 +302,8 @@ class Recipe:
                 for src in data.get("validation_sources", [])
             ],
             collocation=CollocationType(
-                type=coll.get("type", "point_vs_layer"),
-                time_tolerance_minutes=coll.get("time_tolerance_minutes", 60),
-                spatial_tolerance_km=coll.get("spatial_tolerance_km", 50.0),
-                interpolation_method=coll.get("interpolation_method", "nearest"),
-                aggregation_window_km=coll.get("aggregation_window_km", 5.0),
-                validation_temporal_averaging_minutes=coll.get("validation_temporal_averaging_minutes", 30),
-                distance_weighting=coll.get("distance_weighting", "gaussian"),
-                gaussian_sigma_km=coll.get("gaussian_sigma_km", 2.0),
-                patch_size=coll.get("patch_size", 0),
+                point_vs_layer=point_vs_layer,
+                layer_vs_layer=layer_vs_layer,
             ),
             output_dir=data.get("output_dir"),
         )

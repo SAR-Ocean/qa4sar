@@ -1144,12 +1144,21 @@ def plot_collocation_diagnostics(
             lon_max = float(np.nanmax(lons_flat[valid_mask]))
             lat_min = float(np.nanmin(lats_flat[valid_mask]))
             lat_max = float(np.nanmax(lats_flat[valid_mask]))
+            
+            # Extract time bounds from SAR scene
+            sar_time = None
+            if "time" in scene_ds.coords:
+                times = np.atleast_1d(scene_ds.coords["time"].values)
+                if len(times) > 0:
+                    sar_time = np.nanmedian(times.astype('datetime64[ns]').astype('int64')).astype('datetime64[ns]')
+            
             scene_bounds.append({
                 "name": scene_name,
                 "lon_min": lon_min,
                 "lon_max": lon_max,
                 "lat_min": lat_min,
                 "lat_max": lat_max,
+                "time": sar_time,
             })
 
     if not scene_bounds:
@@ -1196,39 +1205,87 @@ def plot_collocation_diagnostics(
     unmatched_lons = np.array(unmatched_lons)
     unmatched_lats = np.array(unmatched_lats)
 
-    # ── Separate in-situ from scatterometer in unmatched points ──────────
-    # Build a set of (lon, lat) tuples from matched points for fast lookup
-    matched_set = set(zip(np.round(matched_lons, 6), np.round(matched_lats, 6)))
+    # ── Separate matched points into in-situ and scatterometer ──────────
+    # Extract point_vs_layer and trajectory_vs_layer (in-situ) matches from collocation_ds
+    if "collocation_type" in collocation_ds:
+        pvl_mask = (collocation_ds["collocation_type"] == "point_vs_layer") | \
+                   (collocation_ds["collocation_type"] == "trajectory_vs_layer")
+        pvl_ds = collocation_ds.where(pvl_mask, drop=True)
+        
+        matched_lons_insitu = pvl_ds["val_lon"].values if "val_lon" in pvl_ds else np.array([])
+        matched_lats_insitu = pvl_ds["val_lat"].values if "val_lat" in pvl_ds else np.array([])
+        if "val_source" in pvl_ds:
+            matched_sources_insitu = pvl_ds["val_source"].values
+        else:
+            matched_sources_insitu = np.full(len(matched_lons_insitu), "unknown")
+    else:
+        # Fallback to original logic if collocation_type not available
+        matched_lons_insitu = matched_lons
+        matched_lats_insitu = matched_lats
+        matched_sources_insitu = matched_sources
+    
+    matched_points_insitu = len(matched_lons_insitu)
+
+    # ── Extract layer_vs_layer (scatterometer) matches from collocation_ds ────────
+    # Use actual matched pairs saved by LayerLayerCollocation.collocate()
+    matched_lons_scat = np.array([])
+    matched_lats_scat = np.array([])
+    matched_points_scat = 0
+    
+    if "collocation_type" in collocation_ds:
+        lvl_mask = collocation_ds["collocation_type"] == "layer_vs_layer"
+        lvl_ds = collocation_ds.where(lvl_mask, drop=True)
+        if len(lvl_ds["collocation"]) > 0:
+            matched_lons_scat = lvl_ds["val_lon"].values
+            matched_lats_scat = lvl_ds["val_lat"].values
+            matched_points_scat = len(matched_lons_scat)
+
+    # ── Identify unmatched points ──────────────────────────────────────
+    # Build sets of (lon, lat) tuples from matched points (both in-situ and scatterometer)
+    all_matched_insitu = set(zip(np.round(matched_lons_insitu, 6), np.round(matched_lats_insitu, 6)))
+    all_matched_scat = set(zip(np.round(matched_lons_scat, 6), np.round(matched_lats_scat, 6)))
     
     unmatched_lons_insitu = []
     unmatched_lats_insitu = []
-    platform_types_arr = np.array(all_val_data["platform_types"])
+    unmatched_lons_scat = []
+    unmatched_lats_scat = []
     
-    for i, (lon, lat) in enumerate(zip(all_val_lons, all_val_lats)):
-        if (round(lon, 6), round(lat, 6)) not in matched_set:
-            # Only keep if it's in-situ, not scatterometer
-            if platform_types_arr[i] != "scatterometer":
+    if "platform_types" in all_val_data:
+        platform_types_arr = np.array(all_val_data["platform_types"])
+        
+        for i, (lon, lat) in enumerate(zip(all_val_lons, all_val_lats)):
+            lon_lat_rounded = (round(lon, 6), round(lat, 6))
+            
+            if platform_types_arr[i] == "scatterometer":
+                # Scatterometer point
+                if lon_lat_rounded not in all_matched_scat:
+                    unmatched_lons_scat.append(lon)
+                    unmatched_lats_scat.append(lat)
+            else:
+                # In-situ point
+                if lon_lat_rounded not in all_matched_insitu:
+                    unmatched_lons_insitu.append(lon)
+                    unmatched_lats_insitu.append(lat)
+    else:
+        # Fallback: no platform type info, treat all unmatched as in-situ
+        for lon, lat in zip(all_val_lons, all_val_lats):
+            if (round(lon, 6), round(lat, 6)) not in all_matched_insitu:
                 unmatched_lons_insitu.append(lon)
                 unmatched_lats_insitu.append(lat)
     
     unmatched_lons = np.array(unmatched_lons_insitu)
     unmatched_lats = np.array(unmatched_lats_insitu)
+    unmatched_points_insitu = len(unmatched_lons)
+    unmatched_lons_scat = np.array(unmatched_lons_scat)
+    unmatched_lats_scat = np.array(unmatched_lats_scat)
+    unmatched_points_scat = len(unmatched_lons_scat)
 
-    # ── Filter matched points to in-situ only ───────────────────────────
-    matched_mask_insitu = []
-    for src in matched_sources:
-        # Exclude scatterometer sources (osi_saf* or "scatterometer")
-        src_str = str(src)
-        if "osi_saf" not in src_str and src_str != "scatterometer":
-            matched_mask_insitu.append(True)
-        else:
-            matched_mask_insitu.append(False)
+    unmatched_points_scat = len(unmatched_lons_scat)
     
-    matched_mask_insitu = np.array(matched_mask_insitu)
-    matched_lons = matched_lons[matched_mask_insitu]
-    matched_lats = matched_lats[matched_mask_insitu]
-    matched_sources = matched_sources[matched_mask_insitu]
-    matched_points = len(matched_lons)
+    logger.debug(
+        "Classification: in-situ=%d matched/%d unmatched; scatterometer=%d matched/%d unmatched (from collocation_results.nc)",
+        matched_points_insitu, unmatched_points_insitu, matched_points_scat, unmatched_points_scat
+    )
 
     # ── Calculate expanded geographic bounds (+5 degrees on all sides) ───
     bounds = recipe.config.geographic_bounds
@@ -1236,23 +1293,6 @@ def plot_collocation_diagnostics(
     expanded_max_lon = bounds.max_lon + 5
     expanded_min_lat = bounds.min_lat - 5
     expanded_max_lat = bounds.max_lat + 5
-
-    # ── Extract and filter scatterometer data to expanded bounds ────────
-    scatterometer_lons = []
-    scatterometer_lats = []
-    
-    # Check if we have platform_types in the validation data
-    if "platform_types" in all_val_data:
-        platform_types_arr = np.array(all_val_data["platform_types"])
-        scatterometer_mask = platform_types_arr == "scatterometer"
-        
-        if scatterometer_mask.any():
-            all_lons_arr = np.array(all_val_data["lons"])
-            all_lats_arr = np.array(all_val_data["lats"])
-            
-            # Extract all scatterometer points (plot extent will clip to visible area)
-            scatterometer_lons = all_lons_arr[scatterometer_mask]
-            scatterometer_lats = all_lats_arr[scatterometer_mask]
 
     # ── Create geographic plot ──────────────────────────────────────────
     fig = plt.figure(figsize=(14, 10), dpi=100)
@@ -1269,14 +1309,22 @@ def plot_collocation_diagnostics(
     ax.set_extent([expanded_min_lon, expanded_max_lon, expanded_min_lat, expanded_max_lat],
                   crs=ccrs.PlateCarree())
 
-    # ── Plot scatterometer data points (background layer, zorder=1) ──────
+    # ── Plot scatterometer matched points (green dots, zorder=2.5) ────────
     transform = ccrs.PlateCarree()
     
-    if len(scatterometer_lons) > 0:
+    if len(matched_lons_scat) > 0:
         ax.scatter(
-            scatterometer_lons, scatterometer_lats,
-            s=15, c="#cccccc", alpha=0.5, edgecolors="none",
-            transform=transform, zorder=1, label=f"Scatterometer background ({len(scatterometer_lons)})"
+            matched_lons_scat, matched_lats_scat,
+            s=15, c="green", alpha=0.5, edgecolors="none",
+            transform=transform, zorder=2.5, label=f"Scatterometer matched ({len(matched_lons_scat)})"
+        )
+
+    # ── Plot scatterometer unmatched points (red dots, zorder=1.5) ────────
+    if len(unmatched_lons_scat) > 0:
+        ax.scatter(
+            unmatched_lons_scat, unmatched_lats_scat,
+            s=15, c="red", alpha=0.5, edgecolors="none",
+            transform=transform, zorder=1.5, label=f"Scatterometer unmatched ({len(unmatched_lons_scat)})"
         )
 
     # ── Plot SAR scene bounds (blue lines, zorder=2) ──────────────────────
@@ -1290,46 +1338,51 @@ def plot_collocation_diagnostics(
         ax.plot(lons_box, lats_box, color="blue", linewidth=1.5, 
                 transform=transform, zorder=2, label="SAR scene bounds" if i == 0 else "")
 
-    # ── Plot unmatched validation points (red dots, zorder=3) ──────────────────────
+    # ── Plot unmatched in-situ validation points (red dots, zorder=3) ─────
     if len(unmatched_lons) > 0:
         ax.scatter(
             unmatched_lons, unmatched_lats,
             s=20, c="red", alpha=0.6, edgecolors="darkred", linewidths=0.3,
-            transform=transform, zorder=3, label=f"Not matched ({len(unmatched_lons)})"
+            transform=transform, zorder=3, label=f"In-situ not matched ({len(unmatched_lons)})"
         )
 
-    # ── Plot matched validation points (colored by source, zorder=4) ──────
-    if len(matched_lons) > 0:
-        if len(np.unique(matched_sources)) > 1:
+    # ── Plot matched in-situ validation points (colored by source, zorder=4) ──
+    if len(matched_lons_insitu) > 0:
+        if len(np.unique(matched_sources_insitu)) > 1:
             # Multiple sources: use color map
-            source_map = _source_color_map(list(np.unique(matched_sources)))
-            for source in np.unique(matched_sources):
-                source_mask = matched_sources == source
-                source_lons = matched_lons[source_mask]
-                source_lats = matched_lats[source_mask]
+            source_map = _source_color_map(list(np.unique(matched_sources_insitu)))
+            for source in np.unique(matched_sources_insitu):
+                source_mask = matched_sources_insitu == source
+                source_lons = matched_lons_insitu[source_mask]
+                source_lats = matched_lats_insitu[source_mask]
                 color = source_map.get(str(source), "#ff7f0e")
                 ax.scatter(
                     source_lons, source_lats,
                     s=25, c=color, alpha=0.7, edgecolors="black", linewidths=0.3,
-                    transform=transform, zorder=4, label=f"Matched: {source}"
+                    transform=transform, zorder=4, label=f"In-situ matched: {source}"
                 )
         else:
             # Single source: use green
             ax.scatter(
-                matched_lons, matched_lats,
+                matched_lons_insitu, matched_lats_insitu,
                 s=25, c="green", alpha=0.7, edgecolors="black", linewidths=0.3,
-                transform=transform, zorder=4, label=f"Matched ({len(matched_lons)})"
+                transform=transform, zorder=4, label=f"In-situ matched ({len(matched_lons_insitu)})"
             )
 
     # ── Create title with statistics ────────────────────────────────────
     recipe_name = recipe.config.name or "unknown"
-    unmatched_points = len(unmatched_lons)  # Now only in-situ unmatched points
-    insitu_total = matched_points + unmatched_points  # Total in-situ observations
     
+    # In-situ statistics
+    insitu_total = matched_points_insitu + unmatched_points_insitu
+    
+    # Scatterometer statistics
+    scat_total = matched_points_scat + unmatched_points_scat
+    
+    # Build title with both in-situ and scatterometer statistics
     title = (
         f"{recipe_name} Collocation Diagnostics\n"
-        f"In-situ observations: {insitu_total:,}, Matched: {matched_points}, Not matched: {unmatched_points} | "
-        f"Scatterometer background: {len(scatterometer_lons)}"
+        f"In-situ: {insitu_total}, Matched: {matched_points_insitu}, Unmatched: {unmatched_points_insitu} | "
+        f"Scatterometer: {scat_total}, Matched: {matched_points_scat}, Unmatched: {unmatched_points_scat}"
     )
     ax.set_title(title, fontsize=12, fontweight="bold", pad=15)
 
@@ -1343,8 +1396,8 @@ def plot_collocation_diagnostics(
     plt.close(fig)
 
     logger.info(
-        "Collocation diagnostics plot saved: %s (%d matched, %d unmatched)",
-        output_file, matched_points, unmatched_points
+        "Collocation diagnostics plot saved: %s (in-situ: %d matched, %d unmatched; scatterometer: %d matched, %d unmatched)",
+        output_file, matched_points_insitu, unmatched_points_insitu, matched_points_scat, unmatched_points_scat
     )
     return output_file
 
