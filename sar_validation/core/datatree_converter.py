@@ -29,6 +29,20 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["DataTreeConverter"]
 
+# OSI-SAF/ASCAT `wvc_quality_flag` bit meanings (see the file's own
+# flag_masks/flag_meanings attrs) that indicate the wind retrieval itself is
+# invalid or contaminated. Wind-vector cells carrying any of these bits are
+# dropped in ``DataTreeConverter.from_scatterometer_nc`` before they ever
+# reach collocation — otherwise they show up as spurious points over land/ice
+# with no (or a bogus) retrieved value.
+_ASCAT_REJECT_FLAGS = {
+    "some_portion_of_wvc_is_over_land",
+    "some_portion_of_wvc_is_over_ice",
+    "wind_inversion_not_successful",
+    "not_enough_good_sigma0_for_wind_retrieval",
+    "distance_to_gmf_too_large",
+}
+
 
 class DataTreeConverter:
     """Convert various data formats to standardised xarray objects."""
@@ -432,12 +446,55 @@ class DataTreeConverter:
             time_arr = np.full(n_points, np.datetime64("NaT", "ns"))
 
         # ------------------------------------------------------------------
+        # Drop wind-vector cells whose quality flag marks the retrieval as
+        # invalid (over land/ice, failed inversion, etc.) — see
+        # ``_ASCAT_REJECT_FLAGS``. Without this, such cells still end up as
+        # collocated validation points with a bogus or missing value, often
+        # sitting on land.
+        # ------------------------------------------------------------------
+        n_points_raw = n_points
+        keep_mask = np.ones(n_points_raw, dtype=bool)
+        if "wvc_quality_flag" in raw:
+            qf_attrs = raw["wvc_quality_flag"].attrs
+            flag_masks = qf_attrs.get("flag_masks")
+            flag_meanings = qf_attrs.get("flag_meanings")
+            if flag_masks is not None and flag_meanings:
+                qf = raw["wvc_quality_flag"].values.ravel()
+                if len(qf) == n_points_raw:
+                    reject_bits = 0
+                    for mask_val, meaning in zip(flag_masks, flag_meanings.split()):
+                        if meaning in _ASCAT_REJECT_FLAGS:
+                            reject_bits |= int(mask_val)
+                    if reject_bits:
+                        keep_mask = (qf.astype(np.int64) & reject_bits) == 0
+
+        n_dropped = n_points_raw - int(keep_mask.sum())
+        if n_dropped:
+            logger.info(
+                "from_scatterometer_nc: dropped %d/%d cells in %s (core QC reject flags)",
+                n_dropped, n_points_raw, nc_path.name,
+            )
+            lat_arr = lat_arr[keep_mask]
+            lon_arr = lon_arr[keep_mask]
+            time_arr = time_arr[keep_mask]
+            n_points = int(keep_mask.sum())
+
+        if n_points == 0:
+            logger.warning(
+                "from_scatterometer_nc: all cells in %s were rejected by QC flags.",
+                nc_path.name,
+            )
+            raw.close()
+            return None
+
+        # ------------------------------------------------------------------
         # Collect numeric data variables (skip lat/lon/time/flag arrays)
         # ------------------------------------------------------------------
         _skip = {
             "lat", "latitude", "Latitude", "LAT",
             "lon", "longitude", "Longitude", "LON",
             "time", "Time", "TIME",
+            "wvc_quality_flag", "wvc_index",
         }
         # OSI-SAF/ASCAT variable names → canonical validation codes, so that
         # scatterometer wind speed/direction line up with the WSPD/WDIR codes
@@ -451,9 +508,9 @@ class DataTreeConverter:
             if da.dtype.kind not in ("f", "i", "u"):   # floats and integers only
                 continue
             flat = da.values.ravel()
-            if len(flat) != n_points:
+            if len(flat) != n_points_raw:
                 continue   # different spatial grid — skip
-            flat = flat.astype(float)
+            flat = flat[keep_mask].astype(float)
             if vname == "wind_dir":
                 # ASCAT/OSI-SAF direction is oceanographic convention (the
                 # direction the wind is blowing TOWARDS), while Sentinel-1

@@ -79,6 +79,17 @@ def _filter_by_scene(collocation_ds, scene_name: str):
     return collocation_ds.isel(collocation=mask)
 
 
+def _land_coastline_features(scale: str = "10m"):
+    """Natural Earth land/coastline features at a finer resolution than
+    cartopy's default 110m — the default is too coarse on complex
+    coastlines (straits, bays) and visibly misaligns with SAR swath edges."""
+    import cartopy.feature as cfeature  # noqa: PLC0415
+
+    land = cfeature.NaturalEarthFeature("physical", "land", scale, facecolor=cfeature.COLORS["land"])
+    coastline = cfeature.NaturalEarthFeature("physical", "coastline", scale, facecolor="none")
+    return land, coastline
+
+
 def _sar_field(scene_ds, sar_var: str) -> Optional[np.ndarray]:
     """
     Return the (y, x) array for *sar_var* in *scene_ds*, or None if absent.
@@ -212,7 +223,12 @@ def plot_scatter(
     ax.plot([vmin, vmax], [vmin, vmax], "k--", linewidth=1, label="1:1")
 
     # Annotate with N, bias, RMSE
-    diff = df[sar_col].values - df[val_col].values
+    from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg  # noqa: PLC0415
+
+    if val_var in CIRCULAR_VAL_VARS:
+        diff = circular_diff_deg(df[sar_col].values, df[val_col].values)
+    else:
+        diff = df[sar_col].values - df[val_col].values
     n = len(diff)
     bias = float(np.mean(diff))
     rmse = float(np.sqrt(np.mean(diff ** 2)))
@@ -255,7 +271,7 @@ def plot_geographic(
     *,
     ncols: int = 2,
     cmap: str = "viridis",
-    val_cmap: str = "plasma",
+    val_cmap: Optional[str] = None,
     point_size: int = 40,
     split_by: str = "collocation_type",
     interactive: bool = False,
@@ -283,8 +299,13 @@ def plot_geographic(
         Number of subplot columns.
     cmap : str
         Matplotlib colourmap for the SAR background field.
-    val_cmap : str
-        Matplotlib colourmap for the validation scatter points.
+    val_cmap : str, optional
+        Matplotlib colourmap for the validation scatter points. Defaults to
+        the same colourmap as *cmap* (and always shares its colour limits),
+        so SAR and validation values are directly comparable by colour; the
+        two layers stay visually distinguishable by shape (continuous field
+        vs. black-edged markers) rather than by hue. Pass an explicit value
+        to opt back into a separate palette.
     point_size : int
         Scatter marker size in points² (matplotlib ``s`` argument).
     split_by : str or None
@@ -388,36 +409,41 @@ def plot_geographic(
     import matplotlib.cm as mcm  # noqa: PLC0415
     import matplotlib.lines as mlines  # noqa: PLC0415
 
-    # Global SAR colour limits (same across all figures/groups)
+    # Colour limits — pooled from the SAR field *and* the validation values
+    # (when present) so both layers share one scale and are directly
+    # comparable by colour (same across all figures/groups).
     all_field_vals = []
     for scene_name in scene_names:
         arr = _sar_field(sar_node[scene_name].to_dataset(), sar_var)
         if arr is not None:
             all_field_vals.append(arr[np.isfinite(arr)])
-    if all_field_vals:
-        flat = np.concatenate(all_field_vals)
-        vmin = float(np.nanpercentile(flat, 2))
-        vmax = float(np.nanpercentile(flat, 98))
-    else:
-        vmin, vmax = 0.0, 1.0
-    sar_norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-    sar_sm = mcm.ScalarMappable(cmap=cmap, norm=sar_norm)
-    sar_sm.set_array([])
+    flat = np.concatenate(all_field_vals) if all_field_vals else np.array([])
 
-    # Global validation colour limits (from all collocations, all groups)
-    val_norm = val_sm = None
+    finite_v = np.array([])
     if val_col_present:
         finite_v = collocation_ds[val_col].values
         finite_v = finite_v[np.isfinite(finite_v)]
-        if len(finite_v) > 0:
-            val_norm = mcolors.Normalize(
-                vmin=float(np.nanpercentile(finite_v, 2)),
-                vmax=float(np.nanpercentile(finite_v, 98)),
-            )
-            val_sm = mcm.ScalarMappable(cmap=val_cmap, norm=val_norm)
-            val_sm.set_array([])
 
-    right_margin = 0.80 if val_sm is not None else 0.88
+    pooled = np.concatenate([flat, finite_v]) if len(flat) or len(finite_v) else np.array([0.0, 1.0])
+    vmin = float(np.nanpercentile(pooled, 2))
+    vmax = float(np.nanpercentile(pooled, 98))
+
+    effective_val_cmap = val_cmap if val_cmap is not None else cmap
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    sar_sm = mcm.ScalarMappable(cmap=cmap, norm=norm)
+    sar_sm.set_array([])
+    sar_norm = norm
+
+    val_norm = val_sm = None
+    if len(finite_v) > 0:
+        val_norm = norm
+        val_sm = mcm.ScalarMappable(cmap=effective_val_cmap, norm=val_norm)
+        val_sm.set_array([])
+
+    # One shared colorbar when both layers use the same palette+scale
+    # (the default); two only if the caller opted into a distinct val_cmap.
+    single_colorbar = val_sm is not None and effective_val_cmap == cmap
+    right_margin = 0.88 if (val_sm is None or single_colorbar) else 0.80
     subplot_kw = {"projection": ccrs.PlateCarree()} if HAS_CARTOPY else {}
 
     def _build_figure(group_coll_ds, group_label):
@@ -440,8 +466,9 @@ def plot_geographic(
                 continue
 
             if HAS_CARTOPY:
-                ax.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0, rasterized=True)
-                ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=0, rasterized=True)
+                land, coastline = _land_coastline_features()
+                ax.add_feature(land, facecolor="lightgray", zorder=0, rasterized=True)
+                ax.add_feature(coastline, linewidth=0.5, zorder=0, rasterized=True)
                 gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
                 gl.top_labels = False
                 gl.right_labels = False
@@ -500,23 +527,45 @@ def plot_geographic(
                         df_pts = df_pts.drop_duplicates(subset=id_cols)
 
                 if val_col_present and val_norm is not None:
-                    ax.scatter(
-                        df_pts["val_lon"], df_pts["val_lat"],
-                        c=df_pts[val_col], cmap=val_cmap, norm=val_norm,
-                        s=point_size, edgecolors="black", linewidths=0.4,
-                        rasterized=True, **kw_sc,
-                    )
+                    nan_mask = df_pts[val_col].isna()
+                    valid_pts = df_pts[~nan_mask]
+                    nan_pts = df_pts[nan_mask]
+
+                    if len(valid_pts):
+                        ax.scatter(
+                            valid_pts["val_lon"], valid_pts["val_lat"],
+                            c=valid_pts[val_col], cmap=val_cmap, norm=val_norm,
+                            s=point_size, edgecolors="black", linewidths=0.4,
+                            rasterized=True, **kw_sc,
+                        )
+                    if len(nan_pts):
+                        # No retrieved value at this location/time — mark it
+                        # clearly (gray + hatch) instead of leaving an
+                        # invisible gap that looks like "no observation here".
+                        ax.scatter(
+                            nan_pts["val_lon"], nan_pts["val_lat"],
+                            s=point_size, facecolor="lightgray", edgecolors="dimgray",
+                            linewidths=0.6, hatch="////", rasterized=True, **kw_sc,
+                        )
+
+                    handles = []
                     if "val_source" in df_pts.columns:
                         present = set(df_pts["val_source"].astype(str))
-                        handles = [
+                        handles += [
                             mlines.Line2D([], [], marker="o", linestyle="None",
                                           markerfacecolor=clr, markeredgecolor="black",
                                           markersize=5, label=s)
                             for s, clr in source_cmap.items() if s in present
                         ]
-                        if handles:
-                            ax.legend(handles=handles, fontsize=6,
-                                      loc="lower left", framealpha=0.7)
+                    if len(nan_pts):
+                        handles.append(
+                            mlines.Line2D([], [], marker="o", linestyle="None",
+                                          markerfacecolor="lightgray", markeredgecolor="dimgray",
+                                          markersize=5, label="No data (NaN)")
+                        )
+                    if handles:
+                        ax.legend(handles=handles, fontsize=6,
+                                  loc="lower left", framealpha=0.7)
                 elif "val_source" in df_pts.columns:
                     for src, grp in df_pts.groupby("val_source"):
                         color = source_cmap.get(str(src), "#ff0000")
@@ -541,10 +590,13 @@ def plot_geographic(
 
         fig.subplots_adjust(right=right_margin)
         cbar_ax = fig.add_axes([right_margin + 0.01, 0.15, 0.015, 0.70])
-        fig.colorbar(sar_sm, cax=cbar_ax, label=f"SAR {sar_var}")
-        if val_sm is not None:
-            val_cbar_ax = fig.add_axes([right_margin + 0.055, 0.15, 0.015, 0.70])
-            fig.colorbar(val_sm, cax=val_cbar_ax, label=f"In-situ {val_var}")
+        if single_colorbar:
+            fig.colorbar(sar_sm, cax=cbar_ax, label=f"{sar_var} / {val_var}")
+        else:
+            fig.colorbar(sar_sm, cax=cbar_ax, label=f"SAR {sar_var}")
+            if val_sm is not None:
+                val_cbar_ax = fig.add_axes([right_margin + 0.055, 0.15, 0.015, 0.70])
+                fig.colorbar(val_sm, cax=val_cbar_ax, label=f"In-situ {val_var}")
 
         title = f"SAR {sar_var}"
         if val_var:
@@ -696,8 +748,14 @@ def plot_residuals(
         warnings.warn(f"No valid data for {sar_col} vs {val_col}.")
         return None
 
-    df["residual"] = df[sar_col] - df[val_col]
-    title = f"Residuals: {sar_var} − {val_var}"
+    from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg  # noqa: PLC0415
+
+    if val_var in CIRCULAR_VAL_VARS:
+        df["residual"] = circular_diff_deg(df[sar_col].values, df[val_col].values)
+        title = f"Residuals: {sar_var} − {val_var} (wrapped to ±180°)"
+    else:
+        df["residual"] = df[sar_col] - df[val_col]
+        title = f"Residuals: {sar_var} − {val_var}"
 
     if interactive:
         _require("plotly")
@@ -906,8 +964,9 @@ def plot_sar_on_no_collocation(
 
         # ── Add map features ────────────────────────────────────────────
         if HAS_CARTOPY:
-            ax.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0, alpha=0.3)
-            ax.add_feature(cfeature.COASTLINE, linewidth=0.3, zorder=0)
+            land, coastline = _land_coastline_features()
+            ax.add_feature(land, facecolor="lightgray", zorder=0, alpha=0.3)
+            ax.add_feature(coastline, linewidth=0.3, zorder=0)
             gl = ax.gridlines(draw_labels=True, linewidth=0.2, alpha=0.3)
             gl.top_labels = False
             gl.right_labels = False
@@ -983,8 +1042,9 @@ def plot_sar_on_no_collocation(
 
             # ── Add map features (simplified for speed) ─────────────────
             if HAS_CARTOPY:
-                ax_scat.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0, alpha=0.3)
-                ax_scat.add_feature(cfeature.COASTLINE, linewidth=0.3, zorder=0)
+                land, coastline = _land_coastline_features()
+                ax_scat.add_feature(land, facecolor="lightgray", zorder=0, alpha=0.3)
+                ax_scat.add_feature(coastline, linewidth=0.3, zorder=0)
                 gl = ax_scat.gridlines(draw_labels=True, linewidth=0.2, alpha=0.3)
                 gl.top_labels = False
                 gl.right_labels = False
@@ -1304,8 +1364,9 @@ def plot_collocation_diagnostics(
     ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
 
     # Add coastlines and features
-    ax.add_feature(cfeature.LAND, facecolor="lightgray", alpha=0.3, zorder=0)
-    ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=0)
+    land, coastline = _land_coastline_features()
+    ax.add_feature(land, facecolor="lightgray", alpha=0.3, zorder=0)
+    ax.add_feature(coastline, linewidth=0.5, zorder=0)
     gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
     gl.top_labels = False
     gl.right_labels = False

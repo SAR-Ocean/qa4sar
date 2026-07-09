@@ -12,7 +12,12 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
-__all__ = ["VARIABLE_PAIRS", "CIRCULAR_VAL_VARS", "infer_variable_pairs", "filter_variable_pairs"]
+import numpy as np
+
+__all__ = [
+    "VARIABLE_PAIRS", "CIRCULAR_VAL_VARS", "infer_variable_pairs",
+    "filter_variable_pairs", "circular_diff_deg",
+]
 
 # ---------------------------------------------------------------------------
 # (sar_variable_name, validation_variable_name) pairs per validated quantity
@@ -39,6 +44,11 @@ VARIABLE_PAIRS: dict[str, List[Tuple[str, str]]] = {
 # ---------------------------------------------------------------------------
 
 CIRCULAR_VAL_VARS: set[str] = {"WDIR"}
+
+
+def circular_diff_deg(a, b):
+    """Wrapped angular difference a-b in (-180, 180], for degree-valued circular variables."""
+    return ((np.asarray(a, dtype=float) - np.asarray(b, dtype=float) + 180.0) % 360.0) - 180.0
 
 
 def infer_variable_pairs(variable: str) -> List[Tuple[str, str]]:

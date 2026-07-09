@@ -14,7 +14,7 @@ from typing import List, Optional, Union
 import numpy as np
 import xarray as xr
 
-from ._variable_map import CIRCULAR_VAL_VARS, infer_variable_pairs, filter_variable_pairs
+from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg, infer_variable_pairs, filter_variable_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +147,7 @@ def compute_statistics(
         if is_circular:
             # Wrapped angular difference, e.g. sar=359°, val=1° → diff=-2°
             # (not 358°), since direction is a circular quantity in [0, 360).
-            diff = ((sar_vals - val_vals + 180.0) % 360.0) - 180.0
+            diff = circular_diff_deg(sar_vals, val_vals)
             bias = ((_circular_mean_deg(diff) + 180.0) % 360.0) - 180.0
             if n > 1:
                 diff_rad = np.radians(diff)

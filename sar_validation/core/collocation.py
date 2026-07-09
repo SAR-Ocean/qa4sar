@@ -467,6 +467,23 @@ class PointLayerCollocation:
             pd.api.types.is_numeric_dtype(val_data_filtered[col])
         ]
 
+        # Time-sorted view used to forward-fill a NaN reading: when a
+        # validation observation is missing a value for some column, look at
+        # later observations (still within ``time_tolerance_minutes`` of the
+        # original reading) for the next one that has a valid value.
+        val_data_sorted = val_data_filtered.sort_values("time").reset_index(drop=True)
+        sorted_times = _to_datetime_array(val_data_sorted["time"].values)
+
+        def _next_valid_value(col: str, after_time) -> Optional[float]:
+            for cand_time, cand_val in zip(sorted_times, val_data_sorted[col]):
+                if cand_time <= after_time:
+                    continue
+                if (cand_time - after_time).total_seconds() / 60.0 > self.time_tolerance_minutes:
+                    break  # sorted ascending — no later candidate can be closer
+                if pd.notna(cand_val):
+                    return float(cand_val)
+            return None
+
         # Process each validation observation
         for idx, val_row in val_data_filtered.iterrows():
             v_lon = float(val_row["lon"])
@@ -512,12 +529,19 @@ class PointLayerCollocation:
 
                 # Use the validation observation's own raw value (nearest in
                 # time by construction, since it is matched as-is rather than
-                # averaged with neighboring observations).
-                val_aggregated = {
-                    col: float(val_row[col])
-                    for col in numeric_cols
-                    if pd.notna(val_row[col])
-                }
+                # averaged with neighboring observations). If a column is NaN
+                # for this exact reading, forward-fill it from the next
+                # observation still within the temporal tolerance window
+                # (e.g. a mooring sensor gap) instead of leaving it missing.
+                val_aggregated = {}
+                for col in numeric_cols:
+                    raw_val = val_row[col]
+                    if pd.notna(raw_val):
+                        val_aggregated[col] = float(raw_val)
+                        continue
+                    filled_val = _next_valid_value(col, v_time)
+                    if filled_val is not None:
+                        val_aggregated[col] = filled_val
 
                 if not val_aggregated:
                     logger.debug("No valid validation values")
