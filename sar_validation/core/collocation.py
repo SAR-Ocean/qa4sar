@@ -123,6 +123,24 @@ def _haversine_distance_grid(
     return R * 2.0 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
 
 
+def _lonlat_to_unit_xyz(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+    """
+    Convert longitude/latitude (degrees) to Cartesian coordinates on the unit
+    sphere, shape ``(..., 3)``.
+
+    Chord length between two such points is a monotonic function of their
+    great-circle angular separation, so a Euclidean nearest-neighbour search
+    (e.g. via ``scipy.spatial.cKDTree``) on these coordinates gives the same
+    result as a Haversine nearest-neighbour search, at KD-tree speed.
+    """
+    lon_rad = np.radians(lon)
+    lat_rad = np.radians(lat)
+    x = np.cos(lat_rad) * np.cos(lon_rad)
+    y = np.cos(lat_rad) * np.sin(lon_rad)
+    z = np.sin(lat_rad)
+    return np.stack([x, y, z], axis=-1)
+
+
 def _to_datetime_array(time_array) -> np.ndarray:
     """Normalise heterogeneous time inputs to an object array of Python datetimes."""
     if not isinstance(time_array, (list, tuple, np.ndarray)):
@@ -1427,7 +1445,8 @@ class LayerLayerCollocation(PointLayerCollocation):
         Match each individual SAR pixel to the closest scatterometer point (individual method).
 
         For each SAR grid cell at each time step:
-        1. Find closest scatterometer point (by Haversine distance)
+        1. Find closest scatterometer point (vectorized nearest-neighbour search
+           via a KD-tree over unit-sphere Cartesian coordinates)
         2. Check spatial tolerance (within spatial_tolerance_km)
         3. Check temporal match (within time_tolerance_minutes)
         4. Create CollocatedPoint with SAR as anchor, scatterometer as matched value
@@ -1439,6 +1458,7 @@ class LayerLayerCollocation(PointLayerCollocation):
             List of collocated matches (one per matched SAR cell).
         """
         from datetime import timedelta as _td
+        from scipy.spatial import cKDTree
 
         sar_times = _to_datetime_array(sar_time)
         collocations: List[CollocatedPoint] = []
@@ -1491,13 +1511,27 @@ class LayerLayerCollocation(PointLayerCollocation):
         ]
 
         # Pre-extract scatterometer coordinates and times for vectorized distance computation
-        scat_lons = val_data_filtered["lon"].values
-        scat_lats = val_data_filtered["lat"].values
+        scat_lons = val_data_filtered["lon"].values.astype(float)
+        scat_lats = val_data_filtered["lat"].values.astype(float)
         scat_times_pd = pd.to_datetime(val_data_filtered["time"].values)
         if scat_times_pd.tz is not None:
             scat_times_pd = scat_times_pd.tz_localize(None)
-        scat_times_objs = np.array([t.to_pydatetime() if hasattr(t, 'to_pydatetime') else t 
+        scat_times_np = scat_times_pd.values.astype("datetime64[ns]")
+        scat_times_objs = np.array([t.to_pydatetime() if hasattr(t, 'to_pydatetime') else t
                                     for t in scat_times_pd], dtype=object)
+
+        # Build a KD-tree over scatterometer points in unit-sphere Cartesian
+        # coordinates once: Euclidean nearest-neighbour there is equivalent to
+        # great-circle nearest-neighbour, so per-time-step matching becomes a
+        # single vectorized query instead of an O(pixels x scat_points)
+        # Python-level Haversine loop.
+        R = 6371.0
+        scat_tree = cKDTree(_lonlat_to_unit_xyz(scat_lons, scat_lats))
+
+        sar_grid_y, sar_grid_x = sar_lon.shape
+        sar_lon_flat = sar_lon.ravel()
+        sar_lat_flat = sar_lat.ravel()
+        var_names = list(sar_data.keys())
 
         # Process each SAR time
         rejected_spatial = 0
@@ -1505,111 +1539,129 @@ class LayerLayerCollocation(PointLayerCollocation):
         rejected_no_data = 0
 
         for t_idx, sar_t in enumerate(sar_times):
-            # Get SAR data shape (y, x)
-            sar_grid_y, sar_grid_x = sar_lon.shape
+            # Stack all SAR variables for this time step: (n_vars, n_cells)
+            values_stack = np.stack(
+                [sar_data[var][t_idx].ravel() for var in var_names], axis=0
+            )
+            has_data_mask = ~np.all(np.isnan(values_stack), axis=0)
+            rejected_no_data += int(np.sum(~has_data_mask))
 
-            # Process each SAR grid cell
-            for y_idx in range(sar_grid_y):
-                for x_idx in range(sar_grid_x):
-                    # Check if SAR data exists at this cell
-                    sar_aggregated = {}
-                    for var in sar_data.keys():
-                        val = sar_data[var][t_idx, y_idx, x_idx]
-                        if not np.isnan(val):
-                            sar_aggregated[var] = float(val)
+            candidate_cells = np.where(has_data_mask)[0]
+            if candidate_cells.size == 0:
+                continue
 
-                    if not sar_aggregated:
-                        rejected_no_data += 1
-                        continue
+            # Vectorized nearest-scatterometer-point search for every
+            # SAR cell that has at least one valid variable.
+            chord_dist, closest_scat_idx = scat_tree.query(
+                _lonlat_to_unit_xyz(sar_lon_flat[candidate_cells], sar_lat_flat[candidate_cells]),
+                k=1,
+            )
+            distances_km = R * 2.0 * np.arcsin(np.clip(chord_dist, 0.0, 2.0) / 2.0)
 
-                    # Get SAR cell position
-                    sar_cell_lon = float(sar_lon[y_idx, x_idx])
-                    sar_cell_lat = float(sar_lat[y_idx, x_idx])
+            spatial_ok = distances_km <= self.spatial_tolerance_km
+            rejected_spatial += int(np.sum(~spatial_ok))
+            if self.emit_diagnostics and np.any(~spatial_ok):
+                for cell_idx, dist in zip(candidate_cells[~spatial_ok], distances_km[~spatial_ok]):
+                    y_idx, x_idx = divmod(int(cell_idx), sar_grid_x)
+                    logger.debug(
+                        "SAR cell (y=%d, x=%d) at (%.3f°, %.3f°): REJECTED spatial (dist=%.2f km > %.1f km)",
+                        y_idx, x_idx, sar_lon_flat[cell_idx], sar_lat_flat[cell_idx],
+                        dist, self.spatial_tolerance_km,
+                    )
 
-                    # Compute distances to all scatterometer points (vectorized)
-                    distances_to_scat = np.array([
-                        _haversine_distance(sar_cell_lon, sar_cell_lat, scat_lon, scat_lat)
-                        for scat_lon, scat_lat in zip(scat_lons, scat_lats)
-                    ])
+            if not np.any(spatial_ok):
+                continue
 
-                    # Find closest scatterometer point
-                    closest_scat_idx = np.argmin(distances_to_scat)
-                    closest_distance = distances_to_scat[closest_scat_idx]
+            spatial_cells = candidate_cells[spatial_ok]
+            spatial_distances = distances_km[spatial_ok]
+            spatial_scat_idx = closest_scat_idx[spatial_ok]
 
-                    # Check spatial tolerance
-                    if closest_distance > self.spatial_tolerance_km:
-                        rejected_spatial += 1
-                        if self.emit_diagnostics:
-                            logger.debug(
-                                "SAR cell (y=%d, x=%d) at (%.3f°, %.3f°): REJECTED spatial (dist=%.2f km > %.1f km)",
-                                y_idx, x_idx, sar_cell_lon, sar_cell_lat, 
-                                closest_distance, self.spatial_tolerance_km,
-                            )
-                        continue
+            # Vectorized temporal check for the spatially-valid candidates.
+            sar_t_np = np.datetime64(sar_t)
+            time_diff_min = np.abs(
+                (scat_times_np[spatial_scat_idx] - sar_t_np) / np.timedelta64(1, "m")
+            ).astype(float)
+            temporal_ok = time_diff_min <= self.time_tolerance_minutes
+            rejected_temporal += int(np.sum(~temporal_ok))
+            if self.emit_diagnostics and np.any(~temporal_ok):
+                for cell_idx, diff in zip(spatial_cells[~temporal_ok], time_diff_min[~temporal_ok]):
+                    y_idx, x_idx = divmod(int(cell_idx), sar_grid_x)
+                    logger.debug(
+                        "SAR cell (y=%d, x=%d): REJECTED temporal (time_diff=%.1f min > %d min)",
+                        y_idx, x_idx, diff, self.time_tolerance_minutes,
+                    )
 
-                    # Get closest scatterometer observation
-                    closest_scat_time = scat_times_objs[closest_scat_idx]
-                    time_diff = abs((sar_t - closest_scat_time).total_seconds() / 60.0)
+            if not np.any(temporal_ok):
+                continue
 
-                    # Check temporal tolerance
-                    if time_diff > self.time_tolerance_minutes:
-                        rejected_temporal += 1
-                        if self.emit_diagnostics:
-                            logger.debug(
-                                "SAR cell (y=%d, x=%d): REJECTED temporal (time_diff=%.1f min > %d min)",
-                                y_idx, x_idx, time_diff, self.time_tolerance_minutes,
-                            )
-                        continue
+            matched_cells = spatial_cells[temporal_ok]
+            matched_distance = spatial_distances[temporal_ok]
+            matched_time_diff = time_diff_min[temporal_ok]
+            matched_scat_idx = spatial_scat_idx[temporal_ok]
 
-                    # Extract scatterometer value at closest point
-                    val_aggregated = {}
-                    closest_row = val_data_filtered.iloc[closest_scat_idx]
-                    for col in val_numeric_cols:
-                        if col in closest_row and pd.notna(closest_row[col]):
-                            val_aggregated[col] = float(closest_row[col])
+            # Only the already-matched cells reach this per-row loop now,
+            # instead of every (SAR pixel, scatterometer point) pair.
+            for k, cell_idx in enumerate(matched_cells):
+                y_idx, x_idx = divmod(int(cell_idx), sar_grid_x)
 
-                    if not val_aggregated:
-                        rejected_no_data += 1
-                        if self.emit_diagnostics:
-                            logger.debug(
-                                "SAR cell (y=%d, x=%d): REJECTED (no valid scatterometer values)",
-                                y_idx, x_idx,
-                            )
-                        continue
+                sar_aggregated = {
+                    var: float(values_stack[v_idx, cell_idx])
+                    for v_idx, var in enumerate(var_names)
+                    if not np.isnan(values_stack[v_idx, cell_idx])
+                }
 
-                    # Get closest scatterometer position
-                    closest_scat_lon = float(scat_lons[closest_scat_idx])
-                    closest_scat_lat = float(scat_lats[closest_scat_idx])
+                scat_idx = int(matched_scat_idx[k])
+                closest_row = val_data_filtered.iloc[scat_idx]
+                val_aggregated = {
+                    col: float(closest_row[col])
+                    for col in val_numeric_cols
+                    if pd.notna(closest_row[col])
+                }
 
+                if not val_aggregated:
+                    rejected_no_data += 1
                     if self.emit_diagnostics:
                         logger.debug(
-                            "SAR cell (%.3f°, %.3f°) MATCHED to scatterometer (%.3f°, %.3f°) "
-                            "at distance=%.2f km, time_diff=%.1f min",
-                            sar_cell_lon, sar_cell_lat, closest_scat_lon, closest_scat_lat,
-                            closest_distance, time_diff,
+                            "SAR cell (y=%d, x=%d): REJECTED (no valid scatterometer values)",
+                            y_idx, x_idx,
                         )
+                    continue
 
-                    # Create CollocatedPoint with SAR as anchor
-                    collocations.append(
-                        CollocatedPoint(
-                            sar_lon=sar_cell_lon,
-                            sar_lat=sar_cell_lat,
-                            sar_time=sar_t,
-                            sar_data=sar_aggregated,
-                            val_lon=closest_scat_lon,
-                            val_lat=closest_scat_lat,
-                            val_time=closest_scat_time,
-                            val_data=val_aggregated,
-                            spatial_distance_km=closest_distance,
-                            temporal_distance_minutes=time_diff,
-                            val_source=val_source,
-                            val_id=None,  # Scatterometer points don't have IDs
-                            collocation_type=self.collocation_type,
-                            sar_y_idx=y_idx,
-                            sar_x_idx=x_idx,
-                            sar_scene_name=sar_scene_name,
-                        )
+                sar_cell_lon = float(sar_lon_flat[cell_idx])
+                sar_cell_lat = float(sar_lat_flat[cell_idx])
+                closest_scat_lon = float(scat_lons[scat_idx])
+                closest_scat_lat = float(scat_lats[scat_idx])
+                closest_scat_time = scat_times_objs[scat_idx]
+
+                if self.emit_diagnostics:
+                    logger.debug(
+                        "SAR cell (%.3f°, %.3f°) MATCHED to scatterometer (%.3f°, %.3f°) "
+                        "at distance=%.2f km, time_diff=%.1f min",
+                        sar_cell_lon, sar_cell_lat, closest_scat_lon, closest_scat_lat,
+                        matched_distance[k], matched_time_diff[k],
                     )
+
+                # Create CollocatedPoint with SAR as anchor
+                collocations.append(
+                    CollocatedPoint(
+                        sar_lon=sar_cell_lon,
+                        sar_lat=sar_cell_lat,
+                        sar_time=sar_t,
+                        sar_data=sar_aggregated,
+                        val_lon=closest_scat_lon,
+                        val_lat=closest_scat_lat,
+                        val_time=closest_scat_time,
+                        val_data=val_aggregated,
+                        spatial_distance_km=float(matched_distance[k]),
+                        temporal_distance_minutes=float(matched_time_diff[k]),
+                        val_source=val_source,
+                        val_id=None,  # Scatterometer points don't have IDs
+                        collocation_type=self.collocation_type,
+                        sar_y_idx=y_idx,
+                        sar_x_idx=x_idx,
+                        sar_scene_name=sar_scene_name,
+                    )
+                )
 
         if self.emit_diagnostics:
             logger.info(
