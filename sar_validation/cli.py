@@ -427,15 +427,19 @@ def _execute_recipe(
         if not datatree_path.exists():
             _convert_data(recipe, orchestrator.base_dir)
         else:
-            print("Step 2 skipped — DataTree already exists")
+            print("Step 2 skipped — datatree.nc already exists")
 
     if collocate:
-        _collocate_data(
-            recipe,
-            orchestrator.base_dir,
-            emit_diagnostics=collocation_log,
-            layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
-        )
+        collocation_path = orchestrator.base_dir / "collocation_results.nc"
+        if not collocation_path.exists():
+            _collocate_data(
+                recipe,
+                orchestrator.base_dir,
+                emit_diagnostics=collocation_log,
+                layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
+            )
+        else:
+            print("Step 3 skipped — collocation_results.nc already exists")
 
     if stats or plot:
         _compute_stats(recipe, orchestrator.base_dir)

@@ -1516,7 +1516,7 @@ class LayerLayerCollocation(PointLayerCollocation):
                     for var in sar_data.keys():
                         val = sar_data[var][t_idx, y_idx, x_idx]
                         if not np.isnan(val):
-                            sar_aggregated[f"sar_{var}"] = float(val)
+                            sar_aggregated[var] = float(val)
 
                     if not sar_aggregated:
                         rejected_no_data += 1
