@@ -119,6 +119,100 @@ class TestFromInsituCsv:
         with pytest.raises(ValueError, match="lat"):
             DataTreeConverter.from_insitu_csv(path)
 
+    def test_mixed_platform_types_labeled_per_point(self, tmp_path):
+        # A single Copernicus in-situ CSV mixes platform types (long format,
+        # one row per variable measurement) — must be labeled per point, not
+        # collapsed into one blanket source_type.
+        rows = []
+        for pid, code in (("MO001", "MO"), ("MO002", "MO"), ("DB001", "DB")):
+            rows.append({"variable": "WSPD", "platform_id": pid, "platform_type": code,
+                         "time": "2026-01-01T00:00:00", "longitude": 0.0, "latitude": 50.0,
+                         "value": 7.5})
+        df = pd.DataFrame(rows)
+        path = tmp_path / "mixed.csv"
+        df.to_csv(path, index=False)
+
+        ds = DataTreeConverter.from_insitu_csv(path, source_type="insitu")
+        assert ds is not None
+        assert "platform_type" in ds.coords
+        labels = dict(zip(ds["platform_id"].values, ds["platform_type"].values))
+        assert labels["MO001"] == "mooring"
+        assert labels["MO002"] == "mooring"
+        assert labels["DB001"] == "buoy"
+
+    def test_platform_type_falls_back_to_source_type_without_column(self, tmp_path):
+        path = _make_insitu_csv(tmp_path, rows=3)
+        # Overwrite: this fixture already has a platform_type column, so
+        # build one without it to exercise the fallback path directly.
+        df = pd.read_csv(path).drop(columns=["platform_type"])
+        df.to_csv(path, index=False)
+
+        ds = DataTreeConverter.from_insitu_csv(path, source_type="tidal_gauge")
+        assert set(ds["platform_type"].values) == {"tidal_gauge"}
+
+
+# ---------------------------------------------------------------------------
+# from_scatterometer_nc
+# ---------------------------------------------------------------------------
+
+def _make_scatterometer_nc(tmp_path: Path, rows: int = 4, cells: int = 3,
+                            wind_dir: np.ndarray = None) -> Path:
+    """Write a minimal OSI-SAF/ASCAT-shaped NetCDF (NUMROWS x NUMCELLS)."""
+    rng = np.random.default_rng(2)
+    if wind_dir is None:
+        wind_dir = rng.uniform(0, 360, (rows, cells))
+    ds = xr.Dataset(
+        {
+            "wind_speed": (("NUMROWS", "NUMCELLS"), rng.uniform(2, 15, (rows, cells))),
+            "wind_dir":   (("NUMROWS", "NUMCELLS"), wind_dir),
+            "model_speed": (("NUMROWS", "NUMCELLS"), rng.uniform(2, 15, (rows, cells))),
+        },
+        coords={
+            "lat": (("NUMROWS", "NUMCELLS"), np.linspace(50.0, 55.0, rows * cells).reshape(rows, cells)),
+            "lon": (("NUMROWS", "NUMCELLS"), np.linspace(-10.0, -5.0, rows * cells).reshape(rows, cells)),
+        },
+        attrs={"time_coverage_start": "2026-07-05T18:33:00Z"},
+    )
+    path = tmp_path / "OASWC12_20260705_183300_71590_M01.nc"
+    ds.to_netcdf(path)
+    return path
+
+
+class TestFromScatterometerNc:
+    def test_renames_wind_vars_to_canonical_codes(self, tmp_path):
+        path = _make_scatterometer_nc(tmp_path)
+        ds = DataTreeConverter.from_scatterometer_nc(path)
+        assert ds is not None
+        assert "WSPD" in ds
+        assert "WDIR" in ds
+        assert "wind_speed" not in ds
+        assert "wind_dir" not in ds
+
+    def test_leaves_other_variables_untouched(self, tmp_path):
+        path = _make_scatterometer_nc(tmp_path)
+        ds = DataTreeConverter.from_scatterometer_nc(path)
+        assert "model_speed" in ds
+
+    def test_platform_type_attr(self, tmp_path):
+        path = _make_scatterometer_nc(tmp_path)
+        ds = DataTreeConverter.from_scatterometer_nc(path)
+        assert ds.attrs["platform_type"] == "scatterometer"
+        assert ds.attrs["data_type"] == "scatterometer"
+
+    def test_returns_none_for_missing_file(self, tmp_path):
+        ds = DataTreeConverter.from_scatterometer_nc(tmp_path / "nonexistent.nc")
+        assert ds is None
+
+    def test_direction_converted_from_oceanographic_to_meteorological(self, tmp_path):
+        # ASCAT reports the direction the wind blows TOWARDS (oceanographic).
+        # from_scatterometer_nc must rotate 180° to the meteorological
+        # "blows FROM" convention used by owiWindDirection / in-situ WDIR.
+        raw_dir = np.array([[0.0, 90.0, 350.0], [180.0, 270.0, 10.0]])
+        expected = np.array([[180.0, 270.0, 170.0], [0.0, 90.0, 190.0]])
+        path = _make_scatterometer_nc(tmp_path, rows=2, cells=3, wind_dir=raw_dir)
+        ds = DataTreeConverter.from_scatterometer_nc(path)
+        np.testing.assert_allclose(sorted(ds["WDIR"].values), sorted(expected.ravel()))
+
 
 # ---------------------------------------------------------------------------
 # from_collocations

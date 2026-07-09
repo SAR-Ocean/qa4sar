@@ -116,7 +116,7 @@ class DataTreeConverter:
         # ------------------------------------------------------------------
         if "variable" in df.columns and "value" in df.columns:
             pivot_id_cols = [
-                c for c in ("platform_id", "time", "lon", "lat", "depth")
+                c for c in ("platform_id", "platform_type", "time", "lon", "lat", "depth")
                 if c in df.columns
             ]
             df = (
@@ -134,7 +134,7 @@ class DataTreeConverter:
                 [c for c in df.columns if c not in pivot_id_cols],
             )
 
-        coord_cols = {"lon", "lat", "time", "platform_id"}
+        coord_cols = {"lon", "lat", "time", "platform_id", "platform_type"}
         data_cols  = [c for c in df.columns if c not in coord_cols]
 
         platform_id = (
@@ -142,6 +142,24 @@ class DataTreeConverter:
             if "platform_id" in df.columns
             else np.array(["unknown"] * len(df))
         )
+
+        # Per-point platform type, e.g. "mooring"/"buoy"/"drifter"/etc. — a
+        # single Copernicus in-situ CSV can mix multiple platform types (see
+        # its ``platform_type`` column, raw codes like "MO"/"DB"/"AD"), so
+        # this is tracked per point rather than as a single Dataset-level
+        # value. Falls back to *source_type* when the raw code is missing or
+        # unrecognised (e.g. hand-built CSVs without a platform_type column).
+        from ..downloaders.insitu_downloader import PLATFORM_CODE_TO_SOURCE_TYPE
+
+        if "platform_type" in df.columns:
+            platform_type = (
+                df["platform_type"]
+                .map(PLATFORM_CODE_TO_SOURCE_TYPE)
+                .fillna(source_type)
+                .values
+            )
+        else:
+            platform_type = np.array([source_type] * len(df))
 
         def _to_numpy(arr):
             """Convert pandas extension arrays (e.g. StringDtype) to numpy object."""
@@ -152,10 +170,11 @@ class DataTreeConverter:
         ds = xr.Dataset(
             {col: ("point", _to_numpy(df[col].values)) for col in data_cols},
             coords={
-                "lon":         ("point", df["lon"].values),
-                "lat":         ("point", df["lat"].values),
-                "time":        ("point", df["time"].values),
-                "platform_id": ("point", _to_numpy(platform_id)),
+                "lon":           ("point", df["lon"].values),
+                "lat":           ("point", df["lat"].values),
+                "time":          ("point", df["time"].values),
+                "platform_id":   ("point", _to_numpy(platform_id)),
+                "platform_type": ("point", _to_numpy(platform_type)),
             },
         )
         ds.attrs["data_type"]     = "insitu_observations"
@@ -300,6 +319,15 @@ class DataTreeConverter:
         Only float / int data variables (excluding coordinate-like arrays
         and quality flags) are kept.
 
+        The raw ``wind_speed``/``wind_dir`` variables are renamed to the
+        canonical ``WSPD``/``WDIR`` codes. ``wind_dir`` is additionally
+        rotated 180° during this rename, converting ASCAT's oceanographic
+        direction convention ("blowing towards") to the meteorological
+        convention ("blowing from") used by Sentinel-1 OWI
+        (``owiWindDirection``) and the Copernicus Marine in-situ ``WDIR``
+        code — so all three direction sources are directly comparable
+        downstream, in collocation and validation statistics.
+
         Parameters
         ----------
         nc_path : str or Path
@@ -411,6 +439,11 @@ class DataTreeConverter:
             "lon", "longitude", "Longitude", "LON",
             "time", "Time", "TIME",
         }
+        # OSI-SAF/ASCAT variable names → canonical validation codes, so that
+        # scatterometer wind speed/direction line up with the WSPD/WDIR codes
+        # produced by the in-situ (Copernicus Marine) converter and expected
+        # by ``_variable_map.VARIABLE_PAIRS``.
+        _rename = {"wind_speed": "WSPD", "wind_dir": "WDIR"}
         data_vars: Dict[str, tuple] = {}
         for vname, da in raw.data_vars.items():
             if vname in _skip:
@@ -420,7 +453,17 @@ class DataTreeConverter:
             flat = da.values.ravel()
             if len(flat) != n_points:
                 continue   # different spatial grid — skip
-            data_vars[vname] = ("point", flat.astype(float))
+            flat = flat.astype(float)
+            if vname == "wind_dir":
+                # ASCAT/OSI-SAF direction is oceanographic convention (the
+                # direction the wind is blowing TOWARDS), while Sentinel-1
+                # OWI owiWindDirection and the Copernicus Marine in-situ WDIR
+                # code both use meteorological convention (the direction the
+                # wind is blowing FROM). Rotate by 180° here, once, so every
+                # downstream consumer (collocation, statistics, plots) sees a
+                # single consistent convention.
+                flat = (flat + 180.0) % 360.0
+            data_vars[_rename.get(vname, vname)] = ("point", flat)
 
         if not data_vars:
             logger.warning(
@@ -437,9 +480,10 @@ class DataTreeConverter:
                 "time": ("point", time_arr),
             },
         )
-        ds.attrs["data_type"] = "scatterometer"
-        ds.attrs["source"]    = "OSI-SAF ASCAT"
-        ds.attrs["filename"]  = nc_path.name
+        ds.attrs["data_type"]     = "scatterometer"
+        ds.attrs["platform_type"] = "scatterometer"
+        ds.attrs["source"]        = "OSI-SAF ASCAT"
+        ds.attrs["filename"]      = nc_path.name
 
         raw.close()
         return ds

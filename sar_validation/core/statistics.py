@@ -14,7 +14,7 @@ from typing import List, Optional, Union
 import numpy as np
 import xarray as xr
 
-from ._variable_map import infer_variable_pairs, filter_variable_pairs
+from ._variable_map import CIRCULAR_VAL_VARS, infer_variable_pairs, filter_variable_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,36 @@ __all__ = [
     "save_statistics",
     "run_statistics",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Circular-statistics helpers (for angular variables such as wind direction)
+# ---------------------------------------------------------------------------
+
+def _circular_mean_deg(deg: np.ndarray) -> float:
+    """Circular mean of angles given in degrees, wrapped to [0, 360)."""
+    rad = np.radians(deg)
+    mean_rad = np.arctan2(np.mean(np.sin(rad)), np.mean(np.cos(rad)))
+    return float(np.degrees(mean_rad)) % 360.0
+
+
+def _circular_corrcoef_deg(a_deg: np.ndarray, b_deg: np.ndarray) -> float:
+    """
+    Jammalamadaka–Sarma circular-circular correlation coefficient.
+
+    Returns NaN if either series has (numerically) zero angular spread
+    around its circular mean.
+    """
+    a = np.radians(a_deg)
+    b = np.radians(b_deg)
+    a0 = np.radians(_circular_mean_deg(a_deg))
+    b0 = np.radians(_circular_mean_deg(b_deg))
+    sa = np.sin(a - a0)
+    sb = np.sin(b - b0)
+    denom = np.sqrt(np.sum(sa ** 2) * np.sum(sb ** 2))
+    if denom <= 1e-12:
+        return float("nan")
+    return float(np.sum(sa * sb) / denom)
 
 
 # ---------------------------------------------------------------------------
@@ -44,8 +74,15 @@ def compute_statistics(
     * **bias** — mean(sar − val)
     * **std** — standard deviation of (sar − val)
     * **rmse** — root-mean-square error
-    * **correlation** — Pearson r
+    * **correlation** — Pearson r (or Jammalamadaka–Sarma circular correlation if val_var is circular)
     * **scatter_index** — RMSE / |mean(val)|  (dimensionless, NaN if mean_val ≈ 0)
+
+    If ``val_var`` is a circular quantity (currently just ``"WDIR"`` — see
+    :data:`~._variable_map.CIRCULAR_VAL_VARS`), the difference used above is
+    the wrapped angular difference in ``(-180, 180]`` instead of a plain
+    subtraction, ``std`` is the circular standard deviation, and
+    ``correlation`` is the Jammalamadaka–Sarma circular-circular correlation
+    coefficient rather than Pearson r.
 
     Parameters
     ----------
@@ -97,6 +134,8 @@ def compute_statistics(
         df["_group"] = df[group_by].astype(str).agg(" | ".join, axis=1)
         groups = df.groupby("_group")
 
+    is_circular = val_var in CIRCULAR_VAL_VARS
+
     records = []
     source_labels = []
 
@@ -104,18 +143,35 @@ def compute_statistics(
         sar_vals = grp[sar_col].values.astype(float)
         val_vals = grp[val_col].values.astype(float)
         n = len(sar_vals)
-        diff = sar_vals - val_vals
-        bias = float(np.mean(diff))
-        std = float(np.std(diff, ddof=1)) if n > 1 else float("nan")
-        rmse = float(np.sqrt(np.mean(diff ** 2)))
-        mean_val = float(np.mean(val_vals))
-        si = rmse / abs(mean_val) if abs(mean_val) > 1e-10 else float("nan")
 
-        if n > 1:
-            corr_mat = np.corrcoef(sar_vals, val_vals)
-            corr = float(corr_mat[0, 1])
+        if is_circular:
+            # Wrapped angular difference, e.g. sar=359°, val=1° → diff=-2°
+            # (not 358°), since direction is a circular quantity in [0, 360).
+            diff = ((sar_vals - val_vals + 180.0) % 360.0) - 180.0
+            bias = ((_circular_mean_deg(diff) + 180.0) % 360.0) - 180.0
+            if n > 1:
+                diff_rad = np.radians(diff)
+                resultant_length = np.hypot(np.mean(np.cos(diff_rad)), np.mean(np.sin(diff_rad)))
+                std = float(np.degrees(np.sqrt(-2.0 * np.log(resultant_length)))) if resultant_length > 0 else float("nan")
+            else:
+                std = float("nan")
+            rmse = float(np.sqrt(np.mean(diff ** 2)))
+            mean_val = _circular_mean_deg(val_vals)
+            si = rmse / abs(mean_val) if abs(mean_val) > 1e-10 else float("nan")
+            corr = _circular_corrcoef_deg(sar_vals, val_vals) if n > 1 else float("nan")
         else:
-            corr = float("nan")
+            diff = sar_vals - val_vals
+            bias = float(np.mean(diff))
+            std = float(np.std(diff, ddof=1)) if n > 1 else float("nan")
+            rmse = float(np.sqrt(np.mean(diff ** 2)))
+            mean_val = float(np.mean(val_vals))
+            si = rmse / abs(mean_val) if abs(mean_val) > 1e-10 else float("nan")
+
+            if n > 1 and np.std(sar_vals) > 0 and np.std(val_vals) > 0:
+                corr_mat = np.corrcoef(sar_vals, val_vals)
+                corr = float(corr_mat[0, 1])
+            else:
+                corr = float("nan")
 
         records.append({
             "N":             n,
@@ -216,22 +272,12 @@ def run_statistics(
     for sar_var, val_var in pairs:
         logger.info("Computing statistics: %s vs %s …", sar_var, val_var)
 
-        # Choose grouping dimension: per-station (val_id) when multiple unique
-        # stations exist, otherwise fall back to per-source (val_source).
-        group_by = ["val_source"]
-        if "val_id" in collocation_ds.coords:
-            unique_ids = [
-                v for v in np.unique(collocation_ds["val_id"].values)
-                if str(v) not in ("unknown", "nan", "")
-            ]
-            if len(unique_ids) > 1:
-                group_by = ["val_id"]
-                logger.info(
-                    "Grouping statistics by val_id (%d unique stations)", len(unique_ids)
-                )
-
+        # Group by platform type (val_source, e.g. "mooring", "buoy",
+        # "drifter", "scatterometer") rather than per-station (val_id), so
+        # categories stay coarse and every platform type — including
+        # scatterometer — gets its own row.
         stats_ds = compute_statistics(collocation_ds, sar_var, val_var,
-                                      group_by=group_by)
+                                      group_by=["val_source"])
         if stats_ds is None:
             continue
         key = f"{sar_var}_vs_{val_var}"

@@ -8,6 +8,11 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from sar_validation.downloaders.base import normalize_datetime, is_date_recent
+from sar_validation.downloaders.insitu_downloader import (
+    SOURCE_TYPE_TO_PLATFORM,
+    PLATFORM_CODE_TO_SOURCE_TYPE,
+    _resolve_platform_codes,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -235,3 +240,32 @@ class TestDatetimeIntegration:
         # Verify they parse as valid ISO datetime
         datetime.fromisoformat(api_start.rstrip("Z"))
         datetime.fromisoformat(api_end.rstrip("Z"))
+
+
+# ---------------------------------------------------------------------------
+# Tests for in-situ source-type <-> Copernicus platform-code mapping
+# ---------------------------------------------------------------------------
+
+class TestInsituPlatformCodeMapping:
+    def test_drifter_covers_both_db_and_ad(self):
+        assert SOURCE_TYPE_TO_PLATFORM["drifter"] == ["DB", "AD"]
+
+    def test_buoy_is_db_only(self):
+        assert SOURCE_TYPE_TO_PLATFORM["buoy"] == ["DB"]
+
+    def test_resolve_platform_codes_dedupes_shared_db(self):
+        codes = _resolve_platform_codes(["buoy", "drifter"])
+        assert codes == ["DB", "AD"]
+
+    def test_resolve_platform_codes_unknown_source_type_raises(self):
+        with pytest.raises(ValueError):
+            _resolve_platform_codes(["not_a_real_type"])
+
+    def test_db_labels_as_buoy(self):
+        assert PLATFORM_CODE_TO_SOURCE_TYPE["DB"] == "buoy"
+
+    def test_ad_labels_as_drifter(self):
+        assert PLATFORM_CODE_TO_SOURCE_TYPE["AD"] == "drifter"
+
+    def test_mo_labels_as_mooring(self):
+        assert PLATFORM_CODE_TO_SOURCE_TYPE["MO"] == "mooring"

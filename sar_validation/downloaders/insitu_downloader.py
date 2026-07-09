@@ -38,7 +38,11 @@ import pandas as pd
 
 from .base import normalize_datetime, is_date_recent, build_output_dir
 
-__all__ = ["InSituDownloader"]
+__all__ = [
+    "InSituDownloader",
+    "SOURCE_TYPE_TO_PLATFORM",
+    "PLATFORM_CODE_TO_SOURCE_TYPE",
+]
 
 # ---------------------------------------------------------------------------
 # Dataset constants
@@ -47,13 +51,31 @@ __all__ = ["InSituDownloader"]
 DATASET_ID = "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr"
 ALL_VARIABLES = ["WSPD", "WDIR", "VAVH", "VGHS", "VHM0", "HCDT", "HCSP", "EWCT", "NSCT"]
 
-# Mapping from recipe source types to Copernicus platform codes
+# Mapping from recipe source types to Copernicus platform codes.
+# "drifter" resolves to both "DB" (drifting buoy) and "AD" (autonomous
+# drifter) since a recipe's drifter source is meant to cover both platform
+# kinds. This makes "DB" inherently shared between "buoy" and "drifter" —
+# see PLATFORM_CODE_TO_SOURCE_TYPE below for how that ambiguity is resolved
+# when labeling individual observations.
 SOURCE_TYPE_TO_PLATFORM = {
-    "mooring":     "MO",
-    "buoy":        "DB",
-    "ferrybox":    "FB",
-    "drifter":     "DB",
-    "tidal_gauge": "TG",
+    "mooring":     ["MO"],
+    "buoy":        ["DB"],
+    "ferrybox":    ["FB"],
+    "drifter":     ["DB", "AD"],
+    "tidal_gauge": ["TG"],
+}
+
+# Reverse mapping, Copernicus platform code -> canonical source-type label,
+# used to label individual observations by platform type. Not auto-derived
+# from SOURCE_TYPE_TO_PLATFORM because "DB" is shared: it always labels as
+# "buoy" (physical instrument identity) even though "drifter" also requests
+# it; only "AD" labels as "drifter".
+PLATFORM_CODE_TO_SOURCE_TYPE = {
+    "MO": "mooring",
+    "DB": "buoy",
+    "FB": "ferrybox",
+    "TG": "tidal_gauge",
+    "AD": "drifter",
 }
 
 
@@ -61,14 +83,15 @@ def _resolve_platform_codes(source_types: list[str]) -> list[str]:
     """Map source-type names to Copernicus platform codes (deduplicated)."""
     codes: list[str] = []
     for st in source_types:
-        code = SOURCE_TYPE_TO_PLATFORM.get(st.lower())
-        if code is None:
+        source_codes = SOURCE_TYPE_TO_PLATFORM.get(st.lower())
+        if source_codes is None:
             raise ValueError(
                 f"Unknown source type '{st}'. "
                 f"Valid types: {', '.join(sorted(SOURCE_TYPE_TO_PLATFORM))}"
             )
-        if code not in codes:
-            codes.append(code)
+        for code in source_codes:
+            if code not in codes:
+                codes.append(code)
     return codes
 
 

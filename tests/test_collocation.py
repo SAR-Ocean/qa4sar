@@ -259,6 +259,42 @@ class TestPointLayerCollocation:
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time_64, val, "buoy")
         assert len(results) > 0
 
+    def test_per_row_platform_type_overrides_val_source(self):
+        """A combined in-situ CSV can mix platform types — val_source should
+        reflect each observation's own platform_type, not the single
+        val_source argument passed to collocate()."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        val = _make_val_dataframe(
+            lons=[-0.5, 0.5], lats=[51.5, 52.5],
+            times=[datetime(2026, 1, 1, 12, 0, 0), datetime(2026, 1, 1, 12, 0, 0)],
+            WSPD=[7.0, 8.0],
+            platform_type=["mooring", "buoy"],
+        )
+
+        colloc = PointLayerCollocation(spatial_tolerance_km=500, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "insitu")
+
+        sources = {r.val_source for r in results}
+        assert sources == {"mooring", "buoy"}
+        assert "insitu" not in sources
+
+    def test_missing_platform_type_falls_back_to_val_source(self):
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            WSPD=[7.0],
+        )
+
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "insitu")
+        assert len(results) > 0
+        assert results[0].val_source == "insitu"
+
 
 # ---------------------------------------------------------------------------
 # TrajectoryLayerCollocation

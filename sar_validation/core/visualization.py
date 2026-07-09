@@ -216,7 +216,10 @@ def plot_scatter(
     n = len(diff)
     bias = float(np.mean(diff))
     rmse = float(np.sqrt(np.mean(diff ** 2)))
-    corr = float(np.corrcoef(df[val_col].values, df[sar_col].values)[0, 1]) if n > 1 else float("nan")
+    if n > 1 and np.std(df[val_col].values) > 0 and np.std(df[sar_col].values) > 0:
+        corr = float(np.corrcoef(df[val_col].values, df[sar_col].values)[0, 1])
+    else:
+        corr = float("nan")
     annotation = f"N={n}\nBias={bias:.3g}\nRMSE={rmse:.3g}\nr={corr:.3f}"
     ax.text(0.04, 0.96, annotation, transform=ax.transAxes,
             va="top", ha="left", fontsize=8,

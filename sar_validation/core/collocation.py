@@ -472,7 +472,7 @@ class PointLayerCollocation:
         # Identify numeric columns (for aggregation)
         numeric_cols = [
             col for col in val_data_filtered.columns
-            if col not in {"lon", "lat", "time", "platform_id"} and
+            if col not in {"lon", "lat", "time", "platform_id", "platform_type"} and
             pd.api.types.is_numeric_dtype(val_data_filtered[col])
         ]
 
@@ -568,6 +568,16 @@ class PointLayerCollocation:
                     except (KeyError, ValueError, TypeError) as e:
                         logger.debug("RVL projection failed: %s", e)
 
+                # Prefer the observation's own platform type (e.g. a combined
+                # in-situ CSV mixing moorings and buoys) over the single
+                # val_source passed in for the whole pass, when available.
+                row_platform_type = val_row.get("platform_type")
+                point_val_source = (
+                    row_platform_type
+                    if isinstance(row_platform_type, str) and row_platform_type
+                    else val_source
+                )
+
                 # Create CollocatedPoint
                 collocations.append(
                     CollocatedPoint(
@@ -581,7 +591,7 @@ class PointLayerCollocation:
                         val_data=val_aggregated,
                         spatial_distance_km=spatial_dist,
                         temporal_distance_minutes=temporal_dist,
-                        val_source=val_source,
+                        val_source=point_val_source,
                         val_id=val_row.get("platform_id"),
                         collocation_type=self.collocation_type,
                         sar_y_idx=y_idx,

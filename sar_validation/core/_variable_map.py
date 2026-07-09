@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
-__all__ = ["VARIABLE_PAIRS", "infer_variable_pairs", "filter_variable_pairs"]
+__all__ = ["VARIABLE_PAIRS", "CIRCULAR_VAL_VARS", "infer_variable_pairs", "filter_variable_pairs"]
 
 # ---------------------------------------------------------------------------
 # (sar_variable_name, validation_variable_name) pairs per validated quantity
@@ -31,6 +31,14 @@ VARIABLE_PAIRS: dict[str, List[Tuple[str, str]]] = {
         ("owiHs",    "VHM0"),  # IW/EW mode OWI grid (fallback)
     ],
 }
+
+# ---------------------------------------------------------------------------
+# Validation-variable codes that are circular (angular, degrees in [0, 360)).
+# ``statistics.compute_statistics`` uses this to switch to wrap-aware bias /
+# RMSE / correlation instead of plain linear arithmetic.
+# ---------------------------------------------------------------------------
+
+CIRCULAR_VAL_VARS: set[str] = {"WDIR"}
 
 
 def infer_variable_pairs(variable: str) -> List[Tuple[str, str]]:

@@ -157,6 +157,22 @@ class TestPlotScatter:
         assert fig is not None
         plt.close("all")
 
+    def test_constant_values_no_runtime_warning(self):
+        import warnings
+        import matplotlib.pyplot as plt
+
+        n = 5
+        ds = xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", [8.0] * n),
+            "val_WSPD":         ("collocation", [8.0] * n),
+            "val_source":       ("collocation", ["buoy"] * n),
+        })
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            fig = plot_scatter(ds, "owiWindSpeed", "WSPD")
+        assert fig is not None
+        plt.close("all")
+
 
 class TestPlotResiduals:
     def test_returns_figure(self, collocation_ds):

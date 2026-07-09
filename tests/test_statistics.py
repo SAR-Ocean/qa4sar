@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 import xarray as xr
 
-from sar_validation.core.statistics import compute_statistics, save_statistics
+from sar_validation.core.statistics import compute_statistics, save_statistics, run_statistics
 from sar_validation.core._variable_map import infer_variable_pairs
+from sar_validation.core.recipe import Recipe, RecipeConfig
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +83,110 @@ class TestComputeStatistics:
         ds = compute_statistics(collocation_ds, "owiWindSpeed", "WSPD")
         total_n = int(ds["N"].sum())
         assert total_n == 40
+
+
+# ---------------------------------------------------------------------------
+# Circular statistics (wind direction)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def direction_collocation_ds():
+    """Direction pairs that straddle the 0°/360° wrap boundary."""
+    sar_deg = np.array([10.0, 90.0, 180.0, 270.0, 359.0])
+    val_deg = (sar_deg + 2.0) % 360.0  # sar - val should wrap to ~-2° everywhere
+
+    ds = xr.Dataset(
+        {
+            "sar_owiWindDirection": ("collocation", sar_deg),
+            "val_WDIR":             ("collocation", val_deg),
+            "val_source":           ("collocation", ["buoy"] * len(sar_deg)),
+        }
+    )
+    return ds
+
+
+class TestCircularStatistics:
+    def test_bias_uses_wrapped_difference(self, direction_collocation_ds):
+        ds = compute_statistics(direction_collocation_ds, "owiWindDirection", "WDIR")
+        # A naive (sar - val) mean would be dominated by the 358° outlier at
+        # the wrap boundary; the correct wrapped bias is close to -2°.
+        assert abs(float(ds["bias"].values[0]) - (-2.0)) < 1e-6
+
+    def test_rmse_small_despite_wrap(self, direction_collocation_ds):
+        ds = compute_statistics(direction_collocation_ds, "owiWindDirection", "WDIR")
+        assert float(ds["rmse"].values[0]) < 5.0
+
+    def test_correlation_near_one_for_rotated_series(self, direction_collocation_ds):
+        ds = compute_statistics(direction_collocation_ds, "owiWindDirection", "WDIR")
+        assert float(ds["correlation"].values[0]) > 0.9
+
+    def test_no_runtime_warning(self, direction_collocation_ds):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            compute_statistics(direction_collocation_ds, "owiWindDirection", "WDIR")
+
+    def test_constant_direction_group_no_warning(self):
+        """A group with zero angular spread must not raise a RuntimeWarning."""
+        ds = xr.Dataset(
+            {
+                "sar_owiWindDirection": ("collocation", [180.0, 180.0]),
+                "val_WDIR":             ("collocation", [180.0, 180.0]),
+                "val_source":           ("collocation", ["buoy", "buoy"]),
+            }
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            result = compute_statistics(ds, "owiWindDirection", "WDIR")
+        assert np.isnan(float(result["correlation"].values[0]))
+
+
+# ---------------------------------------------------------------------------
+# run_statistics — platform-type grouping
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def multi_station_collocation_ds():
+    """Multiple stations per platform type, plus a scatterometer source."""
+    rng = np.random.default_rng(7)
+
+    def _block(n, source, val_ids):
+        sar_vals = rng.uniform(2, 14, size=n)
+        val_vals = sar_vals + rng.normal(0, 0.5, size=n)
+        return sar_vals, val_vals, [source] * n, val_ids
+
+    sar1, val1, src1, id1 = _block(6, "mooring", ["MO_A"] * 3 + ["MO_B"] * 3)
+    sar2, val2, src2, id2 = _block(4, "buoy", ["BUOY_X"] * 2 + ["BUOY_Y"] * 2)
+    sar3, val3, src3, id3 = _block(50, "scatterometer", ["unknown"] * 50)
+
+    sar_vals = np.concatenate([sar1, sar2, sar3])
+    val_vals = np.concatenate([val1, val2, val3])
+    sources = src1 + src2 + src3
+    val_ids = id1 + id2 + id3
+
+    return xr.Dataset(
+        {
+            "sar_owiWindSpeed": ("collocation", sar_vals),
+            "val_WSPD":         ("collocation", val_vals),
+            "val_source":       ("collocation", sources),
+            "val_id":           ("collocation", val_ids),
+        }
+    )
+
+
+class TestRunStatisticsGrouping:
+    def _recipe(self):
+        return Recipe(RecipeConfig(name="test", variable="wind"))
+
+    def test_groups_by_platform_type_not_station(self, tmp_path, multi_station_collocation_ds):
+        results = run_statistics(multi_station_collocation_ds, self._recipe(), tmp_path)
+        stats_ds = results["owiWindSpeed_vs_WSPD"]
+        assert set(stats_ds["source"].values) == {"mooring", "buoy", "scatterometer"}
+
+    def test_scatterometer_row_present_with_full_count(self, tmp_path, multi_station_collocation_ds):
+        results = run_statistics(multi_station_collocation_ds, self._recipe(), tmp_path)
+        stats_ds = results["owiWindSpeed_vs_WSPD"]
+        df = stats_ds.to_dataframe()
+        assert int(df.loc["scatterometer", "N"]) == 50
 
 
 # ---------------------------------------------------------------------------
