@@ -11,7 +11,6 @@ from .core import (
     DataTreeConverter,
     CollocatedPoint,
     PointLayerCollocation,
-    TrajectoryLayerCollocation,
     LayerLayerCollocation,
     DataOrchestrator,
 )
@@ -29,7 +28,6 @@ __all__ = [
     "DataTreeConverter",
     "CollocatedPoint",
     "PointLayerCollocation",
-    "TrajectoryLayerCollocation",
     "LayerLayerCollocation",
     "DataOrchestrator",
 ]

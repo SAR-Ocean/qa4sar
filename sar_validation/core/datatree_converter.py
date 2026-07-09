@@ -280,7 +280,7 @@ class DataTreeConverter:
             [c.collocation_type for c in collocations],
         )
 
-        # Pixel indices — needed by patch_extractor to slice SAR arrays
+        # Pixel indices — the SAR pixel and scene this observation was matched to
         data["sar_y_idx"] = ("collocation", [c.sar_y_idx for c in collocations])
         data["sar_x_idx"] = ("collocation", [c.sar_x_idx for c in collocations])
         data["sar_scene_name"] = ("collocation", [c.sar_scene_name for c in collocations])

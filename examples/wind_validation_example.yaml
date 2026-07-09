@@ -61,7 +61,7 @@ validation_sources:
       spatial_tolerance_km: 100
 
 # Collocation strategy
-# Options: point_vs_layer | trajectory_vs_layer | layer_vs_layer
+# Options: point_vs_layer | layer_vs_layer
 collocation:
   type: point_vs_layer
   time_tolerance_minutes: 60

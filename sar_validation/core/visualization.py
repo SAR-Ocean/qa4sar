@@ -440,8 +440,8 @@ def plot_geographic(
                 continue
 
             if HAS_CARTOPY:
-                ax.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0)
-                ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=0)
+                ax.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0, rasterized=True)
+                ax.add_feature(cfeature.COASTLINE, linewidth=0.5, zorder=0, rasterized=True)
                 gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
                 gl.top_labels = False
                 gl.right_labels = False
@@ -458,13 +458,14 @@ def plot_geographic(
                     ax.scatter(
                         scene_ds["lon"].values, scene_ds["lat"].values, c=arr,
                         cmap=cmap, norm=sar_norm, s=20, edgecolors="none",
-                        zorder=3, **kw,
+                        zorder=3, rasterized=True, **kw,
                     )
                 else:
                     # Gridded data (e.g., IW/EW mode) — use pcolormesh
                     ax.pcolormesh(
                         scene_ds["lon"].values, scene_ds["lat"].values, arr,
-                        cmap=cmap, norm=sar_norm, shading="auto", zorder=2, **kw,
+                        cmap=cmap, norm=sar_norm, shading="auto", zorder=2,
+                        rasterized=True, **kw,
                     )
 
             sub_coll = _filter_by_scene(group_coll_ds, scene_name)
@@ -503,7 +504,7 @@ def plot_geographic(
                         df_pts["val_lon"], df_pts["val_lat"],
                         c=df_pts[val_col], cmap=val_cmap, norm=val_norm,
                         s=point_size, edgecolors="black", linewidths=0.4,
-                        **kw_sc,
+                        rasterized=True, **kw_sc,
                     )
                     if "val_source" in df_pts.columns:
                         present = set(df_pts["val_source"].astype(str))
@@ -522,7 +523,7 @@ def plot_geographic(
                         ax.scatter(grp["val_lon"], grp["val_lat"],
                                    s=point_size, c=color,
                                    edgecolors="black", linewidths=0.4,
-                                   label=str(src), **kw_sc)
+                                   label=str(src), rasterized=True, **kw_sc)
                     ax.legend(fontsize=6, loc="lower left", framealpha=0.7)
                 else:
                     ax.scatter(df_pts["val_lon"], df_pts["val_lat"],
@@ -628,13 +629,15 @@ def plot_statistics(
     ncols = len(available)
     fig, axes = plt.subplots(1, ncols, figsize=(4.5 * ncols, 4), squeeze=False)
 
+    x = np.arange(len(sources))
     for i, metric in enumerate(available):
         ax = axes[0][i]
         vals = stats_ds[metric].values.astype(float)
         colors = [_SOURCE_COLORS[j % len(_SOURCE_COLORS)] for j in range(len(sources))]
-        ax.bar(sources, vals, color=colors, edgecolor="white", linewidth=0.5)
+        ax.bar(x, vals, color=colors, edgecolor="white", linewidth=0.5)
         ax.set_title(metric.replace("_", " ").title())
         ax.set_xlabel("Source")
+        ax.set_xticks(x)
         ax.set_xticklabels(sources, rotation=30, ha="right", fontsize=8)
         ax.grid(axis="y", linewidth=0.4)
 
@@ -1209,10 +1212,9 @@ def plot_collocation_diagnostics(
     unmatched_lats = np.array(unmatched_lats)
 
     # ── Separate matched points into in-situ and scatterometer ──────────
-    # Extract point_vs_layer and trajectory_vs_layer (in-situ) matches from collocation_ds
+    # Extract point_vs_layer (in-situ) matches from collocation_ds
     if "collocation_type" in collocation_ds:
-        pvl_mask = (collocation_ds["collocation_type"] == "point_vs_layer") | \
-                   (collocation_ds["collocation_type"] == "trajectory_vs_layer")
+        pvl_mask = collocation_ds["collocation_type"] == "point_vs_layer"
         pvl_ds = collocation_ds.where(pvl_mask, drop=True)
         
         matched_lons_insitu = pvl_ds["val_lon"].values if "val_lon" in pvl_ds else np.array([])
@@ -1906,7 +1908,7 @@ def validation_report(
             plt.close(cover)
 
             for _title, fig in pdf_pages:
-                pdf.savefig(fig, bbox_inches="tight")
+                pdf.savefig(fig, dpi=150, bbox_inches="tight")
 
         logger.info("PDF report saved to %s", pdf_path)
 

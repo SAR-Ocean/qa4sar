@@ -1,4 +1,4 @@
-"""Tests for sar_validation.core.visualization and patch_extractor."""
+"""Tests for sar_validation.core.visualization."""
 
 from __future__ import annotations
 
@@ -6,11 +6,6 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from sar_validation.core.patch_extractor import (
-    extract_patches,
-    add_patches_to_dataset,
-    _validate_patch_size,
-)
 from sar_validation.core.visualization import (
     plot_scatter,
     plot_residuals,
@@ -45,92 +40,6 @@ def collocation_ds():
         "val_lon":          ("collocation", rng.uniform(-10, 5, n)),
         "val_lat":          ("collocation", rng.uniform(50, 65, n)),
     })
-
-
-@pytest.fixture
-def mock_datatree():
-    """Minimal DataTree with two SAR scenes."""
-    rng = np.random.default_rng(1)
-    ny, nx = 20, 20
-
-    def make_scene_ds():
-        lon = np.linspace(-10, 5, nx)
-        lat = np.linspace(50, 65, ny)
-        lon2d, lat2d = np.meshgrid(lon, lat)
-        return xr.Dataset(
-            {"owiWindSpeed": (("y", "x"), rng.uniform(3, 15, (ny, nx)))},
-            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d)},
-        )
-
-    scene_a = make_scene_ds()
-    scene_b = make_scene_ds()
-
-    dt = xr.DataTree.from_dict({
-        "/sar/sceneA": scene_a,
-        "/sar/sceneB": scene_b,
-    })
-    return dt
-
-
-# ---------------------------------------------------------------------------
-# patch_extractor
-# ---------------------------------------------------------------------------
-
-class TestValidatePatchSize:
-    def test_valid_odd(self):
-        assert _validate_patch_size(5) == 5
-
-    def test_even_rounds_up(self):
-        with pytest.warns(UserWarning, match="rounding up"):
-            result = _validate_patch_size(4)
-        assert result == 5
-
-    def test_zero_raises(self):
-        with pytest.raises(ValueError):
-            _validate_patch_size(0)
-
-    def test_negative_raises(self):
-        with pytest.raises(ValueError):
-            _validate_patch_size(-3)
-
-
-class TestExtractPatches:
-    def test_output_shape(self, collocation_ds, mock_datatree):
-        patches = extract_patches(collocation_ds, mock_datatree, patch_size=5)
-        assert "sar_patch_owiWindSpeed" in patches
-        arr = patches["sar_patch_owiWindSpeed"]
-        assert arr.shape == (30, 5, 5)
-
-    def test_patch_size_3(self, collocation_ds, mock_datatree):
-        patches = extract_patches(collocation_ds, mock_datatree, patch_size=3)
-        arr = patches["sar_patch_owiWindSpeed"]
-        assert arr.shape == (30, 3, 3)
-
-    def test_no_sar_group_raises(self, collocation_ds):
-        empty_dt = xr.DataTree()
-        with pytest.raises(ValueError, match="no '/sar' group"):
-            extract_patches(collocation_ds, empty_dt, patch_size=5)
-
-
-class TestAddPatchesToDataset:
-    def test_adds_variables(self, collocation_ds, mock_datatree):
-        patches = extract_patches(collocation_ds, mock_datatree, patch_size=5)
-        augmented = add_patches_to_dataset(collocation_ds, patches, patch_size=5)
-        assert "sar_patch_owiWindSpeed" in augmented.data_vars
-
-    def test_patch_dimensions(self, collocation_ds, mock_datatree):
-        patches = extract_patches(collocation_ds, mock_datatree, patch_size=5)
-        augmented = add_patches_to_dataset(collocation_ds, patches, patch_size=5)
-        var = augmented["sar_patch_owiWindSpeed"]
-        assert var.dims == ("collocation", "patch_y", "patch_x")
-        assert var.sizes["patch_y"] == 5
-        assert var.sizes["patch_x"] == 5
-
-    def test_patch_offsets(self, collocation_ds, mock_datatree):
-        patches = extract_patches(collocation_ds, mock_datatree, patch_size=5)
-        augmented = add_patches_to_dataset(collocation_ds, patches, patch_size=5)
-        offsets = augmented["patch_y"].values.tolist()
-        assert offsets == [-2, -1, 0, 1, 2]
 
 
 # ---------------------------------------------------------------------------

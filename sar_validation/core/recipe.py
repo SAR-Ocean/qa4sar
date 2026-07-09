@@ -95,7 +95,6 @@ class PointVsLayerCollocation:
     validation_temporal_averaging_minutes: int = 30  # unused for point_vs_layer; kept for schema/API compatibility
     distance_weighting: str = "gaussian"
     gaussian_sigma_km: float = 2.0
-    patch_size: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -258,7 +257,6 @@ class Recipe:
             validation_temporal_averaging_minutes=pvl_config.get("validation_temporal_averaging_minutes", 30),
             distance_weighting=pvl_config.get("distance_weighting", "gaussian"),
             gaussian_sigma_km=pvl_config.get("gaussian_sigma_km", 2.0),
-            patch_size=pvl_config.get("patch_size", 0),
         )
 
         # Parse layer_vs_layer section if present

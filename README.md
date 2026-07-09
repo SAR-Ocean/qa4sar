@@ -22,8 +22,7 @@ Step 2 — Convert to xarray.DataTree
           │  handle different grids / resolutions
           ▼
 Step 3 — Collocation
-          │  point vs. layer   (mooring / buoy vs. SAR)
-          │  trajectory vs. layer  (ferrybox / drifter vs. SAR)
+          │  point vs. layer   (mooring / buoy / ferrybox / drifter vs. SAR)
           │  layer vs. layer   (scatterometer / HF-radar vs. SAR)
           ▼
 Step 4 — Store collocated pairs
@@ -48,7 +47,6 @@ sar_validation/
 │   ├── orchestrator.py     # Orchestrates step 1 (download all sources)
 │   ├── datatree_converter.py  # Step 2: convert to xarray.DataTree
 │   ├── collocation.py      # Step 3: collocation algorithms
-│   ├── patch_extractor.py  # Step 4a: extract pixel neighborhoods around collocations
 │   ├── statistics.py       # Step 4b: compute bias, RMSE, correlation, scatter index
 │   ├── visualization.py    # Step 5: scatter plots, geographic maps, statistics charts, residuals
 │   ├── _variable_map.py    # Variable mapping (wind/currents/waves)
@@ -151,8 +149,7 @@ plt.show()
 
 | Type | Example | Status |
 |------|---------|--------|
-| Point vs. Layer | mooring/buoy vs. SAR | ✅ implemented |
-| Trajectory vs. Layer | ferrybox/drifter vs. SAR | 🚧 stub |
+| Point vs. Layer | mooring/buoy/ferrybox/drifter vs. SAR | ✅ implemented |
 | Layer vs. Layer | scatterometer (ASCAT) vs. SAR | ✅ implemented |
 
 ---

@@ -12,7 +12,6 @@ from sar_validation.core.collocation import (
     CollocatedPoint,
     PointLayerCollocation,
     LayerLayerCollocation,
-    TrajectoryLayerCollocation,
     _haversine_distance,
     _haversine_distance_grid,
     _to_datetime_array,
@@ -21,7 +20,6 @@ from sar_validation.core.collocation import (
     _inverse_distance_weights,
     _linear_weights,
     _equal_weights,
-    TRAJECTORY_PLATFORM_TYPES,
     LAYER_DATA_TYPES,
 )
 
@@ -297,49 +295,6 @@ class TestPointLayerCollocation:
 
 
 # ---------------------------------------------------------------------------
-# TrajectoryLayerCollocation
-# ---------------------------------------------------------------------------
-
-class TestTrajectoryLayerCollocation:
-    def test_finds_match_and_labels_correctly(self):
-        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
-        # Simulate a short ferrybox track crossing the SAR scene
-        val = _make_val_dataframe(
-            lons=[-0.5, 0.0, 0.5],
-            lats=[51.5, 52.0, 52.5],
-            times=[
-                datetime(2026, 1, 1, 11, 55, 0),
-                datetime(2026, 1, 1, 12,  0, 0),
-                datetime(2026, 1, 1, 12,  5, 0),
-            ],
-            EWCT=[0.3, 0.4, 0.5],
-            NSCT=[0.1, 0.2, 0.1],
-        )
-        colloc = TrajectoryLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
-                                             aggregation_window_km=100)
-        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "ferrybox")
-
-        assert len(results) > 0
-        assert all(r.collocation_type == "trajectory_vs_layer" for r in results)
-        assert all(r.val_source == "ferrybox" for r in results)
-
-    def test_no_match_outside_tolerance(self):
-        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
-        val = _make_val_dataframe(
-            lons=[30.0], lats=[52.0],
-            times=[datetime(2026, 1, 1, 12, 0, 0)],
-            EWCT=[0.5],
-        )
-        colloc = TrajectoryLayerCollocation(spatial_tolerance_km=10, time_tolerance_minutes=60,
-                                             aggregation_window_km=20)
-        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "drifter")
-        assert results == []
-
-    def test_inherits_from_point_layer(self):
-        assert issubclass(TrajectoryLayerCollocation, PointLayerCollocation)
-
-
-# ---------------------------------------------------------------------------
 # LayerLayerCollocation
 # ---------------------------------------------------------------------------
 
@@ -528,11 +483,11 @@ class TestDetectCollocationTypeImport:
         ds = xr.Dataset()
         assert _detect_collocation_type(ds, "validation/mooring") == "point_vs_layer"
 
-    def test_trajectory_by_platform_type(self):
+    def test_ferrybox_drifter_default_to_point(self):
         import xarray as xr
-        for pt in TRAJECTORY_PLATFORM_TYPES:
+        for pt in ("ferrybox", "fb", "drifter", "ad"):
             ds = xr.Dataset(attrs={"platform_type": pt})
-            assert _detect_collocation_type(ds, "val/x") == "trajectory_vs_layer", pt
+            assert _detect_collocation_type(ds, "val/x") == "point_vs_layer", pt
 
     def test_layer_by_data_type(self):
         import xarray as xr
@@ -552,7 +507,7 @@ class TestDetectCollocationTypeImport:
 # ---------------------------------------------------------------------------
 
 class TestAllTypesWork:
-    def test_all_three_classes_return_results(self):
+    def test_both_classes_return_results(self):
         grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
         val = _make_val_dataframe(
             lons=[0.0], lats=[52.0],
@@ -560,9 +515,8 @@ class TestAllTypesWork:
             wind_speed=[8.0],
         )
         for cls, expected_type in (
-            (PointLayerCollocation,      "point_vs_layer"),
-            (TrajectoryLayerCollocation, "trajectory_vs_layer"),
-            (LayerLayerCollocation,      "layer_vs_layer"),
+            (PointLayerCollocation, "point_vs_layer"),
+            (LayerLayerCollocation, "layer_vs_layer"),
         ):
             colloc = cls(spatial_tolerance_km=200, time_tolerance_minutes=60, aggregation_window_km=100)
             results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "test")

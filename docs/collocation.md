@@ -1,21 +1,20 @@
 # Collocation
 
 Collocation is step 3 of the validation pipeline.  It matches SAR L2 OCN
-grid cells to validation observations (in-situ measurements, trajectory data,
-or a second satellite swath) and writes the paired values to
+grid cells to validation observations (in-situ measurements, moving-platform
+tracks, or a second satellite swath) and writes the paired values to
 `collocation_results.nc`.
 
 ---
 
 ## Collocation types
 
-Three types are supported, each targeting a different kind of validation
+Two types are supported, each targeting a different kind of validation
 source:
 
 | Type | When used | Typical sources |
 |---|---|---|
-| `point_vs_layer` | Fixed or slowly-moving observation vs SAR grid | Mooring, buoy, tidal gauge, HF radar |
-| `trajectory_vs_layer` | Moving platform vs SAR grid | Ferrybox, drifting buoy |
+| `point_vs_layer` | Fixed or moving observation vs SAR grid | Mooring, buoy, tidal gauge, HF radar, ferrybox, drifting buoy |
 | `layer_vs_layer` | Gridded satellite swath vs SAR grid | ASCAT scatterometer (OSI-SAF), altimeter |
 
 The type is **auto-detected per source** from the `platform_type` and
@@ -27,9 +26,9 @@ explicitly — the converter writes the right attributes when it builds
 
 ## Algorithm
 
-All three types use the same matching algorithm.  For each validation
-observation (whether a single point, one step along a trajectory, or one
-cell of a swath grid) and each SAR scene:
+Both types use the same matching algorithm.  For each validation
+observation (whether a single point or one cell of a swath grid) and each
+SAR scene:
 
 1. **Spatial filter** — compute the great-circle distance (Haversine) from the
    observation's `(lon, lat)` to every SAR grid cell.  Keep cells within
@@ -96,7 +95,7 @@ validation_sources:
   - source_type: mooring        # → point_vs_layer  (auto-detected)
     collocation_kwargs: {}      # use global settings
 
-  - source_type: ferrybox       # → trajectory_vs_layer  (auto-detected)
+  - source_type: ferrybox       # → point_vs_layer  (auto-detected)
     collocation_kwargs:
       time_tolerance_minutes: 30  # example: same as point settings
 
@@ -162,12 +161,12 @@ mooring_df = df[df["val_source"] == "mooring"]
 ```python
 import matplotlib.pyplot as plt
 
-fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+fig, axes = plt.subplots(1, 2, figsize=(10, 5))
 
 for ax, ctype, label in zip(
     axes,
-    ["point_vs_layer", "trajectory_vs_layer", "layer_vs_layer"],
-    ["Point (mooring/buoy)", "Trajectory (ferrybox/drifter)", "Layer (scatterometer)"],
+    ["point_vs_layer", "layer_vs_layer"],
+    ["Point (mooring/buoy/ferrybox/drifter)", "Layer (scatterometer)"],
 ):
     sub = df[df["collocation_type"] == ctype].dropna(
         subset=["sar_owiWindSpeed", "val_WSPD"]
@@ -211,7 +210,7 @@ Every row of `collocation_results.nc` contains:
 | `val_lon`, `val_lat` | Validation observation coordinates |
 | `spatial_distance_km` | Great-circle distance between the pair |
 | `temporal_distance_minutes` | Absolute time difference |
-| `collocation_type` | `point_vs_layer`, `trajectory_vs_layer`, or `layer_vs_layer` |
+| `collocation_type` | `point_vs_layer` or `layer_vs_layer` |
 | `val_source` | Source label (e.g. `mooring`, `ferrybox`, `scatterometer`) |
 | `sar_<variable>` | SAR value at the matched pixel (e.g. `sar_owiWindSpeed`) |
 | `val_<variable>` | Validation value (e.g. `val_WSPD`, `val_wind_speed`) |

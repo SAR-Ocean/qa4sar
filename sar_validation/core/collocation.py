@@ -1,11 +1,10 @@
 """
 Collocation algorithms — step 3 of the validation pipeline.
 
-Three collocation geometries are supported:
+Two collocation geometries are supported:
 
-1. ``PointLayerCollocation``      — fixed / slow-moving point vs. SAR grid  ✅
-2. ``TrajectoryLayerCollocation`` — moving trajectory vs. SAR grid          🚧
-3. ``LayerLayerCollocation``      — gridded product vs. SAR grid            🚧
+1. ``PointLayerCollocation`` — fixed / slow-moving point vs. SAR grid  ✅
+2. ``LayerLayerCollocation`` — gridded product vs. SAR grid            🚧
 """
 
 from __future__ import annotations
@@ -24,11 +23,9 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CollocatedPoint",
     "PointLayerCollocation",
-    "TrajectoryLayerCollocation",
     "LayerLayerCollocation",
     "run_collocation",
     "_detect_collocation_type",
-    "TRAJECTORY_PLATFORM_TYPES",
     "LAYER_DATA_TYPES",
     "LAYER_SOURCE_PATHS",
 ]
@@ -61,9 +58,9 @@ class CollocatedPoint:
     # Provenance
     val_source: str              # e.g. "mooring", "buoy", "scatterometer"
     val_id: Optional[str] = None
-    collocation_type: str = "point_vs_layer"  # point_vs_layer | trajectory_vs_layer | layer_vs_layer
+    collocation_type: str = "point_vs_layer"  # point_vs_layer | layer_vs_layer
 
-    # Pixel indices — used by patch_extractor to retrieve a spatial neighbourhood
+    # Pixel indices — the SAR pixel and scene this observation was matched to
     sar_y_idx: int = 0
     sar_x_idx: int = 0
     sar_scene_name: str = ""
@@ -265,8 +262,6 @@ def _equal_weights(distances: np.ndarray) -> np.ndarray:
 # Source-type dispatch helpers
 # ---------------------------------------------------------------------------
 
-# platform_type attribute values that indicate a moving trajectory source
-TRAJECTORY_PLATFORM_TYPES = {"ferrybox", "fb", "drifter", "ad"}
 # data_type attribute values that indicate a gridded layer source
 LAYER_DATA_TYPES = {"scatterometer"}
 # path-fragment fallbacks when attributes are absent
@@ -278,15 +273,11 @@ def _detect_collocation_type(val_ds: "xr.Dataset", source_path: str) -> str:
     Infer the appropriate collocation class name from a validation Dataset.
 
     Checks (in order):
-    1. ``platform_type`` attribute  → trajectory or default
-    2. ``data_type`` attribute      → layer or default
-    3. Source path fragment         → layer or default
+    1. ``data_type`` attribute      → layer or default
+    2. Source path fragment         → layer or default
     """
-    platform_type = val_ds.attrs.get("platform_type", "").lower()
     data_type = val_ds.attrs.get("data_type", "").lower()
 
-    if platform_type in TRAJECTORY_PLATFORM_TYPES:
-        return "trajectory_vs_layer"
     if data_type in LAYER_DATA_TYPES:
         return "layer_vs_layer"
     for fragment in LAYER_SOURCE_PATHS:
@@ -861,15 +852,14 @@ def run_collocation(
     layer_vs_layer_collocation_method: str = "cell-averaging",
 ) -> Optional["xr.Dataset"]:
     """
-    Run all three collocation passes between SAR and validation nodes in
+    Run both collocation passes between SAR and validation nodes in
     *datatree* and save the combined results to
     ``<base_dir>/collocation_results.nc``.
 
     Pass order
     ----------
-    1. **point_vs_layer**      — moorings, buoys, tidal gauges, HF radar
-    2. **trajectory_vs_layer** — ferryboxes, drifters
-    3. **layer_vs_layer**      — scatterometer swaths, OSI-SAF winds
+    1. **point_vs_layer** — moorings, buoys, tidal gauges, HF radar, ferryboxes, drifters
+    2. **layer_vs_layer** — scatterometer swaths, OSI-SAF winds
 
     Each validation source is auto-assigned to a pass based on its
     ``platform_type`` / ``data_type`` Dataset attribute (see
@@ -919,9 +909,8 @@ def run_collocation(
     coll_cfg = recipe.config.collocation
 
     _COLLOC_CLASSES = {
-        "point_vs_layer":       PointLayerCollocation,
-        "trajectory_vs_layer":  TrajectoryLayerCollocation,
-        "layer_vs_layer":       LayerLayerCollocation,
+        "point_vs_layer": PointLayerCollocation,
+        "layer_vs_layer": LayerLayerCollocation,
     }
 
     # Build a map of source_type to collocation_kwargs for per-source overrides
@@ -1188,36 +1177,11 @@ def run_collocation(
         out_path, len(all_collocations),
     )
 
-    # Step 4a: optional SAR patch extraction
-    patch_size = getattr(coll_cfg, "patch_size", 0)
-    if patch_size and patch_size > 0:
-        from .patch_extractor import run_patch_extraction
-        run_patch_extraction(result_ds, datatree, patch_size, base_dir)
-
     return result_ds
 
 
 # ---------------------------------------------------------------------------
-# 2. Trajectory vs. Layer
-# ---------------------------------------------------------------------------
-
-class TrajectoryLayerCollocation(PointLayerCollocation):
-    """
-    Match a moving trajectory (ferrybox, drifter) to a SAR layer.
-
-    Each observation is matched independently: its individual ``lon``, ``lat``,
-    and ``time`` are checked against the SAR grid.  This is equivalent to
-    ``PointLayerCollocation`` but produces results labelled
-    ``collocation_type="trajectory_vs_layer"``.
-
-    Typical use cases: ferrybox transects, drifting buoys.
-    """
-
-    collocation_type: str = "trajectory_vs_layer"
-
-
-# ---------------------------------------------------------------------------
-# 3. Layer vs. Layer
+# 2. Layer vs. Layer
 # ---------------------------------------------------------------------------
 
 class LayerLayerCollocation(PointLayerCollocation):

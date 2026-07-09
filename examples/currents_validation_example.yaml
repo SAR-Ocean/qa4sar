@@ -56,7 +56,7 @@ validation_sources:
       time_tolerance_minutes: 60
       spatial_tolerance_km: 50
 
-  # Ferrybox data (trajectory)
+  # Ferrybox data
   - source_type: ferrybox
     min_depth: -20
     max_depth:  20
@@ -65,7 +65,7 @@ validation_sources:
       spatial_tolerance_km: 50
 
 collocation:
-  type: point_vs_layer       # trajectory_vs_layer (not yet implemented for ferrybox)
+  type: point_vs_layer
   time_tolerance_minutes: 60
   spatial_tolerance_km: 50
   interpolation_method: nearest

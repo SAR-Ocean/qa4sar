@@ -2,9 +2,8 @@
 
 Steps 4 and 5 consume the collocation results produced by step 3 and generate:
 
-- **Step 4a** — `collocation_patches.nc`: a spatial SAR pixel neighbourhood around each match
-- **Step 4b** — `validation_statistics_*.nc/.csv`: per-source bias, RMSE, and correlation
-- **Step 5**  — `plots/*.png`: scatter, geographic, statistics bar chart, and residual histogram
+- **Step 4** — `validation_statistics_*.nc/.csv`: per-source bias, RMSE, and correlation
+- **Step 5** — `plots/*.png`: scatter, geographic, statistics bar chart, and residual histogram
 
 Prerequisites: steps 1–3 must have run and produced `datatree.nc` and
 `collocation_results.nc` in the data directory.
@@ -16,14 +15,14 @@ Prerequisites: steps 1–3 must have run and produced `datatree.nc` and
 | Flag | Implies | What it does |
 |------|---------|-------------|
 | `--collocate` | `--convert` | Steps 1–3: download → convert → collocate |
-| `--stats` | `--collocate` | + Step 4b: compute and save statistics |
+| `--stats` | `--collocate` | + Step 4: compute and save statistics |
 | `--plot` | `--stats` | + Step 5: generate and save all plots |
 
 All flags are additive — `--plot` automatically runs everything before it.
 
 ---
 
-## Step 4b — Validation statistics
+## Step 4 — Validation statistics
 
 ```bash
 sar-validate --recipe recipes/wind_validation.yaml --collocate --stats
@@ -78,39 +77,9 @@ sar-validate --recipe recipes/wind_validation.yaml --plot
 
 ---
 
-## Step 4a — SAR patch extraction
-
-Patch extraction runs automatically during collocation when `patch_size` is set
-in the recipe YAML.  It is **not triggered by a separate CLI flag**.
-
-Edit `collocation.patch_size` in your recipe:
-
-```yaml
-collocation:
-  type: point_vs_layer
-  time_tolerance_minutes: 60
-  spatial_tolerance_km: 50
-  interpolation_method: nearest
-  patch_size: 5    # 0 = disabled (default); must be odd, e.g. 3, 5, 7, 9
-```
-
-Then re-run collocation:
-
-```bash
-sar-validate --recipe recipes/wind_validation.yaml --collocate
-```
-
-Output: `data/<run>/collocation_patches.nc`
-
-Each collocated pair gains a `sar_patch_<var>` variable of shape
-`(collocation, patch_y, patch_x)` where `patch_y = patch_x = 0` is the
-originally matched pixel.  Out-of-bounds pixels are NaN-padded.
-
----
-
 ## Running from Python
 
-### Step 4b — statistics
+### Step 4 — statistics
 
 ```python
 import xarray as xr
@@ -209,24 +178,6 @@ display(m)
 
 All functions fall back to a friendly `ImportError` if the required backend is
 not installed.
-
-### Step 4a — patch extraction
-
-```python
-import xarray as xr
-from sar_validation.core.patch_extractor import run_patch_extraction
-
-collocation_ds = xr.open_dataset("data/<run>/collocation_results.nc")
-datatree       = xr.open_datatree("data/<run>/datatree.nc", engine="netcdf4")
-
-patches_ds = run_patch_extraction(
-    collocation_ds=collocation_ds,
-    datatree=datatree,
-    patch_size=5,
-    base_dir="data/<run>",         # saves collocation_patches.nc here
-)
-# patches_ds["sar_patch_owiWindSpeed"].shape  ->  (n_collocations, 5, 5)
-```
 
 ---
 
