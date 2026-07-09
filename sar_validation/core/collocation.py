@@ -308,11 +308,12 @@ class PointLayerCollocation:
        (circular radius). Compute a distance-weighted average of SAR variables
        using the selected weighting method (Gaussian, inverse-distance, linear, or equal).
 
-    2. **Validation Aggregation**: Temporally average validation observations
-       within ±`validation_temporal_averaging_minutes` around each observation.
+    2. **Validation matching**: Each validation observation is matched as-is
+       (no temporal averaging) to any SAR acquisition within
+       `time_tolerance_minutes`.
 
     3. **Output**: Single `CollocatedPoint` per validation observation with
-       aggregated SAR mean vs. aggregated validation mean.
+       aggregated SAR mean vs. the raw validation observation.
 
     Typical use cases: moorings, in-situ buoys.
 
@@ -329,8 +330,9 @@ class PointLayerCollocation:
         Circular radius (km) around each validation point for SAR aggregation.
         Default: 5.0 km.
     validation_temporal_averaging_minutes : int
-        Half-width (minutes) of temporal window for validation data averaging.
-        Observations within ±this window are averaged. Default: 30 min.
+        Unused by `PointLayerCollocation` (kept for API compatibility and used
+        by subclasses such as `LayerLayerCollocation`). Validation observations
+        are matched using their own raw value, not averaged.
     distance_weighting : str
         Distance weighting method for SAR aggregation:
         - ``"gaussian"`` — Gaussian kernel (default)
@@ -397,8 +399,8 @@ class PointLayerCollocation:
 
         1. Find all SAR cells within ``aggregation_window_km`` (circular radius).
         2. Compute distance-weighted average of SAR variables using ``distance_weighting`` method.
-        3. Temporally average validation observations within ±``validation_temporal_averaging_minutes``.
-        4. Create single `CollocatedPoint` with aggregated SAR vs. aggregated validation.
+        3. Use the validation observation's own raw value (no temporal averaging).
+        4. Create single `CollocatedPoint` with aggregated SAR vs. raw validation value.
 
         Parameters
         ----------
@@ -517,21 +519,14 @@ class PointLayerCollocation:
                     logger.debug("No valid SAR values at t_idx=%d", t_idx)
                     continue
 
-                # Aggregate validation observations temporally
-                val_aggregated = self._average_validation_observations(
-                    val_data_filtered,
-                    v_time,
-                    self.validation_temporal_averaging_minutes,
-                    numeric_cols,
-                )
-
-                # If no temporal aggregation found, use current observation
-                if not val_aggregated:
-                    val_aggregated = {
-                        col: float(val_row[col])
-                        for col in numeric_cols
-                        if pd.notna(val_row[col])
-                    }
+                # Use the validation observation's own raw value (nearest in
+                # time by construction, since it is matched as-is rather than
+                # averaged with neighboring observations).
+                val_aggregated = {
+                    col: float(val_row[col])
+                    for col in numeric_cols
+                    if pd.notna(val_row[col])
+                }
 
                 if not val_aggregated:
                     logger.debug("No valid validation values")

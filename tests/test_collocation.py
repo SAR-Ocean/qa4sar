@@ -649,8 +649,8 @@ class TestPointLayerCollocationAggregation:
         assert "wind_speed" in results[0].sar_data
         assert "wind_speed" in results[0].val_data
 
-    def test_aggregation_temporal_averaging(self):
-        """Aggregation should average validation data within temporal window."""
+    def test_no_temporal_averaging_uses_raw_value(self):
+        """Each validation observation should keep its own raw value (no averaging)."""
         grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
 
         # Multiple validation observations at same location, different times
@@ -669,17 +669,16 @@ class TestPointLayerCollocationAggregation:
             spatial_tolerance_km=200,
             time_tolerance_minutes=60,
             aggregation_window_km=50.0,  # Large enough to include nearby cells
-            validation_temporal_averaging_minutes=30,  # ±30 min window
             distance_weighting="gaussian",
             gaussian_sigma_km=2.0,
         )
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "test")
 
-        # Each validation observation produces a match, with temporal averaging applied
-        # All 3 observations fall within the ±30 min window, so each gets avg of [7,8,9]=8
+        # Each validation observation produces a match with its own raw value,
+        # not averaged with neighboring observations.
         assert len(results) == 3
-        for result in results:
-            assert result.val_data["wind_speed"] == pytest.approx(8.0)
+        val_speeds = sorted(result.val_data["wind_speed"] for result in results)
+        assert val_speeds == pytest.approx([7.0, 8.0, 9.0])
 
     def test_aggregation_different_weighting_methods(self):
         """Aggregation should work with all weighting methods."""

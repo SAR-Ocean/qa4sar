@@ -92,7 +92,7 @@ class PointVsLayerCollocation:
     spatial_tolerance_km: float = 12.5
     interpolation_method: str = "nearest"
     aggregation_window_km: float = 5.0
-    validation_temporal_averaging_minutes: int = 30
+    validation_temporal_averaging_minutes: int = 30  # unused for point_vs_layer; kept for schema/API compatibility
     distance_weighting: str = "gaussian"
     gaussian_sigma_km: float = 2.0
     patch_size: int = 0
