@@ -809,6 +809,7 @@ def plot_sar_on_no_collocation(
     output_dir: Union[str, Path],
     recipe=None,
     has_collocation: bool = False,
+    filename_suffix: str = "",
 ) -> Union[Path, None]:
     """
     Plot SAR data geographic coverage with optional validation data overlay.
@@ -833,6 +834,10 @@ def plot_sar_on_no_collocation(
     has_collocation : bool, optional
         If True, names the plot ``sar_collocation_*.png``. If False (default),
         names it ``sar_no_collocation_*.png``. Default is False.
+    filename_suffix : str
+        Appended to the output filename stem, e.g. ``"_individual"``. Lets
+        coverage plots for two collocation methods coexist without
+        overwriting each other.
 
     Returns
     -------
@@ -1111,7 +1116,7 @@ def plot_sar_on_no_collocation(
 
     # ── Save to PNG ─────────────────────────────────────────────────────
     collocation_prefix = "collocation" if has_collocation else "no_collocation"
-    filename = f"sar_{collocation_prefix}_{actual_var}_{recipe_name}.png"
+    filename = f"sar_{collocation_prefix}_{actual_var}_{recipe_name}{filename_suffix}.png"
     filepath = plots_dir / filename
     try:
         fig.savefig(filepath, dpi=150, bbox_inches="tight")
@@ -1132,6 +1137,7 @@ def plot_collocation_diagnostics(
     collocation_ds,
     recipe,
     output_dir: Union[str, Path],
+    filename_suffix: str = "",
 ) -> Union[Path, None]:
     """
     Plot collocation diagnostics: SAR scene bounds, scatterometer data, matched and unmatched validation points.
@@ -1154,6 +1160,10 @@ def plot_collocation_diagnostics(
         Recipe object containing metadata.
     output_dir : str or Path
         Directory to save the PNG file (typically the base_dir).
+    filename_suffix : str
+        Appended to the output filename stem, e.g. ``"_individual"``. Lets
+        diagnostic plots for two collocation methods coexist without
+        overwriting each other.
 
     Returns
     -------
@@ -1457,7 +1467,7 @@ def plot_collocation_diagnostics(
 
     # ── Save figure ─────────────────────────────────────────────────────
     fig.tight_layout()
-    output_file = plots_dir / f"collocation_diagnostics_{recipe_name}.png"
+    output_file = plots_dir / f"collocation_diagnostics_{recipe_name}{filename_suffix}.png"
     fig.savefig(str(output_file), dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -1830,6 +1840,7 @@ def validation_report(
     recipe,
     stats_ds_map: Optional[Dict[str, "xr.Dataset"]] = None,
     out_dir: Optional[Union[str, Path]] = None,
+    filename_suffix: str = "",
 ) -> Dict[str, list]:
     """
     Run all four plot functions for every (sar_var, val_var) pair inferred
@@ -1854,6 +1865,10 @@ def validation_report(
         combined PDF is written to ``<out_dir>/validation_report.pdf``
         (alongside the ``validation_statistics_*.nc`` files).
         If None the figures are returned without saving.
+    filename_suffix : str
+        Appended to the PNG/PDF filename stems, e.g. ``"_individual"``.
+        Lets reports for two collocation methods coexist in the same
+        ``plots/`` directory without overwriting each other.
 
     Returns
     -------
@@ -1893,7 +1908,7 @@ def validation_report(
             pdf_pages.append((f"{sar_var} vs {val_var} — scatter", fig_scatter))
             if plots_dir:
                 fig_scatter.savefig(
-                    plots_dir / f"{key}_scatter.png", dpi=150, bbox_inches="tight"
+                    plots_dir / f"{key}{filename_suffix}_scatter.png", dpi=150, bbox_inches="tight"
                 )
 
         # Geographic — returns dict[collocation_type, Figure] by default
@@ -1909,7 +1924,7 @@ def validation_report(
                         if plots_dir:
                             safe_group = str(group).replace("/", "-")
                             fig_geo.savefig(
-                                plots_dir / f"{key}_geographic_{safe_group}.png",
+                                plots_dir / f"{key}{filename_suffix}_geographic_{safe_group}.png",
                                 dpi=150, bbox_inches="tight",
                             )
             elif geo_result is not None:
@@ -1917,7 +1932,7 @@ def validation_report(
                 pdf_pages.append((f"{sar_var} vs {val_var} — geographic", geo_result))
                 if plots_dir:
                     geo_result.savefig(
-                        plots_dir / f"{key}_geographic.png", dpi=150, bbox_inches="tight"
+                        plots_dir / f"{key}{filename_suffix}_geographic.png", dpi=150, bbox_inches="tight"
                     )
         except Exception as exc:
             logger.warning("plot_geographic failed for %s: %s", sar_var, exc)
@@ -1930,7 +1945,7 @@ def validation_report(
                 pdf_pages.append((f"{sar_var} vs {val_var} — statistics", fig_stats))
                 if plots_dir:
                     fig_stats.savefig(
-                        plots_dir / f"{key}_statistics.png", dpi=150, bbox_inches="tight"
+                        plots_dir / f"{key}{filename_suffix}_statistics.png", dpi=150, bbox_inches="tight"
                     )
 
         # Residuals
@@ -1940,7 +1955,7 @@ def validation_report(
             pdf_pages.append((f"{sar_var} vs {val_var} — residuals", fig_res))
             if plots_dir:
                 fig_res.savefig(
-                    plots_dir / f"{key}_residuals.png", dpi=150, bbox_inches="tight"
+                    plots_dir / f"{key}{filename_suffix}_residuals.png", dpi=150, bbox_inches="tight"
                 )
 
         all_figures[key] = figs
@@ -1950,7 +1965,7 @@ def validation_report(
         from matplotlib.backends.backend_pdf import PdfPages  # noqa: PLC0415
         import datetime as _dt  # noqa: PLC0415
 
-        pdf_path = base_dir / "validation_report.pdf"
+        pdf_path = base_dir / f"validation_report{filename_suffix}.pdf"
         with PdfPages(pdf_path) as pdf:
             # Cover page
             cover = plt.figure(figsize=(11, 8.5))

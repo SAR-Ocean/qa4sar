@@ -344,77 +344,17 @@ class TestLayerLayerCollocation:
         assert colloc.distance_weighting == "equal"  # Uniform for regular grid
         assert colloc.validation_temporal_averaging_minutes == 60  # ±1 hour window
 
-    def test_grid_inference_single_cell(self):
-        """Test that grid inference groups points into cells correctly."""
-        # Create a cluster of points
-        lons = np.linspace(-0.15, 0.15, 4)
-        lats = np.linspace(51.85, 52.15, 4)
-        mg_lon, mg_lat = np.meshgrid(lons, lats)
-        val = _make_val_dataframe(
-            lons=mg_lon.ravel().tolist(),
-            lats=mg_lat.ravel().tolist(),
-            times=[datetime(2026, 1, 1, 12, 0, 0)] * mg_lon.size,
-            wind_speed=[8.0] * mg_lon.size,
-        )
-        colloc = LayerLayerCollocation()
-        cells = colloc._infer_scatterometer_grid(val)
-        
-        # Should detect at least 1 cell and at most ~N cells
-        assert len(cells) >= 1, f"Expected ≥1 cell, got {len(cells)}"
-        assert len(cells) <= len(val), f"Too many cells: {len(cells)} > {len(val)}"
-        
-        # All points must be assigned
-        total_points = sum(len(indices) for indices in cells.values())
-        assert total_points == len(val), f"Point assignment mismatch: {total_points} != {len(val)}"
-        
-        # Each cell should have a valid list of indices
-        for cell_id, indices in cells.items():
-            assert isinstance(indices, list), f"Cell {cell_id} indices not a list"
-            assert len(indices) > 0, f"Cell {cell_id} is empty"
-            assert all(0 <= idx < len(val) for idx in indices), f"Cell {cell_id} has invalid indices"
+    def test_aggregates_sar_around_each_point(self):
+        """Test that SAR values are aggregated around each scatterometer point.
 
-    def test_grid_inference_multiple_cells(self):
-        """Test that grid inference separates distant point clusters."""
-        # Create two well-separated clusters (~200 km apart)
-        lons1 = np.linspace(-1.0, -0.5, 3)
-        lats1 = np.linspace(50.0, 50.5, 3)
-        lons2 = np.linspace(1.0, 1.5, 3)
-        lats2 = np.linspace(50.0, 50.5, 3)
-        
-        lons = np.concatenate([lons1, lons2])
-        lats = np.concatenate([lats1, lats2])
-        
-        val = _make_val_dataframe(
-            lons=lons.tolist(),
-            lats=lats.tolist(),
-            times=[datetime(2026, 1, 1, 12, 0, 0)] * len(lons),
-            wind_speed=[8.0] * len(lons),
-        )
-        colloc = LayerLayerCollocation()
-        cells = colloc._infer_scatterometer_grid(val)
-        
-        # Should detect 2 or more clusters
-        assert len(cells) >= 2, f"Expected ≥2 cells for separated clusters, got {len(cells)}"
-
-    def test_grid_inference_single_point(self):
-        """Test that grid inference handles single point gracefully."""
-        val = _make_val_dataframe(
-            lons=[0.0],
-            lats=[52.0],
-            times=[datetime(2026, 1, 1, 12, 0, 0)],
-            wind_speed=[8.0],
-        )
-        colloc = LayerLayerCollocation()
-        cells = colloc._infer_scatterometer_grid(val)
-        
-        assert len(cells) == 1
-        assert cells[0] == [0]
-
-    def test_aggregates_sar_within_each_cell(self):
-        """Test that SAR values are aggregated per scatterometer cell."""
+        ASCAT/OSI-SAF data is already delivered one observation per
+        12.5 km cell, so cell-averaging no longer re-clusters points —
+        each scatterometer point is its own cell and gets its own
+        SAR-aggregated match.
+        """
         grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
-        
-        # Create 2 scatterometer cells: one overlapping SAR, one outside
+
+        # Create 2 scatterometer point groups: one overlapping SAR, one outside
         cell1_lons = [0.0, 0.1, -0.1]
         cell1_lats = [52.0, 52.1, 52.0]
         cell2_lons = [5.0, 5.1]  # Far outside SAR grid
@@ -433,20 +373,21 @@ class TestLayerLayerCollocation:
             aggregation_window_km=50
         )
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
-        
-        # Should find matches only from cell1 (cell2 is outside)
-        assert len(results) > 0
+
+        # One match per cell1 point (cell2 is outside SAR range); no merging.
+        assert len(results) == len(cell1_lons)
         # All matches should have collocation_type = "layer_vs_layer"
         assert all(r.collocation_type == "layer_vs_layer" for r in results)
         # SAR and validation locations should be relatively close
         for r in results:
             assert r.spatial_distance_km <= colloc.aggregation_window_km + 5  # small tolerance
 
-    def test_temporal_aggregation_within_cell(self):
-        """Test that validation observations within temporal window are averaged."""
+    def test_each_point_matched_independently(self):
+        """Test that scatterometer points are matched independently, not
+        merged/averaged together even when at the same location."""
         grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
-        
-        # Create scatterometer cell with multiple observations at different times
+
+        # Create scatterometer points at the same location, different times
         base_time = datetime(2026, 1, 1, 12, 0, 0)
         times = [base_time + timedelta(minutes=i*10) for i in range(5)]
         
@@ -464,13 +405,12 @@ class TestLayerLayerCollocation:
             validation_temporal_averaging_minutes=30  # ±30 min window
         )
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
-        
-        # Should produce 1 collocation (all points grouped + temporally averaged)
-        assert len(results) > 0
-        # Aggregated wind_speed should be mean of input values within temporal window
-        for r in results:
-            if "wind_speed" in r.val_data:
-                assert 7.0 <= r.val_data["wind_speed"] <= 9.0
+
+        # One collocation per scatterometer point — no spatial merging or
+        # temporal averaging across points, even at an identical location.
+        assert len(results) == 5
+        val_speeds = sorted(r.val_data["wind_speed"] for r in results)
+        assert val_speeds == [7.0, 7.5, 8.0, 8.5, 9.0]
 
 
 # ---------------------------------------------------------------------------

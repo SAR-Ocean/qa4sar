@@ -239,10 +239,11 @@ def run_statistics(
     collocation_ds: xr.Dataset,
     recipe,
     base_dir: Union[str, Path],
+    filename_suffix: str = "",
 ) -> dict[str, xr.Dataset]:
     """
     Compute statistics for all variable pairs inferred from *recipe* and save
-    results to ``<base_dir>/validation_statistics_<sar_var>_vs_<val_var>.nc``.
+    results to ``<base_dir>/validation_statistics_<sar_var>_vs_<val_var><filename_suffix>.nc``.
 
     Parameters
     ----------
@@ -253,6 +254,10 @@ def run_statistics(
         (sar_var, val_var) pairs via :func:`~._variable_map.infer_variable_pairs`.
     base_dir : str or Path
         Directory where statistics files will be written.
+    filename_suffix : str
+        Appended to each output filename stem, e.g. ``"_individual"``. Lets
+        statistics for two collocation methods coexist without overwriting
+        each other.
 
     Returns
     -------
@@ -281,7 +286,7 @@ def run_statistics(
         if stats_ds is None:
             continue
         key = f"{sar_var}_vs_{val_var}"
-        out_path = base_dir / f"validation_statistics_{key}.nc"
+        out_path = base_dir / f"validation_statistics_{key}{filename_suffix}.nc"
         save_statistics(stats_ds, out_path)
         results[key] = stats_ds
 

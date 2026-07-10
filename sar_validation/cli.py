@@ -164,11 +164,13 @@ Examples:
     parser.add_argument(
         "--layer-vs-layer-collocation-method",
         metavar="METHOD",
-        choices=["individual", "cell-averaging"],
+        choices=["individual", "cell-averaging", "both"],
         default="cell-averaging",
         help="Collocation method for layer-vs-layer (scatterometer) data: "
              "'individual' matches each SAR pixel to the closest scatterometer point (reusable, many matches), "
-             "'cell-averaging' clusters scatterometer into grid cells then aggregates SAR (~57 matches, default)",
+             "'cell-averaging' aggregates SAR pixels within aggregation_window_km around each scatterometer "
+             "point (default), 'both' runs both methods and writes suffixed outputs "
+             "(collocation_results.nc + collocation_results_individual.nc, etc.) for comparison",
     )
 
     args = parser.parse_args(argv)
@@ -429,23 +431,32 @@ def _execute_recipe(
         else:
             print("Step 2 skipped — datatree.nc already exists")
 
-    if collocate:
-        collocation_path = orchestrator.base_dir / "collocation_results.nc"
-        if not collocation_path.exists():
-            _collocate_data(
-                recipe,
-                orchestrator.base_dir,
-                emit_diagnostics=collocation_log,
-                layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
-            )
-        else:
-            print("Step 3 skipped — collocation_results.nc already exists")
+    if layer_vs_layer_collocation_method == "both":
+        # Run the full pipeline once per method, writing distinctly-suffixed
+        # outputs so neither run overwrites the other.
+        method_runs = [("cell-averaging", ""), ("individual", "_individual")]
+    else:
+        method_runs = [(layer_vs_layer_collocation_method, "")]
 
-    if stats or plot:
-        _compute_stats(recipe, orchestrator.base_dir)
+    for method, suffix in method_runs:
+        if collocate:
+            collocation_path = orchestrator.base_dir / f"collocation_results{suffix}.nc"
+            if not collocation_path.exists():
+                _collocate_data(
+                    recipe,
+                    orchestrator.base_dir,
+                    emit_diagnostics=collocation_log,
+                    layer_vs_layer_collocation_method=method,
+                    filename_suffix=suffix,
+                )
+            else:
+                print(f"Step 3 skipped — collocation_results{suffix}.nc already exists")
 
-    if plot:
-        _generate_plots(recipe, orchestrator.base_dir)
+        if stats or plot:
+            _compute_stats(recipe, orchestrator.base_dir, filename_suffix=suffix)
+
+        if plot:
+            _generate_plots(recipe, orchestrator.base_dir, filename_suffix=suffix)
 
 
 def _is_already_downloaded(base_dir: Path) -> bool:
@@ -515,6 +526,7 @@ def _collocate_data(
     base_dir: Path,
     emit_diagnostics: bool = False,
     layer_vs_layer_collocation_method: str = "cell-averaging",
+    filename_suffix: str = "",
 ) -> None:
     """Run step 3: load DataTree and run collocation."""
     import xarray as xr
@@ -532,13 +544,14 @@ def _collocate_data(
     else:
         tree = xr.open_datatree(str(datatree_path), engine='netcdf4')
 
-    print("\nStep 3: Running collocation…")
+    print(f"\nStep 3: Running collocation (method={layer_vs_layer_collocation_method})…")
     result = run_collocation(
         recipe,
         tree,
         base_dir,
         emit_diagnostics=emit_diagnostics,
         layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
+        filename_suffix=filename_suffix,
     )
     if result is None:
         print("  No collocated pairs found.")
@@ -546,67 +559,67 @@ def _collocate_data(
         try:
             sar_var = _infer_sar_var_from_recipe(recipe)
             recipe_name = recipe.config.name or "unknown"
-            png_path = plot_sar_on_no_collocation(tree, sar_var, recipe_name, base_dir, recipe=recipe)
+            png_path = plot_sar_on_no_collocation(tree, sar_var, recipe_name, base_dir, recipe=recipe, filename_suffix=filename_suffix)
             if png_path:
                 print(f"  Generated SAR coverage plot: {png_path.relative_to(base_dir.parent)}")
         except Exception as exc:
             print(f"  Could not generate SAR coverage plot: {exc}")
     else:
         n = result.sizes.get("collocation", 0)
-        print(f"  {n} collocated pair(s) saved to {base_dir / 'collocation_results.nc'}")
-        
+        print(f"  {n} collocated pair(s) saved to {base_dir / f'collocation_results{filename_suffix}.nc'}")
+
         # Generate diagnostic plot if requested
         if emit_diagnostics and n > 0:
             try:
-                diag_path = plot_collocation_diagnostics(tree, result, recipe, base_dir)
+                diag_path = plot_collocation_diagnostics(tree, result, recipe, base_dir, filename_suffix=filename_suffix)
                 if diag_path:
                     print(f"  Generated diagnostic plot: {diag_path.relative_to(base_dir.parent)}")
             except Exception as exc:
                 print(f"  Could not generate diagnostic plot: {exc}")
                 logger.debug("Diagnostic plot error: %s", exc, exc_info=True)
-        
+
         # Also generate SAR coverage plot with collocation status
         try:
             sar_var = _infer_sar_var_from_recipe(recipe)
             recipe_name = recipe.config.name or "unknown"
-            png_path = plot_sar_on_no_collocation(tree, sar_var, recipe_name, base_dir, recipe=recipe, has_collocation=True)
+            png_path = plot_sar_on_no_collocation(tree, sar_var, recipe_name, base_dir, recipe=recipe, has_collocation=True, filename_suffix=filename_suffix)
             if png_path:
                 print(f"  Generated SAR coverage plot: {png_path.relative_to(base_dir.parent)}")
         except Exception as exc:
             print(f"  Could not generate SAR coverage plot: {exc}")
 
 
-def _compute_stats(recipe, base_dir: Path) -> None:
-    """Run step 4b: compute validation statistics from collocation_results.nc."""
+def _compute_stats(recipe, base_dir: Path, filename_suffix: str = "") -> None:
+    """Run step 4b: compute validation statistics from collocation_results<suffix>.nc."""
     import xarray as xr
     from .core.statistics import run_statistics
 
-    coll_path = base_dir / "collocation_results.nc"
+    coll_path = base_dir / f"collocation_results{filename_suffix}.nc"
     if not coll_path.exists():
-        print("  collocation_results.nc not found — statistics skipped.")
+        print(f"  collocation_results{filename_suffix}.nc not found — statistics skipped.")
         return
 
     print("\nStep 4b: Computing validation statistics…")
     collocation_ds = xr.open_dataset(str(coll_path))
-    results = run_statistics(collocation_ds, recipe, base_dir)
+    results = run_statistics(collocation_ds, recipe, base_dir, filename_suffix=filename_suffix)
     if not results:
         print("  No statistics produced (check that variable names match the recipe).")
     else:
         for key in results:
-            print(f"  Statistics saved: validation_statistics_{key}.nc/.csv")
+            print(f"  Statistics saved: validation_statistics_{key}{filename_suffix}.nc/.csv")
 
 
-def _generate_plots(recipe, base_dir: Path) -> None:
+def _generate_plots(recipe, base_dir: Path, filename_suffix: str = "") -> None:
     """Run step 5: generate validation plots and save to <base_dir>/plots/."""
     import xarray as xr
     from .core.visualization import validation_report
     from .core.statistics import run_statistics
 
-    coll_path = base_dir / "collocation_results.nc"
+    coll_path = base_dir / f"collocation_results{filename_suffix}.nc"
     datatree_path = base_dir / "datatree.nc"
 
     if not coll_path.exists():
-        print("  collocation_results.nc not found — plotting skipped.")
+        print(f"  collocation_results{filename_suffix}.nc not found — plotting skipped.")
         return
     if not datatree_path.exists():
         print("  datatree.nc not found — plotting skipped.")
@@ -623,7 +636,7 @@ def _generate_plots(recipe, base_dir: Path) -> None:
         pairs = infer_variable_pairs(recipe.config.variable)
         for sar_var, val_var in pairs:
             key = f"{sar_var}_vs_{val_var}"
-            stats_path = base_dir / f"validation_statistics_{key}.nc"
+            stats_path = base_dir / f"validation_statistics_{key}{filename_suffix}.nc"
             if stats_path.exists():
                 stats_ds_map[key] = xr.open_dataset(str(stats_path))
     except KeyError:
@@ -631,9 +644,10 @@ def _generate_plots(recipe, base_dir: Path) -> None:
 
     validation_report(collocation_ds, datatree, recipe,
                       stats_ds_map=stats_ds_map or None,
-                      out_dir=base_dir)
+                      out_dir=base_dir,
+                      filename_suffix=filename_suffix)
     plots_dir = base_dir / "plots"
-    pdf_path = base_dir / "validation_report.pdf"
+    pdf_path = base_dir / f"validation_report{filename_suffix}.pdf"
     print(f"  PNG plots saved to {plots_dir}")
     if pdf_path.exists():
         print(f"  PDF report saved to {pdf_path}")
