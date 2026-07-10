@@ -9,7 +9,7 @@
 name: "Wave Height Validation — European West Coast"
 description: |
   Validate Sentinel-1 WV mode significant wave height (Hs)
-  against mooring observations.
+  against mooring observations, tidal gauges, drifters, and altimeter.
 
   Geographic region: European West Coast
   Time period: 2026-05-01 to 2026-05-02
@@ -43,18 +43,29 @@ validation_sources:
   - source_type: mooring
     min_depth: -20
     max_depth:  20
-    collocation_kwargs:
-      time_tolerance_minutes: 60
-      spatial_tolerance_km: 50
+    collocation_kwargs: {}
 
-  # Altimeter (TODO: altimeter downloader not yet implemented)
-  # - source_type: altimeter
-  #   collocation_kwargs:
-  #     time_tolerance_minutes: 60
-  #     spatial_tolerance_km: 50
+  # Tidal gauges
+  - source_type: tidal_gauge
+    min_depth: -20
+    max_depth:  20
+    collocation_kwargs: {}
 
+  # Autonomous drifters
+  - source_type: drifter
+    min_depth: -20
+    max_depth:  20
+    collocation_kwargs: {}
+
+  # Along-track altimeter (Copernicus Marine L3 SWH, both 1 Hz and 5 Hz)
+  - source_type: altimeter
+
+# point_vs_layer applies to moorings/tidal gauges/drifters (30 min / 12.5 km,
+# the Abderrahim et al. 2019 / hal-04202202 standard). Altimeter's
+# layer_vs_layer aggregation windows come from recipe.py's
+# DEFAULT_LAYER_TYPE_SPECS (altimeter_1hz/altimeter_5hz) automatically.
 collocation:
-  type: point_vs_layer
-  time_tolerance_minutes: 60
-  spatial_tolerance_km: 50
-  interpolation_method: nearest
+  point_vs_layer:
+    time_tolerance_minutes: 30
+    spatial_tolerance_km: 12.5
+    interpolation_method: nearest

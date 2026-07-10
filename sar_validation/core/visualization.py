@@ -10,7 +10,10 @@ Four public plot functions:
 
 Plus fallback and convenience wrappers:
 
-* :func:`plot_sar_on_no_collocation` — SAR coverage map (fallback when collocation fails)
+* :func:`plot_collocation_diagnostics` — SAR scene bounds + matched/unmatched
+  validation points (one category per validation source actually present),
+  always generated as part of the collocation step (step 3), including when
+  there are zero collocated pairs.
 * :func:`validation_report` — runs all four plots, infers variable pairs from the recipe,
   and saves PNG files to ``<out_dir>/plots/``
 
@@ -37,7 +40,6 @@ __all__ = [
     "plot_geographic",
     "plot_statistics",
     "plot_residuals",
-    "plot_sar_on_no_collocation",
     "plot_collocation_diagnostics",
     "validation_report",
 ]
@@ -799,337 +801,7 @@ def plot_residuals(
 
 
 # ---------------------------------------------------------------------------
-# 4b. SAR data plot (fallback for no-collocation cases)
-# ---------------------------------------------------------------------------
-
-def plot_sar_on_no_collocation(
-    datatree,
-    sar_var: str,
-    recipe_name: str,
-    output_dir: Union[str, Path],
-    recipe=None,
-    has_collocation: bool = False,
-    filename_suffix: str = "",
-) -> Union[Path, None]:
-    """
-    Plot SAR data geographic coverage with optional validation data overlay.
-
-    Creates map-view figures showing SAR measurements with overlaid validation data:
-    - Subplot 1: SAR + in-situ data sources
-    - Subplot 2 (if scatterometer data available): SAR + scatterometer data with time colormap
-
-    Parameters
-    ----------
-    datatree : xr.DataTree
-        Step-2 DataTree (``datatree.nc``).
-    sar_var : str
-        SAR variable name (e.g. ``"owiSignificantWaveHeight"``).
-    recipe_name : str
-        Name of the recipe (for filename/title), e.g., ``"waves_test"``.
-    output_dir : str or Path
-        Directory to save the PNG file.
-    recipe : Recipe, optional
-        Recipe object containing geographic bounds for filtering scatterometer data.
-        If provided, enables scatterometer subplot with geographic filtering.
-    has_collocation : bool, optional
-        If True, names the plot ``sar_collocation_*.png``. If False (default),
-        names it ``sar_no_collocation_*.png``. Default is False.
-    filename_suffix : str
-        Appended to the output filename stem, e.g. ``"_individual"``. Lets
-        coverage plots for two collocation methods coexist without
-        overwriting each other.
-
-    Returns
-    -------
-    Path or None
-        Path to the saved PNG file, or None if no SAR data could be plotted.
-    """
-    import matplotlib.pyplot as plt  # noqa: PLC0415
-    import matplotlib.colors as mcolors  # noqa: PLC0415
-    import matplotlib.cm as mcm  # noqa: PLC0415
-    from matplotlib.patches import Patch  # noqa: PLC0415
-
-    output_dir = Path(output_dir)
-    plots_dir = output_dir / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-
-    sar_node = datatree.get("sar")
-    if sar_node is None:
-        logger.warning("plot_sar_on_no_collocation: DataTree has no '/sar' group.")
-        return None
-
-    scene_names = list(sar_node.children.keys())
-    if not scene_names:
-        logger.warning("plot_sar_on_no_collocation: No SAR scenes found in DataTree.")
-        return None
-
-    # ── Try to find the requested variable, or a suitable alternative ───
-    actual_var = _find_available_sar_variable(sar_node, sar_var)
-    if actual_var is None:
-        logger.warning(
-            "plot_sar_on_no_collocation: Variable '%s' not found and no "
-            "suitable alternative available.", sar_var
-        )
-        return None
-
-    if actual_var != sar_var:
-        logger.info(
-            "plot_sar_on_no_collocation: Requested variable '%s' not found; "
-            "plotting alternative '%s' instead.", sar_var, actual_var
-        )
-
-    # ── Determine colour limits from all SAR data ────────────────────────
-    all_field_vals = []
-    for scene_name in scene_names:
-        arr = _sar_field(sar_node[scene_name].to_dataset(), actual_var)
-        if arr is not None:
-            all_field_vals.append(arr[np.isfinite(arr)])
-
-    if not all_field_vals:
-        logger.warning(
-            "plot_sar_on_no_collocation: No valid (non-NaN) data found for '%s'.", actual_var
-        )
-        return None
-
-    flat = np.concatenate(all_field_vals)
-    vmin = float(np.nanpercentile(flat, 2))
-    vmax = float(np.nanpercentile(flat, 98))
-    sar_norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-    sar_sm = mcm.ScalarMappable(cmap="viridis", norm=sar_norm)
-    sar_sm.set_array([])
-
-    # ── Extract validation data ─────────────────────────────────────────
-    val_data = _extract_validation_data_for_plot(datatree)
-    has_validation = bool(val_data)
-
-    # ── Separate in-situ and scatterometer data ────────────────────────
-    insitu_data = {}
-    scatterometer_data = {}
-    if has_validation:
-        # Convert to numpy arrays for efficient fancy indexing
-        platform_types = np.array(val_data["platform_types"])
-        insitu_mask = platform_types == "insitu"
-        scatterometer_mask = platform_types == "scatterometer"
-        insitu_idx = np.where(insitu_mask)[0]
-        scatterometer_idx = np.where(scatterometer_mask)[0]
-        
-        if len(insitu_idx) > 0:
-            insitu_data = {
-                "lons": val_data["lons"][insitu_idx],
-                "lats": val_data["lats"][insitu_idx],
-                "platform_types": platform_types[insitu_idx].tolist(),
-            }
-        
-        if len(scatterometer_idx) > 0:
-            scatterometer_data = {
-                "lons": val_data["lons"][scatterometer_idx],
-                "lats": val_data["lats"][scatterometer_idx],
-                "platform_types": platform_types[scatterometer_idx].tolist(),
-                "times": val_data["times"][scatterometer_idx],
-            }
-
-    # ── Set up cartopy if available ─────────────────────────────────────
-    try:
-        import cartopy.crs as ccrs  # noqa: PLC0415
-        import cartopy.feature as cfeature  # noqa: PLC0415
-        HAS_CARTOPY = True
-    except ImportError:
-        HAS_CARTOPY = False
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "cartopy not installed — using plain matplotlib axes."
-            )
-
-    subplot_kw = {"projection": ccrs.PlateCarree()} if HAS_CARTOPY else {}
-
-    # ── Determine number of subplots ────────────────────────────────────
-    # Each row has: left column = SAR scene + in-situ, right column = scatterometer (row 0 only) or empty
-    has_scatterometer = bool(scatterometer_data)
-    nrows = len(scene_names)
-    ncols = 2
-    figsize = (14, 6 * nrows)
-    
-    fig, axes = plt.subplots(
-        nrows, ncols,
-        figsize=figsize,
-        subplot_kw=subplot_kw,
-        squeeze=False,
-        dpi=100,  # Reduced DPI for faster rendering
-    )
-    axes_flat = axes.flatten()
-
-    # ── Plot subplot: SAR + in-situ data (left column of each row) ────────
-    for idx, scene_name in enumerate(scene_names):
-        ax = axes_flat[2 * idx]  # Left column (every other subplot)
-        scene_ds = sar_node[scene_name].to_dataset()
-
-        if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
-            ax.set_visible(False)
-            continue
-
-        # ── Add map features ────────────────────────────────────────────
-        if HAS_CARTOPY:
-            land, coastline = _land_coastline_features()
-            ax.add_feature(land, facecolor="lightgray", zorder=0, alpha=0.3)
-            ax.add_feature(coastline, linewidth=0.3, zorder=0)
-            gl = ax.gridlines(draw_labels=True, linewidth=0.2, alpha=0.3)
-            gl.top_labels = False
-            gl.right_labels = False
-            transform = ccrs.PlateCarree()
-        else:
-            transform = None
-
-        # ── Plot SAR data (background) ──────────────────────────────────
-        arr = _sar_field(scene_ds, actual_var)
-        if arr is not None:
-            kw = {"transform": transform} if transform else {}
-            
-            # Check if this is point-based data (WV mode) or grid data (IW/EW mode)
-            is_point_based = len(arr.shape) == 1 or (len(arr.shape) == 2 and arr.shape[0] == 1)
-            
-            if is_point_based:
-                # Point-based data (WV mode) — use scatter plot
-                lon_1d = scene_ds["lon"].values.flatten()
-                lat_1d = scene_ds["lat"].values.flatten()
-                arr_1d = arr.flatten()
-                
-                # Filter out NaN values
-                valid = np.isfinite(arr_1d)
-                lon_valid = lon_1d[valid]
-                lat_valid = lat_1d[valid]
-                arr_valid = arr_1d[valid]
-                
-                if len(arr_valid) > 0:
-                    ax.scatter(
-                        lon_valid, lat_valid, c=arr_valid,
-                        cmap="viridis", norm=sar_norm, s=20, zorder=2, 
-                        rasterized=True, **kw,
-                    )
-            else:
-                # Grid-based data (IW/EW mode) — use pcolormesh with rasterization
-                ax.pcolormesh(
-                    scene_ds["lon"].values, scene_ds["lat"].values, arr,
-                    cmap="viridis", norm=sar_norm, shading="auto", zorder=2, 
-                    rasterized=True, **kw,
-                )
-
-        # ── Overlay in-situ validation data ──────────────────────────────
-        if insitu_data:
-            source_color_map = _source_color_map(sorted(set(insitu_data["platform_types"])))
-            for pt_type in sorted(set(insitu_data["platform_types"])):
-                mask = np.array(insitu_data["platform_types"]) == pt_type
-                pt_lons = np.array(insitu_data["lons"])[mask]
-                pt_lats = np.array(insitu_data["lats"])[mask]
-                kw = {"transform": transform} if transform else {}
-                ax.scatter(
-                    pt_lons, pt_lats, c=source_color_map[pt_type], s=100,
-                    marker='D', edgecolors='black', linewidth=0.5, zorder=3, label=pt_type, **kw,
-                )
-            ax.legend(loc='best', fontsize=8, framealpha=0.8)
-
-        ax.set_title(f"{scene_name.split('/')[-1]} — {actual_var} + in-situ", fontsize=10)
-
-    # ── Plot subplot: SAR + scatterometer footprint outlines (right column, all rows) ──
-    if has_scatterometer and scatterometer_data:
-        # Pre-extract scatterometer overpasses once for all rows
-        overpasses = None
-        if recipe is not None:
-            overpasses = _extract_scatterometer_overpasses(datatree, recipe)
-        
-        # Plot scatterometer on every row's right column
-        for idx in range(len(scene_names)):
-            ax_scat = axes_flat[2 * idx + 1]  # Right column of each row
-            scene_ds = sar_node[scene_names[idx]].to_dataset()
-
-            if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
-                ax_scat.set_visible(False)
-                continue
-
-            # ── Add map features (simplified for speed) ─────────────────
-            if HAS_CARTOPY:
-                land, coastline = _land_coastline_features()
-                ax_scat.add_feature(land, facecolor="lightgray", zorder=0, alpha=0.3)
-                ax_scat.add_feature(coastline, linewidth=0.3, zorder=0)
-                gl = ax_scat.gridlines(draw_labels=True, linewidth=0.2, alpha=0.3)
-                gl.top_labels = False
-                gl.right_labels = False
-                transform = ccrs.PlateCarree()
-            else:
-                transform = None
-
-            # ── Plot SAR data (background, rasterized for speed) ────────
-            arr = _sar_field(scene_ds, actual_var)
-            if arr is not None:
-                kw = {"transform": transform} if transform else {}
-                
-                is_point_based = len(arr.shape) == 1 or (len(arr.shape) == 2 and arr.shape[0] == 1)
-                
-                if is_point_based:
-                    lon_1d = scene_ds["lon"].values.flatten()
-                    lat_1d = scene_ds["lat"].values.flatten()
-                    arr_1d = arr.flatten()
-                    valid = np.isfinite(arr_1d)
-                    lon_valid = lon_1d[valid]
-                    lat_valid = lat_1d[valid]
-                    arr_valid = arr_1d[valid]
-                    if len(arr_valid) > 0:
-                        ax_scat.scatter(
-                            lon_valid, lat_valid, c=arr_valid,
-                            cmap="viridis", norm=sar_norm, s=10, zorder=2, 
-                            rasterized=True, **kw,
-                        )
-                else:
-                    ax_scat.pcolormesh(
-                        scene_ds["lon"].values, scene_ds["lat"].values, arr,
-                        cmap="viridis", norm=sar_norm, shading="auto", zorder=2, 
-                        rasterized=True, **kw,
-                    )
-
-            # ── Extract and plot scatterometer footprints ──────────────
-            if overpasses is not None:
-                _plot_scatterometer_footprints(ax_scat, overpasses, fig, transform)
-            else:
-                ax_scat.text(0.5, 0.5, "No geographic bounds (recipe not provided)",
-                            ha='center', va='center', transform=ax_scat.transAxes, fontsize=10)
-
-            ax_scat.set_title(f"{actual_var} + scatterometer footprints (entry/exit times)", fontsize=10)
-
-    # Hide unused subplots (right column for all rows if no scatterometer, plus any trailing subplots)
-    num_used = nrows * ncols
-    for idx in range(num_used, len(axes_flat)):
-        axes_flat[idx].set_visible(False)
-    # Right column is not used if has_scatterometer is False
-    if not has_scatterometer:
-        for row in range(nrows):
-            axes_flat[2 * row + 1].set_visible(False)
-
-    # ── Add colourbar and title ─────────────────────────────────────────
-    fig.subplots_adjust(right=0.88)
-    cbar_ax = fig.add_axes([0.90, 0.15, 0.02, 0.70])
-    fig.colorbar(sar_sm, cax=cbar_ax, label=actual_var)
-
-    collocation_status = "collocation" if has_collocation else "no collocation"
-    fig.suptitle(
-        f"SAR {actual_var} — {collocation_status} (coverage overview)",
-        fontsize=12, y=0.98,
-    )
-
-    # ── Save to PNG ─────────────────────────────────────────────────────
-    collocation_prefix = "collocation" if has_collocation else "no_collocation"
-    filename = f"sar_{collocation_prefix}_{actual_var}_{recipe_name}{filename_suffix}.png"
-    filepath = plots_dir / filename
-    try:
-        fig.savefig(filepath, dpi=150, bbox_inches="tight")
-        logger.info("Saved SAR coverage plot: %s", filepath)
-        plt.close(fig)
-        return filepath
-    except Exception as exc:
-        logger.error("Failed to save SAR coverage plot: %s", exc)
-        plt.close(fig)
-        return None
-
-# ---------------------------------------------------------------------------
-# 4c. Collocation diagnostics plot
+# 4b. Collocation diagnostics plot
 # ---------------------------------------------------------------------------
 
 def plot_collocation_diagnostics(
@@ -1140,22 +812,38 @@ def plot_collocation_diagnostics(
     filename_suffix: str = "",
 ) -> Union[Path, None]:
     """
-    Plot collocation diagnostics: SAR scene bounds, scatterometer data, matched and unmatched validation points.
+    Plot collocation diagnostics: SAR scene bounds, and matched/unmatched
+    validation points for every validation source actually present (in-situ,
+    plus one category per distinct layer_vs_layer source type — e.g.
+    scatterometer, altimeter, hf_radar — found in the data; categories with
+    zero points are omitted).
 
     Creates a geographic map showing:
-    - Scatterometer data points (light gray dots in background)
     - SAR scene footprints (blue lines for each scene boundary)
-    - Matched validation observations (colored dots)
-    - Unmatched validation observations (red dots)
-    - Statistics in title (total, matched, unmatched counts)
-    - Plot extent expanded ±5 degrees from recipe geographic bounds
+    - Unmatched validation observations (red dots, drawn first) — restricted
+      to points whose timestamp falls within a SAR scene's time range ±
+      that source's collocation time tolerance, i.e. the same coarse
+      temporal pre-filter the real matcher applies. Points that were never
+      temporally eligible are omitted rather than cluttering the plot with
+      "unmatched" observations that failed for a time reason, not a spatial
+      one; the omitted count per category is reported in the title.
+    - Matched validation observations (colored dots, drawn last so a matched
+      point from one category is never hidden underneath an unmatched point
+      from another category)
+    - Statistics in title (total, matched, unmatched counts per category)
+    - Plot extent set to the recipe's geographic bounds
+
+    Always generated as part of the collocation step, including when there
+    are zero collocated pairs — pass ``collocation_ds=None`` in that case and
+    every validation point shows up as unmatched.
 
     Parameters
     ----------
     datatree : xr.DataTree
         Step-2 DataTree (``datatree.nc``).
-    collocation_ds : xr.Dataset
-        Step-3 collocation results (``collocation_results.nc``).
+    collocation_ds : xr.Dataset or None
+        Step-3 collocation results (``collocation_results.nc``), or None if
+        no collocated pairs were found.
     recipe : Recipe
         Recipe object containing metadata.
     output_dir : str or Path
@@ -1170,10 +858,10 @@ def plot_collocation_diagnostics(
     Path or None
         Path to the saved PNG file, or None if plot could not be generated.
     """
-    import xarray as xr  # noqa: PLC0415
+    from .collocation import LAYER_DATA_TYPES  # noqa: PLC0415
+    from .recipe import DEFAULT_LAYER_TYPE_SPECS  # noqa: PLC0415
     import matplotlib.pyplot as plt  # noqa: PLC0415
-    from matplotlib.patches import Rectangle, Patch  # noqa: PLC0415
-    import matplotlib.lines as mlines  # noqa: PLC0415
+    import pandas as pd  # noqa: PLC0415
 
     output_dir = Path(output_dir)
     plots_dir = output_dir / "plots"
@@ -1182,7 +870,6 @@ def plot_collocation_diagnostics(
     # Set up cartopy if available
     try:
         import cartopy.crs as ccrs  # noqa: PLC0415
-        import cartopy.feature as cfeature  # noqa: PLC0415
         HAS_CARTOPY = True
     except ImportError:
         HAS_CARTOPY = False
@@ -1195,17 +882,34 @@ def plot_collocation_diagnostics(
         logger.warning("plot_collocation_diagnostics: No SAR data found in DataTree.")
         return None
 
-    scene_bounds = []
+    scene_bounds = []            # bounding boxes for grid-mode (IW/EW) scenes
+    footprint_points = []        # (lon, lat) per sparse WV-mode imagette
+    # (time_min, time_max) per scene that has a usable time coordinate — used
+    # to decide which validation points were even temporally eligible to
+    # match any SAR acquisition, before we get to spatial matching at all.
+    scene_time_windows: List[Tuple["pd.Timestamp", "pd.Timestamp"]] = []
     scene_names = list(sar_node.children.keys())
-    
+    # Footprint radius each sparse WV imagette actually matches within, so the
+    # plot's circles line up with what the collocation step considered.
+    footprint_radius_km = getattr(
+        recipe.config.collocation, "sar_footprint_radius_km", 14.0
+    )
+
     for scene_name in scene_names:
         scene_ds = sar_node[scene_name].to_dataset()
         if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
             continue
-        
+
         lons = scene_ds["lon"].values
         lats = scene_ds["lat"].values
-        
+
+        # WV/point-mode scenes are sparse imagettes, not a filled grid — draw
+        # them as per-footprint circles instead of one misleading bounding box.
+        is_wv_scene = (
+            ("point" in scene_ds.dims and "y" not in scene_ds.dims)
+            or str(scene_ds.attrs.get("swath_mode", "")).upper() == "WV"
+        )
+
         # Handle both 2D grids and 1D point arrays
         if len(lons.shape) > 1:
             lons_flat = lons.flatten()
@@ -1213,31 +917,30 @@ def plot_collocation_diagnostics(
         else:
             lons_flat = lons
             lats_flat = lats
-        
+
         valid_mask = np.isfinite(lons_flat) & np.isfinite(lats_flat)
         if valid_mask.any():
-            lon_min = float(np.nanmin(lons_flat[valid_mask]))
-            lon_max = float(np.nanmax(lons_flat[valid_mask]))
-            lat_min = float(np.nanmin(lats_flat[valid_mask]))
-            lat_max = float(np.nanmax(lats_flat[valid_mask]))
-            
-            # Extract time bounds from SAR scene
-            sar_time = None
-            if "time" in scene_ds.coords:
-                times = np.atleast_1d(scene_ds.coords["time"].values)
-                if len(times) > 0:
-                    sar_time = np.nanmedian(times.astype('datetime64[ns]').astype('int64')).astype('datetime64[ns]')
-            
-            scene_bounds.append({
-                "name": scene_name,
-                "lon_min": lon_min,
-                "lon_max": lon_max,
-                "lat_min": lat_min,
-                "lat_max": lat_max,
-                "time": sar_time,
-            })
+            if is_wv_scene:
+                footprint_points.extend(
+                    zip(lons_flat[valid_mask].tolist(), lats_flat[valid_mask].tolist())
+                )
+            else:
+                scene_bounds.append({
+                    "lon_min": float(np.nanmin(lons_flat[valid_mask])),
+                    "lon_max": float(np.nanmax(lons_flat[valid_mask])),
+                    "lat_min": float(np.nanmin(lats_flat[valid_mask])),
+                    "lat_max": float(np.nanmax(lats_flat[valid_mask])),
+                })
 
-    if not scene_bounds:
+        if "time" in scene_ds.coords:
+            # Scalar for grid-mode (IW/EW) scenes, a (point,) array for
+            # WV-mode scenes — atleast_1d handles both uniformly.
+            scene_times = pd.to_datetime(np.atleast_1d(scene_ds["time"].values))
+            scene_times = scene_times[~scene_times.isna()]
+            if len(scene_times) > 0:
+                scene_time_windows.append((scene_times.min(), scene_times.max()))
+
+    if not scene_bounds and not footprint_points:
         logger.warning("plot_collocation_diagnostics: Could not extract SAR scene bounds.")
         return None
 
@@ -1249,129 +952,149 @@ def plot_collocation_diagnostics(
 
     all_val_lons = all_val_data["lons"]
     all_val_lats = all_val_data["lats"]
-    total_points = len(all_val_lons)
+    all_val_times = all_val_data["times"]
+    platform_types_arr = np.array(all_val_data["platform_types"])
 
-    # ── Extract matched validation points ───────────────────────────────
-    matched_lons = []
-    matched_lats = []
-    matched_sources = []
-    
-    if "val_lon" in collocation_ds and "val_lat" in collocation_ds:
-        matched_lons = collocation_ds["val_lon"].values
-        matched_lats = collocation_ds["val_lat"].values
-        if "val_source" in collocation_ds:
-            matched_sources = collocation_ds["val_source"].values
-        else:
-            matched_sources = np.full(len(matched_lons), "unknown")
-    
-    matched_points = len(matched_lons)
-    unmatched_points = total_points - matched_points
+    # ── Resolve the time tolerance each point would actually be matched
+    # with, mirroring run_collocation's own resolution (collocation.py) so
+    # "temporally eligible" here means the same thing it means there. ─────
+    coll_cfg = recipe.config.collocation
+    pvl_default_tol = coll_cfg.point_vs_layer.time_tolerance_minutes
+    source_type_tol: Dict[str, float] = {
+        src.source_type: src.collocation_kwargs.get("time_tolerance_minutes", pvl_default_tol)
+        for src in recipe.config.validation_sources
+    }
+    layer_vs_layer_specs = dict(DEFAULT_LAYER_TYPE_SPECS)
+    if coll_cfg.layer_vs_layer is not None:
+        layer_vs_layer_specs.update(coll_cfg.layer_vs_layer.layer_type_specs)
+    # Collapse altimeter_1hz/altimeter_5hz down to one "altimeter" key (the
+    # plot doesn't distinguish frequency), taking the max of the two so a
+    # point isn't hidden just because it misses the stricter of the pair.
+    layer_type_tol: Dict[str, float] = {}
+    for key, spec in layer_vs_layer_specs.items():
+        base = key.split("_")[0] if key.startswith("altimeter") else key
+        tol = spec.get("time_tolerance_minutes", pvl_default_tol)
+        layer_type_tol[base] = max(layer_type_tol.get(base, 0), tol)
 
-    # ── Identify unmatched points ──────────────────────────────────────
-    # Build a set of (lon, lat) tuples from matched points for fast lookup
-    matched_set = set(zip(np.round(matched_lons, 6), np.round(matched_lats, 6)))
-    
-    unmatched_lons = []
-    unmatched_lats = []
-    for lon, lat in zip(all_val_lons, all_val_lats):
-        if (round(lon, 6), round(lat, 6)) not in matched_set:
-            unmatched_lons.append(lon)
-            unmatched_lats.append(lat)
-    
-    unmatched_lons = np.array(unmatched_lons)
-    unmatched_lats = np.array(unmatched_lats)
+    def _time_tolerance_minutes(label: str, ptype) -> float:
+        if label == "In-situ":
+            return source_type_tol.get(str(ptype), pvl_default_tol)
+        return layer_type_tol.get(label.lower(), pvl_default_tol)
 
-    # ── Separate matched points into in-situ and scatterometer ──────────
-    # Extract point_vs_layer (in-situ) matches from collocation_ds
-    if "collocation_type" in collocation_ds:
-        pvl_mask = collocation_ds["collocation_type"] == "point_vs_layer"
-        pvl_ds = collocation_ds.where(pvl_mask, drop=True)
-        
-        matched_lons_insitu = pvl_ds["val_lon"].values if "val_lon" in pvl_ds else np.array([])
-        matched_lats_insitu = pvl_ds["val_lat"].values if "val_lat" in pvl_ds else np.array([])
-        if "val_source" in pvl_ds:
-            matched_sources_insitu = pvl_ds["val_source"].values
-        else:
-            matched_sources_insitu = np.full(len(matched_lons_insitu), "unknown")
+    def _time_eligible(point_time, tol_minutes: float) -> bool:
+        # Points with no timestamp, or when no scene has usable time
+        # metadata, can't be evaluated — never hide them on account of a
+        # check we can't actually perform.
+        if not scene_time_windows or point_time is None or pd.isnull(point_time):
+            return True
+        pt = pd.Timestamp(point_time)
+        tol = pd.Timedelta(minutes=tol_minutes)
+        return any(t_min - tol <= pt <= t_max + tol for t_min, t_max in scene_time_windows)
+
+    # ── Split matched points (from collocation_ds) by their validation
+    # source — "In-situ" for anything that isn't a layer type, plus one
+    # bucket per distinct layer source (altimeter/scatterometer/hf_radar).
+    # This mirrors the unmatched classification below and is independent of
+    # collocation_type, so point_vs_point / point_vs_layer / layer_vs_layer
+    # all bucket correctly. Tolerates collocation_ds=None (zero pairs) by
+    # treating everything as unmatched. ──────────────────────────────────
+    has_matches = collocation_ds is not None and "val_lon" in collocation_ds and "val_lat" in collocation_ds
+    if has_matches:
+        val_lon_all = np.asarray(collocation_ds["val_lon"].values)
+        val_lat_all = np.asarray(collocation_ds["val_lat"].values)
+        val_source_all = np.asarray(
+            collocation_ds["val_source"].values if "val_source" in collocation_ds
+            else np.full(len(val_lon_all), "unknown")
+        )
     else:
-        # Fallback to original logic if collocation_type not available
-        matched_lons_insitu = matched_lons
-        matched_lats_insitu = matched_lats
-        matched_sources_insitu = matched_sources
-    
-    matched_points_insitu = len(matched_lons_insitu)
+        val_lon_all = np.array([])
+        val_lat_all = np.array([])
+        val_source_all = np.array([])
 
-    # ── Extract layer_vs_layer (scatterometer) matches from collocation_ds ────────
-    # Use actual matched pairs saved by LayerLayerCollocation.collocate()
-    matched_lons_scat = np.array([])
-    matched_lats_scat = np.array([])
-    matched_points_scat = 0
-    
-    if "collocation_type" in collocation_ds:
-        lvl_mask = collocation_ds["collocation_type"] == "layer_vs_layer"
-        lvl_ds = collocation_ds.where(lvl_mask, drop=True)
-        if len(lvl_ds["collocation"]) > 0:
-            matched_lons_scat = lvl_ds["val_lon"].values
-            matched_lats_scat = lvl_ds["val_lat"].values
-            matched_points_scat = len(matched_lons_scat)
+    matched_labels_all = np.array([
+        str(src).title() if src in LAYER_DATA_TYPES else "In-situ"
+        for src in val_source_all
+    ])
 
-    # ── Identify unmatched points ──────────────────────────────────────
-    # Build sets of (lon, lat) tuples from matched points (both in-situ and scatterometer)
-    all_matched_insitu = set(zip(np.round(matched_lons_insitu, 6), np.round(matched_lats_insitu, 6)))
-    all_matched_scat = set(zip(np.round(matched_lons_scat, 6), np.round(matched_lats_scat, 6)))
-    
-    unmatched_lons_insitu = []
-    unmatched_lats_insitu = []
-    unmatched_lons_scat = []
-    unmatched_lats_scat = []
-    
-    if "platform_types" in all_val_data:
-        platform_types_arr = np.array(all_val_data["platform_types"])
-        
-        for i, (lon, lat) in enumerate(zip(all_val_lons, all_val_lats)):
-            lon_lat_rounded = (round(lon, 6), round(lat, 6))
-            
-            if platform_types_arr[i] == "scatterometer":
-                # Scatterometer point
-                if lon_lat_rounded not in all_matched_scat:
-                    unmatched_lons_scat.append(lon)
-                    unmatched_lats_scat.append(lat)
-            else:
-                # In-situ point
-                if lon_lat_rounded not in all_matched_insitu:
-                    unmatched_lons_insitu.append(lon)
-                    unmatched_lats_insitu.append(lat)
-    else:
-        # Fallback: no platform type info, treat all unmatched as in-situ
-        for lon, lat in zip(all_val_lons, all_val_lats):
-            if (round(lon, 6), round(lat, 6)) not in all_matched_insitu:
-                unmatched_lons_insitu.append(lon)
-                unmatched_lats_insitu.append(lat)
-    
-    unmatched_lons = np.array(unmatched_lons_insitu)
-    unmatched_lats = np.array(unmatched_lats_insitu)
-    unmatched_points_insitu = len(unmatched_lons)
-    unmatched_lons_scat = np.array(unmatched_lons_scat)
-    unmatched_lats_scat = np.array(unmatched_lats_scat)
-    unmatched_points_scat = len(unmatched_lons_scat)
+    matched_by_category: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for label in sorted(set(matched_labels_all.tolist())) or ["In-situ"]:
+        sel = matched_labels_all == label
+        matched_by_category[label] = (
+            val_lon_all[sel], val_lat_all[sel], val_source_all[sel],
+        )
+    # Guarantee an In-situ bucket exists so downstream code can assume it.
+    matched_by_category.setdefault("In-situ", (np.array([]), np.array([]), np.array([])))
 
-    unmatched_points_scat = len(unmatched_lons_scat)
-    
+    matched_lookup = {
+        label: set(zip(np.round(lons, 6), np.round(lats, 6)))
+        for label, (lons, lats, _) in matched_by_category.items()
+    }
+
+    # ── Classify every validation point into the same categories, using
+    # LAYER_DATA_TYPES (the same constant collocation.py uses to route
+    # sources to layer_vs_layer collocation) as the single source of truth
+    # for "which platform_type values are layer types" — so this plot
+    # automatically covers scatterometer, altimeter, hf_radar, or any future
+    # addition, without hardcoding a fixed list here. ────────────────────
+    unmatched_by_category: Dict[str, Tuple[List[float], List[float]]] = {
+        label: ([], []) for label in matched_by_category
+    }
+    excluded_by_time: Dict[str, int] = {}
+    for lon, lat, ptype, ptime in zip(all_val_lons, all_val_lats, platform_types_arr, all_val_times):
+        label = str(ptype).title() if ptype in LAYER_DATA_TYPES else "In-situ"
+        if (round(lon, 6), round(lat, 6)) in matched_lookup.get(label, set()):
+            continue
+        tol_minutes = _time_tolerance_minutes(label, ptype)
+        if not _time_eligible(ptime, tol_minutes):
+            excluded_by_time[label] = excluded_by_time.get(label, 0) + 1
+            continue
+        lon_lats = unmatched_by_category.setdefault(label, ([], []))
+        lon_lats[0].append(lon)
+        lon_lats[1].append(lat)
+
+    # ── Assemble final per-category data, dropping empty categories ──────
+    categories = []
+    for label in sorted(set(matched_by_category) | set(unmatched_by_category)):
+        m_lon, m_lat, m_src = matched_by_category.get(label, (np.array([]), np.array([]), np.array([])))
+        u_lon = np.array(unmatched_by_category.get(label, ([], []))[0])
+        u_lat = np.array(unmatched_by_category.get(label, ([], []))[1])
+        if len(m_lon) + len(u_lon) == 0:
+            continue
+        categories.append({
+            "label": label,
+            "matched_lon": m_lon, "matched_lat": m_lat, "matched_source": m_src,
+            "unmatched_lon": u_lon, "unmatched_lat": u_lat,
+        })
+
+    if not categories:
+        logger.warning("plot_collocation_diagnostics: No classifiable validation points.")
+        return None
+
     logger.debug(
-        "Classification: in-situ=%d matched/%d unmatched; scatterometer=%d matched/%d unmatched (from collocation_results.nc)",
-        matched_points_insitu, unmatched_points_insitu, matched_points_scat, unmatched_points_scat
+        "Classification: %s",
+        "; ".join(
+            f"{c['label']}={len(c['matched_lon'])} matched/{len(c['unmatched_lon'])} unmatched"
+            for c in categories
+        ),
     )
 
-    # ── Calculate expanded geographic bounds (+5 degrees on all sides) ───
+    # ── Build one shared color map across every distinct source name, so
+    # in-situ sub-sources (mooring/buoy/…) and layer-type categories
+    # (altimeter/scatterometer/…) never collide on the same color ────────
+    all_source_names = set()
+    for cat in categories:
+        if cat["label"] == "In-situ" and len(cat["matched_source"]) > 0:
+            all_source_names.update(str(s) for s in np.unique(cat["matched_source"]))
+        else:
+            all_source_names.add(cat["label"])
+    source_color_map = _source_color_map(sorted(all_source_names))
+
     bounds = recipe.config.geographic_bounds
-    expanded_min_lon = bounds.min_lon - 5
-    expanded_max_lon = bounds.max_lon + 5
-    expanded_min_lat = bounds.min_lat - 5
-    expanded_max_lat = bounds.max_lat + 5
 
     # ── Create geographic plot ──────────────────────────────────────────
     fig = plt.figure(figsize=(14, 10), dpi=100)
     ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+    transform = ccrs.PlateCarree()
 
     # Add coastlines and features
     land, coastline = _land_coastline_features()
@@ -1381,85 +1104,85 @@ def plot_collocation_diagnostics(
     gl.top_labels = False
     gl.right_labels = False
 
-    # ── Set plot extent to expanded bounds ───────────────────────────────
-    ax.set_extent([expanded_min_lon, expanded_max_lon, expanded_min_lat, expanded_max_lat],
+    # ── Set plot extent to the recipe's geographic bounds ────────────────
+    ax.set_extent([bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat],
                   crs=ccrs.PlateCarree())
 
-    # ── Plot scatterometer matched points (green dots, zorder=2.5) ────────
-    transform = ccrs.PlateCarree()
-    
-    if len(matched_lons_scat) > 0:
-        ax.scatter(
-            matched_lons_scat, matched_lats_scat,
-            s=15, c="green", alpha=0.5, edgecolors="none",
-            transform=transform, zorder=2.5, label=f"Scatterometer matched ({len(matched_lons_scat)})"
-        )
-
-    # ── Plot scatterometer unmatched points (red dots, zorder=1.5) ────────
-    if len(unmatched_lons_scat) > 0:
-        ax.scatter(
-            unmatched_lons_scat, unmatched_lats_scat,
-            s=15, c="red", alpha=0.5, edgecolors="none",
-            transform=transform, zorder=1.5, label=f"Scatterometer unmatched ({len(unmatched_lons_scat)})"
-        )
-
-    # ── Plot SAR scene bounds (blue lines, zorder=2) ──────────────────────
-    for i, bounds in enumerate(scene_bounds):
-        lon_min, lon_max = bounds["lon_min"], bounds["lon_max"]
-        lat_min, lat_max = bounds["lat_min"], bounds["lat_max"]
-        
-        # Draw rectangle outline for each scene
-        lons_box = [lon_min, lon_max, lon_max, lon_min, lon_min]
-        lats_box = [lat_min, lat_min, lat_max, lat_max, lat_min]
-        ax.plot(lons_box, lats_box, color="blue", linewidth=1.5, 
-                transform=transform, zorder=2, label="SAR scene bounds" if i == 0 else "")
-
-    # ── Plot unmatched in-situ validation points (red dots, zorder=3) ─────
-    if len(unmatched_lons) > 0:
-        ax.scatter(
-            unmatched_lons, unmatched_lats,
-            s=20, c="red", alpha=0.6, edgecolors="darkred", linewidths=0.3,
-            transform=transform, zorder=3, label=f"In-situ not matched ({len(unmatched_lons)})"
-        )
-
-    # ── Plot matched in-situ validation points (colored by source, zorder=4) ──
-    if len(matched_lons_insitu) > 0:
-        if len(np.unique(matched_sources_insitu)) > 1:
-            # Multiple sources: use color map
-            source_map = _source_color_map(list(np.unique(matched_sources_insitu)))
-            for source in np.unique(matched_sources_insitu):
-                source_mask = matched_sources_insitu == source
-                source_lons = matched_lons_insitu[source_mask]
-                source_lats = matched_lats_insitu[source_mask]
-                color = source_map.get(str(source), "#ff7f0e")
-                ax.scatter(
-                    source_lons, source_lats,
-                    s=25, c=color, alpha=0.7, edgecolors="black", linewidths=0.3,
-                    transform=transform, zorder=4, label=f"In-situ matched: {source}"
-                )
-        else:
-            # Single source: use green
+    # ── Tier 1 (zorder=2): unmatched points, every category — drawn first
+    # so matched points (tier 3 below) are never visually covered by an
+    # unmatched point from a different category. ─────────────────────────
+    for cat in categories:
+        if len(cat["unmatched_lon"]) > 0:
             ax.scatter(
-                matched_lons_insitu, matched_lats_insitu,
-                s=25, c="green", alpha=0.7, edgecolors="black", linewidths=0.3,
-                transform=transform, zorder=4, label=f"In-situ matched ({len(matched_lons_insitu)})"
+                cat["unmatched_lon"], cat["unmatched_lat"],
+                s=18, c="red", alpha=0.55, edgecolors="darkred", linewidths=0.3,
+                transform=transform, zorder=2,
+                label=f"{cat['label']} unmatched ({len(cat['unmatched_lon'])})",
             )
 
-    # ── Create title with statistics ────────────────────────────────────
+    # ── Tier 2 (zorder=3): SAR coverage ───────────────────────────────────
+    # Grid scenes → bounding box; sparse WV imagettes → one footprint circle
+    # each (radius = the collocation footprint radius), so it's visually clear
+    # that matches are only possible near each imagette, not across the whole
+    # bounding rectangle.
+    for i, sb in enumerate(scene_bounds):
+        lons_box = [sb["lon_min"], sb["lon_max"], sb["lon_max"], sb["lon_min"], sb["lon_min"]]
+        lats_box = [sb["lat_min"], sb["lat_min"], sb["lat_max"], sb["lat_max"], sb["lat_min"]]
+        ax.plot(lons_box, lats_box, color="blue", linewidth=1.5,
+                transform=transform, zorder=3, label="SAR scene bounds" if i == 0 else "")
+
+    if footprint_points:
+        theta = np.linspace(0, 2 * np.pi, 60)
+        r_lat_deg = footprint_radius_km / 111.0
+        for j, (flon, flat) in enumerate(footprint_points):
+            # Approximate circle in lon/lat (lon degrees shrink by cos(lat)).
+            cos_lat = max(np.cos(np.radians(flat)), 1e-6)
+            circ_lon = flon + (r_lat_deg / cos_lat) * np.cos(theta)
+            circ_lat = flat + r_lat_deg * np.sin(theta)
+            ax.plot(circ_lon, circ_lat, color="blue", linewidth=1.2,
+                    transform=transform, zorder=3,
+                    label=f"SAR footprint (±{footprint_radius_km:.0f} km)" if j == 0 else "")
+            ax.scatter([flon], [flat], s=10, c="blue", marker="+",
+                       transform=transform, zorder=3)
+
+    # ── Tier 3 (zorder=4): matched points, every category — always drawn
+    # last/on top, regardless of category. ────────────────────────────────
+    for cat in categories:
+        m_lon, m_lat, m_src = cat["matched_lon"], cat["matched_lat"], cat["matched_source"]
+        if len(m_lon) == 0:
+            continue
+        if cat["label"] == "In-situ" and len(m_src) > 0:
+            # In-situ keeps its existing per-source-type coloring (mooring/
+            # buoy/drifter/…), each its own legend entry.
+            for source in np.unique(m_src):
+                mask = m_src == source
+                color = source_color_map.get(str(source), "#ff7f0e")
+                ax.scatter(
+                    m_lon[mask], m_lat[mask],
+                    s=25, c=color, alpha=0.7, edgecolors="black", linewidths=0.3,
+                    transform=transform, zorder=4, label=f"In-situ matched: {source}",
+                )
+        else:
+            color = source_color_map.get(cat["label"], "#2ca02c")
+            ax.scatter(
+                m_lon, m_lat,
+                s=20, c=color, alpha=0.6, edgecolors="none",
+                transform=transform, zorder=4, label=f"{cat['label']} matched ({len(m_lon)})",
+            )
+
+    # ── Title: one segment per category actually present ─────────────────
     recipe_name = recipe.config.name or "unknown"
-    
-    # In-situ statistics
-    insitu_total = matched_points_insitu + unmatched_points_insitu
-    
-    # Scatterometer statistics
-    scat_total = matched_points_scat + unmatched_points_scat
-    
-    # Build title with both in-situ and scatterometer statistics
-    title = (
-        f"{recipe_name} Collocation Diagnostics\n"
-        f"In-situ: {insitu_total}, Matched: {matched_points_insitu}, Unmatched: {unmatched_points_insitu} | "
-        f"Scatterometer: {scat_total}, Matched: {matched_points_scat}, Unmatched: {unmatched_points_scat}"
-    )
+    segments = [
+        f"{cat['label']}: {len(cat['matched_lon']) + len(cat['unmatched_lon'])}, "
+        f"Matched: {len(cat['matched_lon'])}, Unmatched: {len(cat['unmatched_lon'])}"
+        for cat in categories
+    ]
+    title = f"{recipe_name} Collocation Diagnostics\n" + " | ".join(segments)
+    if any(excluded_by_time.values()):
+        excl_segments = [
+            f"{label} {count:,}" for label, count in excluded_by_time.items() if count
+        ]
+        title += "\n(outside ± time tolerance, not shown: " + ", ".join(excl_segments) + ")"
     ax.set_title(title, fontsize=12, fontweight="bold", pad=15)
 
     # ── Add legend ──────────────────────────────────────────────────────
@@ -1471,10 +1194,7 @@ def plot_collocation_diagnostics(
     fig.savefig(str(output_file), dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    logger.info(
-        "Collocation diagnostics plot saved: %s (in-situ: %d matched, %d unmatched; scatterometer: %d matched, %d unmatched)",
-        output_file, matched_points_insitu, unmatched_points_insitu, matched_points_scat, unmatched_points_scat
-    )
+    logger.info("Collocation diagnostics plot saved: %s (%s)", output_file, "; ".join(segments))
     return output_file
 
 # ---------------------------------------------------------------------------
@@ -1535,24 +1255,37 @@ def _extract_validation_data_for_plot(datatree):
             if len(times.shape) > 1:
                 times = times.flatten()
 
-            # Determine platform type from attributes and source name
-            platform_type = ds.attrs.get("platform_type", None)
-            if platform_type is None:
-                data_type = ds.attrs.get("data_type", "")
-                if data_type:
-                    platform_type = data_type
-                elif "osi_saf" in source_name:
-                    platform_type = "scatterometer"
-                else:
-                    platform_type = source_name.replace("_", " ").title()
+            n = len(lons)
+
+            # Prefer a per-point platform_type coord when present — a single
+            # in-situ CSV can mix multiple platform types (mooring/buoy/
+            # drifter/tidal_gauge, see from_insitu_csv), and downstream
+            # per-source time-tolerance lookups need that granularity, not
+            # one dataset-wide label.
+            if "platform_type" in ds.coords or "platform_type" in ds.data_vars:
+                ptypes = ds["platform_type"].values
+                if len(ptypes.shape) > 1:
+                    ptypes = ptypes.flatten()
+                platform_types_for_points = list(ptypes)
+            else:
+                # Determine platform type from attributes and source name
+                platform_type = ds.attrs.get("platform_type", None)
+                if platform_type is None:
+                    data_type = ds.attrs.get("data_type", "")
+                    if data_type:
+                        platform_type = data_type
+                    elif "osi_saf" in source_name:
+                        platform_type = "scatterometer"
+                    else:
+                        platform_type = source_name.replace("_", " ").title()
+                platform_types_for_points = [platform_type] * n
 
             # Accumulate observations using vectorized operations
-            n = len(lons)
             all_lons.extend(lons)
             all_lats.extend(lats)
             all_times.extend(times)
             all_sources.extend([source_name] * n)
-            all_platform_types.extend([platform_type] * n)
+            all_platform_types.extend(platform_types_for_points)
 
             # Collect measurement variables
             for var_name in ds.data_vars:
@@ -1587,247 +1320,6 @@ def _extract_validation_data_for_plot(datatree):
         "source_to_data": source_to_data,
         "all_measurements": all_measurements,
     }
-
-
-def _find_available_sar_variable(sar_node, preferred_var: str) -> Optional[str]:
-    """
-    Find an available SAR variable, preferring *preferred_var* but falling
-    back to related alternatives if not found.
-
-    Parameters
-    ----------
-    sar_node : xr.DataTree
-        The '/sar' node of the datatree.
-    preferred_var : str
-        The preferred SAR variable name (e.g., "owiSignificantWaveHeight").
-
-    Returns
-    -------
-    str or None
-        The name of the first available SAR variable, or None if no suitable
-        variable is found in any scene.
-    """
-    if not sar_node.children:
-        return None
-
-    # Get variables from the first SAR scene
-    first_scene_name = next(iter(sar_node.children.keys()))
-    scene_ds = sar_node[first_scene_name].to_dataset()
-    available_vars = list(scene_ds.data_vars)
-
-    # 1. Try the preferred variable first
-    for var in available_vars:
-        if var == preferred_var:
-            return preferred_var
-
-    # 2. Try related variables based on the preferred variable's type
-    # e.g., if preferred is owiSignificantWaveHeight, try owiWindSeaHs, owiWaveHs, etc.
-    wave_related = [v for v in available_vars if "hs" in v.lower() or "wave" in v.lower()]
-    if "wave" in preferred_var.lower() or "hs" in preferred_var.lower():
-        if wave_related:
-            return wave_related[0]
-
-    wind_related = [v for v in available_vars if "wind" in v.lower()]
-    if "wind" in preferred_var.lower():
-        if wind_related:
-            return wind_related[0]
-
-    current_related = [v for v in available_vars if "current" in v.lower()]
-    if "current" in preferred_var.lower():
-        if current_related:
-            return current_related[0]
-
-    # 3. Fallback: use any non-quality/non-metadata variable
-    non_metadata = [v for v in available_vars
-                    if not any(x in v.lower() for x in
-                              ("quality", "mask", "heading", "incidence", "elevation", "ecmwf"))]
-    if non_metadata:
-        return non_metadata[0]
-
-    return None
-
-
-def _extract_scatterometer_overpasses(datatree, recipe):
-    """
-    Extract scatterometer overpass footprints with entry/exit times.
-
-    For each scatterometer file (= one satellite overpass), calculates the
-    geographic boundary of points within the recipe's geographic bounds and
-    extracts entry/exit times.
-
-    Parameters
-    ----------
-    datatree : xr.DataTree
-        Step-2 DataTree with validation data.
-    recipe : Recipe
-        Recipe containing geographic_bounds for filtering.
-
-    Returns
-    -------
-    list of dict
-        Each dict contains: {
-            'file_name': str,
-            'entry_time': datetime64 or None,
-            'exit_time': datetime64 or None,
-            'boundary_lons': array of lon values defining boundary,
-            'boundary_lats': array of lat values defining boundary,
-            'num_points_in_bounds': int,
-        }
-        Returns empty list if no scatterometer data or no in-bounds points.
-    """
-    from scipy.spatial import ConvexHull  # noqa: PLC0415
-    import pandas as pd  # noqa: PLC0415
-
-    val_node = datatree.get("validation")
-    if val_node is None:
-        return []
-
-    osi_node = val_node.get("osi_saf_winds")
-    if osi_node is None:
-        return []
-
-    overpasses = []
-    bounds = recipe.config.geographic_bounds
-
-    def process_overpass_node(node, file_name):
-        """Process a single scatterometer file node."""
-        ds = node.to_dataset()
-
-        if "lon" not in ds.coords or "lat" not in ds.coords:
-            return
-
-        lons = ds["lon"].values.flatten()
-        lats = ds["lat"].values.flatten()
-        times = ds.coords.get("time", None)
-        if times is not None:
-            times = times.values.flatten()
-        else:
-            times = np.full(len(lons), None, dtype=object)
-
-        # Filter by geographic bounds
-        mask = (
-            (lons >= bounds.min_lon) & (lons <= bounds.max_lon) &
-            (lats >= bounds.min_lat) & (lats <= bounds.max_lat)
-        )
-        in_bounds_lons = lons[mask]
-        in_bounds_lats = lats[mask]
-        in_bounds_times = times[mask]
-
-        if len(in_bounds_lons) == 0:
-            return  # No points in bounds for this overpass
-
-        # Calculate entry/exit times
-        valid_times = in_bounds_times[in_bounds_times != None]
-        if len(valid_times) > 0:
-            entry_time = valid_times.min()
-            exit_time = valid_times.max()
-        else:
-            entry_time = None
-            exit_time = None
-
-        # Calculate boundary via ConvexHull
-        try:
-            if len(in_bounds_lons) >= 3:
-                points = np.column_stack((in_bounds_lons, in_bounds_lats))
-                hull = ConvexHull(points)
-                boundary_indices = hull.vertices
-                boundary_lons = in_bounds_lons[boundary_indices]
-                boundary_lats = in_bounds_lats[boundary_indices]
-                # Close the polygon
-                boundary_lons = np.append(boundary_lons, boundary_lons[0])
-                boundary_lats = np.append(boundary_lats, boundary_lats[0])
-            else:
-                # Too few points for ConvexHull; just use the points as-is
-                boundary_lons = in_bounds_lons
-                boundary_lats = in_bounds_lats
-        except Exception as e:
-            logger.warning("Failed to calculate ConvexHull for overpass %s: %s", file_name, e)
-            return
-
-        overpasses.append({
-            "file_name": file_name,
-            "entry_time": entry_time,
-            "exit_time": exit_time,
-            "boundary_lons": boundary_lons,
-            "boundary_lats": boundary_lats,
-            "num_points_in_bounds": len(in_bounds_lons),
-        })
-
-    # Recursively process all nodes under osi_saf_winds
-    def process_node_tree(node, file_name):
-        """Recursively traverse DataTree nodes."""
-        ds = node.to_dataset()
-        if "lon" in ds.coords and "lat" in ds.coords:
-            # This node has data; process it as an overpass
-            process_overpass_node(node, file_name)
-        else:
-            # No data in this node; recurse into children
-            for child_name, child_node in node.children.items():
-                process_node_tree(child_node, f"{file_name}/{child_name}")
-
-    # Process all children of osi_saf_winds
-    for stem_name, stem_node in osi_node.children.items():
-        process_node_tree(stem_node, stem_name)
-
-    logger.info("Extracted %d scatterometer overpasses with in-bounds coverage", len(overpasses))
-    return overpasses
-
-
-def _plot_scatterometer_footprints(ax, overpasses, fig, transform=None):
-    """
-    Plot scatterometer footprint outlines with entry/exit time annotations.
-
-    Parameters
-    ----------
-    ax : matplotlib.axes.Axes
-        Axes to draw into.
-    overpasses : list of dict
-        Output from _extract_scatterometer_overpasses().
-    fig : matplotlib.figure.Figure
-        Figure object for adding annotations.
-    transform : cartopy.crs.CRS, optional
-        Cartopy transform for plotting (ccrs.PlateCarree()).
-    """
-    import pandas as pd  # noqa: PLC0415
-
-    if not overpasses:
-        ax.text(0.5, 0.5, "No scatterometer coverage in geographic bounds",
-                ha='center', va='center', transform=ax.transAxes, fontsize=10)
-        return
-
-    for idx, overpass in enumerate(overpasses):
-        boundary_lons = overpass["boundary_lons"]
-        boundary_lats = overpass["boundary_lats"]
-
-        kw_plot = {"transform": transform} if transform else {}
-
-        # Draw footprint boundary as red line
-        ax.plot(boundary_lons, boundary_lats, color='red', linewidth=2, zorder=3, **kw_plot)
-
-        # Optional: fill with semi-transparent red
-        ax.fill(boundary_lons, boundary_lats, color='red', alpha=0.1, zorder=2, **kw_plot)
-
-        # Calculate centroid for text placement
-        centroid_lon = np.mean(boundary_lons)
-        centroid_lat = np.mean(boundary_lats)
-
-        # Format entry/exit times
-        if overpass["entry_time"] is not None:
-            entry_dt = pd.Timestamp(overpass["entry_time"]).strftime("%H:%M:%S")
-            exit_dt = pd.Timestamp(overpass["exit_time"]).strftime("%H:%M:%S")
-            time_text = f"In: {entry_dt}\nOut: {exit_dt}"
-        else:
-            time_text = f"Pass {idx + 1}"
-
-        # Add annotation at centroid
-        ax.text(centroid_lon, centroid_lat, time_text, fontsize=8, ha='center',
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.7), **kw_plot)
-
-        logger.info(
-            "Plotted scatterometer overpass %d: %s points, entry=%s, exit=%s",
-            idx + 1, overpass["num_points_in_bounds"],
-            overpass["entry_time"], overpass["exit_time"]
-        )
 
 
 # ---------------------------------------------------------------------------

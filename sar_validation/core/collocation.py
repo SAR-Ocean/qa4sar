@@ -58,7 +58,7 @@ class CollocatedPoint:
     # Provenance
     val_source: str              # e.g. "mooring", "buoy", "scatterometer"
     val_id: Optional[str] = None
-    collocation_type: str = "point_vs_layer"  # point_vs_layer | layer_vs_layer
+    collocation_type: str = "point_vs_layer"  # point_vs_point | point_vs_layer | layer_vs_layer
 
     # Pixel indices — the SAR pixel and scene this observation was matched to
     sar_y_idx: int = 0
@@ -263,9 +263,9 @@ def _equal_weights(distances: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 # data_type attribute values that indicate a gridded layer source
-LAYER_DATA_TYPES = {"scatterometer"}
+LAYER_DATA_TYPES = {"scatterometer", "altimeter", "hf_radar"}
 # path-fragment fallbacks when attributes are absent
-LAYER_SOURCE_PATHS = {"osi_saf_winds", "scatterometer"}
+LAYER_SOURCE_PATHS = {"osi_saf_winds", "scatterometer", "altimeter", "hf_radar"}
 
 
 def _detect_collocation_type(val_ds: "xr.Dataset", source_path: str) -> str:
@@ -811,6 +811,188 @@ def _merge_collocation_kwargs(
     return merged
 
 
+def _distance_weights(
+    distances_km: np.ndarray,
+    method: str,
+    sigma_km: float,
+    radius_km: float,
+) -> np.ndarray:
+    """Dispatch to the same weighting kernels used for SAR aggregation."""
+    if method == "gaussian":
+        return _gaussian_weights(distances_km, sigma_km)
+    if method == "inverse_distance":
+        return _inverse_distance_weights(distances_km, power=2.0)
+    if method == "linear":
+        return _linear_weights(distances_km, radius_km)
+    return _equal_weights(distances_km)
+
+
+def _collocate_wv_points(
+    sar_lons: np.ndarray,
+    sar_lats: np.ndarray,
+    sar_times: np.ndarray,
+    sar_point_vars: Dict[str, np.ndarray],
+    val_data: pd.DataFrame,
+    val_source: str,
+    footprint_radius_km: float,
+    time_tolerance_minutes: float,
+    distance_weighting: str,
+    gaussian_sigma_km: float,
+    collocation_type: str,
+    sar_scene_name: str = "",
+) -> List[CollocatedPoint]:
+    """
+    SAR-point-anchored collocation for sparse WV-mode OSW imagettes.
+
+    Each Sentinel-1 WV imagette is a single point representing a ~20×20 km
+    footprint, and consecutive imagettes are ~200 km apart. Rather than
+    requiring validation data within a few km of the imagette *centre* (as the
+    grid-oriented matchers do when a WV point is faked into a 1×1 grid), this
+    gathers every validation observation within ``footprint_radius_km`` and
+    ``time_tolerance_minutes`` of each imagette and aggregates them into a
+    single match anchored on the SAR point.
+
+    Parameters
+    ----------
+    sar_lons, sar_lats, sar_times : np.ndarray
+        Per-imagette coordinates/times for one SAR scene, shape ``(n_points,)``.
+    sar_point_vars : dict
+        SAR variables as ``(n_points,)`` arrays (e.g. ``{"oswHs": ...}``).
+    val_data : pd.DataFrame
+        Validation observations with ``lon``, ``lat``, ``time`` and any number
+        of variable columns.
+    footprint_radius_km : float
+        Search radius around each imagette (≈ footprint half-diagonal).
+    time_tolerance_minutes : float
+        Maximum absolute time difference for a validation obs to contribute.
+    distance_weighting : str
+        Aggregation weighting: ``"equal"`` (plain average, used for in-situ),
+        ``"gaussian"``, ``"inverse_distance"`` or ``"linear"``.
+    collocation_type : str
+        Label stored on each result (``"point_vs_point"`` for in-situ,
+        ``"point_vs_layer"`` for altimeter/scatterometer layers).
+
+    Returns
+    -------
+    list[CollocatedPoint]
+        One match per imagette that had at least one contributing observation.
+    """
+    from scipy.spatial import cKDTree
+
+    collocations: List[CollocatedPoint] = []
+    if val_data.empty:
+        return collocations
+
+    numeric_cols = [
+        col for col in val_data.columns
+        if col not in {"lon", "lat", "time", "platform_id", "platform_type"} and
+        pd.api.types.is_numeric_dtype(val_data[col])
+    ]
+    if not numeric_cols:
+        return collocations
+
+    val_lons = val_data["lon"].values.astype(float)
+    val_lats = val_data["lat"].values.astype(float)
+    val_times_pd = pd.to_datetime(val_data["time"].values)
+    if val_times_pd.tz is not None:
+        val_times_pd = val_times_pd.tz_localize(None)
+    val_times_np = val_times_pd.values.astype("datetime64[ns]")
+    has_platform_type = "platform_type" in val_data.columns
+    has_platform_id = "platform_id" in val_data.columns
+
+    # KD-tree over validation points; query_ball_point with the chord-length
+    # equivalent of footprint_radius_km returns every obs inside the footprint.
+    R = 6371.0
+    tree = cKDTree(_lonlat_to_unit_xyz(val_lons, val_lats))
+    chord_radius = 2.0 * np.sin(footprint_radius_km / (2.0 * R))
+
+    for i in range(len(sar_lons)):
+        s_lon = float(sar_lons[i])
+        s_lat = float(sar_lats[i])
+        if not (np.isfinite(s_lon) and np.isfinite(s_lat)):
+            continue
+
+        # SAR variables for this imagette (skip if all NaN)
+        sar_aggregated = {
+            var: float(arr[i]) for var, arr in sar_point_vars.items()
+            if np.isfinite(arr[i])
+        }
+        if not sar_aggregated:
+            continue
+
+        idx = tree.query_ball_point(
+            _lonlat_to_unit_xyz(np.array([s_lon]), np.array([s_lat]))[0],
+            r=chord_radius,
+        )
+        if not idx:
+            continue
+        idx = np.asarray(idx)
+
+        s_time_np = np.datetime64(pd.Timestamp(sar_times[i]))
+        dt_min = np.abs(
+            (val_times_np[idx] - s_time_np) / np.timedelta64(1, "m")
+        ).astype(float)
+        tmask = dt_min <= time_tolerance_minutes
+        if not np.any(tmask):
+            continue
+        idx = idx[tmask]
+        dt_min = dt_min[tmask]
+
+        dists = _haversine_distance_grid(s_lon, s_lat, val_lons[idx], val_lats[idx])
+        weights = _distance_weights(
+            dists, distance_weighting, gaussian_sigma_km, footprint_radius_km
+        )
+
+        val_aggregated: Dict[str, float] = {}
+        for col in numeric_cols:
+            vals = val_data[col].values[idx].astype(float)
+            valid = np.isfinite(vals)
+            if not np.any(valid):
+                continue
+            w = weights[valid]
+            wsum = float(np.sum(w))
+            agg = float(np.mean(vals[valid])) if wsum == 0 else float(np.sum(vals[valid] * w) / wsum)
+            if np.isfinite(agg):
+                val_aggregated[col] = agg
+        if not val_aggregated:
+            continue
+
+        nearest = int(np.argmin(dists))
+        near_row = idx[nearest]
+        point_val_source = val_source
+        if has_platform_type:
+            pt = val_data["platform_type"].values[near_row]
+            if isinstance(pt, str) and pt:
+                point_val_source = pt
+
+        collocations.append(
+            CollocatedPoint(
+                sar_lon=s_lon,
+                sar_lat=s_lat,
+                sar_time=pd.Timestamp(sar_times[i]).to_pydatetime(),
+                sar_data=sar_aggregated,
+                val_lon=float(val_lons[near_row]),
+                val_lat=float(val_lats[near_row]),
+                val_time=_to_datetime_array([val_data["time"].values[near_row]])[0],
+                val_data=val_aggregated,
+                spatial_distance_km=float(dists[nearest]),
+                temporal_distance_minutes=float(np.min(dt_min)),
+                val_source=point_val_source,
+                val_id=(val_data["platform_id"].values[near_row] if has_platform_id else None),
+                collocation_type=collocation_type,
+                sar_y_idx=0,
+                sar_x_idx=i,
+                sar_scene_name=sar_scene_name,
+            )
+        )
+
+    logger.info(
+        "WV-point collocation [%s]: %d match(es) from %d imagette(s) (source=%s)",
+        collocation_type, len(collocations), len(sar_lons), val_source,
+    )
+    return collocations
+
+
 def run_collocation(
     recipe,
     datatree: "xr.DataTree",
@@ -906,10 +1088,13 @@ def run_collocation(
         "emit_diagnostics": emit_diagnostics,
     }
     
-    # Extract layer_vs_layer specs if configured
-    layer_vs_layer_specs = {}
+    # Layer-vs-layer specs: start from the built-in defaults (so recipes that
+    # declare no layer_vs_layer section at all still get sensible per-source
+    # aggregation windows), then let any recipe-level overrides win per-key.
+    from .recipe import DEFAULT_LAYER_TYPE_SPECS
+    layer_vs_layer_specs = dict(DEFAULT_LAYER_TYPE_SPECS)
     if coll_cfg.layer_vs_layer is not None:
-        layer_vs_layer_specs = coll_cfg.layer_vs_layer.layer_type_specs
+        layer_vs_layer_specs.update(coll_cfg.layer_vs_layer.layer_type_specs)
 
     # Collect SAR nodes (one Dataset per SAR scene)
     sar_scenes: Dict[str, Any] = {}
@@ -921,8 +1106,12 @@ def run_collocation(
         logger.warning("No SAR nodes found in DataTree — nothing to collocate.")
         return None
 
-    # Load RVL data on-demand for currents validation
-    _load_rvl_for_collocation(sar_scenes, base_dir)
+    # Load RVL (radial velocity) data on-demand — only for currents recipes.
+    # RVL is the currents observable; loading it for a wind/waves recipe would
+    # add spurious {scene}_rvl SAR nodes that get collocated against the
+    # in-situ/altimeter data instead of the intended OWI/OSW measurement.
+    if str(getattr(recipe.config, "variable", "")).lower() == "currents":
+        _load_rvl_for_collocation(sar_scenes, base_dir)
 
     # Collect validation nodes (flatten up to two levels deep) and bucket
     # each by its auto-detected collocation type, tracking source metadata.
@@ -981,13 +1170,17 @@ def run_collocation(
         is_wv_mode = "point" in sar_ds.dims and "y" not in sar_ds.dims
 
         if is_wv_mode:
-            # =========== WV MODE (Point-based) ===========
-            # Extract point measurements and iterate over each point
+            # =========== WV MODE (SAR-footprint-anchored) ===========
+            # Each imagette is a single point standing for a ~20×20 km
+            # footprint, and imagettes are ~200 km apart — far too sparse to
+            # match by requiring validation data within a few km of the point
+            # centre. Instead, anchor on each imagette and aggregate every
+            # validation obs within the footprint radius (see
+            # _collocate_wv_points).
             sar_lons = sar_ds["lon"].values   # (point,)
             sar_lats = sar_ds["lat"].values   # (point,)
             sar_times = sar_ds["time"].values # (point,) as datetime64
 
-            # Get all point variables
             sar_point_vars = {
                 var: sar_ds[var].values  # (point,)
                 for var in sar_ds.data_vars
@@ -998,72 +1191,71 @@ def run_collocation(
                 logger.warning("SAR node '%s' (WV mode) has no point variables — skipping.", sar_name)
                 continue
 
-            # For each SAR point, convert to 1×1 grid format and collocate
             n_points = len(sar_lons)
-            logger.info("SAR node '%s' is WV mode with %d point measurements", sar_name, n_points)
+            logger.info("SAR node '%s' is WV mode with %d imagette point(s)", sar_name, n_points)
 
-            for point_idx in range(n_points):
-                # Extract single point and reshape to 1×1 grid
-                lon_1x1 = np.array([[sar_lons[point_idx]]])
-                lat_1x1 = np.array([[sar_lats[point_idx]]])
-                acq_time = pd.Timestamp(sar_times[point_idx]).to_pydatetime()
-                sar_time_arr = np.array([acq_time])
+            for ctype, sources in buckets.items():
+                if not sources:
+                    continue
+                for val_name, val_ds in sources.items():
+                    per_source_kwargs = source_metadata.get(val_name, {}).get("colloc_kwargs", {})
+                    merged_kwargs = _merge_collocation_kwargs(global_coll_kwargs, per_source_kwargs)
 
-                # Create 1×1 grid for each variable
-                sar_data_3d: Dict[str, np.ndarray] = {
-                    var: np.array([[[sar_point_vars[var][point_idx]]]])
-                    for var in sar_point_vars
-                }
+                    # Footprint radius (per-source override wins over recipe default)
+                    footprint_radius_km = per_source_kwargs.get(
+                        "sar_footprint_radius_km", coll_cfg.sar_footprint_radius_km
+                    )
 
-                # Run the three passes in order
-                for ctype, sources in buckets.items():
-                    if not sources:
-                        continue
-                    for val_name, val_ds in sources.items():
-                        # Apply per-source kwargs overrides
-                        per_source_kwargs = source_metadata.get(val_name, {}).get("colloc_kwargs", {})
-                        merged_kwargs = _merge_collocation_kwargs(global_coll_kwargs, per_source_kwargs)
+                    if ctype == "layer_vs_layer":
+                        # Altimeter/scatterometer: sampled as a layer at the
+                        # imagette with distance-weighted aggregation and the
+                        # layer's own time tolerance. Resolve the layer type
+                        # exactly as the grid path does.
+                        layer_type = val_ds.attrs.get("data_type", "").lower()
+                        if not layer_type:
+                            path_parts = val_name.lower().split("/")
+                            if "scatterometer" in path_parts:
+                                layer_type = "scatterometer"
+                            elif "osi_saf_winds" in path_parts or "winds" in path_parts:
+                                layer_type = "scatterometer"
+                            elif "altimeter" in path_parts:
+                                layer_type = "altimeter"
+                            elif "hf_radar" in path_parts:
+                                layer_type = "hf_radar"
+                        if layer_type == "altimeter":
+                            freq = val_ds.attrs.get("frequency", "1hz").lower()
+                            layer_type = f"altimeter_{freq}"
+                        if layer_type in layer_vs_layer_specs:
+                            merged_kwargs.update(layer_vs_layer_specs[layer_type])
+                        collocation_type = "point_vs_layer"
+                        distance_weighting = merged_kwargs.get("distance_weighting", "equal")
+                    else:
+                        # In-situ: plain average over the obs inside the footprint.
+                        collocation_type = "point_vs_point"
+                        distance_weighting = "equal"
 
-                        # For layer_vs_layer, apply layer-type-specific specs from recipe
-                        if ctype == "layer_vs_layer" and layer_vs_layer_specs:
-                            layer_type = val_ds.attrs.get("data_type", "").lower()
-                            if not layer_type:
-                                # Fallback: infer from path (e.g., "osi_saf_winds/...", "scatterometer", "altimeter")
-                                path_parts = val_name.lower().split("/")
-                                if "scatterometer" in path_parts:
-                                    layer_type = "scatterometer"
-                                elif "osi_saf_winds" in path_parts or "winds" in path_parts:
-                                    layer_type = "scatterometer"
-                                elif "altimeter" in path_parts:
-                                    layer_type = "altimeter"
-                                elif "hf_radar" in path_parts:
-                                    layer_type = "hf_radar"
-                            
-                            if layer_type in layer_vs_layer_specs:
-                                merged_kwargs.update(layer_vs_layer_specs[layer_type])
-                                logger.info(
-                                    "Applying layer_vs_layer specs for '%s': %s",
-                                    layer_type, layer_vs_layer_specs[layer_type],
-                                )
-                            
-                            # Add layer-vs-layer collocation method
-                            merged_kwargs["method"] = layer_vs_layer_collocation_method
+                    df = val_ds.to_dataframe().reset_index(drop=True)
+                    source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
 
-                        colloc = _COLLOC_CLASSES[ctype](**merged_kwargs)
-
-                        df = val_ds.to_dataframe().reset_index(drop=True)
-                        source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
-
-                        matches = colloc.collocate(
-                            sar_data=sar_data_3d,
-                            sar_lon=lon_1x1,
-                            sar_lat=lat_1x1,
-                            sar_time=sar_time_arr,
-                            val_data=df,
-                            val_source=source_label,
-                            sar_scene_name=sar_name,
-                        )
-                        all_collocations.extend(matches)
+                    matches = _collocate_wv_points(
+                        sar_lons=sar_lons,
+                        sar_lats=sar_lats,
+                        sar_times=sar_times,
+                        sar_point_vars=sar_point_vars,
+                        val_data=df,
+                        val_source=source_label,
+                        footprint_radius_km=footprint_radius_km,
+                        time_tolerance_minutes=merged_kwargs.get("time_tolerance_minutes", 30),
+                        distance_weighting=distance_weighting,
+                        gaussian_sigma_km=merged_kwargs.get("gaussian_sigma_km", 5.0),
+                        collocation_type=collocation_type,
+                        sar_scene_name=sar_name,
+                    )
+                    all_collocations.extend(matches)
+                    logger.info(
+                        "SAR '%s' × validation '%s' [%s]: %d match(es)",
+                        sar_name, val_name, collocation_type, len(matches),
+                    )
 
         else:
             # =========== IW/EW MODE (Grid-based) ===========
@@ -1106,7 +1298,14 @@ def run_collocation(
                                 layer_type = "altimeter"
                             elif "hf_radar" in path_parts:
                                 layer_type = "hf_radar"
-                        
+
+                        if layer_type == "altimeter":
+                            # Altimeter's aggregation window depends on
+                            # along-track resolution, which differs 5x
+                            # between the 1 Hz and 5 Hz products.
+                            freq = val_ds.attrs.get("frequency", "1hz").lower()
+                            layer_type = f"altimeter_{freq}"
+
                         if layer_type in layer_vs_layer_specs:
                             merged_kwargs.update(layer_vs_layer_specs[layer_type])
                             logger.info(

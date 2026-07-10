@@ -11,11 +11,14 @@ entire pipeline:
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +92,7 @@ class SARDataSpec:
 class PointVsLayerCollocation:
     """Collocation config for point vs gridded SAR data (buoys, moorings)."""
     time_tolerance_minutes: int = 30
-    spatial_tolerance_km: float = 12.5
+    spatial_tolerance_km: float = 25
     interpolation_method: str = "nearest"
     aggregation_window_km: float = 5.0
     validation_temporal_averaging_minutes: int = 30  # unused for point_vs_layer; kept for schema/API compatibility
@@ -98,6 +101,21 @@ class PointVsLayerCollocation:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+#: Built-in fallback collocation parameters per layer-type, applied
+#: regardless of whether a recipe declares a ``layer_vs_layer`` section at
+#: all. A recipe's own ``layer_type_specs`` entries (if any) override these
+#: per-key. Altimeter is split into ``altimeter_1hz``/``altimeter_5hz``
+#: because the two frequencies have very different along-track point
+#: spacing (7km vs 1.4km — see WAVE_GLO_PHY_SWH_L3_NRT_014_001), so a single
+#: aggregation window would be wrong for at least one of them.
+DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
+    "scatterometer":  {"time_tolerance_minutes": 180, "aggregation_window_km": 12.5, "distance_weighting": "equal"},
+    "altimeter_1hz":  {"time_tolerance_minutes": 180, "aggregation_window_km": 7.0,  "distance_weighting": "equal"},
+    "altimeter_5hz":  {"time_tolerance_minutes": 180, "aggregation_window_km": 1.4,  "distance_weighting": "equal"},
+    "hf_radar":       {"time_tolerance_minutes": 20,  "aggregation_window_km": 5.0,  "distance_weighting": "equal"},
+}
 
 
 @dataclass
@@ -119,8 +137,8 @@ class LayerVsLayerCollocation:
             aggregation_window_km: 12.5
             distance_weighting: equal
           altimeter:
-            time_tolerance_minutes: 120
-            aggregation_window_km: 10.0
+            time_tolerance_minutes: 180
+            aggregation_window_km: 5
             distance_weighting: equal
     """
     method: str = "cell-averaging"
@@ -146,8 +164,17 @@ class CollocationType:
     point_vs_layer: PointVsLayerCollocation = field(default_factory=PointVsLayerCollocation)
     layer_vs_layer: Optional[LayerVsLayerCollocation] = None
 
+    #: Search radius (km) around each sparse SAR WV-mode OSW imagette point
+    #: used to gather validation observations. A WV imagette covers ~20×20 km,
+    #: so 14 km ≈ its center-to-corner distance (fully covers the footprint).
+    #: Only affects WV/point-mode SAR; IW/EW grid collocation is unaffected.
+    sar_footprint_radius_km: float = 14.0
+
     def to_dict(self) -> Dict[str, Any]:
-        result = {"point_vs_layer": self.point_vs_layer.to_dict()}
+        result = {
+            "point_vs_layer": self.point_vs_layer.to_dict(),
+            "sar_footprint_radius_km": self.sar_footprint_radius_km,
+        }
         if self.layer_vs_layer is not None:
             result["layer_vs_layer"] = self.layer_vs_layer.to_dict()
         return result
@@ -247,11 +274,20 @@ class Recipe:
         sar = data.get("sar_data", {})
         coll = data.get("collocation", {})
 
+        unknown_coll_keys = set(coll) - {"point_vs_layer", "layer_vs_layer", "sar_footprint_radius_km"}
+        if unknown_coll_keys:
+            logger.warning(
+                "Recipe '%s': collocation block has unrecognized key(s) %s — "
+                "expected a nested 'point_vs_layer:'/'layer_vs_layer:' schema. "
+                "These keys are ignored; defaults apply instead.",
+                data.get("name", "<unnamed>"), sorted(unknown_coll_keys),
+            )
+
         # Parse point_vs_layer section
         pvl_config = coll.get("point_vs_layer", {})
         point_vs_layer = PointVsLayerCollocation(
             time_tolerance_minutes=pvl_config.get("time_tolerance_minutes", 30),
-            spatial_tolerance_km=pvl_config.get("spatial_tolerance_km", 12.5),
+            spatial_tolerance_km=pvl_config.get("spatial_tolerance_km", 25),
             interpolation_method=pvl_config.get("interpolation_method", "nearest"),
             aggregation_window_km=pvl_config.get("aggregation_window_km", 5.0),
             validation_temporal_averaging_minutes=pvl_config.get("validation_temporal_averaging_minutes", 30),
@@ -302,6 +338,7 @@ class Recipe:
             collocation=CollocationType(
                 point_vs_layer=point_vs_layer,
                 layer_vs_layer=layer_vs_layer,
+                sar_footprint_radius_km=coll.get("sar_footprint_radius_km", 14.0),
             ),
             output_dir=data.get("output_dir"),
         )

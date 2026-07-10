@@ -201,17 +201,24 @@ class DataTreeConverter:
         nc_path: Union[str, Path],
     ) -> Optional[xr.Dataset]:
         """
-        Open an altimeter netCDF file as a Dataset.
+        Open a Copernicus Marine along-track altimeter NetCDF (L3 SWH product)
+        and return a standardised Dataset with a flat ``point`` dimension,
+        matching the layout produced by ``from_scatterometer_nc``.
+
+        These files carry a single ``time`` dimension, with ``latitude``,
+        ``longitude`` and every variable (``VAVH``, ``VAVH_UNFILTERED``, and
+        either ``WIND_SPEED`` (1 Hz) or ``VAVH_UNCERTAINTY`` (5 Hz)) all
+        indexed purely by ``time`` — i.e. a flat along-track point series.
 
         Parameters
         ----------
         nc_path : str or Path
-            Path to a netCDF file.
+            Path to the altimeter NetCDF file.
 
         Returns
         -------
         xr.Dataset or None
-            None if the file does not exist.
+            Dataset with ``data_type="altimeter"``, or None on failure.
         """
         nc_path = Path(nc_path)
         if not nc_path.exists():
@@ -219,13 +226,71 @@ class DataTreeConverter:
             return None
 
         try:
-            ds = xr.open_dataset(nc_path)
+            raw = xr.open_dataset(nc_path)
         except Exception as exc:
             logger.warning("Could not open %s: %s", nc_path, exc)
             return None
 
-        ds.attrs.setdefault("data_type", "altimeter")
-        ds.attrs.setdefault("source",    "Copernicus")
+        if "latitude" not in raw or "longitude" not in raw:
+            logger.warning(
+                "Could not find latitude/longitude in %s (available: %s)",
+                nc_path.name, list(raw.coords) + list(raw.data_vars),
+            )
+            raw.close()
+            return None
+
+        lat_arr = raw["latitude"].values.ravel().astype(float)
+        lon_arr = raw["longitude"].values.ravel().astype(float)
+        # Files use 0-360 degrees_east; normalize to -180..180.
+        lon_arr = ((lon_arr + 180) % 360) - 180
+
+        if "time" in raw:
+            time_arr = pd.to_datetime(raw["time"].values.ravel()).values
+        else:
+            logger.warning("Could not find time in %s; using NaT.", nc_path.name)
+            time_arr = np.full(len(lat_arr), np.datetime64("NaT", "ns"))
+
+        n_points = len(lat_arr)
+
+        # 1 Hz files carry WIND_SPEED; 5 Hz files carry VAVH_UNCERTAINTY
+        # instead — this also doubles as the frequency signal used by the
+        # collocation step to pick a resolution-appropriate aggregation
+        # window (7km at 1 Hz vs 1.4km at 5 Hz).
+        frequency = "5hz" if "VAVH_UNCERTAINTY" in raw else "1hz"
+
+        _skip = {"latitude", "longitude", "time"}
+        data_vars: Dict[str, tuple] = {}
+        for vname, da in raw.data_vars.items():
+            if vname in _skip:
+                continue
+            if da.dtype.kind not in ("f", "i", "u"):
+                continue
+            flat = da.values.ravel()
+            if len(flat) != n_points:
+                continue
+            data_vars[vname] = ("point", flat.astype(float))
+
+        if not data_vars:
+            logger.warning("No usable data variables found in %s.", nc_path.name)
+            raw.close()
+            return None
+
+        ds = xr.Dataset(
+            data_vars,
+            coords={
+                "lon":  ("point", lon_arr),
+                "lat":  ("point", lat_arr),
+                "time": ("point", time_arr),
+            },
+        )
+        ds.attrs["data_type"]     = "altimeter"
+        ds.attrs["platform_type"] = "altimeter"
+        ds.attrs["satellite"]     = raw.attrs.get("platform", "")
+        ds.attrs["frequency"]     = frequency
+        ds.attrs["source"]        = "Copernicus Marine altimeter L3"
+        ds.attrs["filename"]      = nc_path.name
+
+        raw.close()
         return ds
 
     @staticmethod
@@ -1371,14 +1436,24 @@ class DataTreeConverter:
                         datasets[f"validation/{subdir_name}/{nc_path.stem}"] = ds
                         logger.info("Converted %s (scatterometer): %s", subdir_name, nc_path.name)
 
-        # Altimeter NetCDF products (kept as raw dataset)
+        # Altimeter NetCDF products (kept as raw dataset). copernicusmarine
+        # sometimes can't merge a satellite/frequency request into a single
+        # flat file and instead writes a directory (named after the
+        # requested output filename) containing one .nc per platform, so
+        # discovery must recurse. The node key is built from the path
+        # relative to `altimeter/` (not just the file stem) because
+        # different frequency subdirectories can contain identically-named
+        # platform files (e.g. "Cryosat-2.nc" under both a 1 Hz and 5 Hz
+        # dataset folder), which would otherwise collide in `datasets`.
         subdir = base_dir / "altimeter"
         if subdir.exists():
-            for nc_path in sorted(subdir.glob("*.nc")):
+            for nc_path in sorted(subdir.rglob("*.nc")):
                 ds = DataTreeConverter.from_altimeter(nc_path)
                 if ds is not None:
-                    datasets[f"validation/altimeter/{nc_path.stem}"] = ds
-                    logger.info("Converted altimeter: %s", nc_path.name)
+                    rel = nc_path.relative_to(subdir).with_suffix("")
+                    key = "_".join(rel.parts)
+                    datasets[f"validation/altimeter/{key}"] = ds
+                    logger.info("Converted altimeter: %s", nc_path.relative_to(subdir))
 
         if not datasets:
             logger.warning("No convertible data found in %s", base_dir)

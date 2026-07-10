@@ -159,7 +159,8 @@ Examples:
     parser.add_argument(
         "--collocation-log",
         action="store_true",
-        help="Enable detailed diagnostic logging and visualization for scatterometer collocation",
+        help="Enable detailed per-point diagnostic logging during collocation "
+             "(the diagnostics plot is always generated regardless of this flag)",
     )
     parser.add_argument(
         "--layer-vs-layer-collocation-method",
@@ -251,7 +252,7 @@ def _create_recipe(
             name="Wind Validation",
             description=(
                 "Validate Sentinel-1 IW/EW mode wind speed and direction\n"
-                "against moorings, buoys, and ASCAT scatterometer."
+                "against moorings, buoys, ASCAT scatterometer, and 1 Hz altimeter."
             ),
             variable="wind",
             variable_specs={"components": ["speed", "direction"]},
@@ -264,6 +265,7 @@ def _create_recipe(
                 ValidationDataSource(source_type="drifter"),
                 ValidationDataSource(source_type="tidal_gauge"),
                 ValidationDataSource(source_type="scatterometer"),
+                ValidationDataSource(source_type="altimeter"),
             ],
             collocation=CollocationType(
                 point_vs_layer=PointVsLayerCollocation(),
@@ -273,7 +275,15 @@ def _create_recipe(
                             "time_tolerance_minutes": 180,
                             "aggregation_window_km": 12.5,
                             "distance_weighting": "equal",
-                        }
+                        },
+                        # Wind recipes only ever download 1 Hz altimeter data
+                        # (no WIND_SPEED at 5 Hz) — see DEFAULT_LAYER_TYPE_SPECS
+                        # in recipe.py for the matching aggregation window.
+                        "altimeter_1hz": {
+                            "time_tolerance_minutes": 180,
+                            "aggregation_window_km": 7.0,
+                            "distance_weighting": "equal",
+                        },
                     }
                 ),
             ),
@@ -314,7 +324,7 @@ def _create_recipe(
             name="Wave Height Validation",
             description=(
                 "Validate Sentinel-1 significant wave height\n"
-                "against moorings and altimeter."
+                "against moorings, tidal gauges, drifters, and altimeter."
             ),
             variable="waves",
             variable_specs={"components": ["significant_wave_height"]},
@@ -322,17 +332,27 @@ def _create_recipe(
             sar_data=SARDataSpec(swath_mode=["WV","SM"], max_downloads=limit),
             validation_sources=[
                 ValidationDataSource(source_type="mooring"),
+                ValidationDataSource(source_type="tidal_gauge"),
+                ValidationDataSource(source_type="drifter"),
                 ValidationDataSource(source_type="altimeter"),
             ],
             collocation=CollocationType(
                 point_vs_layer=PointVsLayerCollocation(),
                 layer_vs_layer=LayerVsLayerCollocation(
                     layer_type_specs={
-                        "altimeter": {
-                            "time_tolerance_minutes": 120,
-                            "aggregation_window_km": 10.0,
+                        # 1 Hz (~7km) and 5 Hz (~1.4km along-track) altimeter
+                        # data need different aggregation windows — see
+                        # DEFAULT_LAYER_TYPE_SPECS in recipe.py.
+                        "altimeter_1hz": {
+                            "time_tolerance_minutes": 180,
+                            "aggregation_window_km": 7.0,
                             "distance_weighting": "equal",
-                        }
+                        },
+                        "altimeter_5hz": {
+                            "time_tolerance_minutes": 180,
+                            "aggregation_window_km": 1.4,
+                            "distance_weighting": "equal",
+                        },
                     }
                 ),
             ),
@@ -473,39 +493,6 @@ def _is_already_downloaded(base_dir: Path) -> bool:
         return False
 
 
-def _infer_sar_var_from_recipe(recipe) -> str:
-    """
-    Infer the primary SAR variable name from the recipe's ``variable`` field.
-
-    Parameters
-    ----------
-    recipe : Recipe
-        Recipe object with config.variable (e.g., "wind", "currents", "waves").
-
-    Returns
-    -------
-    str
-        The primary SAR variable name, e.g., "owiWindSpeed", "owiSignificantWaveHeight".
-
-    Raises
-    ------
-    ValueError
-        If variable is not recognised or no SAR variable pair exists.
-    """
-    from .core._variable_map import VARIABLE_PAIRS
-
-    variable = recipe.config.variable
-    if variable not in VARIABLE_PAIRS:
-        raise ValueError(f"Unknown recipe variable: {variable}")
-
-    pairs = VARIABLE_PAIRS[variable]
-    if not pairs:
-        raise ValueError(f"No SAR variable pairs defined for {variable}")
-
-    # Return the first (primary) SAR variable for this variable type
-    return pairs[0][0]
-
-
 def _convert_data(recipe, base_dir: Path) -> "xr.DataTree | None":
     """Run step 2: convert downloaded files to a DataTree."""
     from .core.datatree_converter import DataTreeConverter
@@ -531,7 +518,7 @@ def _collocate_data(
     """Run step 3: load DataTree and run collocation."""
     import xarray as xr
     from .core.collocation import run_collocation
-    from .core.visualization import plot_sar_on_no_collocation, plot_collocation_diagnostics
+    from .core.visualization import plot_collocation_diagnostics
 
     datatree_path = base_dir / "datatree.nc"
     if not datatree_path.exists():
@@ -555,38 +542,22 @@ def _collocate_data(
     )
     if result is None:
         print("  No collocated pairs found.")
-        # Fallback: plot SAR data coverage for debugging
-        try:
-            sar_var = _infer_sar_var_from_recipe(recipe)
-            recipe_name = recipe.config.name or "unknown"
-            png_path = plot_sar_on_no_collocation(tree, sar_var, recipe_name, base_dir, recipe=recipe, filename_suffix=filename_suffix)
-            if png_path:
-                print(f"  Generated SAR coverage plot: {png_path.relative_to(base_dir.parent)}")
-        except Exception as exc:
-            print(f"  Could not generate SAR coverage plot: {exc}")
+        collocation_ds = None
     else:
         n = result.sizes.get("collocation", 0)
         print(f"  {n} collocated pair(s) saved to {base_dir / f'collocation_results{filename_suffix}.nc'}")
+        collocation_ds = result
 
-        # Generate diagnostic plot if requested
-        if emit_diagnostics and n > 0:
-            try:
-                diag_path = plot_collocation_diagnostics(tree, result, recipe, base_dir, filename_suffix=filename_suffix)
-                if diag_path:
-                    print(f"  Generated diagnostic plot: {diag_path.relative_to(base_dir.parent)}")
-            except Exception as exc:
-                print(f"  Could not generate diagnostic plot: {exc}")
-                logger.debug("Diagnostic plot error: %s", exc, exc_info=True)
-
-        # Also generate SAR coverage plot with collocation status
-        try:
-            sar_var = _infer_sar_var_from_recipe(recipe)
-            recipe_name = recipe.config.name or "unknown"
-            png_path = plot_sar_on_no_collocation(tree, sar_var, recipe_name, base_dir, recipe=recipe, has_collocation=True, filename_suffix=filename_suffix)
-            if png_path:
-                print(f"  Generated SAR coverage plot: {png_path.relative_to(base_dir.parent)}")
-        except Exception as exc:
-            print(f"  Could not generate SAR coverage plot: {exc}")
+    # Always generate the collocation diagnostics plot — including when
+    # there are zero collocated pairs, in which case every validation point
+    # shows up as unmatched.
+    try:
+        diag_path = plot_collocation_diagnostics(tree, collocation_ds, recipe, base_dir, filename_suffix=filename_suffix)
+        if diag_path:
+            print(f"  Generated diagnostic plot: {diag_path.relative_to(base_dir.parent)}")
+    except Exception as exc:
+        print(f"  Could not generate diagnostic plot: {exc}")
+        logger.debug("Diagnostic plot error: %s", exc, exc_info=True)
 
 
 def _compute_stats(recipe, base_dir: Path, filename_suffix: str = "") -> None:

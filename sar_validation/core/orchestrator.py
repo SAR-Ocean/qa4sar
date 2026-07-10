@@ -6,6 +6,7 @@ Reads a Recipe and drives all data downloads:
   - In-situ observations (moorings, buoys, ferryboxes, …)
   - HF radar
   - Scatterometer (ASCAT MetOp-B/C)
+  - Altimeter (along-track SWH/wind, Copernicus Marine L3)
   - Radiosonde (not yet implemented)
 """
 
@@ -273,12 +274,47 @@ class DataOrchestrator:
             self.metadata["downloads"]["hf_radar"] = {"status": "failed", "error": msg}
             return False
 
+    # Altimeter download frequencies, keyed by recipe variable. Wind never
+    # needs 5 Hz (no WIND_SPEED there, and 5x the point density for no
+    # benefit); waves uses both since VAVH/VAVH_UNFILTERED exist at both.
+    _ALTIMETER_FREQUENCIES_BY_VARIABLE = {
+        "wind":  ["1hz"],
+        "waves": ["1hz", "5hz"],
+    }
+
     def _download_altimeter(self, source) -> bool:
-        # TODO: implement altimeter downloader
-        msg = "Altimeter downloader is not yet implemented."
-        logger.warning(msg)
-        self.metadata["downloads"]["altimeter"] = {"status": "not_implemented"}
-        return True   # non-fatal
+        from ..downloaders.altimeter_downloader import AltimeterDownloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        temp   = cfg.temporal_bounds
+        out_dir = self.base_dir / "altimeter"
+
+        try:
+            dl = AltimeterDownloader(output_dir=out_dir, dry_run=self.dry_run)
+            kwargs = {
+                "frequencies": self._ALTIMETER_FREQUENCIES_BY_VARIABLE.get(
+                    cfg.variable, ["1hz", "5hz"]
+                ),
+            }
+            kwargs.update(source.download_kwargs)   # recipe-level override wins
+            paths = dl.download(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=temp.start, end=temp.end,
+                **kwargs,
+            )
+            self.metadata["downloads"]["altimeter"] = {
+                "status": "dry_run" if self.dry_run else "success",
+                "files":  [str(p) for p in paths],
+            }
+            return True
+        except Exception as exc:
+            msg = f"Altimeter download failed: {exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"]["altimeter"] = {"status": "failed", "error": msg}
+            return False
 
     def _download_radiosonde(self, source) -> bool:
         msg = "Radiosonde downloader is not yet implemented (see radiosonde_downloader.py)."

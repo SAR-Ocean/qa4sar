@@ -44,28 +44,30 @@ validation_sources:
   - source_type: hf_radar
     min_depth: -2
     max_depth:  2
-    collocation_kwargs:
-      time_tolerance_minutes: 60
-      spatial_tolerance_km: 25
 
   # Drifting buoys
   - source_type: drifter
     min_depth: -20
     max_depth:  20
-    collocation_kwargs:
-      time_tolerance_minutes: 60
-      spatial_tolerance_km: 50
+    collocation_kwargs: {}
 
   # Ferrybox data
   - source_type: ferrybox
     min_depth: -20
     max_depth:  20
-    collocation_kwargs:
-      time_tolerance_minutes: 60
-      spatial_tolerance_km: 50
+    collocation_kwargs: {}
 
+# point_vs_layer applies to drifters/ferryboxes (30 min / 12.5 km, the
+# Abderrahim et al. 2019 / hal-04202202 standard); layer_vs_layer applies to
+# HF radar (60 min / 5 km aggregation window).
 collocation:
-  type: point_vs_layer
-  time_tolerance_minutes: 60
-  spatial_tolerance_km: 50
-  interpolation_method: nearest
+  point_vs_layer:
+    time_tolerance_minutes: 30
+    spatial_tolerance_km: 12.5
+    interpolation_method: nearest
+  layer_vs_layer:
+    layer_type_specs:
+      hf_radar:
+        time_tolerance_minutes: 60
+        aggregation_window_km: 5.0
+        distance_weighting: equal

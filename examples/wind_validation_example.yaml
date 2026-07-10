@@ -44,26 +44,27 @@ validation_sources:
   - source_type: mooring
     min_depth: -20
     max_depth:  20
-    collocation_kwargs:
-      time_tolerance_minutes: 60
-      spatial_tolerance_km: 50
+    collocation_kwargs: {}
 
   - source_type: buoy
     min_depth: -20
     max_depth:  20
-    collocation_kwargs:
-      time_tolerance_minutes: 60
-      spatial_tolerance_km: 50
+    collocation_kwargs: {}
 
   - source_type: scatterometer   # ASCAT MetOp-B/C via EUMETSAT EUMDAC
-    collocation_kwargs:
-      time_tolerance_minutes: 120
-      spatial_tolerance_km: 100
 
 # Collocation strategy
-# Options: point_vs_layer | layer_vs_layer
+# point_vs_layer applies to moorings/buoys (30 min / 12.5 km, the
+# Abderrahim et al. 2019 / hal-04202202 standard); layer_vs_layer applies to
+# scatterometer (180 min / 12.5 km aggregation window, same reference).
 collocation:
-  type: point_vs_layer
-  time_tolerance_minutes: 60
-  spatial_tolerance_km: 50
-  interpolation_method: nearest
+  point_vs_layer:
+    time_tolerance_minutes: 30
+    spatial_tolerance_km: 12.5
+    interpolation_method: nearest
+  layer_vs_layer:
+    layer_type_specs:
+      scatterometer:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 12.5
+        distance_weighting: equal

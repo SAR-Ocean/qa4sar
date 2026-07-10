@@ -26,6 +26,7 @@ __all__ = [
 VARIABLE_PAIRS: dict[str, List[Tuple[str, str]]] = {
     "wind": [
         ("owiWindSpeed",     "WSPD"),
+        ("owiWindSpeed",     "WIND_SPEED"),   # 1 Hz altimeter-derived U10
         ("owiWindDirection", "WDIR"),
     ],
     "currents": [
