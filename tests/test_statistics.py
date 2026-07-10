@@ -222,11 +222,11 @@ class TestVariableMap:
 
     def test_currents_pairs(self):
         pairs = infer_variable_pairs("currents")
-        assert ("owiEastwardCurrent", "EWCT") in pairs
+        assert ("rvlRadVel", "rvlRadVel_projection") in pairs
 
     def test_waves_pairs(self):
         pairs = infer_variable_pairs("waves")
-        assert ("owiSignificantWaveHeight", "VHM0") in pairs
+        assert ("oswHs", "VHM0") in pairs
 
     def test_unknown_raises(self):
         with pytest.raises(KeyError):

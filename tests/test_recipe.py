@@ -17,6 +17,8 @@ from sar_validation.core.recipe import (
     SARDataSpec,
     ValidationDataSource,
     CollocationType,
+    PointVsLayerCollocation,
+    LayerVsLayerCollocation,
 )
 
 
@@ -96,9 +98,14 @@ class TestJSONRoundtrip:
             variable="currents",
             sar_data=SARDataSpec(swath_mode=["WV"], max_downloads=5),
             collocation=CollocationType(
-                type="layer_vs_layer",
-                time_tolerance_minutes=120,
-                spatial_tolerance_km=25.0,
+                point_vs_layer=PointVsLayerCollocation(
+                    time_tolerance_minutes=120,
+                    spatial_tolerance_km=25.0,
+                ),
+                layer_vs_layer=LayerVsLayerCollocation(
+                    layer_type_specs={"altimeter": {"time_tolerance_minutes": 90}},
+                ),
+                sar_footprint_radius_km=18.0,
             ),
         )
         recipe = Recipe(cfg)
@@ -109,8 +116,15 @@ class TestJSONRoundtrip:
         assert loaded.config.name == "Currents Test"
         assert loaded.config.sar_data.swath_mode == ["WV"]
         assert loaded.config.sar_data.max_downloads == 5
-        assert loaded.config.collocation.type == "layer_vs_layer"
-        assert loaded.config.collocation.spatial_tolerance_km == 25.0
+        assert loaded.config.collocation.point_vs_layer.time_tolerance_minutes == 120
+        assert loaded.config.collocation.point_vs_layer.spatial_tolerance_km == 25.0
+        assert loaded.config.collocation.sar_footprint_radius_km == 18.0
+        assert (
+            loaded.config.collocation.layer_vs_layer.layer_type_specs["altimeter"][
+                "time_tolerance_minutes"
+            ]
+            == 90
+        )
 
 
 # ---------------------------------------------------------------------------
