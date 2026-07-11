@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 import logging
+
+from ._cf_metadata import apply_cf_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,130 @@ _ASCAT_REJECT_FLAGS = {
     "not_enough_good_sigma0_for_wind_retrieval",
     "distance_to_gmf_too_large",
 }
+
+
+def _subset_point_ds(
+    ds: xr.Dataset,
+    *,
+    min_lon: float,
+    max_lon: float,
+    min_lat: float,
+    max_lat: float,
+    t_start,
+    t_end,
+    buffer_km: float,
+    time_tolerance_minutes: float,
+) -> Optional[xr.Dataset]:
+    """
+    Subset a point-geometry Dataset to a recipe's domain plus tolerances.
+
+    Keeps only points inside the geographic bounding box expanded by
+    ``buffer_km`` (converted to degrees with the same ~55 km/deg convention
+    used by the collocation pre-filters) and inside the temporal window
+    expanded by ``time_tolerance_minutes`` on both sides. Points with a NaT
+    timestamp are kept — they cannot be proven out-of-window.
+
+    Datasets without a ``point`` dimension or without ``lon``/``lat``
+    coordinates are returned unchanged.
+
+    Returns
+    -------
+    xr.Dataset or None
+        The subset Dataset, or None if no points survive the filter.
+    """
+    if "point" not in ds.dims or "lon" not in ds.coords or "lat" not in ds.coords:
+        return ds
+
+    deg_buf = buffer_km / 55.0
+    lon = ds["lon"].values
+    lat = ds["lat"].values
+    mask = (
+        (lon >= min_lon - deg_buf) & (lon <= max_lon + deg_buf)
+        & (lat >= min_lat - deg_buf) & (lat <= max_lat + deg_buf)
+    )
+
+    if "time" in ds.coords:
+        tol = pd.Timedelta(minutes=time_tolerance_minutes)
+        t0 = (pd.Timestamp(t_start) - tol).to_datetime64()
+        t1 = (pd.Timestamp(t_end) + tol).to_datetime64()
+        times = pd.to_datetime(ds["time"].values)
+        if times.tz is not None:
+            times = times.tz_localize(None)
+        times = times.values
+        in_window = (times >= t0) & (times <= t1)
+        mask &= in_window | pd.isna(times)
+
+    n_total = ds.sizes["point"]
+    n_kept = int(mask.sum())
+    if n_kept == 0:
+        return None
+    if n_kept == n_total:
+        return ds
+    logger.info(
+        "Domain filter kept %d/%d points (%.1f%%)",
+        n_kept, n_total, 100.0 * n_kept / n_total,
+    )
+    return ds.isel(point=np.flatnonzero(mask))
+
+
+def _build_subset_kwargs(recipe) -> Dict[str, Any]:
+    """
+    Derive the widest filter envelope for :func:`_subset_point_ds` from a
+    recipe: its geographic/temporal bounds plus the most permissive spatial
+    and temporal collocation tolerance any source could use — so the filter
+    can never discard a point that some collocation pass would have matched.
+    """
+    from .recipe import DEFAULT_LAYER_TYPE_SPECS
+
+    cfg = recipe.config
+    coll = cfg.collocation
+    pvl = coll.point_vs_layer
+
+    layer_specs = dict(DEFAULT_LAYER_TYPE_SPECS)
+    if coll.layer_vs_layer is not None:
+        for key, spec in coll.layer_vs_layer.layer_type_specs.items():
+            layer_specs[key] = {**layer_specs.get(key, {}), **spec}
+    # Per-source collocation overrides can also raise the tolerances
+    override_specs = [
+        src.collocation_kwargs
+        for src in cfg.validation_sources
+        if src.collocation_kwargs
+    ]
+    all_specs = list(layer_specs.values()) + override_specs
+
+    buffer_km = max(
+        pvl.aggregation_window_km,
+        pvl.spatial_tolerance_km,
+        coll.sar_footprint_radius_km,
+        *(
+            float(spec["aggregation_window_km"])
+            for spec in all_specs
+            if "aggregation_window_km" in spec
+        ),
+        *(
+            float(spec["spatial_tolerance_km"])
+            for spec in all_specs
+            if "spatial_tolerance_km" in spec
+        ),
+    )
+    time_tolerance_minutes = max(
+        pvl.time_tolerance_minutes,
+        *(
+            float(spec["time_tolerance_minutes"])
+            for spec in all_specs
+            if "time_tolerance_minutes" in spec
+        ),
+    )
+
+    b = cfg.geographic_bounds
+    t = cfg.temporal_bounds
+    return {
+        "min_lon": b.min_lon, "max_lon": b.max_lon,
+        "min_lat": b.min_lat, "max_lat": b.max_lat,
+        "t_start": t.start, "t_end": t.end,
+        "buffer_km": buffer_km,
+        "time_tolerance_minutes": time_tolerance_minutes,
+    }
 
 
 class DataTreeConverter:
@@ -121,6 +247,19 @@ class DataTreeConverter:
 
         df["time"] = pd.to_datetime(df["time"])
 
+        # Provenance columns present in Copernicus Marine in-situ exports;
+        # captured before the wide-format pivot drops them.
+        doi = None
+        insitu_institution = None
+        for col, target in (("product_doi", "doi"), ("doi", "doi"), ("institution", "institution")):
+            if col in df.columns:
+                vals = df[col].dropna()
+                if not vals.empty:
+                    if target == "doi" and doi is None:
+                        doi = str(vals.iloc[0])
+                    elif target == "institution" and insitu_institution is None:
+                        insitu_institution = str(vals.iloc[0])
+
         # ------------------------------------------------------------------
         # Copernicus Marine in-situ files use a long format where each row
         # holds one variable code ("WSPD", "EWCT", …) in a ``variable``
@@ -191,6 +330,15 @@ class DataTreeConverter:
                 "platform_type": ("point", _to_numpy(platform_type)),
             },
         )
+        if doi:
+            ds.attrs["references"] = doi
+        if insitu_institution:
+            ds.attrs["institution"] = insitu_institution
+        apply_cf_metadata(ds, "insitu", {
+            "platform_id":   {"long_name": "platform identifier (Copernicus Marine)"},
+            "platform_type": {"long_name": "platform category (mooring, buoy, drifter, ...)"},
+        })
+
         ds.attrs["data_type"]     = "insitu_observations"
         ds.attrs["platform_type"] = source_type
         ds.attrs["source"]        = "Copernicus Marine"
@@ -209,6 +357,10 @@ class DataTreeConverter:
         ``longitude`` and every variable (``VAVH``, ``VAVH_UNFILTERED``, and
         either ``WIND_SPEED`` (1 Hz) or ``VAVH_UNCERTAINTY`` (5 Hz)) all
         indexed purely by ``time`` — i.e. a flat along-track point series.
+
+        The raw ``WIND_SPEED`` variable is renamed to the canonical ``WSPD``
+        code (matching the in-situ and scatterometer converters) so all
+        wind-speed sources are compared in the same validation section.
 
         Parameters
         ----------
@@ -259,7 +411,12 @@ class DataTreeConverter:
         frequency = "5hz" if "VAVH_UNCERTAINTY" in raw else "1hz"
 
         _skip = {"latitude", "longitude", "time"}
+        # CMEMS altimeter wind speed → the canonical WSPD code used by the
+        # in-situ and scatterometer converters, so all wind-speed sources
+        # land in the same comparison (statistics section / report plots).
+        _rename = {"WIND_SPEED": "WSPD"}
         data_vars: Dict[str, tuple] = {}
+        var_attrs: Dict[str, Dict] = {}
         for vname, da in raw.data_vars.items():
             if vname in _skip:
                 continue
@@ -268,7 +425,9 @@ class DataTreeConverter:
             flat = da.values.ravel()
             if len(flat) != n_points:
                 continue
-            data_vars[vname] = ("point", flat.astype(float))
+            out_name = _rename.get(vname, vname)
+            data_vars[out_name] = ("point", flat.astype(float))
+            var_attrs[out_name] = dict(da.attrs)
 
         if not data_vars:
             logger.warning("No usable data variables found in %s.", nc_path.name)
@@ -283,6 +442,10 @@ class DataTreeConverter:
                 "time": ("point", time_arr),
             },
         )
+        if raw.attrs.get("doi"):
+            ds.attrs["references"] = str(raw.attrs["doi"])
+        apply_cf_metadata(ds, "altimeter", var_attrs)
+
         ds.attrs["data_type"]     = "altimeter"
         ds.attrs["platform_type"] = "altimeter"
         ds.attrs["satellite"]     = raw.attrs.get("platform", "")
@@ -567,6 +730,7 @@ class DataTreeConverter:
         # by ``_variable_map.VARIABLE_PAIRS``.
         _rename = {"wind_speed": "WSPD", "wind_dir": "WDIR"}
         data_vars: Dict[str, tuple] = {}
+        var_attrs: Dict[str, Dict] = {}
         for vname, da in raw.data_vars.items():
             if vname in _skip:
                 continue
@@ -576,6 +740,8 @@ class DataTreeConverter:
             if len(flat) != n_points_raw:
                 continue   # different spatial grid — skip
             flat = flat[keep_mask].astype(float)
+            out_name = _rename.get(vname, vname)
+            attrs = dict(da.attrs)
             if vname == "wind_dir":
                 # ASCAT/OSI-SAF direction is oceanographic convention (the
                 # direction the wind is blowing TOWARDS), while Sentinel-1
@@ -585,7 +751,17 @@ class DataTreeConverter:
                 # downstream consumer (collocation, statistics, plots) sees a
                 # single consistent convention.
                 flat = (flat + 180.0) % 360.0
-            data_vars[_rename.get(vname, vname)] = ("point", flat)
+                # The raw attrs describe the pre-rotation convention
+                # (standard_name "wind_to_direction") — fix them to match
+                # the rotated values.
+                attrs["standard_name"] = "wind_from_direction"
+                attrs["long_name"] = "wind direction at 10 m (meteorological convention)"
+                attrs["comment"] = (
+                    "Rotated 180 degrees from the OSI-SAF oceanographic "
+                    "convention (wind_to_direction) by sar-l2-validation-toolbox."
+                )
+            data_vars[out_name] = ("point", flat)
+            var_attrs[out_name] = attrs
 
         if not data_vars:
             logger.warning(
@@ -602,6 +778,13 @@ class DataTreeConverter:
                 "time": ("point", time_arr),
             },
         )
+        # Carry over the raw product's descriptive globals before stamping
+        # the CF conventions/references/history.
+        for gattr in ("title", "institution"):
+            if raw.attrs.get(gattr):
+                ds.attrs[gattr] = str(raw.attrs[gattr])
+        apply_cf_metadata(ds, "scatterometer", var_attrs)
+
         ds.attrs["data_type"]     = "scatterometer"
         ds.attrs["platform_type"] = "scatterometer"
         ds.attrs["source"]        = "OSI-SAF ASCAT"
@@ -773,6 +956,7 @@ class DataTreeConverter:
         point_hs = []
         point_times = []
         file_names = []
+        osw_attrs: Dict[str, Dict] = {}
 
         for nc_path in wv_files:
             try:
@@ -789,6 +973,8 @@ class DataTreeConverter:
                 # Extract oswHs from first partition
                 hs_val = ds_raw["oswHs"].isel(oswPartitions=0).values.item()
                 hs = float(hs_val) if np.isfinite(hs_val) else np.nan
+                if not osw_attrs:
+                    osw_attrs = {"oswHs": dict(ds_raw["oswHs"].attrs)}
 
                 # Acquisition time from filename (format: YYYYMMDDtHHMMSS)
                 m = re.search(r"(\d{8}t\d{6})", nc_path.stem, re.IGNORECASE)
@@ -830,6 +1016,7 @@ class DataTreeConverter:
         }
 
         ds = xr.Dataset(data_vars, coords=coords)
+        apply_cf_metadata(ds, "sar", osw_attrs)
         ds.attrs["data_type"] = "sar_l2_ocn"
         ds.attrs["source"] = "Sentinel-1"
         ds.attrs["safe_dir"] = safe_dir.name
@@ -971,6 +1158,11 @@ class DataTreeConverter:
                 }
 
                 ds = xr.Dataset(data_vars, coords=coords)
+                apply_cf_metadata(ds, "sar", {
+                    var: dict(ds_raw[var].attrs)
+                    for var in data_vars
+                    if var in ds_raw
+                })
                 ds.attrs["data_type"] = "sar_l2_ocn"
                 ds.attrs["source"] = "Sentinel-1"
                 ds.attrs["safe_dir"] = safe_dir.name
@@ -998,6 +1190,7 @@ class DataTreeConverter:
             point_incidence = []
             point_times = []
             file_names = []
+            rvl_attrs: Dict[str, Dict] = {}
 
             for nc_path in rvl_files:
                 try:
@@ -1010,6 +1203,13 @@ class DataTreeConverter:
                     # Check if RVL data exists in this file
                     if "rvlRadVel" not in ds_raw:
                         continue
+
+                    if not rvl_attrs:
+                        rvl_attrs = {
+                            v: dict(ds_raw[v].attrs)
+                            for v in ("rvlRadVel", "rvlHeading", "rvlIncidenceAngle")
+                            if v in ds_raw
+                        }
 
                     # Extract RVL grid arrays and flatten to 1D
                     rvl_radvel = ds_raw["rvlRadVel"].values.ravel()
@@ -1071,6 +1271,7 @@ class DataTreeConverter:
             }
 
             ds = xr.Dataset(data_vars, coords=coords)
+            apply_cf_metadata(ds, "sar", rvl_attrs)
             ds.attrs["data_type"] = "sar_l2_ocn"
             ds.attrs["source"] = "Sentinel-1"
             ds.attrs["safe_dir"] = safe_dir.name
@@ -1254,6 +1455,11 @@ class DataTreeConverter:
             }
 
             ds = xr.Dataset(data_vars, coords=coords)
+            apply_cf_metadata(ds, "sar", {
+                var: dict(ds_raw[var].attrs)
+                for var in data_vars
+                if var in ds_raw
+            })
             ds.attrs["data_type"] = "sar_l2_ocn"
             ds.attrs["source"] = "Sentinel-1"
             ds.attrs["safe_dir"] = safe_dir.name
@@ -1376,6 +1582,7 @@ class DataTreeConverter:
     def convert_downloaded_data(
         base_dir: Union[str, Path],
         product_type: str = "wind",
+        recipe=None,
     ) -> Optional[xr.DataTree]:
         """
         Auto-discover all downloaded files inside *base_dir* and convert them
@@ -1398,6 +1605,13 @@ class DataTreeConverter:
         product_type : str, optional
             Type of SAR product to extract: "wind" (OWI), "waves" (OSW), or "currents" (RVL).
             Default is "wind".
+        recipe : Recipe, optional
+            When given, every validation node is subset to the recipe's
+            geographic/temporal bounds expanded by the largest collocation
+            tolerance in play (see :func:`_subset_point_ds`) before it is
+            stored, so ``datatree.nc`` only carries points that can actually
+            collocate. Full-orbit scatterometer files shrink by >95% this
+            way. SAR nodes are never cropped. ``None`` keeps everything.
 
         Returns
         -------
@@ -1406,6 +1620,23 @@ class DataTreeConverter:
         """
         base_dir = Path(base_dir)
         datasets: Dict[str, xr.Dataset] = {}
+
+        # Domain-filter envelope derived from the recipe (None → no filtering)
+        subset_kwargs: Optional[Dict[str, Any]] = None
+        if recipe is not None:
+            subset_kwargs = _build_subset_kwargs(recipe)
+
+        def _filtered(ds: Optional[xr.Dataset], label: str) -> Optional[xr.Dataset]:
+            """Apply the recipe domain filter to a validation Dataset."""
+            if ds is None or subset_kwargs is None:
+                return ds
+            out = _subset_point_ds(ds, **subset_kwargs)
+            if out is None:
+                logger.info(
+                    "Dropped %s — no points within recipe bounds + tolerances.",
+                    label,
+                )
+            return out
 
         # SAR L2_OCN SAFE directories
         sar_dir = base_dir / "S1_L2_OCN"
@@ -1421,7 +1652,10 @@ class DataTreeConverter:
         insitu_dir = base_dir / "copernicus_insitu"
         if insitu_dir.exists():
             for csv_path in sorted(insitu_dir.glob("*.csv")):
-                ds = DataTreeConverter.from_insitu_csv(csv_path, source_type="insitu")
+                ds = _filtered(
+                    DataTreeConverter.from_insitu_csv(csv_path, source_type="insitu"),
+                    csv_path.name,
+                )
                 if ds is not None:
                     datasets[f"validation/{csv_path.stem}"] = ds
                     logger.info("Converted in-situ CSV: %s", csv_path.name)
@@ -1431,7 +1665,10 @@ class DataTreeConverter:
             subdir = base_dir / subdir_name
             if subdir.exists():
                 for nc_path in sorted(subdir.glob("*.nc")):
-                    ds = DataTreeConverter.from_scatterometer_nc(nc_path)
+                    ds = _filtered(
+                        DataTreeConverter.from_scatterometer_nc(nc_path),
+                        nc_path.name,
+                    )
                     if ds is not None:
                         datasets[f"validation/{subdir_name}/{nc_path.stem}"] = ds
                         logger.info("Converted %s (scatterometer): %s", subdir_name, nc_path.name)
@@ -1448,7 +1685,7 @@ class DataTreeConverter:
         subdir = base_dir / "altimeter"
         if subdir.exists():
             for nc_path in sorted(subdir.rglob("*.nc")):
-                ds = DataTreeConverter.from_altimeter(nc_path)
+                ds = _filtered(DataTreeConverter.from_altimeter(nc_path), nc_path.name)
                 if ds is not None:
                     rel = nc_path.relative_to(subdir).with_suffix("")
                     key = "_".join(rel.parts)
@@ -1461,8 +1698,19 @@ class DataTreeConverter:
 
         tree = DataTreeConverter.to_datatree(datasets)
 
+        # Compress every numeric variable — SAR grids are float64 with large
+        # NaN land masks and deflate extremely well.
+        encoding = {
+            f"/{name.lstrip('/')}": {
+                var: {"zlib": True, "complevel": 4}
+                for var, da in ds.variables.items()
+                if da.dtype.kind in ("f", "i", "u")
+            }
+            for name, ds in datasets.items()
+        }
+
         out_path = base_dir / "datatree.nc"
-        tree.to_netcdf(out_path)
+        tree.to_netcdf(out_path, encoding=encoding)
         logger.info("DataTree saved to %s (%d nodes)", out_path, len(datasets))
 
         return tree

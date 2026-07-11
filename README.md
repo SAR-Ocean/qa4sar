@@ -195,3 +195,12 @@ pytest tests/ -v
 # With coverage:
 pytest tests/ --cov=sar_validation --cov-report=term-missing
 ```
+
+---
+
+## Documentation
+
+- [Design choices](docs/design-choices.md) — toolbox overview and the rationale behind conventions: wind-direction rotation, collocation aggregation windows and tolerances, WV footprint handling, circular statistics, datatree filtering and CF metadata
+- [Creating recipes](docs/creating-recipes.md) — recipe options and CLI flags
+- [Collocation](docs/collocation.md) — matching algorithm mechanics and parameters
+- [Statistics & plots](docs/cli-statistics-and-plots.md) — steps 4–5 outputs and CLI usage

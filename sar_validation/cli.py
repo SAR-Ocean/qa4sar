@@ -500,7 +500,9 @@ def _convert_data(recipe, base_dir: Path) -> "xr.DataTree | None":
     print("\nStep 2: Converting data to DataTree…")
     # Extract product type from recipe to guide SAR data extraction
     product_type = getattr(recipe.config, "variable", "wind")  # Default to "wind" for backward compatibility
-    tree = DataTreeConverter.convert_downloaded_data(base_dir, product_type=product_type)
+    tree = DataTreeConverter.convert_downloaded_data(
+        base_dir, product_type=product_type, recipe=recipe
+    )
     if tree is None:
         print("  No data files found — nothing to convert.")
         return None

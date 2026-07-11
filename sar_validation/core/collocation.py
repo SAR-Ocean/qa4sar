@@ -472,17 +472,39 @@ class PointLayerCollocation:
         # later observations (still within ``time_tolerance_minutes`` of the
         # original reading) for the next one that has a valid value.
         val_data_sorted = val_data_filtered.sort_values("time").reset_index(drop=True)
-        sorted_times = _to_datetime_array(val_data_sorted["time"].values)
+        sorted_times_ns = pd.to_datetime(val_data_sorted["time"].values)
+        if sorted_times_ns.tz is not None:
+            sorted_times_ns = sorted_times_ns.tz_localize(None)
+        sorted_times_ns = sorted_times_ns.values.astype("datetime64[ns]")
+        n_sorted = len(val_data_sorted)
+
+        # Per column: index of the first row at-or-after each position that
+        # holds a valid (non-NaN) value, so each lookup is a binary search
+        # instead of an O(n) scan.
+        _next_valid_idx: Dict[str, np.ndarray] = {}
 
         def _next_valid_value(col: str, after_time) -> Optional[float]:
-            for cand_time, cand_val in zip(sorted_times, val_data_sorted[col]):
-                if cand_time <= after_time:
-                    continue
-                if (cand_time - after_time).total_seconds() / 60.0 > self.time_tolerance_minutes:
-                    break  # sorted ascending — no later candidate can be closer
-                if pd.notna(cand_val):
-                    return float(cand_val)
-            return None
+            if col not in _next_valid_idx:
+                valid = val_data_sorted[col].notna().values
+                idx = np.where(valid, np.arange(n_sorted), n_sorted)
+                _next_valid_idx[col] = np.minimum.accumulate(idx[::-1])[::-1]
+            after_ns = np.datetime64(pd.Timestamp(after_time))
+            pos = int(np.searchsorted(sorted_times_ns, after_ns, side="right"))
+            if pos >= n_sorted:
+                return None
+            j = int(_next_valid_idx[col][pos])
+            if j >= n_sorted:
+                return None
+            gap_min = (sorted_times_ns[j] - after_ns) / np.timedelta64(1, "m")
+            if gap_min > self.time_tolerance_minutes:
+                return None
+            return float(val_data_sorted[col].values[j])
+
+        # KD-tree over the SAR grid cells (unit-sphere Cartesian coordinates,
+        # see _lonlat_to_unit_xyz) built once per scene: each validation
+        # point then queries only its local neighbourhood instead of
+        # computing a Haversine distance to every grid cell.
+        grid_tree = self._build_grid_tree(sar_lon, sar_lat)
 
         # Process each validation observation
         for idx, val_row in val_data_filtered.iterrows():
@@ -492,7 +514,8 @@ class PointLayerCollocation:
 
             # Find nearby SAR cells within aggregation window
             nearby_cells_with_dist = self._nearby_cells_with_distances(
-                v_lon, v_lat, sar_lon, sar_lat, self.aggregation_window_km
+                v_lon, v_lat, sar_lon, sar_lat, self.aggregation_window_km,
+                grid_tree=grid_tree,
             )
 
             if not nearby_cells_with_dist:
@@ -639,24 +662,81 @@ class PointLayerCollocation:
         target: datetime,
         time_array: np.ndarray,
     ) -> List[int]:
-        distances = np.array(
-            [abs((t - target).total_seconds() / 60.0) for t in time_array]
-        )
+        times_ns = pd.to_datetime(list(time_array))
+        if times_ns.tz is not None:
+            times_ns = times_ns.tz_localize(None)
+        target_ns = np.datetime64(pd.Timestamp(target))
+        distances = np.abs(
+            (times_ns.values.astype("datetime64[ns]") - target_ns)
+            / np.timedelta64(1, "m")
+        ).astype(float)
         return np.where(distances <= self.time_tolerance_minutes)[0].tolist()
+
+    @staticmethod
+    def _build_grid_tree(
+        grid_lon: np.ndarray, grid_lat: np.ndarray,
+    ) -> Tuple["cKDTree", np.ndarray, int]:
+        """
+        Build a KD-tree over the finite cells of a 2-D coordinate grid.
+
+        Returns
+        -------
+        (tree, flat_idx, n_x)
+            ``tree`` is a cKDTree over unit-sphere Cartesian coordinates,
+            ``flat_idx`` maps tree indices back to flat grid indices (NaN
+            cells are excluded), ``n_x`` is the grid's x-dimension size.
+        """
+        from scipy.spatial import cKDTree
+
+        lon_flat = grid_lon.ravel()
+        lat_flat = grid_lat.ravel()
+        flat_idx = np.flatnonzero(np.isfinite(lon_flat) & np.isfinite(lat_flat))
+        tree = cKDTree(_lonlat_to_unit_xyz(lon_flat[flat_idx], lat_flat[flat_idx]))
+        return tree, flat_idx, grid_lon.shape[1]
 
     def _nearby_cells_with_distances(
         self,
         lon: float, lat: float,
         grid_lon: np.ndarray, grid_lat: np.ndarray,
         max_distance_km: float,
+        grid_tree: Optional[Tuple["cKDTree", np.ndarray, int]] = None,
     ) -> List[Tuple[int, int, float]]:
         """
         Find SAR cells within max_distance_km and return with distances.
-        
+
+        When *grid_tree* (from :meth:`_build_grid_tree`) is given, only the
+        KD-tree neighbourhood of the point is examined; otherwise a Haversine
+        distance is computed to every grid cell.
+
         Returns
         -------
         list of (y_idx, x_idx, distance_km) tuples
         """
+        if grid_tree is not None:
+            tree, flat_idx, n_x = grid_tree
+            R = 6371.0
+            # Chord length equivalent of the great-circle search radius: a
+            # point is within max_distance_km along the sphere iff its chord
+            # distance is within this radius, so the ball query is exact.
+            chord_radius = 2.0 * np.sin(max_distance_km / (2.0 * R))
+            cand = tree.query_ball_point(
+                _lonlat_to_unit_xyz(np.array([lon]), np.array([lat]))[0],
+                r=chord_radius,
+            )
+            if not cand:
+                return []
+            # Ascending flat order matches the row-major order np.where
+            # produced before, keeping argmin tie-breaks identical.
+            sel = np.sort(flat_idx[np.asarray(cand)])
+            dists = _haversine_distance_grid(
+                lon, lat, grid_lon.ravel()[sel], grid_lat.ravel()[sel]
+            )
+            keep = dists <= max_distance_km
+            return [
+                (int(f) // n_x, int(f) % n_x, float(d))
+                for f, d in zip(sel[keep], dists[keep])
+            ]
+
         distances = _haversine_distance_grid(lon, lat, grid_lon, grid_lat)
         ys, xs = np.where(distances <= max_distance_km)
         result = [(y, x, distances[y, x]) for y, x in zip(ys.tolist(), xs.tolist())]
@@ -1117,6 +1197,9 @@ def run_collocation(
     # each by its auto-detected collocation type, tracking source metadata.
     buckets: Dict[str, Dict[str, Any]] = {t: {} for t in _COLLOC_CLASSES}
     source_metadata: Dict[str, Dict[str, Any]] = {}  # source_name -> {source_type, colloc_kwargs}
+    # DataFrame view of each validation node, built once here rather than
+    # once per (SAR scene × source) pair inside the scene loop below.
+    val_dfs: Dict[str, pd.DataFrame] = {}
 
     if "validation" in datatree.children:
         for name, node in datatree["validation"].children.items():
@@ -1148,6 +1231,10 @@ def run_collocation(
     if total_sources == 0:
         logger.warning("No validation nodes with 'point' dimension found — nothing to collocate.")
         return None
+
+    for sources in buckets.values():
+        for val_name, val_ds in sources.items():
+            val_dfs[val_name] = val_ds.to_dataframe().reset_index(drop=True)
 
     for ctype, sources in buckets.items():
         if sources:
@@ -1234,7 +1321,7 @@ def run_collocation(
                         collocation_type = "point_vs_point"
                         distance_weighting = "equal"
 
-                    df = val_ds.to_dataframe().reset_index(drop=True)
+                    df = val_dfs[val_name]
                     source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
 
                     matches = _collocate_wv_points(
@@ -1318,7 +1405,7 @@ def run_collocation(
 
                     colloc = _COLLOC_CLASSES[ctype](**merged_kwargs)
 
-                    df = val_ds.to_dataframe().reset_index(drop=True)
+                    df = val_dfs[val_name]
                     source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
 
                     matches = colloc.collocate(
@@ -1341,6 +1428,11 @@ def run_collocation(
         return None
 
     result_ds = DataTreeConverter.from_collocations(all_collocations)
+
+    # Carry the datatree's CF metadata (standard_name/long_name/units) over
+    # to the matched sar_*/val_* columns.
+    from ._cf_metadata import annotate_collocation_ds
+    annotate_collocation_ds(result_ds, datatree)
 
     out_path = base_dir / f"collocation_results{filename_suffix}.nc"
     result_ds.to_netcdf(out_path)

@@ -25,8 +25,11 @@ __all__ = [
 
 VARIABLE_PAIRS: dict[str, List[Tuple[str, str]]] = {
     "wind": [
+        # WSPD covers in-situ, scatterometer AND altimeter wind speed: the
+        # converters rename the raw product names (OSI-SAF ``wind_speed``,
+        # CMEMS altimeter ``WIND_SPEED``) to this single canonical code so
+        # all sources land in one comparison section.
         ("owiWindSpeed",     "WSPD"),
-        ("owiWindSpeed",     "WIND_SPEED"),   # 1 Hz altimeter-derived U10
         ("owiWindDirection", "WDIR"),
     ],
     "currents": [
