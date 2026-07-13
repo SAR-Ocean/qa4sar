@@ -49,7 +49,14 @@ __all__ = [
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+    "#bcbd22", "#17becf",
 ]
+
+# Marker shapes paired 1:1 with _SOURCE_COLORS by index, used wherever
+# validation sources need to stay identifiable independently of color (e.g.
+# when color is taken by a continuous value like wind speed or temporal
+# offset instead of by source).
+_SOURCE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "+"]
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +65,50 @@ _SOURCE_COLORS = [
 
 def _source_color_map(sources: List[str]) -> Dict[str, str]:
     return {s: _SOURCE_COLORS[i % len(_SOURCE_COLORS)] for i, s in enumerate(sorted(set(sources)))}
+
+
+def _canonical_source_order() -> List[str]:
+    """
+    Fixed, alphabetically-sorted reference order for known validation
+    source/platform types, built from the two canonical sets already
+    maintained elsewhere in the codebase (avoids introducing a third list
+    that could drift out of sync):
+
+    * ``LAYER_DATA_TYPES`` (collocation.py) — scatterometer/altimeter/etc.
+    * ``_INSITU_TYPES`` (orchestrator.py) — mooring/buoy/etc.
+    """
+    from .collocation import LAYER_DATA_TYPES  # noqa: PLC0415
+    from .orchestrator import _INSITU_TYPES  # noqa: PLC0415
+
+    return sorted(LAYER_DATA_TYPES | _INSITU_TYPES)
+
+
+def _source_style_map(sources: List[str]) -> Dict[str, Tuple[str, str]]:
+    """
+    Map each source name in *sources* to a stable ``(color, marker)`` pair.
+
+    The index used for each name is its position in the fixed canonical
+    order (see :func:`_canonical_source_order`), not its position among
+    whichever sources happen to be present in this particular call — so a
+    known source (e.g. "altimeter") always gets the same color and marker
+    everywhere in a report, and across separate report runs. Matching is
+    case-insensitive (``plot_collocation_diagnostics`` title-cases layer
+    source labels, e.g. "Altimeter", while other call sites use the raw
+    lowercase source name — both must land on the same canonical slot).
+    Names outside the canonical set are appended afterwards, in sorted order.
+    """
+    canonical = _canonical_source_order()
+    present = sorted(set(sources))
+    unknown = [s for s in present if s.lower() not in canonical]
+    style: Dict[str, Tuple[str, str]] = {}
+    for s in present:
+        key = s.lower()
+        idx = canonical.index(key) if key in canonical else len(canonical) + unknown.index(s)
+        style[s] = (
+            _SOURCE_COLORS[idx % len(_SOURCE_COLORS)],
+            _SOURCE_MARKERS[idx % len(_SOURCE_MARKERS)],
+        )
+    return style
 
 
 def _require(package: str, extra: str = "plot") -> None:

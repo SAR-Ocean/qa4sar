@@ -121,3 +121,31 @@ class TestPlotStatistics:
             result = plot_statistics(stats_ds, metrics=["nonexistent_metric"])
         assert result is None
         assert any("nonexistent_metric" in str(warning.message) for warning in w)
+
+
+class TestSourceStyleMap:
+    def test_stable_regardless_of_other_sources_present(self):
+        from sar_validation.core.visualization import _source_style_map
+        style_alone = _source_style_map(["altimeter"])
+        style_with_others = _source_style_map(["altimeter", "radiometer", "mooring"])
+        assert style_alone["altimeter"] == style_with_others["altimeter"]
+
+    def test_distinct_known_sources_get_distinct_styles(self):
+        from sar_validation.core.visualization import _source_style_map
+        style = _source_style_map(["altimeter", "radiometer", "mooring", "buoy"])
+        colors = [c for c, _ in style.values()]
+        markers = [m for _, m in style.values()]
+        assert len(set(colors)) == 4
+        assert len(set(markers)) == 4
+
+    def test_unknown_source_does_not_crash(self):
+        from sar_validation.core.visualization import _source_style_map
+        style = _source_style_map(["altimeter", "some_future_sensor"])
+        assert "some_future_sensor" in style
+        assert style["some_future_sensor"] != style["altimeter"]
+
+    def test_case_insensitive_matches_canonical_entry(self):
+        from sar_validation.core.visualization import _source_style_map
+        style_lower = _source_style_map(["altimeter"])
+        style_title = _source_style_map(["Altimeter"])
+        assert style_lower["altimeter"] == style_title["Altimeter"]
