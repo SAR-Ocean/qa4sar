@@ -1,7 +1,7 @@
 """
 Visualization — step 5 of the validation pipeline.
 
-Four public plot functions:
+Five public plot functions:
 
 * :func:`plot_scatter`      — SAR vs. validation variable scatter plot
 * :func:`plot_geographic`   — SAR field + collocated points, one subplot per SAR scene
@@ -16,7 +16,7 @@ Plus fallback and convenience wrappers:
   validation points (one category per validation source actually present),
   always generated as part of the collocation step (step 3), including when
   there are zero collocated pairs.
-* :func:`validation_report` — runs all four plots, infers variable pairs from the recipe,
+* :func:`validation_report` — runs all five plots, infers variable pairs from the recipe,
   and saves PNG files to ``<out_dir>/plots/``
 
 All functions accept an ``interactive=False`` keyword argument.  When
@@ -673,10 +673,10 @@ def plot_geographic(
                     if "val_source" in df_pts.columns:
                         present = set(df_pts["val_source"].astype(str))
                         handles += [
-                            mlines.Line2D([], [], marker=marker, linestyle="None",
+                            mlines.Line2D([], [], marker=mkr, linestyle="None",
                                           markerfacecolor="lightgray", markeredgecolor="black",
                                           markersize=5, label=s)
-                            for s, (_, marker) in source_style.items() if s in present
+                            for s, (_, mkr) in source_style.items() if s in present
                         ]
                     if len(nan_pts):
                         handles.append(
@@ -1700,7 +1700,7 @@ def validation_report(
         fig_scatter_offset = plot_scatter(collocation_ds, sar_var, val_var, color_by="temporal_offset")
         if fig_scatter_offset is not None:
             figs.append(fig_scatter_offset)
-            pdf_pages.append((f"{sar_var} vs {val_var} — scatter (by temporal offset)", fig_scatter_offset))
+            pdf_pages.append((f"{sar_var} vs {val_var} — scatter (colored by temporal offset)", fig_scatter_offset))
             if plots_dir:
                 fig_scatter_offset.savefig(
                     plots_dir / f"{key}{filename_suffix}_scatter_by_offset.png", dpi=150, bbox_inches="tight"
