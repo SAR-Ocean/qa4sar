@@ -262,13 +262,14 @@ def plot_scatter(
         fig = ax.get_figure()
 
     sources = df["val_source"].unique().tolist()
-    cmap = _source_color_map(sources)
+    style = _source_style_map(sources)
 
     for src in sorted(sources):
         sub = df[df["val_source"] == src]
         label = src if by_source else None
+        color, marker = style[src]
         ax.scatter(sub[val_col], sub[sar_col], s=18, alpha=0.6,
-                   color=cmap[src], label=label, rasterized=True)
+                   color=color, marker=marker, label=label, rasterized=True)
 
     all_vals = np.concatenate([df[val_col].values, df[sar_col].values])
     vmin, vmax = float(np.nanmin(all_vals)), float(np.nanmax(all_vals))

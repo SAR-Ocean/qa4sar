@@ -82,6 +82,24 @@ class TestPlotScatter:
         assert fig is not None
         plt.close("all")
 
+    def test_distinct_sources_get_distinct_markers(self, collocation_ds, monkeypatch):
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+
+        recorded_markers = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded_markers.append(kwargs.get("marker"))
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        fig = plot_scatter(collocation_ds, "owiWindSpeed", "WSPD")
+        plt.close(fig)
+
+        assert len(recorded_markers) == 2
+        assert len(set(recorded_markers)) == 2
+
 
 class TestPlotResiduals:
     def test_returns_figure(self, collocation_ds):
