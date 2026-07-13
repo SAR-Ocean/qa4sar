@@ -239,6 +239,47 @@ class TestPlotResiduals:
         assert result is None
 
 
+class TestPlotTemporalOffset:
+    def test_returns_figure(self, collocation_ds):
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import plot_temporal_offset
+        fig = plot_temporal_offset(collocation_ds, "owiWindSpeed", "WSPD")
+        assert fig is not None
+        plt.close(fig)
+
+    def test_missing_temporal_column_returns_none(self):
+        import warnings
+        from sar_validation.core.visualization import plot_temporal_offset
+        n = 5
+        ds = xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", [8.0, 7.0, 6.0, 9.0, 10.0]),
+            "val_WSPD":         ("collocation", [7.5, 7.2, 6.1, 8.9, 9.8]),
+            "val_source":       ("collocation", ["buoy"] * n),
+        })
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            result = plot_temporal_offset(ds, "owiWindSpeed", "WSPD")
+        assert result is None
+
+    def test_distinct_sources_get_distinct_markers(self, collocation_ds, monkeypatch):
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import plot_temporal_offset
+
+        recorded_markers = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded_markers.append(kwargs.get("marker"))
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        fig = plot_temporal_offset(collocation_ds, "owiWindSpeed", "WSPD")
+        plt.close(fig)
+
+        assert len(set(recorded_markers)) == 2
+
+
 class TestPlotStatistics:
     def test_returns_figure(self, collocation_ds):
         import matplotlib.pyplot as plt
