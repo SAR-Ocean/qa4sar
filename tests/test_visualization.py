@@ -203,6 +203,26 @@ class TestPlotScatterColorByTemporalOffset:
         assert fig is not None
         plt.close(fig)
 
+    def test_shares_one_color_scale_across_sources(self, collocation_ds, monkeypatch):
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+
+        recorded_clims = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            pc = original_scatter(self, *args, **kwargs)
+            if kwargs.get("c") is not None:
+                recorded_clims.append(pc.get_clim())
+            return pc
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        fig = plot_scatter(collocation_ds, "owiWindSpeed", "WSPD", color_by="temporal_offset")
+        plt.close(fig)
+
+        assert len(recorded_clims) == 2
+        assert recorded_clims[0] == recorded_clims[1]
+
 
 class TestPlotResiduals:
     def test_returns_figure(self, collocation_ds):

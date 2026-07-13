@@ -283,6 +283,10 @@ def plot_scatter(
         color_by_offset = False
 
     offset_sm = None
+    offset_vmin = offset_vmax = None
+    if color_by_offset:
+        offset_vmin = float(df["temporal_distance_minutes"].min())
+        offset_vmax = float(df["temporal_distance_minutes"].max())
     for src in sorted(sources):
         sub = df[df["val_source"] == src]
         marker = style[src][1]
@@ -290,6 +294,7 @@ def plot_scatter(
             offset_sm = ax.scatter(
                 sub[val_col], sub[sar_col], s=18, alpha=0.7,
                 c=sub["temporal_distance_minutes"], cmap="plasma",
+                vmin=offset_vmin, vmax=offset_vmax,
                 marker=marker, rasterized=True,
             )
         else:
