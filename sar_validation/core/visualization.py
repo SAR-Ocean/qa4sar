@@ -390,7 +390,7 @@ def plot_geographic(
         if "val_source" in collocation_ds
         else []
     )
-    source_cmap = _source_color_map(val_sources) if val_sources else {}
+    source_style = _source_style_map(val_sources) if val_sources else {}
 
     # ── Determine group values for splitting ────────────────────────────────
     # None means "do not split" (handled by an early return below); otherwise
@@ -431,7 +431,7 @@ def plot_geographic(
                     cols_needed.append(val_col)
                 df_pts = sub_coll[cols_needed].to_dataframe()
                 for _, row in df_pts.iterrows():
-                    color = source_cmap.get(str(row.get("val_source", "")), "#1f77b4")
+                    color = source_style.get(str(row.get("val_source", "")), ("#1f77b4", "o"))[0]
                     tooltip = (
                         f"{val_var}: {row[val_col]:.2f}" if val_col_present
                         else str(row.get("val_source", ""))
@@ -590,7 +590,17 @@ def plot_geographic(
                     valid_pts = df_pts[~nan_mask]
                     nan_pts = df_pts[nan_mask]
 
-                    if len(valid_pts):
+                    if len(valid_pts) and "val_source" in valid_pts.columns:
+                        for src, grp in valid_pts.groupby("val_source"):
+                            marker = source_style.get(str(src), ("#1f77b4", "o"))[1]
+                            ax.scatter(
+                                grp["val_lon"], grp["val_lat"],
+                                c=grp[val_col], cmap=val_cmap, norm=val_norm,
+                                marker=marker, s=point_size,
+                                edgecolors="black", linewidths=0.4,
+                                rasterized=True, **kw_sc,
+                            )
+                    elif len(valid_pts):
                         ax.scatter(
                             valid_pts["val_lon"], valid_pts["val_lat"],
                             c=valid_pts[val_col], cmap=val_cmap, norm=val_norm,
@@ -607,14 +617,18 @@ def plot_geographic(
                             linewidths=0.6, hatch="////", rasterized=True, **kw_sc,
                         )
 
+                    # Fill color varies continuously with the validation
+                    # value here (shared with the SAR colorbar), so a solid
+                    # legend swatch would misrepresent what's on the map —
+                    # marker shape is the discriminator instead.
                     handles = []
                     if "val_source" in df_pts.columns:
                         present = set(df_pts["val_source"].astype(str))
                         handles += [
-                            mlines.Line2D([], [], marker="o", linestyle="None",
-                                          markerfacecolor=clr, markeredgecolor="black",
+                            mlines.Line2D([], [], marker=marker, linestyle="None",
+                                          markerfacecolor="lightgray", markeredgecolor="black",
                                           markersize=5, label=s)
-                            for s, clr in source_cmap.items() if s in present
+                            for s, (_, marker) in source_style.items() if s in present
                         ]
                     if len(nan_pts):
                         handles.append(
@@ -627,9 +641,9 @@ def plot_geographic(
                                   loc="lower left", framealpha=0.7)
                 elif "val_source" in df_pts.columns:
                     for src, grp in df_pts.groupby("val_source"):
-                        color = source_cmap.get(str(src), "#ff0000")
+                        color, marker = source_style.get(str(src), ("#ff0000", "o"))
                         ax.scatter(grp["val_lon"], grp["val_lat"],
-                                   s=point_size, c=color,
+                                   s=point_size, c=color, marker=marker,
                                    edgecolors="black", linewidths=0.4,
                                    label=str(src), rasterized=True, **kw_sc)
                     ax.legend(fontsize=6, loc="lower left", framealpha=0.7)
