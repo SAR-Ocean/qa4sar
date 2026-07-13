@@ -1158,7 +1158,7 @@ def plot_collocation_diagnostics(
             all_source_names.update(str(s) for s in np.unique(np.asarray(cat["matched_source"])))
         else:
             all_source_names.add(str(cat["label"]))
-    source_color_map = _source_color_map(sorted(all_source_names))
+    source_style_map = _source_style_map(sorted(all_source_names))
 
     bounds = recipe.config.geographic_bounds
 
@@ -1229,17 +1229,18 @@ def plot_collocation_diagnostics(
             # buoy/drifter/…), each its own legend entry.
             for source in np.unique(m_src):
                 mask = m_src == source
-                color = source_color_map.get(str(source), "#ff7f0e")
+                color, marker = source_style_map.get(str(source), ("#ff7f0e", "o"))
                 ax.scatter(
                     m_lon[mask], m_lat[mask],
-                    s=25, c=color, alpha=0.7, edgecolors="black", linewidths=0.3,
+                    s=25, c=color, marker=marker, alpha=0.7,
+                    edgecolors="black", linewidths=0.3,
                     transform=transform, zorder=4, label=f"In-situ matched: {source}",
                 )
         else:
-            color = source_color_map.get(str(cat["label"]), "#2ca02c")
+            color, marker = source_style_map.get(str(cat["label"]), ("#2ca02c", "o"))
             ax.scatter(
                 m_lon, m_lat,
-                s=20, c=color, alpha=0.6, edgecolors="none",
+                s=20, c=color, marker=marker, alpha=0.6, edgecolors="none",
                 transform=transform, zorder=4, label=f"{cat['label']} matched ({len(m_lon)})",
             )
 

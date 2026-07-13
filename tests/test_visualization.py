@@ -262,3 +262,50 @@ class TestPlotGeographic:
         assert fig is not None
         source_markers = [m for m in recorded_markers if m is not None]
         assert len(set(source_markers)) == 2
+
+
+@pytest.fixture
+def diagnostics_recipe():
+    from sar_validation.core.recipe import (
+        GeographicBounds, Recipe, RecipeConfig, ValidationDataSource,
+        CollocationType, PointVsLayerCollocation,
+    )
+    config = RecipeConfig(
+        name="test_recipe",
+        variable="wind",
+        geographic_bounds=GeographicBounds(min_lon=-11.0, max_lon=-7.0, min_lat=49.0, max_lat=53.0),
+        validation_sources=[
+            ValidationDataSource(source_type="mooring"),
+            ValidationDataSource(source_type="altimeter"),
+        ],
+        collocation=CollocationType(point_vs_layer=PointVsLayerCollocation(time_tolerance_minutes=30)),
+    )
+    return Recipe(config=config)
+
+
+class TestPlotCollocationDiagnostics:
+    def test_distinct_sources_get_distinct_markers(
+        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
+    ):
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+
+        recorded_markers = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded_markers.append(kwargs.get("marker"))
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        out_path = plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe, tmp_path,
+        )
+        plt.close("all")
+
+        assert out_path is not None
+        matched_markers = [m for m in recorded_markers if m is not None]
+        assert len(set(matched_markers)) >= 2
