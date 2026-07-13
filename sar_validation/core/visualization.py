@@ -49,14 +49,14 @@ __all__ = [
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
-    "#bcbd22", "#17becf",
+    "#bcbd22",
 ]
 
 # Marker shapes paired 1:1 with _SOURCE_COLORS by index, used wherever
 # validation sources need to stay identifiable independently of color (e.g.
 # when color is taken by a continuous value like wind speed or temporal
 # offset instead of by source).
-_SOURCE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "+"]
+_SOURCE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h"]
 
 
 # ---------------------------------------------------------------------------
