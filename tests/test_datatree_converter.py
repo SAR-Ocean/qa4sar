@@ -685,3 +685,81 @@ class TestFromRadiometerNc:
         path = _make_radiometer_nc(tmp_path, nan_frac=1.0)
         ds = DataTreeConverter.from_radiometer_nc(path)
         assert ds is None
+
+
+# ---------------------------------------------------------------------------
+# from_radiometer_bytemap (RSS binary bytemaps: GMI / SSMIS / WindSat)
+# ---------------------------------------------------------------------------
+
+import gzip as _gzip
+
+
+def _make_bytemap_gz(tmp_path: Path, sensor: str, filename: str, cells) -> Path:
+    """Write a full-size RSS bytemap .gz (all-missing 255 except `cells`).
+
+    cells: list of (pass, var_idx, lat_idx, lon_idx, byte_value).
+    """
+    from sar_validation.downloaders._rss_bytemap import BYTEMAP_LAYOUT, NPASS, NLAT, NLON
+    nvar = len(BYTEMAP_LAYOUT[sensor]["vars"])
+    arr = np.full((NPASS, nvar, NLAT, NLON), 255, np.uint8)
+    for (p, v, la, lo, val) in cells:
+        arr[p, v, la, lo] = val
+    path = tmp_path / filename
+    with _gzip.open(path, "wb") as fh:
+        fh.write(arr.tobytes())
+    return path
+
+
+class TestFromRadiometerBytemap:
+    def test_gmi_to_points(self, tmp_path):
+        # GMI: var 0=time(×0.1 h), var 2=windLF(×0.2). One valid cell.
+        p = _make_bytemap_gz(tmp_path, "gmi", "f35_20240601v8.2.gz",
+                             [(0, 2, 400, 600, 50), (0, 0, 400, 600, 100)])
+        ds = DataTreeConverter.from_radiometer_bytemap(p)
+        assert ds is not None
+        assert ds.sizes["point"] == 1
+        assert float(ds["WSPD"].values[0]) == pytest.approx(10.0)   # 50×0.2
+        assert "WDIR" not in ds
+        assert ds.attrs["data_type"] == "radiometer"
+        assert ds.attrs["sensor"] == "gmi"
+        # time = 2024-06-01 + 10.0 h
+        assert str(ds["time"].values[0]).startswith("2024-06-01T10:00")
+        # lon normalized to -180..180
+        assert -180.0 <= float(ds["lon"].values[0]) <= 180.0
+
+    def test_windsat_direction_rotated_to_meteorological(self, tmp_path):
+        # WindSat: var 0=mingmt(×6 min), 2=w-lf(×0.2), 8=wdir(×1.5 oceanographic).
+        # wdir byte 40 → 60° oceanographic → 240° meteorological (rotate 180°).
+        p = _make_bytemap_gz(tmp_path, "windsat", "wsat_20150601v7.0.1.gz",
+                             [(0, 2, 300, 500, 50), (0, 0, 300, 500, 120), (0, 8, 300, 500, 40)])
+        ds = DataTreeConverter.from_radiometer_bytemap(p)
+        assert "WDIR" in ds
+        assert float(ds["WDIR"].values[0]) == pytest.approx((60.0 + 180.0) % 360.0)  # 240
+        assert ds["WDIR"].attrs["standard_name"] == "wind_from_direction"
+        assert ds.attrs["sensor"] == "windsat"
+        # mingmt 120×6 = 720 min = 12:00
+        assert str(ds["time"].values[0]).startswith("2015-06-01T12:00")
+
+    def test_sensor_inferred_from_filename(self, tmp_path):
+        # SSMIS: var 0=time, var 1=wspd_mf(×0.2). No explicit sensor arg.
+        p = _make_bytemap_gz(tmp_path, "ssmis_f17", "f17_20240601v7.gz",
+                             [(0, 1, 10, 10, 45), (0, 0, 10, 10, 60)])
+        ds = DataTreeConverter.from_radiometer_bytemap(p)   # sensor=None → inferred
+        assert ds.attrs["sensor"] == "ssmis_f17"
+        assert float(ds["WSPD"].values[0]) == pytest.approx(9.0)    # 45×0.2
+
+    def test_special_codes_dropped(self, tmp_path):
+        # A cell with valid time but masked wind (251) yields no point.
+        p = _make_bytemap_gz(tmp_path, "gmi", "f35_20240601v8.2.gz",
+                             [(0, 0, 5, 5, 100), (0, 2, 5, 5, 251)])
+        ds = DataTreeConverter.from_radiometer_bytemap(p)
+        assert ds is None            # the only touched cell has masked wind
+
+    def test_missing_file_returns_none(self, tmp_path):
+        assert DataTreeConverter.from_radiometer_bytemap(tmp_path / "nope.gz") is None
+
+    def test_unresolvable_sensor_returns_none(self, tmp_path):
+        p = tmp_path / "unknownprefix_20240601.gz"
+        with _gzip.open(p, "wb") as fh:
+            fh.write(b"\x00" * 10)
+        assert DataTreeConverter.from_radiometer_bytemap(p) is None

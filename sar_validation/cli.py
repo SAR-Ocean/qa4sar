@@ -294,11 +294,37 @@ def _create_recipe(
                             "aggregation_window_km": 7.0,
                             "distance_weighting": "equal",
                         },
-                        # RSS radiometer (AMSR2): all products share the 0.25°
-                        # (~25 km) grid. Per-sensor key so each sensor stays
+                        # RSS radiometers all share the 0.25° (~25 km) grid, so
+                        # the specs default alike. Per-sensor keys keep each one
                         # individually tunable; collocation resolves a node's
                         # 'radiometer' layer type to 'radiometer_<sensor>'.
+                        # AMSR2 is NetCDF; GMI/SSMIS/WindSat are RSS bytemaps.
                         "radiometer_amsr2": {
+                            "time_tolerance_minutes": 180,
+                            "aggregation_window_km": 25.0,
+                            "distance_weighting": "equal",
+                        },
+                        "radiometer_gmi": {
+                            "time_tolerance_minutes": 180,
+                            "aggregation_window_km": 25.0,
+                            "distance_weighting": "equal",
+                        },
+                        "radiometer_ssmis_f16": {
+                            "time_tolerance_minutes": 180,
+                            "aggregation_window_km": 25.0,
+                            "distance_weighting": "equal",
+                        },
+                        "radiometer_ssmis_f17": {
+                            "time_tolerance_minutes": 180,
+                            "aggregation_window_km": 25.0,
+                            "distance_weighting": "equal",
+                        },
+                        "radiometer_ssmis_f18": {
+                            "time_tolerance_minutes": 180,
+                            "aggregation_window_km": 25.0,
+                            "distance_weighting": "equal",
+                        },
+                        "radiometer_windsat": {
                             "time_tolerance_minutes": 180,
                             "aggregation_window_km": 25.0,
                             "distance_weighting": "equal",

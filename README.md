@@ -58,7 +58,8 @@ sar_validation/
     ├── hf_radar_downloader.py # HF radar via Copernicus Marine
     ├── scatterometer_downloader.py  # ASCAT (MetOp) via EUMETSAT EUMDAC
     ├── altimeter_downloader.py      # Along-track SWH/wind via Copernicus Marine
-    └── radiometer_downloader.py     # RSS radiometer ocean winds (AMSR2) via public HTTPS
+    ├── radiometer_downloader.py     # RSS radiometer ocean winds (AMSR2 NetCDF + GMI/SSMIS/WindSat bytemaps)
+    └── _rss_bytemap.py              # Decoder for RSS binary bytemap (.gz) radiometer products
 ```
 
 ---
@@ -144,7 +145,7 @@ plt.show()
 | Moorings / Buoys / Ferryboxes | wind / currents / waves | `insitu_downloader` | Copernicus Marine |
 | HF Radar | ocean currents | `hf_radar_downloader` | Copernicus Marine |
 | ASCAT (MetOp-B/C) | wind | `scatterometer_downloader` | EUMETSAT EUMDAC |
-| Radiometer (AMSR2) | wind | `radiometer_downloader` | RSS `data.remss.com` (public HTTPS) |
+| Radiometer — AMSR2 (NetCDF); GMI, SSMIS F16/F17/F18, WindSat (binary bytemaps) | wind (+ direction from WindSat) | `radiometer_downloader` | RSS `data.remss.com` (public HTTPS) |
 
 ### Collocation types
 

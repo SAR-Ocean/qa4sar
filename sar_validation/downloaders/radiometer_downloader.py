@@ -19,11 +19,11 @@ Format landscape (verified against the live site)
   **binary bytemaps** (gzipped flat arrays), a different format that needs a
   dedicated reader.
 
-This module currently implements the **NetCDF** sensors (AMSR2). The binary
-bytemap sensors are declared in :data:`SENSORS` with ``format="bytemap"`` and
-skipped with an informative message; adding a bytemap branch here (and a
-matching converter) is the planned fast-follow that also brings in WindSat
-wind direction.
+This module downloads both formats over HTTPS: AMSR2 as **NetCDF**, and GMI /
+SSMIS (f16/f17/f18) / WindSat as RSS **binary bytemaps** (``.gz``, decoded by
+:mod:`sar_validation.downloaders._rss_bytemap`; WindSat additionally provides
+wind direction). The per-sensor :data:`SENSORS` table carries a ``format`` tag
+and the URL templates for each.
 
 Library usage::
 
@@ -80,17 +80,42 @@ SENSORS: dict[str, dict] = {
         "rt_url_path": "amsr2/ocean/L3/v08.2/daily/rt",
         "rt_file": "RSS_AMSR2_ocean_L3_daily_{Y}-{m}-{d}_v08.2-rt.nc",
     },
-    # --- Binary-bytemap sensors: declared, not yet downloaded (fast-follow) ---
-    "gmi":       {"format": "bytemap", "has_direction": False},
-    "ssmis_f16": {"format": "bytemap", "has_direction": False},
-    "ssmis_f17": {"format": "bytemap", "has_direction": False},
-    "ssmis_f18": {"format": "bytemap", "has_direction": False},
-    "windsat":   {"format": "bytemap", "has_direction": True},
-    "amsre":     {"format": "bytemap", "has_direction": False},
+    # --- Binary-bytemap sensors (RSS .gz; decoded by _rss_bytemap.py) ---
+    # Daily files live under y{Y}/m{m}/ with a YYYYMMDD stamp in the name.
+    "gmi": {
+        "format": "bytemap", "has_direction": False,
+        "availability_start": "2014-03-04T00:00:00",
+        "url_path": "gmi/bmaps_v08.2/y{Y}/m{m}",
+        "file": "f35_{Y}{m}{d}v8.2.gz",
+    },
+    "ssmis_f16": {
+        "format": "bytemap", "has_direction": False,
+        "availability_start": "2003-10-26T00:00:00",
+        "url_path": "ssmi/f16/bmaps_v07/y{Y}/m{m}",
+        "file": "f16_{Y}{m}{d}v7.gz",
+    },
+    "ssmis_f17": {
+        "format": "bytemap", "has_direction": False,
+        "availability_start": "2006-11-04T00:00:00",
+        "url_path": "ssmi/f17/bmaps_v07/y{Y}/m{m}",
+        "file": "f17_{Y}{m}{d}v7.gz",
+    },
+    "ssmis_f18": {
+        "format": "bytemap", "has_direction": False,
+        "availability_start": "2009-10-18T00:00:00",
+        "url_path": "ssmi/f18/bmaps_v07/y{Y}/m{m}",
+        "file": "f18_{Y}{m}{d}v7.gz",
+    },
+    "windsat": {
+        "format": "bytemap", "has_direction": True,
+        "availability_start": "2003-02-05T00:00:00",
+        "url_path": "windsat/bmaps_v07.0.1/y{Y}/m{m}",
+        "file": "wsat_{Y}{m}{d}v7.0.1.gz",
+    },
 }
 
-#: Sensors this module can currently download (NetCDF path implemented).
-SUPPORTED_SENSORS = [s for s, cfg in SENSORS.items() if cfg["format"] == "netcdf"]
+#: Sensors this module can download (those with a configured URL template).
+SUPPORTED_SENSORS = [s for s, cfg in SENSORS.items() if cfg.get("url_path")]
 
 
 class RadiometerDownloader:
@@ -159,11 +184,8 @@ class RadiometerDownloader:
 
         for sensor in requested:
             cfg = SENSORS[sensor]
-            if cfg["format"] != "netcdf":
-                print(
-                    f"  Skipping {sensor}: distributed only as RSS binary bytemaps, "
-                    f"which this downloader does not yet read (planned fast-follow)."
-                )
+            if not cfg.get("url_path"):
+                print(f"  Skipping {sensor}: no download URL configured for this sensor.")
                 continue
 
             avail_start = cfg.get("availability_start")

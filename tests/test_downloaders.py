@@ -285,12 +285,23 @@ class TestRadiometerDownloader:
         assert "amsr2" in SUPPORTED_SENSORS
         assert SENSORS["amsr2"]["format"] == "netcdf"
 
-    def test_bytemap_sensors_declared_but_not_supported(self):
-        # Fast-follow sensors are present in the table but not yet downloadable.
-        for s in ("gmi", "ssmis_f16", "windsat"):
+    def test_bytemap_sensors_supported(self):
+        # GMI/SSMIS/WindSat are RSS binary bytemaps and now downloadable.
+        for s in ("gmi", "ssmis_f16", "ssmis_f17", "ssmis_f18", "windsat"):
             assert s in SENSORS
             assert SENSORS[s]["format"] == "bytemap"
-            assert s not in SUPPORTED_SENSORS
+            assert s in SUPPORTED_SENSORS
+            assert SENSORS[s]["url_path"]        # has a configured download URL
+
+    def test_supported_sensor_set(self):
+        assert set(SUPPORTED_SENSORS) == {
+            "amsr2", "gmi", "ssmis_f16", "ssmis_f17", "ssmis_f18", "windsat"
+        }
+
+    def test_only_windsat_has_direction(self):
+        assert SENSORS["windsat"]["has_direction"] is True
+        for s in ("amsr2", "gmi", "ssmis_f16"):
+            assert SENSORS[s]["has_direction"] is False
 
     def test_dry_run_lists_urls_without_network(self, tmp_path, capsys):
         dl = RadiometerDownloader(output_dir=tmp_path, dry_run=True)
@@ -304,13 +315,15 @@ class TestRadiometerDownloader:
         assert "RSS_AMSR2_ocean_L3_daily_2024-06-02_v08.2.nc" in out
         assert "data.remss.com/amsr2/ocean/L3" in out
 
-    def test_dry_run_skips_bytemap_sensors(self, tmp_path, capsys):
+    def test_dry_run_lists_bytemap_urls(self, tmp_path, capsys):
         dl = RadiometerDownloader(output_dir=tmp_path, dry_run=True)
         dl.download(min_lon=-10, max_lon=5, min_lat=50, max_lat=62,
-                    start="2024-06-01", end="2024-06-01", sensors=["windsat"])
+                    start="2024-06-01", end="2024-06-01")
         out = capsys.readouterr().out
-        assert "Skipping windsat" in out
-        assert "bytemap" in out
+        # Monthly-subfolder .gz URLs with a YYYYMMDD stamp, per sensor.
+        assert "gmi/bmaps_v08.2/y2024/m06/f35_20240601v8.2.gz" in out
+        assert "ssmi/f16/bmaps_v07/y2024/m06/f16_20240601v7.gz" in out
+        assert "windsat/bmaps_v07.0.1/y2024/m06/wsat_20240601v7.0.1.gz" in out
 
     def test_availability_window_skips_early_dates(self, tmp_path, capsys):
         # AMSR2 data starts 2012 — a 2010 request should be skipped, no download.
@@ -327,3 +340,69 @@ class TestRadiometerDownloader:
                     start="2024-06-01", end="2024-06-01", sensors=["not_a_sensor"])
         out = capsys.readouterr().out
         assert "unknown radiometer sensor" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# RSS binary bytemap reader (_rss_bytemap.read_rss_bytemap)
+# ---------------------------------------------------------------------------
+
+import gzip
+import numpy as np
+from sar_validation.downloaders._rss_bytemap import (
+    read_rss_bytemap, BYTEMAP_LAYOUT, NPASS, NLAT, NLON,
+)
+
+
+def _write_bytemap(tmp_path, sensor, filename, cells):
+    """Write a full-size RSS bytemap .gz (all-missing 255 except `cells`).
+
+    cells: list of (pass, var_idx, lat_idx, lon_idx, byte_value).
+    """
+    nvar = len(BYTEMAP_LAYOUT[sensor]["vars"])
+    arr = np.full((NPASS, nvar, NLAT, NLON), 255, np.uint8)
+    for (p, v, la, lo, val) in cells:
+        arr[p, v, la, lo] = val
+    path = tmp_path / filename
+    with gzip.open(path, "wb") as fh:
+        fh.write(arr.tobytes())
+    return path
+
+
+class TestReadRssBytemap:
+    def test_gmi_scale_offset_and_grid(self, tmp_path):
+        # GMI var indices: 0=time (×0.1), 2=windLF (×0.2).
+        p = _write_bytemap(tmp_path, "gmi", "f35_20240601v8.2.gz",
+                           [(0, 2, 400, 600, 50), (0, 0, 400, 600, 100)])
+        decoded, lon, lat = read_rss_bytemap(p, "gmi")
+        assert decoded["windLF"].shape == (NPASS, NLAT, NLON)
+        assert decoded["windLF"][0, 400, 600] == pytest.approx(10.0)   # 50×0.2
+        assert decoded["time"][0, 400, 600] == pytest.approx(10.0)     # 100×0.1
+        assert np.isnan(decoded["windLF"][1, 0, 0])                    # 255 → NaN
+        assert lon[600] == pytest.approx(600 * 0.25 + 0.125)
+        assert lat[400] == pytest.approx(400 * 0.25 - 89.875)
+
+    def test_missing_code_threshold(self, tmp_path):
+        # Byte 250 is valid; 251 is the first special/missing code.
+        p = _write_bytemap(tmp_path, "gmi", "f35_20240101v8.2.gz",
+                           [(0, 2, 0, 0, 250), (0, 2, 0, 1, 251)])
+        decoded, _, _ = read_rss_bytemap(p, "gmi")
+        assert decoded["windLF"][0, 0, 0] == pytest.approx(50.0)       # 250×0.2
+        assert np.isnan(decoded["windLF"][0, 0, 1])                    # 251 masked
+
+    def test_windsat_has_nine_vars_incl_wdir(self, tmp_path):
+        p = _write_bytemap(tmp_path, "windsat", "wsat_20150601v7.0.1.gz",
+                           [(0, 8, 300, 500, 40)])
+        decoded, _, _ = read_rss_bytemap(p, "windsat")
+        assert "wdir" in decoded and "w-lf" in decoded
+        assert decoded["wdir"][0, 300, 500] == pytest.approx(60.0)     # 40×1.5
+
+    def test_size_mismatch_raises(self, tmp_path):
+        path = tmp_path / "f35_bad.gz"
+        with gzip.open(path, "wb") as fh:
+            fh.write(b"\x00" * 100)
+        with pytest.raises(ValueError):
+            read_rss_bytemap(path, "gmi")
+
+    def test_unknown_sensor_raises(self, tmp_path):
+        with pytest.raises(KeyError):
+            read_rss_bytemap(tmp_path / "x.gz", "not_a_sensor")

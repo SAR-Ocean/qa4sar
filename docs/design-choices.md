@@ -130,13 +130,23 @@ Design choices:
   cells for free**; the Medium-Frequency and All-Weather winds are only
   fallbacks if a product lacks LF. Cells with a NaN wind (land, ice, rain) are
   dropped at ingestion, which is why the global grid shrinks to ocean points.
-- **AMSR2 (NetCDF) is implemented now; GMI / SSMIS / WindSat / AMSR-E are a
-  fast-follow.** On `data.remss.com` only the AMSR2 family publishes NetCDF;
-  the other sensors are distributed as RSS **binary bytemaps**, a different
-  format needing a dedicated reader. The downloader's `SENSORS` table carries a
-  `format` field ("netcdf"/"bytemap") so the binary sensors — which also add
-  WindSat wind **direction** — slot in without reworking the pipeline. Download
-  is over **public HTTPS** (`data.remss.com`), no account required.
+- **Two formats, one pipeline.** On `data.remss.com` only AMSR2 publishes
+  **NetCDF**; GMI, SSMIS (F16/F17/F18) and WindSat are distributed as RSS
+  **binary bytemaps** (gzipped `uint8`), decoded by a compact in-house reader
+  (`downloaders/_rss_bytemap.py`) rather than RSS's Python-2 routines. Both
+  formats funnel through the shared `_finalize_radiometer_points` tail so every
+  sensor produces an identical node. The downloader's `SENSORS` table carries a
+  `format` field and per-sensor URL templates; download is over **public
+  HTTPS**, no account required. The bytemap format (confirmed empirically): a
+  `(pass=2, var, lat=720, lon=1440)` grid, `physical = byte·scale + offset`,
+  and **byte ≥ 251 = special/missing → NaN** (land/ice/coast/rain/no-obs). The
+  per-cell time-of-day is fractional **hours** for most sensors but **minutes**
+  for WindSat, so the reader tracks the unit per sensor.
+- **WindSat adds wind direction.** WindSat is the one radiometer with a
+  direction retrieval; its `wdir` is in the **oceanographic** convention, so it
+  is rotated 180° to meteorological at ingestion — the same rotation applied to
+  the ASCAT scatterometer (§3.1) — so WindSat `WDIR` compares directly against
+  `owiWindDirection` and the in-situ `WDIR` code.
 - **Per-sensor collocation specs.** Because every RSS product shares the 0.25°
   grid, the aggregation window is the same for all sensors, but each sensor
   gets its own `radiometer_<sensor>` spec key (e.g. `radiometer_amsr2`),

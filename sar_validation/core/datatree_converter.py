@@ -884,28 +884,67 @@ class DataTreeConverter:
             )
             time_full = np.full(wspd_full.shape, t0)
 
-        # Normalize longitude to -180..180 (RSS grids are 0..360).
-        lon_full = ((lon_full + 180) % 360) - 180
+        # Optional wind direction (polarimetric sensors like WindSat; AMSR2
+        # has none). NetCDF direction is assumed already meteorological.
+        wdir_full = None
+        wdir_attrs = None
+        for dname in ("wind_direction", "wind_dir"):
+            if dname in raw and raw[dname].shape == wind.shape:
+                wdir_full = raw[dname].values.ravel().astype(float)
+                wdir_attrs = dict(raw[dname].attrs)
+                break
+
+        # Sensor tag (e.g. "amsr2") for the per-sensor collocation spec.
+        sensor = str(raw.attrs.get("sensor", "")).strip().lower()
+        if not sensor:
+            m = re.search(r"RSS_([A-Za-z0-9]+)_", nc_path.name)
+            sensor = m.group(1).lower() if m else "unknown"
+        extra = {g: str(raw.attrs[g]) for g in ("title", "institution") if raw.attrs.get(g)}
+        wspd_attrs = dict(wind.attrs)
+        raw.close()
+
+        return DataTreeConverter._finalize_radiometer_points(
+            lon_full, lat_full, time_full, wspd_full, sensor,
+            source=f"RSS radiometer ({sensor.upper()})", filename=nc_path.name,
+            wdir_full=wdir_full, wspd_attrs=wspd_attrs, wdir_attrs=wdir_attrs,
+            extra_global_attrs=extra, log_label=f"(nc wspd_var={wspd_name})",
+        )
+
+    @staticmethod
+    def _finalize_radiometer_points(
+        lon_full, lat_full, time_full, wspd_full, sensor, *,
+        source: str, filename: str, wdir_full=None,
+        wspd_attrs=None, wdir_attrs=None, extra_global_attrs=None, log_label: str = "",
+    ) -> Optional[xr.Dataset]:
+        """
+        Shared tail for the radiometer converters.
+
+        Normalises longitude to −180…180, drops cells without a valid wind
+        retrieval or timestamp, builds the standardised ``point`` Dataset (with
+        canonical ``WSPD`` and optional ``WDIR``), tags it, and stamps CF
+        metadata. Both :meth:`from_radiometer_nc` (NetCDF) and
+        :meth:`from_radiometer_bytemap` (RSS binary) funnel through here so the
+        two formats produce identical node structure.
+        """
+        lon_full = ((np.asarray(lon_full, float) + 180) % 360) - 180
+        lat_full = np.asarray(lat_full, float)
+        wspd_full = np.asarray(wspd_full, float)
+        time_full = np.asarray(time_full)
 
         # Keep only cells with a valid wind retrieval and a valid time. Wind is
-        # already NaN over land/ice/rain, so this also removes those.
+        # already NaN over land/ice/rain (or a masked special code), so this
+        # also removes those.
         keep = np.isfinite(wspd_full) & ~np.isnat(time_full)
         n_keep = int(keep.sum())
         if n_keep == 0:
-            logger.info("from_radiometer_nc: no valid wind cells in %s.", nc_path.name)
-            raw.close()
+            logger.info("from_radiometer: no valid wind cells in %s.", filename)
             return None
 
         data_vars: Dict[str, tuple] = {"WSPD": ("point", wspd_full[keep])}
-        var_attrs: Dict[str, Dict] = {"WSPD": dict(wind.attrs)}
-
-        # Optional wind direction (polarimetric sensors like WindSat).
-        for dname in ("wind_direction", "wind_dir"):
-            if dname in raw and raw[dname].shape == wind.shape:
-                wdir = raw[dname].values.ravel().astype(float)[keep]
-                data_vars["WDIR"] = ("point", wdir)
-                var_attrs["WDIR"] = dict(raw[dname].attrs)
-                break
+        var_attrs: Dict[str, Dict] = {"WSPD": dict(wspd_attrs or {})}
+        if wdir_full is not None:
+            data_vars["WDIR"] = ("point", np.asarray(wdir_full, float)[keep])
+            var_attrs["WDIR"] = dict(wdir_attrs or {})
 
         ds = xr.Dataset(
             data_vars,
@@ -915,30 +954,139 @@ class DataTreeConverter:
                 "time": ("point", time_full[keep]),
             },
         )
-
-        # Sensor tag (e.g. "amsr2") for the per-sensor collocation spec.
-        sensor = str(raw.attrs.get("sensor", "")).strip().lower()
-        if not sensor:
-            m = re.search(r"RSS_([A-Za-z0-9]+)_", nc_path.name)
-            sensor = m.group(1).lower() if m else "unknown"
-
-        for gattr in ("title", "institution"):
-            if raw.attrs.get(gattr):
-                ds.attrs[gattr] = str(raw.attrs[gattr])
+        for gattr, val in (extra_global_attrs or {}).items():
+            ds.attrs[gattr] = val
         apply_cf_metadata(ds, "radiometer", var_attrs)
 
         ds.attrs["data_type"]     = "radiometer"
         ds.attrs["platform_type"] = "radiometer"
         ds.attrs["sensor"]        = sensor
-        ds.attrs["source"]        = f"RSS radiometer ({sensor.upper()})"
-        ds.attrs["filename"]      = nc_path.name
+        ds.attrs["source"]        = source
+        ds.attrs["filename"]      = filename
 
         logger.info(
-            "from_radiometer_nc: %s → %d valid wind points (sensor=%s, wspd_var=%s)",
-            nc_path.name, n_keep, sensor, wspd_name,
+            "from_radiometer: %s → %d valid wind points (sensor=%s) %s",
+            filename, n_keep, sensor, log_label,
         )
-        raw.close()
         return ds
+
+    #: Filename-prefix → sensor key for RSS binary bytemap products.
+    _BYTEMAP_PREFIX_TO_SENSOR = {
+        "f35":  "gmi",
+        "f16":  "ssmis_f16",
+        "f17":  "ssmis_f17",
+        "f18":  "ssmis_f18",
+        "wsat": "windsat",
+    }
+
+    @staticmethod
+    def bytemap_sensor_from_filename(name: Union[str, Path]) -> Optional[str]:
+        """Infer the RSS bytemap sensor key from a filename prefix (e.g.
+        ``f35_20240601v8.2.gz`` → ``"gmi"``)."""
+        prefix = Path(name).name.split("_")[0].lower()
+        return DataTreeConverter._BYTEMAP_PREFIX_TO_SENSOR.get(prefix)
+
+    @staticmethod
+    def from_radiometer_bytemap(
+        path: Union[str, Path],
+        sensor: Optional[str] = None,
+    ) -> Optional[xr.Dataset]:
+        """
+        Decode an RSS binary bytemap radiometer file (GMI / SSMIS / WindSat)
+        and return the same standardised ``point`` Dataset as
+        :meth:`from_radiometer_nc`.
+
+        The gzipped 0.25° grid is decoded by
+        :func:`sar_validation.downloaders._rss_bytemap.read_rss_bytemap`, then
+        flattened to points. Per-cell time is built from the filename date plus
+        the file's time-of-day variable (fractional hours, or minutes for
+        WindSat). WindSat's wind direction is rotated 180°
+        (oceanographic → meteorological) so it matches ``owiWindDirection`` and
+        the in-situ ``WDIR`` code — reusing the convention applied in
+        :meth:`from_scatterometer_nc`.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to the ``.gz`` bytemap file.
+        sensor : str, optional
+            Sensor key; inferred from the filename prefix when omitted.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="radiometer"``, or None on failure.
+        """
+        from ..downloaders._rss_bytemap import read_rss_bytemap, BYTEMAP_LAYOUT
+
+        path = Path(path)
+        if not path.exists():
+            logger.warning("Bytemap not found: %s", path)
+            return None
+        if sensor is None:
+            sensor = DataTreeConverter.bytemap_sensor_from_filename(path.name)
+        if sensor is None or sensor not in BYTEMAP_LAYOUT:
+            logger.warning(
+                "from_radiometer_bytemap: cannot resolve sensor for %s.", path.name
+            )
+            return None
+
+        try:
+            decoded, lon1d, lat1d = read_rss_bytemap(path, sensor)
+        except Exception as exc:
+            logger.warning("from_radiometer_bytemap: failed to read %s: %s", path.name, exc)
+            return None
+
+        layout = BYTEMAP_LAYOUT[sensor]
+        wind = decoded[layout["wind"]]  # (pass, lat, lon)
+
+        lat_grid, lon_grid = np.meshgrid(lat1d, lon1d, indexing="ij")
+        lat_full = np.broadcast_to(lat_grid, wind.shape).ravel()
+        lon_full = np.broadcast_to(lon_grid, wind.shape).ravel()
+        wspd_full = wind.ravel()
+
+        # Per-cell time = filename date + time-of-day (hours or minutes).
+        tod = decoded[layout["time"]].ravel()
+        factor_ns = {"hours": 3_600_000_000_000, "minutes": 60_000_000_000}[layout["time_unit"]]
+        m = re.search(r"(\d{8})", path.stem)
+        if m:
+            d = m.group(1)
+            base = np.datetime64(f"{d[0:4]}-{d[4:6]}-{d[6:8]}", "ns")
+            offset = (np.nan_to_num(tod) * factor_ns).astype("timedelta64[ns]")
+            time_full = np.where(
+                np.isfinite(tod), base + offset, np.datetime64("NaT", "ns")
+            )
+        else:
+            time_full = np.full(wspd_full.shape, np.datetime64("NaT", "ns"))
+
+        # WindSat wind direction → canonical WDIR, rotated oceanographic →
+        # meteorological (see from_scatterometer_nc).
+        wdir_full = None
+        wdir_attrs = None
+        if layout.get("wdir"):
+            wdir_full = (decoded[layout["wdir"]].ravel() + 180.0) % 360.0
+            wdir_attrs = {
+                "standard_name": "wind_from_direction",
+                "long_name": "wind direction at 10 m (meteorological convention)",
+                "units": "degree",
+                "comment": (
+                    "Rotated 180 degrees from the RSS WindSat oceanographic "
+                    "convention by sar-l2-validation-toolbox."
+                ),
+            }
+
+        return DataTreeConverter._finalize_radiometer_points(
+            lon_full, lat_full, time_full, wspd_full, sensor,
+            source=f"RSS radiometer bytemap ({sensor.upper()})", filename=path.name,
+            wdir_full=wdir_full,
+            wspd_attrs={
+                "standard_name": "wind_speed",
+                "long_name": f"{layout['wind']} 10 m wind speed",
+                "units": "m s-1",
+            },
+            wdir_attrs=wdir_attrs,
+            log_label=f"(bytemap wind={layout['wind']})",
+        )
 
     @staticmethod
     def to_datatree(
@@ -1839,17 +1987,22 @@ class DataTreeConverter:
                     datasets[f"validation/altimeter/{key}"] = ds
                     logger.info("Converted altimeter: %s", nc_path.relative_to(subdir))
 
-        # Radiometer daily gridded NetCDF products (RSS AMSR2 etc.). Each file
-        # is a global 0.25° grid; from_radiometer_nc flattens it to points and
-        # the domain filter crops to the recipe bbox (>95% reduction, like the
-        # scatterometer).
+        # Radiometer daily gridded products. Each file is a global 0.25° grid;
+        # the converter flattens it to points and the domain filter crops to
+        # the recipe bbox (>95% reduction, like the scatterometer). AMSR2 is
+        # NetCDF (.nc → from_radiometer_nc); GMI/SSMIS/WindSat are RSS binary
+        # bytemaps (.gz → from_radiometer_bytemap, sensor from filename prefix).
         subdir = base_dir / "radiometer"
         if subdir.exists():
-            for nc_path in sorted(subdir.glob("*.nc")):
-                ds = _filtered(DataTreeConverter.from_radiometer_nc(nc_path), nc_path.name)
+            for f in sorted(list(subdir.glob("*.nc")) + list(subdir.glob("*.gz"))):
+                if f.suffix == ".nc":
+                    raw_ds = DataTreeConverter.from_radiometer_nc(f)
+                else:
+                    raw_ds = DataTreeConverter.from_radiometer_bytemap(f)
+                ds = _filtered(raw_ds, f.name)
                 if ds is not None:
-                    datasets[f"validation/radiometer/{nc_path.stem}"] = ds
-                    logger.info("Converted radiometer: %s", nc_path.name)
+                    datasets[f"validation/radiometer/{f.stem}"] = ds
+                    logger.info("Converted radiometer: %s", f.name)
 
         if not datasets:
             logger.warning("No convertible data found in %s", base_dir)
