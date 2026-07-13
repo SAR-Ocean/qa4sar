@@ -189,6 +189,7 @@ def plot_scatter(
     val_var: str,
     *,
     by_source: bool = True,
+    color_by: str = "source",
     interactive: bool = False,
     ax=None,
 ):
@@ -204,7 +205,15 @@ def plot_scatter(
     val_var : str
         Validation variable name *without* ``val_`` prefix (e.g. ``"WSPD"``).
     by_source : bool
-        Colour points by ``val_source``.
+        Whether per-source legend labels are shown (``color_by="source"``)
+        or the per-source marker-shape legend is shown
+        (``color_by="temporal_offset"``).
+    color_by : str
+        ``"source"`` (default) colours points by ``val_source``.
+        ``"temporal_offset"`` colours points by ``temporal_distance_minutes``
+        (continuous colormap + colorbar) instead, with marker shape still
+        varying by source — falls back to ``"source"`` with a warning if
+        ``temporal_distance_minutes`` is not present in *collocation_ds*.
     interactive : bool
         Return a plotly Figure instead of matplotlib.
     ax : matplotlib.axes.Axes, optional
@@ -222,7 +231,7 @@ def plot_scatter(
         warnings.warn(f"No valid data for {sar_col} vs {val_col}.")
         return None
 
-    extra_cols = [c for c in ("val_id", "val_lat", "val_lon") if c in collocation_ds]
+    extra_cols = [c for c in ("val_id", "val_lat", "val_lon", "temporal_distance_minutes") if c in collocation_ds]
     base_cols = [sar_col, val_col, "val_source"] + extra_cols
     df_raw = collocation_ds[base_cols].to_dataframe()
     if "val_time" in collocation_ds.coords:
@@ -255,6 +264,7 @@ def plot_scatter(
         return fig
 
     import matplotlib.pyplot as plt  # noqa: PLC0415
+    import matplotlib.lines as mlines  # noqa: PLC0415
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 6))
@@ -264,16 +274,35 @@ def plot_scatter(
     sources = df["val_source"].unique().tolist()
     style = _source_style_map(sources)
 
+    color_by_offset = color_by == "temporal_offset"
+    if color_by_offset and "temporal_distance_minutes" not in df.columns:
+        warnings.warn(
+            "color_by='temporal_offset' requested but collocation_ds has no "
+            "'temporal_distance_minutes' column; falling back to color_by='source'."
+        )
+        color_by_offset = False
+
+    offset_sm = None
     for src in sorted(sources):
         sub = df[df["val_source"] == src]
-        label = src if by_source else None
-        color, marker = style[src]
-        ax.scatter(sub[val_col], sub[sar_col], s=18, alpha=0.6,
-                   color=color, marker=marker, label=label, rasterized=True)
+        marker = style[src][1]
+        if color_by_offset:
+            offset_sm = ax.scatter(
+                sub[val_col], sub[sar_col], s=18, alpha=0.7,
+                c=sub["temporal_distance_minutes"], cmap="plasma",
+                marker=marker, rasterized=True,
+            )
+        else:
+            label = src if by_source else None
+            ax.scatter(sub[val_col], sub[sar_col], s=18, alpha=0.6,
+                       color=style[src][0], marker=marker, label=label, rasterized=True)
 
     all_vals = np.concatenate([df[val_col].values, df[sar_col].values])
     vmin, vmax = float(np.nanmin(all_vals)), float(np.nanmax(all_vals))
-    ax.plot([vmin, vmax], [vmin, vmax], "k--", linewidth=1, label="1:1")
+    line11 = ax.plot([vmin, vmax], [vmin, vmax], "k--", linewidth=1, label="1:1")[0]
+
+    if color_by_offset and offset_sm is not None:
+        fig.colorbar(offset_sm, ax=ax, label="Temporal offset (min)", shrink=0.8)
 
     # Annotate with N, bias, RMSE
     from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg  # noqa: PLC0415
@@ -305,7 +334,18 @@ def plot_scatter(
     ax.set_ylim(vmin, vmax)
     ax.set_aspect("equal", "box")
     ax.grid(True, linewidth=0.4)
-    if by_source:
+
+    if color_by_offset:
+        if by_source:
+            handles = [
+                mlines.Line2D([], [], marker=style[src][1], linestyle="None",
+                              markerfacecolor="lightgray", markeredgecolor="black",
+                              markersize=6, label=src)
+                for src in sorted(sources)
+            ]
+            handles.append(line11)
+            ax.legend(handles=handles, fontsize=7, framealpha=0.7)
+    elif by_source:
         ax.legend(fontsize=7, framealpha=0.7)
 
     fig.tight_layout()
