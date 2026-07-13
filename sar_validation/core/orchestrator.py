@@ -7,7 +7,7 @@ Reads a Recipe and drives all data downloads:
   - HF radar
   - Scatterometer (ASCAT MetOp-B/C)
   - Altimeter (along-track SWH/wind, Copernicus Marine L3)
-  - Radiosonde (not yet implemented)
+  - Radiometer (RSS daily gridded ocean winds, e.g. AMSR2)
 """
 
 from __future__ import annotations
@@ -205,7 +205,7 @@ class DataOrchestrator:
             "scatterometer": self._download_scatterometer,
             "hf_radar":      self._download_hf_radar,
             "altimeter":     self._download_altimeter,
-            "radiosonde":    self._download_radiosonde,
+            "radiometer":    self._download_radiometer,
         }
         handler = handlers.get(source.source_type)
         if handler is None:
@@ -316,11 +316,34 @@ class DataOrchestrator:
             self.metadata["downloads"]["altimeter"] = {"status": "failed", "error": msg}
             return False
 
-    def _download_radiosonde(self, source) -> bool:
-        msg = "Radiosonde downloader is not yet implemented (see radiosonde_downloader.py)."
-        logger.warning(msg)
-        self.metadata["downloads"]["radiosonde"] = {"status": "not_implemented"}
-        return True   # non-fatal
+    def _download_radiometer(self, source) -> bool:
+        from ..downloaders.radiometer_downloader import RadiometerDownloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        temp   = cfg.temporal_bounds
+        out_dir = self.base_dir / "radiometer"
+
+        try:
+            dl = RadiometerDownloader(output_dir=out_dir, dry_run=self.dry_run)
+            kwargs = dict(source.download_kwargs)   # e.g. {"sensors": ["amsr2"]}
+            paths = dl.download(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=temp.start, end=temp.end,
+                **kwargs,
+            )
+            self.metadata["downloads"]["radiometer"] = {
+                "status": "dry_run" if self.dry_run else "success",
+                "files":  [str(p) for p in paths],
+            }
+            return True
+        except Exception as exc:
+            msg = f"Radiometer download failed: {exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"]["radiometer"] = {"status": "failed", "error": msg}
+            return False
 
     # ------------------------------------------------------------------
     # Metadata

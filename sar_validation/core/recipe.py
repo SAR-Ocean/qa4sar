@@ -57,9 +57,8 @@ class ValidationDataSource:
 
     Accepted values:
       in-situ   : mooring, buoy, ferrybox, drifter, tidal_gauge
-      satellite : scatterometer, altimeter
+      satellite : scatterometer, altimeter, radiometer
       coastal   : hf_radar
-      upper-air : radiosonde  (not yet implemented)
     """
 
     # Optional depth filter (for in-situ and HF radar sources)
@@ -110,11 +109,28 @@ class PointVsLayerCollocation:
 #: because the two frequencies have very different along-track point
 #: spacing (7km vs 1.4km — see WAVE_GLO_PHY_SWH_L3_NRT_014_001), so a single
 #: aggregation window would be wrong for at least one of them.
+#: RSS radiometers are all distributed on a common 0.25° (~25 km) grid, so
+#: every ``radiometer_<sensor>`` entry defaults to the same aggregation window.
+#: They are kept as separate per-sensor keys (mirroring the altimeter split)
+#: purely so each can be tuned individually in a recipe — e.g. a different time
+#: tolerance, or down-weighting a coarser-footprint sensor. Collocation refines
+#: ``radiometer`` to ``radiometer_<sensor>`` from each node's ``sensor`` attr.
+_RADIOMETER_DEFAULT = {"time_tolerance_minutes": 180, "aggregation_window_km": 25.0, "distance_weighting": "equal"}
+
 DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
     "scatterometer":  {"time_tolerance_minutes": 180, "aggregation_window_km": 12.5, "distance_weighting": "equal"},
     "altimeter_1hz":  {"time_tolerance_minutes": 180, "aggregation_window_km": 7.0,  "distance_weighting": "equal"},
     "altimeter_5hz":  {"time_tolerance_minutes": 180, "aggregation_window_km": 1.4,  "distance_weighting": "equal"},
     "hf_radar":       {"time_tolerance_minutes": 20,  "aggregation_window_km": 5.0,  "distance_weighting": "equal"},
+    # Bare key is the fallback when a node's sensor is unknown.
+    "radiometer":       dict(_RADIOMETER_DEFAULT),
+    "radiometer_amsr2": dict(_RADIOMETER_DEFAULT),
+    "radiometer_gmi":   dict(_RADIOMETER_DEFAULT),
+    "radiometer_ssmis_f16": dict(_RADIOMETER_DEFAULT),
+    "radiometer_ssmis_f17": dict(_RADIOMETER_DEFAULT),
+    "radiometer_ssmis_f18": dict(_RADIOMETER_DEFAULT),
+    "radiometer_windsat":   dict(_RADIOMETER_DEFAULT),
+    "radiometer_amsre":     dict(_RADIOMETER_DEFAULT),
 }
 
 

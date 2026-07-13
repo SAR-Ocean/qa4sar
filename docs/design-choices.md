@@ -33,7 +33,7 @@ Three validated quantities are supported — **wind** (speed + direction,
 OWI grids), **currents** (RVL radial velocity), **waves** (significant wave
 height, OSW/WV imagettes) — against in-situ platforms (moorings, buoys,
 drifters, ferryboxes, tidal gauges), ASCAT scatterometer, satellite
-altimeters, and HF radar.
+altimeters, RSS radiometers (AMSR2), and HF radar.
 
 > Code: `sar_validation/cli.py` (pipeline driver), `core/recipe.py`
 > (recipe schema), `core/orchestrator.py` (step 1).
@@ -54,6 +54,7 @@ ingestion, means no downstream component ever needs alias logic.
 | OSI-SAF scatterometer | `wind_speed` | `WSPD` | 10-m wind speed |
 | OSI-SAF scatterometer | `wind_dir` | `WDIR` | 10-m wind direction |
 | CMEMS altimeter L3 (1 Hz) | `WIND_SPEED` | `WSPD` | altimeter-derived wind speed |
+| RSS radiometer (AMSR2) | `wind_speed_LF` | `WSPD` | 10-m radiometer wind speed |
 | Copernicus in-situ CSV | already `WSPD`, `WDIR`, `VHM0`, `EWCT`, `NSCT`, … | unchanged | — |
 
 The mapping from recipe variable ("wind" / "currents" / "waves") to the
@@ -110,7 +111,40 @@ is detected from the file content (5 Hz files carry `VAVH_UNCERTAINTY`
 instead of `WIND_SPEED`). Wind recipes download only 1 Hz (5 Hz has no wind
 and 5× the point density for no benefit); wave recipes download both.
 
-### 3.4 Other ingestion conventions
+### 3.4 Radiometer products are pre-gridded to 0.25° bins
+
+Remote Sensing Systems (RSS) distributes each microwave radiometer mission as
+a **daily gridded product already resampled to a common 0.25° (~25 km) global
+grid** — the toolbox never touches the native swath. One file per sensor per
+day covers the whole globe, with **two passes** (ascending / descending) and a
+**per-cell measurement time**; `from_radiometer_nc` flattens every
+`(pass, lat, lon)` cell to a point that carries its own timestamp, so each cell
+collocates against the SAR scene nearest in time rather than sharing one file
+time.
+
+Design choices:
+
+- **Wind speed is taken from the Low-Frequency (LF, 10.7 GHz) channel**
+  (`wind_speed_LF` → `WSPD`). LF is RSS's standard all-purpose 10-m wind and is
+  set to fill (NaN) under rain, so keeping LF also **drops rain-contaminated
+  cells for free**; the Medium-Frequency and All-Weather winds are only
+  fallbacks if a product lacks LF. Cells with a NaN wind (land, ice, rain) are
+  dropped at ingestion, which is why the global grid shrinks to ocean points.
+- **AMSR2 (NetCDF) is implemented now; GMI / SSMIS / WindSat / AMSR-E are a
+  fast-follow.** On `data.remss.com` only the AMSR2 family publishes NetCDF;
+  the other sensors are distributed as RSS **binary bytemaps**, a different
+  format needing a dedicated reader. The downloader's `SENSORS` table carries a
+  `format` field ("netcdf"/"bytemap") so the binary sensors — which also add
+  WindSat wind **direction** — slot in without reworking the pipeline. Download
+  is over **public HTTPS** (`data.remss.com`), no account required.
+- **Per-sensor collocation specs.** Because every RSS product shares the 0.25°
+  grid, the aggregation window is the same for all sensors, but each sensor
+  gets its own `radiometer_<sensor>` spec key (e.g. `radiometer_amsr2`),
+  mirroring the altimeter split, so it stays individually tunable (§5.2). Each
+  node is tagged with its `sensor` attribute and collocation refines the bare
+  `radiometer` layer type to `radiometer_<sensor>`.
+
+### 3.5 Other ingestion conventions
 
 - **Longitude** is normalised to −180…180° everywhere (source products mix
   0–360 and ±180 conventions).
@@ -123,7 +157,8 @@ and 5× the point density for no benefit); wave recipes download both.
   used for the (single, batched) download.
 
 > Code: `core/datatree_converter.py` (`_ASCAT_REJECT_FLAGS`,
-> `from_scatterometer_nc`, `from_altimeter`, `from_insitu_csv`),
+> `from_scatterometer_nc`, `from_altimeter`, `from_radiometer_nc`,
+> `from_insitu_csv`), `downloaders/radiometer_downloader.py` (`SENSORS`),
 > `core/orchestrator.py` (`_ALTIMETER_FREQUENCIES_BY_VARIABLE`,
 > depth-window merge in `download_all`).
 
@@ -231,6 +266,7 @@ The window size is matched to the validation sensor:
 | scatterometer | 12.5 | ASCAT wind-vector-cell size |
 | altimeter 1 Hz | 7.0 | 1 Hz along-track spacing |
 | altimeter 5 Hz | 1.4 | 5 Hz along-track spacing |
+| radiometer (AMSR2, …) | 25.0 | RSS 0.25° grid-cell size |
 | HF radar | 5.0 | typical radial grid spacing |
 
 These built-in defaults apply even when a recipe declares no
@@ -244,7 +280,7 @@ per key.
   aggregation window (§5.2); the separate `spatial_tolerance_km` recipe
   parameter (default 25 km) is a legacy pre-filter kept for API
   compatibility.
-- **Satellite layers vs SAR: ±180 min** (scatterometer, altimeter) —
+- **Satellite layers vs SAR: ±180 min** (scatterometer, altimeter, radiometer) —
   following the 3-hour match window used for Sentinel-1/scatterometer
   validation in hal-04202202; the 12.5 km spatial scale is the ASCAT cell
   size from the same reference.
@@ -343,7 +379,7 @@ for the residual plots, so figures and tables always agree.
 ## 7. Statistics definitions
 
 Per *(SAR variable, validation variable)* pair, grouped by **platform type**
-(`val_source`: mooring, buoy, drifter, scatterometer, altimeter, …) so every
+(`val_source`: mooring, buoy, drifter, scatterometer, altimeter, radiometer, …) so every
 platform type gets its own row rather than drowning in a single pooled
 number:
 

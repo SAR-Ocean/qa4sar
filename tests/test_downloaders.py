@@ -269,3 +269,61 @@ class TestInsituPlatformCodeMapping:
 
     def test_mo_labels_as_mooring(self):
         assert PLATFORM_CODE_TO_SOURCE_TYPE["MO"] == "mooring"
+
+
+# ---------------------------------------------------------------------------
+# RadiometerDownloader (RSS radiometer over HTTPS)
+# ---------------------------------------------------------------------------
+
+from sar_validation.downloaders.radiometer_downloader import (
+    RadiometerDownloader, SENSORS, SUPPORTED_SENSORS,
+)
+
+
+class TestRadiometerDownloader:
+    def test_amsr2_is_a_supported_netcdf_sensor(self):
+        assert "amsr2" in SUPPORTED_SENSORS
+        assert SENSORS["amsr2"]["format"] == "netcdf"
+
+    def test_bytemap_sensors_declared_but_not_supported(self):
+        # Fast-follow sensors are present in the table but not yet downloadable.
+        for s in ("gmi", "ssmis_f16", "windsat"):
+            assert s in SENSORS
+            assert SENSORS[s]["format"] == "bytemap"
+            assert s not in SUPPORTED_SENSORS
+
+    def test_dry_run_lists_urls_without_network(self, tmp_path, capsys):
+        dl = RadiometerDownloader(output_dir=tmp_path, dry_run=True)
+        paths = dl.download(min_lon=-10, max_lon=5, min_lat=50, max_lat=62,
+                            start="2024-06-01", end="2024-06-02")
+        out = capsys.readouterr().out
+        assert paths == []
+        assert "DRY RUN" in out
+        # Both days for the default (amsr2) sensor, with the correct URL shape.
+        assert "RSS_AMSR2_ocean_L3_daily_2024-06-01_v08.2.nc" in out
+        assert "RSS_AMSR2_ocean_L3_daily_2024-06-02_v08.2.nc" in out
+        assert "data.remss.com/amsr2/ocean/L3" in out
+
+    def test_dry_run_skips_bytemap_sensors(self, tmp_path, capsys):
+        dl = RadiometerDownloader(output_dir=tmp_path, dry_run=True)
+        dl.download(min_lon=-10, max_lon=5, min_lat=50, max_lat=62,
+                    start="2024-06-01", end="2024-06-01", sensors=["windsat"])
+        out = capsys.readouterr().out
+        assert "Skipping windsat" in out
+        assert "bytemap" in out
+
+    def test_availability_window_skips_early_dates(self, tmp_path, capsys):
+        # AMSR2 data starts 2012 — a 2010 request should be skipped, no download.
+        dl = RadiometerDownloader(output_dir=tmp_path, dry_run=True)
+        dl.download(min_lon=-10, max_lon=5, min_lat=50, max_lat=62,
+                    start="2010-01-01", end="2010-01-02", sensors=["amsr2"])
+        out = capsys.readouterr().out
+        assert "Skipping amsr2" in out
+        assert "availability" in out
+
+    def test_unknown_sensor_warns(self, tmp_path, capsys):
+        dl = RadiometerDownloader(output_dir=tmp_path, dry_run=True)
+        dl.download(min_lon=-10, max_lon=5, min_lat=50, max_lat=62,
+                    start="2024-06-01", end="2024-06-01", sensors=["not_a_sensor"])
+        out = capsys.readouterr().out
+        assert "unknown radiometer sensor" in out.lower()

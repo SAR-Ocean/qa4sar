@@ -793,6 +793,153 @@ class DataTreeConverter:
         raw.close()
         return ds
 
+    #: Radiometer wind-speed variables in order of preference. RSS AMSR2 L3
+    #: carries Low-Frequency (LF, 10.7 GHz), Medium-Frequency (MF, 18.7 GHz)
+    #: and All-Weather (AW) winds. LF is the standard all-purpose 10 m wind and
+    #: is set to fill (NaN) under rain, so keeping LF also drops rain-flagged
+    #: cells for free; MF/AW are fallbacks if a product lacks LF.
+    _RADIOMETER_WSPD_VARS = ("wind_speed_LF", "wind_speed_MF", "wind_speed_AW", "wind_speed")
+
+    @staticmethod
+    def from_radiometer_nc(
+        nc_path: Union[str, Path],
+    ) -> Optional[xr.Dataset]:
+        """
+        Open an RSS radiometer daily gridded NetCDF (e.g. AMSR2 L3) and return
+        a standardised Dataset with a flat ``point`` dimension, matching the
+        layout produced by :meth:`from_scatterometer_nc`.
+
+        RSS distributes these products **already resampled to a common 0.25°
+        global grid** (dims ``pass`` × ``lat`` × ``lon``), with two passes
+        (ascending / descending) per file and a per-cell measurement ``time``.
+        This method flattens every (pass, lat, lon) cell to a point, keeps the
+        cells with a valid wind retrieval, and renames the chosen wind-speed
+        variable (see :data:`_RADIOMETER_WSPD_VARS`) to the canonical ``WSPD``
+        code so radiometer wind lands in the same wind comparison as the
+        in-situ, scatterometer and altimeter sources. **No change to
+        ``_variable_map.py`` is needed.**
+
+        The node is tagged with ``sensor`` (e.g. ``"amsr2"``) so collocation
+        can look up a per-sensor spec (``radiometer_<sensor>``).
+
+        Parameters
+        ----------
+        nc_path : str or Path
+            Path to the radiometer NetCDF file.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="radiometer"``, or None on failure.
+        """
+        nc_path = Path(nc_path)
+        if not nc_path.exists():
+            logger.warning("NetCDF not found: %s", nc_path)
+            return None
+
+        try:
+            raw = xr.open_dataset(nc_path)
+        except Exception as exc:
+            logger.warning("Could not open %s: %s", nc_path, exc)
+            return None
+
+        if "lon" not in raw.coords or "lat" not in raw.coords:
+            logger.warning(
+                "from_radiometer_nc: no lon/lat coords in %s (have %s)",
+                nc_path.name, list(raw.coords),
+            )
+            raw.close()
+            return None
+
+        # Pick the wind-speed variable (LF preferred).
+        wspd_name = next((v for v in DataTreeConverter._RADIOMETER_WSPD_VARS if v in raw), None)
+        if wspd_name is None:
+            logger.warning(
+                "from_radiometer_nc: no wind-speed variable in %s (tried %s)",
+                nc_path.name, DataTreeConverter._RADIOMETER_WSPD_VARS,
+            )
+            raw.close()
+            return None
+
+        wind = raw[wspd_name]  # dims (pass, lat, lon) — or (lat, lon) if single-pass
+        lat1d = raw["lat"].values
+        lon1d = raw["lon"].values
+
+        # Broadcast the 1-D grid coords to the full data shape, then flatten.
+        # np.meshgrid gives (lat, lon); broadcasting adds the leading pass axis.
+        lat_grid, lon_grid = np.meshgrid(lat1d, lon1d, indexing="ij")
+        lat_full = np.broadcast_to(lat_grid, wind.shape).ravel().astype(float)
+        lon_full = np.broadcast_to(lon_grid, wind.shape).ravel().astype(float)
+        wspd_full = wind.values.ravel().astype(float)
+
+        # Per-cell acquisition time (same dims as wind); fall back to the file
+        # date if absent.
+        if "time" in raw and raw["time"].shape == wind.shape:
+            time_full = pd.to_datetime(raw["time"].values.ravel()).values
+        else:
+            m = re.search(r"(\d{4})-(\d{2})-(\d{2})", nc_path.stem)
+            t0 = (
+                np.datetime64(f"{m.group(1)}-{m.group(2)}-{m.group(3)}", "ns")
+                if m else np.datetime64("NaT", "ns")
+            )
+            time_full = np.full(wspd_full.shape, t0)
+
+        # Normalize longitude to -180..180 (RSS grids are 0..360).
+        lon_full = ((lon_full + 180) % 360) - 180
+
+        # Keep only cells with a valid wind retrieval and a valid time. Wind is
+        # already NaN over land/ice/rain, so this also removes those.
+        keep = np.isfinite(wspd_full) & ~np.isnat(time_full)
+        n_keep = int(keep.sum())
+        if n_keep == 0:
+            logger.info("from_radiometer_nc: no valid wind cells in %s.", nc_path.name)
+            raw.close()
+            return None
+
+        data_vars: Dict[str, tuple] = {"WSPD": ("point", wspd_full[keep])}
+        var_attrs: Dict[str, Dict] = {"WSPD": dict(wind.attrs)}
+
+        # Optional wind direction (polarimetric sensors like WindSat).
+        for dname in ("wind_direction", "wind_dir"):
+            if dname in raw and raw[dname].shape == wind.shape:
+                wdir = raw[dname].values.ravel().astype(float)[keep]
+                data_vars["WDIR"] = ("point", wdir)
+                var_attrs["WDIR"] = dict(raw[dname].attrs)
+                break
+
+        ds = xr.Dataset(
+            data_vars,
+            coords={
+                "lon":  ("point", lon_full[keep]),
+                "lat":  ("point", lat_full[keep]),
+                "time": ("point", time_full[keep]),
+            },
+        )
+
+        # Sensor tag (e.g. "amsr2") for the per-sensor collocation spec.
+        sensor = str(raw.attrs.get("sensor", "")).strip().lower()
+        if not sensor:
+            m = re.search(r"RSS_([A-Za-z0-9]+)_", nc_path.name)
+            sensor = m.group(1).lower() if m else "unknown"
+
+        for gattr in ("title", "institution"):
+            if raw.attrs.get(gattr):
+                ds.attrs[gattr] = str(raw.attrs[gattr])
+        apply_cf_metadata(ds, "radiometer", var_attrs)
+
+        ds.attrs["data_type"]     = "radiometer"
+        ds.attrs["platform_type"] = "radiometer"
+        ds.attrs["sensor"]        = sensor
+        ds.attrs["source"]        = f"RSS radiometer ({sensor.upper()})"
+        ds.attrs["filename"]      = nc_path.name
+
+        logger.info(
+            "from_radiometer_nc: %s → %d valid wind points (sensor=%s, wspd_var=%s)",
+            nc_path.name, n_keep, sensor, wspd_name,
+        )
+        raw.close()
+        return ds
+
     @staticmethod
     def to_datatree(
         datasets: Dict[str, Optional[xr.Dataset]],
@@ -1691,6 +1838,18 @@ class DataTreeConverter:
                     key = "_".join(rel.parts)
                     datasets[f"validation/altimeter/{key}"] = ds
                     logger.info("Converted altimeter: %s", nc_path.relative_to(subdir))
+
+        # Radiometer daily gridded NetCDF products (RSS AMSR2 etc.). Each file
+        # is a global 0.25° grid; from_radiometer_nc flattens it to points and
+        # the domain filter crops to the recipe bbox (>95% reduction, like the
+        # scatterometer).
+        subdir = base_dir / "radiometer"
+        if subdir.exists():
+            for nc_path in sorted(subdir.glob("*.nc")):
+                ds = _filtered(DataTreeConverter.from_radiometer_nc(nc_path), nc_path.name)
+                if ds is not None:
+                    datasets[f"validation/radiometer/{nc_path.stem}"] = ds
+                    logger.info("Converted radiometer: %s", nc_path.name)
 
         if not datasets:
             logger.warning("No convertible data found in %s", base_dir)

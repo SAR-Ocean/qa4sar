@@ -40,6 +40,7 @@ PRODUCT_REFERENCES: Dict[str, str] = {
         "https://data.marine.copernicus.eu/product/"
         "WAVE_GLO_PHY_SWH_L3_NRT_014_001/services"
     ),
+    "radiometer": "https://www.remss.com/missions/amsr/",
     "sar": "https://s1.pages.eopf.copernicus.eu/s1-l12-rp/main/pfs/index.html",
     "insitu": (
         "https://data.marine.copernicus.eu/product/"
@@ -132,7 +133,8 @@ def apply_cf_metadata(
     ds : xr.Dataset
         Dataset to annotate (modified in place and returned).
     source_kind : str
-        One of ``"scatterometer"``, ``"altimeter"``, ``"sar"``, ``"insitu"``.
+        One of ``"scatterometer"``, ``"altimeter"``, ``"radiometer"``,
+        ``"sar"``, ``"insitu"``.
     var_attrs : dict, optional
         Mapping of output variable name → raw attribute dict.
     """

@@ -25,6 +25,14 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Type-only import: binds ``xr`` for the string return annotations below
+    # (e.g. ``"xr.DataTree | None"``). This module imports xarray lazily inside
+    # the functions that use it rather than at module scope, so without this
+    # guard a type checker can't resolve ``xr`` in those annotations.
+    import xarray as xr
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -252,7 +260,8 @@ def _create_recipe(
             name="Wind Validation",
             description=(
                 "Validate Sentinel-1 IW/EW mode wind speed and direction\n"
-                "against moorings, buoys, ASCAT scatterometer, and 1 Hz altimeter."
+                "against moorings, buoys, ASCAT scatterometer, 1 Hz altimeter,\n"
+                "and RSS radiometer (AMSR2) ocean winds."
             ),
             variable="wind",
             variable_specs={"components": ["speed", "direction"]},
@@ -266,6 +275,7 @@ def _create_recipe(
                 ValidationDataSource(source_type="tidal_gauge"),
                 ValidationDataSource(source_type="scatterometer"),
                 ValidationDataSource(source_type="altimeter"),
+                ValidationDataSource(source_type="radiometer"),
             ],
             collocation=CollocationType(
                 point_vs_layer=PointVsLayerCollocation(),
@@ -282,6 +292,15 @@ def _create_recipe(
                         "altimeter_1hz": {
                             "time_tolerance_minutes": 180,
                             "aggregation_window_km": 7.0,
+                            "distance_weighting": "equal",
+                        },
+                        # RSS radiometer (AMSR2): all products share the 0.25°
+                        # (~25 km) grid. Per-sensor key so each sensor stays
+                        # individually tunable; collocation resolves a node's
+                        # 'radiometer' layer type to 'radiometer_<sensor>'.
+                        "radiometer_amsr2": {
+                            "time_tolerance_minutes": 180,
+                            "aggregation_window_km": 25.0,
                             "distance_weighting": "equal",
                         },
                     }
@@ -586,7 +605,6 @@ def _generate_plots(recipe, base_dir: Path, filename_suffix: str = "") -> None:
     """Run step 5: generate validation plots and save to <base_dir>/plots/."""
     import xarray as xr
     from .core.visualization import validation_report
-    from .core.statistics import run_statistics
 
     coll_path = base_dir / f"collocation_results{filename_suffix}.nc"
     datatree_path = base_dir / "datatree.nc"

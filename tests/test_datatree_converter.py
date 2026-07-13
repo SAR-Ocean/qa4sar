@@ -565,3 +565,123 @@ class TestToDataFrame:
         df = DataTreeConverter.to_dataframe([])
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 0
+
+
+# ---------------------------------------------------------------------------
+# from_radiometer_nc
+# ---------------------------------------------------------------------------
+
+def _make_radiometer_nc(tmp_path: Path, npass: int = 2, nlat: int = 4,
+                        nlon: int = 6, nan_frac: float = 0.0,
+                        sensor: str = "AMSR2",
+                        with_direction: bool = False) -> Path:
+    """Write a minimal RSS AMSR2-shaped daily gridded NetCDF (pass x lat x lon)."""
+    rng = np.random.default_rng(3)
+    lat = np.linspace(-80.0, 80.0, nlat).astype("float32")
+    lon = np.linspace(0.125, 359.875, nlon).astype("float32")   # 0..360, like RSS
+    shape = (npass, nlat, nlon)
+
+    wspd = rng.uniform(2, 15, shape).astype("float32")
+    if nan_frac > 0:
+        mask = rng.random(shape) < nan_frac
+        wspd[mask] = np.nan
+
+    # Per-cell time on 2024-06-01, spread across the day.
+    base = np.datetime64("2024-06-01T00:00:00", "ns")
+    secs = rng.integers(0, 86400, shape).astype("timedelta64[s]").astype("timedelta64[ns]")
+    time = base + secs
+
+    data = {
+        "wind_speed_LF": (("pass", "lat", "lon"), wspd,
+                          {"standard_name": "wind_speed",
+                           "long_name": "AMSR2 Low Frequency (LF) wind speed",
+                           "units": "m s-1", "valid_min": 0, "valid_max": 70}),
+        "SST": (("pass", "lat", "lon"), rng.uniform(0, 25, shape).astype("float32")),
+        "time": (("pass", "lat", "lon"), time,
+                 {"long_name": "fractional hours of day since midnight UTC"}),
+    }
+    if with_direction:
+        data["wind_direction"] = (("pass", "lat", "lon"),
+                                  rng.uniform(0, 360, shape).astype("float32"),
+                                  {"units": "degree"})
+
+    ds = xr.Dataset(
+        data,
+        coords={
+            "lon": ("lon", lon, {"units": "degrees_east"}),
+            "lat": ("lat", lat, {"units": "degrees_north"}),
+            "pass": ("pass", np.arange(1, npass + 1, dtype="int32")),
+        },
+        attrs={"sensor": sensor, "platform": "GCOM-W1",
+               "title": "RSS AMSR2 V8.2 Air-Sea ECV",
+               "institution": "Remote Sensing Systems"},
+    )
+    path = tmp_path / f"RSS_{sensor}_ocean_L3_daily_2024-06-01_v08.2.nc"
+    ds.to_netcdf(path)
+    return path
+
+
+class TestFromRadiometerNc:
+    def test_flattens_to_points_and_renames_wspd(self, tmp_path):
+        path = _make_radiometer_nc(tmp_path, npass=2, nlat=4, nlon=6)
+        ds = DataTreeConverter.from_radiometer_nc(path)
+        assert ds is not None
+        assert "point" in ds.dims
+        assert ds.sizes["point"] == 2 * 4 * 6          # no NaNs → every cell kept
+        assert "WSPD" in ds
+        assert "wind_speed_LF" not in ds
+        assert set(ds.coords) >= {"lon", "lat", "time"}
+
+    def test_longitude_normalized_to_pm180(self, tmp_path):
+        path = _make_radiometer_nc(tmp_path)
+        ds = DataTreeConverter.from_radiometer_nc(path)
+        assert float(ds["lon"].min()) >= -180.0
+        assert float(ds["lon"].max()) <= 180.0
+
+    def test_drops_nan_wind_cells(self, tmp_path):
+        path = _make_radiometer_nc(tmp_path, npass=2, nlat=5, nlon=5, nan_frac=0.5)
+        ds = DataTreeConverter.from_radiometer_nc(path)
+        assert ds is not None
+        assert ds.sizes["point"] < 2 * 5 * 5           # some cells dropped
+        assert np.isfinite(ds["WSPD"].values).all()    # no NaNs survive
+
+    def test_attrs_data_type_and_sensor(self, tmp_path):
+        path = _make_radiometer_nc(tmp_path, sensor="AMSR2")
+        ds = DataTreeConverter.from_radiometer_nc(path)
+        assert ds.attrs["data_type"] == "radiometer"
+        assert ds.attrs["platform_type"] == "radiometer"
+        assert ds.attrs["sensor"] == "amsr2"           # lowercased for spec lookup
+
+    def test_per_cell_time_preserved(self, tmp_path):
+        path = _make_radiometer_nc(tmp_path)
+        ds = DataTreeConverter.from_radiometer_nc(path)
+        # Times span the observation day and are not all identical.
+        assert str(ds["time"].min().values).startswith("2024-06-01")
+        assert ds["time"].to_index().nunique() > 1
+
+    def test_optional_wind_direction(self, tmp_path):
+        path = _make_radiometer_nc(tmp_path, with_direction=True)
+        ds = DataTreeConverter.from_radiometer_nc(path)
+        assert "WDIR" in ds
+        assert "wind_direction" not in ds
+
+    def test_no_direction_when_absent(self, tmp_path):
+        path = _make_radiometer_nc(tmp_path, with_direction=False)
+        ds = DataTreeConverter.from_radiometer_nc(path)
+        assert "WDIR" not in ds
+
+    def test_cf_metadata(self, tmp_path):
+        path = _make_radiometer_nc(tmp_path)
+        ds = DataTreeConverter.from_radiometer_nc(path)
+        assert ds["WSPD"].attrs["units"] == "m s-1"
+        assert "valid_min" not in ds["WSPD"].attrs       # packing attrs dropped
+        assert "remss.com" in ds.attrs.get("references", "")
+
+    def test_returns_none_for_missing_file(self, tmp_path):
+        ds = DataTreeConverter.from_radiometer_nc(tmp_path / "nonexistent.nc")
+        assert ds is None
+
+    def test_all_nan_returns_none(self, tmp_path):
+        path = _make_radiometer_nc(tmp_path, nan_frac=1.0)
+        ds = DataTreeConverter.from_radiometer_nc(path)
+        assert ds is None

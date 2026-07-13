@@ -57,7 +57,8 @@ sar_validation/
     ├── insitu_downloader.py   # Moorings/buoys/ferrybox via Copernicus Marine
     ├── hf_radar_downloader.py # HF radar via Copernicus Marine
     ├── scatterometer_downloader.py  # ASCAT (MetOp) via EUMETSAT EUMDAC
-    └── radiosonde_downloader.py     # Radiosonde (TODO: REMSS FTP)
+    ├── altimeter_downloader.py      # Along-track SWH/wind via Copernicus Marine
+    └── radiometer_downloader.py     # RSS radiometer ocean winds (AMSR2) via public HTTPS
 ```
 
 ---
@@ -143,14 +144,14 @@ plt.show()
 | Moorings / Buoys / Ferryboxes | wind / currents / waves | `insitu_downloader` | Copernicus Marine |
 | HF Radar | ocean currents | `hf_radar_downloader` | Copernicus Marine |
 | ASCAT (MetOp-B/C) | wind | `scatterometer_downloader` | EUMETSAT EUMDAC |
-| Radiosonde | wind | `radiosonde_downloader` | *TODO: REMSS / HY-2B/C* |
+| Radiometer (AMSR2) | wind | `radiometer_downloader` | RSS `data.remss.com` (public HTTPS) |
 
 ### Collocation types
 
 | Type | Example | Status |
 |------|---------|--------|
 | Point vs. Layer | mooring/buoy/ferrybox/drifter vs. SAR | ✅ implemented |
-| Layer vs. Layer | scatterometer (ASCAT) vs. SAR | ✅ implemented |
+| Layer vs. Layer | scatterometer (ASCAT) / altimeter / radiometer (AMSR2) vs. SAR | ✅ implemented |
 
 ---
 

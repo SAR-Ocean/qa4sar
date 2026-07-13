@@ -263,9 +263,9 @@ def _equal_weights(distances: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 # data_type attribute values that indicate a gridded layer source
-LAYER_DATA_TYPES = {"scatterometer", "altimeter", "hf_radar"}
+LAYER_DATA_TYPES = {"scatterometer", "altimeter", "hf_radar", "radiometer"}
 # path-fragment fallbacks when attributes are absent
-LAYER_SOURCE_PATHS = {"osi_saf_winds", "scatterometer", "altimeter", "hf_radar"}
+LAYER_SOURCE_PATHS = {"osi_saf_winds", "scatterometer", "altimeter", "hf_radar", "radiometer"}
 
 
 def _detect_collocation_type(val_ds: "xr.Dataset", source_path: str) -> str:
@@ -1307,11 +1307,20 @@ def run_collocation(
                                 layer_type = "scatterometer"
                             elif "altimeter" in path_parts:
                                 layer_type = "altimeter"
+                            elif "radiometer" in path_parts:
+                                layer_type = "radiometer"
                             elif "hf_radar" in path_parts:
                                 layer_type = "hf_radar"
                         if layer_type == "altimeter":
                             freq = val_ds.attrs.get("frequency", "1hz").lower()
                             layer_type = f"altimeter_{freq}"
+                        elif layer_type == "radiometer":
+                            # Per-sensor specs (radiometer_amsr2, …); all RSS
+                            # products share the 0.25° grid but stay individually
+                            # tunable. Falls back to bare 'radiometer' if unset.
+                            sensor = val_ds.attrs.get("sensor", "").lower()
+                            if sensor and f"radiometer_{sensor}" in layer_vs_layer_specs:
+                                layer_type = f"radiometer_{sensor}"
                         if layer_type in layer_vs_layer_specs:
                             merged_kwargs.update(layer_vs_layer_specs[layer_type])
                         collocation_type = "point_vs_layer"
@@ -1383,6 +1392,8 @@ def run_collocation(
                                 layer_type = "scatterometer"
                             elif "altimeter" in path_parts:
                                 layer_type = "altimeter"
+                            elif "radiometer" in path_parts:
+                                layer_type = "radiometer"
                             elif "hf_radar" in path_parts:
                                 layer_type = "hf_radar"
 
@@ -1392,6 +1403,14 @@ def run_collocation(
                             # between the 1 Hz and 5 Hz products.
                             freq = val_ds.attrs.get("frequency", "1hz").lower()
                             layer_type = f"altimeter_{freq}"
+                        elif layer_type == "radiometer":
+                            # Per-sensor specs (radiometer_amsr2, …). All RSS
+                            # radiometers share the 0.25° grid, so the specs
+                            # default alike, but each stays tunable. Falls back
+                            # to bare 'radiometer' when the sensor is unknown.
+                            sensor = val_ds.attrs.get("sensor", "").lower()
+                            if sensor and f"radiometer_{sensor}" in layer_vs_layer_specs:
+                                layer_type = f"radiometer_{sensor}"
 
                         if layer_type in layer_vs_layer_specs:
                             merged_kwargs.update(layer_vs_layer_specs[layer_type])
