@@ -410,3 +410,22 @@ class TestPlotCollocationDiagnostics:
         assert out_path is not None
         matched_markers = [m for m in recorded_markers if m is not None]
         assert len(set(matched_markers)) >= 2
+
+
+class TestValidationReport:
+    def test_includes_temporal_offset_plots(self, geo_datatree_and_collocation, tmp_path):
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import validation_report
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recipe = Recipe(config=RecipeConfig(name="test", variable="wind"))
+
+        figures = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        key = "owiWindSpeed_vs_WSPD"
+        assert key in figures
+        assert (tmp_path / "plots" / f"{key}_scatter_by_offset.png").exists()
+        assert (tmp_path / "plots" / f"{key}_temporal_offset.png").exists()
+        assert (tmp_path / "validation_report.pdf").exists()
+        plt.close("all")

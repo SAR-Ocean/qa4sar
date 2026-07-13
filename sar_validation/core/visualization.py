@@ -1694,6 +1694,28 @@ def validation_report(
                     plots_dir / f"{key}{filename_suffix}_residuals.png", dpi=150, bbox_inches="tight"
                 )
 
+        # Scatter colored by temporal offset — same SAR-vs-validation
+        # comparison as above, but colored by how far apart in time each
+        # pair was matched, to help explain a lower-than-expected r.
+        fig_scatter_offset = plot_scatter(collocation_ds, sar_var, val_var, color_by="temporal_offset")
+        if fig_scatter_offset is not None:
+            figs.append(fig_scatter_offset)
+            pdf_pages.append((f"{sar_var} vs {val_var} — scatter (by temporal offset)", fig_scatter_offset))
+            if plots_dir:
+                fig_scatter_offset.savefig(
+                    plots_dir / f"{key}{filename_suffix}_scatter_by_offset.png", dpi=150, bbox_inches="tight"
+                )
+
+        # Temporal offset vs. residual magnitude
+        fig_offset = plot_temporal_offset(collocation_ds, sar_var, val_var)
+        if fig_offset is not None:
+            figs.append(fig_offset)
+            pdf_pages.append((f"{sar_var} vs {val_var} — residual vs. temporal offset", fig_offset))
+            if plots_dir:
+                fig_offset.savefig(
+                    plots_dir / f"{key}{filename_suffix}_temporal_offset.png", dpi=150, bbox_inches="tight"
+                )
+
         all_figures[key] = figs
 
         # Each figure is already saved to PNG and queued in pdf_pages (which
