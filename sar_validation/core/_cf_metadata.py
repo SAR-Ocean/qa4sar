@@ -198,11 +198,12 @@ def annotate_collocation_ds(result_ds: xr.Dataset, datatree: xr.DataTree) -> xr.
     """
     source_attrs: Dict[str, Dict[str, Any]] = {}
     for node in datatree.subtree:
-        for name, var in node.to_dataset().variables.items():
+        for raw_name, var in node.to_dataset().variables.items():
+            name = str(raw_name)
             if var.attrs and name not in source_attrs:
                 source_attrs[name] = sanitize_raw_attrs(var.attrs)
 
-    for name in list(result_ds.variables):
+    for name in map(str, result_ds.variables):
         if name in _COLLOCATION_GEOMETRY_ATTRS:
             result_ds[name].attrs.update(_COLLOCATION_GEOMETRY_ATTRS[name])
             continue

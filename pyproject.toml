@@ -15,6 +15,7 @@ dependencies = [
     "xarray>=2024.1",
     "numpy",
     "pandas",
+    "scipy",           # scipy.spatial.cKDTree — collocation nearest-neighbour search
     "pyyaml",
     "requests",
     "copernicusmarine>=2.0",
@@ -43,3 +44,19 @@ include = ["sar_validation*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+# Only type-check this project's own code. Third-party scientific libs
+# (xarray, zarr, copernicusmarine, eumdac, cartopy, …) are followed for
+# imports but their own errors are suppressed — "silent" stops mypy choking
+# on e.g. zarr's 3.12-only syntax, and ignore_missing_imports covers the
+# stub-less packages.
+follow_imports = "silent"
+ignore_missing_imports = true
+# Keep the first pass focused on real problems, not annotation coverage.
+disallow_untyped_defs = false
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+exclude = ["tests/"]

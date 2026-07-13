@@ -25,7 +25,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     # Type-only import: binds ``xr`` for the string return annotations below
@@ -240,14 +240,14 @@ def _list_recipes() -> None:
 
 def _create_recipe(
     name: str,
-    limit: int = None,
-    min_lon: float = None,
-    max_lon: float = None,
-    min_lat: float = None,
-    max_lat: float = None,
-    start: str = None,
-    end: str = None,
-    recipe_name: str = None,
+    limit: Optional[int] = None,
+    min_lon: Optional[float] = None,
+    max_lon: Optional[float] = None,
+    min_lat: Optional[float] = None,
+    max_lat: Optional[float] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    recipe_name: Optional[str] = None,
 ) -> None:
     from .core.recipe import (
         Recipe, RecipeConfig, GeographicBounds, TemporalBounds,
@@ -440,7 +440,7 @@ def _create_recipe(
 def _execute_recipe(
     recipe_path: str,
     dry_run: bool = False,
-    output_dir: str = None,
+    output_dir: Optional[str] = None,
     force_download: bool = False,
     convert: bool = False,
     collocate: bool = False,

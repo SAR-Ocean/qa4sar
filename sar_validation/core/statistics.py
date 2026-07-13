@@ -63,7 +63,7 @@ def compute_statistics(
     collocation_ds: xr.Dataset,
     sar_var: str,
     val_var: str,
-    group_by: List[str] = None,
+    group_by: Optional[List[str]] = None,
 ) -> Optional[xr.Dataset]:
     """
     Compute validation statistics for one (sar_var, val_var) pair.

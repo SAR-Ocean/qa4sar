@@ -147,7 +147,10 @@ class ScatterometerDownloader:
 
             try:
                 product = datastore.get_product(
-                    product_id=product_id, collection_id=COLLECTION_ID
+                    # eumdac's search yields product objects that get_product
+                    # accepts here; its stub types product_id as str.
+                    product_id=product_id,  # type: ignore[arg-type]
+                    collection_id=COLLECTION_ID,
                 )
                 with product.open() as fsrc:
                     out_path = self.output_dir / fsrc.name

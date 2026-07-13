@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import xarray as xr
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +74,6 @@ def _require(package: str, extra: str = "plot") -> None:
 
 def _filter_by_scene(collocation_ds, scene_name: str):
     """Return rows where sar_scene_name matches *scene_name*."""
-    import xarray as xr  # noqa: PLC0415
-
     if "sar_scene_name" not in collocation_ds:
         return collocation_ds   # old dataset without scene name — return all
     mask = collocation_ds["sar_scene_name"] == scene_name
@@ -269,7 +268,7 @@ def plot_geographic(
     datatree,
     collocation_ds,
     sar_var: str,
-    val_var: str = None,
+    val_var: Optional[str] = None,
     *,
     ncols: int = 2,
     cmap: str = "viridis",
@@ -342,15 +341,18 @@ def plot_geographic(
     source_cmap = _source_color_map(val_sources) if val_sources else {}
 
     # ── Determine group values for splitting ────────────────────────────────
+    # None means "do not split" (handled by an early return below); otherwise
+    # it is the list of string group keys.
+    group_values: Optional[List[str]]
     if split_by:
         if split_by in collocation_ds:
             group_values = sorted(set(str(v) for v in collocation_ds[split_by].values))
         elif split_by in collocation_ds.coords:
             group_values = sorted(set(str(v) for v in collocation_ds.coords[split_by].values))
         else:
-            group_values = [None]
+            group_values = None
     else:
-        group_values = [None]
+        group_values = None
 
     if interactive:
         _require("folium")
@@ -373,6 +375,7 @@ def plot_geographic(
             if "collocation" in sub_coll.dims and sub_coll.sizes["collocation"] > 0:
                 cols_needed = ["val_lat", "val_lon", "val_source"]
                 if val_col_present:
+                    assert val_col is not None   # implied by val_col_present
                     cols_needed.append(val_col)
                 df_pts = sub_coll[cols_needed].to_dataframe()
                 for _, row in df_pts.iterrows():
@@ -506,6 +509,7 @@ def plot_geographic(
                 # Build a dataframe with observation position + val value
                 col_list = ["val_lat", "val_lon"]
                 if val_col_present:
+                    assert val_col is not None   # implied by val_col_present
                     col_list.append(val_col)
                 if "val_source" in sub_coll:
                     col_list.append("val_source")
@@ -517,6 +521,7 @@ def plot_geographic(
 
                 # Deduplicate: one dot per observation at its actual position
                 if val_col_present and val_norm is not None:
+                    assert val_col is not None   # implied by val_col_present
                     # Use a proxy SAR column so _deduplicate_obs works
                     _proxy = "__sar_proxy__"
                     df_pts[_proxy] = np.nan
@@ -591,13 +596,13 @@ def plot_geographic(
             axes[idx // ncols][idx % ncols].set_visible(False)
 
         fig.subplots_adjust(right=right_margin)
-        cbar_ax = fig.add_axes([right_margin + 0.01, 0.15, 0.015, 0.70])
+        cbar_ax = fig.add_axes((right_margin + 0.01, 0.15, 0.015, 0.70))
         if single_colorbar:
             fig.colorbar(sar_sm, cax=cbar_ax, label=f"{sar_var} / {val_var}")
         else:
             fig.colorbar(sar_sm, cax=cbar_ax, label=f"SAR {sar_var}")
             if val_sm is not None:
-                val_cbar_ax = fig.add_axes([right_margin + 0.055, 0.15, 0.015, 0.70])
+                val_cbar_ax = fig.add_axes((right_margin + 0.055, 0.15, 0.015, 0.70))
                 fig.colorbar(val_sm, cax=val_cbar_ax, label=f"In-situ {val_var}")
 
         title = f"SAR {sar_var}"
@@ -609,7 +614,7 @@ def plot_geographic(
         return fig
 
     # ── Build figures ────────────────────────────────────────────────────────
-    if group_values == [None]:
+    if group_values is None:
         return _build_figure(collocation_ds, None)
 
     figures: Dict[str, object] = {}
@@ -631,7 +636,7 @@ def plot_geographic(
 
 def plot_statistics(
     stats_ds,
-    metrics: List[str] = None,
+    metrics: Optional[List[str]] = None,
     *,
     interactive: bool = False,
 ):
@@ -883,7 +888,7 @@ def plot_collocation_diagnostics(
         return None
 
     scene_bounds = []            # bounding boxes for grid-mode (IW/EW) scenes
-    footprint_points = []        # (lon, lat) per sparse WV-mode imagette
+    footprint_points: list[tuple[float, float]] = []  # (lon, lat) per sparse WV-mode imagette
     # (time_min, time_max) per scene that has a usable time coordinate — used
     # to decide which validation points were even temporally eligible to
     # match any SAR acquisition, before we get to spatial matching at all.
@@ -1081,12 +1086,12 @@ def plot_collocation_diagnostics(
     # ── Build one shared color map across every distinct source name, so
     # in-situ sub-sources (mooring/buoy/…) and layer-type categories
     # (altimeter/scatterometer/…) never collide on the same color ────────
-    all_source_names = set()
+    all_source_names: set[str] = set()
     for cat in categories:
         if cat["label"] == "In-situ" and len(cat["matched_source"]) > 0:
-            all_source_names.update(str(s) for s in np.unique(cat["matched_source"]))
+            all_source_names.update(str(s) for s in np.unique(np.asarray(cat["matched_source"])))
         else:
-            all_source_names.add(cat["label"])
+            all_source_names.add(str(cat["label"]))
     source_color_map = _source_color_map(sorted(all_source_names))
 
     bounds = recipe.config.geographic_bounds
@@ -1148,7 +1153,9 @@ def plot_collocation_diagnostics(
     # ── Tier 3 (zorder=4): matched points, every category — always drawn
     # last/on top, regardless of category. ────────────────────────────────
     for cat in categories:
-        m_lon, m_lat, m_src = cat["matched_lon"], cat["matched_lat"], cat["matched_source"]
+        m_lon = np.asarray(cat["matched_lon"])
+        m_lat = np.asarray(cat["matched_lat"])
+        m_src = np.asarray(cat["matched_source"])
         if len(m_lon) == 0:
             continue
         if cat["label"] == "In-situ" and len(m_src) > 0:
@@ -1163,7 +1170,7 @@ def plot_collocation_diagnostics(
                     transform=transform, zorder=4, label=f"In-situ matched: {source}",
                 )
         else:
-            color = source_color_map.get(cat["label"], "#2ca02c")
+            color = source_color_map.get(str(cat["label"]), "#2ca02c")
             ax.scatter(
                 m_lon, m_lat,
                 s=20, c=color, alpha=0.6, edgecolors="none",
@@ -1231,7 +1238,7 @@ def _extract_validation_data_for_plot(datatree):
     all_sources = []
     all_platform_types = []
     source_to_data = {}
-    all_measurements = {}
+    all_measurements: Dict[str, list] = {}
 
     def process_node(node, source_name):
         """Recursively process a validation node."""

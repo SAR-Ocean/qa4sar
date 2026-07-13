@@ -57,6 +57,18 @@ MISSING_CODE_MIN = 251
 #   SSMIS   — ssmi/ssmi_support/python/ssmis_daily_v7.py
 #   WindSat — windsat/support_v07.0.1/python/windsat_daily_v7.py
 # ---------------------------------------------------------------------------
+# SSMIS f16/f17/f18 share one layout (medium-frequency wind only).
+_SSMIS_LAYOUT = {
+    "vars": [
+        ("time",    0.1,  0.0),
+        ("wspd_mf", 0.2,  0.0),
+        ("vapor",   0.3,  0.0),
+        ("cloud",   0.01, -0.05),
+        ("rain",    0.1,  0.0),
+    ],
+    "wind": "wspd_mf", "wdir": None, "time": "time", "time_unit": "hours",
+}
+
 BYTEMAP_LAYOUT: Dict[str, dict] = {
     "gmi": {
         "vars": [
@@ -70,10 +82,9 @@ BYTEMAP_LAYOUT: Dict[str, dict] = {
         ],
         "wind": "windLF", "wdir": None, "time": "time", "time_unit": "hours",
     },
-    # SSMIS f16/f17/f18 share one layout (medium-frequency wind only).
-    "ssmis_f16": None,  # filled below
-    "ssmis_f17": None,
-    "ssmis_f18": None,
+    "ssmis_f16": _SSMIS_LAYOUT,
+    "ssmis_f17": _SSMIS_LAYOUT,
+    "ssmis_f18": _SSMIS_LAYOUT,
     "windsat": {
         "vars": [
             ("mingmt", 6.0,  0.0),
@@ -89,19 +100,6 @@ BYTEMAP_LAYOUT: Dict[str, dict] = {
         "wind": "w-lf", "wdir": "wdir", "time": "mingmt", "time_unit": "minutes",
     },
 }
-
-_SSMIS_LAYOUT = {
-    "vars": [
-        ("time",    0.1,  0.0),
-        ("wspd_mf", 0.2,  0.0),
-        ("vapor",   0.3,  0.0),
-        ("cloud",   0.01, -0.05),
-        ("rain",    0.1,  0.0),
-    ],
-    "wind": "wspd_mf", "wdir": None, "time": "time", "time_unit": "hours",
-}
-for _f in ("ssmis_f16", "ssmis_f17", "ssmis_f18"):
-    BYTEMAP_LAYOUT[_f] = _SSMIS_LAYOUT
 
 
 def read_rss_bytemap(

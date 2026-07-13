@@ -12,11 +12,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
+import xarray as xr
 import logging
+
+if TYPE_CHECKING:
+    # scipy is only needed when collocation actually runs and is imported
+    # lazily inside those functions; bind cKDTree here purely so the type
+    # annotations below resolve.
+    from scipy.spatial import cKDTree
 
 logger = logging.getLogger(__name__)
 
@@ -1136,7 +1143,6 @@ def run_collocation(
     xr.Dataset or None
         Dataset of collocated pairs, or None if no matches were found.
     """
-    import xarray as xr
     from pathlib import Path as _Path
     from .datatree_converter import DataTreeConverter
 
@@ -1447,6 +1453,11 @@ def run_collocation(
         return None
 
     result_ds = DataTreeConverter.from_collocations(all_collocations)
+    if result_ds is None:
+        logger.warning(
+            "Collocation produced no Dataset despite %d match(es).", len(all_collocations)
+        )
+        return None
 
     # Carry the datatree's CF metadata (standard_name/long_name/units) over
     # to the matched sar_*/val_* columns.

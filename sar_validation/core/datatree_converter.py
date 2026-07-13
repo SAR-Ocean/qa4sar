@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -425,7 +425,7 @@ class DataTreeConverter:
             flat = da.values.ravel()
             if len(flat) != n_points:
                 continue
-            out_name = _rename.get(vname, vname)
+            out_name = _rename.get(str(vname), str(vname))
             data_vars[out_name] = ("point", flat.astype(float))
             var_attrs[out_name] = dict(da.attrs)
 
@@ -740,7 +740,7 @@ class DataTreeConverter:
             if len(flat) != n_points_raw:
                 continue   # different spatial grid — skip
             flat = flat[keep_mask].astype(float)
-            out_name = _rename.get(vname, vname)
+            out_name = _rename.get(str(vname), str(vname))
             attrs = dict(da.attrs)
             if vname == "wind_dir":
                 # ASCAT/OSI-SAF direction is oceanographic convention (the
@@ -1090,7 +1090,7 @@ class DataTreeConverter:
 
     @staticmethod
     def to_datatree(
-        datasets: Dict[str, Optional[xr.Dataset]],
+        datasets: Mapping[str, Optional[xr.Dataset]],
     ) -> xr.DataTree:
         """
         Combine multiple Datasets into an xarray DataTree.
@@ -1478,11 +1478,11 @@ class DataTreeConverter:
 
         else:
             # Flatten RVL grids to points (for WV mode backward compat)
-            point_lons = []
-            point_lats = []
-            point_radvel = []
-            point_heading = []
-            point_incidence = []
+            point_lons: list[float] = []
+            point_lats: list[float] = []
+            point_radvel: list[float] = []
+            point_heading: list[float] = []
+            point_incidence: list[float] = []
             point_times = []
             file_names = []
             rvl_attrs: Dict[str, Dict] = {}
@@ -1553,9 +1553,9 @@ class DataTreeConverter:
 
             # Create Dataset with point dimension (flattened RVL grids)
             data_vars = {
-                "rvlRadVel": (["point"], point_radvel),
-                "rvlHeading": (["point"], point_heading),
-                "rvlIncidenceAngle": (["point"], point_incidence),
+                "rvlRadVel": (("point",), np.asarray(point_radvel)),
+                "rvlHeading": (("point",), np.asarray(point_heading)),
+                "rvlIncidenceAngle": (("point",), np.asarray(point_incidence)),
             }
 
             coords = {
@@ -1726,10 +1726,7 @@ class DataTreeConverter:
                 else:
                     acq_time_ns = np.datetime64("NaT", "ns")
 
-            # Infer dimension names from owiLat shape (typically owiAzSize, owiRaSize)
-            dims = ds_raw["owiLat"].dims if hasattr(ds_raw["owiLat"], "dims") else ("y", "x")
-            dims = tuple("y" if d.startswith("owi") or d == "owiAzSize" else "x" if d in ("owiRaSize",) else d for d in dims)
-            # Simplify to standard (y, x) naming
+            # Standard (y, x) naming for the flattened OWI grid.
             dims = ("y", "x")
 
             # Create Dataset with 2D grid structure

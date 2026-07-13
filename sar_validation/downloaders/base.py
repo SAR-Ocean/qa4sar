@@ -145,7 +145,7 @@ class CopernicusODataClient:
         params = {
             "$filter": " and ".join(filters),
             "$orderby": "ContentDate/Start desc",
-            "$top": top,
+            "$top": str(top),   # query params serialise to strings anyway
             "$expand": "Attributes",
         }
         resp = self.session.get(self.CATALOGUE_URL, params=params, timeout=60)
