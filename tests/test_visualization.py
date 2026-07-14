@@ -746,6 +746,39 @@ class TestValidationReportIncludesDiagnostics:
             "page in validation_report.pdf"
         )
 
+    def test_diagnostics_page_is_first_after_cover(self, geo_datatree_and_collocation, tmp_path, monkeypatch):
+        """The diagnostics image page must be the first content page (index 1,
+        right after the cover) in the PDF."""
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+        from sar_validation.core.visualization import validation_report
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
+
+        recorded_figs = []
+        original_savefig = PdfPages.savefig
+
+        def recording_savefig(self, *args, **kwargs):
+            fig = args[0] if args else kwargs.get("figure")
+            recorded_figs.append(fig)
+            return original_savefig(self, *args, **kwargs)
+
+        monkeypatch.setattr(PdfPages, "savefig", recording_savefig)
+        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        def is_image_page(fig):
+            return fig is not None and len(fig.axes) == 1 and len(fig.axes[0].images) > 0
+
+        image_indices = [i for i, f in enumerate(recorded_figs) if is_image_page(f)]
+        assert image_indices, "Expected a diagnostics image page in the PDF"
+        assert image_indices[0] == 1, (
+            f"Diagnostics page should be first after the cover (index 1), "
+            f"got first image page at index {image_indices[0]}"
+        )
+
 
 class TestDropNonDirectionalSources:
     def _ds(self):

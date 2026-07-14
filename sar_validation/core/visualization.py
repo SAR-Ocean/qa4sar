@@ -1859,7 +1859,10 @@ def validation_report(
                 ax_diag = fig_diag.add_axes([0, 0, 1, 1])
                 ax_diag.imshow(diag_img)
                 ax_diag.axis("off")
-                pdf_pages.append((f"Collocation diagnostics — {recipe.config.name}", fig_diag))
+                # Lead the report body with the diagnostics overview (the
+                # cover page is written separately, so index 0 here becomes
+                # the first page after the cover).
+                pdf_pages.insert(0, (f"Collocation diagnostics — {recipe.config.name}", fig_diag))
         except Exception as exc:
             logger.warning("plot_collocation_diagnostics failed: %s", exc)
 
