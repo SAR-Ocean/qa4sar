@@ -138,6 +138,25 @@ def _filter_by_scene(collocation_ds, scene_name: str):
     return collocation_ds.isel(collocation=mask)
 
 
+def _drop_nondirectional_sources(coll_ds, val_var):
+    """Drop validation sources with no finite ``val_<val_var>`` value.
+
+    For circular variables (wind direction), non-directional instruments
+    such as altimeter and radiometer carry all-NaN direction and would
+    otherwise render as gray "No data" clutter on the direction maps.
+    A source is kept iff it has at least one finite value for *val_var*.
+    Returns the input unchanged if the needed columns are absent.
+    """
+    val_col = f"val_{val_var}"
+    if val_col not in coll_ds or "val_source" not in coll_ds:
+        return coll_ds
+    finite = np.isfinite(np.asarray(coll_ds[val_col].values))
+    sources = np.asarray(coll_ds["val_source"].values)
+    keep = {s for s in np.unique(sources) if finite[sources == s].any()}
+    mask = np.array([s in keep for s in sources])
+    return coll_ds.isel(collocation=mask)
+
+
 def _land_coastline_features(scale: str = "10m"):
     """Natural Earth land/coastline features at a finer resolution than
     cartopy's default 110m — the default is too coarse on complex
@@ -1694,7 +1713,7 @@ def validation_report(
     dict[str, list[matplotlib.figure.Figure]]
         ``"<sar_var>_vs_<val_var>"`` → list of Figure objects for that pair.
     """
-    from ._variable_map import infer_variable_pairs, filter_variable_pairs  # noqa: PLC0415
+    from ._variable_map import infer_variable_pairs, filter_variable_pairs, CIRCULAR_VAL_VARS  # noqa: PLC0415
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
     base_dir: Optional[Path] = None
@@ -1718,10 +1737,19 @@ def validation_report(
         key = f"{sar_var}_vs_{val_var}"
         figs = []
 
+        # Direction-only sources for circular variables (WDIR): drop
+        # non-directional instruments (altimeter/radiometer, all-NaN
+        # direction) so they don't clutter the direction plots. Speed
+        # pairs keep every source.
+        pair_ds = (
+            _drop_nondirectional_sources(collocation_ds, val_var)
+            if val_var in CIRCULAR_VAL_VARS else collocation_ds
+        )
+
         logger.info("Generating plots for %s vs %s …", sar_var, val_var)
 
         # Scatter
-        fig_scatter = plot_scatter(collocation_ds, sar_var, val_var)
+        fig_scatter = plot_scatter(pair_ds, sar_var, val_var)
         if fig_scatter is not None:
             figs.append(fig_scatter)
             pdf_pages.append((f"{sar_var} vs {val_var} — scatter", fig_scatter))
@@ -1732,7 +1760,7 @@ def validation_report(
 
         # Geographic — returns dict[collocation_type, Figure] by default
         try:
-            geo_result = plot_geographic(datatree, collocation_ds, sar_var, val_var)
+            geo_result = plot_geographic(datatree, pair_ds, sar_var, val_var)
             if isinstance(geo_result, dict):
                 for group, fig_geo in geo_result.items():
                     if fig_geo is not None:
@@ -1768,7 +1796,7 @@ def validation_report(
                     )
 
         # Residuals
-        fig_res = plot_residuals(collocation_ds, sar_var, val_var)
+        fig_res = plot_residuals(pair_ds, sar_var, val_var)
         if fig_res is not None:
             figs.append(fig_res)
             pdf_pages.append((f"{sar_var} vs {val_var} — residuals", fig_res))
@@ -1780,7 +1808,7 @@ def validation_report(
         # Scatter colored by temporal offset — same SAR-vs-validation
         # comparison as above, but colored by how far apart in time each
         # pair was matched, to help explain a lower-than-expected r.
-        fig_scatter_offset = plot_scatter(collocation_ds, sar_var, val_var, color_by="temporal_offset")
+        fig_scatter_offset = plot_scatter(pair_ds, sar_var, val_var, color_by="temporal_offset")
         if fig_scatter_offset is not None:
             figs.append(fig_scatter_offset)
             pdf_pages.append((f"{sar_var} vs {val_var} — scatter (colored by temporal offset)", fig_scatter_offset))
@@ -1790,7 +1818,7 @@ def validation_report(
                 )
 
         # Temporal offset vs. residual magnitude
-        fig_offset = plot_temporal_offset(collocation_ds, sar_var, val_var)
+        fig_offset = plot_temporal_offset(pair_ds, sar_var, val_var)
         if fig_offset is not None:
             figs.append(fig_offset)
             pdf_pages.append((f"{sar_var} vs {val_var} — residual vs. temporal offset", fig_offset))

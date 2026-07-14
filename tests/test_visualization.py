@@ -745,3 +745,75 @@ class TestValidationReportIncludesDiagnostics:
             "Expected the collocation diagnostics plot to be embedded as a "
             "page in validation_report.pdf"
         )
+
+
+class TestDropNonDirectionalSources:
+    def _ds(self):
+        return xr.Dataset({
+            "sar_owiWindDirection": ("collocation", [10.0, 20.0, 30.0, 40.0]),
+            "val_WDIR":   ("collocation", [12.0, np.nan, 33.0, np.nan]),
+            "val_WSPD":   ("collocation", [6.0, 6.5, 7.0, 7.5]),
+            "val_source": ("collocation", ["mooring", "altimeter", "mooring", "altimeter"]),
+        })
+
+    def test_drops_all_nan_source_for_circular_var(self):
+        from sar_validation.core.visualization import _drop_nondirectional_sources
+        out = _drop_nondirectional_sources(self._ds(), "WDIR")
+        kept = set(out["val_source"].values.tolist())
+        assert kept == {"mooring"}          # altimeter had all-NaN WDIR
+
+    def test_keeps_all_sources_when_var_has_values(self):
+        from sar_validation.core.visualization import _drop_nondirectional_sources
+        out = _drop_nondirectional_sources(self._ds(), "WSPD")
+        kept = set(out["val_source"].values.tolist())
+        assert kept == {"mooring", "altimeter"}  # both have finite WSPD
+
+    def test_returns_input_when_columns_absent(self):
+        from sar_validation.core.visualization import _drop_nondirectional_sources
+        ds = xr.Dataset({"sar_x": ("collocation", [1.0, 2.0])})
+        out = _drop_nondirectional_sources(ds, "WDIR")
+        assert out is ds
+
+
+class TestValidationReportWindDirectionFilter:
+    def test_nondirectional_source_absent_from_wdir_scatter(self, tmp_path, monkeypatch):
+        """Altimeter (all-NaN WDIR) must not appear in the wind-direction
+        scatter, but must appear in the wind-speed scatter."""
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import validation_report
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        # Minimal 1-scene SAR datatree so plot_geographic has something to draw.
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
+        sar_ds = xr.Dataset(
+            {"owiWindSpeed": (("y", "x"), np.full((y, x), 7.0)),
+             "owiWindDirection": (("y", "x"), np.full((y, x), 90.0))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T19:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+
+        coll = xr.Dataset({
+            "sar_owiWindSpeed":     ("collocation", [7.0, 7.1, 7.2, 7.3]),
+            "sar_owiWindDirection": ("collocation", [90.0, 92.0, 88.0, 91.0]),
+            "val_WSPD":             ("collocation", [6.8, 6.9, 7.0, 7.1]),
+            "val_WDIR":             ("collocation", [85.0, np.nan, 95.0, np.nan]),
+            "val_source":           ("collocation", ["mooring", "altimeter", "mooring", "altimeter"]),
+            "sar_scene_name":       ("collocation", ["sceneA"] * 4),
+            "val_lon":              ("collocation", [-9.5, -9.4, -9.3, -9.2]),
+            "val_lat":              ("collocation", [50.5, 50.6, 50.7, 50.8]),
+        })
+
+        seen = {}  # val_var -> set of sources that reached a scatter fill
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        recipe = Recipe(config=RecipeConfig(name="wdir_test", variable="wind"))
+        validation_report(coll, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        # Both PNGs exist; only the direction one has altimeter removed.
+        assert (tmp_path / "plots" / "owiWindSpeed_vs_WSPD_scatter.png").exists()
+        assert (tmp_path / "plots" / "owiWindDirection_vs_WDIR_scatter.png").exists()
