@@ -406,3 +406,52 @@ class TestReadRssBytemap:
     def test_unknown_sensor_raises(self, tmp_path):
         with pytest.raises(KeyError):
             read_rss_bytemap(tmp_path / "x.gz", "not_a_sensor")
+
+
+from sar_validation.downloaders.noaa_hfradar_downloader import (
+    select_erddap_dataset,
+    build_erddap_subset_url,
+    select_backend,
+    ERDDAP_BASE,
+)
+
+
+class TestSelectErddapDataset:
+    def test_us_west_6km_default(self):
+        assert select_erddap_dataset(-125, -119, 33, 38, 6) == "ucsdHfrW6"
+
+    def test_us_west_2km(self):
+        assert select_erddap_dataset(-125, -119, 33, 38, 2) == "ucsdHfrW2"
+
+    def test_us_east_gulf_6km(self):
+        assert select_erddap_dataset(-80, -70, 35, 42, 6) == "ucsdHfrE6"
+
+    def test_unsupported_region_raises(self):
+        with pytest.raises(ValueError, match="No ERDDAP HF-radar dataset"):
+            select_erddap_dataset(2.0, 8.0, 53.0, 55.0, 6)  # German Bight → Phase 3c
+
+    def test_unsupported_resolution_raises(self):
+        with pytest.raises(ValueError, match="resolution"):
+            select_erddap_dataset(-80, -70, 35, 42, 2)  # US-East has no 2 km
+
+
+class TestBuildErddapSubsetUrl:
+    def test_url_has_vars_bbox_and_time_selectors(self):
+        url = build_erddap_subset_url(
+            "ucsdHfrW6", -125, -119, 33, 38, "2024-05-01", "2024-05-01T06:00:00"
+        )
+        assert url.startswith(f"{ERDDAP_BASE}/ucsdHfrW6.nc?")
+        assert "water_u[(2024-05-01T00:00:00Z):(2024-05-01T06:00:00Z)]" in url
+        assert "water_v[(2024-05-01T00:00:00Z):(2024-05-01T06:00:00Z)]" in url
+        assert "[(33.0):(38.0)]" in url   # latitude ascending
+        assert "[(-125.0):(-119.0)]" in url  # longitude ascending
+
+
+class TestSelectBackend:
+    def test_recent_date_uses_erddap(self):
+        recent = (datetime.utcnow() - timedelta(days=10)).strftime("%Y-%m-%d")
+        assert select_backend(recent) == "erddap"
+
+    def test_old_date_not_yet_supported(self):
+        with pytest.raises(NotImplementedError, match="Phase 3b"):
+            select_backend("2015-01-01")
