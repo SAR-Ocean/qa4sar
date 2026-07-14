@@ -17,8 +17,8 @@ inconsistency that would keep currents validation broken even once the
 
 In `DataTreeConverter._extract_rvl_grid_data`
 (`sar_validation/core/datatree_converter.py`), the 2-D-grid branch handles
-IW/EW/SM products. For these modes `rvlRadVel` / `rvlLat` / `rvlLon` are 3-D
-with dims `(rvlAzSize, rvlRaSize, rvlSwath)`. The code correctly slices
+IW/EW/SM products. For multi-swath modes `rvlRadVel` / `rvlLat` / `rvlLon`
+are 3-D with dims `(rvlAzSize, rvlRaSize, rvlSwath)`. The code slices
 `[:, :, 0]` to reduce each array to 2-D, but then reads the dimension **names**
 from the *un-sliced* variable:
 
@@ -37,10 +37,19 @@ The caller `_from_sar_l2_ocn_iw_safe`, for `product_type="currents"`, then
 `owiWindSpeed` with no error surfaced to the user. This is the observed
 symptom.
 
+**Second, latent defect — the `[:, :, 0]` slice discards sub-swaths.** Even if
+the dim-name mismatch were fixed by keeping the slice, taking swath index 0
+keeps only the first sub-swath and drops the rest, and those are not padding.
 Confirmed against real data
-(`data/2026-06-20-180000-2026-06-20-230000_-20.00_0.00_35.00_60.00/`): the
-EW `-ocn-` file genuinely contains RVL (27 `rvl*` variables including
-`rvlRadVel`), so the failure is purely a shape/dims bug, not missing data.
+(`data/2026-06-20-180000-2026-06-20-230000_-20.00_0.00_35.00_60.00/`): the EW
+`-ocn-` file's `rvlRadVel` is `(382, 114, 5)` — **5 sub-swaths (EW1–EW5)**, each
+carrying tens of thousands of distinct finite values (swath finite counts
+41,143 / 33,379 / 41,907 / 41,907 / 35,777; value ranges differ per swath).
+Slicing `[:, :, 0]` therefore throws away ~194k of ~228k valid radial-velocity
+measurements (4 of 5 swaths for EW; 2 of 3 for IW). The fix must retain all
+sub-swaths (see §3a). The `rvl*` variables are otherwise fully present (27
+`rvl*` variables including `rvlRadVel`), so this is purely a shape-handling bug,
+not missing data.
 
 ### 1b. WV conversion ignores `product_type` (always extracts waves)
 
@@ -94,13 +103,32 @@ wind and waves behavior untouched.
 File: `sar_validation/core/datatree_converter.py` (2-D-grid branch,
 `flatten_to_points=False`).
 
-After the 3-D → 2-D slice, build the Dataset with dimension names that match
-the sliced 2-D data, standardized to **`("y", "x")`** to mirror the OWI grid
-produced by `_extract_owi_grid_data`. This keeps the SAR grid model uniform,
-so `is_wv_mode` detection (`"point" in dims and "y" not in dims`) and the grid
-collocation path treat RVL and OWI grids identically. `lon` / `lat` remain
-2-D coordinates over `("y", "x")`. The already-2-D (single-swath) case must
-continue to work.
+Do **not** slice `[:, :, 0]`. For 3-D multi-swath arrays, **merge the
+`rvlSwath` axis into the range axis** to form a single 2-D `(y, x)` grid that
+retains every sub-swath:
+
+```
+(rvlAzSize, rvlRaSize, rvlSwath) → (rvlAzSize, rvlRaSize * rvlSwath) = (y, x)
+```
+
+Apply the identical reshape to `rvlRadVel`, `rvlLat`, `rvlLon`, `rvlHeading`,
+and `rvlIncidenceAngle` so all arrays stay cell-aligned. Because the grid
+collocation path matches each cell by its own 2-D `lon`/`lat` (haversine), not
+by regular grid spacing, the swath overlaps and coordinate discontinuities
+introduced by the merge are harmless — each cell is collocated independently.
+
+Build the Dataset with dim names **`("y", "x")`** to mirror the OWI grid from
+`_extract_owi_grid_data`, keeping the SAR grid model uniform so `is_wv_mode`
+detection (`"point" in dims and "y" not in dims`) and the grid collocation path
+treat RVL and OWI grids identically. `lon` / `lat` are 2-D coordinates over
+`("y", "x")`. The already-2-D single-swath case (e.g. SM) passes through
+unchanged (no swath axis to merge).
+
+Rejected alternative — flatten all swaths to a `point` dataset: also preserves
+the data, but a `point` node routes IW/EW into the WV footprint-anchored
+collocation path (≈14 km radius, designed for sparse ~200 km-spaced imagettes),
+which is wrong for dense grids. The reshape keeps IW/EW/SM on the correct grid
+path.
 
 ### b. `_from_sar_l2_ocn_iw_safe` — remove the currents → OWI fallback
 
@@ -160,6 +188,10 @@ recipe.variable = currents  →  product_type = currents
 
 - 3-D `(rvlAzSize, rvlRaSize, rvlSwath)` RVL array → `(y, x)` grid node with
   `rvlRadVel` present (regression guard for the crash in 1a).
+- **All sub-swaths retained**: a 3-D input with `S` swaths yields a grid whose
+  `x` size equals `rvlRaSize * S`, and the count of finite `rvlRadVel` cells
+  equals the sum across all input swaths (regression guard against the
+  `[:, :, 0]` data-loss defect).
 - Single-swath 2-D RVL array still produces a valid `(y, x)` grid node.
 - WV SAFE + `product_type="currents"` → `point` node with `rvlRadVel`.
 - Currents extraction with no RVL available → returns `None` and logs a
