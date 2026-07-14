@@ -428,11 +428,11 @@ class PointLayerCollocation:
 
         # Pre-filters: eliminate validation rows that cannot match
         # Use spatial_tolerance_km for initial bounding box
-        deg_buf = self.aggregation_window_km / 55.0  # Use aggregation window for pre-filter
-        lon_min = float(sar_lon.min()) - deg_buf
-        lon_max = float(sar_lon.max()) + deg_buf
-        lat_min = float(sar_lat.min()) - deg_buf
-        lat_max = float(sar_lat.max()) + deg_buf
+        deg_buf = self.spatial_tolerance_km / 100.0   # Use spatial_tolerance_km for pre-filter; 100 converts from km to degrees (conservatively)
+        lon_min = float(np.nanmin(sar_lon)) - deg_buf # sar_lon is in degrees
+        lon_max = float(np.nanmax(sar_lon)) + deg_buf
+        lat_min = float(np.nanmin(sar_lat)) - deg_buf # sar_lat is in degrees
+        lat_max = float(np.nanmax(sar_lat)) + deg_buf
 
         spatial_mask = (
             (val_data["lon"] >= lon_min) & (val_data["lon"] <= lon_max) &
