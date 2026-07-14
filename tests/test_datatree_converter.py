@@ -1045,7 +1045,7 @@ class TestBuildDatatreeHfrNoaa:
         base = tmp_path / "run"
         (base / "hfr_noaa").mkdir(parents=True)
         _make_hfr_grid_nc(base / "hfr_noaa")  # writes ucsdHfrW6_6km_2024-05-01.nc
-        tree = DataTreeConverter.build_datatree(base, product_type="currents")
+        tree = DataTreeConverter.convert_downloaded_data(base, product_type="currents")
         assert tree is not None
         node_paths = [node.path for node in tree.subtree]
         assert any("hfr_noaa" in p for p in node_paths)

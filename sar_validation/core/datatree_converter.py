@@ -2178,6 +2178,3 @@ class DataTreeConverter:
         logger.info("DataTree saved to %s (%d nodes)", out_path, len(datasets))
 
         return tree
-
-    # Alias for backwards compatibility and test clarity
-    build_datatree = staticmethod(convert_downloaded_data.__func__)
