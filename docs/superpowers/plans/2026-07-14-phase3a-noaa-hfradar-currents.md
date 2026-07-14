@@ -26,7 +26,7 @@
 **Modify:**
 - `sar_validation/core/collocation.py` — add `_project_currents_to_radial`; refactor the two inline projection sites; add projection to `_collocate_individual`; register `hf_radar_grid` in `LAYER_DATA_TYPES` and the two layer-type-resolution blocks.
 - `sar_validation/core/recipe.py` — add `hf_radar_grid` entry to `DEFAULT_LAYER_TYPE_SPECS`.
-- `sar_validation/core/datatree_converter.py` — add `from_hf_radar_grid`; discover a new `hfr_noaa/` download folder in `build_datatree`.
+- `sar_validation/core/datatree_converter.py` — add `from_hf_radar_grid`; discover a new `hfr_noaa/` download folder in `convert_downloaded_data`.
 - `sar_validation/core/_cf_metadata.py` — add `PRODUCT_REFERENCES["hf_radar"]`.
 - `sar_validation/core/orchestrator.py` — add `_download_noaa_hfradar` and register `hf_radar_noaa` in `_dispatch_source`.
 - `sar_validation/cli.py` — add the `hf_radar_noaa` source + `hf_radar_grid` layer spec to the `currents` recipe template.
@@ -889,10 +889,10 @@ git commit -m "feat: from_hf_radar_grid converter with retained ancillary QC fie
 
 ---
 
-## Task 6: Discover the `hfr_noaa/` download folder in `build_datatree`
+## Task 6: Discover the `hfr_noaa/` download folder in `convert_downloaded_data`
 
 **Files:**
-- Modify: `sar_validation/core/datatree_converter.py` (`build_datatree` discovery block ~line 1978-1989)
+- Modify: `sar_validation/core/datatree_converter.py` (`convert_downloaded_data` discovery block ~line 2100-2110)
 - Test: `tests/test_datatree_converter.py`
 
 **Interfaces:**
@@ -909,7 +909,7 @@ class TestBuildDatatreeHfrNoaa:
         base = tmp_path / "run"
         (base / "hfr_noaa").mkdir(parents=True)
         _make_hfr_grid_nc(base / "hfr_noaa")  # writes ucsdHfrW6_6km_2024-05-01.nc
-        tree = DataTreeConverter.build_datatree(base, product_type="currents")
+        tree = DataTreeConverter.convert_downloaded_data(base, product_type="currents")
         assert tree is not None
         node_paths = [node.path for node in tree.subtree]
         assert any("hfr_noaa" in p for p in node_paths)
@@ -922,7 +922,7 @@ Expected: FAIL (no `validation/hfr_noaa/` node — folder not discovered)
 
 - [ ] **Step 3: Add the discovery block**
 
-In `build_datatree`, after the scatterometer discovery loop (~line 1989, before the altimeter block), add:
+In `convert_downloaded_data`, after the scatterometer discovery loop (~line 1989, before the altimeter block), add:
 
 ```python
         # NOAA HFRnet gridded RTV currents (flattened to points, tagged
@@ -1156,7 +1156,7 @@ Place (or symlink) a real Sentinel-1 IW/WV **currents** SAFE with overlapping co
 
 ```bash
 python -c "from sar_validation.core.datatree_converter import DataTreeConverter as D; \
-t=D.build_datatree('/tmp/hfr_run', product_type='currents'); \
+t=D.convert_downloaded_data('/tmp/hfr_run', product_type='currents'); \
 print([n.path for n in t.subtree if 'hfr_noaa' in n.path]); \
 print(t['validation/hfr_noaa'])"
 ```
