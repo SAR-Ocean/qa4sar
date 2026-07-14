@@ -1383,41 +1383,29 @@ class DataTreeConverter:
                 rvl_lats_full = ds_raw["rvlLat"].values
                 rvl_lons_full = ds_raw["rvlLon"].values
 
-                # If 3D data (with swaths), use first swath only for collocation compatibility
-                if rvl_radvel_full.ndim == 3:
-                    rvl_radvel = rvl_radvel_full[:, :, 0]
-                    rvl_lats = rvl_lats_full[:, :, 0]
-                    rvl_lons = rvl_lons_full[:, :, 0]
-                else:
-                    rvl_radvel = rvl_radvel_full
-                    rvl_lats = rvl_lats_full
-                    rvl_lons = rvl_lons_full
+                # RVL is 3-D (rvlAzSize, rvlRaSize, rvlSwath) for multi-swath
+                # modes (IW/EW). Merge the swath axis into the range axis so the
+                # grid keeps EVERY sub-swath — slicing [:, :, 0] would silently
+                # drop all but the first swath (4 of 5 for EW, 2 of 3 for IW).
+                # Single-swath products (SM) are already 2-D and pass through.
+                def _swaths_to_grid(arr):
+                    arr = np.asarray(arr)
+                    return arr.reshape(arr.shape[0], -1) if arr.ndim == 3 else arr
 
-                rvl_heading_full = (
-                    ds_raw["rvlHeading"].values
+                rvl_radvel = _swaths_to_grid(rvl_radvel_full)
+                rvl_lats = _swaths_to_grid(rvl_lats_full)
+                rvl_lons = _swaths_to_grid(rvl_lons_full)
+
+                rvl_heading = (
+                    _swaths_to_grid(ds_raw["rvlHeading"].values)
                     if "rvlHeading" in ds_raw
-                    else None
+                    else np.full_like(rvl_radvel, np.nan)
                 )
-                if rvl_heading_full is not None:
-                    rvl_heading = (
-                        rvl_heading_full[:, :, 0] if rvl_heading_full.ndim == 3
-                        else rvl_heading_full
-                    )
-                else:
-                    rvl_heading = np.full_like(rvl_radvel, np.nan)
-
-                rvl_incidence_full = (
-                    ds_raw["rvlIncidenceAngle"].values
+                rvl_incidence = (
+                    _swaths_to_grid(ds_raw["rvlIncidenceAngle"].values)
                     if "rvlIncidenceAngle" in ds_raw
-                    else None
+                    else np.full_like(rvl_radvel, np.nan)
                 )
-                if rvl_incidence_full is not None:
-                    rvl_incidence = (
-                        rvl_incidence_full[:, :, 0] if rvl_incidence_full.ndim == 3
-                        else rvl_incidence_full
-                    )
-                else:
-                    rvl_incidence = np.full_like(rvl_radvel, np.nan)
 
                 # Get acquisition time (scalar for grid)
                 time_str = ds_raw.attrs.get("firstMeasurementTime")
@@ -1436,8 +1424,10 @@ class DataTreeConverter:
                     else:
                         acq_time_ns = np.datetime64("NaT", "ns")
 
-                # Infer dimension names from rvlLat shape
-                dims = ds_raw["rvlLat"].dims if hasattr(ds_raw["rvlLat"], "dims") else ("rvlLat", "rvlLon")
+                # Standard (y, x) naming to mirror the OWI grid, so is_wv_mode
+                # detection and the grid collocation path treat RVL and OWI
+                # grids identically.
+                dims = ("y", "x")
 
                 # Create Dataset with 2D grid structure
                 data_vars = {

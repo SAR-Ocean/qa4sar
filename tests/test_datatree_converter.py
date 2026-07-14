@@ -39,6 +39,55 @@ def _make_insitu_csv(tmp_path: Path, rows: int = 5) -> Path:
     return path
 
 
+def _make_ocn_safe(
+    tmp_path: Path,
+    safe_name: str,
+    *,
+    rvl_swaths: int | None = None,
+    wv: bool = False,
+    with_owi: bool = True,
+    ny: int = 5,
+    nx: int = 4,
+    seed: int = 0,
+) -> Path:
+    """
+    Build a *.SAFE dir containing one '-ocn-' measurement NetCDF.
+
+    rvl_swaths=None -> no rvl* variables written.
+    rvl_swaths=S (wv=False) -> 3-D rvl (rvlAzSize, rvlRaSize, rvlSwath=S).
+    wv=True -> 2-D 13x13 rvl (rvlAzSize, rvlRaSize), as in WV imagettes.
+    """
+    rng = np.random.default_rng(seed)
+    safe = tmp_path / safe_name
+    meas = safe / "measurement"
+    meas.mkdir(parents=True)
+
+    data: dict = {}
+    if with_owi:
+        odims = ("owiAzSize", "owiRaSize")
+        data["owiWindSpeed"] = (odims, rng.uniform(2, 15, (ny, nx)).astype("float32"))
+        data["owiWindDirection"] = (odims, rng.uniform(0, 360, (ny, nx)).astype("float32"))
+        data["owiLon"] = (odims, rng.uniform(-20.0, -19.0, (ny, nx)).astype("float32"))
+        data["owiLat"] = (odims, rng.uniform(50.0, 51.0, (ny, nx)).astype("float32"))
+
+    if rvl_swaths is not None:
+        if wv:
+            shape, rdims = (13, 13), ("rvlAzSize", "rvlRaSize")
+        else:
+            shape, rdims = (ny, nx, rvl_swaths), ("rvlAzSize", "rvlRaSize", "rvlSwath")
+        data["rvlRadVel"] = (rdims, rng.uniform(-3, 3, shape).astype("float32"))
+        data["rvlLon"] = (rdims, rng.uniform(-20.0, -19.0, shape).astype("float32"))
+        data["rvlLat"] = (rdims, rng.uniform(50.0, 51.0, shape).astype("float32"))
+        data["rvlHeading"] = (rdims, rng.uniform(0, 360, shape).astype("float32"))
+        data["rvlIncidenceAngle"] = (rdims, rng.uniform(20, 45, shape).astype("float32"))
+
+    ds = xr.Dataset(data, attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"})
+    mode = "wv1" if wv else "ew"
+    fname = f"s1a-{mode}-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+    ds.to_netcdf(meas / fname)
+    return safe
+
+
 def _make_collocations(n: int = 3) -> list[CollocatedPoint]:
     """Create a list of synthetic CollocatedPoint objects."""
     result = []
@@ -763,3 +812,40 @@ class TestFromRadiometerBytemap:
         with _gzip.open(p, "wb") as fh:
             fh.write(b"\x00" * 10)
         assert DataTreeConverter.from_radiometer_bytemap(p) is None
+
+
+# ---------------------------------------------------------------------------
+# _extract_rvl_grid_data
+# ---------------------------------------------------------------------------
+
+class TestExtractRvlGridData:
+    def test_multiswath_reshaped_to_grid_keeps_all_swaths(self, tmp_path):
+        safe = _make_ocn_safe(tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=5, ny=5, nx=4)
+        ds = DataTreeConverter._extract_rvl_grid_data(
+            safe / "measurement", safe, flatten_to_points=False
+        )
+        assert ds is not None
+        assert "rvlRadVel" in ds
+        assert ds["rvlRadVel"].dims == ("y", "x")
+        # All 5 sub-swaths retained: x == rvlRaSize * n_swaths, not just rvlRaSize.
+        assert ds.sizes["y"] == 5
+        assert ds.sizes["x"] == 4 * 5
+        # No data lost: every input cell survives (fixture has no NaNs).
+        assert int(np.isfinite(ds["rvlRadVel"].values).sum()) == 5 * 4 * 5
+
+    def test_single_swath_2d_passes_through(self, tmp_path):
+        # WV-style 13x13 2-D rvl, read through the grid (non-flatten) branch.
+        safe = _make_ocn_safe(tmp_path, "S1A_SM_OCN.SAFE", rvl_swaths=1, wv=True)
+        ds = DataTreeConverter._extract_rvl_grid_data(
+            safe / "measurement", safe, flatten_to_points=False
+        )
+        assert ds is not None
+        assert ds["rvlRadVel"].dims == ("y", "x")
+        assert ds.sizes == {"y": 13, "x": 13}
+
+    def test_returns_none_when_no_rvl(self, tmp_path):
+        safe = _make_ocn_safe(tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=None)
+        ds = DataTreeConverter._extract_rvl_grid_data(
+            safe / "measurement", safe, flatten_to_points=False
+        )
+        assert ds is None
