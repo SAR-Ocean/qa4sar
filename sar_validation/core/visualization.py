@@ -1349,28 +1349,15 @@ def plot_collocation_diagnostics(
     ax.set_extent([bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat],
                   crs=ccrs.PlateCarree())
 
-    # ── Tier 1 (zorder=2): unmatched points, every category — drawn first
-    # so matched points (tier 3 below) are never visually covered by an
-    # unmatched point from a different category. ─────────────────────────
-    for cat in categories:
-        if len(cat["unmatched_lon"]) > 0:
-            ax.scatter(
-                cat["unmatched_lon"], cat["unmatched_lat"],
-                s=18, c="red", alpha=0.55, edgecolors="darkred", linewidths=0.3,
-                transform=transform, zorder=2,
-                label=f"{cat['label']} unmatched ({len(cat['unmatched_lon'])})",
-            )
-
-    # ── Tier 2 (zorder=3): SAR coverage ───────────────────────────────────
-    # Grid scenes → bounding box; sparse WV imagettes → one footprint circle
-    # each (radius = the collocation footprint radius), so it's visually clear
-    # that matches are only possible near each imagette, not across the whole
-    # bounding rectangle.
+    # ── SAR coverage (zorder=1): Grid scenes → bounding box; sparse WV
+    # imagettes → one footprint circle each (radius = the collocation footprint
+    # radius), so it's visually clear that matches are only possible near each
+    # imagette, not across the whole bounding rectangle. ──────────────────────
     for i, sb in enumerate(scene_bounds):
         lons_box = [sb["lon_min"], sb["lon_max"], sb["lon_max"], sb["lon_min"], sb["lon_min"]]
         lats_box = [sb["lat_min"], sb["lat_min"], sb["lat_max"], sb["lat_max"], sb["lat_min"]]
         ax.plot(lons_box, lats_box, color="blue", linewidth=1.5,
-                transform=transform, zorder=3, label="SAR scene bounds" if i == 0 else "")
+                transform=transform, zorder=1, label="SAR scene bounds" if i == 0 else "")
 
     if footprint_points:
         theta = np.linspace(0, 2 * np.pi, 60)
@@ -1381,38 +1368,78 @@ def plot_collocation_diagnostics(
             circ_lon = flon + (r_lat_deg / cos_lat) * np.cos(theta)
             circ_lat = flat + r_lat_deg * np.sin(theta)
             ax.plot(circ_lon, circ_lat, color="blue", linewidth=1.2,
-                    transform=transform, zorder=3,
+                    transform=transform, zorder=1,
                     label=f"SAR footprint (±{footprint_radius_km:.0f} km)" if j == 0 else "")
             ax.scatter([flon], [flat], s=10, c="blue", marker="+",
-                       transform=transform, zorder=3)
+                       transform=transform, zorder=1)
 
-    # ── Tier 3 (zorder=4): matched points, every category — always drawn
-    # last/on top, regardless of category. ────────────────────────────────
+    # ── Tier 1 (zorder=2): unmatched layer data (non-in-situ categories) ────
+    # Gray (#808080) with alpha=0.3, drawn first so matched points (tiers 3-4)
+    # are never visually covered by an unmatched point from a different category.
     for cat in categories:
-        m_lon = np.asarray(cat["matched_lon"])
-        m_lat = np.asarray(cat["matched_lat"])
-        m_src = np.asarray(cat["matched_source"])
-        if len(m_lon) == 0:
-            continue
-        if cat["label"] == "In-situ" and len(m_src) > 0:
-            # In-situ keeps its existing per-source-type coloring (mooring/
-            # buoy/drifter/…), each its own legend entry.
-            for source in np.unique(m_src):
-                mask = m_src == source
-                color, marker = source_style_map.get(str(source), ("#ff7f0e", "o"))
-                ax.scatter(
-                    m_lon[mask], m_lat[mask],
-                    s=25, c=color, marker=marker, alpha=0.7,
-                    edgecolors="black", linewidths=0.3,
-                    transform=transform, zorder=4, label=f"In-situ matched: {source}",
-                )
-        else:
+        if cat["label"] != "In-situ" and len(cat["unmatched_lon"]) > 0:
+            ax.scatter(
+                cat["unmatched_lon"], cat["unmatched_lat"],
+                s=18, c="#808080", alpha=0.3, edgecolors="none",
+                transform=transform, zorder=2,
+            )
+
+    # ── Tier 2 (zorder=3): unmatched in-situ data ──────────────────────────
+    # Gray (#808080) with alpha=0.3, drawn separately to layer unmatched.
+    for cat in categories:
+        if cat["label"] == "In-situ" and len(cat["unmatched_lon"]) > 0:
+            ax.scatter(
+                cat["unmatched_lon"], cat["unmatched_lat"],
+                s=18, c="#808080", alpha=0.3, edgecolors="none",
+                transform=transform, zorder=3,
+            )
+
+    # ── Tier 3 (zorder=5): matched layer data ─────────────────────────────
+    # Colored by source (from _source_style_map), alpha=0.6, drawn before
+    # matched in-situ so in-situ markers are always on top. ──────────────────
+    for cat in categories:
+        if cat["label"] != "In-situ":
+            m_lon = np.asarray(cat["matched_lon"])
+            m_lat = np.asarray(cat["matched_lat"])
+            if len(m_lon) == 0:
+                continue
             color, marker = source_style_map.get(str(cat["label"]), ("#2ca02c", "o"))
             ax.scatter(
                 m_lon, m_lat,
                 s=20, c=color, marker=marker, alpha=0.6, edgecolors="none",
-                transform=transform, zorder=4, label=f"{cat['label']} matched ({len(m_lon)})",
+                transform=transform, zorder=5, label=f"{cat['label']} matched ({len(m_lon)})",
             )
+
+    # ── Tier 4 (zorder=6): matched in-situ data ───────────────────────────
+    # Colored by sub-source type (mooring/buoy/drifter/…), alpha=0.7,
+    # drawn last so in-situ markers are always on top. ──────────────────────
+    for cat in categories:
+        if cat["label"] == "In-situ":
+            m_lon = np.asarray(cat["matched_lon"])
+            m_lat = np.asarray(cat["matched_lat"])
+            m_src = np.asarray(cat["matched_source"])
+            if len(m_lon) == 0:
+                continue
+            # In-situ keeps its per-source-type coloring (mooring/buoy/drifter/…),
+            # each its own legend entry.
+            if len(m_src) > 0:
+                for source in np.unique(m_src):
+                    mask = m_src == source
+                    color, marker = source_style_map.get(str(source), ("#ff7f0e", "o"))
+                    ax.scatter(
+                        m_lon[mask], m_lat[mask],
+                        s=25, c=color, marker=marker, alpha=0.7,
+                        edgecolors="black", linewidths=0.3,
+                        transform=transform, zorder=6, label=f"In-situ matched: {source}",
+                    )
+            else:
+                # Fallback if no source info available
+                ax.scatter(
+                    m_lon, m_lat,
+                    s=25, c="#ff7f0e", marker="o", alpha=0.7,
+                    edgecolors="black", linewidths=0.3,
+                    transform=transform, zorder=6, label="In-situ matched",
+                )
 
     # ── Title: one segment per category actually present ─────────────────
     recipe_name = recipe.config.name or "unknown"
@@ -1429,8 +1456,14 @@ def plot_collocation_diagnostics(
         title += "\n(outside ± time tolerance, not shown: " + ", ".join(excl_segments) + ")"
     ax.set_title(title, fontsize=12, fontweight="bold", pad=15)
 
-    # ── Add legend ──────────────────────────────────────────────────────
+    # ── Add legend and explanatory text ──────────────────────────────────
+    # The legend explains per-source-type coloring (in-situ sub-sources, layer
+    # types). A text annotation explains the overall rendering scheme (matched
+    # vs. unmatched via color intensity and alpha).
     ax.legend(loc="lower left", fontsize=9, framealpha=0.9)
+    ax.text(0.99, 0.01, "Filled = matched collocations, faint gray = unmatched observations",
+            transform=ax.transAxes, fontsize=8, ha="right", va="bottom",
+            bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.8))
 
     # ── Save figure ─────────────────────────────────────────────────────
     fig.tight_layout()

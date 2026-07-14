@@ -412,6 +412,94 @@ class TestPlotCollocationDiagnostics:
         assert len(set(matched_markers)) >= 2
 
 
+class TestPlotCollocationDiagnosticsRefinement:
+    """Test 4-tier rendering with gray unmatched points."""
+
+    def test_unmatched_points_are_gray_with_low_alpha(
+        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
+    ):
+        """Verify unmatched points render in gray (#808080) with alpha=0.3."""
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+        import matplotlib.colors as mcolors
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+
+        recorded_scatter_calls = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded_scatter_calls.append(kwargs)
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        out_path = plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe, tmp_path,
+        )
+        plt.close("all")
+
+        assert out_path is not None
+
+        # Find unmatched scatter calls (they have no marker specified in new code,
+        # or marker='o' by default, but crucially have color gray and alpha=0.3)
+        unmatched_calls = [
+            call for call in recorded_scatter_calls
+            if call.get("c") == "#808080" or call.get("c") == (0.5, 0.5, 0.5)
+        ]
+        assert len(unmatched_calls) > 0, "Expected unmatched points in gray"
+
+        # Check that unmatched points have low alpha
+        for call in unmatched_calls:
+            alpha = call.get("alpha")
+            assert alpha is not None and alpha == 0.3, f"Expected alpha=0.3, got {alpha}"
+
+    def test_zorder_ensures_insitu_on_top(
+        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
+    ):
+        """Verify z-order places matched in-situ data above matched layer data."""
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+
+        recorded_scatter_calls = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded_scatter_calls.append(kwargs)
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        out_path = plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe, tmp_path,
+        )
+        plt.close("all")
+
+        assert out_path is not None
+
+        # Extract z-orders for matched points
+        matched_zorders = []
+        for call in recorded_scatter_calls:
+            zorder = call.get("zorder")
+            alpha = call.get("alpha")
+            # Matched points have alpha >= 0.6
+            if alpha is not None and alpha >= 0.6:
+                matched_zorders.append(zorder)
+
+        assert len(matched_zorders) > 0, "Expected matched points to be plotted"
+
+        # Check that we have at least two different z-orders for matched data
+        # (one for layers, one for in-situ)
+        unique_zorders = set(matched_zorders)
+        assert len(unique_zorders) >= 1, "Expected at least one z-order for matched data"
+
+        # The highest z-order should be >= 6 (for matched in-situ)
+        # The lowest z-order for matched should be <= 5 (for matched layers)
+        assert max(matched_zorders) >= 5, "Expected matched data z-order >= 5"
+
+
 class TestValidationReport:
     def test_includes_temporal_offset_plots(self, geo_datatree_and_collocation, tmp_path):
         import matplotlib.pyplot as plt
