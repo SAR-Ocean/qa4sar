@@ -112,6 +112,11 @@ NRT, historical (pre-~2026 / outside the NRT window) → MY, with fallback.
 - **Copernicus point path.** Reuse the existing in-situ CSV conversion for both
   `013_030` and `013_044`. Assign `data_type` by inspecting delivered structure
   (regular grid → `hf_radar_grid`; station rows → `hf_radar`).
+- **Retain ancillary uncertainty/QC fields (do not use them yet).** Both
+  converters carry an explicit allow-list of ancillary variables alongside
+  `EWCT`/`NSCT`, at native resolution, so the deferred correction/QC phase (see
+  §3.7) is a converter no-op to enable. Phase 3 does not filter or correct on
+  them — it just refuses to drop them.
 
 ### 3.4 Collocation — `sar_validation/core/collocation.py` (core correctness item)
 
@@ -146,6 +151,48 @@ NRT, historical (pre-~2026 / outside the NRT window) → MY, with fallback.
 The currents pair `("rvlRadVel", "rvlRadVel_projection")` in `_variable_map.py`
 and the `EWCT`/`NSCT` CF metadata in `_cf_metadata.py` already exist and are
 reused as-is.
+
+### 3.7 HF-radar ancillary parameters to retain (for a future correction/QC phase)
+
+Martin, Gommenginger, Jacob & Staneva (2022), *"First multi-year assessment of
+Sentinel-1 radial velocity products using HF radar currents in a coastal
+environment"*, Remote Sensing of Environment 268:112758
+([doi:10.1016/j.rse.2021.112758](https://doi.org/10.1016/j.rse.2021.112758),
+open-access PDF at nora.nerc.ac.uk/id/eprint/532190) is the methodological
+reference for this comparison. It confirms the toolbox's core approach —
+projecting the HF-radar Cartesian `(EWCT, NSCT)` field onto the S1 line-of-sight
+(the range direction, ⊥ to `rvlHeading`) and comparing the scalar radial
+component — and its collocation choices (±20 min temporal window; box/median
+averaging over ~21×27 km improves std to ~0.24 m/s and r up to 0.93).
+
+**Important caveat for interpreting Phase 3 results:** the paper shows that raw
+operational L2 OCN `rvlRadVel` is a radial *velocity* (current + Stokes drift +
+wind-wave artefact bias, the latter up to ~2 m/s), **not** a radial *current*,
+and agrees poorly with HF-radar currents (r < 0.5, std > 0.65 m/s) until a
+correction chain is applied — outlier flagging (3σ-MAD in range then azimuth),
+de-scalloping, antenna-mispointing and land-bias corrections, and above all the
+**WASV** (Wind-wave Artefact Surface Velocity) correction via the Y19C-Dop
+(Yurovsky 2019) model driven by ERA5 sea state. That correction chain is
+**explicitly deferred** to a later phase; Phase 3 produces the raw comparison and
+should document the expected weak agreement rather than treat it as a failure.
+
+To make that later phase cheap to add, the Phase 3 converters (§3.3) **retain but
+do not use** the following ancillary fields, renamed to a canonical scheme and
+kept at native resolution:
+
+| Source | Wire variable(s) | Retain as | Enables later |
+|--------|------------------|-----------|---------------|
+| NOAA RTV (grid) | `water_u`, `water_v` | `EWCT`, `NSCT` | projection (already core) |
+| NOAA RTV (grid) | `DOPx`, `DOPy` | `hfr_gdop` (= √(DOPx²+DOPy²)), plus components | LOS-accuracy QC filter; project error onto LOS |
+| NOAA RTV (grid) | `number_of_radials`, `number_of_sites` | `hfr_n_radials`, `hfr_n_sites` | coverage/quality gating |
+| Copernicus HFR total | `EWCS`, `NSCS` | per-cell std error of u/v | LOS-accuracy QC filter; uncertainty projection |
+| Copernicus HFR total | `GDOP` | `hfr_gdop` | geometry-based QC |
+| Copernicus HFR total | `*_QC` / `QCflag` | `hfr_qc` | keep only good cells (paper's QC step) |
+| Copernicus HFR total | `CSPD`, `CDIR` (if present) | speed/direction | deferred HCDT **direction** comparison |
+
+The QC/uncertainty threshold the paper uses (retain HF-radar cells with LOS
+accuracy < 0.09 m/s; median accuracy 0.04 m/s) is the intended first consumer of
+these fields.
 
 ---
 
