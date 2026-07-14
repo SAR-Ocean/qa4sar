@@ -1829,7 +1829,9 @@ class DataTreeConverter:
                 return ds_rvl
 
         elif product_type.lower() == "currents":
-            # Try RVL extraction for currents products
+            # RVL is the currents observable. Do NOT fall back to OWI wind — a
+            # currents run must never silently produce wind data. If no RVL is
+            # found, skip the scene (the caller drops None nodes) with a warning.
             ds_rvl = DataTreeConverter._extract_rvl_grid_data(
                 measurement_dir, safe_dir, flatten_to_points=False
             )
@@ -1837,13 +1839,11 @@ class DataTreeConverter:
                 ds_rvl.attrs["swath_mode"] = "IW/EW/SM"
                 logger.info("Extracted RVL data from IW/EW/SM product %s", safe_dir.name)
                 return ds_rvl
-            # Fall back to OWI if RVL not available
-            logger.debug("RVL data not found in %s; trying OWI fallback", safe_dir.name)
-            ds = DataTreeConverter._extract_owi_grid_data(measurement_dir, safe_dir)
-            if ds is not None:
-                ds.attrs["swath_mode"] = "IW/EW/SM"
-                logger.info("Extracted OWI data (fallback) from IW/EW/SM product %s", safe_dir.name)
-                return ds
+            logger.warning(
+                "scene %s: no RVL/currents data — skipping (no OWI fallback for currents)",
+                safe_dir.name,
+            )
+            return None
 
         else:
             logger.warning("Unknown product_type: %s; trying wind (OWI) extraction", product_type)

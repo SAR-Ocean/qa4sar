@@ -849,3 +849,32 @@ class TestExtractRvlGridData:
             safe / "measurement", safe, flatten_to_points=False
         )
         assert ds is None
+
+
+# ---------------------------------------------------------------------------
+# _from_sar_l2_ocn_iw_safe (currents, no OWI fallback)
+# ---------------------------------------------------------------------------
+
+class TestIwSafeCurrentsNoOwiFallback:
+    def test_currents_with_rvl_returns_rvl_grid(self, tmp_path):
+        safe = _make_ocn_safe(tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=3, with_owi=True)
+        ds = DataTreeConverter._from_sar_l2_ocn_iw_safe(safe, product_type="currents")
+        assert ds is not None
+        assert "rvlRadVel" in ds.data_vars
+        assert "owiWindSpeed" not in ds.data_vars
+        assert ds.attrs["swath_mode"] == "IW/EW/SM"
+
+    def test_currents_without_rvl_returns_none_and_warns(self, tmp_path, caplog):
+        # OWI present but no rvl* variables — must NOT fall back to wind.
+        safe = _make_ocn_safe(tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=None, with_owi=True)
+        with caplog.at_level("WARNING"):
+            ds = DataTreeConverter._from_sar_l2_ocn_iw_safe(safe, product_type="currents")
+        assert ds is None
+        assert any("no RVL" in r.message for r in caplog.records)
+
+    def test_wind_still_extracts_owi(self, tmp_path):
+        # Regression: wind behavior unchanged.
+        safe = _make_ocn_safe(tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=None, with_owi=True)
+        ds = DataTreeConverter._from_sar_l2_ocn_iw_safe(safe, product_type="wind")
+        assert ds is not None
+        assert "owiWindSpeed" in ds.data_vars
