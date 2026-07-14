@@ -166,3 +166,56 @@ class TestFromDict:
         }
         recipe = Recipe._from_dict(d)
         assert recipe.config.sar_data.swath_mode == ["IW"]
+
+
+# ---------------------------------------------------------------------------
+# CLI 'currents' recipe template
+# ---------------------------------------------------------------------------
+
+class TestCurrentsTemplate:
+    def test_includes_noaa_hf_radar_source(self):
+        from sar_validation import cli
+
+        recipe = cli._build_currents_config(limit=None)
+        source_types = {s.source_type for s in recipe.validation_sources}
+        assert "hf_radar_noaa" in source_types
+
+        noaa_src = next(
+            s for s in recipe.validation_sources if s.source_type == "hf_radar_noaa"
+        )
+        assert noaa_src.min_depth == -2.0
+        assert noaa_src.max_depth == 2.0
+        assert noaa_src.download_kwargs == {"resolution_km": 6}
+
+    def test_includes_hf_radar_grid_layer_spec(self):
+        from sar_validation import cli
+
+        recipe = cli._build_currents_config(limit=None)
+        specs = recipe.collocation.layer_vs_layer.layer_type_specs
+        assert "hf_radar_grid" in specs
+        assert specs["hf_radar_grid"] == {
+            "time_tolerance_minutes": 20,
+            "aggregation_window_km": 6.0,
+            "distance_weighting": "equal",
+        }
+
+    def test_preserves_existing_currents_content(self):
+        """The extraction into a builder must not drop any existing sources/specs."""
+        from sar_validation import cli
+
+        recipe = cli._build_currents_config(limit=7)
+        source_types = [s.source_type for s in recipe.validation_sources]
+        assert source_types == ["hf_radar", "hf_radar_noaa", "drifter", "ferrybox", "mooring"]
+
+        hf_radar_src = recipe.validation_sources[0]
+        assert hf_radar_src.min_depth == -2.0
+        assert hf_radar_src.max_depth == 2.0
+
+        specs = recipe.collocation.layer_vs_layer.layer_type_specs
+        assert specs["hf_radar"] == {
+            "time_tolerance_minutes": 60,
+            "aggregation_window_km": 5.0,
+            "distance_weighting": "equal",
+        }
+
+        assert recipe.sar_data.max_downloads == 7

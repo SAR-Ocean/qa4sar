@@ -238,6 +238,61 @@ def _list_recipes() -> None:
         print(f"  {f.name}")
 
 
+def _build_currents_config(limit: Optional[int] = None):
+    """Build the 'currents' recipe template's RecipeConfig.
+
+    Extracted from ``_create_recipe`` so the template content is
+    unit-testable independent of the CLI's file-writing side effects.
+    """
+    from .core.recipe import (
+        RecipeConfig, GeographicBounds, SARDataSpec, ValidationDataSource,
+        CollocationType, PointVsLayerCollocation, LayerVsLayerCollocation,
+    )
+
+    return RecipeConfig(
+        name="Ocean Currents Validation",
+        description=(
+            "Validate Sentinel-1 WV mode ocean currents\n"
+            "against HF radar and drifting buoys."
+        ),
+        variable="currents",
+        variable_specs={"components": ["zonal", "meridional"]},
+        geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+        sar_data=SARDataSpec(swath_mode=["WV","IW","EW","SM"], max_downloads=limit),
+        validation_sources=[
+            ValidationDataSource(
+                source_type="hf_radar",
+                min_depth=-2.0, max_depth=2.0,
+            ),
+            ValidationDataSource(
+                source_type="hf_radar_noaa",
+                min_depth=-2.0, max_depth=2.0,
+                download_kwargs={"resolution_km": 6},
+            ),
+            ValidationDataSource(source_type="drifter"),
+            ValidationDataSource(source_type="ferrybox"),
+            ValidationDataSource(source_type="mooring"),
+        ],
+        collocation=CollocationType(
+            point_vs_layer=PointVsLayerCollocation(),
+            layer_vs_layer=LayerVsLayerCollocation(
+                layer_type_specs={
+                    "hf_radar": {
+                        "time_tolerance_minutes": 60,
+                        "aggregation_window_km": 5.0,
+                        "distance_weighting": "equal",
+                    },
+                    "hf_radar_grid": {
+                        "time_tolerance_minutes": 20,
+                        "aggregation_window_km": 6.0,
+                        "distance_weighting": "equal",
+                    },
+                }
+            ),
+        ),
+    )
+
+
 def _create_recipe(
     name: str,
     limit: Optional[int] = None,
@@ -333,38 +388,7 @@ def _create_recipe(
                 ),
             ),
         ),
-        "currents": RecipeConfig(
-            name="Ocean Currents Validation",
-            description=(
-                "Validate Sentinel-1 WV mode ocean currents\n"
-                "against HF radar and drifting buoys."
-            ),
-            variable="currents",
-            variable_specs={"components": ["zonal", "meridional"]},
-            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
-            sar_data=SARDataSpec(swath_mode=["WV","IW","EW","SM"], max_downloads=limit),
-            validation_sources=[
-                ValidationDataSource(
-                    source_type="hf_radar",
-                    min_depth=-2.0, max_depth=2.0,
-                ),
-                ValidationDataSource(source_type="drifter"),
-                ValidationDataSource(source_type="ferrybox"),
-                ValidationDataSource(source_type="mooring"),
-            ],
-            collocation=CollocationType(
-                point_vs_layer=PointVsLayerCollocation(),
-                layer_vs_layer=LayerVsLayerCollocation(
-                    layer_type_specs={
-                        "hf_radar": {
-                            "time_tolerance_minutes": 60,
-                            "aggregation_window_km": 5.0,
-                            "distance_weighting": "equal",
-                        }
-                    }
-                ),
-            ),
-        ),
+        "currents": _build_currents_config(limit),
         "waves": RecipeConfig(
             name="Wave Height Validation",
             description=(
