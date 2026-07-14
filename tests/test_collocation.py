@@ -443,6 +443,25 @@ class TestDetectCollocationTypeImport:
         assert _detect_collocation_type(ds, "validation/scatterometer/file") == "layer_vs_layer"
 
 
+class TestHfRadarGridDispatch:
+    def test_data_type_routes_to_layer(self):
+        import xarray as xr
+        ds = xr.Dataset(attrs={"data_type": "hf_radar_grid"})
+        assert _detect_collocation_type(ds, "validation/hfr_noaa/scene") == "layer_vs_layer"
+
+    def test_path_fallback_routes_to_layer(self):
+        import xarray as xr
+        ds = xr.Dataset()  # no data_type attr
+        assert _detect_collocation_type(ds, "validation/hfr_noaa/scene") == "layer_vs_layer"
+
+    def test_default_layer_spec_present(self):
+        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+        spec = DEFAULT_LAYER_TYPE_SPECS["hf_radar_grid"]
+        assert spec["aggregation_window_km"] == 6.0
+        assert spec["time_tolerance_minutes"] == 20
+        assert spec["distance_weighting"] == "equal"
+
+
 # ---------------------------------------------------------------------------
 # Former stub tests (now verify classes are functional)
 # ---------------------------------------------------------------------------

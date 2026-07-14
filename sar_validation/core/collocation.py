@@ -284,9 +284,9 @@ def _equal_weights(distances: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 # data_type attribute values that indicate a gridded layer source
-LAYER_DATA_TYPES = {"scatterometer", "altimeter", "hf_radar", "radiometer"}
+LAYER_DATA_TYPES = {"scatterometer", "altimeter", "hf_radar", "hf_radar_grid", "radiometer"}
 # path-fragment fallbacks when attributes are absent
-LAYER_SOURCE_PATHS = {"osi_saf_winds", "scatterometer", "altimeter", "hf_radar", "radiometer"}
+LAYER_SOURCE_PATHS = {"osi_saf_winds", "scatterometer", "altimeter", "hf_radar", "hf_radar_grid", "hfr_noaa", "radiometer"}
 
 
 def _detect_collocation_type(val_ds: "xr.Dataset", source_path: str) -> str:
@@ -1291,6 +1291,8 @@ def run_collocation(
                                 layer_type = "radiometer"
                             elif "hf_radar" in path_parts:
                                 layer_type = "hf_radar"
+                            elif "hfr_noaa" in path_parts or "hf_radar_grid" in path_parts:
+                                layer_type = "hf_radar_grid"
                         if layer_type == "altimeter":
                             freq = val_ds.attrs.get("frequency", "1hz").lower()
                             layer_type = f"altimeter_{freq}"
@@ -1376,6 +1378,8 @@ def run_collocation(
                                 layer_type = "radiometer"
                             elif "hf_radar" in path_parts:
                                 layer_type = "hf_radar"
+                            elif "hfr_noaa" in path_parts or "hf_radar_grid" in path_parts:
+                                layer_type = "hf_radar_grid"
 
                         if layer_type == "altimeter":
                             # Altimeter's aggregation window depends on

@@ -122,6 +122,7 @@ DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
     "altimeter_1hz":  {"time_tolerance_minutes": 180, "aggregation_window_km": 7.0,  "distance_weighting": "equal"},
     "altimeter_5hz":  {"time_tolerance_minutes": 180, "aggregation_window_km": 1.4,  "distance_weighting": "equal"},
     "hf_radar":       {"time_tolerance_minutes": 20,  "aggregation_window_km": 5.0,  "distance_weighting": "equal"},
+    "hf_radar_grid":  {"time_tolerance_minutes": 20,  "aggregation_window_km": 6.0,  "distance_weighting": "equal"},
     # Bare key is the fallback when a node's sensor is unknown.
     "radiometer":       dict(_RADIOMETER_DEFAULT),
     "radiometer_amsr2": dict(_RADIOMETER_DEFAULT),
