@@ -366,6 +366,70 @@ class TestPlotGeographic:
 
 
 @pytest.fixture
+def geo_datatree_and_collocation_with_unmatched():
+    """Synthetic DataTree + collocation_ds with both matched and unmatched
+    layer-type points (altimeter) to test per-source marker rendering for
+    unmatched layer data."""
+    from sar_validation.core.datatree_converter import DataTreeConverter
+
+    y, x = 4, 5
+    lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+    wind = np.linspace(5.0, 12.0, y * x).reshape(y, x)
+    sar_ds = xr.Dataset(
+        {"owiWindSpeed": (("y", "x"), wind)},
+        coords={
+            "lon": (("y", "x"), lon2d),
+            "lat": (("y", "x"), lat2d),
+            "time": pd.Timestamp("2026-07-10T19:00:00"),
+        },
+    )
+
+    # 4 mooring points: 2 matched, 2 unmatched
+    mooring_ds = xr.Dataset(
+        {"WSPD": ("point", np.array([6.0, 6.5, 7.0, 7.5]))},
+        coords={
+            "lon": ("point", np.array([-9.8, -9.6, -9.4, -9.2])),
+            "lat": ("point", np.array([50.2, 50.4, 50.6, 50.8])),
+            "time": ("point", pd.date_range("2026-07-10T19:05", periods=4, freq="5min")),
+        },
+        attrs={"platform_type": "mooring"},
+    )
+
+    # 6 altimeter points: 2 matched, 4 unmatched
+    altimeter_ds = xr.Dataset(
+        {"WSPD": ("point", np.array([8.0, 8.5, 9.0, 9.5, 10.0, 10.5]))},
+        coords={
+            "lon": ("point", np.array([-9.0, -8.8, -8.6, -8.4, -8.2, -8.0])),
+            "lat": ("point", np.array([51.0, 51.2, 51.4, 51.6, 51.8, 52.0])),
+            "time": ("point", pd.date_range("2026-07-10T19:10", periods=6, freq="5min")),
+        },
+        attrs={"platform_type": "altimeter"},
+    )
+
+    datatree = DataTreeConverter.to_datatree({
+        "sar/sceneA": sar_ds,
+        "validation/mooring": mooring_ds,
+        "validation/altimeter": altimeter_ds,
+    })
+
+    # Only 4 matches: 2 mooring, 2 altimeter (leaving 4 altimeter unmatched)
+    collocation_ds = xr.Dataset({
+        "sar_owiWindSpeed":            ("collocation", np.array([6.1, 6.9, 8.2, 9.3])),
+        "val_WSPD":                    ("collocation", np.array([6.0, 7.0, 8.0, 9.5])),
+        "val_source":                  ("collocation", ["mooring", "mooring", "altimeter", "altimeter"]),
+        "sar_scene_name":              ("collocation", ["sceneA"] * 4),
+        "val_lon":                     ("collocation", np.array([-9.8, -9.6, -9.0, -8.8])),
+        "val_lat":                     ("collocation", np.array([50.2, 50.4, 51.0, 51.2])),
+        "val_id":                      ("collocation", ["mo0", "mo1", "al0", "al1"]),
+        "temporal_distance_minutes":   ("collocation", np.array([10.0, 45.0, 90.0, 150.0])),
+    })
+    collocation_ds = collocation_ds.assign_coords(
+        val_time=("collocation", pd.date_range("2026-07-10T19:05", periods=4, freq="5min")),
+    )
+    return datatree, collocation_ds
+
+
+@pytest.fixture
 def diagnostics_recipe():
     from sar_validation.core.recipe import (
         GeographicBounds, Recipe, RecipeConfig, ValidationDataSource,
@@ -536,6 +600,43 @@ class TestPlotCollocationDiagnosticsRefinement:
         # Verify we have distinct markers (not all the same)
         unique_markers = set(all_markers)
         assert len(unique_markers) >= 1, "Expected at least one marker type"
+
+    def test_unmatched_layer_points_get_per_source_markers(
+        self, geo_datatree_and_collocation_with_unmatched, diagnostics_recipe, tmp_path, monkeypatch
+    ):
+        """Verify unmatched layer-type (altimeter) points get per-source markers, not default 'o'."""
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation_with_unmatched
+
+        recorded_scatter_calls = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded_scatter_calls.append(kwargs)
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        out_path = plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe, tmp_path,
+        )
+        plt.close("all")
+
+        assert out_path is not None
+
+        # Find unmatched layer data calls (zorder=2, alpha=0.3, c="#808080")
+        unmatched_layer_calls = [
+            call for call in recorded_scatter_calls
+            if (call.get("zorder") == 2 and call.get("alpha") == 0.3 and call.get("c") == "#808080")
+        ]
+        assert len(unmatched_layer_calls) > 0, "Expected unmatched layer points"
+
+        # Verify that at least some have non-default markers (not all "o")
+        markers_used = [call.get("marker") for call in unmatched_layer_calls]
+        unique_markers = set(m for m in markers_used if m is not None)
+        assert len(unique_markers) > 0, "Expected per-source markers on unmatched layer points"
 
 
 class TestValidationReport:

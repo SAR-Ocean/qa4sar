@@ -1389,7 +1389,9 @@ def plot_collocation_diagnostics(
                 # Iterate through unique sources to apply per-source markers
                 for source in np.unique(u_src):
                     mask = u_src == source
-                    color, marker = source_style_map.get(str(source), ("#808080", "o"))
+                    # Layer sources are stored lowercase but source_style_map has
+                    # title-case keys (e.g., "altimeter" → "Altimeter")
+                    color, marker = source_style_map.get(str(source).title(), ("#808080", "o"))
                     ax.scatter(
                         u_lon[mask], u_lat[mask],
                         s=18, c="#808080", marker=marker, alpha=0.3, edgecolors="none",
