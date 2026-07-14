@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -449,7 +449,7 @@ class TestBuildErddapSubsetUrl:
 
 class TestSelectBackend:
     def test_recent_date_uses_erddap(self):
-        recent = (datetime.utcnow() - timedelta(days=10)).strftime("%Y-%m-%d")
+        recent = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y-%m-%d")
         assert select_backend(recent) == "erddap"
 
     def test_old_date_not_yet_supported(self):

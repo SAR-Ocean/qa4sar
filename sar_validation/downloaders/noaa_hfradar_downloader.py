@@ -23,7 +23,7 @@ from __future__ import annotations
 import argparse
 import sys
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -117,9 +117,9 @@ def select_backend(end: str) -> str:
     older than ``ERDDAP_WINDOW_DAYS`` require the THREDDS archive backend, which
     is delivered in Phase 3b.
     """
-    end_norm = normalize_datetime(end).rstrip("Z")
-    end_dt = datetime.fromisoformat(end_norm)
-    age_days = (datetime.utcnow() - end_dt).days
+    end_dt = datetime.fromisoformat(normalize_datetime(end))
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    age_days = (now_utc - end_dt).days
     if age_days > ERDDAP_WINDOW_DAYS:
         raise NotImplementedError(
             f"end date {end} is older than the ERDDAP ~{ERDDAP_WINDOW_DAYS}-day "
