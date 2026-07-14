@@ -455,3 +455,45 @@ class TestSelectBackend:
     def test_old_date_not_yet_supported(self):
         with pytest.raises(NotImplementedError, match="Phase 3b"):
             select_backend("2015-01-01")
+
+
+from unittest.mock import patch
+from sar_validation.downloaders.noaa_hfradar_downloader import NOAAHFRadarDownloader
+
+
+# NOTE: the task brief's verbatim test used a hardcoded "2024-05-01" date for
+# `end`. select_backend() rejects any `end` older than the rolling ~90-day
+# ERDDAP window relative to wall-clock "now", so a hardcoded past date goes
+# stale and starts raising NotImplementedError once the suite is run more
+# than ~90 days after the brief was written. Using a date a few days before
+# "now" keeps these tests deterministically inside the window (mirroring the
+# existing TestSelectBackend.test_recent_date_uses_erddar pattern above)
+# without changing any of the brief's assertions.
+_RECENT_START = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
+_RECENT_END = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%dT06:00:00")
+
+
+class TestNOAAHFRadarDownload:
+    def test_dry_run_returns_none_and_no_fetch(self, tmp_path, capsys):
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=True, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+        ) as m:
+            out = dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+        assert out is None
+        m.assert_not_called()
+        assert "ucsdHfrW6.nc?" in capsys.readouterr().out
+
+    def test_download_fetches_url_to_expected_path(self, tmp_path):
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+        ) as m:
+            out = dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+        assert out is not None
+        assert out.parent == tmp_path
+        assert out.suffix == ".nc"
+        m.assert_called_once()
+        called_url, called_path = m.call_args[0][0], m.call_args[0][1]
+        assert "ucsdHfrW6.nc?" in called_url
+        assert str(out) == str(called_path)

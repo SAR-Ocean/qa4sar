@@ -129,10 +129,77 @@ def select_backend(end: str) -> str:
 
 
 class NOAAHFRadarDownloader:
-    """See Task 4 for the full implementation."""
+    """Download NOAA HFRnet gridded RTV currents via ERDDAP griddap.
+
+    Parameters
+    ----------
+    output_dir : Path
+        Directory to save the downloaded NetCDF.
+    dry_run : bool
+        If True, print the subset URL and return None without fetching.
+    resolution_km : int
+        Grid resolution (1/2/6 km); default 6 km for robust coverage.
+    """
 
     def __init__(self, output_dir: Path, dry_run: bool = False,
                  resolution_km: int = DEFAULT_RESOLUTION_KM) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
         self.resolution_km = resolution_km
+
+    def download(self, min_lon, max_lon, min_lat, max_lat,
+                 start: str, end: str) -> Optional[Path]:
+        backend = select_backend(end)  # raises if archive (Phase 3b) needed
+        dataset_id = select_erddap_dataset(
+            min_lon, max_lon, min_lat, max_lat, self.resolution_km
+        )
+        url = build_erddap_subset_url(
+            dataset_id, min_lon, max_lon, min_lat, max_lat, start, end
+        )
+
+        if self.dry_run:
+            print(f"[dry-run] NOAA HF-radar ({backend}) would download:\n  {url}")
+            return None
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        start_d = normalize_datetime(start).split("T")[0]
+        end_d = normalize_datetime(end).split("T")[0]
+        date_str = start_d if start_d == end_d else f"{start_d}_{end_d}"
+        out_path = self.output_dir / f"{dataset_id}_{self.resolution_km}km_{date_str}.nc"
+        urllib.request.urlretrieve(url, str(out_path))
+        return out_path
+
+
+def _parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Download NOAA HFRnet RTV currents (ERDDAP).")
+    p.add_argument("--min-lon", type=float, required=True)
+    p.add_argument("--max-lon", type=float, required=True)
+    p.add_argument("--min-lat", type=float, required=True)
+    p.add_argument("--max-lat", type=float, required=True)
+    p.add_argument("--start", required=True)
+    p.add_argument("--end", required=True)
+    p.add_argument("--resolution", type=int, default=DEFAULT_RESOLUTION_KM,
+                   choices=[1, 2, 6])
+    p.add_argument("--output-dir", default="data/hfr_noaa")
+    p.add_argument("--dry-run", action="store_true")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    dl = NOAAHFRadarDownloader(
+        output_dir=Path(args.output_dir),
+        dry_run=args.dry_run,
+        resolution_km=args.resolution,
+    )
+    out = dl.download(
+        args.min_lon, args.max_lon, args.min_lat, args.max_lat,
+        args.start, args.end,
+    )
+    if out is not None:
+        print(f"Saved: {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
