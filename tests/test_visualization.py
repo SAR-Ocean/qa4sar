@@ -779,10 +779,8 @@ class TestValidationReportWindDirectionFilter:
     def test_nondirectional_source_absent_from_wdir_scatter(self, tmp_path, monkeypatch):
         """Altimeter (all-NaN WDIR) must not appear in the wind-direction
         scatter, but must appear in the wind-speed scatter."""
-        import sys
         import matplotlib.pyplot as plt
-        import matplotlib.axes
-        from sar_validation.core.visualization import validation_report
+        import sar_validation.core.visualization as viz
         from sar_validation.core.recipe import Recipe, RecipeConfig
         from sar_validation.core.datatree_converter import DataTreeConverter
 
@@ -813,44 +811,62 @@ class TestValidationReportWindDirectionFilter:
             "temporal_distance_minutes": ("collocation", [10.0, 20.0, 15.0, 25.0]),
         })
 
-        # Spy on Axes.scatter and, for every call that carries a per-source
-        # "label" kwarg, record which val_var pair was being plotted when
-        # the call happened. Only plot_scatter's default color_by="source"
-        # path (and plot_temporal_offset, also by_source) ever pass
-        # label=<source> — plot_geographic never does — so this isolates
-        # exactly the calls that produce the per-pair scatter PNGs. The
-        # calling pair is identified by reading the immediate caller's
-        # local `val_var` (the parameter name both plot_scatter and
-        # plot_temporal_offset use), which works regardless of call order.
-        seen = {}  # val_var -> set of sources reaching a scatter call
-        original_scatter = matplotlib.axes.Axes.scatter
+        # Spy at the wiring boundary itself: wrap the module-level
+        # plot_scatter and plot_geographic so we observe the *dataset each
+        # one receives* for each (sar_var, val_var) pair, not a downstream
+        # rendering side-effect. (A scatter/label-based spy is unreliable
+        # here — plot_scatter and plot_temporal_offset each do their own
+        # dropna() on the val_ column before ever calling ax.scatter, which
+        # would independently strip altimeter's all-NaN WDIR rows even if
+        # validation_report's pair_ds filtering were never wired up at all —
+        # see Fix Round 2 report for the falsification that proved this.)
+        # validation_report calls plot_scatter/plot_geographic as bare
+        # names resolved through the module's own globals at call time, so
+        # patching the module attribute here intercepts those calls.
+        captured = {}  # val_var -> list of val_source sets seen in each captured call
 
-        def recording_scatter(self, *args, **kwargs):
-            label = kwargs.get("label")
-            if label is not None:
-                caller_val_var = sys._getframe(1).f_locals.get("val_var")
-                seen.setdefault(caller_val_var, set()).add(label)
-            return original_scatter(self, *args, **kwargs)
+        def _record(coll_ds, sar_var, val_var, *args, **kwargs):
+            if "val_source" in coll_ds:
+                captured.setdefault(val_var, []).append(
+                    set(coll_ds["val_source"].values.tolist())
+                )
 
-        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        original_plot_scatter = viz.plot_scatter
+        original_plot_geographic = viz.plot_geographic
+
+        def spy_plot_scatter(coll_ds, sar_var, val_var, **kwargs):
+            _record(coll_ds, sar_var, val_var)
+            return original_plot_scatter(coll_ds, sar_var, val_var, **kwargs)
+
+        def spy_plot_geographic(datatree_arg, coll_ds, sar_var, val_var=None, **kwargs):
+            _record(coll_ds, sar_var, val_var)
+            return original_plot_geographic(datatree_arg, coll_ds, sar_var, val_var, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_scatter", spy_plot_scatter)
+        monkeypatch.setattr(viz, "plot_geographic", spy_plot_geographic)
 
         recipe = Recipe(config=RecipeConfig(name="wdir_test", variable="wind"))
-        validation_report(coll, datatree, recipe, out_dir=tmp_path)
+        viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
         plt.close("all")
 
         # Both PNGs exist; only the direction one has altimeter removed.
         assert (tmp_path / "plots" / "owiWindSpeed_vs_WSPD_scatter.png").exists()
         assert (tmp_path / "plots" / "owiWindDirection_vs_WDIR_scatter.png").exists()
 
-        # The pair_ds wiring actually reached plot_scatter (and friends)
-        # with the filtered dataset: altimeter (all-NaN WDIR) must never
-        # show up in a scatter call made while plotting the WDIR pair, but
-        # must still show up for the WSPD pair, where every source is kept.
-        assert "altimeter" not in seen.get("WDIR", set()), (
-            "altimeter should have been dropped from the WDIR scatter plots"
+        # The pair_ds wiring actually reached plot_scatter/plot_geographic
+        # with the filtered dataset: altimeter (all-NaN WDIR) must never be
+        # present in any dataset handed to a plot call made for the WDIR
+        # pair, but must still be present for the WSPD pair, where every
+        # source is kept untouched.
+        wdir_sources = set().union(*captured.get("WDIR", [set()]))
+        wspd_sources = set().union(*captured.get("WSPD", [set()]))
+        assert "altimeter" not in wdir_sources, (
+            "altimeter should have been dropped from the dataset passed to "
+            "WDIR-pair plot calls"
         )
-        assert "altimeter" in seen.get("WSPD", set()), (
-            "altimeter should still appear in the WSPD scatter plots"
+        assert "altimeter" in wspd_sources, (
+            "altimeter should still be present in the dataset passed to "
+            "WSPD-pair plot calls"
         )
-        assert "mooring" in seen.get("WDIR", set())
-        assert "mooring" in seen.get("WSPD", set())
+        assert "mooring" in wdir_sources
+        assert "mooring" in wspd_sources
