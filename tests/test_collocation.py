@@ -631,3 +631,35 @@ class TestPointLayerCollocationAggregation:
             results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "test")
             assert len(results) == 1, f"Failed for weighting method '{method}'"
             assert "wind_speed" in results[0].sar_data
+
+
+class TestWvRvlProjection:
+    def test_projection_added_from_ewct_nsct(self):
+        from sar_validation.core.collocation import _collocate_wv_points
+
+        # One WV RVL point with a known heading; one in-situ current obs on top.
+        sar_lons = np.array([-19.5])
+        sar_lats = np.array([50.5])
+        sar_times = np.array([np.datetime64("2026-06-20T19:15:00", "ns")])
+        sar_point_vars = {
+            "rvlRadVel": np.array([1.0]),
+            "rvlHeading": np.array([90.0]),  # heading_rad = radians(90-90)=0
+        }
+        val = pd.DataFrame({
+            "lon": [-19.5],
+            "lat": [50.5],
+            "time": [pd.Timestamp("2026-06-20T19:20:00")],
+            "EWCT": [0.4],
+            "NSCT": [0.3],
+        })
+        matches = _collocate_wv_points(
+            sar_lons=sar_lons, sar_lats=sar_lats, sar_times=sar_times,
+            sar_point_vars=sar_point_vars, val_data=val, val_source="mooring",
+            footprint_radius_km=14.0, time_tolerance_minutes=30,
+            distance_weighting="equal", gaussian_sigma_km=5.0,
+            collocation_type="point_vs_point",
+        )
+        assert len(matches) == 1
+        proj = matches[0].val_data["rvlRadVel_projection"]
+        # heading 90 -> heading_rad 0 -> projection = EWCT*cos0 + NSCT*sin0 = EWCT
+        assert proj == pytest.approx(0.4, abs=1e-6)

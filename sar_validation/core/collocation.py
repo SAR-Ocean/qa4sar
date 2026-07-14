@@ -1044,6 +1044,21 @@ def _collocate_wv_points(
         if not val_aggregated:
             continue
 
+        # Project the in-situ current vector (EWCT/NSCT) onto the SAR radial
+        # look direction so it can be compared against rvlRadVel — mirrors the
+        # grid collocation path. Here rvlHeading is a scalar per imagette point.
+        if (
+            "rvlRadVel" in sar_aggregated
+            and "rvlHeading" in sar_aggregated
+            and "EWCT" in val_aggregated
+            and "NSCT" in val_aggregated
+        ):
+            heading_rad = np.radians(float(sar_aggregated["rvlHeading"]) - 90.0)
+            val_aggregated["rvlRadVel_projection"] = (
+                float(val_aggregated["EWCT"]) * np.cos(heading_rad)
+                + float(val_aggregated["NSCT"]) * np.sin(heading_rad)
+            )
+
         nearest = int(np.argmin(dists))
         near_row = idx[nearest]
         point_val_source = val_source
