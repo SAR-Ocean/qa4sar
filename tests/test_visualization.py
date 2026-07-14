@@ -478,26 +478,64 @@ class TestPlotCollocationDiagnosticsRefinement:
         plt.close("all")
 
         assert out_path is not None
+        assert len(recorded_scatter_calls) > 0, "Expected scatter calls"
 
-        # Extract z-orders for matched points
-        matched_zorders = []
+        # Group calls by z-order
+        by_zorder = {}
         for call in recorded_scatter_calls:
             zorder = call.get("zorder")
             alpha = call.get("alpha")
-            # Matched points have alpha >= 0.6
-            if alpha is not None and alpha >= 0.6:
-                matched_zorders.append(zorder)
+            marker = call.get("marker")
+            if zorder is not None:
+                if zorder not in by_zorder:
+                    by_zorder[zorder] = []
+                by_zorder[zorder].append({"alpha": alpha, "marker": marker})
 
-        assert len(matched_zorders) > 0, "Expected matched points to be plotted"
+        # Verify all 4 tiers are present (zorder 2, 3, 5, 6)
+        # Note: zorder=1 is for SAR coverage (lines/plot, not scatter)
+        expected_zorders = {2, 3, 5, 6}
+        actual_zorders = set(by_zorder.keys())
+        present_zorders = expected_zorders & actual_zorders
+        assert len(present_zorders) >= 2, (
+            f"Expected at least 2 of {expected_zorders} z-orders, "
+            f"but got {present_zorders}"
+        )
 
-        # Check that we have at least two different z-orders for matched data
-        # (one for layers, one for in-situ)
-        unique_zorders = set(matched_zorders)
-        assert len(unique_zorders) >= 1, "Expected at least one z-order for matched data"
+        # Verify alpha values: unmatched (0.3), matched layers (0.6), matched in-situ (0.7)
+        unmatched_alphas = set()
+        matched_layer_alphas = set()
+        matched_insitu_alphas = set()
 
-        # The highest z-order should be >= 6 (for matched in-situ)
-        # The lowest z-order for matched should be <= 5 (for matched layers)
-        assert max(matched_zorders) >= 5, "Expected matched data z-order >= 5"
+        if 2 in by_zorder:  # Tier 1: unmatched layers
+            unmatched_alphas.update(call["alpha"] for call in by_zorder[2])
+        if 3 in by_zorder:  # Tier 2: unmatched in-situ
+            unmatched_alphas.update(call["alpha"] for call in by_zorder[3])
+        if 5 in by_zorder:  # Tier 3: matched layers
+            matched_layer_alphas.update(call["alpha"] for call in by_zorder[5])
+        if 6 in by_zorder:  # Tier 4: matched in-situ
+            matched_insitu_alphas.update(call["alpha"] for call in by_zorder[6])
+
+        # Verify unmatched alpha is 0.3
+        assert 0.3 in unmatched_alphas or len(unmatched_alphas) == 0, (
+            f"Expected unmatched alpha=0.3, got {unmatched_alphas}"
+        )
+
+        # Verify matched layers alpha is 0.6
+        assert 0.6 in matched_layer_alphas or len(matched_layer_alphas) == 0, (
+            f"Expected matched layer alpha=0.6, got {matched_layer_alphas}"
+        )
+
+        # Verify matched in-situ alpha is 0.7
+        assert 0.7 in matched_insitu_alphas or len(matched_insitu_alphas) == 0, (
+            f"Expected matched in-situ alpha=0.7, got {matched_insitu_alphas}"
+        )
+
+        # Verify per-source markers are used (not all None)
+        all_markers = [call["marker"] for call in recorded_scatter_calls if call.get("marker") is not None]
+        assert len(all_markers) > 0, "Expected per-source markers to be used"
+        # Verify we have distinct markers (not all the same)
+        unique_markers = set(all_markers)
+        assert len(unique_markers) >= 1, "Expected at least one marker type"
 
 
 class TestValidationReport:

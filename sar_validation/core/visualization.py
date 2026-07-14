@@ -1277,8 +1277,8 @@ def plot_collocation_diagnostics(
     # for "which platform_type values are layer types" — so this plot
     # automatically covers scatterometer, altimeter, hf_radar, or any future
     # addition, without hardcoding a fixed list here. ────────────────────
-    unmatched_by_category: Dict[str, Tuple[List[float], List[float]]] = {
-        label: ([], []) for label in matched_by_category
+    unmatched_by_category: Dict[str, Tuple[List[float], List[float], List[str]]] = {
+        label: ([], [], []) for label in matched_by_category
     }
     excluded_by_time: Dict[str, int] = {}
     for lon, lat, ptype, ptime in zip(all_val_lons, all_val_lats, platform_types_arr, all_val_times):
@@ -1289,22 +1289,25 @@ def plot_collocation_diagnostics(
         if not _time_eligible(ptime, tol_minutes):
             excluded_by_time[label] = excluded_by_time.get(label, 0) + 1
             continue
-        lon_lats = unmatched_by_category.setdefault(label, ([], []))
-        lon_lats[0].append(lon)
-        lon_lats[1].append(lat)
+        lon_lats_srcs = unmatched_by_category.setdefault(label, ([], [], []))
+        lon_lats_srcs[0].append(lon)
+        lon_lats_srcs[1].append(lat)
+        lon_lats_srcs[2].append(str(ptype))
 
     # ── Assemble final per-category data, dropping empty categories ──────
     categories = []
     for label in sorted(set(matched_by_category) | set(unmatched_by_category)):
         m_lon, m_lat, m_src = matched_by_category.get(label, (np.array([]), np.array([]), np.array([])))
-        u_lon = np.array(unmatched_by_category.get(label, ([], []))[0])
-        u_lat = np.array(unmatched_by_category.get(label, ([], []))[1])
+        u_lon, u_lat, u_src = unmatched_by_category.get(label, ([], [], []))
+        u_lon = np.array(u_lon)
+        u_lat = np.array(u_lat)
+        u_src = np.array(u_src)
         if len(m_lon) + len(u_lon) == 0:
             continue
         categories.append({
             "label": label,
             "matched_lon": m_lon, "matched_lat": m_lat, "matched_source": m_src,
-            "unmatched_lon": u_lon, "unmatched_lat": u_lat,
+            "unmatched_lon": u_lon, "unmatched_lat": u_lat, "unmatched_source": u_src,
         })
 
     if not categories:
@@ -1374,25 +1377,57 @@ def plot_collocation_diagnostics(
                        transform=transform, zorder=1)
 
     # ── Tier 1 (zorder=2): unmatched layer data (non-in-situ categories) ────
-    # Gray (#808080) with alpha=0.3, drawn first so matched points (tiers 3-4)
-    # are never visually covered by an unmatched point from a different category.
+    # Gray (#808080) with alpha=0.3, per-source markers, drawn first so matched
+    # points (tiers 3-4) are never visually covered by an unmatched point from
+    # a different category.
     for cat in categories:
         if cat["label"] != "In-situ" and len(cat["unmatched_lon"]) > 0:
-            ax.scatter(
-                cat["unmatched_lon"], cat["unmatched_lat"],
-                s=18, c="#808080", alpha=0.3, edgecolors="none",
-                transform=transform, zorder=2,
-            )
+            u_lon = np.asarray(cat["unmatched_lon"])
+            u_lat = np.asarray(cat["unmatched_lat"])
+            u_src = np.asarray(cat["unmatched_source"])
+            if len(u_src) > 0:
+                # Iterate through unique sources to apply per-source markers
+                for source in np.unique(u_src):
+                    mask = u_src == source
+                    color, marker = source_style_map.get(str(source), ("#808080", "o"))
+                    ax.scatter(
+                        u_lon[mask], u_lat[mask],
+                        s=18, c="#808080", marker=marker, alpha=0.3, edgecolors="none",
+                        transform=transform, zorder=2,
+                    )
+            else:
+                # Fallback if no source info
+                ax.scatter(
+                    u_lon, u_lat,
+                    s=18, c="#808080", alpha=0.3, edgecolors="none",
+                    transform=transform, zorder=2,
+                )
 
     # ── Tier 2 (zorder=3): unmatched in-situ data ──────────────────────────
-    # Gray (#808080) with alpha=0.3, drawn separately to layer unmatched.
+    # Gray (#808080) with alpha=0.3, per-source markers, drawn separately to
+    # layer unmatched.
     for cat in categories:
         if cat["label"] == "In-situ" and len(cat["unmatched_lon"]) > 0:
-            ax.scatter(
-                cat["unmatched_lon"], cat["unmatched_lat"],
-                s=18, c="#808080", alpha=0.3, edgecolors="none",
-                transform=transform, zorder=3,
-            )
+            u_lon = np.asarray(cat["unmatched_lon"])
+            u_lat = np.asarray(cat["unmatched_lat"])
+            u_src = np.asarray(cat["unmatched_source"])
+            if len(u_src) > 0:
+                # Iterate through unique sources to apply per-source markers
+                for source in np.unique(u_src):
+                    mask = u_src == source
+                    color, marker = source_style_map.get(str(source), ("#808080", "o"))
+                    ax.scatter(
+                        u_lon[mask], u_lat[mask],
+                        s=18, c="#808080", marker=marker, alpha=0.3, edgecolors="none",
+                        transform=transform, zorder=3,
+                    )
+            else:
+                # Fallback if no source info
+                ax.scatter(
+                    u_lon, u_lat,
+                    s=18, c="#808080", alpha=0.3, edgecolors="none",
+                    transform=transform, zorder=3,
+                )
 
     # ── Tier 3 (zorder=5): matched layer data ─────────────────────────────
     # Colored by source (from _source_style_map), alpha=0.6, drawn before
