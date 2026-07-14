@@ -112,6 +112,20 @@ def _haversine_distance(
     return R * 2.0 * np.arcsin(np.sqrt(a))
 
 
+def _project_currents_to_radial(ewct: float, nsct: float, heading_deg: float) -> float:
+    """Project an eastward/northward current onto the SAR radial (line-of-sight).
+
+    The SAR line-of-sight is the range direction, perpendicular to the platform
+    heading ``rvlHeading`` (azimuth/along-track), hence the ``- 90``. The result
+    is the quantity compared against the L2 OCN ``rvlRadVel`` product
+    (``rvlRadVel_projection``).
+
+    Reference: Martin, Gommenginger, Jacob & Staneva (2022), RSE 268:112758.
+    """
+    heading_rad = np.radians(heading_deg - 90.0)
+    return ewct * np.cos(heading_rad) + nsct * np.sin(heading_rad)
+
+
 def _haversine_distance_grid(
     lon1: float, lat1: float,
     grid_lon: np.ndarray, grid_lat: np.ndarray,
@@ -604,12 +618,11 @@ class PointLayerCollocation:
                         ])
                         valid_headings = nearby_headings[~np.isnan(nearby_headings)]
                         if len(valid_headings) > 0:
-                            heading_deg = np.nanmean(valid_headings)
-                            heading_rad = np.radians(float(heading_deg) - 90.0)
-                            ewct = float(val_aggregated["EWCT"])
-                            nsct = float(val_aggregated["NSCT"])
-                            radial_vel = ewct * np.cos(heading_rad) + nsct * np.sin(heading_rad)
-                            val_aggregated["rvlRadVel_projection"] = radial_vel
+                            val_aggregated["rvlRadVel_projection"] = _project_currents_to_radial(
+                                float(val_aggregated["EWCT"]),
+                                float(val_aggregated["NSCT"]),
+                                float(np.nanmean(valid_headings)),
+                            )
                     except (KeyError, ValueError, TypeError) as e:
                         logger.debug("RVL projection failed: %s", e)
 
@@ -1006,10 +1019,10 @@ def _collocate_wv_points(
             and "EWCT" in val_aggregated
             and "NSCT" in val_aggregated
         ):
-            heading_rad = np.radians(float(sar_aggregated["rvlHeading"]) - 90.0)
-            val_aggregated["rvlRadVel_projection"] = (
-                float(val_aggregated["EWCT"]) * np.cos(heading_rad)
-                + float(val_aggregated["NSCT"]) * np.sin(heading_rad)
+            val_aggregated["rvlRadVel_projection"] = _project_currents_to_radial(
+                float(val_aggregated["EWCT"]),
+                float(val_aggregated["NSCT"]),
+                float(sar_aggregated["rvlHeading"]),
             )
 
         nearest = int(np.argmin(dists))
@@ -1737,6 +1750,22 @@ class LayerLayerCollocation(PointLayerCollocation):
                             y_idx, x_idx,
                         )
                     continue
+
+                # Project currents onto the SAR line-of-sight so gridded
+                # HF-radar (EWCT/NSCT) is comparable to rvlRadVel — the
+                # cell-averaging path does this via PointLayerCollocation, but
+                # the SAR-anchor 'individual' path must do it explicitly.
+                if (
+                    "rvlRadVel" in sar_aggregated
+                    and "rvlHeading" in sar_aggregated
+                    and "EWCT" in val_aggregated
+                    and "NSCT" in val_aggregated
+                ):
+                    val_aggregated["rvlRadVel_projection"] = _project_currents_to_radial(
+                        float(val_aggregated["EWCT"]),
+                        float(val_aggregated["NSCT"]),
+                        float(sar_aggregated["rvlHeading"]),
+                    )
 
                 sar_cell_lon = float(sar_lon_flat[cell_idx])
                 sar_cell_lat = float(sar_lat_flat[cell_idx])

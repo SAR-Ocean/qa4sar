@@ -20,6 +20,7 @@ from sar_validation.core.collocation import (
     _inverse_distance_weights,
     _linear_weights,
     _equal_weights,
+    _project_currents_to_radial,
     LAYER_DATA_TYPES,
 )
 
@@ -730,3 +731,22 @@ class TestRunCollocationCurrentsFromDatatree:
         assert "val_rvlRadVel_projection" in result
         # heading 90 -> projection == EWCT == 0.4
         assert float(result["val_rvlRadVel_projection"].values[0]) == pytest.approx(0.4, abs=1e-5)
+
+
+class TestProjectCurrentsToRadial:
+    def test_due_east_current_zero_heading(self):
+        # heading 0° → LOS is heading-90° = -90°; cos(-90)=0, sin(-90)=-1.
+        # A 1 m/s eastward current projects to 0; northward projects to -1.
+        assert _project_currents_to_radial(1.0, 0.0, 0.0) == pytest.approx(0.0, abs=1e-12)
+        assert _project_currents_to_radial(0.0, 1.0, 0.0) == pytest.approx(-1.0, abs=1e-12)
+
+    def test_heading_90_east_projects_fully(self):
+        # heading 90° → θ=0 → cos=1, sin=0: eastward projects fully, north to 0.
+        assert _project_currents_to_radial(1.0, 0.0, 90.0) == pytest.approx(1.0, abs=1e-12)
+        assert _project_currents_to_radial(0.0, 1.0, 90.0) == pytest.approx(0.0, abs=1e-12)
+
+    def test_matches_legacy_inline_formula(self):
+        ewct, nsct, heading = 0.37, -0.12, 190.0
+        expected = (ewct * np.cos(np.radians(heading - 90.0))
+                    + nsct * np.sin(np.radians(heading - 90.0)))
+        assert _project_currents_to_radial(ewct, nsct, heading) == pytest.approx(expected)
