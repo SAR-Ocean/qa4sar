@@ -48,10 +48,14 @@ __all__ = [
     "validation_report",
 ]
 
-# Colour palette used for validation sources (cycles if more sources than colours)
+# Colour palette used for validation sources (cycles if more sources than
+# colours). Deliberately avoids mid-gray shades (e.g. tab10's "#7f7f7f") —
+# plot_collocation_diagnostics uses gray (#808080) to mean "unmatched", so a
+# source landing on a near-gray palette entry would be visually
+# indistinguishable from unmatched points of that same source.
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
-    "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+    "#9467bd", "#8c564b", "#e377c2", "#17becf",
     "#bcbd22",
 ]
 
@@ -1493,14 +1497,22 @@ def plot_collocation_diagnostics(
         title += "\n(outside ± time tolerance, not shown: " + ", ".join(excl_segments) + ")"
     ax.set_title(title, fontsize=12, fontweight="bold", pad=15)
 
-    # ── Add legend and explanatory text ──────────────────────────────────
-    # The legend explains per-source-type coloring (in-situ sub-sources, layer
-    # types). A text annotation explains the overall rendering scheme (matched
-    # vs. unmatched via color intensity and alpha).
-    ax.legend(loc="lower left", fontsize=9, framealpha=0.9)
-    ax.text(0.99, 0.01, "Filled = matched collocations, faint gray = unmatched observations",
-            transform=ax.transAxes, fontsize=8, ha="right", va="bottom",
-            bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.8))
+    # ── Add legend with an explanatory entry ──────────────────────────────
+    # The explanation of matched-vs-unmatched rendering is folded into the
+    # legend itself (rather than a separate floating text box) so it can
+    # never visually collide with the legend — a floating annotation
+    # overlapped the legend box when labels were long (e.g. "Radiometer
+    # matched (1635)").
+    import matplotlib.lines as mlines  # noqa: PLC0415
+    handles, labels = ax.get_legend_handles_labels()
+    explanation = mlines.Line2D(
+        [], [], linestyle="None", marker="o", markerfacecolor="lightgray",
+        markeredgecolor="black", markersize=6,
+        label="Filled = matched, faint gray = unmatched",
+    )
+    handles.append(explanation)
+    labels.append(explanation.get_label())
+    ax.legend(handles=handles, labels=labels, loc="lower left", fontsize=8, framealpha=0.9)
 
     # ── Save figure ─────────────────────────────────────────────────────
     fig.tight_layout()
