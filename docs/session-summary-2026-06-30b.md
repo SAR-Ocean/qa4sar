@@ -144,10 +144,9 @@ data/<timestamp>_<bbox>/
 ├── download_metadata.json         # step 1
 ├── datatree.nc                    # step 2
 ├── collocation_results.nc         # step 3
-├── collocation_patches.nc         # step 4a
-├── validation_statistics_<var>_vs_<val>.nc   # step 4b (one per pair)
+├── validation_statistics_<var>_vs_<val>.nc   # step 5a (one per pair)
 ├── validation_statistics_<var>_vs_<val>.csv
-├── validation_report.pdf          # step 5 — all plots in one PDF
+├── validation_report.pdf          # step 5b — all plots in one PDF
 └── plots/
     ├── <var>_vs_<val>_scatter.png
     ├── <var>_vs_<val>_geographic_<collocation_type>.png

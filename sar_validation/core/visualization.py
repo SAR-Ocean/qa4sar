@@ -1,5 +1,5 @@
 """
-Visualization — step 5 of the validation pipeline.
+Visualization — step 5b of the validation pipeline.
 
 Five public plot functions:
 

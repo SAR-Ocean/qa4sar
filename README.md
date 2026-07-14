@@ -9,27 +9,41 @@ Supports validation of **wind** (speed + direction), **ocean currents**, and **s
 
 ## Architecture
 
-The toolbox is structured around 5 sequential steps that together form a complete validation workflow:
+The toolbox is structured around 6 sequential steps that together form a complete validation workflow:
 
 ```
+Step 0 — Create recipe (.yaml)
+          │  define validation variable (wind / currents / waves)
+          │  define geographic bounds (min/max lon/lat)
+          │  define temporal bounds (start/end dates)
+          │  select validation data sources
+          ▼
 Step 1 — Download data
-          │  define variable (wind / currents / waves)
-          │  define region (lon/lat) and time window
-          │  download SAR L2_OCN + validation sources
+          │  download SAR L2_OCN + all validation sources
+          │  for the recipe region and time window
           ▼
 Step 2 — Convert to xarray.DataTree
           │  standardize all formats
+          │  filter to recipe geographic/temporal bounds
           │  handle different grids / resolutions
           ▼
 Step 3 — Collocation
-          │  point vs. layer   (mooring / buoy / ferrybox / drifter vs. SAR)
-          │  layer vs. layer   (scatterometer / HF-radar vs. SAR)
+          │  point vs. point    (mooring / buoy / drifter / ferrybox vs. waves)
+          │  point vs. layer    (mooring / buoy / drifter / ferrybox / tidal gauge vs. SAR)
+          │  layer vs. layer    (scatterometer / altimeter / radiometer / HF-radar vs. SAR)
           ▼
 Step 4 — Store collocated pairs
           │  keep only overlapping data
           │  store spatial/temporal offset metadata
           ▼
-Step 5 — Visualisation & statistics
+Step 5a — Compute statistics
+          │  bias, RMSE, correlation, scatter index
+          │  per platform/source
+          ▼
+Step 5b — Generate visualisation & report
+          │  scatter plots, geographic maps
+          │  statistics charts, residuals
+          │  PDF report
 ```
 
 Steps 2–5 are dataset-agnostic: they work the same regardless of which validation sources were
@@ -47,8 +61,8 @@ sar_validation/
 │   ├── orchestrator.py     # Orchestrates step 1 (download all sources)
 │   ├── datatree_converter.py  # Step 2: convert to xarray.DataTree
 │   ├── collocation.py      # Step 3: collocation algorithms
-│   ├── statistics.py       # Step 4b: compute bias, RMSE, correlation, scatter index
-│   ├── visualization.py    # Step 5: scatter plots, geographic maps, statistics charts, residuals
+│   ├── statistics.py       # Step 5a: compute bias, RMSE, correlation, scatter index
+│   ├── visualization.py    # Step 5b: scatter plots, geographic maps, statistics charts, residuals
 │   ├── _variable_map.py    # Variable mapping (wind/currents/waves)
 │   └── __init__.py         # Package exports
 └── downloaders/
@@ -127,7 +141,7 @@ results = colloc.collocate(
 df = DataTreeConverter.to_dataframe(results)
 df.to_csv("data/.../collocations_wind_buoy.csv", index=False)
 
-# --- Step 5: analyse ---
+# --- Step 5a/5b: analyse / visualize ---
 import matplotlib.pyplot as plt
 plt.scatter(df["val_wind_speed"], df["sar_wind_speed"])
 plt.xlabel("Buoy wind speed (m/s)")

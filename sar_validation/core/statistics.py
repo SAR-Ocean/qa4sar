@@ -1,5 +1,5 @@
 """
-Validation statistics — step 4b of the validation pipeline.
+Validation statistics — step 5a of the validation pipeline.
 
 Computes per-source bias, RMSE, Pearson correlation, and scatter index
 from the collocated pairs produced by step 3 (``collocation_results.nc``).

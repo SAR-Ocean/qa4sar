@@ -142,12 +142,12 @@ Examples:
     parser.add_argument(
         "--stats",
         action="store_true",
-        help="Compute validation statistics (step 4b — bias, RMSE, correlation); implies --collocate",
+        help="Compute validation statistics (step 5a — bias, RMSE, correlation); implies --collocate",
     )
     parser.add_argument(
         "--plot",
         action="store_true",
-        help="Generate validation plots (step 5 — scatter, geographic, statistics, residuals); implies --stats",
+        help="Generate validation plots (step 5b — scatter, geographic, statistics, residuals); implies --stats",
     )
     parser.add_argument(
         "--output-dir",
@@ -608,7 +608,7 @@ def _collocate_data(
 
 
 def _compute_stats(recipe, base_dir: Path, filename_suffix: str = "") -> None:
-    """Run step 4b: compute validation statistics from collocation_results<suffix>.nc."""
+    """Run step 5a: compute validation statistics from collocation_results<suffix>.nc."""
     import xarray as xr
     from .core.statistics import run_statistics
 
@@ -617,7 +617,7 @@ def _compute_stats(recipe, base_dir: Path, filename_suffix: str = "") -> None:
         print(f"  collocation_results{filename_suffix}.nc not found — statistics skipped.")
         return
 
-    print("\nStep 4b: Computing validation statistics…")
+    print("\nStep 5a: Computing validation statistics…")
     collocation_ds = xr.open_dataset(str(coll_path))
     results = run_statistics(collocation_ds, recipe, base_dir, filename_suffix=filename_suffix)
     if not results:
@@ -628,7 +628,7 @@ def _compute_stats(recipe, base_dir: Path, filename_suffix: str = "") -> None:
 
 
 def _generate_plots(recipe, base_dir: Path, filename_suffix: str = "") -> None:
-    """Run step 5: generate validation plots and save to <base_dir>/plots/."""
+    """Run step 5b: generate validation plots and save to <base_dir>/plots/."""
     import xarray as xr
     from .core.visualization import validation_report
 
@@ -642,7 +642,7 @@ def _generate_plots(recipe, base_dir: Path, filename_suffix: str = "") -> None:
         print("  datatree.nc not found — plotting skipped.")
         return
 
-    print("\nStep 5: Generating validation plots…")
+    print("\nStep 5b: Generating validation plots…")
     collocation_ds = xr.open_dataset(str(coll_path))
     datatree = xr.open_datatree(str(datatree_path), engine="netcdf4")
 

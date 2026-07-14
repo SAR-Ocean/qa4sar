@@ -2,15 +2,15 @@
 
 ## Pipeline overview
 
-`sar-validate` covers all five validation steps.  The flags are cumulative:
+`sar-validate` covers all six validation steps.  The flags are cumulative:
 each flag implies all earlier steps.
 
 ```
 Step 1  (always)      Download SAR + validation data
 Step 2  --convert     Build datatree.nc
 Step 3  --collocate   Build collocation_results.nc          (implies --convert)
-Step 4b --stats       Compute bias / RMSE / correlation      (implies --collocate)
-Step 5  --plot        Generate plots + PDF report            (implies --stats)
+Step 5a --stats       Compute bias / RMSE / correlation      (implies --collocate)
+Step 5b --plot        Generate plots + PDF report            (implies --stats)
 ```
 
 ---
@@ -47,13 +47,13 @@ data/2026-03-01-000000-2026-03-02-000000_-10.00_5.00_50.00_65.00/
 │  ── Step 3 ──
 ├── collocation_results.nc
 │
-│  ── Step 4b ──
+│  ── Step 5a ──
 ├── validation_statistics_owiWindSpeed_vs_WSPD.nc
 ├── validation_statistics_owiWindSpeed_vs_WSPD.csv
 ├── validation_statistics_owiWindDirection_vs_WDIR.nc
 ├── validation_statistics_owiWindDirection_vs_WDIR.csv
 │
-│  ── Step 5 ──
+│  ── Step 5b ──
 ├── validation_report.pdf          ← combined PDF (all plots, one file)
 └── plots/
     ├── owiWindSpeed_vs_WSPD_scatter.png
@@ -105,8 +105,8 @@ statistics files.  Each page corresponds to one plot type for one variable pair:
 | *(none)* | — | Download SAR + validation data (step 1) |
 | `--convert` | — | Convert downloaded files to DataTree (step 2) |
 | `--collocate` | `--convert` | Spatiotemporal collocation (step 3) |
-| `--stats` | `--collocate` | Bias, RMSE, correlation per station (step 4b) |
-| `--plot` | `--stats` | Scatter, geographic, statistics, residuals + PDF (step 5) |
+| `--stats` | `--collocate` | Bias, RMSE, correlation per station (step 5a) |
+| `--plot` | `--stats` | Scatter, geographic, statistics, residuals + PDF (step 5b) |
 | `--dry-run` | — | Preview what would be downloaded; no files written |
 | `--output-dir DIR` | — | Override the output directory from the recipe |
 | `--verbose` / `-v` | — | Enable DEBUG-level logging |
@@ -152,10 +152,10 @@ recipe = Recipe.from_yaml("recipes/wind_validation.yaml")
 collocation_ds = xr.open_dataset(DATA_DIR / "collocation_results.nc")
 datatree = xr.open_datatree(str(DATA_DIR / "datatree.nc"), engine="netcdf4")
 
-# Step 4b — statistics saved as .nc + .csv in DATA_DIR
+# Step 5a — statistics saved as .nc + .csv in DATA_DIR
 stats_map = run_statistics(collocation_ds, recipe, DATA_DIR)
 
-# Step 5 — PNGs saved to DATA_DIR/plots/, PDF to DATA_DIR/validation_report.pdf
+# Step 5b — PNGs saved to DATA_DIR/plots/, PDF to DATA_DIR/validation_report.pdf
 validation_report(
     collocation_ds=collocation_ds,
     datatree=datatree,
