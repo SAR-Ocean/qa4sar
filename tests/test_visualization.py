@@ -779,6 +779,7 @@ class TestValidationReportWindDirectionFilter:
     def test_nondirectional_source_absent_from_wdir_scatter(self, tmp_path, monkeypatch):
         """Altimeter (all-NaN WDIR) must not appear in the wind-direction
         scatter, but must appear in the wind-speed scatter."""
+        import sys
         import matplotlib.pyplot as plt
         import matplotlib.axes
         from sar_validation.core.visualization import validation_report
@@ -805,10 +806,33 @@ class TestValidationReportWindDirectionFilter:
             "sar_scene_name":       ("collocation", ["sceneA"] * 4),
             "val_lon":              ("collocation", [-9.5, -9.4, -9.3, -9.2]),
             "val_lat":              ("collocation", [50.5, 50.6, 50.7, 50.8]),
+            # Present so color_by="temporal_offset" and plot_temporal_offset
+            # don't fall back / bail with "missing" warnings unrelated to
+            # what this test is checking (every other fixture in this file
+            # that exercises those code paths includes this column too).
+            "temporal_distance_minutes": ("collocation", [10.0, 20.0, 15.0, 25.0]),
         })
 
-        seen = {}  # val_var -> set of sources that reached a scatter fill
+        # Spy on Axes.scatter and, for every call that carries a per-source
+        # "label" kwarg, record which val_var pair was being plotted when
+        # the call happened. Only plot_scatter's default color_by="source"
+        # path (and plot_temporal_offset, also by_source) ever pass
+        # label=<source> — plot_geographic never does — so this isolates
+        # exactly the calls that produce the per-pair scatter PNGs. The
+        # calling pair is identified by reading the immediate caller's
+        # local `val_var` (the parameter name both plot_scatter and
+        # plot_temporal_offset use), which works regardless of call order.
+        seen = {}  # val_var -> set of sources reaching a scatter call
         original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            label = kwargs.get("label")
+            if label is not None:
+                caller_val_var = sys._getframe(1).f_locals.get("val_var")
+                seen.setdefault(caller_val_var, set()).add(label)
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
 
         recipe = Recipe(config=RecipeConfig(name="wdir_test", variable="wind"))
         validation_report(coll, datatree, recipe, out_dir=tmp_path)
@@ -817,3 +841,16 @@ class TestValidationReportWindDirectionFilter:
         # Both PNGs exist; only the direction one has altimeter removed.
         assert (tmp_path / "plots" / "owiWindSpeed_vs_WSPD_scatter.png").exists()
         assert (tmp_path / "plots" / "owiWindDirection_vs_WDIR_scatter.png").exists()
+
+        # The pair_ds wiring actually reached plot_scatter (and friends)
+        # with the filtered dataset: altimeter (all-NaN WDIR) must never
+        # show up in a scatter call made while plotting the WDIR pair, but
+        # must still show up for the WSPD pair, where every source is kept.
+        assert "altimeter" not in seen.get("WDIR", set()), (
+            "altimeter should have been dropped from the WDIR scatter plots"
+        )
+        assert "altimeter" in seen.get("WSPD", set()), (
+            "altimeter should still appear in the WSPD scatter plots"
+        )
+        assert "mooring" in seen.get("WDIR", set())
+        assert "mooring" in seen.get("WSPD", set())
