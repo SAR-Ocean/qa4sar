@@ -827,53 +827,6 @@ class PointLayerCollocation:
 # High-level pipeline helper (step 3)
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Helper to load RVL data on-demand for currents validation
-# ---------------------------------------------------------------------------
-
-def _load_rvl_for_collocation(
-    sar_datasets: Dict[str, Any],
-    base_dir: Path,
-) -> None:
-    """
-    Load RVL (Radial Velocity Linesight) data from WV mode SAFE files and
-    add to SAR datasets for currents validation.
-
-    Creates separate dataset entries for RVL data (named `{scene}_rvl`)
-    so it can be processed independently.
-
-    Modifies sar_datasets in-place to add RVL datasets where available.
-
-    Parameters
-    ----------
-    sar_datasets : dict
-        Mapping of SAR scene names to Datasets (will be modified)
-    base_dir : Path
-        Base directory containing S1_L2_OCN/ subdirectory
-    """
-    from .datatree_converter import DataTreeConverter
-
-    sar_dir = base_dir / "S1_L2_OCN"
-    if not sar_dir.exists():
-        return
-
-    # Scan for WV mode SAFE directories and extract RVL
-    for safe_dir in sorted(d for d in sar_dir.iterdir()
-                          if d.is_dir() and d.suffix == ".SAFE"):
-        safe_name = safe_dir.name.upper()
-        if "WV" not in safe_name:
-            continue
-
-        try:
-            rvl_ds = DataTreeConverter._extract_rvl_from_wv_safe(safe_dir)
-            if rvl_ds is not None:
-                # Add as a separate dataset entry with _rvl suffix
-                sar_datasets[f"{safe_dir.name}_rvl"] = rvl_ds
-                logger.info("Loaded RVL data for SAR scene %s", safe_dir.name)
-        except Exception as e:
-            logger.debug("Could not load RVL for %s: %s", safe_dir.name, e)
-
-
 def _merge_collocation_kwargs(
     global_kwargs: Dict[str, Any],
     per_source_kwargs: Dict[str, Any],
@@ -1206,13 +1159,6 @@ def run_collocation(
     if not sar_scenes:
         logger.warning("No SAR nodes found in DataTree — nothing to collocate.")
         return None
-
-    # Load RVL (radial velocity) data on-demand — only for currents recipes.
-    # RVL is the currents observable; loading it for a wind/waves recipe would
-    # add spurious {scene}_rvl SAR nodes that get collocated against the
-    # in-situ/altimeter data instead of the intended OWI/OSW measurement.
-    if str(getattr(recipe.config, "variable", "")).lower() == "currents":
-        _load_rvl_for_collocation(sar_scenes, base_dir)
 
     # Collect validation nodes (flatten up to two levels deep) and bucket
     # each by its auto-detected collocation type, tracking source metadata.
