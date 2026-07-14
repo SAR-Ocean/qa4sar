@@ -2028,6 +2028,7 @@ class DataTreeConverter:
         - ``copernicus_insitu/*.csv``  → ``validation/<stem>`` nodes
         - ``osi_saf_winds/*.nc``       → ``validation/osi_saf_winds/<stem>`` nodes
         - ``scatterometer/*.nc``       → ``validation/scatterometer/<stem>`` nodes
+        - ``hfr_noaa/*.nc``            → ``validation/hfr_noaa/<stem>`` nodes
         - ``altimeter/*.nc``           → ``validation/altimeter/<stem>`` nodes
 
         Parameters
@@ -2106,6 +2107,19 @@ class DataTreeConverter:
                         datasets[f"validation/{subdir_name}/{nc_path.stem}"] = ds
                         logger.info("Converted %s (scatterometer): %s", subdir_name, nc_path.name)
 
+        # NOAA HFRnet gridded RTV currents (flattened to points, tagged
+        # hf_radar_grid). Domain-filtered like the scatterometer path.
+        subdir = base_dir / "hfr_noaa"
+        if subdir.exists():
+            for nc_path in sorted(subdir.glob("*.nc")):
+                ds = _filtered(
+                    DataTreeConverter.from_hf_radar_grid(nc_path),
+                    nc_path.name,
+                )
+                if ds is not None:
+                    datasets[f"validation/hfr_noaa/{nc_path.stem}"] = ds
+                    logger.info("Converted hfr_noaa (HF-radar grid): %s", nc_path.name)
+
         # Altimeter NetCDF products (kept as raw dataset). copernicusmarine
         # sometimes can't merge a satellite/frequency request into a single
         # flat file and instead writes a directory (named after the
@@ -2164,3 +2178,6 @@ class DataTreeConverter:
         logger.info("DataTree saved to %s (%d nodes)", out_path, len(datasets))
 
         return tree
+
+    # Alias for backwards compatibility and test clarity
+    build_datatree = staticmethod(convert_downloaded_data.__func__)
