@@ -497,3 +497,75 @@ class TestNOAAHFRadarDownload:
         called_url, called_path = m.call_args[0][0], m.call_args[0][1]
         assert "ucsdHfrW6.nc?" in called_url
         assert str(out) == str(called_path)
+
+
+# ---------------------------------------------------------------------------
+# Tests for DataOrchestrator "hf_radar_noaa" wiring (Task 7)
+# ---------------------------------------------------------------------------
+# DataOrchestrator can be built cheaply from a stub Recipe (no network, no
+# real base-dir creation under dry_run), so a behavioural test is preferred
+# over source-inspection alone.
+
+class TestOrchestratorHFRadarNOAAWiring:
+    def test_dispatch_source_registers_hf_radar_noaa_handler(self):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        import inspect
+
+        src = inspect.getsource(DataOrchestrator._dispatch_source)
+        assert '"hf_radar_noaa"' in src
+        assert "_download_noaa_hfradar" in src
+        assert hasattr(DataOrchestrator, "_download_noaa_hfradar")
+
+    def test_download_noaa_hfradar_dry_run_sets_metadata_and_makes_no_network_call(
+        self, tmp_path
+    ):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import (
+            Recipe, RecipeConfig, GeographicBounds, TemporalBounds,
+            ValidationDataSource,
+        )
+
+        recipe = Recipe(RecipeConfig(
+            name="test-hf-radar-noaa",
+            variable="currents",
+            output_dir=str(tmp_path),
+            # US_WEST bbox: the only region select_erddap_dataset() accepts
+            # for the default 6 km resolution.
+            geographic_bounds=GeographicBounds(-125.0, -119.0, 33.0, 38.0),
+            temporal_bounds=TemporalBounds(_RECENT_START, _RECENT_END),
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        source = ValidationDataSource(source_type="hf_radar_noaa")
+
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+        ) as m:
+            result = orchestrator._download_noaa_hfradar(source)
+
+        assert result is True
+        assert orchestrator.metadata["downloads"]["hf_radar_noaa"]["status"] == "dry_run"
+        m.assert_not_called()
+
+    def test_download_noaa_hfradar_honours_resolution_km_override(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(
+            name="test-hf-radar-noaa-res",
+            variable="currents",
+            output_dir=str(tmp_path),
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        source = ValidationDataSource(
+            source_type="hf_radar_noaa",
+            download_kwargs={"resolution_km": 1},
+        )
+
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.NOAAHFRadarDownloader"
+        ) as mock_cls:
+            mock_cls.return_value.download.return_value = None
+            orchestrator._download_noaa_hfradar(source)
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["resolution_km"] == 1

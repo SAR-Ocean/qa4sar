@@ -204,6 +204,7 @@ class DataOrchestrator:
         handlers = {
             "scatterometer": self._download_scatterometer,
             "hf_radar":      self._download_hf_radar,
+            "hf_radar_noaa": self._download_noaa_hfradar,
             "altimeter":     self._download_altimeter,
             "radiometer":    self._download_radiometer,
         }
@@ -272,6 +273,42 @@ class DataOrchestrator:
             logger.error(msg)
             self.metadata["errors"].append(msg)
             self.metadata["downloads"]["hf_radar"] = {"status": "failed", "error": msg}
+            return False
+
+    def _download_noaa_hfradar(self, source) -> bool:
+        from ..downloaders.noaa_hfradar_downloader import (
+            NOAAHFRadarDownloader,
+            DEFAULT_RESOLUTION_KM,
+        )
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        temp   = cfg.temporal_bounds
+        out_dir = self.base_dir / "hfr_noaa"
+        # Resolution is an optional per-source override, forwarded via the
+        # established ValidationDataSource.download_kwargs channel.
+        resolution_km = int(source.download_kwargs.get("resolution_km", DEFAULT_RESOLUTION_KM))
+
+        try:
+            dl = NOAAHFRadarDownloader(
+                output_dir=out_dir,
+                dry_run=self.dry_run,
+                resolution_km=resolution_km,
+            )
+            dl.download(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=temp.start, end=temp.end,
+            )
+            self.metadata["downloads"]["hf_radar_noaa"] = {
+                "status": "dry_run" if self.dry_run else "success",
+            }
+            return True
+        except Exception as exc:
+            msg = f"NOAA HF-radar download failed: {exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"]["hf_radar_noaa"] = {"status": "failed", "error": msg}
             return False
 
     # Altimeter download frequencies, keyed by recipe variable. Wind never
