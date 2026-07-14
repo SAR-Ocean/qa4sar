@@ -1172,7 +1172,7 @@ class DataTreeConverter:
         standardised Dataset.
 
         Automatically detects mode by inspecting the SAFE directory name:
-        - If directory name contains "WV": reads WV mode oswHs point measurements
+        - If directory name contains "WV": reads RVL point measurements for currents, oswHs for wind/waves
         - Otherwise: dispatches to extraction based on product_type:
           - "wind" (default): extracts OWI (Ocean Wind Index) grid data
           - "waves": extracts OSW (Ocean Surface Waves) grid data
@@ -1185,7 +1185,7 @@ class DataTreeConverter:
             Path to a ``*.SAFE`` directory.
         product_type : str, optional
             Type of product to extract: "wind" (OWI), "waves" (OSW), or "currents" (RVL).
-            Only used for IW/EW/SM modes; WV mode always extracts oswHs.
+            WV mode extracts RVL for currents, oswHs for wind/waves.
             Default is "wind".
 
         Returns
@@ -1339,7 +1339,7 @@ class DataTreeConverter:
         Extract RVL (Radial Velocity Linesight) data from measurement directory.
 
         RVL is a 13×13 grid measurement in SAR products. By default, this function
-        keeps the grid structure (rvlLat × rvlLon dimensions). If flatten_to_points=True,
+        keeps the grid structure using ("y", "x") dimensions. If flatten_to_points=True,
         the grid is flattened to points (169 points per file) for collocation.
 
         Parameters
@@ -1350,7 +1350,7 @@ class DataTreeConverter:
             Path to the SAFE directory (used for logging and attributes).
         flatten_to_points : bool, optional
             If True, flatten 13×13 grids to 169 points with point dimension (default: False).
-            If False, keep 2D grid structure with (rvlLat, rvlLon) dimensions.
+            If False, keep 2D grid structure with ("y", "x") dimensions.
 
         Returns
         -------
