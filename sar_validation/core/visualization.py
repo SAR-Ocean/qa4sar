@@ -1798,6 +1798,17 @@ def validation_report(
             for fig in figs:
                 plt.close(fig)
 
+    # Collocation diagnostics plot — generated once per recipe
+    if base_dir is not None:
+        try:
+            diag_path = plot_collocation_diagnostics(
+                datatree, collocation_ds, recipe, base_dir, filename_suffix
+            )
+            if diag_path is not None:
+                logger.info("Collocation diagnostics plot saved to %s", diag_path)
+        except Exception as exc:
+            logger.warning("plot_collocation_diagnostics failed: %s", exc)
+
     # Combined PDF — saved alongside the validation_statistics_*.nc files
     if base_dir is not None and pdf_pages:
         from matplotlib.backends.backend_pdf import PdfPages  # noqa: PLC0415

@@ -656,3 +656,19 @@ class TestValidationReport:
         assert (tmp_path / "plots" / f"{key}_temporal_offset.png").exists()
         assert (tmp_path / "validation_report.pdf").exists()
         plt.close("all")
+
+
+class TestValidationReportIncludesDiagnostics:
+    def test_diagnostics_plot_included_in_report(self, geo_datatree_and_collocation, tmp_path):
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import validation_report
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
+
+        figures = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        # Check that the collocation diagnostics plot PNG was created
+        assert (tmp_path / "plots" / "collocation_diagnostics_test_recipe.png").exists()
+        plt.close("all")
