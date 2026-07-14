@@ -672,3 +672,43 @@ class TestValidationReportIncludesDiagnostics:
         # Check that the collocation diagnostics plot PNG was created
         assert (tmp_path / "plots" / "collocation_diagnostics_test_recipe.png").exists()
         plt.close("all")
+
+    def test_diagnostics_page_embedded_in_pdf(self, geo_datatree_and_collocation, tmp_path, monkeypatch):
+        """The diagnostics PNG must not just be saved to disk — it must also
+        appear as a page inside validation_report.pdf. Spy on
+        PdfPages.savefig and check one of the saved pages is a
+        single-axes, full-bleed image page (the shape produced when the
+        reloaded diagnostics PNG is embedded via imshow) — no other plot
+        function in this module uses imshow, so this signature is unique
+        to the diagnostics page.
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+        from sar_validation.core.visualization import validation_report
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
+
+        recorded_figs = []
+        original_savefig = PdfPages.savefig
+
+        def recording_savefig(self, *args, **kwargs):
+            fig = args[0] if args else kwargs.get("figure")
+            recorded_figs.append(fig)
+            return original_savefig(self, *args, **kwargs)
+
+        monkeypatch.setattr(PdfPages, "savefig", recording_savefig)
+
+        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        def is_image_page(fig):
+            if fig is None or len(fig.axes) != 1:
+                return False
+            return len(fig.axes[0].images) > 0
+
+        assert any(is_image_page(fig) for fig in recorded_figs), (
+            "Expected the collocation diagnostics plot to be embedded as a "
+            "page in validation_report.pdf"
+        )

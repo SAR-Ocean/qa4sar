@@ -1799,6 +1799,7 @@ def validation_report(
                 plt.close(fig)
 
     # Collocation diagnostics plot — generated once per recipe
+    fig_diag = None
     if base_dir is not None:
         try:
             diag_path = plot_collocation_diagnostics(
@@ -1806,6 +1807,18 @@ def validation_report(
             )
             if diag_path is not None:
                 logger.info("Collocation diagnostics plot saved to %s", diag_path)
+                # Embed the saved PNG as a page in the combined PDF report —
+                # plot_collocation_diagnostics() closes its own figure
+                # internally (it's also called standalone from cli.py), so
+                # the only way to include it in pdf_pages is to reload the
+                # rendered image.
+                diag_img = plt.imread(str(diag_path))
+                img_h, img_w = diag_img.shape[0], diag_img.shape[1]
+                fig_diag = plt.figure(figsize=(img_w / 150, img_h / 150), dpi=150)
+                ax_diag = fig_diag.add_axes([0, 0, 1, 1])
+                ax_diag.imshow(diag_img)
+                ax_diag.axis("off")
+                pdf_pages.append((f"Collocation diagnostics — {recipe.config.name}", fig_diag))
         except Exception as exc:
             logger.warning("plot_collocation_diagnostics failed: %s", exc)
 
@@ -1836,6 +1849,12 @@ def validation_report(
                 pdf.savefig(fig, dpi=150, bbox_inches="tight")
 
         logger.info("PDF report saved to %s", pdf_path)
+
+    # fig_diag isn't in the `figs` list closed earlier (it's created after
+    # that loop), so it stays open until here — close it now that the PDF
+    # write is done and it's no longer needed.
+    if fig_diag is not None:
+        plt.close(fig_diag)
 
     if plots_dir:
         logger.info("PNG plots saved to %s", plots_dir)
