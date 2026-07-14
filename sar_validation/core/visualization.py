@@ -1436,8 +1436,8 @@ def plot_collocation_diagnostics(
                 )
 
     # ── Tier 3 (zorder=5): matched layer data ─────────────────────────────
-    # Colored by source (from _source_style_map), alpha=0.6, drawn before
-    # matched in-situ so in-situ markers are always on top. ──────────────────
+    # Colored by source (from _source_style_map), alpha=1.0 (emphasized),
+    # drawn before matched in-situ so in-situ markers are always on top. ──────
     for cat in categories:
         if cat["label"] != "In-situ":
             m_lon = np.asarray(cat["matched_lon"])
@@ -1447,7 +1447,8 @@ def plot_collocation_diagnostics(
             color, marker = source_style_map.get(str(cat["label"]), ("#2ca02c", "o"))
             ax.scatter(
                 m_lon, m_lat,
-                s=20, c=color, marker=marker, alpha=0.6, edgecolors="none",
+                s=70, c=color, marker=marker, alpha=1.0,
+                edgecolors="black", linewidths=0.7,
                 transform=transform, zorder=5, label=f"{cat['label']} matched ({len(m_lon)})",
             )
 

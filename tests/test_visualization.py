@@ -584,9 +584,9 @@ class TestPlotCollocationDiagnosticsRefinement:
             f"Expected unmatched alpha=0.3, got {unmatched_alphas}"
         )
 
-        # Verify matched layers alpha is 0.6
-        assert 0.6 in matched_layer_alphas or len(matched_layer_alphas) == 0, (
-            f"Expected matched layer alpha=0.6, got {matched_layer_alphas}"
+        # Verify matched layers alpha is 1.0 (emphasized so few matches stay visible)
+        assert 1.0 in matched_layer_alphas or len(matched_layer_alphas) == 0, (
+            f"Expected matched layer alpha=1.0, got {matched_layer_alphas}"
         )
 
         # Verify matched in-situ alpha is 0.7
@@ -600,6 +600,39 @@ class TestPlotCollocationDiagnosticsRefinement:
         # Verify we have distinct markers (not all the same)
         unique_markers = set(all_markers)
         assert len(unique_markers) >= 1, "Expected at least one marker type"
+
+    def test_matched_layer_points_are_emphasized(
+        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
+    ):
+        """Matched layer points (zorder=5) must be drawn bold: black edge,
+        enlarged marker, full opacity — so a few matched points stay visible
+        against the SAR footprints and gray unmatched tracks."""
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+
+        recorded = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded.append(kwargs)
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        out_path = plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe, tmp_path,
+        )
+        plt.close("all")
+
+        assert out_path is not None
+        matched_layer_calls = [c for c in recorded if c.get("zorder") == 5]
+        assert matched_layer_calls, "Expected at least one matched-layer scatter call"
+        for c in matched_layer_calls:
+            assert c.get("edgecolors") == "black"
+            assert c.get("alpha") == 1.0
+            assert c.get("s") == 70
 
     def test_unmatched_layer_points_get_per_source_markers(
         self, geo_datatree_and_collocation_with_unmatched, diagnostics_recipe, tmp_path, monkeypatch
