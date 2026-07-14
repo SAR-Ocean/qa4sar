@@ -903,3 +903,76 @@ class TestValidationReportWindDirectionFilter:
         )
         assert "mooring" in wdir_sources
         assert "mooring" in wspd_sources
+
+
+class TestPlotGeographicSceneFilter:
+    def _two_scene_datatree_and_coll(self):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        y, x = 3, 3
+        lonA, latA = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
+        lonB, latB = np.meshgrid(np.linspace(-6, -4, x), np.linspace(50, 52, y))
+        sarA = xr.Dataset({"owiWindSpeed": (("y", "x"), np.full((y, x), 7.0))},
+                          coords={"lon": (("y", "x"), lonA), "lat": (("y", "x"), latA),
+                                  "time": pd.Timestamp("2026-07-10T19:00:00")})
+        sarB = xr.Dataset({"owiWindSpeed": (("y", "x"), np.full((y, x), 8.0))},
+                          coords={"lon": (("y", "x"), lonB), "lat": (("y", "x"), latB),
+                                  "time": pd.Timestamp("2026-07-10T19:00:00")})
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sarA, "sar/sceneB": sarB})
+        coll = xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", [7.0, 7.1]),
+            "val_WSPD":         ("collocation", [6.9, 7.0]),
+            "val_source":       ("collocation", ["mooring", "mooring"]),
+            "sar_scene_name":   ("collocation", ["sceneA", "sceneA"]),
+            "val_lon":          ("collocation", [-9.5, -9.3]),
+            "val_lat":          ("collocation", [50.5, 50.7]),
+        })
+        return datatree, coll
+
+    def test_scenes_allowlist_renders_only_listed_scenes(self):
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import plot_geographic
+        datatree, coll = self._two_scene_datatree_and_coll()
+
+        fig = plot_geographic(datatree, coll, "owiWindSpeed", "WSPD",
+                              split_by=None, scenes=["sceneA"])
+        titled = [ax.get_title() for ax in fig.axes if ax.get_title()]
+        plt.close("all")
+        assert len(titled) == 1
+        assert "sceneA" in titled[0]
+
+    def test_scenes_none_renders_all_scenes(self):
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import plot_geographic
+        datatree, coll = self._two_scene_datatree_and_coll()
+
+        fig = plot_geographic(datatree, coll, "owiWindSpeed", "WSPD",
+                              split_by=None, scenes=None)
+        titled = [ax.get_title() for ax in fig.axes if ax.get_title()]
+        plt.close("all")
+        assert len(titled) == 2  # both sceneA and sceneB drawn
+
+
+class TestValidationReportSceneAllowlist:
+    def test_passes_matched_scene_allowlist_to_geographic(self, geo_datatree_and_collocation, tmp_path, monkeypatch):
+        """validation_report must derive the geographic scene allowlist from
+        sar_scene_name and pass it through as `scenes`."""
+        import matplotlib.pyplot as plt
+        import sar_validation.core.visualization as viz
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
+
+        captured = {}
+        original = viz.plot_geographic
+
+        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
+            captured["scenes"] = kwargs.get("scenes")
+            return original(datatree_, coll_, sar_var, val_var, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_geographic", spy)
+        viz.validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        assert captured.get("scenes") is not None
+        assert "sceneA" in set(captured["scenes"])

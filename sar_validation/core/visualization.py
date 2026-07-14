@@ -31,7 +31,7 @@ import logging
 import math
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import xarray as xr
@@ -398,6 +398,7 @@ def plot_geographic(
     val_cmap: Optional[str] = None,
     point_size: int = 40,
     split_by: str = "collocation_type",
+    scenes: Optional[Sequence[str]] = None,
     interactive: bool = False,
 ):
     """
@@ -452,6 +453,15 @@ def plot_geographic(
     scene_names = list(sar_node.children.keys())
     if not scene_names:
         raise ValueError("No SAR scenes found in DataTree.")
+
+    # Optional allowlist: keep only SAR scenes that matched validation points
+    # (computed by validation_report as the union across all variable pairs).
+    # An empty/None allowlist means "no filtering" — draw every scene.
+    if scenes:
+        allow = set(scenes)
+        filtered = [s for s in scene_names if s in allow]
+        if filtered:
+            scene_names = filtered
 
     val_col = f"val_{val_var}" if val_var else None
     val_col_present = val_col is not None and val_col in collocation_ds
@@ -1733,6 +1743,15 @@ def validation_report(
     all_figures: Dict[str, list] = {}
     pdf_pages: list = []   # (title, Figure) pairs fed into the PDF
 
+    # Union across all pairs of SAR scenes that matched at least one
+    # validation point — used to drop scenes with no matches from the
+    # geographic plots. collocation_ds holds only matched pairs, so every
+    # scene present here has >= 1 match. None => don't filter.
+    matched_scenes = (
+        sorted(set(str(s) for s in collocation_ds["sar_scene_name"].values))
+        if "sar_scene_name" in collocation_ds else None
+    )
+
     for sar_var, val_var in pairs:
         key = f"{sar_var}_vs_{val_var}"
         figs = []
@@ -1760,7 +1779,7 @@ def validation_report(
 
         # Geographic — returns dict[collocation_type, Figure] by default
         try:
-            geo_result = plot_geographic(datatree, pair_ds, sar_var, val_var)
+            geo_result = plot_geographic(datatree, pair_ds, sar_var, val_var, scenes=matched_scenes)
             if isinstance(geo_result, dict):
                 for group, fig_geo in geo_result.items():
                     if fig_geo is not None:
