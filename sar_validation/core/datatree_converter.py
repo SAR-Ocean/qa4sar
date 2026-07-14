@@ -1172,7 +1172,7 @@ class DataTreeConverter:
         standardised Dataset.
 
         Automatically detects mode by inspecting the SAFE directory name:
-        - If directory name contains "WV": reads RVL point measurements for currents, oswHs for wind/waves
+        - If directory name contains "WV": reads RVL point measurements for currents, oswTotalHs for wind/waves
         - Otherwise: dispatches to extraction based on product_type:
           - "wind" (default): extracts OWI (Ocean Wind Index) grid data
           - "waves": extracts OSW (Ocean Surface Waves) grid data
@@ -1185,13 +1185,13 @@ class DataTreeConverter:
             Path to a ``*.SAFE`` directory.
         product_type : str, optional
             Type of product to extract: "wind" (OWI), "waves" (OSW), or "currents" (RVL).
-            WV mode extracts RVL for currents, oswHs for wind/waves.
+            WV mode extracts RVL for currents, oswTotalHs for wind/waves.
             Default is "wind".
 
         Returns
         -------
         xr.Dataset or None
-            Dataset with oswHs points (WV) or product-specific grids (IW/EW/SM),
+            Dataset with oswTotalHs points (WV) or product-specific grids (IW/EW/SM),
             or None if no suitable data found.
         """
         safe_dir = Path(safe_dir)
@@ -1199,8 +1199,8 @@ class DataTreeConverter:
 
         # Detect mode from SAFE directory name
         if "WV" in safe_name:
-            # WV imagette OCN files carry oswHs AND a 13x13 rvlRadVel grid.
-            # Route currents to RVL extraction; wind/waves keep oswHs.
+            # WV imagette OCN files carry oswTotalHs AND a 13x13 rvlRadVel grid.
+            # Route currents to RVL extraction; wind/waves keep oswTotalHs.
             if product_type.lower() == "currents":
                 return DataTreeConverter._extract_rvl_from_wv_safe(safe_dir)
             return DataTreeConverter.from_sar_l2_ocn_wv_safe(safe_dir)
@@ -1213,11 +1213,13 @@ class DataTreeConverter:
     ) -> Optional[xr.Dataset]:
         """
         Open Wave Mode (WV) data from one Sentinel-1 SAFE directory and extract
-        oswHs (Ocean Surface Wave Height) point measurements.
+        oswTotalHs (integrated total significant wave height) point measurements.
 
         The WV mode produces multiple measurement files (~16 per SAFE product),
-        each containing a 1×1 oswHs point measurement. This method extracts
-        oswHs from all .nc files in the measurement folder and creates a
+        each carrying a 1×1 imagette. This method extracts ``oswTotalHs`` (the
+        integrated total significant wave height, matching the validation
+        ``VHM0``) from every .nc file — falling back to the mean of the valid
+        ``oswHs`` partitions when a product lacks ``oswTotalHs`` — and creates a
         point-geometry Dataset with dimension ``point``.
 
         Each point's time is extracted from the filename timestamp; coordinates
@@ -1249,7 +1251,7 @@ class DataTreeConverter:
             logger.warning("No WV measurement files found in %s", measurement_dir)
             return None
 
-        # Extract oswHs point measurements from all files
+        # Extract oswTotalHs point measurements from all files
         point_lons = []
         point_lats = []
         point_hs = []
@@ -1269,11 +1271,34 @@ class DataTreeConverter:
                 lon = float(ds_raw["oswLon"].values.item())
                 lat = float(ds_raw["oswLat"].values.item())
 
-                # Extract oswHs from first partition
-                hs_val = ds_raw["oswHs"].isel(oswPartitions=0).values.item()
-                hs = float(hs_val) if np.isfinite(hs_val) else np.nan
-                if not osw_attrs:
-                    osw_attrs = {"oswHs": dict(ds_raw["oswHs"].attrs)}
+                # Wave height to validate against VHM0 = the product's
+                # integrated total significant wave height (oswTotalHs), which
+                # combines all wave systems. This is NOT the same as an
+                # individual oswHs partition (oswHs holds one Hs per partition),
+                # and it is not the root-sum-square of the partitions either —
+                # it is integrated from the full spectrum. If a (legacy)
+                # product lacks oswTotalHs, fall back to the mean of the valid
+                # oswHs partitions (dropping the -1/NaN fill codes) rather than
+                # picking a single partition.
+                if "oswTotalHs" in ds_raw:
+                    hs_val = ds_raw["oswTotalHs"].values.item()
+                    hs = float(hs_val) if np.isfinite(hs_val) else np.nan
+                    if not osw_attrs:
+                        osw_attrs = {"oswTotalHs": dict(ds_raw["oswTotalHs"].attrs)}
+                else:
+                    parts = np.asarray(ds_raw["oswHs"].values, dtype=float).ravel()
+                    valid = parts[np.isfinite(parts) & (parts > 0)]
+                    hs = float(valid.mean()) if valid.size else np.nan
+                    if not osw_attrs:
+                        osw_attrs = {"oswTotalHs": {
+                            "long_name": "total significant wave height "
+                                         "(mean of oswHs partitions; oswTotalHs absent)",
+                            "units": ds_raw["oswHs"].attrs.get("units", "m"),
+                        }}
+                    logger.debug(
+                        "oswTotalHs absent in %s; using mean of %d valid oswHs "
+                        "partitions", nc_path.name, valid.size,
+                    )
 
                 # Acquisition time from filename (format: YYYYMMDDtHHMMSS)
                 m = re.search(r"(\d{8}t\d{6})", nc_path.stem, re.IGNORECASE)
@@ -1299,12 +1324,12 @@ class DataTreeConverter:
                 ds_raw.close()
 
         if not point_hs:
-            logger.warning("No valid oswHs data extracted from %s", measurement_dir)
+            logger.warning("No valid oswTotalHs data extracted from %s", measurement_dir)
             return None
 
         # Create Dataset with point dimension
         data_vars = {
-            "oswHs": (["point"], point_hs),
+            "oswTotalHs": (["point"], point_hs),
         }
 
         coords = {
@@ -1320,11 +1345,11 @@ class DataTreeConverter:
         ds.attrs["source"] = "Sentinel-1"
         ds.attrs["safe_dir"] = safe_dir.name
         ds.attrs["swath_mode"] = "WV"
-        ds.attrs["measurement_type"] = "oswHs"
+        ds.attrs["measurement_type"] = "oswTotalHs"
         ds.attrs["num_points"] = len(point_hs)
 
         logger.info(
-            "Extracted %d oswHs points from WV product %s",
+            "Extracted %d oswTotalHs points from WV product %s",
             len(point_hs), safe_dir.name
         )
         return ds
@@ -1672,10 +1697,14 @@ class DataTreeConverter:
             )
 
             owi_nrcs = (
-                ds_raw["owiNrcs"].values[:, :, 0]  # Use first polarisation if 3D
+                ds_raw["owiNrcs"].values
                 if "owiNrcs" in ds_raw
                 else np.full_like(owi_windspeed, np.nan)
             )
+            # owiNrcs is (owiAzSize, owiRaSize, owiPolarisation) — keep the
+            # co-pol channel. Guard the slice so a product that ships a 2-D
+            # owiNrcs does not raise IndexError (which the broad except below
+            # would swallow, silently dropping the entire wind grid).
             if owi_nrcs.ndim == 3:
                 owi_nrcs = owi_nrcs[:, :, 0]
 

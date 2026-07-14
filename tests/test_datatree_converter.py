@@ -879,6 +879,33 @@ class TestIwSafeCurrentsNoOwiFallback:
         assert ds is not None
         assert "owiWindSpeed" in ds.data_vars
 
+    def test_wind_extracts_owi_with_2d_nrcs(self, tmp_path):
+        # A product with a 2-D owiNrcs (no polarisation axis) must not crash the
+        # whole wind extraction. Previously the inline `[:, :, 0]` slice raised
+        # IndexError, which the broad except swallowed → entire grid lost.
+        ny, nx = 5, 4
+        rng = np.random.default_rng(3)
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        ds_raw = xr.Dataset(
+            {
+                "owiWindSpeed": (odims, rng.uniform(2, 15, (ny, nx)).astype("float32")),
+                "owiWindDirection": (odims, rng.uniform(0, 360, (ny, nx)).astype("float32")),
+                "owiLon": (odims, rng.uniform(-20.0, -19.0, (ny, nx)).astype("float32")),
+                "owiLat": (odims, rng.uniform(50.0, 51.0, (ny, nx)).astype("float32")),
+                "owiNrcs": (odims, rng.uniform(-25, -5, (ny, nx)).astype("float32")),
+            },
+            attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
+        )
+        ds_raw.to_netcdf(meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc")
+        ds = DataTreeConverter._from_sar_l2_ocn_iw_safe(safe, product_type="wind")
+        assert ds is not None
+        assert "owiWindSpeed" in ds.data_vars
+        assert ds["owiNrcs"].dims == ("y", "x")
+        assert ds["owiNrcs"].shape == (ny, nx)
+
 
 # ---------------------------------------------------------------------------
 # from_sar_l2_ocn_safe (WV product type routing)
@@ -893,21 +920,58 @@ class TestWvSafeProductTypeRouting:
         assert "rvlRadVel" in ds.data_vars
         assert ds.attrs.get("swath_mode") == "WV"
 
-    def test_wv_waves_still_returns_oswhs(self, tmp_path):
-        # Regression: non-currents WV behavior unchanged. Build a WV SAFE whose
-        # measurement file also carries oswHs so the oswHs path has data.
+    def _make_wv_waves_safe(self, tmp_path, *, osw_hs, osw_total_hs=None):
+        """
+        Build a WV SAFE whose imagette measurement file carries partitioned
+        ``oswHs`` and optionally an integrated ``oswTotalHs``.
+
+        ``osw_hs`` is the per-partition Hs array (dims oswAzSize, oswRaSize,
+        oswPartitions = 1, 1, N); ``-1`` entries mimic the product fill code.
+        """
         safe = tmp_path / "S1A_WV_OCN.SAFE"
         meas = safe / "measurement"
         meas.mkdir(parents=True)
-        rng = np.random.default_rng(1)
-        ds_raw = xr.Dataset(
-            {
-                "oswHs": (("oswPartitions",), rng.uniform(1, 4, 1).astype("float32")),
-                "oswLon": ((), np.float32(-19.5)),
-                "oswLat": ((), np.float32(50.5)),
-            }
+        osw_hs = np.asarray(osw_hs, dtype="float32").reshape(1, 1, -1)
+        data = {
+            "oswHs": (("oswAzSize", "oswRaSize", "oswPartitions"), osw_hs),
+            "oswLon": (("oswAzSize", "oswRaSize"), np.array([[-19.5]], "float32")),
+            "oswLat": (("oswAzSize", "oswRaSize"), np.array([[50.5]], "float32")),
+        }
+        if osw_total_hs is not None:
+            data["oswTotalHs"] = (
+                ("oswAzSize", "oswRaSize"),
+                np.array([[osw_total_hs]], "float32"),
+            )
+        ds_raw = xr.Dataset(data)
+        ds_raw.to_netcdf(
+            meas / "s1a-wv1-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
         )
-        ds_raw.to_netcdf(meas / "s1a-wv1-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc")
+        return safe
+
+    def test_wv_waves_uses_osw_total_hs(self, tmp_path):
+        # WV waves must validate the product's integrated total significant
+        # wave height (oswTotalHs), NOT an individual oswHs partition.
+        safe = self._make_wv_waves_safe(
+            tmp_path,
+            osw_hs=[0.65, 0.78, 0.54, -1.0, -1.0],
+            osw_total_hs=2.85,
+        )
         out = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
         assert out is not None
-        assert "oswHs" in out.data_vars
+        assert "oswTotalHs" in out.data_vars
+        # The stored value is the integrated total, not partition 0 (0.65) or
+        # the partition mean.
+        assert float(out["oswTotalHs"].values[0]) == pytest.approx(2.85, abs=1e-4)
+
+    def test_wv_waves_falls_back_to_partition_mean(self, tmp_path):
+        # No oswTotalHs (legacy product) → fall back to the mean of the valid
+        # partitions (ignoring the -1 fill code), not partition 0.
+        safe = self._make_wv_waves_safe(
+            tmp_path,
+            osw_hs=[0.60, 0.80, 1.00, -1.0, -1.0],
+            osw_total_hs=None,
+        )
+        out = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert out is not None
+        assert "oswTotalHs" in out.data_vars
+        assert float(out["oswTotalHs"].values[0]) == pytest.approx(0.80, abs=1e-4)

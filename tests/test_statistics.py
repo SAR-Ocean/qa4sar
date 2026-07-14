@@ -226,6 +226,9 @@ class TestVariableMap:
 
     def test_waves_pairs(self):
         pairs = infer_variable_pairs("waves")
+        # WV wave validation compares the integrated total significant wave
+        # height (oswTotalHs); the partitioned oswHs remains as a legacy pair.
+        assert ("oswTotalHs", "VHM0") in pairs
         assert ("oswHs", "VHM0") in pairs
 
     def test_unknown_raises(self):

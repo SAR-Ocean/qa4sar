@@ -331,6 +331,27 @@ imagette:
 This radius only affects WV/point-mode SAR; IW/EW grid collocation is
 untouched.
 
+#### WV wave height: `oswTotalHs`, not an `oswHs` partition
+
+The OSW component reports significant wave height two ways: `oswHs`, which
+carries **one Hs per wave partition** (`oswPartitions` axis, `-1` fill for
+unused slots), and `oswTotalHs`, the **integrated total significant wave
+height** of all wave systems combined. Validation compares against the in-situ
+`VHM0` (total significant wave height), so **we extract `oswTotalHs`** — not
+`oswHs`.
+
+Taking a single `oswHs` partition (previously partition 0) picks one wave
+system, which is not the total sea state; in a real imagette the partitions were
+`[0.65, 0.78, 0.54, …]` m while `oswTotalHs` was 2.85 m. Note `oswTotalHs` is
+**not** the root-sum-square of the partitions either — it is integrated from the
+full spectrum, so it cannot be reconstructed from `oswHs`.
+
+When a (legacy) product lacks `oswTotalHs`, we fall back to the **mean of the
+valid `oswHs` partitions** (dropping the `-1`/NaN fill codes) rather than a
+single partition, giving a representative total. This is why the WV waves pair
+in `_variable_map` is `("oswTotalHs", "VHM0")` with `("oswHs", "VHM0")` kept only
+as a legacy fallback.
+
 ### 5.6 Smaller collocation choices
 
 - **Missing-reading forward-fill:** if an in-situ observation has a NaN for

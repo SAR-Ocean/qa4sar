@@ -36,7 +36,8 @@ VARIABLE_PAIRS: dict[str, List[Tuple[str, str]]] = {
         ("rvlRadVel", "rvlRadVel_projection"),  # RVL radial velocity (scalar) vs projected validation currents
     ],
     "waves": [
-        ("oswHs",                       "VHM0"),  # WV mode point measurement (1×1)
+        ("oswTotalHs",                  "VHM0"),  # WV mode: integrated total significant wave height
+        ("oswHs",                       "VHM0"),  # WV mode partition Hs (legacy fallback)
         ("owiHs",    "VHM0"),  # IW/EW mode OWI grid (fallback)
     ],
 }
@@ -93,7 +94,8 @@ def filter_variable_pairs(
 
     For "waves" variable type, this function:
     1. Detects which wave validation parameters are available (VHM0, VAVH, VGHS, etc.)
-    2. For WV mode: generates pairs with oswHs only
+    2. For WV mode: generates pairs with oswTotalHs (integrated total significant
+       wave height), falling back to the legacy oswHs partition variable
     3. For IW/EW mode: generates pairs for both oswHs and owiSignificantWaveHeight
     4. Filters to only pairs where both SAR and validation variables exist
 
@@ -124,8 +126,10 @@ def filter_variable_pairs(
         
         # Determine which SAR variables to use based on swath mode
         if is_wv_only:
-            # WV mode: only use oswHs
-            sar_vars = ["oswHs"]
+            # WV mode: prefer the integrated total significant wave height;
+            # fall back to the legacy oswHs partition variable. The filter
+            # below keeps only whichever is actually present.
+            sar_vars = ["oswTotalHs", "oswHs"]
         else:
             # IW/EW or mixed mode: prefer oswHs if available, but also try owiSignificantWaveHeight
             sar_vars = ["oswHs", "owiSignificantWaveHeight"]
