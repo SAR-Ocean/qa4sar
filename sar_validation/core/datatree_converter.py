@@ -1199,6 +1199,10 @@ class DataTreeConverter:
 
         # Detect mode from SAFE directory name
         if "WV" in safe_name:
+            # WV imagette OCN files carry oswHs AND a 13x13 rvlRadVel grid.
+            # Route currents to RVL extraction; wind/waves keep oswHs.
+            if product_type.lower() == "currents":
+                return DataTreeConverter._extract_rvl_from_wv_safe(safe_dir)
             return DataTreeConverter.from_sar_l2_ocn_wv_safe(safe_dir)
         else:
             return DataTreeConverter._from_sar_l2_ocn_iw_safe(safe_dir, product_type=product_type)

@@ -878,3 +878,36 @@ class TestIwSafeCurrentsNoOwiFallback:
         ds = DataTreeConverter._from_sar_l2_ocn_iw_safe(safe, product_type="wind")
         assert ds is not None
         assert "owiWindSpeed" in ds.data_vars
+
+
+# ---------------------------------------------------------------------------
+# from_sar_l2_ocn_safe (WV product type routing)
+# ---------------------------------------------------------------------------
+
+class TestWvSafeProductTypeRouting:
+    def test_wv_currents_returns_rvl_points(self, tmp_path):
+        safe = _make_ocn_safe(tmp_path, "S1A_WV_OCN.SAFE", rvl_swaths=1, wv=True, with_owi=False)
+        ds = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="currents")
+        assert ds is not None
+        assert "point" in ds.dims
+        assert "rvlRadVel" in ds.data_vars
+        assert ds.attrs.get("swath_mode") == "WV"
+
+    def test_wv_waves_still_returns_oswhs(self, tmp_path):
+        # Regression: non-currents WV behavior unchanged. Build a WV SAFE whose
+        # measurement file also carries oswHs so the oswHs path has data.
+        safe = tmp_path / "S1A_WV_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        rng = np.random.default_rng(1)
+        ds_raw = xr.Dataset(
+            {
+                "oswHs": (("oswPartitions",), rng.uniform(1, 4, 1).astype("float32")),
+                "oswLon": ((), np.float32(-19.5)),
+                "oswLat": ((), np.float32(50.5)),
+            }
+        )
+        ds_raw.to_netcdf(meas / "s1a-wv1-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc")
+        out = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert out is not None
+        assert "oswHs" in out.data_vars
