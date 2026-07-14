@@ -975,3 +975,66 @@ class TestWvSafeProductTypeRouting:
         assert out is not None
         assert "oswTotalHs" in out.data_vars
         assert float(out["oswTotalHs"].values[0]) == pytest.approx(0.80, abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# from_hf_radar_grid
+# ---------------------------------------------------------------------------
+
+def _make_hfr_grid_nc(tmp_path, n_time=2, n_lat=3, n_lon=4):
+    """Write a minimal NOAA HFRnet-shaped gridded RTV NetCDF (time, lat, lon)."""
+    rng = np.random.default_rng(7)
+    times = pd.date_range("2024-05-01T00:00:00", periods=n_time, freq="1h").values
+    lats = np.linspace(33.0, 38.0, n_lat)
+    lons = np.linspace(-125.0, -119.0, n_lon)
+    shape = (n_time, n_lat, n_lon)
+    ds = xr.Dataset(
+        {
+            "water_u": (("time", "lat", "lon"), rng.uniform(-0.6, 0.6, shape),
+                        {"standard_name": "surface_eastward_sea_water_velocity",
+                         "units": "m s-1"}),
+            "water_v": (("time", "lat", "lon"), rng.uniform(-0.6, 0.6, shape),
+                        {"standard_name": "surface_northward_sea_water_velocity",
+                         "units": "m s-1"}),
+            "DOPx": (("time", "lat", "lon"), rng.uniform(0, 2, shape)),
+            "DOPy": (("time", "lat", "lon"), rng.uniform(0, 2, shape)),
+            "number_of_radials": (("time", "lat", "lon"),
+                                  rng.integers(1, 8, shape).astype(float)),
+            "number_of_sites": (("time", "lat", "lon"),
+                                rng.integers(1, 4, shape).astype(float)),
+        },
+        coords={"time": times, "lat": lats, "lon": lons},
+        attrs={"title": "NOAA HFRnet RTV", "institution": "UCSD/NOAA"},
+    )
+    path = tmp_path / "ucsdHfrW6_6km_2024-05-01.nc"
+    ds.to_netcdf(path)
+    return path
+
+
+class TestFromHfRadarGrid:
+    def test_renames_uv_to_ewct_nsct(self, tmp_path):
+        ds = DataTreeConverter.from_hf_radar_grid(_make_hfr_grid_nc(tmp_path))
+        assert ds is not None
+        assert "EWCT" in ds and "NSCT" in ds
+        assert "water_u" not in ds and "water_v" not in ds
+
+    def test_point_dimension_flattened(self, tmp_path):
+        ds = DataTreeConverter.from_hf_radar_grid(_make_hfr_grid_nc(tmp_path, 2, 3, 4))
+        assert "point" in ds.dims
+        assert ds.sizes["point"] == 2 * 3 * 4
+        for c in ("lon", "lat", "time"):
+            assert c in ds.coords
+
+    def test_data_type_and_platform_tags(self, tmp_path):
+        ds = DataTreeConverter.from_hf_radar_grid(_make_hfr_grid_nc(tmp_path))
+        assert ds.attrs["data_type"] == "hf_radar_grid"
+        assert ds.attrs["platform_type"] == "radar"
+
+    def test_retains_ancillary_uncertainty_fields(self, tmp_path):
+        ds = DataTreeConverter.from_hf_radar_grid(_make_hfr_grid_nc(tmp_path))
+        assert "hfr_gdop" in ds        # derived from DOPx/DOPy
+        assert "hfr_n_radials" in ds
+        assert "hfr_n_sites" in ds
+
+    def test_returns_none_for_missing_file(self, tmp_path):
+        assert DataTreeConverter.from_hf_radar_grid(tmp_path / "nope.nc") is None

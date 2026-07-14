@@ -793,6 +793,124 @@ class DataTreeConverter:
         raw.close()
         return ds
 
+    @staticmethod
+    def from_hf_radar_grid(
+        nc_path: Union[str, Path],
+    ) -> Optional[xr.Dataset]:
+        """
+        Open a NOAA HFRnet gridded RTV NetCDF (dims ``time, lat, lon``; vars
+        ``water_u``/``water_v``) and return a standardised point-frame Dataset
+        tagged ``data_type="hf_radar_grid"``.
+
+        The regular grid is flattened to a ``point`` dimension (one point per
+        cell per time) so it collocates through the ``layer_vs_layer`` path,
+        exactly like the scatterometer converter. ``water_u``/``water_v`` are
+        renamed to canonical ``EWCT``/``NSCT``. Ancillary uncertainty/QC fields
+        are *retained but not used* (design §3.7): ``DOPx``/``DOPy`` are
+        combined into ``hfr_gdop`` (geometric dilution of precision) and the
+        radial/site counts are kept as ``hfr_n_radials``/``hfr_n_sites`` so the
+        deferred correction/QC phase can filter on them.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="hf_radar_grid"``, or None on failure.
+        """
+        nc_path = Path(nc_path)
+        if not nc_path.exists():
+            logger.warning("NetCDF not found: %s", nc_path)
+            return None
+        try:
+            raw = xr.open_dataset(nc_path)
+        except Exception as exc:
+            logger.warning("Could not open %s: %s", nc_path, exc)
+            return None
+
+        # Resolve coordinate names (HFRnet uses lat/lon; tolerate latitude/longitude).
+        lat_name = next((n for n in ("lat", "latitude", "LAT") if n in raw.coords or n in raw), None)
+        lon_name = next((n for n in ("lon", "longitude", "LON") if n in raw.coords or n in raw), None)
+        time_name = next((n for n in ("time", "Time", "TIME") if n in raw.coords or n in raw), None)
+        if not (lat_name and lon_name and "water_u" in raw and "water_v" in raw):
+            logger.warning(
+                "from_hf_radar_grid: %s missing lat/lon or water_u/water_v (have %s)",
+                nc_path.name, list(raw.coords) + list(raw.data_vars),
+            )
+            raw.close()
+            return None
+
+        lats = np.asarray(raw[lat_name].values, dtype=float)
+        lons = np.asarray(raw[lon_name].values, dtype=float)
+        if time_name is not None:
+            times = pd.to_datetime(raw[time_name].values)
+        else:
+            times = pd.to_datetime([np.datetime64("NaT")])
+
+        n_t, n_la, n_lo = len(times), len(lats), len(lons)
+
+        # Broadcast (time, lat, lon) → flat point vectors.
+        tt, la, lo = np.meshgrid(np.arange(n_t), lats, lons, indexing="ij")
+        time_flat = np.repeat(times.values, n_la * n_lo)
+        lat_flat = la.ravel()
+        lon_flat = ((lo.ravel() + 180.0) % 360.0) - 180.0  # normalise to −180..180
+
+        def _flat(varname):
+            return np.asarray(raw[varname].values, dtype=float).reshape(n_t, n_la, n_lo).ravel()
+
+        ewct = _flat("water_u")
+        nsct = _flat("water_v")
+
+        data_vars: Dict[str, tuple] = {
+            "EWCT": ("point", ewct),
+            "NSCT": ("point", nsct),
+        }
+        var_attrs: Dict[str, Dict] = {
+            "EWCT": dict(raw["water_u"].attrs),
+            "NSCT": dict(raw["water_v"].attrs),
+        }
+
+        # --- Retained ancillary fields (not used in Phase 3a; design §3.7) ---
+        if "DOPx" in raw and "DOPy" in raw:
+            dopx, dopy = _flat("DOPx"), _flat("DOPy")
+            data_vars["hfr_gdop"] = ("point", np.sqrt(dopx ** 2 + dopy ** 2))
+            var_attrs["hfr_gdop"] = {
+                "long_name": "geometric dilution of precision (sqrt(DOPx^2+DOPy^2))",
+                "comment": "Retained for a future HF-radar QC/uncertainty filter.",
+            }
+        for src, dst in (("number_of_radials", "hfr_n_radials"),
+                         ("number_of_sites", "hfr_n_sites")):
+            if src in raw:
+                data_vars[dst] = ("point", _flat(src))
+                var_attrs[dst] = {"long_name": src.replace("_", " "),
+                                  "comment": "Retained for a future HF-radar QC filter."}
+
+        # Drop points where both current components are NaN (masked land/gaps).
+        valid = np.isfinite(ewct) | np.isfinite(nsct)
+        if not np.any(valid):
+            logger.warning("from_hf_radar_grid: all cells NaN in %s.", nc_path.name)
+            raw.close()
+            return None
+
+        ds = xr.Dataset(
+            {k: ("point", v[valid]) for k, (_, v) in data_vars.items()},
+            coords={
+                "lon": ("point", lon_flat[valid]),
+                "lat": ("point", lat_flat[valid]),
+                "time": ("point", time_flat[valid]),
+            },
+        )
+        for gattr in ("title", "institution"):
+            if raw.attrs.get(gattr):
+                ds.attrs[gattr] = str(raw.attrs[gattr])
+        apply_cf_metadata(ds, "hf_radar", var_attrs)
+
+        ds.attrs["data_type"]     = "hf_radar_grid"
+        ds.attrs["platform_type"] = "radar"
+        ds.attrs["source"]        = "NOAA HFRnet RTV"
+        ds.attrs["filename"]      = nc_path.name
+
+        raw.close()
+        return ds
+
     #: Radiometer wind-speed variables in order of preference. RSS AMSR2 L3
     #: carries Low-Frequency (LF, 10.7 GHz), Medium-Frequency (MF, 18.7 GHz)
     #: and All-Weather (AW) winds. LF is the standard all-purpose 10 m wind and

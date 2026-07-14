@@ -41,6 +41,7 @@ PRODUCT_REFERENCES: Dict[str, str] = {
         "WAVE_GLO_PHY_SWH_L3_NRT_014_001/services"
     ),
     "radiometer": "https://www.remss.com/missions/amsr/",
+    "hf_radar": "https://hfradar.ioos.us/",
     "sar": "https://s1.pages.eopf.copernicus.eu/s1-l12-rp/main/pfs/index.html",
     "insitu": (
         "https://data.marine.copernicus.eu/product/"
