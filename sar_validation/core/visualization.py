@@ -172,6 +172,50 @@ def _land_coastline_features(scale: str = "10m"):
     return land, coastline
 
 
+def _set_lonlat_ticks(ax, gl):
+    """Cheap plain-matplotlib degree-labeled ticks for a PlateCarree
+    GeoAxes — replaces cartopy's gridliner label placement
+    (``draw_labels=True``), whose curved-projection label-positioning
+    logic is expensive to recompute across many subplots. Only valid for
+    rectangular projections (PlateCarree/Mercator), which is all this
+    module uses. Note: cartopy's GeoAxes ships with axis visibility disabled
+    by default (ax.xaxis.get_visible() == False), so we must re-enable it
+    for the formatted ticks to be rendered to canvas.
+
+    ``gl`` is the Gridliner returned by the ``ax.gridlines(...)`` call that
+    drew the (unlabeled) grid lines for this axes. Grid *lines* are placed by
+    the gridliner's own locator, which is independent of matplotlib's default
+    tick auto-locator — for most extents they happen to coincide, but they
+    can diverge (different degree spacing), which would misalign the labels
+    against the grid lines they're meant to describe. To guarantee labels and
+    grid lines never drift apart, we read the gridliner's own locator-chosen
+    tick values and apply them explicitly instead of trusting matplotlib's
+    independent auto-locator. This is an eager computation — it depends on
+    ``ax.get_xlim()``/``ax.get_ylim()`` already reflecting the final data
+    extent — so callers must invoke this only after the axes' data (and thus
+    autoscale/extent) is finalized.
+
+    ``tick_params(length=0)`` suppresses the small perpendicular tick marks
+    that ``set_visible(True)`` would otherwise re-enable on the whole Axis
+    artist; the original gridliner-only rendering never drew those, so this
+    keeps pixel parity with the pre-fix appearance (labels only, no marks)."""
+    from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter  # noqa: PLC0415
+    import cartopy.crs as ccrs  # noqa: PLC0415
+
+    ax.xaxis.set_major_formatter(LongitudeFormatter())
+    ax.yaxis.set_major_formatter(LatitudeFormatter())
+    ax.xaxis.set_visible(True)
+    ax.yaxis.set_visible(True)
+    ax.tick_params(axis="both", which="both", length=0)
+
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    xticks = [x for x in gl.xlocator.tick_values(*xlim) if xlim[0] <= x <= xlim[1]]
+    yticks = [y for y in gl.ylocator.tick_values(*ylim) if ylim[0] <= y <= ylim[1]]
+    ax.set_xticks(xticks, crs=ccrs.PlateCarree())
+    ax.set_yticks(yticks, crs=ccrs.PlateCarree())
+
+
 def _sar_field(scene_ds, sar_var: str) -> Optional[np.ndarray]:
     """
     Return the (y, x) array for *sar_var* in *scene_ds*, or None if absent.
@@ -611,9 +655,7 @@ def plot_geographic(
                 land, coastline = _land_coastline_features()
                 ax.add_feature(land, facecolor="lightgray", zorder=0, rasterized=True)
                 ax.add_feature(coastline, linewidth=0.5, zorder=0, rasterized=True)
-                gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
-                gl.top_labels = False
-                gl.right_labels = False
+                gl = ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
                 transform = ccrs.PlateCarree()
             else:
                 transform = None
@@ -741,6 +783,12 @@ def plot_geographic(
             ax.set_title(
                 f"{scene_name.split('/')[-1]}  ({n_dedup} obs)", fontsize=8
             )
+            if HAS_CARTOPY:
+                # Deferred until now (rather than right after ax.gridlines above):
+                # this reads the finalized data extent via ax.get_xlim()/get_ylim(),
+                # which only reflects this scene's plotted data after the
+                # pcolormesh/scatter calls above have run their autoscale.
+                _set_lonlat_ticks(ax, gl)
 
         # Hide unused axes
         for idx in range(len(scene_names), nrows * ncols):
@@ -1378,13 +1426,12 @@ def plot_collocation_diagnostics(
     land, coastline = _land_coastline_features()
     ax.add_feature(land, facecolor="lightgray", alpha=0.3, zorder=0)
     ax.add_feature(coastline, linewidth=0.5, zorder=0)
-    gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
-    gl.top_labels = False
-    gl.right_labels = False
+    gl = ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
 
     # ── Set plot extent to the recipe's geographic bounds ────────────────
     ax.set_extent([bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat],
                   crs=ccrs.PlateCarree())
+    _set_lonlat_ticks(ax, gl)
 
     # ── SAR coverage (zorder=1): Grid scenes → bounding box; sparse WV
     # imagettes → one footprint circle each (radius = the collocation footprint
@@ -1698,6 +1745,39 @@ def _extract_validation_data_for_plot(datatree):
 # 5. Validation report (convenience wrapper)
 # ---------------------------------------------------------------------------
 
+
+def _image_page_figure(img, dpi: int = 150):
+    """Build a throwaway Figure that exactly fills its canvas with *img* —
+    used to embed an already-rendered PNG as a PDF page without drawing
+    the original (often much more expensive, e.g. cartopy) figure a
+    second time."""
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    img_h, img_w = img.shape[0], img.shape[1]
+    fig = plt.figure(figsize=(img_w / dpi, img_h / dpi), dpi=dpi)
+    ax = fig.add_axes((0, 0, 1, 1))
+    ax.imshow(img)
+    ax.axis("off")
+    return fig
+
+
+def _finalize_figure_for_report(fig, png_path: Optional[Path], dpi: int = 150):
+    """Render *fig* to PNG exactly once, optionally save it to *png_path*,
+    close *fig*, and return a lightweight image-only Figure for embedding
+    as a PDF page. Avoids drawing the same (often expensive) figure a
+    second time via ``PdfPages.savefig``."""
+    import io
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    if png_path is not None:
+        png_path.write_bytes(buf.getvalue())
+    buf.seek(0)
+    return _image_page_figure(plt.imread(buf, format="png"), dpi=dpi)
+
+
 def validation_report(
     collocation_ds,
     datatree,
@@ -1787,11 +1867,12 @@ def validation_report(
         fig_scatter = plot_scatter(pair_ds, sar_var, val_var)
         if fig_scatter is not None:
             figs.append(fig_scatter)
-            pdf_pages.append((f"{sar_var} vs {val_var} — scatter", fig_scatter))
+            title = f"{sar_var} vs {val_var} — scatter"
             if plots_dir:
-                fig_scatter.savefig(
-                    plots_dir / f"{key}{filename_suffix}_scatter.png", dpi=150, bbox_inches="tight"
-                )
+                png_path = plots_dir / f"{key}{filename_suffix}_scatter.png"
+                pdf_pages.append((title, _finalize_figure_for_report(fig_scatter, png_path)))
+            else:
+                pdf_pages.append((title, fig_scatter))
 
         # Geographic — returns dict[collocation_type, Figure] by default
         try:
@@ -1800,22 +1881,21 @@ def validation_report(
                 for group, fig_geo in geo_result.items():
                     if fig_geo is not None:
                         figs.append(fig_geo)
-                        pdf_pages.append(
-                            (f"{sar_var} vs {val_var} — geographic [{group}]", fig_geo)
-                        )
+                        title = f"{sar_var} vs {val_var} — geographic [{group}]"
                         if plots_dir:
                             safe_group = str(group).replace("/", "-")
-                            fig_geo.savefig(
-                                plots_dir / f"{key}{filename_suffix}_geographic_{safe_group}.png",
-                                dpi=150, bbox_inches="tight",
-                            )
+                            png_path = plots_dir / f"{key}{filename_suffix}_geographic_{safe_group}.png"
+                            pdf_pages.append((title, _finalize_figure_for_report(fig_geo, png_path)))
+                        else:
+                            pdf_pages.append((title, fig_geo))
             elif geo_result is not None:
                 figs.append(geo_result)
-                pdf_pages.append((f"{sar_var} vs {val_var} — geographic", geo_result))
+                title = f"{sar_var} vs {val_var} — geographic"
                 if plots_dir:
-                    geo_result.savefig(
-                        plots_dir / f"{key}{filename_suffix}_geographic.png", dpi=150, bbox_inches="tight"
-                    )
+                    png_path = plots_dir / f"{key}{filename_suffix}_geographic.png"
+                    pdf_pages.append((title, _finalize_figure_for_report(geo_result, png_path)))
+                else:
+                    pdf_pages.append((title, geo_result))
         except Exception as exc:
             logger.warning("plot_geographic failed for %s: %s", sar_var, exc)
 
@@ -1824,21 +1904,23 @@ def validation_report(
             fig_stats = plot_statistics(stats_ds_map[key])
             if fig_stats is not None:
                 figs.append(fig_stats)
-                pdf_pages.append((f"{sar_var} vs {val_var} — statistics", fig_stats))
+                title = f"{sar_var} vs {val_var} — statistics"
                 if plots_dir:
-                    fig_stats.savefig(
-                        plots_dir / f"{key}{filename_suffix}_statistics.png", dpi=150, bbox_inches="tight"
-                    )
+                    png_path = plots_dir / f"{key}{filename_suffix}_statistics.png"
+                    pdf_pages.append((title, _finalize_figure_for_report(fig_stats, png_path)))
+                else:
+                    pdf_pages.append((title, fig_stats))
 
         # Residuals
         fig_res = plot_residuals(pair_ds, sar_var, val_var)
         if fig_res is not None:
             figs.append(fig_res)
-            pdf_pages.append((f"{sar_var} vs {val_var} — residuals", fig_res))
+            title = f"{sar_var} vs {val_var} — residuals"
             if plots_dir:
-                fig_res.savefig(
-                    plots_dir / f"{key}{filename_suffix}_residuals.png", dpi=150, bbox_inches="tight"
-                )
+                png_path = plots_dir / f"{key}{filename_suffix}_residuals.png"
+                pdf_pages.append((title, _finalize_figure_for_report(fig_res, png_path)))
+            else:
+                pdf_pages.append((title, fig_res))
 
         # Scatter colored by temporal offset — same SAR-vs-validation
         # comparison as above, but colored by how far apart in time each
@@ -1846,36 +1928,38 @@ def validation_report(
         fig_scatter_offset = plot_scatter(pair_ds, sar_var, val_var, color_by="temporal_offset")
         if fig_scatter_offset is not None:
             figs.append(fig_scatter_offset)
-            pdf_pages.append((f"{sar_var} vs {val_var} — scatter (colored by temporal offset)", fig_scatter_offset))
+            title = f"{sar_var} vs {val_var} — scatter (colored by temporal offset)"
             if plots_dir:
-                fig_scatter_offset.savefig(
-                    plots_dir / f"{key}{filename_suffix}_scatter_by_offset.png", dpi=150, bbox_inches="tight"
-                )
+                png_path = plots_dir / f"{key}{filename_suffix}_scatter_by_offset.png"
+                pdf_pages.append((title, _finalize_figure_for_report(fig_scatter_offset, png_path)))
+            else:
+                pdf_pages.append((title, fig_scatter_offset))
 
         # Temporal offset vs. residual magnitude
         fig_offset = plot_temporal_offset(pair_ds, sar_var, val_var)
         if fig_offset is not None:
             figs.append(fig_offset)
-            pdf_pages.append((f"{sar_var} vs {val_var} — residual vs. temporal offset", fig_offset))
+            title = f"{sar_var} vs {val_var} — residual vs. temporal offset"
             if plots_dir:
-                fig_offset.savefig(
-                    plots_dir / f"{key}{filename_suffix}_temporal_offset.png", dpi=150, bbox_inches="tight"
-                )
+                png_path = plots_dir / f"{key}{filename_suffix}_temporal_offset.png"
+                pdf_pages.append((title, _finalize_figure_for_report(fig_offset, png_path)))
+            else:
+                pdf_pages.append((title, fig_offset))
 
         all_figures[key] = figs
 
-        # Each figure is already saved to PNG and queued in pdf_pages (which
-        # holds a direct reference, still usable by PdfPages.savefig after
-        # plt.close). Closing here just deregisters them from pyplot's
-        # global figure manager so they don't accumulate across pairs and
-        # across the two collocation-method passes triggered by
-        # --layer-vs-layer-collocation-method both.
+        # When plots_dir is set (base_dir is not None), each fig here was
+        # already closed inside _finalize_figure_for_report. pdf_pages holds
+        # separate lightweight image-page figures, not these same objects — so
+        # this loop is a safe, idempotent no-op double-close. Closing here
+        # deregisters them from pyplot's global figure manager to avoid
+        # accumulating figures across pairs and across the two
+        # collocation-method passes triggered by --layer-vs-layer-collocation-method both.
         if base_dir is not None:
             for fig in figs:
                 plt.close(fig)
 
     # Collocation diagnostics plot — generated once per recipe
-    fig_diag = None
     if base_dir is not None:
         try:
             diag_path = plot_collocation_diagnostics(
@@ -1889,15 +1973,13 @@ def validation_report(
                 # the only way to include it in pdf_pages is to reload the
                 # rendered image.
                 diag_img = plt.imread(str(diag_path))
-                img_h, img_w = diag_img.shape[0], diag_img.shape[1]
-                fig_diag = plt.figure(figsize=(img_w / 150, img_h / 150), dpi=150)
-                ax_diag = fig_diag.add_axes([0, 0, 1, 1])
-                ax_diag.imshow(diag_img)
-                ax_diag.axis("off")
                 # Lead the report body with the diagnostics overview (the
                 # cover page is written separately, so index 0 here becomes
                 # the first page after the cover).
-                pdf_pages.insert(0, (f"Collocation diagnostics — {recipe.config.name}", fig_diag))
+                pdf_pages.insert(
+                    0,
+                    (f"Collocation diagnostics — {recipe.config.name}", _image_page_figure(diag_img)),
+                )
         except Exception as exc:
             logger.warning("plot_collocation_diagnostics failed: %s", exc)
 
@@ -1926,14 +2008,9 @@ def validation_report(
 
             for _title, fig in pdf_pages:
                 pdf.savefig(fig, dpi=150, bbox_inches="tight")
+                plt.close(fig)
 
         logger.info("PDF report saved to %s", pdf_path)
-
-    # fig_diag isn't in the `figs` list closed earlier (it's created after
-    # that loop), so it stays open until here — close it now that the PDF
-    # write is done and it's no longer needed.
-    if fig_diag is not None:
-        plt.close(fig_diag)
 
     if plots_dir:
         logger.info("PNG plots saved to %s", plots_dir)

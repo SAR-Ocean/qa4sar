@@ -381,6 +381,84 @@ class TestPlotGeographic:
         assert len(set(source_markers)) == 2
 
 
+class TestPlotGeographicTicks:
+    def test_subplots_get_degree_formatted_ticks(self, geo_datatree_and_collocation):
+        """Regression test for the gridliner -> plain-tick swap: subplots
+        must still show degree-labeled lon/lat ticks, just without
+        gridliner's expensive label-placement machinery."""
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        # This fixture has no "collocation_type" field, so split_by=None
+        # (matching TestPlotGeographic's existing convention) makes
+        # plot_geographic return a single Figure rather than a dict.
+        fig = plot_geographic(
+            datatree, collocation_ds, "owiWindSpeed", "WSPD", split_by=None,
+        )
+        fig.canvas.draw()
+        ax = fig.axes[0]
+
+        xlabels = [t.get_text() for t in ax.get_xticklabels()]
+        ylabels = [t.get_text() for t in ax.get_yticklabels()]
+        assert any("°" in lbl for lbl in xlabels), xlabels
+        assert any("°" in lbl for lbl in ylabels), ylabels
+        # Regression test: axis visibility must be enabled so ticks are actually
+        # rendered to canvas. Without this, get_xticklabels() returns the Tick
+        # objects and their text content, but nothing is drawn (the axis is
+        # invisible), so the PNG appears with blank margins.
+        assert ax.xaxis.get_visible() is True, "x-axis must be visible"
+        assert ax.yaxis.get_visible() is True, "y-axis must be visible"
+        plt.close("all")
+
+    def test_set_lonlat_ticks_aligns_with_gridliner_locator(self):
+        """Regression test for tick-label alignment: _set_lonlat_ticks must
+        read tick positions from the gridliner's own locator to guarantee
+        labels and grid lines never diverge."""
+        import matplotlib.pyplot as plt
+        import cartopy.crs as ccrs
+        from sar_validation.core.visualization import _set_lonlat_ticks
+
+        # Create a GeoAxes with PlateCarree projection
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection=ccrs.PlateCarree())
+
+        # Plot dummy data so axes have a real extent
+        lon = np.linspace(-10.0, -8.0, 5)
+        lat = np.linspace(50.0, 52.0, 5)
+        lon2d, lat2d = np.meshgrid(lon, lat)
+        data = np.linspace(5.0, 12.0, 25).reshape(5, 5)
+        ax.pcolormesh(lon2d, lat2d, data, transform=ccrs.PlateCarree())
+
+        # Get gridliner and call _set_lonlat_ticks
+        gl = ax.gridlines(draw_labels=False, alpha=0.3)
+        _set_lonlat_ticks(ax, gl)
+
+        # After calling _set_lonlat_ticks, verify that the axis tick positions
+        # match the gridliner's locator (filtered to within axis limits)
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        expected_xticks = np.array([x for x in gl.xlocator.tick_values(*xlim)
+                                     if xlim[0] <= x <= xlim[1]])
+        expected_yticks = np.array([y for y in gl.ylocator.tick_values(*ylim)
+                                     if ylim[0] <= y <= ylim[1]])
+
+        actual_xticks = np.array(ax.get_xticks())
+        actual_yticks = np.array(ax.get_yticks())
+
+        # Filter to only ticks within limits (same logic as _set_lonlat_ticks)
+        actual_xticks = actual_xticks[(xlim[0] <= actual_xticks) & (actual_xticks <= xlim[1])]
+        actual_yticks = actual_yticks[(ylim[0] <= actual_yticks) & (actual_yticks <= ylim[1])]
+
+        # Assert alignment with reasonable tolerance for floating point
+        np.testing.assert_allclose(actual_xticks, expected_xticks, atol=1e-10,
+                                    err_msg="X-ticks don't match gridliner locator values")
+        np.testing.assert_allclose(actual_yticks, expected_yticks, atol=1e-10,
+                                    err_msg="Y-ticks don't match gridliner locator values")
+
+        plt.close("all")
+
+
 @pytest.fixture
 def geo_datatree_and_collocation_with_unmatched():
     """Synthetic DataTree + collocation_ds with both matched and unmatched
@@ -809,6 +887,52 @@ class TestPlotCollocationDiagnosticsRefinement:
         assert "In-situ matched: buoy (1)" in insitu_labels
 
 
+class TestPlotCollocationDiagnosticsTicks:
+    def test_overview_plot_gets_degree_formatted_ticks(
+        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path
+    ):
+        import matplotlib.pyplot as plt
+        import matplotlib.image as mpimg
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        out_path = plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe, tmp_path,
+        )
+        plt.close("all")
+
+        assert out_path is not None
+        # plot_collocation_diagnostics saves its own PNG and closes its
+        # figure internally, so we can only verify the rendered image
+        # exists and is non-trivial in size (a proxy for "axes labels were
+        # drawn"), not inspect live tick-label Text objects.
+        img = mpimg.imread(str(out_path))
+        assert img.shape[0] > 100 and img.shape[1] > 100
+
+    def test_overview_plot_calls_set_lonlat_ticks(
+        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
+    ):
+        import matplotlib.pyplot as plt
+        import sar_validation.core.visualization as viz
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+
+        calls = []
+        original = viz._set_lonlat_ticks
+
+        def spy(ax, gl):
+            calls.append(ax)
+            return original(ax, gl)
+
+        monkeypatch.setattr(viz, "_set_lonlat_ticks", spy)
+        viz.plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe, tmp_path,
+        )
+        plt.close("all")
+
+        assert len(calls) == 1
+
+
 class TestValidationReport:
     def test_includes_temporal_offset_plots(self, geo_datatree_and_collocation, tmp_path):
         import matplotlib.pyplot as plt
@@ -915,6 +1039,26 @@ class TestValidationReportIncludesDiagnostics:
             f"Diagnostics page should be first after the cover (index 1), "
             f"got first image page at index {image_indices[0]}"
         )
+
+
+class TestValidationReportClosesPageFigures:
+    def test_no_figures_left_open_after_report(self, geo_datatree_and_collocation, tmp_path):
+        """Regression guard for the render-once refactor: the new
+        lightweight PDF-page figures (built by _finalize_figure_for_report /
+        _image_page_figure) must be closed once written, not leaked —
+        unlike the original heavy figures, they aren't tracked in
+        `all_figures` / `figs`, so nothing else closes them."""
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import validation_report
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recipe = Recipe(config=RecipeConfig(name="test", variable="wind"))
+
+        plt.close("all")
+        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        assert plt.get_fignums() == []
 
 
 class TestDropNonDirectionalSources:
@@ -1113,3 +1257,56 @@ class TestValidationReportSceneAllowlist:
 
         assert captured.get("scenes") is not None
         assert "sceneA" in set(captured["scenes"])
+
+
+class TestImagePageFigure:
+    def test_figure_size_matches_image_pixel_dimensions(self):
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import _image_page_figure
+
+        img = np.zeros((300, 450, 3), dtype=np.uint8)
+        fig = _image_page_figure(img, dpi=150)
+
+        w_in, h_in = fig.get_size_inches()
+        assert w_in == pytest.approx(450 / 150)
+        assert h_in == pytest.approx(300 / 150)
+        plt.close(fig)
+
+
+class TestFinalizeFigureForReport:
+    def test_writes_png_closes_original_returns_image_page(self, tmp_path):
+        import matplotlib.pyplot as plt
+        import matplotlib._pylab_helpers as pylab_helpers
+        from sar_validation.core.visualization import _finalize_figure_for_report
+
+        fig, ax = plt.subplots()
+        ax.plot([0, 1], [0, 1])
+        png_path = tmp_path / "out.png"
+
+        page_fig = _finalize_figure_for_report(fig, png_path)
+
+        assert png_path.exists()
+        assert png_path.stat().st_size > 0
+        # Check object identity against pyplot's live figure registry, not
+        # `fig.number` — matplotlib recycles figure numbers after `close()`,
+        # so a freshly created page figure can legitimately reuse the
+        # original's number; that would make an `fignum_exists()`-based
+        # check pass even if `fig` were never actually closed.
+        open_figs = [m.canvas.figure for m in pylab_helpers.Gcf.figs.values()]
+        assert fig not in open_figs, "original figure should be closed"
+        assert page_fig is not fig
+        plt.close(page_fig)
+
+    def test_none_png_path_skips_disk_write(self, tmp_path):
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import _finalize_figure_for_report
+
+        fig, ax = plt.subplots()
+        ax.plot([0, 1], [0, 1])
+
+        page_fig = _finalize_figure_for_report(fig, None)
+
+        assert page_fig is not None
+        assert list(tmp_path.iterdir()) == []
+        plt.close(page_fig)
