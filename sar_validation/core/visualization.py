@@ -35,6 +35,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import xarray as xr
+from scipy import ndimage
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +215,21 @@ def _set_lonlat_ticks(ax, gl):
     yticks = [y for y in gl.ylocator.tick_values(*ylim) if ylim[0] <= y <= ylim[1]]
     ax.set_xticks(xticks, crs=ccrs.PlateCarree())
     ax.set_yticks(yticks, crs=ccrs.PlateCarree())
+
+
+def _fill_nan_nearest(a: np.ndarray) -> np.ndarray:
+    """
+    Fill NaN cells in a 2D array with the value of their nearest finite cell.
+
+    Used to repair geolocation (lon/lat) grids before ``pcolormesh``, which
+    rejects non-finite coordinates outright; S1 OCN products commonly carry
+    NaN lon/lat at swath-edge/invalid-retrieval cells.
+    """
+    invalid = ~np.isfinite(a)
+    if not invalid.any():
+        return a
+    idx = ndimage.distance_transform_edt(invalid, return_distances=False, return_indices=True)
+    return a[tuple(idx)]
 
 
 def _sar_field(scene_ds, sar_var: str) -> Optional[np.ndarray]:
@@ -672,9 +688,19 @@ def plot_geographic(
                         zorder=3, rasterized=True, **kw,
                     )
                 else:
-                    # Gridded data (e.g., IW/EW mode) — use pcolormesh
+                    # Gridded data (e.g., IW/EW mode) — use pcolormesh.
+                    # pcolormesh rejects non-finite x/y, so repair NaN
+                    # geolocation cells (common at swath edges) via
+                    # nearest-neighbour fill and mask the corresponding data.
+                    lon2d = scene_ds["lon"].values
+                    lat2d = scene_ds["lat"].values
+                    invalid_xy = ~(np.isfinite(lon2d) & np.isfinite(lat2d))
+                    if invalid_xy.any():
+                        arr = np.where(invalid_xy, np.nan, arr)
+                        lon2d = _fill_nan_nearest(lon2d)
+                        lat2d = _fill_nan_nearest(lat2d)
                     ax.pcolormesh(
-                        scene_ds["lon"].values, scene_ds["lat"].values, arr,
+                        lon2d, lat2d, np.ma.masked_invalid(arr),
                         cmap=cmap, norm=sar_norm, shading="auto", zorder=2,
                         rasterized=True, **kw,
                     )

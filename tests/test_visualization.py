@@ -380,6 +380,38 @@ class TestPlotGeographic:
         source_markers = [m for m in recorded_markers if m is not None]
         assert len(set(source_markers)) == 2
 
+    def test_gridded_scene_with_nan_geolocation_does_not_raise(
+        self, geo_datatree_and_collocation,
+    ):
+        """Regression test: S1 OCN products commonly carry NaN lon/lat at
+        swath-edge cells. pcolormesh rejects non-finite x/y outright, so
+        plot_geographic must repair the coordinate grid rather than crash."""
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        scene_ds = datatree["sar/sceneA"].to_dataset()
+        lon2d = scene_ds["lon"].values.copy()
+        lat2d = scene_ds["lat"].values.copy()
+        lon2d[0, -1] = np.nan
+        lat2d[0, -1] = np.nan
+        scene_ds = scene_ds.assign_coords(
+            lon=(("y", "x"), lon2d), lat=(("y", "x"), lat2d),
+        )
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": scene_ds,
+            "validation/mooring": datatree["validation/mooring"].to_dataset(),
+            "validation/altimeter": datatree["validation/altimeter"].to_dataset(),
+        })
+
+        fig = plot_geographic(
+            datatree, collocation_ds, "owiWindSpeed", "WSPD", split_by=None,
+        )
+        plt.close("all")
+
+        assert fig is not None
+
 
 class TestPlotGeographicTicks:
     def test_subplots_get_degree_formatted_ticks(self, geo_datatree_and_collocation):

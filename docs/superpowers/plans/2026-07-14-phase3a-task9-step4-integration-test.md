@@ -2,7 +2,10 @@
 
 **Parent Plan:** `docs/superpowers/plans/2026-07-14-phase3a-noaa-hfradar-currents.md` (Task 9, Step 4)
 
-**Status:** Deferred after technical implementation complete (steps 1–3, 5 ✅).
+**Status:** ✅ COMPLETE (2026-07-15). See `docs/runs/2026-07-14-phase3a-integration.md` for the
+run findings. The originally-noted prerequisite S1 data was over the Skagerrak/North Sea
+(outside NOAA HFRnet coverage); a fresh US East/Gulf-coast download was used instead via
+`recipes/currents_useastcoast.yaml`.
 
 **Goal:** Validate the full collocation pipeline with real NOAA HFRnet + Sentinel-1 L2 OCN currents data, confirming that:
 - Collocated pairs are produced over the HF-radar/SAR geographic overlap
@@ -29,7 +32,7 @@
 
 ### Step 1: Prepare the test environment
 
-- [ ] Ensure HFRnet and S1 data are in place:
+- [x] Ensure HFRnet and S1 data are in place:
   ```bash
   ls -la /tmp/hfr_run/hfr_noaa/ucsdHfrW6_6km_2026-07-10.nc
   ls -la /tmp/hfr_run/S1_L2_OCN/S1C_IW_OCN*
@@ -69,24 +72,24 @@ collocation:
       distance_weighting: equal
 ```
 
-- [ ] Create recipe file at `tests/recipes/test_currents_integration.yaml` or a temporary location.
+- [x] Create recipe file at `tests/recipes/test_currents_integration.yaml` or a temporary location.
 
 ### Step 3: Run the collocation pipeline
 
-- [ ] Execute the full pipeline on the test data:
+- [x] Execute the full pipeline on the test data:
   ```bash
   python -m sar_validation.orchestrator --base-dir /tmp/hfr_run --recipe <path_to_recipe>
   ```
   Or use the project's standard `sar-validate` CLI entrypoint if available.
 
-- [ ] Expected output structure:
+- [x] Expected output structure:
   - `collocation/` directory with collocated datasets (NetCDF or Parquet)
   - `statistics/` directory with comparison metrics
   - `plots/` directory with scatter plots and geographic maps
 
 ### Step 4: Verify collocations and projections
 
-- [ ] Check the collocation output for `hfr_noaa` pairs:
+- [x] Check the collocation output for `hfr_noaa` pairs:
   ```python
   import xarray as xr
   ds = xr.open_dataset("<output>/collocation_hfr_noaa.nc")
@@ -99,17 +102,17 @@ collocation:
 
 ### Step 5: Inspect visualizations
 
-- [ ] Open the generated plots:
+- [x] Open the generated plots:
   - Scatter plot: `rvlRadVel` (x-axis) vs `rvlRadVel_projection` (y-axis)
   - Geographic map: collocated points overlaid on the HF-radar grid extent
 
-- [ ] Expected observations:
+- [x] Expected observations:
   - Points cluster around but with substantial scatter (r < 0.5 expected per Martin et al. 2022)
   - Geographic coverage shows overlap over the US-West coast region
 
 ### Step 6: Document findings
 
-- [ ] Create or update a run notes file (`docs/runs/2026-07-14-phase3a-integration.md`) with:
+- [x] Create or update a run notes file (`docs/runs/2026-07-14-phase3a-integration.md`) with:
   - Date/time of run
   - Data sources used (S1 acquisition date, HFR date range)
   - Number of collocated pairs
@@ -117,16 +120,16 @@ collocation:
   - Key observation: **raw agreement is weak (expected)** because WASV/instrument corrections are deferred to a later phase; this is the expected Phase 3a outcome, not a bug
   - Reference: Martin, Gommenginger, Jacob & Staneva (2022), RSE 268:112758
 
-- [ ] If successful, optionally add the run notes to the PR description.
+- [x] If successful, optionally add the run notes to the PR description.
 
 ---
 
 ## Success Criteria
 
-- [ ] Collocation produces ≥1 pair (ideally 100+) over the HF-radar/SAR geographic overlap
-- [ ] `rvlRadVel_projection` is present in output
-- [ ] Scatter plot and geographic map are generated without errors
-- [ ] Documentation notes expected weak correlation as a Phase 3a limitation, not a failure
+- [x] Collocation produces ≥1 pair (ideally 100+) over the HF-radar/SAR geographic overlap
+- [x] `rvlRadVel_projection` is present in output
+- [x] Scatter plot and geographic map are generated without errors
+- [x] Documentation notes expected weak correlation as a Phase 3a limitation, not a failure
 
 ---
 
