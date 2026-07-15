@@ -52,18 +52,22 @@ __all__ = [
 # colours). Deliberately avoids mid-gray shades (e.g. tab10's "#7f7f7f") —
 # plot_collocation_diagnostics uses gray (#808080) to mean "unmatched", so a
 # source landing on a near-gray palette entry would be visually
-# indistinguishable from unmatched points of that same source.
+# indistinguishable from unmatched points of that same source. Must have at
+# least as many entries as _canonical_source_order() returns (currently 10):
+# a shorter palette wraps and silently reassigns two unrelated sources (e.g.
+# tidal_gauge landing back on altimeter's blue circle) — see the "matched
+# tidal gauge and altimeter look identical" bug this comment documents.
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#17becf",
-    "#bcbd22",
+    "#bcbd22", "#000000",
 ]
 
 # Marker shapes paired 1:1 with _SOURCE_COLORS by index, used wherever
 # validation sources need to stay identifiable independently of color (e.g.
 # when color is taken by a continuous value like wind speed or temporal
 # offset instead of by source).
-_SOURCE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h"]
+_SOURCE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "p"]
 
 
 # ---------------------------------------------------------------------------

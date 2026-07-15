@@ -320,12 +320,28 @@ class TestSourceStyleMap:
         assert len(set(colors)) == 4
         assert len(set(markers)) == 4
 
+    def test_every_canonical_source_gets_a_distinct_style(self):
+        # Regression test: the palette must have at least as many entries as
+        # there are canonical source names, otherwise it wraps and two
+        # unrelated sources silently collide (e.g. tidal_gauge landing on
+        # altimeter's blue circle because the palette was one entry short).
+        from sar_validation.core.visualization import (
+            _source_style_map, _canonical_source_order,
+        )
+        canonical = _canonical_source_order()
+        style = _source_style_map(canonical)
+        pairs = [style[name] for name in canonical]
+        assert len(set(pairs)) == len(canonical), (
+            f"Expected every canonical source to get a distinct (color, marker) "
+            f"pair, got collisions: {pairs}"
+        )
+
     def test_unknown_source_does_not_crash(self):
-        # With exactly 9 canonical sources and a 9-entry palette, an unknown
-        # source's index (9) wraps to the same palette slot as canonical
-        # index 0 ("altimeter") — this is the same "cycles if more sources
-        # than colours" behavior _SOURCE_COLORS already documents, not a
-        # bug, so this only asserts "present, no crash," not "visually
+        # With exactly 10 canonical sources and a 10-entry palette, an
+        # unknown source's index (10) wraps to the same palette slot as
+        # canonical index 0 ("altimeter") — this is the same "cycles if more
+        # sources than colours" behavior _SOURCE_COLORS already documents,
+        # not a bug, so this only asserts "present, no crash," not "visually
         # distinct from every canonical source."
         from sar_validation.core.visualization import _source_style_map
         style = _source_style_map(["altimeter", "some_future_sensor"])
