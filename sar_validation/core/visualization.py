@@ -1948,12 +1948,13 @@ def validation_report(
 
         all_figures[key] = figs
 
-        # Each figure is already saved to PNG and queued in pdf_pages (which
-        # holds a direct reference, still usable by PdfPages.savefig after
-        # plt.close). Closing here just deregisters them from pyplot's
-        # global figure manager so they don't accumulate across pairs and
-        # across the two collocation-method passes triggered by
-        # --layer-vs-layer-collocation-method both.
+        # When plots_dir is set (base_dir is not None), each fig here was
+        # already closed inside _finalize_figure_for_report. pdf_pages holds
+        # separate lightweight image-page figures, not these same objects — so
+        # this loop is a safe, idempotent no-op double-close. Closing here
+        # deregisters them from pyplot's global figure manager to avoid
+        # accumulating figures across pairs and across the two
+        # collocation-method passes triggered by --layer-vs-layer-collocation-method both.
         if base_dir is not None:
             for fig in figs:
                 plt.close(fig)

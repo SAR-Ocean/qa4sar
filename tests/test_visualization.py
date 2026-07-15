@@ -411,6 +411,53 @@ class TestPlotGeographicTicks:
         assert ax.yaxis.get_visible() is True, "y-axis must be visible"
         plt.close("all")
 
+    def test_set_lonlat_ticks_aligns_with_gridliner_locator(self):
+        """Regression test for tick-label alignment: _set_lonlat_ticks must
+        read tick positions from the gridliner's own locator to guarantee
+        labels and grid lines never diverge."""
+        import matplotlib.pyplot as plt
+        import cartopy.crs as ccrs
+        from sar_validation.core.visualization import _set_lonlat_ticks
+
+        # Create a GeoAxes with PlateCarree projection
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection=ccrs.PlateCarree())
+
+        # Plot dummy data so axes have a real extent
+        lon = np.linspace(-10.0, -8.0, 5)
+        lat = np.linspace(50.0, 52.0, 5)
+        lon2d, lat2d = np.meshgrid(lon, lat)
+        data = np.linspace(5.0, 12.0, 25).reshape(5, 5)
+        ax.pcolormesh(lon2d, lat2d, data, transform=ccrs.PlateCarree())
+
+        # Get gridliner and call _set_lonlat_ticks
+        gl = ax.gridlines(draw_labels=False, alpha=0.3)
+        _set_lonlat_ticks(ax, gl)
+
+        # After calling _set_lonlat_ticks, verify that the axis tick positions
+        # match the gridliner's locator (filtered to within axis limits)
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        expected_xticks = np.array([x for x in gl.xlocator.tick_values(*xlim)
+                                     if xlim[0] <= x <= xlim[1]])
+        expected_yticks = np.array([y for y in gl.ylocator.tick_values(*ylim)
+                                     if ylim[0] <= y <= ylim[1]])
+
+        actual_xticks = np.array(ax.get_xticks())
+        actual_yticks = np.array(ax.get_yticks())
+
+        # Filter to only ticks within limits (same logic as _set_lonlat_ticks)
+        actual_xticks = actual_xticks[(xlim[0] <= actual_xticks) & (actual_xticks <= xlim[1])]
+        actual_yticks = actual_yticks[(ylim[0] <= actual_yticks) & (actual_yticks <= ylim[1])]
+
+        # Assert alignment with reasonable tolerance for floating point
+        np.testing.assert_allclose(actual_xticks, expected_xticks, atol=1e-10,
+                                    err_msg="X-ticks don't match gridliner locator values")
+        np.testing.assert_allclose(actual_yticks, expected_yticks, atol=1e-10,
+                                    err_msg="Y-ticks don't match gridliner locator values")
+
+        plt.close("all")
+
 
 @pytest.fixture
 def geo_datatree_and_collocation_with_unmatched():
