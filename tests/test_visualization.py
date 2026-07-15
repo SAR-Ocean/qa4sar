@@ -403,6 +403,12 @@ class TestPlotGeographicTicks:
         ylabels = [t.get_text() for t in ax.get_yticklabels()]
         assert any("°" in lbl for lbl in xlabels), xlabels
         assert any("°" in lbl for lbl in ylabels), ylabels
+        # Regression test: axis visibility must be enabled so ticks are actually
+        # rendered to canvas. Without this, get_xticklabels() returns the Tick
+        # objects and their text content, but nothing is drawn (the axis is
+        # invisible), so the PNG appears with blank margins.
+        assert ax.xaxis.get_visible() is True, "x-axis must be visible"
+        assert ax.yaxis.get_visible() is True, "y-axis must be visible"
         plt.close("all")
 
 

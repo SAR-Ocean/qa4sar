@@ -178,11 +178,15 @@ def _set_lonlat_ticks(ax):
     (``draw_labels=True``), whose curved-projection label-positioning
     logic is expensive to recompute across many subplots. Only valid for
     rectangular projections (PlateCarree/Mercator), which is all this
-    module uses."""
+    module uses. Note: cartopy's GeoAxes ships with axis visibility disabled
+    by default (ax.xaxis.get_visible() == False), so we must re-enable it
+    for the formatted ticks to be rendered to canvas."""
     from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter  # noqa: PLC0415
 
     ax.xaxis.set_major_formatter(LongitudeFormatter())
     ax.yaxis.set_major_formatter(LatitudeFormatter())
+    ax.xaxis.set_visible(True)
+    ax.yaxis.set_visible(True)
 
 
 def _sar_field(scene_ds, sar_var: str) -> Optional[np.ndarray]:
