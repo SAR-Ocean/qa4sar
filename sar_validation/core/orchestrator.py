@@ -106,8 +106,8 @@ class DataOrchestrator:
         if insitu_sources:
             source_types = [s.source_type for s in insitu_sources]
             # Use the most permissive depth window across all in-situ sources
-            min_depth = min(s.min_depth for s in insitu_sources)
-            max_depth = max(s.max_depth for s in insitu_sources)
+            min_depth = min(s.resolved_min_depth for s in insitu_sources)
+            max_depth = max(s.resolved_max_depth for s in insitu_sources)
             if not self._download_insitu(source_types, min_depth, max_depth):
                 ok = False
 
@@ -256,8 +256,8 @@ class DataOrchestrator:
             dl = HFRadarDownloader(
                 output_dir=out_dir,
                 dry_run=self.dry_run,
-                min_depth=source.min_depth,
-                max_depth=source.max_depth,
+                min_depth=source.resolved_min_depth,
+                max_depth=source.resolved_max_depth,
             )
             dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,

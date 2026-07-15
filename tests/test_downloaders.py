@@ -569,3 +569,110 @@ class TestOrchestratorHFRadarNOAAWiring:
 
         _, kwargs = mock_cls.call_args
         assert kwargs["resolution_km"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for DataOrchestrator depth resolution (optional min_depth/max_depth)
+# ---------------------------------------------------------------------------
+
+class TestOrchestratorDepthResolution:
+    def test_hf_radar_dispatch_uses_default_depth_when_unspecified(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(
+            name="test-hf-radar-depth-default",
+            variable="currents",
+            output_dir=str(tmp_path),
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        source = ValidationDataSource(source_type="hf_radar")
+
+        with patch(
+            "sar_validation.downloaders.hf_radar_downloader.HFRadarDownloader"
+        ) as mock_cls:
+            mock_cls.return_value.download.return_value = None
+            orchestrator._download_hf_radar(source)
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["min_depth"] == -20.0
+        assert kwargs["max_depth"] == 20.0
+
+    def test_hf_radar_dispatch_honours_explicit_depth(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(
+            name="test-hf-radar-depth-explicit",
+            variable="currents",
+            output_dir=str(tmp_path),
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        source = ValidationDataSource(source_type="hf_radar", min_depth=-2.0, max_depth=2.0)
+
+        with patch(
+            "sar_validation.downloaders.hf_radar_downloader.HFRadarDownloader"
+        ) as mock_cls:
+            mock_cls.return_value.download.return_value = None
+            orchestrator._download_hf_radar(source)
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["min_depth"] == -2.0
+        assert kwargs["max_depth"] == 2.0
+
+    def test_insitu_batch_uses_default_depth_when_all_unspecified(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(
+            name="test-insitu-depth-default",
+            variable="wind",
+            output_dir=str(tmp_path),
+            validation_sources=[
+                ValidationDataSource(source_type="mooring"),
+                ValidationDataSource(source_type="buoy"),
+            ],
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+
+        with patch(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader"
+        ) as mock_cls, patch(
+            "sar_validation.downloaders.sar_downloader.SARDownloader"
+        ) as mock_sar_cls:
+            mock_cls.return_value.download.return_value = None
+            mock_sar_cls.return_value.download.return_value = []
+            orchestrator.download_all()
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["min_depth"] == -20.0
+        assert kwargs["max_depth"] == 20.0
+
+    def test_insitu_batch_widens_window_around_explicit_override(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(
+            name="test-insitu-depth-mixed",
+            variable="wind",
+            output_dir=str(tmp_path),
+            validation_sources=[
+                ValidationDataSource(source_type="mooring", min_depth=-5.0, max_depth=5.0),
+                ValidationDataSource(source_type="buoy"),  # unspecified -> -20/20
+            ],
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+
+        with patch(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader"
+        ) as mock_cls, patch(
+            "sar_validation.downloaders.sar_downloader.SARDownloader"
+        ) as mock_sar_cls:
+            mock_cls.return_value.download.return_value = None
+            mock_sar_cls.return_value.download.return_value = []
+            orchestrator.download_all()
+
+        _, kwargs = mock_cls.call_args
+        # most permissive window across resolved depths: min(-5,-20)=-20, max(5,20)=20
+        assert kwargs["min_depth"] == -20.0
+        assert kwargs["max_depth"] == 20.0
