@@ -430,6 +430,79 @@ def geo_datatree_and_collocation_with_unmatched():
 
 
 @pytest.fixture
+def geo_datatree_and_collocation_mixed_layer_counts():
+    """Synthetic DataTree + collocation_ds where every layer/in-situ source
+    has a distinct matched-point count (scatterometer=5, radiometer=3,
+    altimeter=1, mooring=2, buoy=1) — used to verify
+    plot_collocation_diagnostics draws denser sources before sparser ones."""
+    from sar_validation.core.datatree_converter import DataTreeConverter
+
+    y, x = 4, 5
+    lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+    wind = np.linspace(5.0, 12.0, y * x).reshape(y, x)
+    sar_ds = xr.Dataset(
+        {"owiWindSpeed": (("y", "x"), wind)},
+        coords={
+            "lon": (("y", "x"), lon2d),
+            "lat": (("y", "x"), lat2d),
+            "time": pd.Timestamp("2026-07-10T19:00:00"),
+        },
+    )
+
+    def _point_ds(n, lon0, lat0, platform_type):
+        return xr.Dataset(
+            {"WSPD": ("point", np.linspace(6.0, 10.0, n))},
+            coords={
+                "lon": ("point", lon0 + 0.05 * np.arange(n)),
+                "lat": ("point", lat0 + 0.05 * np.arange(n)),
+                "time": ("point", pd.date_range("2026-07-10T19:05", periods=n, freq="5min")),
+            },
+            attrs={"platform_type": platform_type},
+        )
+
+    scatt_ds = _point_ds(5, -9.8, 50.2, "scatterometer")
+    radio_ds = _point_ds(3, -9.6, 50.6, "radiometer")
+    alt_ds = _point_ds(1, -9.4, 51.0, "altimeter")
+    mooring_ds = _point_ds(2, -9.2, 51.4, "mooring")
+    buoy_ds = _point_ds(1, -9.0, 51.8, "buoy")
+
+    datatree = DataTreeConverter.to_datatree({
+        "sar/sceneA": sar_ds,
+        "validation/scatterometer": scatt_ds,
+        "validation/radiometer": radio_ds,
+        "validation/altimeter": alt_ds,
+        "validation/mooring": mooring_ds,
+        "validation/buoy": buoy_ds,
+    })
+
+    def _matched_block(ds, source_label):
+        n = ds.sizes["point"]
+        return {
+            "sar_owiWindSpeed": np.full(n, 7.0),
+            "val_WSPD": ds["WSPD"].values,
+            "val_source": np.array([source_label] * n),
+            "sar_scene_name": np.array(["sceneA"] * n),
+            "val_lon": ds["lon"].values,
+            "val_lat": ds["lat"].values,
+            "temporal_distance_minutes": np.full(n, 10.0),
+        }
+
+    blocks = [
+        _matched_block(scatt_ds, "scatterometer"),
+        _matched_block(radio_ds, "radiometer"),
+        _matched_block(alt_ds, "altimeter"),
+        _matched_block(mooring_ds, "mooring"),
+        _matched_block(buoy_ds, "buoy"),
+    ]
+    merged = {
+        key: np.concatenate([block[key] for block in blocks])
+        for key in blocks[0]
+    }
+    collocation_ds = xr.Dataset({k: ("collocation", v) for k, v in merged.items()})
+    return datatree, collocation_ds
+
+
+@pytest.fixture
 def diagnostics_recipe():
     from sar_validation.core.recipe import (
         GeographicBounds, Recipe, RecipeConfig, ValidationDataSource,
@@ -589,9 +662,9 @@ class TestPlotCollocationDiagnosticsRefinement:
             f"Expected matched layer alpha=1.0, got {matched_layer_alphas}"
         )
 
-        # Verify matched in-situ alpha is 0.7
-        assert 0.7 in matched_insitu_alphas or len(matched_insitu_alphas) == 0, (
-            f"Expected matched in-situ alpha=0.7, got {matched_insitu_alphas}"
+        # Verify matched in-situ alpha is 1.0 (opaque, matching matched layers)
+        assert 1.0 in matched_insitu_alphas or len(matched_insitu_alphas) == 0, (
+            f"Expected matched in-situ alpha=1.0, got {matched_insitu_alphas}"
         )
 
         # Verify per-source markers are used (not all None)
@@ -604,9 +677,10 @@ class TestPlotCollocationDiagnosticsRefinement:
     def test_matched_layer_points_are_emphasized(
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
     ):
-        """Matched layer points (zorder=5) must be drawn bold: black edge,
-        enlarged marker, full opacity — so a few matched points stay visible
-        against the SAR footprints and gray unmatched tracks."""
+        """Matched layer points (zorder=5) must be drawn bold: full opacity,
+        no marker edge, same marker size as matched in-situ points (s=25)
+        — so a few matched points stay visible against the SAR footprints
+        and gray unmatched tracks, without visually outsizing in-situ."""
         import matplotlib.pyplot as plt
         import matplotlib.axes
         from sar_validation.core.visualization import plot_collocation_diagnostics
@@ -630,9 +704,9 @@ class TestPlotCollocationDiagnosticsRefinement:
         matched_layer_calls = [c for c in recorded if c.get("zorder") == 5]
         assert matched_layer_calls, "Expected at least one matched-layer scatter call"
         for c in matched_layer_calls:
-            assert c.get("edgecolors") == "black"
+            assert c.get("edgecolors") == "none"
             assert c.get("alpha") == 1.0
-            assert c.get("s") == 70
+            assert c.get("s") == 25
 
     def test_unmatched_layer_points_get_per_source_markers(
         self, geo_datatree_and_collocation_with_unmatched, diagnostics_recipe, tmp_path, monkeypatch
@@ -670,6 +744,53 @@ class TestPlotCollocationDiagnosticsRefinement:
         markers_used = [call.get("marker") for call in unmatched_layer_calls]
         unique_markers = set(m for m in markers_used if m is not None)
         assert len(unique_markers) > 0, "Expected per-source markers on unmatched layer points"
+
+    def test_matched_sources_drawn_in_descending_matched_count_order(
+        self, geo_datatree_and_collocation_mixed_layer_counts, diagnostics_recipe, tmp_path, monkeypatch
+    ):
+        """Denser sources (more matched points) must be drawn before sparser
+        ones within each tier, so a sparse instrument (e.g. altimeter) ends
+        up layered on top of a dense one (e.g. scatterometer) instead of
+        being buried underneath it."""
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation_mixed_layer_counts
+
+        recorded = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded.append(kwargs)
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        out_path = plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe, tmp_path,
+        )
+        plt.close("all")
+
+        assert out_path is not None
+
+        # Tier 3 (zorder=5): matched layer data, one call per category.
+        # scatterometer=5, radiometer=3, altimeter=1 matched points.
+        layer_calls = [c for c in recorded if c.get("zorder") == 5]
+        drawn_order = [c["label"].split(" matched")[0] for c in layer_calls]
+        assert drawn_order == ["Scatterometer", "Radiometer", "Altimeter"], (
+            f"Expected layer categories drawn most-matched-first, got {drawn_order}"
+        )
+
+        # Tier 4 (zorder=6): matched in-situ data, one call per sub-source.
+        # mooring=2, buoy=1 matched points.
+        insitu_calls = [c for c in recorded if c.get("zorder") == 6]
+        insitu_order = [c["label"].split(": ")[1].split(" (")[0] for c in insitu_calls]
+        assert insitu_order == ["mooring", "buoy"], (
+            f"Expected in-situ sub-sources drawn most-matched-first, got {insitu_order}"
+        )
+        insitu_labels = [c["label"] for c in insitu_calls]
+        assert "In-situ matched: mooring (2)" in insitu_labels
+        assert "In-situ matched: buoy (1)" in insitu_labels
 
 
 class TestValidationReport:

@@ -13,10 +13,9 @@ The toolbox is structured around 6 sequential steps that together form a complet
 
 ```
 Step 0 — Create recipe (.yaml)
-          │  define validation variable (wind / currents / waves)
+          │  define validation variable (wind / currents / waves) --> selects the validation data sources
           │  define geographic bounds (min/max lon/lat)
           │  define temporal bounds (start/end dates)
-          │  select validation data sources
           ▼
 Step 1 — Download data
           │  download SAR L2_OCN + all validation sources
@@ -24,13 +23,14 @@ Step 1 — Download data
           ▼
 Step 2 — Convert to xarray.DataTree
           │  standardize all formats
-          │  filter to recipe geographic/temporal bounds
+          │  filter to recipe geographic/temporal bounds +/- tolerances
           │  handle different grids / resolutions
           ▼
 Step 3 — Collocation
-          │  point vs. point    (mooring / buoy / drifter / ferrybox vs. waves)
+          │  point vs. point    (mooring / buoy / drifter / ferrybox / tidal gauge vs. SAR wave parameter)
           │  point vs. layer    (mooring / buoy / drifter / ferrybox / tidal gauge vs. SAR)
           │  layer vs. layer    (scatterometer / altimeter / radiometer / HF-radar vs. SAR)
+          |  create a collocation diagnostics plot
           ▼
 Step 4 — Store collocated pairs
           │  keep only overlapping data
@@ -43,7 +43,7 @@ Step 5a — Compute statistics
 Step 5b — Generate visualisation & report
           │  scatter plots, geographic maps
           │  statistics charts, residuals
-          │  PDF report
+          │  PDF validation report
 ```
 
 Steps 2–5 are dataset-agnostic: they work the same regardless of which validation sources were

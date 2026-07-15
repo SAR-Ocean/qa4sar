@@ -1100,11 +1100,10 @@ def plot_collocation_diagnostics(
       temporal pre-filter the real matcher applies. Points that were never
       temporally eligible are omitted rather than cluttering the plot with
       "unmatched" observations that failed for a time reason, not a spatial
-      one; the omitted count per category is reported in the title.
+      one; the omitted count per category is reported in the log line.
     - Matched validation observations (colored dots, drawn last so a matched
       point from one category is never hidden underneath an unmatched point
-      from another category)
-    - Statistics in title (total, matched, unmatched counts per category)
+      from another category); per-source matched counts appear in the legend
     - Plot extent set to the recipe's geographic bounds
 
     Always generated as part of the collocation step, including when there
@@ -1313,14 +1312,12 @@ def plot_collocation_diagnostics(
     unmatched_by_category: Dict[str, Tuple[List[float], List[float], List[str]]] = {
         label: ([], [], []) for label in matched_by_category
     }
-    excluded_by_time: Dict[str, int] = {}
     for lon, lat, ptype, ptime in zip(all_val_lons, all_val_lats, platform_types_arr, all_val_times):
         label = str(ptype).title() if ptype in LAYER_DATA_TYPES else "In-situ"
         if (round(lon, 6), round(lat, 6)) in matched_lookup.get(label, set()):
             continue
         tol_minutes = _time_tolerance_minutes(label, ptype)
         if not _time_eligible(ptime, tol_minutes):
-            excluded_by_time[label] = excluded_by_time.get(label, 0) + 1
             continue
         lon_lats_srcs = unmatched_by_category.setdefault(label, ([], [], []))
         lon_lats_srcs[0].append(lon)
@@ -1466,24 +1463,35 @@ def plot_collocation_diagnostics(
 
     # ── Tier 3 (zorder=5): matched layer data ─────────────────────────────
     # Colored by source (from _source_style_map), alpha=1.0 (emphasized),
-    # drawn before matched in-situ so in-situ markers are always on top. ──────
-    for cat in categories:
-        if cat["label"] != "In-situ":
-            m_lon = np.asarray(cat["matched_lon"])
-            m_lat = np.asarray(cat["matched_lat"])
-            if len(m_lon) == 0:
-                continue
-            color, marker = source_style_map.get(str(cat["label"]), ("#2ca02c", "o"))
-            ax.scatter(
-                m_lon, m_lat,
-                s=70, c=color, marker=marker, alpha=1.0,
-                edgecolors="black", linewidths=0.7,
-                transform=transform, zorder=5, label=f"{cat['label']} matched ({len(m_lon)})",
-            )
+    # drawn before matched in-situ so in-situ markers are always on top. No
+    # marker edge, matching the (visually edgeless) in-situ markers below.
+    # Categories are drawn in descending order of matched-point count, so a
+    # sparser source (e.g. altimeter) ends up layered on top of a denser one
+    # (e.g. scatterometer) instead of being buried underneath it. ──────────
+    layer_categories_by_count = sorted(
+        (cat for cat in categories if cat["label"] != "In-situ"),
+        key=lambda c: len(c["matched_lon"]),
+        reverse=True,
+    )
+    for cat in layer_categories_by_count:
+        m_lon = np.asarray(cat["matched_lon"])
+        m_lat = np.asarray(cat["matched_lat"])
+        if len(m_lon) == 0:
+            continue
+        color, marker = source_style_map.get(str(cat["label"]), ("#2ca02c", "o"))
+        ax.scatter(
+            m_lon, m_lat,
+            s=25, c=color, marker=marker, alpha=1.0,
+            edgecolors="none",
+            transform=transform, zorder=5, label=f"{cat['label']} matched ({len(m_lon)})",
+        )
 
     # ── Tier 4 (zorder=6): matched in-situ data ───────────────────────────
-    # Colored by sub-source type (mooring/buoy/drifter/…), alpha=0.7,
-    # drawn last so in-situ markers are always on top. ──────────────────────
+    # Colored by sub-source type (mooring/buoy/drifter/…), alpha=1.0 (fully
+    # opaque, matching Tier 3), drawn last so in-situ markers are always on
+    # top. Sub-sources are drawn in descending order of matched-point count
+    # too, matching Tier 3's ordering so the sparsest in-situ instrument
+    # stays visible on top. ─────────────────────────────────────────────────
     for cat in categories:
         if cat["label"] == "In-situ":
             m_lon = np.asarray(cat["matched_lon"])
@@ -1494,37 +1502,41 @@ def plot_collocation_diagnostics(
             # In-situ keeps its per-source-type coloring (mooring/buoy/drifter/…),
             # each its own legend entry.
             if len(m_src) > 0:
-                for source in np.unique(m_src):
+                sources_by_count = sorted(
+                    np.unique(m_src).tolist(),
+                    key=lambda s: int(np.sum(m_src == s)),
+                    reverse=True,
+                )
+                for source in sources_by_count:
                     mask = m_src == source
+                    count = int(np.sum(mask))
                     color, marker = source_style_map.get(str(source), ("#ff7f0e", "o"))
                     ax.scatter(
                         m_lon[mask], m_lat[mask],
-                        s=25, c=color, marker=marker, alpha=0.7,
-                        edgecolors="black", linewidths=0.3,
-                        transform=transform, zorder=6, label=f"In-situ matched: {source}",
+                        s=25, c=color, marker=marker, alpha=1.0,
+                        edgecolors="none",
+                        transform=transform, zorder=6,
+                        label=f"In-situ matched: {source} ({count})",
                     )
             else:
                 # Fallback if no source info available
                 ax.scatter(
                     m_lon, m_lat,
-                    s=25, c="#ff7f0e", marker="o", alpha=0.7,
-                    edgecolors="black", linewidths=0.3,
-                    transform=transform, zorder=6, label="In-situ matched",
+                    s=25, c="#ff7f0e", marker="o", alpha=1.0,
+                    edgecolors="none",
+                    transform=transform, zorder=6,
+                    label=f"In-situ matched ({len(m_lon)})",
                 )
 
-    # ── Title: one segment per category actually present ─────────────────
+    # ── Title: recipe name only; per-category counts go to the log line
+    # below and to the legend instead of cluttering the plot title. ───────
     recipe_name = recipe.config.name or "unknown"
     segments = [
         f"{cat['label']}: {len(cat['matched_lon']) + len(cat['unmatched_lon'])}, "
         f"Matched: {len(cat['matched_lon'])}, Unmatched: {len(cat['unmatched_lon'])}"
         for cat in categories
     ]
-    title = f"{recipe_name} Collocation Diagnostics\n" + " | ".join(segments)
-    if any(excluded_by_time.values()):
-        excl_segments = [
-            f"{label} {count:,}" for label, count in excluded_by_time.items() if count
-        ]
-        title += "\n(outside ± time tolerance, not shown: " + ", ".join(excl_segments) + ")"
+    title = f"{recipe_name} Collocation Diagnostics"
     ax.set_title(title, fontsize=12, fontweight="bold", pad=15)
 
     # ── Add legend with an explanatory entry ──────────────────────────────
