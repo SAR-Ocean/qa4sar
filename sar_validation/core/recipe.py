@@ -47,6 +47,12 @@ class TemporalBounds:
         return asdict(self)
 
 
+#: Fallback depth window (metres; negative = below sea surface) applied when
+#: a recipe's validation source doesn't specify min_depth/max_depth.
+DEFAULT_MIN_DEPTH = -20.0
+DEFAULT_MAX_DEPTH = 20.0
+
+
 @dataclass
 class ValidationDataSource:
     """One validation data source referenced in a recipe."""
@@ -61,9 +67,13 @@ class ValidationDataSource:
       coastal   : hf_radar
     """
 
-    # Optional depth filter (for in-situ and HF radar sources)
-    min_depth: float = -20.0
-    max_depth: float = 20.0
+    # Optional depth filter (only meaningful for in-situ and HF radar
+    # sources). None means "use DEFAULT_MIN_DEPTH/DEFAULT_MAX_DEPTH" — see
+    # resolved_min_depth/resolved_max_depth below. Left as None for source
+    # types that don't use depth (e.g. scatterometer) so recipes don't
+    # serialize a meaningless depth window for them.
+    min_depth: Optional[float] = None
+    max_depth: Optional[float] = None
 
     # Extra keyword arguments forwarded to the downloader
     download_kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -71,8 +81,23 @@ class ValidationDataSource:
     # Override per-source collocation tolerances
     collocation_kwargs: Dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def resolved_min_depth(self) -> float:
+        return self.min_depth if self.min_depth is not None else DEFAULT_MIN_DEPTH
+
+    @property
+    def resolved_max_depth(self) -> float:
+        return self.max_depth if self.max_depth is not None else DEFAULT_MAX_DEPTH
+
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d: Dict[str, Any] = {"source_type": self.source_type}
+        if self.min_depth is not None:
+            d["min_depth"] = self.min_depth
+        if self.max_depth is not None:
+            d["max_depth"] = self.max_depth
+        d["download_kwargs"] = self.download_kwargs
+        d["collocation_kwargs"] = self.collocation_kwargs
+        return d
 
 
 @dataclass
@@ -345,8 +370,8 @@ class Recipe:
             validation_sources=[
                 ValidationDataSource(
                     source_type=src["source_type"],
-                    min_depth=src.get("min_depth", -20.0),
-                    max_depth=src.get("max_depth",  20.0),
+                    min_depth=src.get("min_depth"),
+                    max_depth=src.get("max_depth"),
                     download_kwargs=src.get("download_kwargs", {}),
                     collocation_kwargs=src.get("collocation_kwargs", {}),
                 )

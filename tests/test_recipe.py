@@ -132,10 +132,20 @@ class TestJSONRoundtrip:
 # ---------------------------------------------------------------------------
 
 class TestValidationSourceParsing:
-    def test_depth_defaults(self):
+    def test_depth_defaults_to_none(self):
         src = ValidationDataSource(source_type="mooring")
-        assert src.min_depth == -20.0
-        assert src.max_depth == 20.0
+        assert src.min_depth is None
+        assert src.max_depth is None
+
+    def test_resolved_depth_falls_back_to_defaults(self):
+        src = ValidationDataSource(source_type="mooring")
+        assert src.resolved_min_depth == -20.0
+        assert src.resolved_max_depth == 20.0
+
+    def test_resolved_depth_uses_explicit_value(self):
+        src = ValidationDataSource(source_type="hf_radar", min_depth=-2.0, max_depth=2.0)
+        assert src.resolved_min_depth == -2.0
+        assert src.resolved_max_depth == 2.0
 
     def test_custom_depth(self):
         src = ValidationDataSource(source_type="hf_radar", min_depth=-2.0, max_depth=2.0)
@@ -144,6 +154,39 @@ class TestValidationSourceParsing:
     def test_collocation_kwargs_default_empty(self):
         src = ValidationDataSource(source_type="buoy")
         assert src.collocation_kwargs == {}
+
+    def test_to_dict_omits_unspecified_depth(self):
+        src = ValidationDataSource(source_type="scatterometer")
+        d = src.to_dict()
+        assert "min_depth" not in d
+        assert "max_depth" not in d
+
+    def test_to_dict_includes_explicit_depth(self):
+        src = ValidationDataSource(source_type="hf_radar", min_depth=-2.0, max_depth=2.0)
+        d = src.to_dict()
+        assert d["min_depth"] == -2.0
+        assert d["max_depth"] == 2.0
+
+    def test_yaml_roundtrip_omits_depth_when_unspecified(self, tmp_path):
+        cfg = RecipeConfig(
+            name="Depth Omission Test",
+            variable="wind",
+            validation_sources=[ValidationDataSource(source_type="scatterometer")],
+        )
+        recipe = Recipe(cfg)
+        out = tmp_path / "recipe.yaml"
+        recipe.to_yaml(out)
+
+        raw_text = out.read_text()
+        assert "min_depth" not in raw_text
+        assert "max_depth" not in raw_text
+
+        loaded = Recipe.from_yaml(out)
+        loaded_src = loaded.config.validation_sources[0]
+        assert loaded_src.min_depth is None
+        assert loaded_src.max_depth is None
+        assert loaded_src.resolved_min_depth == -20.0
+        assert loaded_src.resolved_max_depth == 20.0
 
 
 # ---------------------------------------------------------------------------
