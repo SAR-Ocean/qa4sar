@@ -873,9 +873,9 @@ class TestPlotCollocationDiagnosticsTicks:
         calls = []
         original = viz._set_lonlat_ticks
 
-        def spy(ax):
+        def spy(ax, gl):
             calls.append(ax)
-            return original(ax)
+            return original(ax, gl)
 
         monkeypatch.setattr(viz, "_set_lonlat_ticks", spy)
         viz.plot_collocation_diagnostics(

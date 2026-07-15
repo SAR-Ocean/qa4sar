@@ -172,7 +172,7 @@ def _land_coastline_features(scale: str = "10m"):
     return land, coastline
 
 
-def _set_lonlat_ticks(ax):
+def _set_lonlat_ticks(ax, gl):
     """Cheap plain-matplotlib degree-labeled ticks for a PlateCarree
     GeoAxes — replaces cartopy's gridliner label placement
     (``draw_labels=True``), whose curved-projection label-positioning
@@ -180,13 +180,40 @@ def _set_lonlat_ticks(ax):
     rectangular projections (PlateCarree/Mercator), which is all this
     module uses. Note: cartopy's GeoAxes ships with axis visibility disabled
     by default (ax.xaxis.get_visible() == False), so we must re-enable it
-    for the formatted ticks to be rendered to canvas."""
+    for the formatted ticks to be rendered to canvas.
+
+    ``gl`` is the Gridliner returned by the ``ax.gridlines(...)`` call that
+    drew the (unlabeled) grid lines for this axes. Grid *lines* are placed by
+    the gridliner's own locator, which is independent of matplotlib's default
+    tick auto-locator — for most extents they happen to coincide, but they
+    can diverge (different degree spacing), which would misalign the labels
+    against the grid lines they're meant to describe. To guarantee labels and
+    grid lines never drift apart, we read the gridliner's own locator-chosen
+    tick values and apply them explicitly instead of trusting matplotlib's
+    independent auto-locator. This is an eager computation — it depends on
+    ``ax.get_xlim()``/``ax.get_ylim()`` already reflecting the final data
+    extent — so callers must invoke this only after the axes' data (and thus
+    autoscale/extent) is finalized.
+
+    ``tick_params(length=0)`` suppresses the small perpendicular tick marks
+    that ``set_visible(True)`` would otherwise re-enable on the whole Axis
+    artist; the original gridliner-only rendering never drew those, so this
+    keeps pixel parity with the pre-fix appearance (labels only, no marks)."""
     from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter  # noqa: PLC0415
+    import cartopy.crs as ccrs  # noqa: PLC0415
 
     ax.xaxis.set_major_formatter(LongitudeFormatter())
     ax.yaxis.set_major_formatter(LatitudeFormatter())
     ax.xaxis.set_visible(True)
     ax.yaxis.set_visible(True)
+    ax.tick_params(axis="both", which="both", length=0)
+
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    xticks = [x for x in gl.xlocator.tick_values(*xlim) if xlim[0] <= x <= xlim[1]]
+    yticks = [y for y in gl.ylocator.tick_values(*ylim) if ylim[0] <= y <= ylim[1]]
+    ax.set_xticks(xticks, crs=ccrs.PlateCarree())
+    ax.set_yticks(yticks, crs=ccrs.PlateCarree())
 
 
 def _sar_field(scene_ds, sar_var: str) -> Optional[np.ndarray]:
@@ -628,8 +655,7 @@ def plot_geographic(
                 land, coastline = _land_coastline_features()
                 ax.add_feature(land, facecolor="lightgray", zorder=0, rasterized=True)
                 ax.add_feature(coastline, linewidth=0.5, zorder=0, rasterized=True)
-                ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
-                _set_lonlat_ticks(ax)
+                gl = ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
                 transform = ccrs.PlateCarree()
             else:
                 transform = None
@@ -757,6 +783,12 @@ def plot_geographic(
             ax.set_title(
                 f"{scene_name.split('/')[-1]}  ({n_dedup} obs)", fontsize=8
             )
+            if HAS_CARTOPY:
+                # Deferred until now (rather than right after ax.gridlines above):
+                # this reads the finalized data extent via ax.get_xlim()/get_ylim(),
+                # which only reflects this scene's plotted data after the
+                # pcolormesh/scatter calls above have run their autoscale.
+                _set_lonlat_ticks(ax, gl)
 
         # Hide unused axes
         for idx in range(len(scene_names), nrows * ncols):
@@ -1394,12 +1426,12 @@ def plot_collocation_diagnostics(
     land, coastline = _land_coastline_features()
     ax.add_feature(land, facecolor="lightgray", alpha=0.3, zorder=0)
     ax.add_feature(coastline, linewidth=0.5, zorder=0)
-    ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
+    gl = ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
 
     # ── Set plot extent to the recipe's geographic bounds ────────────────
     ax.set_extent([bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat],
                   crs=ccrs.PlateCarree())
-    _set_lonlat_ticks(ax)
+    _set_lonlat_ticks(ax, gl)
 
     # ── SAR coverage (zorder=1): Grid scenes → bounding box; sparse WV
     # imagettes → one footprint circle each (radius = the collocation footprint
