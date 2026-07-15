@@ -172,6 +172,19 @@ def _land_coastline_features(scale: str = "10m"):
     return land, coastline
 
 
+def _set_lonlat_ticks(ax):
+    """Cheap plain-matplotlib degree-labeled ticks for a PlateCarree
+    GeoAxes — replaces cartopy's gridliner label placement
+    (``draw_labels=True``), whose curved-projection label-positioning
+    logic is expensive to recompute across many subplots. Only valid for
+    rectangular projections (PlateCarree/Mercator), which is all this
+    module uses."""
+    from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter  # noqa: PLC0415
+
+    ax.xaxis.set_major_formatter(LongitudeFormatter())
+    ax.yaxis.set_major_formatter(LatitudeFormatter())
+
+
 def _sar_field(scene_ds, sar_var: str) -> Optional[np.ndarray]:
     """
     Return the (y, x) array for *sar_var* in *scene_ds*, or None if absent.
@@ -611,9 +624,8 @@ def plot_geographic(
                 land, coastline = _land_coastline_features()
                 ax.add_feature(land, facecolor="lightgray", zorder=0, rasterized=True)
                 ax.add_feature(coastline, linewidth=0.5, zorder=0, rasterized=True)
-                gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
-                gl.top_labels = False
-                gl.right_labels = False
+                ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
+                _set_lonlat_ticks(ax)
                 transform = ccrs.PlateCarree()
             else:
                 transform = None

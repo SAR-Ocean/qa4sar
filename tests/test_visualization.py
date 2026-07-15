@@ -381,6 +381,31 @@ class TestPlotGeographic:
         assert len(set(source_markers)) == 2
 
 
+class TestPlotGeographicTicks:
+    def test_subplots_get_degree_formatted_ticks(self, geo_datatree_and_collocation):
+        """Regression test for the gridliner -> plain-tick swap: subplots
+        must still show degree-labeled lon/lat ticks, just without
+        gridliner's expensive label-placement machinery."""
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        # This fixture has no "collocation_type" field, so split_by=None
+        # (matching TestPlotGeographic's existing convention) makes
+        # plot_geographic return a single Figure rather than a dict.
+        fig = plot_geographic(
+            datatree, collocation_ds, "owiWindSpeed", "WSPD", split_by=None,
+        )
+        fig.canvas.draw()
+        ax = fig.axes[0]
+
+        xlabels = [t.get_text() for t in ax.get_xticklabels()]
+        ylabels = [t.get_text() for t in ax.get_yticklabels()]
+        assert any("°" in lbl for lbl in xlabels), xlabels
+        assert any("°" in lbl for lbl in ylabels), ylabels
+        plt.close("all")
+
+
 @pytest.fixture
 def geo_datatree_and_collocation_with_unmatched():
     """Synthetic DataTree + collocation_ds with both matched and unmatched
