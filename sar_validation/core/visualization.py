@@ -1394,13 +1394,12 @@ def plot_collocation_diagnostics(
     land, coastline = _land_coastline_features()
     ax.add_feature(land, facecolor="lightgray", alpha=0.3, zorder=0)
     ax.add_feature(coastline, linewidth=0.5, zorder=0)
-    gl = ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
-    gl.top_labels = False
-    gl.right_labels = False
+    ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
 
     # ── Set plot extent to the recipe's geographic bounds ────────────────
     ax.set_extent([bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat],
                   crs=ccrs.PlateCarree())
+    _set_lonlat_ticks(ax)
 
     # ── SAR coverage (zorder=1): Grid scenes → bounding box; sparse WV
     # imagettes → one footprint circle each (radius = the collocation footprint

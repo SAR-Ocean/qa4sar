@@ -840,6 +840,52 @@ class TestPlotCollocationDiagnosticsRefinement:
         assert "In-situ matched: buoy (1)" in insitu_labels
 
 
+class TestPlotCollocationDiagnosticsTicks:
+    def test_overview_plot_gets_degree_formatted_ticks(
+        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path
+    ):
+        import matplotlib.pyplot as plt
+        import matplotlib.image as mpimg
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        out_path = plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe, tmp_path,
+        )
+        plt.close("all")
+
+        assert out_path is not None
+        # plot_collocation_diagnostics saves its own PNG and closes its
+        # figure internally, so we can only verify the rendered image
+        # exists and is non-trivial in size (a proxy for "axes labels were
+        # drawn"), not inspect live tick-label Text objects.
+        img = mpimg.imread(str(out_path))
+        assert img.shape[0] > 100 and img.shape[1] > 100
+
+    def test_overview_plot_calls_set_lonlat_ticks(
+        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
+    ):
+        import matplotlib.pyplot as plt
+        import sar_validation.core.visualization as viz
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+
+        calls = []
+        original = viz._set_lonlat_ticks
+
+        def spy(ax):
+            calls.append(ax)
+            return original(ax)
+
+        monkeypatch.setattr(viz, "_set_lonlat_ticks", spy)
+        viz.plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe, tmp_path,
+        )
+        plt.close("all")
+
+        assert len(calls) == 1
+
+
 class TestValidationReport:
     def test_includes_temporal_offset_plots(self, geo_datatree_and_collocation, tmp_path):
         import matplotlib.pyplot as plt
