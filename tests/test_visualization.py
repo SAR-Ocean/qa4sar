@@ -994,6 +994,26 @@ class TestValidationReportIncludesDiagnostics:
         )
 
 
+class TestValidationReportClosesPageFigures:
+    def test_no_figures_left_open_after_report(self, geo_datatree_and_collocation, tmp_path):
+        """Regression guard for the render-once refactor: the new
+        lightweight PDF-page figures (built by _finalize_figure_for_report /
+        _image_page_figure) must be closed once written, not leaked —
+        unlike the original heavy figures, they aren't tracked in
+        `all_figures` / `figs`, so nothing else closes them."""
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import validation_report
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recipe = Recipe(config=RecipeConfig(name="test", variable="wind"))
+
+        plt.close("all")
+        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        assert plt.get_fignums() == []
+
+
 class TestDropNonDirectionalSources:
     def _ds(self):
         return xr.Dataset({

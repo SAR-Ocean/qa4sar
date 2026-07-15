@@ -1835,11 +1835,12 @@ def validation_report(
         fig_scatter = plot_scatter(pair_ds, sar_var, val_var)
         if fig_scatter is not None:
             figs.append(fig_scatter)
-            pdf_pages.append((f"{sar_var} vs {val_var} — scatter", fig_scatter))
+            title = f"{sar_var} vs {val_var} — scatter"
             if plots_dir:
-                fig_scatter.savefig(
-                    plots_dir / f"{key}{filename_suffix}_scatter.png", dpi=150, bbox_inches="tight"
-                )
+                png_path = plots_dir / f"{key}{filename_suffix}_scatter.png"
+                pdf_pages.append((title, _finalize_figure_for_report(fig_scatter, png_path)))
+            else:
+                pdf_pages.append((title, fig_scatter))
 
         # Geographic — returns dict[collocation_type, Figure] by default
         try:
@@ -1848,22 +1849,21 @@ def validation_report(
                 for group, fig_geo in geo_result.items():
                     if fig_geo is not None:
                         figs.append(fig_geo)
-                        pdf_pages.append(
-                            (f"{sar_var} vs {val_var} — geographic [{group}]", fig_geo)
-                        )
+                        title = f"{sar_var} vs {val_var} — geographic [{group}]"
                         if plots_dir:
                             safe_group = str(group).replace("/", "-")
-                            fig_geo.savefig(
-                                plots_dir / f"{key}{filename_suffix}_geographic_{safe_group}.png",
-                                dpi=150, bbox_inches="tight",
-                            )
+                            png_path = plots_dir / f"{key}{filename_suffix}_geographic_{safe_group}.png"
+                            pdf_pages.append((title, _finalize_figure_for_report(fig_geo, png_path)))
+                        else:
+                            pdf_pages.append((title, fig_geo))
             elif geo_result is not None:
                 figs.append(geo_result)
-                pdf_pages.append((f"{sar_var} vs {val_var} — geographic", geo_result))
+                title = f"{sar_var} vs {val_var} — geographic"
                 if plots_dir:
-                    geo_result.savefig(
-                        plots_dir / f"{key}{filename_suffix}_geographic.png", dpi=150, bbox_inches="tight"
-                    )
+                    png_path = plots_dir / f"{key}{filename_suffix}_geographic.png"
+                    pdf_pages.append((title, _finalize_figure_for_report(geo_result, png_path)))
+                else:
+                    pdf_pages.append((title, geo_result))
         except Exception as exc:
             logger.warning("plot_geographic failed for %s: %s", sar_var, exc)
 
@@ -1872,21 +1872,23 @@ def validation_report(
             fig_stats = plot_statistics(stats_ds_map[key])
             if fig_stats is not None:
                 figs.append(fig_stats)
-                pdf_pages.append((f"{sar_var} vs {val_var} — statistics", fig_stats))
+                title = f"{sar_var} vs {val_var} — statistics"
                 if plots_dir:
-                    fig_stats.savefig(
-                        plots_dir / f"{key}{filename_suffix}_statistics.png", dpi=150, bbox_inches="tight"
-                    )
+                    png_path = plots_dir / f"{key}{filename_suffix}_statistics.png"
+                    pdf_pages.append((title, _finalize_figure_for_report(fig_stats, png_path)))
+                else:
+                    pdf_pages.append((title, fig_stats))
 
         # Residuals
         fig_res = plot_residuals(pair_ds, sar_var, val_var)
         if fig_res is not None:
             figs.append(fig_res)
-            pdf_pages.append((f"{sar_var} vs {val_var} — residuals", fig_res))
+            title = f"{sar_var} vs {val_var} — residuals"
             if plots_dir:
-                fig_res.savefig(
-                    plots_dir / f"{key}{filename_suffix}_residuals.png", dpi=150, bbox_inches="tight"
-                )
+                png_path = plots_dir / f"{key}{filename_suffix}_residuals.png"
+                pdf_pages.append((title, _finalize_figure_for_report(fig_res, png_path)))
+            else:
+                pdf_pages.append((title, fig_res))
 
         # Scatter colored by temporal offset — same SAR-vs-validation
         # comparison as above, but colored by how far apart in time each
@@ -1894,21 +1896,23 @@ def validation_report(
         fig_scatter_offset = plot_scatter(pair_ds, sar_var, val_var, color_by="temporal_offset")
         if fig_scatter_offset is not None:
             figs.append(fig_scatter_offset)
-            pdf_pages.append((f"{sar_var} vs {val_var} — scatter (colored by temporal offset)", fig_scatter_offset))
+            title = f"{sar_var} vs {val_var} — scatter (colored by temporal offset)"
             if plots_dir:
-                fig_scatter_offset.savefig(
-                    plots_dir / f"{key}{filename_suffix}_scatter_by_offset.png", dpi=150, bbox_inches="tight"
-                )
+                png_path = plots_dir / f"{key}{filename_suffix}_scatter_by_offset.png"
+                pdf_pages.append((title, _finalize_figure_for_report(fig_scatter_offset, png_path)))
+            else:
+                pdf_pages.append((title, fig_scatter_offset))
 
         # Temporal offset vs. residual magnitude
         fig_offset = plot_temporal_offset(pair_ds, sar_var, val_var)
         if fig_offset is not None:
             figs.append(fig_offset)
-            pdf_pages.append((f"{sar_var} vs {val_var} — residual vs. temporal offset", fig_offset))
+            title = f"{sar_var} vs {val_var} — residual vs. temporal offset"
             if plots_dir:
-                fig_offset.savefig(
-                    plots_dir / f"{key}{filename_suffix}_temporal_offset.png", dpi=150, bbox_inches="tight"
-                )
+                png_path = plots_dir / f"{key}{filename_suffix}_temporal_offset.png"
+                pdf_pages.append((title, _finalize_figure_for_report(fig_offset, png_path)))
+            else:
+                pdf_pages.append((title, fig_offset))
 
         all_figures[key] = figs
 
@@ -1923,7 +1927,6 @@ def validation_report(
                 plt.close(fig)
 
     # Collocation diagnostics plot — generated once per recipe
-    fig_diag = None
     if base_dir is not None:
         try:
             diag_path = plot_collocation_diagnostics(
@@ -1937,15 +1940,13 @@ def validation_report(
                 # the only way to include it in pdf_pages is to reload the
                 # rendered image.
                 diag_img = plt.imread(str(diag_path))
-                img_h, img_w = diag_img.shape[0], diag_img.shape[1]
-                fig_diag = plt.figure(figsize=(img_w / 150, img_h / 150), dpi=150)
-                ax_diag = fig_diag.add_axes([0, 0, 1, 1])
-                ax_diag.imshow(diag_img)
-                ax_diag.axis("off")
                 # Lead the report body with the diagnostics overview (the
                 # cover page is written separately, so index 0 here becomes
                 # the first page after the cover).
-                pdf_pages.insert(0, (f"Collocation diagnostics — {recipe.config.name}", fig_diag))
+                pdf_pages.insert(
+                    0,
+                    (f"Collocation diagnostics — {recipe.config.name}", _image_page_figure(diag_img)),
+                )
         except Exception as exc:
             logger.warning("plot_collocation_diagnostics failed: %s", exc)
 
@@ -1974,14 +1975,9 @@ def validation_report(
 
             for _title, fig in pdf_pages:
                 pdf.savefig(fig, dpi=150, bbox_inches="tight")
+                plt.close(fig)
 
         logger.info("PDF report saved to %s", pdf_path)
-
-    # fig_diag isn't in the `figs` list closed earlier (it's created after
-    # that loop), so it stays open until here — close it now that the PDF
-    # write is done and it's no longer needed.
-    if fig_diag is not None:
-        plt.close(fig_diag)
 
     if plots_dir:
         logger.info("PNG plots saved to %s", plots_dir)
