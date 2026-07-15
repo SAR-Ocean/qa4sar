@@ -1713,6 +1713,39 @@ def _extract_validation_data_for_plot(datatree):
 # 5. Validation report (convenience wrapper)
 # ---------------------------------------------------------------------------
 
+
+def _image_page_figure(img, dpi: int = 150):
+    """Build a throwaway Figure that exactly fills its canvas with *img* —
+    used to embed an already-rendered PNG as a PDF page without drawing
+    the original (often much more expensive, e.g. cartopy) figure a
+    second time."""
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    img_h, img_w = img.shape[0], img.shape[1]
+    fig = plt.figure(figsize=(img_w / dpi, img_h / dpi), dpi=dpi)
+    ax = fig.add_axes((0, 0, 1, 1))
+    ax.imshow(img)
+    ax.axis("off")
+    return fig
+
+
+def _finalize_figure_for_report(fig, png_path: Optional[Path], dpi: int = 150):
+    """Render *fig* to PNG exactly once, optionally save it to *png_path*,
+    close *fig*, and return a lightweight image-only Figure for embedding
+    as a PDF page. Avoids drawing the same (often expensive) figure a
+    second time via ``PdfPages.savefig``."""
+    import io
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    if png_path is not None:
+        png_path.write_bytes(buf.getvalue())
+    buf.seek(0)
+    return _image_page_figure(plt.imread(buf, format="png"), dpi=dpi)
+
+
 def validation_report(
     collocation_ds,
     datatree,

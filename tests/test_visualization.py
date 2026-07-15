@@ -1190,3 +1190,56 @@ class TestValidationReportSceneAllowlist:
 
         assert captured.get("scenes") is not None
         assert "sceneA" in set(captured["scenes"])
+
+
+class TestImagePageFigure:
+    def test_figure_size_matches_image_pixel_dimensions(self):
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import _image_page_figure
+
+        img = np.zeros((300, 450, 3), dtype=np.uint8)
+        fig = _image_page_figure(img, dpi=150)
+
+        w_in, h_in = fig.get_size_inches()
+        assert w_in == pytest.approx(450 / 150)
+        assert h_in == pytest.approx(300 / 150)
+        plt.close(fig)
+
+
+class TestFinalizeFigureForReport:
+    def test_writes_png_closes_original_returns_image_page(self, tmp_path):
+        import matplotlib.pyplot as plt
+        import matplotlib._pylab_helpers as pylab_helpers
+        from sar_validation.core.visualization import _finalize_figure_for_report
+
+        fig, ax = plt.subplots()
+        ax.plot([0, 1], [0, 1])
+        png_path = tmp_path / "out.png"
+
+        page_fig = _finalize_figure_for_report(fig, png_path)
+
+        assert png_path.exists()
+        assert png_path.stat().st_size > 0
+        # Check object identity against pyplot's live figure registry, not
+        # `fig.number` — matplotlib recycles figure numbers after `close()`,
+        # so a freshly created page figure can legitimately reuse the
+        # original's number; that would make an `fignum_exists()`-based
+        # check pass even if `fig` were never actually closed.
+        open_figs = [m.canvas.figure for m in pylab_helpers.Gcf.figs.values()]
+        assert fig not in open_figs, "original figure should be closed"
+        assert page_fig is not fig
+        plt.close(page_fig)
+
+    def test_none_png_path_skips_disk_write(self, tmp_path):
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import _finalize_figure_for_report
+
+        fig, ax = plt.subplots()
+        ax.plot([0, 1], [0, 1])
+
+        page_fig = _finalize_figure_for_report(fig, None)
+
+        assert page_fig is not None
+        assert list(tmp_path.iterdir()) == []
+        plt.close(page_fig)
