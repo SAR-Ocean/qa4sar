@@ -97,6 +97,8 @@ class ValidationDataSource:
         return self.max_depth if self.max_depth is not None else DEFAULT_MAX_DEPTH
 
     def to_dict(self) -> Dict[str, Any]:
+        # Hand-built (not asdict()) so unset min_depth/max_depth are omitted
+        # rather than serialized as null — keep in sync with the fields above.
         d: Dict[str, Any] = {"source_type": self.source_type}
         if self.min_depth is not None:
             d["min_depth"] = self.min_depth
