@@ -1133,3 +1133,17 @@ class TestBuildDatatreeHfRadarCopernicus:
         assert tree is not None
         node_paths = [node.path for node in tree.subtree]
         assert any("hf_radar" in p and "hf_radar_noaa" not in p for p in node_paths)
+
+
+class TestBuildDatatreeHfRadarHistorical:
+    def test_hf_radar_historical_folder_becomes_validation_node(self, tmp_path):
+        base = tmp_path / "run"
+        (base / "hf_radar_historical").mkdir(parents=True)
+        _make_copernicus_hfr_grid_nc(base / "hf_radar_historical")
+        tree = DataTreeConverter.convert_downloaded_data(base, product_type="currents")
+        assert tree is not None
+        node_paths = [node.path for node in tree.subtree]
+        assert any(
+            "hf_radar_historical" in p and "hf_radar_noaa" not in p
+            for p in node_paths
+        )

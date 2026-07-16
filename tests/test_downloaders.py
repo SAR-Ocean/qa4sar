@@ -978,3 +978,23 @@ class TestHFRadarHistoricalDownloader:
         assert "time" in result.dims and "latitude" in result.dims and "longitude" in result.dims
         assert "DEPTH" not in result.dims
         assert result.sizes["time"] == 5
+
+
+class TestOrchestratorHFRadarHistoricalWiring:
+    def test_dispatch_source_registers_hf_radar_historical_handler(self):
+        from unittest.mock import patch
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(name="test", variable="currents"))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        source = ValidationDataSource(source_type="hf_radar_historical")
+
+        with patch(
+            "sar_validation.downloaders.hf_radar_historical_downloader.HFRadarHistoricalDownloader"
+        ) as mock_cls:
+            mock_cls.return_value.download.return_value = None
+            ok = orchestrator._dispatch_source(source)
+
+        assert ok is True
+        mock_cls.assert_called_once()

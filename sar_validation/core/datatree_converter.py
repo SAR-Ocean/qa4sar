@@ -2080,6 +2080,7 @@ class DataTreeConverter:
         - ``scatterometer/*.nc``       → ``validation/scatterometer/<stem>`` nodes
         - ``hfr_noaa/*.nc``            → ``validation/hfr_noaa/<stem>`` nodes
         - ``hf_radar/*.nc``            → ``validation/hf_radar/<stem>`` nodes
+        - ``hf_radar_historical/*.nc`` → ``validation/hf_radar_historical/<stem>`` nodes
         - ``altimeter/*.nc``           → ``validation/altimeter/<stem>`` nodes
 
         Parameters
@@ -2187,6 +2188,22 @@ class DataTreeConverter:
                 if ds is not None:
                     datasets[f"validation/hf_radar/{nc_path.stem}"] = ds
                     logger.info("Converted hf_radar (Copernicus HF-radar grid): %s", nc_path.name)
+
+        # Copernicus Marine delayed-mode HF-radar current grid (013_044),
+        # already normalized to the same shape as hf_radar/ by the downloader.
+        subdir = base_dir / "hf_radar_historical"
+        if subdir.exists():
+            for nc_path in sorted(subdir.glob("*.nc")):
+                ds = _filtered(
+                    DataTreeConverter.from_hf_radar_grid(
+                        nc_path, u_var="EWCT", v_var="NSCT",
+                        source_label="Copernicus Marine HFR radar-total (delayed-mode)",
+                    ),
+                    nc_path.name,
+                )
+                if ds is not None:
+                    datasets[f"validation/hf_radar_historical/{nc_path.stem}"] = ds
+                    logger.info("Converted hf_radar_historical (Copernicus HF-radar grid): %s", nc_path.name)
 
         # Altimeter NetCDF products (kept as raw dataset). copernicusmarine
         # sometimes can't merge a satellite/frequency request into a single
