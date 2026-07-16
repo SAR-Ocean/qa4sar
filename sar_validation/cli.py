@@ -649,6 +649,33 @@ def _compute_stats(recipe, base_dir: Path, filename_suffix: str = "") -> None:
             print(f"  Statistics saved: validation_statistics_{key}{filename_suffix}.nc/.csv")
 
 
+def _load_precomputed_stats(recipe, collocation_ds, base_dir: Path, filename_suffix: str = "") -> dict:
+    """Load ``validation_statistics_<sar_var>_vs_<val_var><suffix>.nc`` files already
+    saved by step 5a, keyed the same way ``run_statistics`` names them.
+
+    Extracted from ``_generate_plots`` so the file-matching logic is
+    unit-testable independent of the CLI's plotting/PDF side effects. Uses
+    ``filter_variable_pairs`` — the same dataset-aware pair selection
+    ``run_statistics`` used to *write* these files — rather than the static
+    ``infer_variable_pairs`` list, so the keys this looks up always match
+    the keys the files were actually saved under.
+    """
+    import xarray as xr
+    from .core._variable_map import filter_variable_pairs
+
+    stats_ds_map = {}
+    try:
+        pairs = filter_variable_pairs(recipe, collocation_ds)
+    except KeyError:
+        return stats_ds_map
+    for sar_var, val_var in pairs:
+        key = f"{sar_var}_vs_{val_var}"
+        stats_path = base_dir / f"validation_statistics_{key}{filename_suffix}.nc"
+        if stats_path.exists():
+            stats_ds_map[key] = xr.open_dataset(str(stats_path))
+    return stats_ds_map
+
+
 def _generate_plots(recipe, base_dir: Path, filename_suffix: str = "") -> None:
     """Run step 5b: generate validation plots and save to <base_dir>/plots/."""
     import xarray as xr
@@ -668,18 +695,7 @@ def _generate_plots(recipe, base_dir: Path, filename_suffix: str = "") -> None:
     collocation_ds = xr.open_dataset(str(coll_path))
     datatree = xr.open_datatree(str(datatree_path), engine="netcdf4")
 
-    # Load pre-computed statistics if available
-    from .core._variable_map import infer_variable_pairs
-    stats_ds_map = {}
-    try:
-        pairs = infer_variable_pairs(recipe.config.variable)
-        for sar_var, val_var in pairs:
-            key = f"{sar_var}_vs_{val_var}"
-            stats_path = base_dir / f"validation_statistics_{key}{filename_suffix}.nc"
-            if stats_path.exists():
-                stats_ds_map[key] = xr.open_dataset(str(stats_path))
-    except KeyError:
-        pass
+    stats_ds_map = _load_precomputed_stats(recipe, collocation_ds, base_dir, filename_suffix)
 
     validation_report(collocation_ds, datatree, recipe,
                       stats_ds_map=stats_ds_map or None,
