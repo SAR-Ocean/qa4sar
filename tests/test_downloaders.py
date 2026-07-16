@@ -456,6 +456,22 @@ class TestClampToRegionBbox:
         _, _, min_lat, _ = clamp_to_region_bbox(-80, -60, 20.0, 40.0)
         assert min_lat >= 21.73596
 
+    def test_west_coast_bbox_at_old_config_edge_is_clamped(self):
+        # Reproduces the reported bug: recipes/currents_uswestcoast2.yaml's
+        # bbox reaches min_lat=30.0, which used to equal the (too loose)
+        # _REGIONS US_WEST config bound, so nothing got clamped and the
+        # unclamped 30.0 reached ERDDAP below its real axis minimum
+        # (30.25N per ucsdHfrW6's .das), triggering the same HTTP 404.
+        # The recipe's max_lon=-115.0 is also past the real axis maximum
+        # (-115.8056 per the .das), so it gets clamped too.
+        min_lon, max_lon, min_lat, max_lat = clamp_to_region_bbox(
+            -126.0, -115.0, 30.0, 48.0
+        )
+        assert min_lat == 30.25
+        assert (min_lon, max_lon, max_lat) == (-126.0, -115.8056, 48.0)
+        assert min_lat >= 30.25  # real ERDDAP grid's minimum latitude
+        assert max_lon <= -115.8056  # real ERDDAP grid's maximum longitude
+
 
 class TestBuildErddapSubsetUrl:
     def test_url_has_vars_bbox_and_time_selectors(self):
@@ -532,6 +548,20 @@ class TestNOAAHFRadarDownload:
         called_url = m.call_args[0][0]
         assert "[(22.0):(40.0)]" in called_url
         assert "[(20.0)" not in called_url
+
+    def test_download_clamps_west_coast_recipe_bbox(self, tmp_path):
+        """recipes/currents_uswestcoast2.yaml's exact bbox (min_lat=30.0)
+        must be clamped to the real ERDDAP axis minimum (30.25N), not passed
+        straight through and 404 at the server."""
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+        ) as m:
+            dl.download(-126.0, -115.0, 30.0, 48.0, _RECENT_START, _RECENT_END)
+        called_url = m.call_args[0][0]
+        assert "[(30.25):(48.0)]" in called_url
+        assert "[(30.0)" not in called_url
+        assert "[(-126.0):(-115.8056)]" in called_url
 
 
 # ---------------------------------------------------------------------------

@@ -49,11 +49,11 @@ DEFAULT_RESOLUTION_KM = 6
 # PR/USVI, Great Lakes) are deferred (design §6) and raise a clear error.
 _REGIONS = {
     "US_WEST": {
-        "bbox": (-130.0, -116.0, 30.0, 50.0),
+        "bbox": (-130.36, -115.8056, 30.25, 49.99204),
         "datasets": {1: "ucsdHfrW1", 2: "ucsdHfrW2", 6: "ucsdHfrW6"},
     },
     "US_EAST_GULF": {
-        "bbox": (-98.0, -60.0, 22.0, 46.0),
+        "bbox": (-97.88385, -60.0, 22.0, 46.0),
         "datasets": {1: "ucsdHfrE1", 6: "ucsdHfrE6"},
     },
 }
