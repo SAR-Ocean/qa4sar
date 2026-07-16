@@ -796,20 +796,32 @@ class DataTreeConverter:
     @staticmethod
     def from_hf_radar_grid(
         nc_path: Union[str, Path],
+        u_var: str = "water_u",
+        v_var: str = "water_v",
+        source_label: str = "NOAA HFRnet RTV",
     ) -> Optional[xr.Dataset]:
         """
-        Open a NOAA HFRnet gridded RTV NetCDF (dims ``time, lat, lon``; vars
-        ``water_u``/``water_v``) and return a standardised point-frame Dataset
-        tagged ``data_type="hf_radar_grid"``.
+        Open a gridded HF-radar-current NetCDF (dims ``time, lat, lon``) and
+        return a standardised point-frame Dataset tagged
+        ``data_type="hf_radar_grid"``.
+
+        ``u_var``/``v_var`` name the eastward/northward current variables on
+        the wire — NOAA HFRnet RTV ships ``water_u``/``water_v`` (the
+        defaults); Copernicus Marine HFR radar-total products ship
+        ``EWCT``/``NSCT`` directly.
 
         The regular grid is flattened to a ``point`` dimension (one point per
         cell per time) so it collocates through the ``layer_vs_layer`` path,
-        exactly like the scatterometer converter. ``water_u``/``water_v`` are
-        renamed to canonical ``EWCT``/``NSCT``. Ancillary uncertainty/QC fields
-        are *retained but not used* (design §3.7): ``DOPx``/``DOPy`` are
-        combined into ``hfr_gdop`` (geometric dilution of precision) and the
-        radial/site counts are kept as ``hfr_n_radials``/``hfr_n_sites`` so the
-        deferred correction/QC phase can filter on them.
+        exactly like the scatterometer converter. Ancillary uncertainty/QC
+        fields are *retained but not used* (design §3.7): NOAA's
+        ``DOPx``/``DOPy`` are combined into ``hfr_gdop``, its radial/site
+        counts are kept as ``hfr_n_radials``/``hfr_n_sites``; Copernicus's
+        ``GDOP`` is copied to ``hfr_gdop`` directly, ``EWCS``/``NSCS`` (the
+        per-cell eastward/northward current standard deviations) to
+        ``hfr_ewcs``/``hfr_nscs``, the overall ``QCflag`` to ``hfr_qc``, and
+        each per-parameter QC flag (``CSPD_QC``, ``DDNS_QC``, ``GDOP_QC``,
+        ``VART_QC``, ``POSITION_QC``) to its own ``hfr_qc_<param>`` field —
+        so the deferred correction/QC phase can filter on them later.
 
         Returns
         -------
@@ -826,14 +838,14 @@ class DataTreeConverter:
             logger.warning("Could not open %s: %s", nc_path, exc)
             return None
 
-        # Resolve coordinate names (HFRnet uses lat/lon; tolerate latitude/longitude).
+        # Resolve coordinate names (tolerate lat/lon, latitude/longitude, LAT/LON).
         lat_name = next((n for n in ("lat", "latitude", "LAT") if n in raw.coords or n in raw), None)
         lon_name = next((n for n in ("lon", "longitude", "LON") if n in raw.coords or n in raw), None)
         time_name = next((n for n in ("time", "Time", "TIME") if n in raw.coords or n in raw), None)
-        if not (lat_name and lon_name and "water_u" in raw and "water_v" in raw):
+        if not (lat_name and lon_name and u_var in raw and v_var in raw):
             logger.warning(
-                "from_hf_radar_grid: %s missing lat/lon or water_u/water_v (have %s)",
-                nc_path.name, list(raw.coords) + list(raw.data_vars),
+                "from_hf_radar_grid: %s missing lat/lon or %s/%s (have %s)",
+                nc_path.name, u_var, v_var, list(raw.coords) + list(raw.data_vars),
             )
             raw.close()
             return None
@@ -856,19 +868,19 @@ class DataTreeConverter:
         def _flat(varname):
             return np.asarray(raw[varname].values, dtype=float).reshape(n_t, n_la, n_lo).ravel()
 
-        ewct = _flat("water_u")
-        nsct = _flat("water_v")
+        ewct = _flat(u_var)
+        nsct = _flat(v_var)
 
         data_vars: Dict[str, tuple] = {
             "EWCT": ("point", ewct),
             "NSCT": ("point", nsct),
         }
         var_attrs: Dict[str, Dict] = {
-            "EWCT": dict(raw["water_u"].attrs),
-            "NSCT": dict(raw["water_v"].attrs),
+            "EWCT": dict(raw[u_var].attrs),
+            "NSCT": dict(raw[v_var].attrs),
         }
 
-        # --- Retained ancillary fields (not used in Phase 3a; design §3.7) ---
+        # --- Retained ancillary fields (not used yet; design §3.7) ---
         if "DOPx" in raw and "DOPy" in raw:
             dopx, dopy = _flat("DOPx"), _flat("DOPy")
             data_vars["hfr_gdop"] = ("point", np.sqrt(dopx ** 2 + dopy ** 2))
@@ -882,6 +894,44 @@ class DataTreeConverter:
                 data_vars[dst] = ("point", _flat(src))
                 var_attrs[dst] = {"long_name": src.replace("_", " "),
                                   "comment": "Retained for a future HF-radar QC filter."}
+        if "GDOP" in raw and "hfr_gdop" not in data_vars:
+            data_vars["hfr_gdop"] = ("point", _flat("GDOP"))
+            var_attrs["hfr_gdop"] = {
+                "long_name": "geometric dilution of precision",
+                "comment": "Retained for a future HF-radar QC/uncertainty filter.",
+            }
+        if "EWCS" in raw and "NSCS" in raw:
+            data_vars["hfr_ewcs"] = ("point", _flat("EWCS"))
+            data_vars["hfr_nscs"] = ("point", _flat("NSCS"))
+            var_attrs["hfr_ewcs"] = {
+                "long_name": "eastward current component std error", "units": "m s-1",
+                "comment": "Retained for a future HF-radar QC/uncertainty filter.",
+            }
+            var_attrs["hfr_nscs"] = {
+                "long_name": "northward current component std error", "units": "m s-1",
+                "comment": "Retained for a future HF-radar QC/uncertainty filter.",
+            }
+        if "QCflag" in raw:
+            data_vars["hfr_qc"] = ("point", _flat("QCflag"))
+            var_attrs["hfr_qc"] = {
+                "long_name": "HF-radar overall QC flag",
+                "comment": "Retained for a future HF-radar QC filter (design §3.7).",
+            }
+        # Per-parameter QC flags (Copernicus radar-total product): each one
+        # is retained under its own field rather than folded into hfr_qc, so
+        # a future QC phase can filter per-parameter instead of only on the
+        # overall flag.
+        for src, param in (
+            ("CSPD_QC", "cspd"), ("DDNS_QC", "ddns"), ("GDOP_QC", "gdop"),
+            ("VART_QC", "vart"), ("POSITION_QC", "position"),
+        ):
+            if src in raw:
+                dst = f"hfr_qc_{param}"
+                data_vars[dst] = ("point", _flat(src))
+                var_attrs[dst] = {
+                    "long_name": f"HF-radar {param} QC flag",
+                    "comment": "Retained for a future HF-radar QC filter (design §3.7).",
+                }
 
         # Drop points where both current components are NaN (masked land/gaps).
         valid = np.isfinite(ewct) | np.isfinite(nsct)
@@ -905,7 +955,7 @@ class DataTreeConverter:
 
         ds.attrs["data_type"]     = "hf_radar_grid"
         ds.attrs["platform_type"] = "radar"
-        ds.attrs["source"]        = "NOAA HFRnet RTV"
+        ds.attrs["source"]        = source_label
         ds.attrs["filename"]      = nc_path.name
 
         raw.close()
