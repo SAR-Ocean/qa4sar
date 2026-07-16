@@ -312,6 +312,7 @@ class TestHFRadarDownloaderGrid:
         assert "radar-total--US-EastGulfCoast" in captured
 
     def test_download_calls_subset_with_resolved_region_part(self, tmp_path):
+        from pathlib import Path
         from unittest.mock import patch, MagicMock
         from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
 
@@ -334,6 +335,7 @@ class TestHFRadarDownloaderGrid:
         assert kwargs["maximum_longitude"] == -60.0
 
     def test_recent_date_uses_latest_part_when_region_has_one(self, tmp_path):
+        from pathlib import Path
         from unittest.mock import patch, MagicMock
         from datetime import datetime, timedelta, timezone
         from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
