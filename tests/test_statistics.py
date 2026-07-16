@@ -325,3 +325,15 @@ class TestFilterVariablePairs:
         })
         pairs = filter_variable_pairs(recipe, ds)
         assert set(pairs) == {("oswTotalHs", "VAVH"), ("oswTotalHs", "VHM0")}
+
+    def test_owiSignificantWaveHeight_alone_when_primary_absent(self):
+        """When neither oswTotalHs nor oswHs exists, owiSignificantWaveHeight
+        alone is selected as the (only) SAR variable, as long as it has data."""
+        recipe = _waves_recipe(["WV", "SM"])
+        ds = xr.Dataset({
+            "sar_owiSignificantWaveHeight": ("collocation", [1.35, 1.4]),
+            "val_VAVH":                     ("collocation", [1.42, 1.48]),
+            "val_source":                   ("collocation", ["altimeter", "altimeter"]),
+        })
+        pairs = filter_variable_pairs(recipe, ds)
+        assert pairs == [("owiSignificantWaveHeight", "VAVH")]

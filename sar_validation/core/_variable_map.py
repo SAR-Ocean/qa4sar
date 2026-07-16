@@ -89,8 +89,8 @@ def filter_variable_pairs(
     collocation_ds,
 ) -> List[Tuple[str, str]]:
     """
-    Filter variable pairs based on recipe swath mode and available variables
-    in the collocation dataset.
+    Filter variable pairs based on the recipe's variable type and available
+    variables in the collocation dataset.
 
     For "waves" variable type, this function:
     1. Detects which wave validation parameters are available (VHM0, VAVH, VGHS, etc.)
@@ -106,7 +106,7 @@ def filter_variable_pairs(
     Parameters
     ----------
     recipe : Recipe
-        Recipe object with config.variable and config.sar_data.swath_mode
+        Recipe object with config.variable
     collocation_ds : xr.Dataset
         Collocation dataset with variables named ``sar_<var>`` and ``val_<var>``
 
