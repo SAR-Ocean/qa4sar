@@ -711,3 +711,290 @@ class TestOrchestratorDepthResolution:
         # most permissive window across resolved depths: min(-5,-20)=-20, max(5,20)=20
         assert kwargs["min_depth"] == -20.0
         assert kwargs["max_depth"] == 20.0
+
+
+# ---------------------------------------------------------------------------
+# Tests for _hf_radar_regions (shared Copernicus HF-radar region lookup)
+# ---------------------------------------------------------------------------
+
+from sar_validation.downloaders._hf_radar_regions import HFR_REGIONS, resolve_hfr_region
+
+
+class TestHfRadarRegions:
+    def test_us_east_gulf_bbox_resolves(self):
+        assert resolve_hfr_region(-90.0, -60.0, 30.0, 40.0) == "US-EastGulfCoast"
+
+    def test_us_west_coast_bbox_resolves(self):
+        assert resolve_hfr_region(-125.0, -119.0, 33.0, 38.0) == "US-WestCoast"
+
+    def test_no_overlap_raises_with_region_list(self):
+        with pytest.raises(ValueError, match="US-EastGulfCoast"):
+            resolve_hfr_region(100.0, 105.0, -10.0, -5.0)  # nowhere near any region
+
+    def test_picks_largest_overlap_when_bbox_spans_two_regions(self):
+        # DeltaEbro and ICATMAR genuinely overlap in the western
+        # Mediterranean. A query bbox weighted toward each region's side of
+        # the overlap should resolve to that region, exercising the
+        # largest-overlap-area tie-break rather than "first match wins".
+        assert resolve_hfr_region(0.0, 1.5, 39.6, 41.2) == "DeltaEbro"
+        assert resolve_hfr_region(0.5, 4.0, 40.6, 42.9) == "ICATMAR"
+
+    def test_all_regions_have_bbox_and_flag(self):
+        assert len(HFR_REGIONS) == 25
+        for name, cfg in HFR_REGIONS.items():
+            assert len(cfg["bbox"]) == 4
+            assert isinstance(cfg["has_latest"], bool)
+
+    def test_regions_without_latest_feed(self):
+        no_latest = {n for n, c in HFR_REGIONS.items() if not c["has_latest"]}
+        assert no_latest == {
+            "ARPAS", "COSYNA", "Finnmark", "US-Alaska",
+            "US-EastGulfCoast", "US-Hawaii", "WHub",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Tests for HFRadarDownloader querying the gridded radar-total dataset_parts
+# ---------------------------------------------------------------------------
+
+class TestHFRadarDownloaderGrid:
+    def test_dry_run_prints_resolved_region_and_part(self, tmp_path, capsys):
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        dl = HFRadarDownloader(output_dir=tmp_path, dry_run=True)
+        out = dl.download(-90.0, -60.0, 30.0, 40.0, "2026-06-05", "2026-06-06")
+        assert out is None
+        captured = capsys.readouterr().out
+        assert "US-EastGulfCoast" in captured
+        assert "radar-total--US-EastGulfCoast" in captured
+
+    def test_download_calls_subset_with_resolved_region_part(self, tmp_path):
+        from pathlib import Path
+        from unittest.mock import patch, MagicMock
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False)
+        fake_module = MagicMock()
+
+        def fake_subset(**kwargs):
+            # Simulate copernicusmarine writing the requested file.
+            Path(kwargs["output_directory"], kwargs["output_filename"]).write_bytes(b"")
+
+        fake_module.subset.side_effect = fake_subset
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            out = dl.download(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")
+
+        assert out is not None
+        assert out.exists()
+        _, kwargs = fake_module.subset.call_args
+        assert kwargs["dataset_part"] == "monthly-radar-total--US-EastGulfCoast"
+        assert kwargs["minimum_longitude"] == -90.0
+        assert kwargs["maximum_longitude"] == -60.0
+
+    def test_recent_date_uses_latest_part_when_region_has_one(self, tmp_path):
+        from pathlib import Path
+        from unittest.mock import patch, MagicMock
+        from datetime import datetime, timedelta, timezone
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        recent_end = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+        recent_start = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%d")
+        dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False)
+        fake_module = MagicMock()
+
+        def fake_subset(**kwargs):
+            Path(kwargs["output_directory"], kwargs["output_filename"]).write_bytes(b"")
+
+        fake_module.subset.side_effect = fake_subset
+        # US-WestCoast has a `latest` feed (unlike US-EastGulfCoast).
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            dl.download(-125.0, -119.0, 33.0, 38.0, recent_start, recent_end)
+
+        _, kwargs = fake_module.subset.call_args
+        assert kwargs["dataset_part"] == "latest-radar-total--US-WestCoast"
+
+    def test_constructor_accepts_unused_depth_kwargs(self, tmp_path):
+        # The orchestrator always passes min_depth/max_depth; the gridded
+        # product has no depth axis, but the kwargs must still be accepted.
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        HFRadarDownloader(output_dir=tmp_path, dry_run=True, min_depth=-2.0, max_depth=2.0)
+
+    def test_retries_with_monthly_part_when_latest_out_of_bounds(self, tmp_path):
+        from pathlib import Path
+        from unittest.mock import patch, MagicMock
+        from datetime import datetime, timedelta, timezone
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        recent_end = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+        recent_start = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%d")
+        dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False)
+        fake_module = MagicMock()
+
+        call_count = {"n": 0}
+
+        def fake_subset(**kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError(
+                    "The requested time range appears to exceed the dataset "
+                    "coordinates for this dataset_part."
+                )
+            Path(kwargs["output_directory"], kwargs["output_filename"]).write_bytes(b"")
+
+        fake_module.subset.side_effect = fake_subset
+        # US-WestCoast has a `latest` feed, so the first attempt uses it and
+        # is expected to fail, triggering a retry with the `monthly` part.
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            out = dl.download(-125.0, -119.0, 33.0, 38.0, recent_start, recent_end)
+
+        assert out is not None
+        assert out.exists()
+        assert fake_module.subset.call_count == 2
+        first_kwargs = fake_module.subset.call_args_list[0].kwargs
+        second_kwargs = fake_module.subset.call_args_list[1].kwargs
+        assert first_kwargs["dataset_part"] == "latest-radar-total--US-WestCoast"
+        assert second_kwargs["dataset_part"] == "monthly-radar-total--US-WestCoast"
+
+    def test_raises_file_not_found_when_subset_writes_no_file(self, tmp_path):
+        from unittest.mock import patch, MagicMock
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False)
+        fake_module = MagicMock()
+        # subset() "succeeds" (no exception) but never writes the destination
+        # file, simulating an empty/no-op response from copernicusmarine.
+        fake_module.subset.side_effect = lambda **kwargs: None
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            with pytest.raises(FileNotFoundError):
+                dl.download(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")
+
+
+# ---------------------------------------------------------------------------
+# Tests for HFRadarHistoricalDownloader
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field
+from typing import List, Any
+
+
+@dataclass
+class FileGetResult:
+    files: List[Any] = field(default_factory=list)
+
+
+class TestHFRadarHistoricalDownloader:
+    def test_dry_run_prints_resolved_region_and_filename(self, tmp_path, capsys):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=True)
+        out = dl.download(-90.0, -60.0, 30.0, 40.0, "2021-06-05", "2021-06-06")
+        assert out is None
+        captured = capsys.readouterr().out
+        assert "US-EastGulfCoast" in captured
+        assert "GL_TV_HF_HFR-US-EastGulfCoast_Total_2021.nc" in captured
+
+    def test_unavailable_region_raises_clear_error(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=True)
+        # GoS (Italy) has an NRT feed but no delayed-mode archive.
+        with pytest.raises(ValueError, match="no delayed-mode HF-radar archive"):
+            dl.download(13.5, 15.5, 40.0, 41.0, "2021-01-01", "2021-01-02")
+
+    def test_multi_year_request_not_yet_supported(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=True)
+        with pytest.raises(NotImplementedError, match="single calendar year"):
+            dl.download(-90.0, -60.0, 30.0, 40.0, "2020-12-30", "2021-01-02")
+
+    def test_year_outside_split_archive_range_raises_clear_error(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=True)
+        # US-EastGulfCoast's historical archive is split into one file per
+        # year, only for 2019-2024; a request for 2018 falls outside that
+        # range and should raise a clear, actionable error rather than a
+        # silent bad file lookup.
+        with pytest.raises(
+            ValueError,
+            match="No US-EastGulfCoast historical archive for year 2018",
+        ):
+            dl.download(-90.0, -60.0, 30.0, 40.0, "2018-01-01", "2018-01-02")
+
+    def test_download_gets_file_then_subsets_locally(self, tmp_path):
+        from unittest.mock import patch, MagicMock
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+        import xarray as xr
+        import numpy as np
+        import pandas as pd
+
+        raw_dir = tmp_path / "_raw"
+        raw_dir.mkdir()
+        raw_path = raw_dir / "GL_TV_HF_HFR-US-WestCoast_Total.nc"
+        times = pd.date_range("2019-01-01", periods=5, freq="1h")
+        shape = (5, 1, 2, 2)
+        ds = xr.Dataset(
+            {
+                "EWCT": (("TIME", "DEPTH", "LATITUDE", "LONGITUDE"), np.random.rand(*shape)),
+                "NSCT": (("TIME", "DEPTH", "LATITUDE", "LONGITUDE"), np.random.rand(*shape)),
+                "GDOP": (("TIME", "DEPTH", "LATITUDE", "LONGITUDE"), np.random.rand(*shape)),
+            },
+            coords={
+                "TIME": times, "DEPTH": [0.0],
+                "LATITUDE": [33.0, 34.0], "LONGITUDE": [-121.0, -120.0],
+            },
+        )
+        ds.to_netcdf(raw_path)
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path / "out", dry_run=False)
+        fake_module = MagicMock()
+
+        def fake_get(**kwargs):
+            # FileGetResult is defined at module scope in this test file (see
+            # the brief's note: it's a mock stand-in only, not a symbol the
+            # implementation defines or imports).
+            return FileGetResult(files=[type("F", (), {"file_path": raw_path})()])
+
+        fake_module.get.side_effect = fake_get
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            out = dl.download(-121.0, -120.0, 33.0, 34.0, "2019-01-01", "2019-01-01T04:00:00")
+
+        assert out is not None
+        assert out.exists()
+        result = xr.open_dataset(out)
+        assert "time" in result.dims and "latitude" in result.dims and "longitude" in result.dims
+        assert "DEPTH" not in result.dims
+        assert result.sizes["time"] == 5
+
+
+class TestOrchestratorHFRadarHistoricalWiring:
+    def test_dispatch_source_registers_hf_radar_historical_handler(self):
+        from unittest.mock import patch
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(name="test", variable="currents"))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        source = ValidationDataSource(source_type="hf_radar_historical")
+
+        with patch(
+            "sar_validation.downloaders.hf_radar_historical_downloader.HFRadarHistoricalDownloader"
+        ) as mock_cls:
+            mock_cls.return_value.download.return_value = None
+            ok = orchestrator._dispatch_source(source)
+
+        assert ok is True
+        mock_cls.assert_called_once()

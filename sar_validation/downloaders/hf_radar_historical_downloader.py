@@ -1,0 +1,268 @@
+"""
+Download delayed-mode (historical) HF-radar surface-current grids from
+Copernicus Marine.
+
+Data source: INSITU_GLO_PHY_UV_DISCRETE_MY_013_044
+    Dataset ID: cmems_obs-ins_glo_phy-cur_my_radar-total_irr
+
+Unlike the NRT product (see ``hf_radar_downloader.py``), this dataset is not
+subsettable server-side: it exposes one bulk NetCDF file per named region
+under its "original-files" service (``history/HF/GL_TV_HF_HFR-<Region>_Total[_<YYYY>].nc``),
+1979-2026-ish depending on region. This downloader fetches the one matching
+region file (cached via ``skip_existing``, since a region's file covers many
+years and multiple runs will reuse it), then subsets it locally in xarray to
+the requested time window and bbox, normalizing the on-disk shape (uppercase
+OceanSITES dims + a singleton DEPTH axis) to match the NRT grid downloader's
+output so both share the same converter path.
+
+Library usage::
+
+    from sar_validation.downloaders.hf_radar_historical_downloader import (
+        HFRadarHistoricalDownloader,
+    )
+    dl = HFRadarHistoricalDownloader(output_dir=Path("data/run1/hf_radar_historical"))
+    dl.download(min_lon=-90, max_lon=-60, min_lat=30, max_lat=40,
+                start="2021-06-05", end="2021-06-06")
+
+CLI usage::
+
+    python -m sar_validation.downloaders.hf_radar_historical_downloader \\
+        --min-lon -90 --max-lon -60 --min-lat 30 --max-lat 40 \\
+        --start 2021-06-05 --end 2021-06-06
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Optional
+
+from .base import normalize_datetime, build_output_dir
+from ._hf_radar_regions import resolve_hfr_region
+
+__all__ = ["HFRadarHistoricalDownloader"]
+
+DATASET_ID = "cmems_obs-ins_glo_phy-cur_my_radar-total_irr"
+
+# Regions present in the delayed-mode archive, verified via
+# copernicusmarine.get(dataset_id=DATASET_ID, dry_run=True) on 2026-07-15.
+# Regions in HFR_REGIONS but absent here (GoS, Granitola, WHub) have no
+# historical archive. US-EastGulfCoast is split into one file per year
+# (2019-2024); every other region is one file covering its whole record.
+_SPLIT_BY_YEAR_REGION = "US-EastGulfCoast"
+_SPLIT_BY_YEAR_YEARS = (2019, 2020, 2021, 2022, 2023, 2024)
+
+_REGION_FILENAMES = {
+    "ARPAS": "GL_TV_HF_HFR-ARPAS_Total.nc",
+    "CALYPSO": "GL_TV_HF_HFR-CALYPSO_Total.nc",
+    "COSYNA": "GL_TV_HF_HFR-COSYNA_Total.nc",
+    "DeltaEbro": "GL_TV_HF_HFR-DeltaEbro_Total.nc",
+    "EUSKOOS": "GL_TV_HF_HFR-EUSKOOS_Total.nc",
+    "Finnmark": "GL_TV_HF_HFR-Finnmark_Total.nc",
+    "Galicia": "GL_TV_HF_HFR-Galicia_Total.nc",
+    "Gibraltar": "GL_TV_HF_HFR-Gibraltar_Total.nc",
+    "ICATMAR": "GL_TV_HF_HFR-ICATMAR_Total.nc",
+    "Ibiza": "GL_TV_HF_HFR-Ibiza_Total.nc",
+    "Lisboa": "GL_TV_HF_HFR-Lisboa_Total.nc",
+    "NAdr": "GL_TV_HF_HFR-NAdr_Total.nc",
+    "PLOCAN": "GL_TV_HF_HFR-PLOCAN_Total.nc",
+    "Skagerrak": "GL_TV_HF_HFR-Skagerrak_Total.nc",
+    "South": "GL_TV_HF_HFR-South_Total.nc",
+    "TirLig": "GL_TV_HF_HFR-TirLig_Total.nc",
+    "US-Alaska": "GL_TV_HF_HFR-US-Alaska_Total.nc",
+    "US-Hawaii": "GL_TV_HF_HFR-US-Hawaii_Total.nc",
+    "US-PuertoRicoVirginIslands": "GL_TV_HF_HFR-US-PuertoRicoVirginIslands_Total.nc",
+    "US-WestCoast": "GL_TV_HF_HFR-US-WestCoast_Total.nc",
+    "Vestlandet": "GL_TV_HF_HFR-Vestlandet_Total.nc",
+}
+
+
+def _region_filename(region: str, start_dt: str, end_dt: str) -> str:
+    if region == _SPLIT_BY_YEAR_REGION:
+        start_year = int(start_dt[:4])
+        end_year = int(end_dt[:4])
+        if start_year != end_year:
+            raise NotImplementedError(
+                f"{_SPLIT_BY_YEAR_REGION}'s historical archive is split into one "
+                "file per year; requests spanning more than a single calendar "
+                f"year (got {start_dt} .. {end_dt}) are not yet supported."
+            )
+        if start_year not in _SPLIT_BY_YEAR_YEARS:
+            raise ValueError(
+                f"No {_SPLIT_BY_YEAR_REGION} historical archive for year {start_year}; "
+                f"available years: {_SPLIT_BY_YEAR_YEARS}"
+            )
+        return f"GL_TV_HF_HFR-US-EastGulfCoast_Total_{start_year}.nc"
+    if region not in _REGION_FILENAMES:
+        raise ValueError(
+            f"no delayed-mode HF-radar archive for region '{region}'. "
+            f"Available: {sorted(_REGION_FILENAMES) + [_SPLIT_BY_YEAR_REGION]}"
+        )
+    return _REGION_FILENAMES[region]
+
+
+class HFRadarHistoricalDownloader:
+    """
+    Download and locally subset a Copernicus Marine delayed-mode HF-radar
+    current grid (dataset 013_044) for the region overlapping the request bbox.
+
+    Parameters
+    ----------
+    output_dir : Path
+        Directory to save the subsetted, normalized NetCDF.
+    dry_run : bool
+        If True, print what would be downloaded without fetching anything.
+    """
+
+    def __init__(self, output_dir: Path, dry_run: bool = False) -> None:
+        self.output_dir = Path(output_dir)
+        self.dry_run = dry_run
+
+    def download(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+    ) -> Optional[Path]:
+        region = resolve_hfr_region(min_lon, max_lon, min_lat, max_lat)
+        start_dt = normalize_datetime(start)
+        end_dt = normalize_datetime(end)
+        remote_filename = _region_filename(region, start_dt, end_dt)
+
+        start_d = start_dt.split("T")[0]
+        end_d = end_dt.split("T")[0]
+        date_str = start_d if start_d == end_d else f"{start_d}-{end_d}"
+        dest_path = self.output_dir / f"{DATASET_ID}_{region}_{date_str}.nc"
+
+        if self.dry_run:
+            print(
+                f"[DRY RUN] Would fetch Copernicus HF-radar historical archive "
+                f"'{remote_filename}' for region '{region}' and subset to:\n  {dest_path}"
+            )
+            return None
+
+        try:
+            import copernicusmarine
+        except ImportError as exc:
+            raise ImportError(
+                "copernicusmarine is required for HF radar downloads.\n"
+                "Install it with:  pip install copernicusmarine"
+            ) from exc
+        import xarray as xr
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        raw_cache_dir = self.output_dir / "_raw_archive"
+        raw_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        print("Fetching Copernicus HF-radar delayed-mode archive …")
+        print(f"  Region: {region}")
+        print(f"  Archive file: {remote_filename}")
+        resp = copernicusmarine.get(
+            dataset_id=DATASET_ID,
+            filter=f"*{remote_filename}",
+            output_directory=str(raw_cache_dir),
+            no_directories=True,
+            skip_existing=True,
+            disable_progress_bar=True,
+        )
+        if not resp.files:
+            raise FileNotFoundError(
+                f"No archive file matched '{remote_filename}' for region '{region}'."
+            )
+        raw_path = Path(resp.files[0].file_path)
+
+        raw = xr.open_dataset(raw_path)
+        try:
+            # Keep EWCT/NSCT plus every ancillary uncertainty/QC field the
+            # converter (Task 3) knows how to retain — standard deviations
+            # (EWCS/NSCS), the geometric-dilution field (GDOP), the overall
+            # QCflag, and each per-parameter QC flag — whichever of these
+            # this archive file actually has.
+            _ancillary_vars = (
+                "GDOP", "EWCS", "NSCS", "QCflag",
+                "CSPD_QC", "DDNS_QC", "GDOP_QC", "VART_QC", "POSITION_QC",
+            )
+            normalized = (
+                raw[["EWCT", "NSCT"] + [v for v in _ancillary_vars if v in raw]]
+                .squeeze("DEPTH", drop=True)
+                .rename({"TIME": "time", "LATITUDE": "latitude", "LONGITUDE": "longitude"})
+                .sortby(["latitude", "longitude"])
+                .sel(
+                    time=slice(start_dt, end_dt),
+                    latitude=slice(min_lat, max_lat),
+                    longitude=slice(min_lon, max_lon),
+                )
+            )
+            if normalized.sizes.get("time", 0) == 0:
+                raise FileNotFoundError(
+                    f"Copernicus HF-radar historical archive for region '{region}' has "
+                    f"no data in [{start_dt}, {end_dt}]."
+                )
+            normalized.to_netcdf(dest_path)
+        finally:
+            raw.close()
+
+        print(f"  Saved to {dest_path}")
+        return dest_path
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def _parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="Download a Copernicus Marine delayed-mode HF-radar current grid.",
+    )
+    p.add_argument("--params-file", metavar="FILE")
+    p.add_argument("--min-lon", type=float)
+    p.add_argument("--max-lon", type=float)
+    p.add_argument("--min-lat", type=float)
+    p.add_argument("--max-lat", type=float)
+    p.add_argument("--start")
+    p.add_argument("--end")
+    p.add_argument("--output-dir", default=None)
+    p.add_argument("--dry-run", action="store_true")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+
+    if args.params_file:
+        with open(args.params_file) as f:
+            params = json.load(f)
+        min_lon = params["minimum_longitude"]
+        max_lon = params["maximum_longitude"]
+        min_lat = params["minimum_latitude"]
+        max_lat = params["maximum_latitude"]
+        start = params["start_datetime"]
+        end = params["end_datetime"]
+    else:
+        for attr in ("min_lon", "max_lon", "min_lat", "max_lat", "start", "end"):
+            if getattr(args, attr) is None:
+                print(f"Error: --{attr.replace('_','-')} is required (or use --params-file)")
+                sys.exit(1)
+        min_lon, max_lon = args.min_lon, args.max_lon
+        min_lat, max_lat = args.min_lat, args.max_lat
+        start, end = args.start, args.end
+
+    output_dir = Path(args.output_dir) if args.output_dir else (
+        build_output_dir(start, end, min_lon, max_lon, min_lat, max_lat) / "hf_radar_historical"
+    )
+
+    dl = HFRadarHistoricalDownloader(output_dir=output_dir, dry_run=args.dry_run)
+    dl.download(
+        min_lon=min_lon, max_lon=max_lon,
+        min_lat=min_lat, max_lat=max_lat,
+        start=start, end=end,
+    )
+
+
+if __name__ == "__main__":
+    main()

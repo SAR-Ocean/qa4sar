@@ -89,15 +89,16 @@ def filter_variable_pairs(
     collocation_ds,
 ) -> List[Tuple[str, str]]:
     """
-    Filter variable pairs based on recipe swath mode and available variables
-    in the collocation dataset.
+    Filter variable pairs based on the recipe's variable type and available
+    variables in the collocation dataset.
 
     For "waves" variable type, this function:
     1. Detects which wave validation parameters are available (VHM0, VAVH, VGHS, etc.)
-    2. For WV mode: generates pairs with oswTotalHs (integrated total significant
-       wave height), falling back to the legacy oswHs partition variable
-    3. For IW/EW mode: generates pairs for both oswHs and owiSignificantWaveHeight
-    4. Filters to only pairs where both SAR and validation variables exist
+    2. Picks the primary SAR wave variable by fallback (oswTotalHs, else
+       oswHs, based on which column actually exists in collocation_ds), and
+       additionally includes owiSignificantWaveHeight whenever that column
+       exists and has at least one non-NaN value
+    3. Filters to only pairs where both SAR and validation variables exist
 
     For other variable types (wind, currents):
     - Filters to only pairs where both variables exist in the collocation data
@@ -105,7 +106,7 @@ def filter_variable_pairs(
     Parameters
     ----------
     recipe : Recipe
-        Recipe object with config.variable and config.sar_data.swath_mode
+        Recipe object with config.variable
     collocation_ds : xr.Dataset
         Collocation dataset with variables named ``sar_<var>`` and ``val_<var>``
 
@@ -116,29 +117,44 @@ def filter_variable_pairs(
     """
     variable = recipe.config.variable
     base_pairs = infer_variable_pairs(variable)
-    swath_modes = recipe.config.sar_data.swath_mode or ["IW", "EW"]
-    is_wv_only = set(swath_modes) == {"WV"}
 
     # For waves: expand to all available wave validation parameters
     if variable == "waves":
         # Wave validation parameter candidates (in preferred order)
         wave_val_params = ["VHM0", "VAVH", "VGHS", "VAVH_UNFILTERED"]
-        
-        # Determine which SAR variables to use based on swath mode
-        if is_wv_only:
-            # WV mode: prefer the integrated total significant wave height;
-            # fall back to the legacy oswHs partition variable. The filter
-            # below keeps only whichever is actually present.
-            sar_vars = ["oswTotalHs", "oswHs"]
-        else:
-            # IW/EW or mixed mode: prefer oswHs if available, but also try owiSignificantWaveHeight
-            sar_vars = ["oswHs", "owiSignificantWaveHeight"]
-        
-        # Generate all combinations of available SAR and validation pairs
+
+        # Primary SAR wave-height variable: single-winner fallback driven by
+        # which sar_<name> column actually exists in collocation_ds — NOT by
+        # recipe.config.sar_data.swath_mode, since a recipe can request
+        # multiple modes (e.g. [WV, SM]) while the downloader only ends up
+        # returning scenes for one of them. Using the requested mode to pick
+        # candidates caused real WV-only results to be silently dropped when
+        # a mixed mode was requested (see
+        # docs/superpowers/specs/2026-07-16-wave-sar-variable-fallback-design.md).
+        primary_candidates = ["oswTotalHs", "oswHs"]
+        primary_var = next(
+            (v for v in primary_candidates if f"sar_{v}" in collocation_ds),
+            None,
+        )
+
+        sar_vars = [primary_var] if primary_var is not None else []
+
+        # owiSignificantWaveHeight is additive, not a fallback: it's a
+        # genuinely different measurement (IW/EW grid product), so when it
+        # actually carries data it gets its own statistics alongside the
+        # primary variable rather than replacing it. In every real product
+        # seen so far this column is either absent or entirely NaN, in which
+        # case it must NOT be selected.
+        owi_col = "sar_owiSignificantWaveHeight"
+        if owi_col in collocation_ds and bool(collocation_ds[owi_col].notnull().any()):
+            sar_vars.append("owiSignificantWaveHeight")
+
+        # Generate all combinations of the selected SAR variable(s) and
+        # available validation pairs
         pairs = []
-        for sar_var in sar_vars:
+        for sv in sar_vars:
             for val_param in wave_val_params:
-                pairs.append((sar_var, val_param))
+                pairs.append((sv, val_param))
     else:
         pairs = base_pairs.copy()
 
