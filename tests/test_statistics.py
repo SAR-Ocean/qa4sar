@@ -9,8 +9,8 @@ import pytest
 import xarray as xr
 
 from sar_validation.core.statistics import compute_statistics, save_statistics, run_statistics
-from sar_validation.core._variable_map import infer_variable_pairs
-from sar_validation.core.recipe import Recipe, RecipeConfig
+from sar_validation.core._variable_map import infer_variable_pairs, filter_variable_pairs
+from sar_validation.core.recipe import Recipe, RecipeConfig, SARDataSpec
 
 
 # ---------------------------------------------------------------------------
@@ -234,3 +234,94 @@ class TestVariableMap:
     def test_unknown_raises(self):
         with pytest.raises(KeyError):
             infer_variable_pairs("invalid_variable")
+
+
+# ---------------------------------------------------------------------------
+# filter_variable_pairs
+# ---------------------------------------------------------------------------
+
+def _waves_recipe(swath_mode):
+    return Recipe(RecipeConfig(
+        name="waves_test",
+        variable="waves",
+        sar_data=SARDataSpec(swath_mode=swath_mode),
+    ))
+
+
+class TestFilterVariablePairs:
+    def test_mixed_mode_uses_oswTotalHs_when_present(self):
+        """Regression test: recipe requests [WV, SM] but only WV scenes were
+        actually downloaded, so the dataset only has sar_oswTotalHs. This is
+        the exact scenario from recipes/waves_example.yaml that produced zero
+        statistics before the fix."""
+        recipe = _waves_recipe(["WV", "SM"])
+        ds = xr.Dataset({
+            "sar_oswTotalHs": ("collocation", [1.4, 1.5]),
+            "val_VAVH":       ("collocation", [1.42, 1.48]),
+            "val_source":     ("collocation", ["altimeter", "altimeter"]),
+        })
+        pairs = filter_variable_pairs(recipe, ds)
+        assert pairs == [("oswTotalHs", "VAVH")]
+
+    def test_falls_back_to_oswHs_when_oswTotalHs_absent(self):
+        recipe = _waves_recipe(["WV", "SM"])
+        ds = xr.Dataset({
+            "sar_oswHs":  ("collocation", [1.4, 1.5]),
+            "val_VAVH":   ("collocation", [1.42, 1.48]),
+            "val_source": ("collocation", ["altimeter", "altimeter"]),
+        })
+        pairs = filter_variable_pairs(recipe, ds)
+        assert pairs == [("oswHs", "VAVH")]
+
+    def test_owiSignificantWaveHeight_excluded_when_all_nan(self):
+        """owiSignificantWaveHeight must NOT be selected when its column is
+        entirely NaN — this matches every real product observed so far."""
+        recipe = _waves_recipe(["WV", "SM"])
+        ds = xr.Dataset({
+            "sar_oswTotalHs":               ("collocation", [1.4, 1.5]),
+            "sar_owiSignificantWaveHeight": ("collocation", [np.nan, np.nan]),
+            "val_VAVH":                     ("collocation", [1.42, 1.48]),
+            "val_source":                   ("collocation", ["altimeter", "altimeter"]),
+        })
+        pairs = filter_variable_pairs(recipe, ds)
+        assert pairs == [("oswTotalHs", "VAVH")]
+
+    def test_owiSignificantWaveHeight_additive_when_it_has_data(self):
+        """When owiSignificantWaveHeight has at least one real value, stats
+        must be produced for BOTH it and the primary variable (oswTotalHs) —
+        not just one or the other."""
+        recipe = _waves_recipe(["WV", "SM"])
+        ds = xr.Dataset({
+            "sar_oswTotalHs":               ("collocation", [1.4, 1.5]),
+            "sar_owiSignificantWaveHeight": ("collocation", [1.35, np.nan]),
+            "val_VAVH":                     ("collocation", [1.42, 1.48]),
+            "val_source":                   ("collocation", ["altimeter", "altimeter"]),
+        })
+        pairs = filter_variable_pairs(recipe, ds)
+        assert set(pairs) == {("oswTotalHs", "VAVH"), ("owiSignificantWaveHeight", "VAVH")}
+
+    def test_does_not_double_count_oswTotalHs_and_oswHs(self):
+        """oswTotalHs must win outright over oswHs — oswHs must not also
+        appear even though its column exists in the dataset."""
+        recipe = _waves_recipe(["WV"])
+        ds = xr.Dataset({
+            "sar_oswTotalHs": ("collocation", [1.4, 1.5]),
+            "sar_oswHs":      ("collocation", [1.3, 1.6]),
+            "val_VAVH":       ("collocation", [1.42, 1.48]),
+            "val_source":     ("collocation", ["altimeter", "altimeter"]),
+        })
+        pairs = filter_variable_pairs(recipe, ds)
+        assert pairs == [("oswTotalHs", "VAVH")]
+
+    def test_multiple_val_vars_cross_single_sar_winner(self):
+        """Validation-side candidates are unaffected: every val_var that
+        exists still produces its own pair against the one winning sar_var."""
+        recipe = _waves_recipe(["WV", "SM"])
+        ds = xr.Dataset({
+            "sar_oswTotalHs": ("collocation", [1.4, 1.5]),
+            "val_VAVH":       ("collocation", [1.42, 1.48]),
+            "val_VHM0":       ("collocation", [1.40, 1.50]),
+            "val_source":     ("collocation", ["altimeter", "buoy"]),
+        })
+        pairs = filter_variable_pairs(recipe, ds)
+        assert set(pairs) == {("oswTotalHs", "VAVH"), ("oswTotalHs", "VHM0")}
