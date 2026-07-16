@@ -732,10 +732,12 @@ class TestHfRadarRegions:
             resolve_hfr_region(100.0, 105.0, -10.0, -5.0)  # nowhere near any region
 
     def test_picks_largest_overlap_when_bbox_spans_two_regions(self):
-        # A bbox mostly inside US-WestCoast but touching PLOCAN-scale noise
-        # should not happen in practice; this instead checks the tie-break
-        # is deterministic for a bbox fully inside exactly one region.
-        assert resolve_hfr_region(-124.0, -122.0, 36.0, 37.0) == "US-WestCoast"
+        # DeltaEbro and ICATMAR genuinely overlap in the western
+        # Mediterranean. A query bbox weighted toward each region's side of
+        # the overlap should resolve to that region, exercising the
+        # largest-overlap-area tie-break rather than "first match wins".
+        assert resolve_hfr_region(0.0, 1.5, 39.6, 41.2) == "DeltaEbro"
+        assert resolve_hfr_region(0.5, 4.0, 40.6, 42.9) == "ICATMAR"
 
     def test_all_regions_have_bbox_and_flag(self):
         assert len(HFR_REGIONS) == 25
