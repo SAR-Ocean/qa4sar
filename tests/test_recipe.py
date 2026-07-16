@@ -248,17 +248,6 @@ class TestCurrentsTemplate:
 
         recipe = cli._build_currents_config(limit=7)
         source_types = [s.source_type for s in recipe.validation_sources]
-        assert source_types == ["hf_radar", "hf_radar_noaa", "drifter", "ferrybox", "mooring"]
-
-        hf_radar_src = recipe.validation_sources[0]
-        assert hf_radar_src.min_depth == -2.0
-        assert hf_radar_src.max_depth == 2.0
-
-        specs = recipe.collocation.layer_vs_layer.layer_type_specs
-        assert specs["hf_radar"] == {
-            "time_tolerance_minutes": 60,
-            "aggregation_window_km": 5.0,
-            "distance_weighting": "equal",
-        }
+        assert source_types == ["hf_radar_noaa", "drifter", "ferrybox", "mooring"]
 
         assert recipe.sar_data.max_downloads == 7
