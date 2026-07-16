@@ -278,3 +278,37 @@ universally via the shared helper.
   beyond no longer being saved as standalone PNGs (item 1).
 - The deferred Phase 3a Task 9 Step 4 integration test (separate, unrelated
   plan).
+
+---
+
+## Addendum (2026-07-16) — Item 5: currents HF radar point size in `plot_geographic`
+
+### Problem
+
+Confirmed in
+`data/2026-06-01-000000-2026-06-01-235959_-130.00_-115.00_33.00_48.00/validation_report.pdf`
+(geographic page): `plot_geographic`'s validation-point scatter uses a fixed
+`point_size=40` (visualization.py:463) regardless of source density. HF
+radar — currents' only layer-type (`layer_vs_layer`) source — is dense
+enough (a near-continuous coverage grid) that at `s=40` the matched points
+tile edge-to-edge and completely blanket the SAR `rvlRadVel` field
+underneath, making the SAR scene invisible wherever HF radar coverage
+exists.
+
+### Fix
+
+`validation_report` already computes `variable = recipe.config.variable`
+(visualization.py:1858) before its per-pair plotting loop. Pass a smaller
+`point_size` through to `plot_geographic` when `variable == "currents"`
+(`15` vs. the existing default of `40`) — no change to `plot_geographic`
+itself, which already accepts `point_size` as a parameter. Not scoped to
+HF radar specifically (`plot_geographic` doesn't distinguish sources when
+choosing `point_size`, only `validation_report` decides the value to pass),
+which is an acceptable simplification since HF radar is currents' only
+dense layer source today.
+
+### Test
+
+`validation_report`-level spy on `plot_geographic`, asserting
+`point_size=15` is passed for a `"currents"` recipe and `point_size=40`
+(the existing default) for other variable types.
