@@ -260,13 +260,8 @@ def _build_currents_config(limit: Optional[int] = None):
         geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
         sar_data=SARDataSpec(swath_mode=["WV","IW","EW","SM"], max_downloads=limit),
         validation_sources=[
-            # "hf_radar" (Copernicus cmems_obs-ins_glo_phybgcwav_mynrt_na_irr
-            # sparse point path) is omitted: that dataset_part carries no
-            # HF-radar platforms, so the download always returns empty. Its
-            # real HF-radar data lives in per-region gridded
-            # "*-radar-total--<region>" dataset_parts, which need a separate
-            # gridded downloader (not yet implemented) routed like
-            # hf_radar_grid below.
+            ValidationDataSource(source_type="hf_radar"),
+            ValidationDataSource(source_type="hf_radar_historical"),
             ValidationDataSource(
                 source_type="hf_radar_noaa",
                 min_depth=-2.0, max_depth=2.0,
