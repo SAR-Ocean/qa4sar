@@ -34,6 +34,7 @@ __all__ = [
     "select_erddap_dataset",
     "build_erddap_subset_url",
     "select_backend",
+    "clamp_to_region_bbox",
 ]
 
 # ERDDAP griddap host serving the UCSD HFRnet RTV datasets.
@@ -62,27 +63,53 @@ def _bbox_center(min_lon, max_lon, min_lat, max_lat):
     return (min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0
 
 
+def _match_region(min_lon, max_lon, min_lat, max_lat) -> tuple[str, Dict]:
+    """Find the ``_REGIONS`` entry whose bbox contains the request's center point.
+
+    Raises ``ValueError`` if no configured region contains it.
+    """
+    clon, clat = _bbox_center(min_lon, max_lon, min_lat, max_lat)
+    for name, cfg in _REGIONS.items():
+        lo, hi, la, ha = cfg["bbox"]
+        if lo <= clon <= hi and la <= clat <= ha:
+            return name, cfg
+    raise ValueError(
+        "No ERDDAP HF-radar dataset for bbox center "
+        f"({clon:.2f}, {clat:.2f}). Phase 3a supports US West and US "
+        "East/Gulf coasts; other regions arrive in later phases."
+    )
+
+
 def select_erddap_dataset(min_lon, max_lon, min_lat, max_lat, resolution_km: int) -> str:
     """Choose the ERDDAP RTV dataset id from the request bbox and resolution.
 
     Raises ``ValueError`` if the region is outside the supported CONUS coasts
     or the requested resolution is unavailable for that region.
     """
-    clon, clat = _bbox_center(min_lon, max_lon, min_lat, max_lat)
-    for name, cfg in _REGIONS.items():
-        lo, hi, la, ha = cfg["bbox"]
-        if lo <= clon <= hi and la <= clat <= ha:
-            datasets = cfg["datasets"]
-            if resolution_km not in datasets:
-                raise ValueError(
-                    f"resolution {resolution_km} km not available for region "
-                    f"{name}; available: {sorted(datasets)} km"
-                )
-            return datasets[resolution_km]
-    raise ValueError(
-        "No ERDDAP HF-radar dataset for bbox center "
-        f"({clon:.2f}, {clat:.2f}). Phase 3a supports US West and US "
-        "East/Gulf coasts; other regions arrive in later phases."
+    name, cfg = _match_region(min_lon, max_lon, min_lat, max_lat)
+    datasets = cfg["datasets"]
+    if resolution_km not in datasets:
+        raise ValueError(
+            f"resolution {resolution_km} km not available for region "
+            f"{name}; available: {sorted(datasets)} km"
+        )
+    return datasets[resolution_km]
+
+
+def clamp_to_region_bbox(min_lon, max_lon, min_lat, max_lat) -> tuple[float, float, float, float]:
+    """Clamp a request bbox to the matched region's known grid extent.
+
+    ERDDAP griddap rejects (HTTP 404) any axis constraint that starts or ends
+    outside the dataset's actual coordinate axis, rather than clipping it —
+    so a recipe bbox that only partially overlaps a region (e.g. extending
+    past its southern edge) must be clamped here before the URL is built, not
+    left for the server to reject outright.
+    """
+    _, cfg = _match_region(min_lon, max_lon, min_lat, max_lat)
+    lo, hi, la, ha = cfg["bbox"]
+    return (
+        max(min_lon, lo), min(max_lon, hi),
+        max(min_lat, la), min(max_lat, ha),
     )
 
 
@@ -152,6 +179,9 @@ class NOAAHFRadarDownloader:
         backend = select_backend(end)  # raises if archive (Phase 3b) needed
         dataset_id = select_erddap_dataset(
             min_lon, max_lon, min_lat, max_lat, self.resolution_km
+        )
+        min_lon, max_lon, min_lat, max_lat = clamp_to_region_bbox(
+            min_lon, max_lon, min_lat, max_lat
         )
         url = build_erddap_subset_url(
             dataset_id, min_lon, max_lon, min_lat, max_lat, start, end

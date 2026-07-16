@@ -412,6 +412,7 @@ from sar_validation.downloaders.noaa_hfradar_downloader import (
     select_erddap_dataset,
     build_erddap_subset_url,
     select_backend,
+    clamp_to_region_bbox,
     ERDDAP_BASE,
 )
 
@@ -433,6 +434,27 @@ class TestSelectErddapDataset:
     def test_unsupported_resolution_raises(self):
         with pytest.raises(ValueError, match="resolution"):
             select_erddap_dataset(-80, -70, 35, 42, 2)  # US-East has no 2 km
+
+
+class TestClampToRegionBbox:
+    def test_bbox_fully_inside_region_is_unchanged(self):
+        assert clamp_to_region_bbox(-80, -70, 35, 42) == (-80.0, -70.0, 35.0, 42.0)
+
+    def test_bbox_extending_south_of_region_is_clamped(self):
+        # Reproduces the reported bug: a recipe bbox reaching down to 20.0N
+        # (to also cover Puerto Rico) extends past US-East/Gulf's actual
+        # southern grid edge (22.0N in _REGIONS), which ERDDAP rejects with
+        # HTTP 404 rather than clipping server-side.
+        min_lon, max_lon, min_lat, max_lat = clamp_to_region_bbox(-80, -60, 20.0, 40.0)
+        assert min_lat == 22.0
+        assert (min_lon, max_lon, max_lat) == (-80.0, -60.0, 40.0)
+
+    def test_clamped_bbox_stays_within_erddap_axis_bounds(self):
+        # 22.0N (the _REGIONS config bound) must be >= the real ERDDAP grid's
+        # minimum latitude (21.73596N per the dataset's .das), so clamping to
+        # it never re-triggers the same out-of-bounds 404.
+        _, _, min_lat, _ = clamp_to_region_bbox(-80, -60, 20.0, 40.0)
+        assert min_lat >= 21.73596
 
 
 class TestBuildErddapSubsetUrl:
@@ -497,6 +519,19 @@ class TestNOAAHFRadarDownload:
         called_url, called_path = m.call_args[0][0], m.call_args[0][1]
         assert "ucsdHfrW6.nc?" in called_url
         assert str(out) == str(called_path)
+
+    def test_download_clamps_bbox_extending_past_region_edge(self, tmp_path):
+        """A bbox reaching past a region's real grid edge must be clamped in
+        the built URL, not passed straight through (root cause of the
+        reported HTTP 404 'axis minimum' error)."""
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+        ) as m:
+            dl.download(-80, -60, 20.0, 40.0, _RECENT_START, _RECENT_END)
+        called_url = m.call_args[0][0]
+        assert "[(22.0):(40.0)]" in called_url
+        assert "[(20.0)" not in called_url
 
 
 # ---------------------------------------------------------------------------
