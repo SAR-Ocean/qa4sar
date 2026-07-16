@@ -48,41 +48,42 @@ so this bug can also suppress wave plots for the same scenario.
 
 ## Fix
 
-Replace the `swath_mode`-based branch with a fixed, existence-driven
-fallback chain that no longer depends on the recipe's requested mode:
+Replace the `swath_mode`-based branch with a rule that no longer depends on
+the recipe's requested mode, and that treats `owiSignificantWaveHeight` as
+an *additive* second SAR variable rather than a last-resort fallback:
 
-```python
-sar_var_candidates = ["oswTotalHs", "oswHs", "owiSignificantWaveHeight"]
-```
+1. **Primary variable** — a single-winner fallback between the two
+   `oswHs`-family variables:
+   - Try `oswTotalHs` first. Only fall back to `oswHs` if `sar_oswTotalHs`
+     is **not present as a column** in `collocation_ds` (existence check
+     only — not an all-NaN check). This mirrors `datatree_converter`'s own
+     internal fallback from `oswTotalHs` to `oswHs` partitions when
+     building the dataset.
+   - This part is still single-winner: if both `sar_oswTotalHs` and
+     `sar_oswHs` exist, only `oswTotalHs` is used, never both.
+2. **Additive variable** — `owiSignificantWaveHeight` is included
+   *alongside* the primary variable, but only if it actually carries data:
+   `sar_owiSignificantWaveHeight` exists as a column **and** has at least
+   one non-NaN value in `collocation_ds`. If the column is absent, or
+   present but entirely NaN (the situation observed in every product seen
+   so far), it is left out and only the primary variable is used.
 
-Selection rules:
+So up to **two** SAR variables can be selected per run: the primary
+(`oswTotalHs` or `oswHs`) always, plus `owiSignificantWaveHeight` whenever
+it has real data. This is a deliberate change from a strict single-winner
+model — `owiSignificantWaveHeight` is a genuinely different measurement
+(IW/EW grid product) rather than a redundant alternative to `oswTotalHs`,
+so when both carry data they should both get their own statistics/plots.
 
-- Try `oswTotalHs` first. Only fall back to `oswHs` if `sar_oswTotalHs` is
-  **not present as a column** in `collocation_ds` (existence check only —
-  not an all-NaN check). This mirrors `datatree_converter`'s own internal
-  fallback from `oswTotalHs` to `oswHs` partitions when building the
-  dataset, and matches the existing existence-based filtering style used
-  everywhere else in this function.
-- If `oswHs` is also absent, fall back to `owiSignificantWaveHeight`.
-- This is a **single-winner fallback**, not "try every candidate that
-  exists": once a candidate is found to exist, later candidates in the
-  chain are not also tried. This differs from the current WV-only branch,
-  which tries both `oswTotalHs` and `oswHs` unconditionally when both
-  happen to be present. The new behavior is what was explicitly requested:
-  prefer `oswTotalHs`, only use `oswHs` when `oswTotalHs` is unavailable.
-- `owiSignificantWaveHeight` is kept in the chain as a last-resort fallback
-  even though it is reportedly always NaN in current products — it costs
-  nothing when absent/all-NaN (existing existence/dropna filters already
-  discard it) and avoids silently losing coverage if it's populated by a
-  future product version.
 - `recipe.config.sar_data.swath_mode` is no longer read for this purpose;
   the `is_wv_only` variable is deleted from `filter_variable_pairs`.
 
 The validation-variable candidate list (`VHM0, VAVH, VGHS,
 VAVH_UNFILTERED`) is unchanged. Each one that exists in `collocation_ds` is
-still crossed against the single winning `sar_var` and produces its own
-statistics entry (e.g. `oswTotalHs_vs_VAVH`, `oswTotalHs_vs_VHM0` if both
-are present).
+still crossed against every selected `sar_var` (one or two) and produces
+its own statistics entry (e.g. `oswTotalHs_vs_VAVH`,
+`owiSignificantWaveHeight_vs_VAVH` if both SAR variables have data and
+`VAVH` is present).
 
 ## Testing
 
@@ -96,17 +97,24 @@ fixtures consistent with the file's existing style, covering:
    `("oswTotalHs", "VAVH")` is returned. This must fail before the fix and
    pass after.
 2. **Fallback to oswHs:** `sar_oswTotalHs` column absent, `sar_oswHs`
-   present → `oswHs` is selected.
-3. **Fallback to owiSignificantWaveHeight:** neither `oswTotalHs` nor
-   `oswHs` present, only `sar_owiSignificantWaveHeight` → that is selected.
-4. **No double-counting:** when `sar_oswTotalHs` exists, `oswHs` is *not*
-   also tried, even if a `sar_oswHs` column happens to also be present in
-   the dataset.
+   present → `oswHs` is selected as the primary variable.
+3. **owiSignificantWaveHeight all-NaN is excluded:** `sar_oswTotalHs`
+   present, `sar_owiSignificantWaveHeight` present but entirely NaN → only
+   `oswTotalHs` is selected (matches every real product observed so far).
+4. **owiSignificantWaveHeight with real data is additive:**
+   `sar_oswTotalHs` present, `sar_owiSignificantWaveHeight` present with at
+   least one non-NaN value → both `oswTotalHs` and
+   `owiSignificantWaveHeight` are selected, each crossed against the
+   available validation variables.
+5. **No double-counting between oswTotalHs and oswHs:** when
+   `sar_oswTotalHs` exists, `oswHs` is *not* also tried, even if a
+   `sar_oswHs` column happens to also be present in the dataset.
 
 ## Out of scope
 
-- All-NaN-triggered fallback (only column-existence triggers fallback, per
-  explicit decision).
+- All-NaN-triggered fallback between `oswTotalHs` and `oswHs` (only
+  column-existence triggers that fallback, per explicit decision). The
+  all-NaN check applies only to deciding whether
+  `owiSignificantWaveHeight` is additive.
 - Changes to the validation-variable (`VHM0`/`VAVH`/`VGHS`/
   `VAVH_UNFILTERED`) candidate list — already correct.
-- Removing `owiSignificantWaveHeight` from the candidate chain.
