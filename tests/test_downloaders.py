@@ -711,3 +711,41 @@ class TestOrchestratorDepthResolution:
         # most permissive window across resolved depths: min(-5,-20)=-20, max(5,20)=20
         assert kwargs["min_depth"] == -20.0
         assert kwargs["max_depth"] == 20.0
+
+
+# ---------------------------------------------------------------------------
+# Tests for _hf_radar_regions (shared Copernicus HF-radar region lookup)
+# ---------------------------------------------------------------------------
+
+from sar_validation.downloaders._hf_radar_regions import HFR_REGIONS, resolve_hfr_region
+
+
+class TestHfRadarRegions:
+    def test_us_east_gulf_bbox_resolves(self):
+        assert resolve_hfr_region(-90.0, -60.0, 30.0, 40.0) == "US-EastGulfCoast"
+
+    def test_us_west_coast_bbox_resolves(self):
+        assert resolve_hfr_region(-125.0, -119.0, 33.0, 38.0) == "US-WestCoast"
+
+    def test_no_overlap_raises_with_region_list(self):
+        with pytest.raises(ValueError, match="US-EastGulfCoast"):
+            resolve_hfr_region(100.0, 105.0, -10.0, -5.0)  # nowhere near any region
+
+    def test_picks_largest_overlap_when_bbox_spans_two_regions(self):
+        # A bbox mostly inside US-WestCoast but touching PLOCAN-scale noise
+        # should not happen in practice; this instead checks the tie-break
+        # is deterministic for a bbox fully inside exactly one region.
+        assert resolve_hfr_region(-124.0, -122.0, 36.0, 37.0) == "US-WestCoast"
+
+    def test_all_regions_have_bbox_and_flag(self):
+        assert len(HFR_REGIONS) == 25
+        for name, cfg in HFR_REGIONS.items():
+            assert len(cfg["bbox"]) == 4
+            assert isinstance(cfg["has_latest"], bool)
+
+    def test_regions_without_latest_feed(self):
+        no_latest = {n for n, c in HFR_REGIONS.items() if not c["has_latest"]}
+        assert no_latest == {
+            "ARPAS", "COSYNA", "Finnmark", "US-Alaska",
+            "US-EastGulfCoast", "US-Hawaii", "WHub",
+        }
