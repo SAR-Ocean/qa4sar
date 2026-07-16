@@ -819,3 +819,53 @@ class TestHFRadarDownloaderGrid:
         from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
 
         HFRadarDownloader(output_dir=tmp_path, dry_run=True, min_depth=-2.0, max_depth=2.0)
+
+    def test_retries_with_monthly_part_when_latest_out_of_bounds(self, tmp_path):
+        from pathlib import Path
+        from unittest.mock import patch, MagicMock
+        from datetime import datetime, timedelta, timezone
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        recent_end = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+        recent_start = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%d")
+        dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False)
+        fake_module = MagicMock()
+
+        call_count = {"n": 0}
+
+        def fake_subset(**kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError(
+                    "The requested time range appears to exceed the dataset "
+                    "coordinates for this dataset_part."
+                )
+            Path(kwargs["output_directory"], kwargs["output_filename"]).write_bytes(b"")
+
+        fake_module.subset.side_effect = fake_subset
+        # US-WestCoast has a `latest` feed, so the first attempt uses it and
+        # is expected to fail, triggering a retry with the `monthly` part.
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            out = dl.download(-125.0, -119.0, 33.0, 38.0, recent_start, recent_end)
+
+        assert out is not None
+        assert out.exists()
+        assert fake_module.subset.call_count == 2
+        first_kwargs = fake_module.subset.call_args_list[0].kwargs
+        second_kwargs = fake_module.subset.call_args_list[1].kwargs
+        assert first_kwargs["dataset_part"] == "latest-radar-total--US-WestCoast"
+        assert second_kwargs["dataset_part"] == "monthly-radar-total--US-WestCoast"
+
+    def test_raises_file_not_found_when_subset_writes_no_file(self, tmp_path):
+        from unittest.mock import patch, MagicMock
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False)
+        fake_module = MagicMock()
+        # subset() "succeeds" (no exception) but never writes the destination
+        # file, simulating an empty/no-op response from copernicusmarine.
+        fake_module.subset.side_effect = lambda **kwargs: None
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            with pytest.raises(FileNotFoundError):
+                dl.download(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")

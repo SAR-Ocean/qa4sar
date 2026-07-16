@@ -128,7 +128,10 @@ class HFRadarDownloader:
             )
         except Exception as e:
             error_msg = str(e)
-            if use_latest and "exceed the dataset coordinates" in error_msg:
+            if use_latest and (
+                "exceed the dataset coordinates" in error_msg
+                or "out of bounds" in error_msg.lower()
+            ):
                 dataset_part = f"monthly-radar-total--{region}"
                 print(f"  Retrying with dataset_part='{dataset_part}' due to: {error_msg[:120]}…")
                 self._subset_with_part(
