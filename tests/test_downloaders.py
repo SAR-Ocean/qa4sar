@@ -916,6 +916,22 @@ class TestHFRadarHistoricalDownloader:
         with pytest.raises(NotImplementedError, match="single calendar year"):
             dl.download(-90.0, -60.0, 30.0, 40.0, "2020-12-30", "2021-01-02")
 
+    def test_year_outside_split_archive_range_raises_clear_error(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=True)
+        # US-EastGulfCoast's historical archive is split into one file per
+        # year, only for 2019-2024; a request for 2018 falls outside that
+        # range and should raise a clear, actionable error rather than a
+        # silent bad file lookup.
+        with pytest.raises(
+            ValueError,
+            match="No US-EastGulfCoast historical archive for year 2018",
+        ):
+            dl.download(-90.0, -60.0, 30.0, 40.0, "2018-01-01", "2018-01-02")
+
     def test_download_gets_file_then_subsets_locally(self, tmp_path):
         from unittest.mock import patch, MagicMock
         from sar_validation.downloaders.hf_radar_historical_downloader import (
