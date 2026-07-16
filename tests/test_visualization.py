@@ -238,6 +238,58 @@ class TestPlotResiduals:
             result = plot_residuals(collocation_ds, "owiWaveHeight", "VHM0")
         assert result is None
 
+    def test_by_source_creates_one_subplot_per_source(self, collocation_ds):
+        import matplotlib.pyplot as plt
+        # collocation_ds fixture has 2 distinct sources: mooring, scatterometer
+        fig = plot_residuals(collocation_ds, "owiWindSpeed", "WSPD")
+        assert len(fig.axes) == 2
+        plt.close(fig)
+
+    def test_by_source_false_returns_single_axes(self, collocation_ds):
+        import matplotlib.pyplot as plt
+        fig = plot_residuals(collocation_ds, "owiWindSpeed", "WSPD", by_source=False)
+        assert len(fig.axes) == 1
+        plt.close(fig)
+
+    def test_shares_bin_range_across_sources(self, monkeypatch):
+        """Regression test for the buoy-spike bug: plot_residuals used to
+        call ax.hist(..., bins=30, density=True) once per source without a
+        shared range, so a source with a very narrow residual spread (e.g.
+        2 tightly-clustered buoy points) got a tiny bin width and a density
+        spike that dwarfed every other source sharing the axes. Each source
+        now gets its own subplot, but all subplots must still share one
+        bin range so bars stay position-comparable."""
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+
+        n_wide = 20
+        rng = np.random.default_rng(1)
+        sar_wide = rng.uniform(3, 12, n_wide)
+        val_wide = sar_wide + rng.normal(0, 1.5, n_wide)
+        sar_narrow = np.array([7.0, 7.02])
+        val_narrow = np.array([6.0, 6.0])
+
+        ds = xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", np.concatenate([sar_wide, sar_narrow])),
+            "val_WSPD":         ("collocation", np.concatenate([val_wide, val_narrow])),
+            "val_source":       ("collocation", ["mooring"] * n_wide + ["buoy"] * 2),
+        })
+
+        recorded_ranges = []
+        original_hist = matplotlib.axes.Axes.hist
+
+        def recording_hist(self, *args, **kwargs):
+            recorded_ranges.append(kwargs.get("range"))
+            return original_hist(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "hist", recording_hist)
+        fig = plot_residuals(ds, "owiWindSpeed", "WSPD")
+        plt.close(fig)
+
+        assert len(recorded_ranges) == 2
+        assert all(r is not None for r in recorded_ranges)
+        assert recorded_ranges[0] == recorded_ranges[1]
+
 
 class TestPlotTemporalOffset:
     def test_returns_figure(self, collocation_ds):
@@ -490,6 +542,147 @@ class TestPlotGeographicTicks:
 
         plt.close("all")
 
+    def test_narrow_extent_caps_tick_count(self):
+        """Regression test: narrow WV-mode SAR scenes (sub-1° longitude
+        span) must not get more than a handful of ticks — the gridliner's
+        default locator (nbins=8) produces many closely-spaced,
+        high-decimal-precision ticks that overlap into unreadable labels
+        otherwise."""
+        import matplotlib.pyplot as plt
+        import cartopy.crs as ccrs
+        from sar_validation.core.visualization import _set_lonlat_ticks
+
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection=ccrs.PlateCarree())
+        lon = np.linspace(-49.55, -49.50, 5)   # ~0.05° wide, like a WV imagette
+        lat = np.linspace(20.0, 43.0, 5)       # wide latitude range
+        lon2d, lat2d = np.meshgrid(lon, lat)
+        data = np.linspace(5.0, 12.0, 25).reshape(5, 5)
+        ax.pcolormesh(lon2d, lat2d, data, transform=ccrs.PlateCarree())
+
+        gl = ax.gridlines(draw_labels=False, alpha=0.3)
+        _set_lonlat_ticks(ax, gl)
+
+        assert len(ax.get_xticks()) <= 3
+        assert len(ax.get_yticks()) <= 3
+        plt.close(fig)
+
+    def test_tall_narrow_wv_track_extent_caps_tick_count(self):
+        """Regression test: a WV-mode SAR scene's ground track can span
+        several degrees of longitude (not just sub-1°) while spanning many
+        more degrees of latitude. Because cartopy's PlateCarree GeoAxes
+        always renders at equal aspect ratio, that tall/narrow extent gets
+        squeezed into a visually narrow map column regardless of the
+        subplot's nominal figure width — a moderate cap (e.g. nbins=4) still
+        overlaps in that squeezed column; only a stricter cap avoids it.
+        This reproduces the real bug found by rendering an actual report
+        (a 5°-wide, 23°-tall WV scene), not just an isolated tick-value
+        count."""
+        import matplotlib.pyplot as plt
+        import cartopy.crs as ccrs
+        from sar_validation.core.visualization import _set_lonlat_ticks
+
+        fig, ax = plt.subplots(figsize=(7, 5), subplot_kw={"projection": ccrs.PlateCarree()})
+        lon = np.linspace(-50.0, -45.0, 20)   # 5° wide
+        lat = np.linspace(20.0, 43.0, 20)     # 23° tall — same equal-aspect
+                                               # squeeze that broke this in
+                                               # the real report
+        ax.scatter(lon, lat, transform=ccrs.PlateCarree())
+        ax.set_extent(
+            [lon.min() - 0.5, lon.max() + 0.5, lat.min() - 0.5, lat.max() + 0.5],
+            crs=ccrs.PlateCarree(),
+        )
+        gl = ax.gridlines(draw_labels=False, alpha=0.3)
+        _set_lonlat_ticks(ax, gl)
+
+        assert len(ax.get_xticks()) <= 2
+        assert len(ax.get_yticks()) <= 3
+        plt.close(fig)
+
+
+class TestPlotGeographicCircularColormap:
+    def test_wdir_uses_twilight_cmap_and_0_360_range(self, geo_datatree_and_collocation, monkeypatch):
+        """owiWindDirection/WDIR is a circular (0-360°) variable: both the
+        SAR field (pcolormesh) and the validation points (scatter) must
+        render with a shared cyclic colormap and fixed 0-360 color limits,
+        not viridis + percentile-derived limits (meaningless for data that
+        wraps at the 0/360 seam)."""
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import plot_geographic
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        scene_ds = datatree["sar/sceneA"].to_dataset()
+        scene_ds = scene_ds.assign(owiWindDirection=scene_ds["owiWindSpeed"])
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": scene_ds,
+            "validation/mooring": datatree["validation/mooring"].to_dataset(),
+            "validation/altimeter": datatree["validation/altimeter"].to_dataset(),
+        })
+        coll = collocation_ds.rename({"val_WSPD": "val_WDIR"}).assign(
+            sar_owiWindDirection=collocation_ds["sar_owiWindSpeed"]
+        )
+
+        mesh_calls = []
+        scatter_calls = []
+        original_scatter = matplotlib.axes.Axes.scatter
+        original_pcolormesh = matplotlib.axes.Axes.pcolormesh
+
+        def recording_scatter(self, *args, **kwargs):
+            if "c" in kwargs:
+                scatter_calls.append((kwargs.get("cmap"), kwargs.get("norm")))
+            return original_scatter(self, *args, **kwargs)
+
+        def recording_pcolormesh(self, *args, **kwargs):
+            mesh_calls.append((kwargs.get("cmap"), kwargs.get("norm")))
+            return original_pcolormesh(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        monkeypatch.setattr(matplotlib.axes.Axes, "pcolormesh", recording_pcolormesh)
+        fig = plot_geographic(datatree, coll, "owiWindDirection", "WDIR", split_by=None)
+        plt.close("all")
+
+        assert fig is not None
+        assert mesh_calls, "expected the SAR field to be drawn with pcolormesh"
+        assert scatter_calls, "expected validation points to be drawn with scatter"
+
+        def cmap_name(c):
+            return getattr(c, "name", c)
+
+        for cmap, norm in mesh_calls + scatter_calls:
+            assert cmap_name(cmap) == "twilight"
+            assert norm.vmin == 0.0
+            assert norm.vmax == 360.0
+
+    def test_non_circular_var_keeps_viridis_and_percentile_limits(self, geo_datatree_and_collocation, monkeypatch):
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+
+        mesh_calls = []
+        original_pcolormesh = matplotlib.axes.Axes.pcolormesh
+
+        def recording_pcolormesh(self, *args, **kwargs):
+            mesh_calls.append((kwargs.get("cmap"), kwargs.get("norm")))
+            return original_pcolormesh(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "pcolormesh", recording_pcolormesh)
+        fig = plot_geographic(datatree, collocation_ds, "owiWindSpeed", "WSPD", split_by=None)
+        plt.close("all")
+
+        assert fig is not None
+        assert mesh_calls
+
+        def cmap_name(c):
+            return getattr(c, "name", c)
+
+        for cmap, norm in mesh_calls:
+            assert cmap_name(cmap) == "viridis"
+            assert not (norm.vmin == 0.0 and norm.vmax == 360.0)
+
 
 @pytest.fixture
 def geo_datatree_and_collocation_with_unmatched():
@@ -647,6 +840,44 @@ def diagnostics_recipe():
     return Recipe(config=config)
 
 
+@pytest.fixture
+def diagnostics_recipe_waves():
+    from sar_validation.core.recipe import (
+        GeographicBounds, Recipe, RecipeConfig, ValidationDataSource,
+        CollocationType, PointVsLayerCollocation,
+    )
+    config = RecipeConfig(
+        name="test_recipe",
+        variable="waves",
+        geographic_bounds=GeographicBounds(min_lon=-11.0, max_lon=-7.0, min_lat=49.0, max_lat=53.0),
+        validation_sources=[
+            ValidationDataSource(source_type="mooring"),
+            ValidationDataSource(source_type="altimeter"),
+        ],
+        collocation=CollocationType(point_vs_layer=PointVsLayerCollocation(time_tolerance_minutes=30)),
+    )
+    return Recipe(config=config)
+
+
+@pytest.fixture
+def diagnostics_recipe_currents():
+    from sar_validation.core.recipe import (
+        GeographicBounds, Recipe, RecipeConfig, ValidationDataSource,
+        CollocationType, PointVsLayerCollocation,
+    )
+    config = RecipeConfig(
+        name="test_recipe",
+        variable="currents",
+        geographic_bounds=GeographicBounds(min_lon=-11.0, max_lon=-7.0, min_lat=49.0, max_lat=53.0),
+        validation_sources=[
+            ValidationDataSource(source_type="mooring"),
+            ValidationDataSource(source_type="altimeter"),
+        ],
+        collocation=CollocationType(point_vs_layer=PointVsLayerCollocation(time_tolerance_minutes=30)),
+    )
+    return Recipe(config=config)
+
+
 class TestPlotCollocationDiagnostics:
     def test_distinct_sources_get_distinct_markers(
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
@@ -783,9 +1014,11 @@ class TestPlotCollocationDiagnosticsRefinement:
             f"Expected unmatched alpha=0.3, got {unmatched_alphas}"
         )
 
-        # Verify matched layers alpha is 1.0 (emphasized so few matches stay visible)
-        assert 1.0 in matched_layer_alphas or len(matched_layer_alphas) == 0, (
-            f"Expected matched layer alpha=1.0, got {matched_layer_alphas}"
+        # Verify matched layers alpha is 0.65 for wind recipes (a dense
+        # source like scatterometer would otherwise fully occlude a
+        # sparser layer source, e.g. radiometer, drawn underneath it)
+        assert 0.65 in matched_layer_alphas or len(matched_layer_alphas) == 0, (
+            f"Expected matched layer alpha=0.65 for a wind recipe, got {matched_layer_alphas}"
         )
 
         # Verify matched in-situ alpha is 1.0 (opaque, matching matched layers)
@@ -803,10 +1036,11 @@ class TestPlotCollocationDiagnosticsRefinement:
     def test_matched_layer_points_are_emphasized(
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
     ):
-        """Matched layer points (zorder=5) must be drawn bold: full opacity,
-        no marker edge, same marker size as matched in-situ points (s=25)
-        — so a few matched points stay visible against the SAR footprints
-        and gray unmatched tracks, without visually outsizing in-situ."""
+        """Matched layer points (zorder=5) must be drawn bold: no marker
+        edge, same marker size as matched in-situ points (s=25), and for a
+        wind recipe alpha=0.65 (not full opacity — a dense source like
+        scatterometer would otherwise fully occlude a sparser one, e.g.
+        radiometer, drawn underneath it in the same tier)."""
         import matplotlib.pyplot as plt
         import matplotlib.axes
         from sar_validation.core.visualization import plot_collocation_diagnostics
@@ -831,7 +1065,7 @@ class TestPlotCollocationDiagnosticsRefinement:
         assert matched_layer_calls, "Expected at least one matched-layer scatter call"
         for c in matched_layer_calls:
             assert c.get("edgecolors") == "none"
-            assert c.get("alpha") == 1.0
+            assert c.get("alpha") == 0.65
             assert c.get("s") == 25
 
     def test_unmatched_layer_points_get_per_source_markers(
@@ -919,6 +1153,130 @@ class TestPlotCollocationDiagnosticsRefinement:
         assert "In-situ matched: buoy (1)" in insitu_labels
 
 
+class TestPlotCollocationDiagnosticsRecipeVariableStyling:
+    def test_wind_matched_layer_alpha_is_reduced(
+        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
+    ):
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recorded = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded.append(kwargs)
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        plot_collocation_diagnostics(datatree, collocation_ds, diagnostics_recipe, tmp_path)
+        plt.close("all")
+
+        layer_calls = [c for c in recorded if c.get("zorder") == 5]
+        assert layer_calls
+        for c in layer_calls:
+            assert c.get("alpha") == 0.65
+
+    def test_waves_matched_layer_alpha_stays_opaque(
+        self, geo_datatree_and_collocation, diagnostics_recipe_waves, tmp_path, monkeypatch
+    ):
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recorded = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded.append(kwargs)
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        plot_collocation_diagnostics(datatree, collocation_ds, diagnostics_recipe_waves, tmp_path)
+        plt.close("all")
+
+        layer_calls = [c for c in recorded if c.get("zorder") == 5]
+        assert layer_calls
+        for c in layer_calls:
+            assert c.get("alpha") == 1.0
+
+    def test_currents_matched_layer_alpha_stays_opaque(
+        self, geo_datatree_and_collocation, diagnostics_recipe_currents, tmp_path, monkeypatch
+    ):
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recorded = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded.append(kwargs)
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        plot_collocation_diagnostics(datatree, collocation_ds, diagnostics_recipe_currents, tmp_path)
+        plt.close("all")
+
+        layer_calls = [c for c in recorded if c.get("zorder") == 5]
+        assert layer_calls
+        for c in layer_calls:
+            assert c.get("alpha") == 1.0
+
+    def test_waves_matched_points_are_larger_with_black_edge(
+        self, geo_datatree_and_collocation, diagnostics_recipe_waves, tmp_path, monkeypatch
+    ):
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recorded = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded.append(kwargs)
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        plot_collocation_diagnostics(datatree, collocation_ds, diagnostics_recipe_waves, tmp_path)
+        plt.close("all")
+
+        matched_calls = [c for c in recorded if c.get("zorder") in (5, 6)]
+        assert matched_calls
+        for c in matched_calls:
+            assert c.get("s") == 45
+            assert c.get("edgecolors") == "black"
+
+    def test_wind_matched_points_keep_default_size_and_no_edge(
+        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
+    ):
+        import matplotlib.pyplot as plt
+        import matplotlib.axes
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recorded = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded.append(kwargs)
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        plot_collocation_diagnostics(datatree, collocation_ds, diagnostics_recipe, tmp_path)
+        plt.close("all")
+
+        matched_calls = [c for c in recorded if c.get("zorder") in (5, 6)]
+        assert matched_calls
+        for c in matched_calls:
+            assert c.get("s") == 25
+            assert c.get("edgecolors") == "none"
+
+
 class TestPlotCollocationDiagnosticsTicks:
     def test_overview_plot_gets_degree_formatted_ticks(
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path
@@ -978,8 +1336,6 @@ class TestValidationReport:
 
         key = "owiWindSpeed_vs_WSPD"
         assert key in figures
-        assert (tmp_path / "plots" / f"{key}_scatter_by_offset.png").exists()
-        assert (tmp_path / "plots" / f"{key}_temporal_offset.png").exists()
         assert (tmp_path / "validation_report.pdf").exists()
         plt.close("all")
 
@@ -1195,10 +1551,6 @@ class TestValidationReportWindDirectionFilter:
         viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
         plt.close("all")
 
-        # Both PNGs exist; only the direction one has altimeter removed.
-        assert (tmp_path / "plots" / "owiWindSpeed_vs_WSPD_scatter.png").exists()
-        assert (tmp_path / "plots" / "owiWindDirection_vs_WDIR_scatter.png").exists()
-
         # The pair_ds wiring actually reached plot_scatter/plot_geographic
         # with the filtered dataset: altimeter (all-NaN WDIR) must never be
         # present in any dataset handed to a plot call made for the WDIR
@@ -1291,6 +1643,70 @@ class TestValidationReportSceneAllowlist:
         assert "sceneA" in set(captured["scenes"])
 
 
+class TestValidationReportCurrentsPointSize:
+    def test_currents_recipe_passes_reduced_point_size_to_geographic(self, tmp_path, monkeypatch):
+        """HF radar (layer_vs_layer) currents validation points are dense
+        enough at the default marker size (s=40) to fully blanket the SAR
+        field underneath — validation_report must request a smaller marker
+        for currents recipes so the SAR scene stays visible through them."""
+        import matplotlib.pyplot as plt
+        import sar_validation.core.visualization as viz
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
+        sar_ds = xr.Dataset(
+            {"rvlRadVel": (("y", "x"), np.full((y, x), 0.3))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T19:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+
+        coll = xr.Dataset({
+            "sar_rvlRadVel":            ("collocation", [0.3, 0.31, 0.29, 0.32]),
+            "val_rvlRadVel_projection": ("collocation", [0.28, 0.30, 0.27, 0.31]),
+            "val_source":               ("collocation", ["hf_radar"] * 4),
+            "sar_scene_name":           ("collocation", ["sceneA"] * 4),
+            "val_lon":                  ("collocation", [-9.5, -9.4, -9.3, -9.2]),
+            "val_lat":                  ("collocation", [50.5, 50.6, 50.7, 50.8]),
+        })
+
+        captured = {}
+        original = viz.plot_geographic
+
+        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
+            captured["point_size"] = kwargs.get("point_size")
+            return original(datatree_, coll_, sar_var, val_var, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_geographic", spy)
+        recipe = Recipe(config=RecipeConfig(name="currents_test", variable="currents"))
+        viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        assert captured.get("point_size") == 15
+
+    def test_wind_recipe_keeps_default_point_size(self, geo_datatree_and_collocation, tmp_path, monkeypatch):
+        import matplotlib.pyplot as plt
+        import sar_validation.core.visualization as viz
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        captured = {}
+        original = viz.plot_geographic
+
+        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
+            captured["point_size"] = kwargs.get("point_size")
+            return original(datatree_, coll_, sar_var, val_var, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_geographic", spy)
+        recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
+        viz.validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        assert captured.get("point_size") == 40
+
+
 class TestImagePageFigure:
     def test_figure_size_matches_image_pixel_dimensions(self):
         import numpy as np
@@ -1342,3 +1758,24 @@ class TestFinalizeFigureForReport:
         assert page_fig is not None
         assert list(tmp_path.iterdir()) == []
         plt.close(page_fig)
+
+
+class TestValidationReportOnlyDiagnosticsPngSaved:
+    def test_plots_dir_contains_only_diagnostics_png(self, geo_datatree_and_collocation, tmp_path):
+        """Every plot is already embedded in validation_report.pdf, so
+        plots/ must contain only the collocation-diagnostics PNG — no
+        individual scatter/geographic/statistics/residuals/temporal-offset
+        PNGs."""
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import validation_report
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
+
+        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        plots_dir = tmp_path / "plots"
+        png_files = sorted(p.name for p in plots_dir.glob("*.png"))
+        assert png_files == ["collocation_diagnostics_test_recipe.png"]

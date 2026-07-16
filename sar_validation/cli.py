@@ -677,7 +677,7 @@ def _load_precomputed_stats(recipe, collocation_ds, base_dir: Path, filename_suf
 
 
 def _generate_plots(recipe, base_dir: Path, filename_suffix: str = "") -> None:
-    """Run step 5b: generate validation plots and save to <base_dir>/plots/."""
+    """Run step 5b: generate validation plots and save PDF to <base_dir>/, PNG to <base_dir>/plots/."""
     import xarray as xr
     from .core.visualization import validation_report
 
@@ -701,8 +701,7 @@ def _generate_plots(recipe, base_dir: Path, filename_suffix: str = "") -> None:
                       stats_ds_map=stats_ds_map or None,
                       out_dir=base_dir,
                       filename_suffix=filename_suffix)
-    plots_dir = base_dir / "plots"
     pdf_path = base_dir / f"validation_report{filename_suffix}.pdf"
-    print(f"  PNG plots saved to {plots_dir}")
     if pdf_path.exists():
         print(f"  PDF report saved to {pdf_path}")
+    print(f"  Collocation diagnostics PNG saved to {base_dir / 'plots'}")

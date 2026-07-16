@@ -17,7 +17,7 @@ Plus fallback and convenience wrappers:
   always generated as part of the collocation step (step 3), including when
   there are zero collocated pairs.
 * :func:`validation_report` — runs all five plots, infers variable pairs from the recipe,
-  and saves PNG files to ``<out_dir>/plots/``
+  embeds plots in ``validation_report<suffix>.pdf``, and saves the collocation-diagnostics PNG to ``<out_dir>/plots/``
 
 All functions accept an ``interactive=False`` keyword argument.  When
 ``interactive=True`` the function returns an hvplot / plotly / folium object
@@ -196,6 +196,16 @@ def _set_lonlat_ticks(ax, gl):
     extent — so callers must invoke this only after the axes' data (and thus
     autoscale/extent) is finalized.
 
+    Both locators are first capped to a small ``nbins`` (see below) so
+    narrow-extent subplots never get an unreadable pile of closely-spaced
+    tick labels. ``nbins=2`` (not just a moderate cap like 4) is required
+    because cartopy's PlateCarree GeoAxes always renders at equal aspect
+    ratio: a WV-mode SAR scene's ground track is many degrees tall in
+    latitude but only a few degrees wide in longitude, so the actual
+    rendered map occupies a narrow vertical strip inside its subplot box
+    regardless of the subplot's nominal (wide) figure width — even 3-4
+    tick labels don't fit side by side in that strip without overlapping.
+
     ``tick_params(length=0)`` suppresses the small perpendicular tick marks
     that ``set_visible(True)`` would otherwise re-enable on the whole Axis
     artist; the original gridliner-only rendering never drew those, so this
@@ -208,6 +218,18 @@ def _set_lonlat_ticks(ax, gl):
     ax.xaxis.set_visible(True)
     ax.yaxis.set_visible(True)
     ax.tick_params(axis="both", which="both", length=0)
+
+    # Cap the locator to a small number of ticks regardless of extent
+    # width: the gridliner's default (nbins=8) picks tick counts oblivious
+    # to how narrow the subplot's actual extent is. A sub-1°-wide WV-mode
+    # SAR scene (narrow longitude, wide latitude) triggers many
+    # closely-spaced, high-decimal-precision ticks that pile up into
+    # unreadable overlapping labels; a wide overview map also reads more
+    # cleanly with fewer ticks. nbins=2 (rather than a milder cap) is what
+    # actually stops the overlap for tall/narrow WV-mode extents — see the
+    # docstring note above on equal-aspect rendering.
+    gl.xlocator.set_params(nbins=2)
+    gl.ylocator.set_params(nbins=2)
 
     xlim = ax.get_xlim()
     ylim = ax.get_ylim()
@@ -626,11 +648,22 @@ def plot_geographic(
         finite_v = collocation_ds[val_col].values
         finite_v = finite_v[np.isfinite(finite_v)]
 
-    pooled = np.concatenate([flat, finite_v]) if len(flat) or len(finite_v) else np.array([0.0, 1.0])
-    vmin = float(np.nanpercentile(pooled, 2))
-    vmax = float(np.nanpercentile(pooled, 98))
+    from ._variable_map import CIRCULAR_VAL_VARS  # noqa: PLC0415
+    is_circular = val_var in CIRCULAR_VAL_VARS
 
-    effective_val_cmap = val_cmap if val_cmap is not None else cmap
+    # Circular variables (e.g. WDIR) skip percentile pooling: 0-360 is a
+    # fixed, physically meaningful range, and percentile-clamping a value
+    # that wraps at the 0/360 seam would be actively wrong.
+    if is_circular:
+        cmap = "twilight"
+        vmin, vmax = 0.0, 360.0
+    else:
+        pooled = np.concatenate([flat, finite_v]) if len(flat) or len(finite_v) else np.array([0.0, 1.0])
+        vmin = float(np.nanpercentile(pooled, 2))
+        vmax = float(np.nanpercentile(pooled, 98))
+
+    effective_val_cmap = "twilight" if is_circular else (val_cmap if val_cmap is not None else cmap)
+    val_cmap = effective_val_cmap
     norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
     sar_sm = mcm.ScalarMappable(cmap=cmap, norm=norm)
     sar_sm.set_array([])
@@ -955,11 +988,17 @@ def plot_residuals(
     val_var : str
         Validation variable name without ``val_`` prefix.
     by_source : bool
-        Overlay one histogram per ``val_source``.
+        Draw one subplot per ``val_source`` ("small multiples"), each with
+        its own y-axis but a shared x-range — so a source with a very
+        narrow residual spread (e.g. two tightly-clustered points) can't
+        produce a density spike that dwarfs every other source's bars, the
+        way it would sharing one axes. When False, draw a single combined
+        histogram instead (``ax`` honored in this case only).
     interactive : bool
         Return a plotly Figure instead of matplotlib.
     ax : matplotlib.axes.Axes, optional
-        Axes to draw into (static only).
+        Axes to draw into (static, ``by_source=False`` only — the
+        small-multiples grid always creates its own figure).
 
     Returns
     -------
@@ -1006,26 +1045,51 @@ def plot_residuals(
 
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 4))
-    else:
-        fig = ax.get_figure()
-
-    if by_source:
-        sources = sorted(df["val_source"].unique())
-        cmap = _source_color_map(sources)
-        for src in sources:
-            sub = df[df["val_source"] == src]["residual"].dropna()
-            ax.hist(sub, bins=30, alpha=0.5, color=cmap[src], label=src, density=True)
-        ax.legend(fontsize=7)
-    else:
+    if not by_source:
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(6, 4))
+        else:
+            fig = ax.get_figure()
         ax.hist(df["residual"].dropna(), bins=30, density=True, alpha=0.7, color="#1f77b4")
+        ax.axvline(0, color="black", linewidth=1, linestyle="--")
+        ax.set_xlabel(f"{sar_var} − {val_var}")
+        ax.set_ylabel("Density")
+        ax.set_title(title)
+        ax.grid(True, linewidth=0.4)
+        fig.tight_layout()
+        return fig
 
-    ax.axvline(0, color="black", linewidth=1, linestyle="--")
-    ax.set_xlabel(f"{sar_var} − {val_var}")
-    ax.set_ylabel("Density")
-    ax.set_title(title)
-    ax.grid(True, linewidth=0.4)
+    # by_source=True: one subplot per source, sharing a common x-range but
+    # each with its own y-axis (see docstring for why a shared axes breaks
+    # under density=True when spreads differ wildly across sources).
+    sources = sorted(df["val_source"].unique())
+    color_map = _source_color_map(sources)
+    residual_min = float(df["residual"].min())
+    residual_max = float(df["residual"].max())
+    if residual_min == residual_max:
+        residual_min -= 0.5
+        residual_max += 0.5
+    shared_range = (residual_min, residual_max)
+
+    ncols = 2
+    nrows = math.ceil(len(sources) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), squeeze=False)
+
+    for idx, src in enumerate(sources):
+        r, c = divmod(idx, ncols)
+        sub_ax = axes[r][c]
+        sub = df.loc[df["val_source"] == src, "residual"].dropna()
+        sub_ax.hist(sub, bins=30, range=shared_range, density=True, alpha=0.7, color=color_map[src])
+        sub_ax.axvline(0, color="black", linewidth=1, linestyle="--")
+        sub_ax.set_xlabel(f"{sar_var} − {val_var}")
+        sub_ax.set_ylabel("Density")
+        sub_ax.set_title(f"{src} (N={len(sub)})", fontsize=9)
+        sub_ax.grid(True, linewidth=0.4)
+
+    for idx in range(len(sources), nrows * ncols):
+        axes[idx // ncols][idx % ncols].set_visible(False)
+
+    fig.suptitle(title)
     fig.tight_layout()
     return fig
 
@@ -1442,6 +1506,24 @@ def plot_collocation_diagnostics(
     source_style_map = _source_style_map(sorted(all_source_names))
 
     bounds = recipe.config.geographic_bounds
+    variable = recipe.config.variable
+
+    # Matched-point styling depends on the recipe's variable type:
+    # - wind: layer-source matches (Tier 3) get a moderate alpha instead of
+    #   full opacity, since a dense swath (e.g. scatterometer) would
+    #   otherwise fully occlude a sparser layer source (e.g. radiometer)
+    #   plotted underneath it in the same tier.
+    # - waves: all matched points (Tier 3 + Tier 4) get a larger marker and
+    #   a black edge, making individual matches easier to pick out.
+    matched_layer_alpha = 0.65 if variable == "wind" else 1.0
+    if variable == "waves":
+        matched_marker_size = 45
+        matched_edgecolors = "black"
+        matched_linewidths = 0.5
+    else:
+        matched_marker_size = 25
+        matched_edgecolors = "none"
+        matched_linewidths = 0.0
 
     # ── Create geographic plot ──────────────────────────────────────────
     fig = plt.figure(figsize=(14, 10), dpi=100)
@@ -1558,8 +1640,8 @@ def plot_collocation_diagnostics(
         color, marker = source_style_map.get(str(cat["label"]), ("#2ca02c", "o"))
         ax.scatter(
             m_lon, m_lat,
-            s=25, c=color, marker=marker, alpha=1.0,
-            edgecolors="none",
+            s=matched_marker_size, c=color, marker=marker, alpha=matched_layer_alpha,
+            edgecolors=matched_edgecolors, linewidths=matched_linewidths,
             transform=transform, zorder=5, label=f"{cat['label']} matched ({len(m_lon)})",
         )
 
@@ -1590,8 +1672,8 @@ def plot_collocation_diagnostics(
                     color, marker = source_style_map.get(str(source), ("#ff7f0e", "o"))
                     ax.scatter(
                         m_lon[mask], m_lat[mask],
-                        s=25, c=color, marker=marker, alpha=1.0,
-                        edgecolors="none",
+                        s=matched_marker_size, c=color, marker=marker, alpha=1.0,
+                        edgecolors=matched_edgecolors, linewidths=matched_linewidths,
                         transform=transform, zorder=6,
                         label=f"In-situ matched: {source} ({count})",
                     )
@@ -1599,8 +1681,8 @@ def plot_collocation_diagnostics(
                 # Fallback if no source info available
                 ax.scatter(
                     m_lon, m_lat,
-                    s=25, c="#ff7f0e", marker="o", alpha=1.0,
-                    edgecolors="none",
+                    s=matched_marker_size, c="#ff7f0e", marker="o", alpha=1.0,
+                    edgecolors=matched_edgecolors, linewidths=matched_linewidths,
                     transform=transform, zorder=6,
                     label=f"In-situ matched ({len(m_lon)})",
                 )
@@ -1814,9 +1896,9 @@ def validation_report(
 ) -> Dict[str, list]:
     """
     Run all four plot functions for every (sar_var, val_var) pair inferred
-    from *recipe*, save individual PNG files to ``<out_dir>/plots/``, and
-    write a combined ``validation_report.pdf`` to *out_dir* (alongside the
-    ``validation_statistics_*.nc`` files).
+    from *recipe*, embed all plots in a combined ``validation_report.pdf``,
+    and save the collocation-diagnostics PNG to ``<out_dir>/plots/`` (alongside
+    the ``validation_statistics_*.nc`` files).
 
     Parameters
     ----------
@@ -1831,14 +1913,15 @@ def validation_report(
         :func:`~.statistics.run_statistics`).  If provided,
         :func:`plot_statistics` is also called for each pair.
     out_dir : str or Path, optional
-        Base output directory.  PNGs go to ``<out_dir>/plots/``; the
-        combined PDF is written to ``<out_dir>/validation_report.pdf``
+        Base output directory.  The combined PDF is written to
+        ``<out_dir>/validation_report<suffix>.pdf``; the collocation-diagnostics
+        PNG is saved to ``<out_dir>/plots/collocation_diagnostics_<recipe_name><suffix>.png``
         (alongside the ``validation_statistics_*.nc`` files).
         If None the figures are returned without saving.
     filename_suffix : str
-        Appended to the PNG/PDF filename stems, e.g. ``"_individual"``.
-        Lets reports for two collocation methods coexist in the same
-        ``plots/`` directory without overwriting each other.
+        Appended to PDF and collocation-diagnostics PNG filenames,
+        e.g. ``"_individual"``. Lets reports from two collocation methods
+        coexist without overwriting each other.
 
     Returns
     -------
@@ -1849,11 +1932,8 @@ def validation_report(
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
     base_dir: Optional[Path] = None
-    plots_dir: Optional[Path] = None
     if out_dir is not None:
         base_dir = Path(out_dir)
-        plots_dir = base_dir / "plots"
-        plots_dir.mkdir(parents=True, exist_ok=True)
 
     variable = recipe.config.variable
     try:
@@ -1894,32 +1974,37 @@ def validation_report(
         if fig_scatter is not None:
             figs.append(fig_scatter)
             title = f"{sar_var} vs {val_var} — scatter"
-            if plots_dir:
-                png_path = plots_dir / f"{key}{filename_suffix}_scatter.png"
-                pdf_pages.append((title, _finalize_figure_for_report(fig_scatter, png_path)))
+            if base_dir is not None:
+                pdf_pages.append((title, _finalize_figure_for_report(fig_scatter, None)))
             else:
                 pdf_pages.append((title, fig_scatter))
 
         # Geographic — returns dict[collocation_type, Figure] by default
         try:
-            geo_result = plot_geographic(datatree, pair_ds, sar_var, val_var, scenes=matched_scenes)
+            # HF radar (currents' only layer-type source) forms a
+            # near-continuous coverage grid that at the default marker size
+            # tiles edge-to-edge and completely hides the SAR field
+            # underneath it — use a smaller marker for currents recipes so
+            # the SAR scene stays visible through the validation points.
+            geo_point_size = 15 if variable == "currents" else 40
+            geo_result = plot_geographic(
+                datatree, pair_ds, sar_var, val_var, scenes=matched_scenes,
+                point_size=geo_point_size,
+            )
             if isinstance(geo_result, dict):
                 for group, fig_geo in geo_result.items():
                     if fig_geo is not None:
                         figs.append(fig_geo)
                         title = f"{sar_var} vs {val_var} — geographic [{group}]"
-                        if plots_dir:
-                            safe_group = str(group).replace("/", "-")
-                            png_path = plots_dir / f"{key}{filename_suffix}_geographic_{safe_group}.png"
-                            pdf_pages.append((title, _finalize_figure_for_report(fig_geo, png_path)))
+                        if base_dir is not None:
+                            pdf_pages.append((title, _finalize_figure_for_report(fig_geo, None)))
                         else:
                             pdf_pages.append((title, fig_geo))
             elif geo_result is not None:
                 figs.append(geo_result)
                 title = f"{sar_var} vs {val_var} — geographic"
-                if plots_dir:
-                    png_path = plots_dir / f"{key}{filename_suffix}_geographic.png"
-                    pdf_pages.append((title, _finalize_figure_for_report(geo_result, png_path)))
+                if base_dir is not None:
+                    pdf_pages.append((title, _finalize_figure_for_report(geo_result, None)))
                 else:
                     pdf_pages.append((title, geo_result))
         except Exception as exc:
@@ -1931,9 +2016,8 @@ def validation_report(
             if fig_stats is not None:
                 figs.append(fig_stats)
                 title = f"{sar_var} vs {val_var} — statistics"
-                if plots_dir:
-                    png_path = plots_dir / f"{key}{filename_suffix}_statistics.png"
-                    pdf_pages.append((title, _finalize_figure_for_report(fig_stats, png_path)))
+                if base_dir is not None:
+                    pdf_pages.append((title, _finalize_figure_for_report(fig_stats, None)))
                 else:
                     pdf_pages.append((title, fig_stats))
 
@@ -1942,9 +2026,8 @@ def validation_report(
         if fig_res is not None:
             figs.append(fig_res)
             title = f"{sar_var} vs {val_var} — residuals"
-            if plots_dir:
-                png_path = plots_dir / f"{key}{filename_suffix}_residuals.png"
-                pdf_pages.append((title, _finalize_figure_for_report(fig_res, png_path)))
+            if base_dir is not None:
+                pdf_pages.append((title, _finalize_figure_for_report(fig_res, None)))
             else:
                 pdf_pages.append((title, fig_res))
 
@@ -1955,9 +2038,8 @@ def validation_report(
         if fig_scatter_offset is not None:
             figs.append(fig_scatter_offset)
             title = f"{sar_var} vs {val_var} — scatter (colored by temporal offset)"
-            if plots_dir:
-                png_path = plots_dir / f"{key}{filename_suffix}_scatter_by_offset.png"
-                pdf_pages.append((title, _finalize_figure_for_report(fig_scatter_offset, png_path)))
+            if base_dir is not None:
+                pdf_pages.append((title, _finalize_figure_for_report(fig_scatter_offset, None)))
             else:
                 pdf_pages.append((title, fig_scatter_offset))
 
@@ -1966,21 +2048,20 @@ def validation_report(
         if fig_offset is not None:
             figs.append(fig_offset)
             title = f"{sar_var} vs {val_var} — residual vs. temporal offset"
-            if plots_dir:
-                png_path = plots_dir / f"{key}{filename_suffix}_temporal_offset.png"
-                pdf_pages.append((title, _finalize_figure_for_report(fig_offset, png_path)))
+            if base_dir is not None:
+                pdf_pages.append((title, _finalize_figure_for_report(fig_offset, None)))
             else:
                 pdf_pages.append((title, fig_offset))
 
         all_figures[key] = figs
 
-        # When plots_dir is set (base_dir is not None), each fig here was
-        # already closed inside _finalize_figure_for_report. pdf_pages holds
-        # separate lightweight image-page figures, not these same objects — so
-        # this loop is a safe, idempotent no-op double-close. Closing here
-        # deregisters them from pyplot's global figure manager to avoid
-        # accumulating figures across pairs and across the two
-        # collocation-method passes triggered by --layer-vs-layer-collocation-method both.
+        # When base_dir is not None, each fig here was already closed inside
+        # _finalize_figure_for_report. pdf_pages holds separate lightweight
+        # image-page figures, not these same objects — so this loop is a safe,
+        # idempotent no-op double-close. Closing here deregisters them from
+        # pyplot's global figure manager to avoid accumulating figures across
+        # pairs and across the two collocation-method passes triggered by
+        # --layer-vs-layer-collocation-method both.
         if base_dir is not None:
             for fig in figs:
                 plt.close(fig)
@@ -2037,8 +2118,5 @@ def validation_report(
                 plt.close(fig)
 
         logger.info("PDF report saved to %s", pdf_path)
-
-    if plots_dir:
-        logger.info("PNG plots saved to %s", plots_dir)
 
     return all_figures

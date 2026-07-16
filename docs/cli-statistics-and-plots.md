@@ -54,15 +54,9 @@ data/2026-03-01-000000-2026-03-02-000000_-10.00_5.00_50.00_65.00/
 ├── validation_statistics_owiWindDirection_vs_WDIR.csv
 │
 │  ── Step 5b ──
-├── validation_report.pdf          ← combined PDF (all plots, one file)
+├── validation_report.pdf          ← combined PDF (every plot, one file)
 └── plots/
-    ├── owiWindSpeed_vs_WSPD_scatter.png
-    ├── owiWindSpeed_vs_WSPD_geographic_point_vs_layer.png
-    ├── owiWindSpeed_vs_WSPD_geographic_layer_vs_layer.png
-    ├── owiWindSpeed_vs_WSPD_statistics.png
-    ├── owiWindSpeed_vs_WSPD_residuals.png
-    ├── owiWindDirection_vs_WDIR_scatter.png
-    └── ...
+    └── collocation_diagnostics_<recipe_name>.png   ← also written at Step 3
 ```
 
 ### Statistics files (`.nc` + `.csv`)
@@ -155,7 +149,8 @@ datatree = xr.open_datatree(str(DATA_DIR / "datatree.nc"), engine="netcdf4")
 # Step 5a — statistics saved as .nc + .csv in DATA_DIR
 stats_map = run_statistics(collocation_ds, recipe, DATA_DIR)
 
-# Step 5b — PNGs saved to DATA_DIR/plots/, PDF to DATA_DIR/validation_report.pdf
+# Step 5b — PDF report saved to DATA_DIR/validation_report.pdf (collocation
+# diagnostics PNG in DATA_DIR/plots/; every other plot is PDF-only)
 validation_report(
     collocation_ds=collocation_ds,
     datatree=datatree,
