@@ -1,89 +1,72 @@
 """
-Download HF radar surface current data from Copernicus Marine.
+Download HF-radar surface-current *grids* from Copernicus Marine.
 
 Data source: INSITU_GLO_PHYBGCWAV_DISCRETE_MYNRT_013_030
     Dataset ID: cmems_obs-ins_glo_phybgcwav_mynrt_na_irr
-    Platform type: HF (HF radar station)
+    dataset_part: "<latest|monthly>-radar-total--<Region>"
 
-HF radar measures surface currents (EWCT, NSCT) at high spatial and temporal
-resolution along coastlines.
+The dataset's plain "latest"/"monthly" parts are a *sparse per-platform*
+in-situ feed (moorings/buoys/drifters/ferrybox/tide gauges) that carries no
+HF-radar rows at all — verified empty for any bbox/time/variable combination
+tried on 2026-07-15. HF-radar current data is delivered separately, as a
+regular (time, lat, lon) grid per named coastal region, via
+"<latest|monthly>-radar-total--<Region>" dataset_parts. This downloader
+resolves the request bbox to one of those named regions and subsets that
+grid directly.
 
 Library usage::
 
     from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
     dl = HFRadarDownloader(output_dir=Path("data/run1/hf_radar"))
-    dl.download(min_lon=-20, max_lon=0, min_lat=35, max_lat=60,
-                start="2026-01-01", end="2026-01-02")
+    dl.download(min_lon=-90, max_lon=-60, min_lat=30, max_lat=40,
+                start="2026-06-05", end="2026-06-06")
 
 CLI usage::
 
     python -m sar_validation.downloaders.hf_radar_downloader \\
-        --min-lon -20 --max-lon 0 --min-lat 35 --max-lat 60 \\
-        --start 2026-01-01 --end 2026-01-02
+        --min-lon -90 --max-lon -60 --min-lat 30 --max-lat 40 \\
+        --start 2026-06-05 --end 2026-06-06
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import shutil
 import sys
 from pathlib import Path
 from typing import Optional
 
-import pandas as pd
-
 from .base import normalize_datetime, is_date_recent, build_output_dir
+from ._hf_radar_regions import HFR_REGIONS, resolve_hfr_region
 
 __all__ = ["HFRadarDownloader"]
 
-# ---------------------------------------------------------------------------
-# Dataset constants
-# ---------------------------------------------------------------------------
-
-DATASET_ID     = "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr"
-HF_RADAR_VARS  = ["EWCT", "NSCT", "HCDT", "HCSP"]
-PLATFORM_CODE  = "HF"   # HF Radar platform type in Copernicus in-situ dataset
+DATASET_ID = "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr"
 
 
-def _build_csv_filename(
-    min_lon: float, max_lon: float,
-    min_lat: float, max_lat: float,
-    start_dt: str, end_dt: str,
-    min_depth: float, max_depth: float,
-) -> str:
-    lon_sfx = lambda v: "W" if v < 0 else "E"
-    lat_sfx = lambda v: "S" if v < 0 else "N"
-    vars_str = "-".join(HF_RADAR_VARS)
+def _build_filename(region: str, start_dt: str, end_dt: str) -> str:
     start_d = start_dt.split("T")[0]
-    end_d   = end_dt.split("T")[0]
+    end_d = end_dt.split("T")[0]
     date_str = start_d if start_d == end_d else f"{start_d}-{end_d}"
-    depth_str = f"{abs(min_depth):.2f}-{abs(max_depth):.2f}m"
-    return (
-        f"{DATASET_ID}_{vars_str}_"
-        f"{abs(min_lon):.2f}{lon_sfx(min_lon)}-{abs(max_lon):.2f}{lon_sfx(max_lon)}_"
-        f"{abs(min_lat):.2f}{lat_sfx(min_lat)}-{abs(max_lat):.2f}{lat_sfx(max_lat)}_"
-        f"{depth_str}_{date_str}.csv"
-    )
+    return f"{DATASET_ID}_radar-total_{region}_{date_str}.nc"
 
 
 class HFRadarDownloader:
     """
-    Download HF radar surface current data from Copernicus Marine.
-
-    HF radar data is part of the global in-situ dataset. This downloader
-    downloads only the current-relevant variables (EWCT, NSCT, HCDT, HCSP)
-    and filters the result to platform type 'HF'.
+    Download a Copernicus Marine HF-radar current grid for the region that
+    overlaps the request bbox.
 
     Parameters
     ----------
     output_dir : Path
-        Directory to save downloaded files.
+        Directory to save the downloaded NetCDF.
     dry_run : bool
         If True, print what would be downloaded without actually downloading.
     min_depth, max_depth : float
-        Depth range (HF radar measures surface, so defaults are near-surface).
+        Accepted for interface compatibility with the orchestrator's
+        recipe-level depth-resolution machinery. The HF-radar-total grid has
+        no depth axis (it's a fixed near-surface radar measurement), so
+        these are unused.
     """
 
     def __init__(
@@ -95,8 +78,6 @@ class HFRadarDownloader:
     ) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
-        self.min_depth = min_depth
-        self.max_depth = max_depth
 
     def download(
         self,
@@ -106,22 +87,23 @@ class HFRadarDownloader:
         max_lat: float,
         start: str,
         end: str,
-        dataset_part: Optional[str] = None,
     ) -> Optional[Path]:
-        """
-        Download HF radar observations and save to a CSV.
+        region = resolve_hfr_region(min_lon, max_lon, min_lat, max_lat)
+        start_dt = normalize_datetime(start)
+        end_dt = normalize_datetime(end)
 
-        Parameters
-        ----------
-        dataset_part : str, optional
-            Which dataset part to use: "monthly" (historical) or "latest" (recent).
-            If None, auto-detects based on whether end_date is within 30 days.
+        use_latest = HFR_REGIONS[region]["has_latest"] and is_date_recent(end_dt)
+        dataset_part = f"{'latest' if use_latest else 'monthly'}-radar-total--{region}"
+        filename = _build_filename(region, start_dt, end_dt)
+        dest_path = self.output_dir / filename
 
-        Returns
-        -------
-        Path or None
-            Path to the downloaded CSV, or None in dry-run mode.
-        """
+        if self.dry_run:
+            print(
+                f"[DRY RUN] Would download Copernicus HF-radar grid for region "
+                f"'{region}' (dataset_part='{dataset_part}') to:\n  {dest_path}"
+            )
+            return None
+
         try:
             import copernicusmarine
         except ImportError as exc:
@@ -130,127 +112,68 @@ class HFRadarDownloader:
                 "Install it with:  pip install copernicusmarine"
             ) from exc
 
-        start_dt = normalize_datetime(start)
-        end_dt   = normalize_datetime(end)
-
-        expected_filename = _build_csv_filename(
-            min_lon, max_lon, min_lat, max_lat,
-            start_dt, end_dt, self.min_depth, self.max_depth,
-        )
-        dest_path = self.output_dir / expected_filename
-
-        if self.dry_run:
-            print(
-                f"[DRY RUN] Would download HF radar data to:\n  {dest_path}"
-            )
-            return None
-
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Auto-detect dataset_part if not provided
-        if dataset_part is None:
-            dataset_part = "latest" if is_date_recent(end_dt) else "monthly"
-
-        print("Downloading HF radar surface current data …")
-        print(f"  Region: lon [{min_lon}, {max_lon}] lat [{min_lat}, {max_lat}]")
+        print("Downloading Copernicus HF-radar surface-current grid …")
+        print(f"  Region: {region}")
+        print(f"  BBox:   lon [{min_lon}, {max_lon}] lat [{min_lat}, {max_lat}]")
         print(f"  Time:   {start_dt} → {end_dt}")
-        print(f"  Depth:  {self.min_depth} to {self.max_depth} m")
-        print(f"  Variables: {', '.join(HF_RADAR_VARS)}")
-        print(f"  Dataset: {dataset_part}")
+        print(f"  Dataset part: {dataset_part}")
 
-        # Try initial dataset_part, with fallback if data not available
         try:
-            self._download_with_part(
-                copernicusmarine,
-                dataset_part,
+            self._subset_with_part(
+                copernicusmarine, dataset_part,
                 min_lon, max_lon, min_lat, max_lat,
-                start_dt, end_dt,
+                start_dt, end_dt, dest_path,
             )
         except Exception as e:
             error_msg = str(e)
-            # Check if error is about data exceeding coordinates (date outside available range)
-            if "exceed the dataset coordinates" in error_msg or "out of bounds" in error_msg.lower():
-                # Try the opposite dataset_part
-                alt_dataset_part = "monthly" if dataset_part == "latest" else "latest"
-                print(f"  Retrying with dataset_part='{alt_dataset_part}' due to: {error_msg[:100]}…")
-                try:
-                    self._download_with_part(
-                        copernicusmarine,
-                        alt_dataset_part,
-                        min_lon, max_lon, min_lat, max_lat,
-                        start_dt, end_dt,
-                    )
-                    dataset_part = alt_dataset_part
-                except Exception as e2:
-                    # Both failed, raise the second error
-                    raise e2
+            if use_latest and (
+                "exceed the dataset coordinates" in error_msg
+                or "out of bounds" in error_msg.lower()
+            ):
+                dataset_part = f"monthly-radar-total--{region}"
+                print(f"  Retrying with dataset_part='{dataset_part}' due to: {error_msg[:120]}…")
+                self._subset_with_part(
+                    copernicusmarine, dataset_part,
+                    min_lon, max_lon, min_lat, max_lat,
+                    start_dt, end_dt, dest_path,
+                )
             else:
-                # Not a data availability error, re-raise original
                 raise
 
-        # Move file from CWD to output_dir
-        if Path(expected_filename).exists():
-            shutil.move(str(expected_filename), str(dest_path))
-        elif dest_path.exists():
-            pass  # already there
-        else:
-            # Search for the most recently created CSV
-            candidates = sorted(
-                Path(".").glob(f"{DATASET_ID}*.csv"),
-                key=os.path.getmtime,
-                reverse=True,
+        if not dest_path.exists():
+            raise FileNotFoundError(
+                f"Copernicus HF-radar grid download completed but produced no "
+                f"file for region '{region}' in [{start_dt}, {end_dt}] "
+                f"(dataset_part='{dataset_part}')."
             )
-            if candidates:
-                shutil.move(str(candidates[0]), str(dest_path))
-            else:
-                raise FileNotFoundError(
-                    f"HF radar download completed but output CSV not found.\n"
-                    f"Expected: {expected_filename}"
-                )
-
-        # Filter to HF radar platform type only
-        df = pd.read_csv(dest_path)
-        if "platform_type" in df.columns:
-            df_hf = df[df["platform_type"] == PLATFORM_CODE]
-            if df_hf.empty:
-                print(
-                    f"  WARNING: No HF radar stations (platform_type='{PLATFORM_CODE}') "
-                    f"found in the downloaded data for this region/period."
-                )
-            else:
-                df_hf.to_csv(dest_path, index=False)
-                print(f"  Filtered to {len(df_hf)} HF radar observations")
-        else:
-            print("  WARNING: 'platform_type' column not found; keeping all data.")
 
         print(f"  Saved to {dest_path}")
         return dest_path
 
-    def _download_with_part(
-        self,
-        copernicusmarine,
-        dataset_part: str,
-        min_lon: float,
-        max_lon: float,
-        min_lat: float,
-        max_lat: float,
-        start_dt: str,
-        end_dt: str,
+    def _subset_with_part(
+        self, copernicusmarine, dataset_part,
+        min_lon, max_lon, min_lat, max_lat,
+        start_dt, end_dt, dest_path,
     ) -> None:
-        """Internal helper to run copernicusmarine.subset() with a specific dataset_part."""
+        # No `variables=` filter: omitting it makes copernicusmarine return
+        # every variable in the dataset_part (verified live — 14 vars for
+        # *-radar-total--<Region>, including EWCS/NSCS standard deviations
+        # and all *_QC/QCflag fields), so the converter (Task 3) always has
+        # the full ancillary set to pick from on disk.
         copernicusmarine.subset(
             dataset_id=DATASET_ID,
             dataset_part=dataset_part,
-            variables=HF_RADAR_VARS,
             minimum_longitude=min_lon,
             maximum_longitude=max_lon,
             minimum_latitude=min_lat,
             maximum_latitude=max_lat,
             start_datetime=start_dt,
             end_datetime=end_dt,
-            minimum_depth=self.min_depth,
-            maximum_depth=self.max_depth,
-            force_download=False,
+            output_directory=str(dest_path.parent),
+            output_filename=dest_path.name,
+            force_download=True,
         )
 
 
@@ -260,7 +183,7 @@ class HFRadarDownloader:
 
 def _parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Download HF radar surface current data from Copernicus Marine.",
+        description="Download a Copernicus Marine HF-radar current grid.",
     )
     p.add_argument("--params-file", metavar="FILE")
     p.add_argument("--min-lon", type=float)
@@ -269,8 +192,6 @@ def _parse_args(argv=None):
     p.add_argument("--max-lat", type=float)
     p.add_argument("--start")
     p.add_argument("--end")
-    p.add_argument("--min-depth", type=float, default=-2.0)
-    p.add_argument("--max-depth", type=float, default=2.0)
     p.add_argument("--output-dir", default=None)
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args(argv)
@@ -282,14 +203,12 @@ def main(argv=None):
     if args.params_file:
         with open(args.params_file) as f:
             params = json.load(f)
-        min_lon   = params["minimum_longitude"]
-        max_lon   = params["maximum_longitude"]
-        min_lat   = params["minimum_latitude"]
-        max_lat   = params["maximum_latitude"]
-        start     = params["start_datetime"]
-        end       = params["end_datetime"]
-        min_depth = params.get("minimum_depth", -2.0)
-        max_depth = params.get("maximum_depth",  2.0)
+        min_lon = params["minimum_longitude"]
+        max_lon = params["maximum_longitude"]
+        min_lat = params["minimum_latitude"]
+        max_lat = params["maximum_latitude"]
+        start = params["start_datetime"]
+        end = params["end_datetime"]
     else:
         for attr in ("min_lon", "max_lon", "min_lat", "max_lat", "start", "end"):
             if getattr(args, attr) is None:
@@ -298,18 +217,12 @@ def main(argv=None):
         min_lon, max_lon = args.min_lon, args.max_lon
         min_lat, max_lat = args.min_lat, args.max_lat
         start, end = args.start, args.end
-        min_depth, max_depth = args.min_depth, args.max_depth
 
     output_dir = Path(args.output_dir) if args.output_dir else (
         build_output_dir(start, end, min_lon, max_lon, min_lat, max_lat) / "hf_radar"
     )
 
-    dl = HFRadarDownloader(
-        output_dir=output_dir,
-        dry_run=args.dry_run,
-        min_depth=min_depth,
-        max_depth=max_depth,
-    )
+    dl = HFRadarDownloader(output_dir=output_dir, dry_run=args.dry_run)
     dl.download(
         min_lon=min_lon, max_lon=max_lon,
         min_lat=min_lat, max_lat=max_lat,

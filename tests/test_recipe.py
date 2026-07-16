@@ -248,17 +248,20 @@ class TestCurrentsTemplate:
 
         recipe = cli._build_currents_config(limit=7)
         source_types = [s.source_type for s in recipe.validation_sources]
-        assert source_types == ["hf_radar", "hf_radar_noaa", "drifter", "ferrybox", "mooring"]
-
-        hf_radar_src = recipe.validation_sources[0]
-        assert hf_radar_src.min_depth == -2.0
-        assert hf_radar_src.max_depth == 2.0
-
-        specs = recipe.collocation.layer_vs_layer.layer_type_specs
-        assert specs["hf_radar"] == {
-            "time_tolerance_minutes": 60,
-            "aggregation_window_km": 5.0,
-            "distance_weighting": "equal",
-        }
+        assert source_types == [
+            "hf_radar", "hf_radar_historical", "hf_radar_noaa",
+            "drifter", "ferrybox", "mooring",
+        ]
 
         assert recipe.sar_data.max_downloads == 7
+
+    def test_hf_radar_source_has_no_leftover_depth_kwargs(self):
+        from sar_validation import cli
+
+        recipe = cli._build_currents_config(limit=None)
+        hf_radar_src = next(
+            s for s in recipe.validation_sources if s.source_type == "hf_radar"
+        )
+        # The gridded product has no depth axis; the recipe shouldn't imply one.
+        assert hf_radar_src.min_depth is None
+        assert hf_radar_src.max_depth is None

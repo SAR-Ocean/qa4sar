@@ -1040,6 +1040,79 @@ class TestFromHfRadarGrid:
         assert DataTreeConverter.from_hf_radar_grid(tmp_path / "nope.nc") is None
 
 
+def _make_copernicus_hfr_grid_nc(tmp_path, n_time=2, n_lat=3, n_lon=4):
+    """Write a minimal Copernicus radar-total-shaped gridded NetCDF."""
+    rng = np.random.default_rng(11)
+    times = pd.date_range("2026-06-05T00:00:00", periods=n_time, freq="1h").values
+    lats = np.linspace(30.0, 40.0, n_lat)
+    lons = np.linspace(-90.0, -60.0, n_lon)
+    shape = (n_time, n_lat, n_lon)
+    ds = xr.Dataset(
+        {
+            "EWCT": (("time", "latitude", "longitude"), rng.uniform(-0.6, 0.6, shape),
+                     {"standard_name": "eastward_sea_water_velocity", "units": "m s-1"}),
+            "NSCT": (("time", "latitude", "longitude"), rng.uniform(-0.6, 0.6, shape),
+                     {"standard_name": "northward_sea_water_velocity", "units": "m s-1"}),
+            "GDOP": (("time", "latitude", "longitude"), rng.uniform(0, 2, shape)),
+            "EWCS": (("time", "latitude", "longitude"), rng.uniform(0, 0.1, shape)),
+            "NSCS": (("time", "latitude", "longitude"), rng.uniform(0, 0.1, shape)),
+            "QCflag": (("time", "latitude", "longitude"), rng.integers(0, 2, shape).astype(float)),
+            "CSPD_QC": (("time", "latitude", "longitude"), rng.integers(0, 5, shape).astype(float)),
+            "DDNS_QC": (("time", "latitude", "longitude"), rng.integers(0, 5, shape).astype(float)),
+            "GDOP_QC": (("time", "latitude", "longitude"), rng.integers(0, 5, shape).astype(float)),
+            "VART_QC": (("time", "latitude", "longitude"), rng.integers(0, 5, shape).astype(float)),
+            "POSITION_QC": (("time", "latitude", "longitude"), rng.integers(0, 5, shape).astype(float)),
+        },
+        coords={"time": times, "latitude": lats, "longitude": lons},
+        attrs={"title": "Copernicus HFR radar-total", "institution": "HFR-EU"},
+    )
+    path = tmp_path / "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr_radar-total_US-EastGulfCoast_2026-06-05.nc"
+    ds.to_netcdf(path)
+    return path
+
+
+class TestFromHfRadarGridCopernicus:
+    def test_reads_ewct_nsct_directly(self, tmp_path):
+        ds = DataTreeConverter.from_hf_radar_grid(
+            _make_copernicus_hfr_grid_nc(tmp_path), u_var="EWCT", v_var="NSCT",
+            source_label="Copernicus Marine HFR radar-total",
+        )
+        assert ds is not None
+        assert "EWCT" in ds and "NSCT" in ds
+
+    def test_data_type_tag_is_grid(self, tmp_path):
+        ds = DataTreeConverter.from_hf_radar_grid(
+            _make_copernicus_hfr_grid_nc(tmp_path), u_var="EWCT", v_var="NSCT",
+            source_label="Copernicus Marine HFR radar-total",
+        )
+        assert ds.attrs["data_type"] == "hf_radar_grid"
+        assert ds.attrs["source"] == "Copernicus Marine HFR radar-total"
+
+    def test_retains_copernicus_ancillary_fields(self, tmp_path):
+        ds = DataTreeConverter.from_hf_radar_grid(
+            _make_copernicus_hfr_grid_nc(tmp_path), u_var="EWCT", v_var="NSCT",
+            source_label="Copernicus Marine HFR radar-total",
+        )
+        assert "hfr_gdop" in ds
+        assert "hfr_ewcs" in ds and "hfr_nscs" in ds
+        assert "hfr_qc" in ds  # overall QCflag
+
+    def test_retains_per_parameter_qc_flags(self, tmp_path):
+        ds = DataTreeConverter.from_hf_radar_grid(
+            _make_copernicus_hfr_grid_nc(tmp_path), u_var="EWCT", v_var="NSCT",
+            source_label="Copernicus Marine HFR radar-total",
+        )
+        for name in ("hfr_qc_cspd", "hfr_qc_ddns", "hfr_qc_gdop",
+                     "hfr_qc_vart", "hfr_qc_position"):
+            assert name in ds, f"{name} missing from converted dataset"
+
+    def test_noaa_default_args_unaffected(self, tmp_path):
+        # Default u_var/v_var must still resolve NOAA's water_u/water_v.
+        ds = DataTreeConverter.from_hf_radar_grid(_make_hfr_grid_nc(tmp_path))
+        assert ds is not None
+        assert "EWCT" in ds and ds.attrs["source"] == "NOAA HFRnet RTV"
+
+
 class TestBuildDatatreeHfrNoaa:
     def test_hfr_noaa_folder_becomes_validation_node(self, tmp_path):
         base = tmp_path / "run"
@@ -1049,3 +1122,28 @@ class TestBuildDatatreeHfrNoaa:
         assert tree is not None
         node_paths = [node.path for node in tree.subtree]
         assert any("hfr_noaa" in p for p in node_paths)
+
+
+class TestBuildDatatreeHfRadarCopernicus:
+    def test_hf_radar_folder_becomes_validation_node(self, tmp_path):
+        base = tmp_path / "run"
+        (base / "hf_radar").mkdir(parents=True)
+        _make_copernicus_hfr_grid_nc(base / "hf_radar")
+        tree = DataTreeConverter.convert_downloaded_data(base, product_type="currents")
+        assert tree is not None
+        node_paths = [node.path for node in tree.subtree]
+        assert any("hf_radar" in p and "hf_radar_noaa" not in p for p in node_paths)
+
+
+class TestBuildDatatreeHfRadarHistorical:
+    def test_hf_radar_historical_folder_becomes_validation_node(self, tmp_path):
+        base = tmp_path / "run"
+        (base / "hf_radar_historical").mkdir(parents=True)
+        _make_copernicus_hfr_grid_nc(base / "hf_radar_historical")
+        tree = DataTreeConverter.convert_downloaded_data(base, product_type="currents")
+        assert tree is not None
+        node_paths = [node.path for node in tree.subtree]
+        assert any(
+            "hf_radar_historical" in p and "hf_radar_noaa" not in p
+            for p in node_paths
+        )

@@ -260,10 +260,8 @@ def _build_currents_config(limit: Optional[int] = None):
         geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
         sar_data=SARDataSpec(swath_mode=["WV","IW","EW","SM"], max_downloads=limit),
         validation_sources=[
-            ValidationDataSource(
-                source_type="hf_radar",
-                min_depth=-2.0, max_depth=2.0,
-            ),
+            ValidationDataSource(source_type="hf_radar"),
+            ValidationDataSource(source_type="hf_radar_historical"),
             ValidationDataSource(
                 source_type="hf_radar_noaa",
                 min_depth=-2.0, max_depth=2.0,
