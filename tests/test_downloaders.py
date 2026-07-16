@@ -869,3 +869,96 @@ class TestHFRadarDownloaderGrid:
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
             with pytest.raises(FileNotFoundError):
                 dl.download(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")
+
+
+# ---------------------------------------------------------------------------
+# Tests for HFRadarHistoricalDownloader
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field
+from typing import List, Any
+
+
+@dataclass
+class FileGetResult:
+    files: List[Any] = field(default_factory=list)
+
+
+class TestHFRadarHistoricalDownloader:
+    def test_dry_run_prints_resolved_region_and_filename(self, tmp_path, capsys):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=True)
+        out = dl.download(-90.0, -60.0, 30.0, 40.0, "2021-06-05", "2021-06-06")
+        assert out is None
+        captured = capsys.readouterr().out
+        assert "US-EastGulfCoast" in captured
+        assert "GL_TV_HF_HFR-US-EastGulfCoast_Total_2021.nc" in captured
+
+    def test_unavailable_region_raises_clear_error(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=True)
+        # GoS (Italy) has an NRT feed but no delayed-mode archive.
+        with pytest.raises(ValueError, match="no delayed-mode HF-radar archive"):
+            dl.download(13.5, 15.5, 40.0, 41.0, "2021-01-01", "2021-01-02")
+
+    def test_multi_year_request_not_yet_supported(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=True)
+        with pytest.raises(NotImplementedError, match="single calendar year"):
+            dl.download(-90.0, -60.0, 30.0, 40.0, "2020-12-30", "2021-01-02")
+
+    def test_download_gets_file_then_subsets_locally(self, tmp_path):
+        from unittest.mock import patch, MagicMock
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+        import xarray as xr
+        import numpy as np
+        import pandas as pd
+
+        raw_dir = tmp_path / "_raw"
+        raw_dir.mkdir()
+        raw_path = raw_dir / "GL_TV_HF_HFR-US-WestCoast_Total.nc"
+        times = pd.date_range("2019-01-01", periods=5, freq="1h")
+        shape = (5, 1, 2, 2)
+        ds = xr.Dataset(
+            {
+                "EWCT": (("TIME", "DEPTH", "LATITUDE", "LONGITUDE"), np.random.rand(*shape)),
+                "NSCT": (("TIME", "DEPTH", "LATITUDE", "LONGITUDE"), np.random.rand(*shape)),
+                "GDOP": (("TIME", "DEPTH", "LATITUDE", "LONGITUDE"), np.random.rand(*shape)),
+            },
+            coords={
+                "TIME": times, "DEPTH": [0.0],
+                "LATITUDE": [33.0, 34.0], "LONGITUDE": [-121.0, -120.0],
+            },
+        )
+        ds.to_netcdf(raw_path)
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path / "out", dry_run=False)
+        fake_module = MagicMock()
+
+        def fake_get(**kwargs):
+            # FileGetResult is defined at module scope in this test file (see
+            # the brief's note: it's a mock stand-in only, not a symbol the
+            # implementation defines or imports).
+            return FileGetResult(files=[type("F", (), {"file_path": raw_path})()])
+
+        fake_module.get.side_effect = fake_get
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            out = dl.download(-121.0, -120.0, 33.0, 34.0, "2019-01-01", "2019-01-01T04:00:00")
+
+        assert out is not None
+        assert out.exists()
+        result = xr.open_dataset(out)
+        assert "time" in result.dims and "latitude" in result.dims and "longitude" in result.dims
+        assert "DEPTH" not in result.dims
+        assert result.sizes["time"] == 5
