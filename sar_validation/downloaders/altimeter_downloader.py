@@ -31,7 +31,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .base import normalize_datetime, build_output_dir
+from .base import normalize_datetime, build_output_dir, split_antimeridian_bbox
 
 __all__ = ["AltimeterDownloader"]
 
@@ -187,61 +187,65 @@ class AltimeterDownloader:
                 dataset_id = template.format(sat=sat_code)
                 start_d = eff_start_dt.split("T")[0]
                 end_d = end_dt.split("T")[0]
-                filename = f"{dataset_id}_{start_d}_{end_d}.nc"
-                dest_path = self.output_dir / filename
 
-                if self.dry_run:
-                    print(
-                        f"[DRY RUN] Would download {freq.upper()} altimeter data "
-                        f"({sat_map[sat_code]}, dataset_id={dataset_id}) to:\n"
-                        f"  {dest_path}"
-                    )
-                    continue
+                windows = split_antimeridian_bbox(min_lon, max_lon)
+                for i, (win_min_lon, win_max_lon) in enumerate(windows):
+                    suffix = f"_w{i}" if len(windows) > 1 else ""
+                    filename = f"{dataset_id}_{start_d}_{end_d}{suffix}.nc"
+                    dest_path = self.output_dir / filename
 
-                print(f"Downloading {freq.upper()} altimeter data ({sat_map[sat_code]}) …")
-                print(f"  Dataset: {dataset_id}")
-                print(f"  Region:  lon [{min_lon}, {max_lon}] lat [{min_lat}, {max_lat}]")
-                print(f"  Time:    {eff_start_dt} → {end_dt}")
+                    if self.dry_run:
+                        print(
+                            f"[DRY RUN] Would download {freq.upper()} altimeter data "
+                            f"({sat_map[sat_code]}, dataset_id={dataset_id}) to:\n"
+                            f"  {dest_path}"
+                        )
+                        continue
 
-                try:
-                    copernicusmarine.subset(
-                        dataset_id=dataset_id,
-                        variables=variables,
-                        minimum_longitude=min_lon,
-                        maximum_longitude=max_lon,
-                        minimum_latitude=min_lat,
-                        maximum_latitude=max_lat,
-                        start_datetime=eff_start_dt,
-                        end_datetime=end_dt,
-                        minimum_depth=0,
-                        maximum_depth=0,
-                        output_directory=self.output_dir,
-                        output_filename=filename,
-                        force_download=False,
-                    )
-                    if dest_path.is_dir():
-                        # copernicusmarine can't always merge the request
-                        # into a single file (e.g. multiple platforms in
-                        # one dataset_id) — it then writes a directory
-                        # named after output_filename containing one .nc
-                        # per platform instead.
-                        new_files = sorted(dest_path.rglob("*.nc"))
-                        downloaded.extend(new_files)
-                        for f in new_files:
-                            print(f"  Saved to {f}")
-                        if not new_files:
+                    print(f"Downloading {freq.upper()} altimeter data ({sat_map[sat_code]}) …")
+                    print(f"  Dataset: {dataset_id}")
+                    print(f"  Region:  lon [{win_min_lon}, {win_max_lon}] lat [{min_lat}, {max_lat}]")
+                    print(f"  Time:    {eff_start_dt} → {end_dt}")
+
+                    try:
+                        copernicusmarine.subset(
+                            dataset_id=dataset_id,
+                            variables=variables,
+                            minimum_longitude=win_min_lon,
+                            maximum_longitude=win_max_lon,
+                            minimum_latitude=min_lat,
+                            maximum_latitude=max_lat,
+                            start_datetime=eff_start_dt,
+                            end_datetime=end_dt,
+                            minimum_depth=0,
+                            maximum_depth=0,
+                            output_directory=self.output_dir,
+                            output_filename=filename,
+                            force_download=False,
+                        )
+                        if dest_path.is_dir():
+                            # copernicusmarine can't always merge the request
+                            # into a single file (e.g. multiple platforms in
+                            # one dataset_id) — it then writes a directory
+                            # named after output_filename containing one .nc
+                            # per platform instead.
+                            new_files = sorted(dest_path.rglob("*.nc"))
+                            downloaded.extend(new_files)
+                            for f in new_files:
+                                print(f"  Saved to {f}")
+                            if not new_files:
+                                print("  No data in this region/time window — skipped.")
+                        elif dest_path.exists():
+                            downloaded.append(dest_path)
+                            print(f"  Saved to {dest_path}")
+                        else:
+                            # copernicusmarine.subset() writes nothing (and
+                            # raises no error) when the satellite's ground
+                            # track doesn't cross this region/time window —
+                            # expected for most satellites on a small bbox.
                             print("  No data in this region/time window — skipped.")
-                    elif dest_path.exists():
-                        downloaded.append(dest_path)
-                        print(f"  Saved to {dest_path}")
-                    else:
-                        # copernicusmarine.subset() writes nothing (and
-                        # raises no error) when the satellite's ground
-                        # track doesn't cross this region/time window —
-                        # expected for most satellites on a small bbox.
-                        print("  No data in this region/time window — skipped.")
-                except Exception as exc:
-                    print(f"  Skipping {dataset_id}: {exc}")
+                    except Exception as exc:
+                        print(f"  Skipping {dataset_id}: {exc}")
 
         print(f"Downloaded {len(downloaded)} altimeter file(s).")
         return downloaded

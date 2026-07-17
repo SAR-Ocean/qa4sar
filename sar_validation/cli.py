@@ -95,7 +95,11 @@ Examples:
         "--max-lon",
         type=float,
         metavar="DEG",
-        help="Eastern bound in decimal degrees (used with --create-recipe)",
+        help=(
+            "Eastern bound in decimal degrees (used with --create-recipe). "
+            "If less than --min-lon, the bbox wraps through 180 deg "
+            "(e.g. --min-lon 135 --max-lon -120 covers the Pacific)."
+        ),
     )
     parser.add_argument(
         "--min-lat",

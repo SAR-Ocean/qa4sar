@@ -39,7 +39,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .base import normalize_datetime, build_output_dir
+from .base import normalize_datetime, build_output_dir, split_antimeridian_bbox
 from ._hf_radar_regions import resolve_hfr_region
 
 __all__ = ["HFRadarHistoricalDownloader"]
@@ -128,16 +128,52 @@ class HFRadarHistoricalDownloader:
         max_lat: float,
         start: str,
         end: str,
-    ) -> Optional[Path]:
-        region = resolve_hfr_region(min_lon, max_lon, min_lat, max_lat)
+    ) -> list[Path]:
         start_dt = normalize_datetime(start)
         end_dt = normalize_datetime(end)
+        windows = split_antimeridian_bbox(min_lon, max_lon)
+
+        downloaded: list[Path] = []
+        last_error: Optional[ValueError] = None
+        resolved_any = False
+        for i, (win_min_lon, win_max_lon) in enumerate(windows):
+            suffix = f"_w{i}" if len(windows) > 1 else ""
+            try:
+                region = resolve_hfr_region(win_min_lon, win_max_lon, min_lat, max_lat)
+            except ValueError as exc:
+                if len(windows) == 1:
+                    raise
+                last_error = exc
+                continue
+            resolved_any = True
+            path = self._download_region_window(
+                region, win_min_lon, win_max_lon, min_lat, max_lat,
+                start_dt, end_dt, suffix,
+            )
+            if path is not None:
+                downloaded.append(path)
+
+        if not resolved_any and last_error is not None:
+            raise last_error
+        return downloaded
+
+    def _download_region_window(
+        self,
+        region: str,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start_dt: str,
+        end_dt: str,
+        filename_suffix: str,
+    ) -> Optional[Path]:
         remote_filename = _region_filename(region, start_dt, end_dt)
 
         start_d = start_dt.split("T")[0]
         end_d = end_dt.split("T")[0]
         date_str = start_d if start_d == end_d else f"{start_d}-{end_d}"
-        dest_path = self.output_dir / f"{DATASET_ID}_{region}_{date_str}.nc"
+        dest_path = self.output_dir / f"{DATASET_ID}_{region}_{date_str}{filename_suffix}.nc"
 
         if self.dry_run:
             print(

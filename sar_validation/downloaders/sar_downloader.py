@@ -31,6 +31,7 @@ from .base import (
     authenticate_cdse,
     normalize_datetime,
     build_output_dir,
+    split_antimeridian_bbox,
 )
 
 __all__ = ["SARDownloader"]
@@ -106,20 +107,24 @@ class SARDownloader:
         end_norm   = normalize_datetime(end)   + ".000Z"
 
         client = self._get_client()
-        records = client.query_products(
-            collection="SENTINEL-1",
-            product_type="OCN",
-            start_date=start_norm,
-            end_date=end_norm,
-            min_lon=min_lon,
-            max_lon=max_lon,
-            min_lat=min_lat,
-            max_lat=max_lat,
-            top=top,
-        )
-        df = pd.DataFrame(records)
+        frames = []
+        for lo, hi in split_antimeridian_bbox(min_lon, max_lon):
+            records = client.query_products(
+                collection="SENTINEL-1",
+                product_type="OCN",
+                start_date=start_norm,
+                end_date=end_norm,
+                min_lon=lo,
+                max_lon=hi,
+                min_lat=min_lat,
+                max_lat=max_lat,
+                top=top,
+            )
+            frames.append(pd.DataFrame(records))
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         if df.empty:
             return df
+        df = df.drop_duplicates(subset="Id", keep="first").reset_index(drop=True)
 
         # Filter by mode if specified
         if modes:

@@ -235,8 +235,8 @@ def _set_lonlat_ticks(ax, gl):
     ylim = ax.get_ylim()
     xticks = [x for x in gl.xlocator.tick_values(*xlim) if xlim[0] <= x <= xlim[1]]
     yticks = [y for y in gl.ylocator.tick_values(*ylim) if ylim[0] <= y <= ylim[1]]
-    ax.set_xticks(xticks, crs=ccrs.PlateCarree())
-    ax.set_yticks(yticks, crs=ccrs.PlateCarree())
+    ax.set_xticks(xticks, crs=ax.projection)
+    ax.set_yticks(yticks, crs=ax.projection)
 
 
 def _fill_nan_nearest(a: np.ndarray) -> np.ndarray:
@@ -1526,8 +1526,13 @@ def plot_collocation_diagnostics(
         matched_linewidths = 0.0
 
     # ── Create geographic plot ──────────────────────────────────────────
+    # A crossing bbox (min_lon > max_lon, see GeographicBounds' antimeridian
+    # convention) is centered on 180 deg instead of Greenwich, so the map
+    # itself doesn't get cut at the dateline.
+    crosses_dateline = bounds.min_lon > bounds.max_lon
+    proj = ccrs.PlateCarree(central_longitude=180) if crosses_dateline else ccrs.PlateCarree()
     fig = plt.figure(figsize=(14, 10), dpi=100)
-    ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+    ax = fig.add_subplot(1, 1, 1, projection=proj)
     transform = ccrs.PlateCarree()
 
     # Add coastlines and features
@@ -1537,8 +1542,19 @@ def plot_collocation_diagnostics(
     gl = ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
 
     # ── Set plot extent to the recipe's geographic bounds ────────────────
-    ax.set_extent([bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat],
-                  crs=ccrs.PlateCarree())
+    if crosses_dateline:
+        # In the central_longitude=180 axes frame, true longitude L maps to
+        # (L % 360) - 180, which turns the wrapped [min_lon, 180] +
+        # [-180, max_lon] range into one contiguous span with no wraparound.
+        def _shift(lon: float) -> float:
+            return (lon % 360) - 180
+        ax.set_extent(
+            [_shift(bounds.min_lon), _shift(bounds.max_lon), bounds.min_lat, bounds.max_lat],
+            crs=proj,
+        )
+    else:
+        ax.set_extent([bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat],
+                      crs=transform)
     _set_lonlat_ticks(ax, gl)
 
     # ── SAR coverage (zorder=1): Grid scenes → bounding box; sparse WV

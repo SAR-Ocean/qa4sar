@@ -48,7 +48,7 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-from .base import authenticate_eumdac, normalize_datetime, build_output_dir
+from .base import authenticate_eumdac, normalize_datetime, build_output_dir, split_antimeridian_bbox
 
 __all__ = ["ScatterometerDownloader"]
 
@@ -115,24 +115,32 @@ class ScatterometerDownloader:
 
         start_dt = normalize_datetime(start)
         end_dt   = normalize_datetime(end)
-        bbox     = f"{min_lon},{min_lat},{max_lon},{max_lat}"
+        windows = split_antimeridian_bbox(min_lon, max_lon)
 
         if self.dry_run:
-            print(
-                f"[DRY RUN] Would download ASCAT data\n"
-                f"  Region: lon [{min_lon},{max_lon}] lat [{min_lat},{max_lat}]\n"
-                f"  Time:   {start_dt} → {end_dt}\n"
-                f"  Output: {self.output_dir}"
-            )
+            for lo, hi in windows:
+                print(
+                    f"[DRY RUN] Would download ASCAT data\n"
+                    f"  Region: lon [{lo},{hi}] lat [{min_lat},{max_lat}]\n"
+                    f"  Time:   {start_dt} → {end_dt}\n"
+                    f"  Output: {self.output_dir}"
+                )
             return []
 
         token = self._get_token()
         datastore = eumdac.DataStore(token)
         collection = datastore.get_collection(COLLECTION_ID)
 
-        products = list(
-            collection.search(bbox=bbox, dtstart=start_dt, dtend=end_dt)
-        )
+        seen_ids: set[str] = set()
+        products = []
+        for lo, hi in windows:
+            bbox = f"{lo},{min_lat},{hi},{max_lat}"
+            for product_id in collection.search(bbox=bbox, dtstart=start_dt, dtend=end_dt):
+                key = str(product_id)
+                if key not in seen_ids:
+                    seen_ids.add(key)
+                    products.append(product_id)
+
         print(f"Found {len(products)} ASCAT products.")
         if not products:
             return []

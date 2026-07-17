@@ -28,6 +28,7 @@ __all__ = [
     "normalize_datetime",
     "is_date_recent",
     "build_output_dir",
+    "split_antimeridian_bbox",
 ]
 
 
@@ -392,3 +393,20 @@ def build_output_dir(
         f"{min_lon:.2f}_{max_lon:.2f}_{min_lat:.2f}_{max_lat:.2f}"
     )
     return Path(base) / dir_name
+
+
+def split_antimeridian_bbox(min_lon: float, max_lon: float) -> list[tuple[float, float]]:
+    """
+    Split a longitude range into 1 or 2 non-crossing (lon_min, lon_max) windows.
+
+    A recipe's ``GeographicBounds.min_lon > max_lon`` means the bbox wraps
+    through the antimeridian (180 degrees) rather than being invalid, e.g.
+    ``min_lon=135, max_lon=-120`` covers the Pacific from 135E to 120W.
+    Returns the box unchanged (as a single window) when ``min_lon <=
+    max_lon``; otherwise returns the two windows ``[min_lon, 180]`` and
+    ``[-180, max_lon]`` that together cover the same region without either
+    window itself crossing the antimeridian.
+    """
+    if min_lon <= max_lon:
+        return [(min_lon, max_lon)]
+    return [(min_lon, 180.0), (-180.0, max_lon)]

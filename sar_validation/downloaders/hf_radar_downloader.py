@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .base import normalize_datetime, is_date_recent, build_output_dir
+from .base import normalize_datetime, is_date_recent, build_output_dir, split_antimeridian_bbox
 from ._hf_radar_regions import HFR_REGIONS, resolve_hfr_region
 
 __all__ = ["HFRadarDownloader"]
@@ -87,14 +87,51 @@ class HFRadarDownloader:
         max_lat: float,
         start: str,
         end: str,
-    ) -> Optional[Path]:
-        region = resolve_hfr_region(min_lon, max_lon, min_lat, max_lat)
+    ) -> list[Path]:
         start_dt = normalize_datetime(start)
         end_dt = normalize_datetime(end)
+        windows = split_antimeridian_bbox(min_lon, max_lon)
 
+        downloaded: list[Path] = []
+        last_error: Optional[ValueError] = None
+        resolved_any = False
+        for i, (win_min_lon, win_max_lon) in enumerate(windows):
+            suffix = f"_w{i}" if len(windows) > 1 else ""
+            try:
+                region = resolve_hfr_region(win_min_lon, win_max_lon, min_lat, max_lat)
+            except ValueError as exc:
+                if len(windows) == 1:
+                    raise
+                last_error = exc
+                continue
+            resolved_any = True
+            path = self._download_region_window(
+                region, win_min_lon, win_max_lon, min_lat, max_lat,
+                start_dt, end_dt, suffix,
+            )
+            if path is not None:
+                downloaded.append(path)
+
+        if not resolved_any and last_error is not None:
+            raise last_error
+        return downloaded
+
+    def _download_region_window(
+        self,
+        region: str,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start_dt: str,
+        end_dt: str,
+        filename_suffix: str,
+    ) -> Optional[Path]:
         use_latest = HFR_REGIONS[region]["has_latest"] and is_date_recent(end_dt)
         dataset_part = f"{'latest' if use_latest else 'monthly'}-radar-total--{region}"
         filename = _build_filename(region, start_dt, end_dt)
+        if filename_suffix:
+            filename = filename.replace(".nc", f"{filename_suffix}.nc")
         dest_path = self.output_dir / filename
 
         if self.dry_run:

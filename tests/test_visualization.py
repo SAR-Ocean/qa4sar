@@ -841,6 +841,79 @@ def diagnostics_recipe():
 
 
 @pytest.fixture
+def geo_datatree_and_collocation_dateline():
+    """Synthetic DataTree + collocation_ds whose SAR scene and validation
+    points straddle the antimeridian (170E..170W), used to test
+    plot_collocation_diagnostics' dateline-crossing map extent."""
+    from sar_validation.core.datatree_converter import DataTreeConverter
+
+    lon2d = np.array([
+        [170.0, 175.0, 180.0, -175.0, -170.0],
+        [170.0, 175.0, 180.0, -175.0, -170.0],
+    ])
+    lat2d = np.array([
+        [-2.0, -2.0, -2.0, -2.0, -2.0],
+        [2.0, 2.0, 2.0, 2.0, 2.0],
+    ])
+    wind = np.linspace(5.0, 12.0, lon2d.size).reshape(lon2d.shape)
+    sar_ds = xr.Dataset(
+        {"owiWindSpeed": (("y", "x"), wind)},
+        coords={
+            "lon": (("y", "x"), lon2d),
+            "lat": (("y", "x"), lat2d),
+            "time": pd.Timestamp("2026-07-02T12:00:00"),
+        },
+    )
+
+    n = 4
+    mooring_ds = xr.Dataset(
+        {"WSPD": ("point", np.array([6.0, 6.5, 7.0, 7.5]))},
+        coords={
+            "lon": ("point", np.array([172.0, 178.0, -178.0, -172.0])),
+            "lat": ("point", np.array([-1.0, -0.5, 0.5, 1.0])),
+            "time": ("point", pd.date_range("2026-07-02T12:05", periods=n, freq="5min")),
+        },
+        attrs={"platform_type": "mooring"},
+    )
+
+    datatree = DataTreeConverter.to_datatree({
+        "sar/sceneA": sar_ds,
+        "validation/mooring": mooring_ds,
+    })
+
+    collocation_ds = xr.Dataset({
+        "sar_owiWindSpeed":            ("collocation", np.array([6.1, 6.9, 8.2, 9.3])),
+        "val_WSPD":                    ("collocation", np.array([6.0, 7.0, 8.0, 9.5])),
+        "val_source":                  ("collocation", ["mooring"] * n),
+        "sar_scene_name":              ("collocation", ["sceneA"] * n),
+        "val_lon":                     ("collocation", np.array([172.0, 178.0, -178.0, -172.0])),
+        "val_lat":                     ("collocation", np.array([-1.0, -0.5, 0.5, 1.0])),
+        "val_id":                      ("collocation", ["mo0", "mo1", "mo2", "mo3"]),
+        "temporal_distance_minutes":   ("collocation", np.array([10.0, 20.0, 30.0, 40.0])),
+    })
+    collocation_ds = collocation_ds.assign_coords(
+        val_time=("collocation", pd.date_range("2026-07-02T12:05", periods=n, freq="5min")),
+    )
+    return datatree, collocation_ds
+
+
+@pytest.fixture
+def diagnostics_recipe_dateline():
+    from sar_validation.core.recipe import (
+        GeographicBounds, Recipe, RecipeConfig, ValidationDataSource,
+        CollocationType, PointVsLayerCollocation,
+    )
+    config = RecipeConfig(
+        name="test_recipe_dateline",
+        variable="wind",
+        geographic_bounds=GeographicBounds(min_lon=135.0, max_lon=-120.0, min_lat=-15.0, max_lat=30.0),
+        validation_sources=[ValidationDataSource(source_type="mooring")],
+        collocation=CollocationType(point_vs_layer=PointVsLayerCollocation(time_tolerance_minutes=30)),
+    )
+    return Recipe(config=config)
+
+
+@pytest.fixture
 def diagnostics_recipe_waves():
     from sar_validation.core.recipe import (
         GeographicBounds, Recipe, RecipeConfig, ValidationDataSource,
@@ -2065,3 +2138,61 @@ class TestValidationReportOnlyDiagnosticsPngSaved:
         plots_dir = tmp_path / "plots"
         png_files = sorted(p.name for p in plots_dir.glob("*.png"))
         assert png_files == ["collocation_diagnostics_test_recipe.png"]
+
+
+class TestPlotCollocationDiagnosticsAntimeridian:
+    def test_uses_central_longitude_180_projection_when_crossing(
+        self, geo_datatree_and_collocation_dateline, diagnostics_recipe_dateline, tmp_path, monkeypatch
+    ):
+        import sar_validation.core.visualization as viz
+
+        datatree, collocation_ds = geo_datatree_and_collocation_dateline
+        seen_ax = []
+        original = viz._set_lonlat_ticks
+
+        def spy(ax, gl):
+            seen_ax.append(ax)
+            return original(ax, gl)
+
+        monkeypatch.setattr(viz, "_set_lonlat_ticks", spy)
+        out_path = viz.plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe_dateline, tmp_path,
+        )
+
+        assert out_path is not None
+        assert len(seen_ax) == 1
+        assert seen_ax[0].projection.proj4_params.get("lon_0") == 180
+
+    def test_non_crossing_recipe_keeps_default_projection(
+        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
+    ):
+        import sar_validation.core.visualization as viz
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        seen_ax = []
+        original = viz._set_lonlat_ticks
+
+        def spy(ax, gl):
+            seen_ax.append(ax)
+            return original(ax, gl)
+
+        monkeypatch.setattr(viz, "_set_lonlat_ticks", spy)
+        viz.plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe, tmp_path,
+        )
+
+        assert len(seen_ax) == 1
+        assert seen_ax[0].projection.proj4_params.get("lon_0", 0) == 0
+
+    def test_produces_a_valid_png_for_crossing_bbox(
+        self, geo_datatree_and_collocation_dateline, diagnostics_recipe_dateline, tmp_path
+    ):
+        import matplotlib.image as mpimg
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation_dateline
+        out_path = plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe_dateline, tmp_path,
+        )
+        img = mpimg.imread(str(out_path))
+        assert img.shape[0] > 100 and img.shape[1] > 100

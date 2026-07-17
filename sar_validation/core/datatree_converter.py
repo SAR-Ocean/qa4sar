@@ -81,8 +81,15 @@ def _subset_point_ds(
     deg_buf = buffer_km / 55.0
     lon = ds["lon"].values
     lat = ds["lat"].values
+    if min_lon <= max_lon:
+        lon_mask = (lon >= min_lon - deg_buf) & (lon <= max_lon + deg_buf)
+    else:
+        # Antimeridian-crossing bbox (GeographicBounds.min_lon > max_lon):
+        # valid longitudes are the union of the two wrap-around windows,
+        # not their (empty) intersection.
+        lon_mask = (lon >= min_lon - deg_buf) | (lon <= max_lon + deg_buf)
     mask = (
-        (lon >= min_lon - deg_buf) & (lon <= max_lon + deg_buf)
+        lon_mask
         & (lat >= min_lat - deg_buf) & (lat <= max_lat + deg_buf)
     )
 

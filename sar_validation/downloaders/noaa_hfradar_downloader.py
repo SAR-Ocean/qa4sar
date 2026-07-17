@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
-from .base import normalize_datetime
+from .base import normalize_datetime, split_antimeridian_bbox
 
 __all__ = [
     "NOAAHFRadarDownloader",
@@ -175,7 +175,33 @@ class NOAAHFRadarDownloader:
         self.resolution_km = resolution_km
 
     def download(self, min_lon, max_lon, min_lat, max_lat,
-                 start: str, end: str) -> Optional[Path]:
+                 start: str, end: str) -> list[Path]:
+        windows = split_antimeridian_bbox(min_lon, max_lon)
+        downloaded: list[Path] = []
+        last_error: Optional[ValueError] = None
+        resolved_any = False
+        for i, (win_min_lon, win_max_lon) in enumerate(windows):
+            suffix = f"_w{i}" if len(windows) > 1 else ""
+            try:
+                path = self._download_window(
+                    win_min_lon, win_max_lon, min_lat, max_lat, start, end, suffix,
+                )
+            except ValueError as exc:
+                if len(windows) == 1:
+                    raise
+                last_error = exc
+                continue
+            resolved_any = True
+            if path is not None:
+                downloaded.append(path)
+
+        if not resolved_any and last_error is not None:
+            raise last_error
+        return downloaded
+
+    def _download_window(
+        self, min_lon, max_lon, min_lat, max_lat, start: str, end: str, filename_suffix: str,
+    ) -> Optional[Path]:
         backend = select_backend(end)  # raises if archive (Phase 3b) needed
         dataset_id = select_erddap_dataset(
             min_lon, max_lon, min_lat, max_lat, self.resolution_km
@@ -195,7 +221,7 @@ class NOAAHFRadarDownloader:
         start_d = normalize_datetime(start).split("T")[0]
         end_d = normalize_datetime(end).split("T")[0]
         date_str = start_d if start_d == end_d else f"{start_d}_{end_d}"
-        out_path = self.output_dir / f"{dataset_id}_{self.resolution_km}km_{date_str}.nc"
+        out_path = self.output_dir / f"{dataset_id}_{self.resolution_km}km_{date_str}{filename_suffix}.nc"
         urllib.request.urlretrieve(url, str(out_path))
         return out_path
 

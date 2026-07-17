@@ -565,6 +565,39 @@ class TestSubsetPointDs:
         assert out is ds
 
 
+_CROSSING_SUBSET_KW = dict(
+    min_lon=135.0, max_lon=-120.0, min_lat=-15.0, max_lat=30.0,
+    t_start="2026-07-02", t_end="2026-07-03",
+    buffer_km=25.0, time_tolerance_minutes=180,
+)
+
+
+class TestSubsetPointDsAntimeridian:
+    def test_keeps_points_on_both_sides_of_the_dateline(self):
+        ds = _make_point_ds(
+            lons=[170.0, -170.0], lats=[0.0, 0.0],
+            times=["2026-07-02T12:00"] * 2,
+        )
+        out = _subset_point_ds(ds, **_CROSSING_SUBSET_KW)
+        assert out.sizes["point"] == 2
+
+    def test_drops_points_in_the_excluded_middle(self):
+        ds = _make_point_ds(
+            lons=[0.0, 45.0], lats=[0.0, 0.0],
+            times=["2026-07-02T12:00"] * 2,
+        )
+        assert _subset_point_ds(ds, **_CROSSING_SUBSET_KW) is None
+
+    def test_keeps_latitude_filtering_alongside_the_lon_union(self):
+        ds = _make_point_ds(
+            lons=[170.0, 170.0], lats=[0.0, 80.0],
+            times=["2026-07-02T12:00"] * 2,
+        )
+        out = _subset_point_ds(ds, **_CROSSING_SUBSET_KW)
+        assert out.sizes["point"] == 1
+        assert float(out["lat"].values[0]) == 0.0
+
+
 def _make_scatterometer_nc_at(tmp_path: Path, lons, lats,
                               time_str="2026-07-05T18:33:00Z") -> Path:
     """Scatterometer-shaped file with explicit per-point coordinates."""

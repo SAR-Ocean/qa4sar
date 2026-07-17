@@ -7,7 +7,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from sar_validation.downloaders.base import normalize_datetime, is_date_recent
+from sar_validation.downloaders.base import normalize_datetime, is_date_recent, split_antimeridian_bbox
 from sar_validation.downloaders.insitu_downloader import (
     SOURCE_TYPE_TO_PLATFORM,
     PLATFORM_CODE_TO_SOURCE_TYPE,
@@ -225,21 +225,307 @@ class TestDatetimeIntegration:
         # User provides input with HHMMSS format
         user_start = "2026-06-24 000000"
         user_end = "2026-06-24 030000"
-        
+
         # SAR downloader normalizes and appends .000Z
         norm_start = normalize_datetime(user_start)
         norm_end = normalize_datetime(user_end)
-        
+
         api_start = norm_start + ".000Z"
         api_end = norm_end + ".000Z"
-        
+
         # These should be valid for Copernicus API
         assert api_start == "2026-06-24T00:00:00.000Z"
         assert api_end == "2026-06-24T03:00:00.000Z"
-        
+
         # Verify they parse as valid ISO datetime
         datetime.fromisoformat(api_start.rstrip("Z"))
         datetime.fromisoformat(api_end.rstrip("Z"))
+
+
+# ---------------------------------------------------------------------------
+# Tests for split_antimeridian_bbox()
+# ---------------------------------------------------------------------------
+
+class TestSplitAntimeridianBbox:
+    def test_non_crossing_bbox_returned_unchanged(self):
+        assert split_antimeridian_bbox(-20.0, 0.0) == [(-20.0, 0.0)]
+
+    def test_equal_bounds_treated_as_non_crossing(self):
+        assert split_antimeridian_bbox(10.0, 10.0) == [(10.0, 10.0)]
+
+    def test_crossing_bbox_splits_into_two_windows(self):
+        assert split_antimeridian_bbox(135.0, -120.0) == [(135.0, 180.0), (-180.0, -120.0)]
+
+    def test_crossing_bbox_windows_are_each_non_crossing(self):
+        windows = split_antimeridian_bbox(170.0, -170.0)
+        for lo, hi in windows:
+            assert lo <= hi
+
+
+# ---------------------------------------------------------------------------
+# SARDownloader — antimeridian crossing
+# ---------------------------------------------------------------------------
+
+class TestSARDownloaderAntimeridian:
+    def _record(self, id_):
+        return {
+            "Id": id_, "Name": "S1A_IW_OCN__2SDV_20260702T000000",
+            "ContentDate_Start": "2026-07-02T00:00:00Z",
+            "ContentDate_End": "2026-07-02T00:00:10Z",
+            "ContentLength_GB": 1.0, "Online": True,
+        }
+
+    def test_query_splits_crossing_bbox_into_two_windows(self, tmp_path):
+        from unittest.mock import MagicMock
+        from sar_validation.downloaders.sar_downloader import SARDownloader
+
+        dl = SARDownloader(output_dir=tmp_path)
+        fake_client = MagicMock()
+        fake_client.query_products.side_effect = [
+            [self._record("a")], [self._record("b")],
+        ]
+        dl._client = fake_client
+
+        df = dl.query(
+            min_lon=135.0, max_lon=-120.0, min_lat=-15.0, max_lat=30.0,
+            start="2026-07-02", end="2026-07-03",
+        )
+
+        assert fake_client.query_products.call_count == 2
+        first_kwargs = fake_client.query_products.call_args_list[0].kwargs
+        second_kwargs = fake_client.query_products.call_args_list[1].kwargs
+        assert (first_kwargs["min_lon"], first_kwargs["max_lon"]) == (135.0, 180.0)
+        assert (second_kwargs["min_lon"], second_kwargs["max_lon"]) == (-180.0, -120.0)
+        assert sorted(df["Id"]) == ["a", "b"]
+
+    def test_query_dedupes_product_returned_by_both_windows(self, tmp_path):
+        from unittest.mock import MagicMock
+        from sar_validation.downloaders.sar_downloader import SARDownloader
+
+        dl = SARDownloader(output_dir=tmp_path)
+        fake_client = MagicMock()
+        dup = self._record("dup")
+        fake_client.query_products.side_effect = [[dup], [dup]]
+        dl._client = fake_client
+
+        df = dl.query(
+            min_lon=135.0, max_lon=-120.0, min_lat=-15.0, max_lat=30.0,
+            start="2026-07-02", end="2026-07-03",
+        )
+        assert len(df) == 1
+
+    def test_query_non_crossing_bbox_calls_once(self, tmp_path):
+        from unittest.mock import MagicMock
+        from sar_validation.downloaders.sar_downloader import SARDownloader
+
+        dl = SARDownloader(output_dir=tmp_path)
+        fake_client = MagicMock()
+        fake_client.query_products.return_value = []
+        dl._client = fake_client
+
+        dl.query(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2026-01-01", end="2026-01-02",
+        )
+        assert fake_client.query_products.call_count == 1
+        kwargs = fake_client.query_products.call_args.kwargs
+        assert (kwargs["min_lon"], kwargs["max_lon"]) == (-20.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# AltimeterDownloader — antimeridian crossing
+# ---------------------------------------------------------------------------
+
+class TestAltimeterDownloaderAntimeridian:
+    def _patch_subset(self):
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        fake_module = MagicMock()
+
+        def fake_subset(**kwargs):
+            Path(kwargs["output_directory"], kwargs["output_filename"]).write_bytes(b"")
+
+        fake_module.subset.side_effect = fake_subset
+        return fake_module
+
+    def test_crossing_bbox_splits_into_two_windows_with_distinct_filenames(self, tmp_path):
+        from unittest.mock import patch
+        from sar_validation.downloaders.altimeter_downloader import AltimeterDownloader
+
+        dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
+        fake_module = self._patch_subset()
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            paths = dl.download(
+                min_lon=135.0, max_lon=-120.0, min_lat=-15.0, max_lat=30.0,
+                start="2026-07-02", end="2026-07-03",
+                frequencies=["1hz"], satellites=["al"],
+            )
+
+        assert fake_module.subset.call_count == 2
+        first_kwargs = fake_module.subset.call_args_list[0].kwargs
+        second_kwargs = fake_module.subset.call_args_list[1].kwargs
+        assert (first_kwargs["minimum_longitude"], first_kwargs["maximum_longitude"]) == (135.0, 180.0)
+        assert (second_kwargs["minimum_longitude"], second_kwargs["maximum_longitude"]) == (-180.0, -120.0)
+        assert first_kwargs["output_filename"] != second_kwargs["output_filename"]
+        assert len(paths) == 2
+
+    def test_non_crossing_bbox_keeps_single_call_and_original_filename(self, tmp_path):
+        from unittest.mock import patch
+        from sar_validation.downloaders.altimeter_downloader import AltimeterDownloader
+
+        dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
+        fake_module = self._patch_subset()
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            paths = dl.download(
+                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+                start="2026-06-01", end="2026-06-02",
+                frequencies=["1hz"], satellites=["al"],
+            )
+
+        assert fake_module.subset.call_count == 1
+        kwargs = fake_module.subset.call_args.kwargs
+        assert kwargs["output_filename"] == "cmems_obs-wave_glo_phy-swh_nrt_al-l3_PT1S_2026-06-01_2026-06-02.nc"
+        assert len(paths) == 1
+
+
+# ---------------------------------------------------------------------------
+# InSituDownloader — antimeridian crossing
+# ---------------------------------------------------------------------------
+
+class TestInSituDownloaderAntimeridian:
+    def test_download_splits_crossing_bbox_into_two_windows(self, tmp_path):
+        from unittest.mock import patch, MagicMock
+        from sar_validation.downloaders.insitu_downloader import (
+            InSituDownloader, _build_csv_filename,
+        )
+
+        dl = InSituDownloader(output_dir=tmp_path, dry_run=False)
+        fake_module = MagicMock()
+        fake_module.subset.side_effect = lambda **kwargs: None  # real subset writes to CWD; not needed here
+
+        start_dt, end_dt = "2026-07-02T00:00:00", "2026-07-03T00:00:00"
+        for lo, hi in [(135.0, 180.0), (-180.0, -120.0)]:
+            fname = _build_csv_filename(lo, hi, -15.0, 30.0, start_dt, end_dt, -20.0, 20.0)
+            # Pre-create the destination file so _download_window's
+            # "already at dest_path" branch is taken instead of the
+            # CWD-relative move (which the fake subset() doesn't produce).
+            (tmp_path / fname).write_text("platform_type\n")
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            paths = dl.download(
+                min_lon=135.0, max_lon=-120.0, min_lat=-15.0, max_lat=30.0,
+                start="2026-07-02", end="2026-07-03",
+            )
+
+        assert fake_module.subset.call_count == 2
+        first_kwargs = fake_module.subset.call_args_list[0].kwargs
+        second_kwargs = fake_module.subset.call_args_list[1].kwargs
+        assert (first_kwargs["minimum_longitude"], first_kwargs["maximum_longitude"]) == (135.0, 180.0)
+        assert (second_kwargs["minimum_longitude"], second_kwargs["maximum_longitude"]) == (-180.0, -120.0)
+        assert len(paths) == 2
+        assert all(p.exists() for p in paths)
+        assert paths[0].name != paths[1].name
+
+    def test_non_crossing_bbox_calls_once_and_returns_single_path(self, tmp_path):
+        from unittest.mock import patch, MagicMock
+        from sar_validation.downloaders.insitu_downloader import (
+            InSituDownloader, _build_csv_filename,
+        )
+
+        dl = InSituDownloader(output_dir=tmp_path, dry_run=False)
+        fake_module = MagicMock()
+        fake_module.subset.side_effect = lambda **kwargs: None
+
+        start_dt, end_dt = "2026-01-01T00:00:00", "2026-01-02T00:00:00"
+        fname = _build_csv_filename(-20.0, 0.0, 35.0, 60.0, start_dt, end_dt, -20.0, 20.0)
+        (tmp_path / fname).write_text("platform_type\n")
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            paths = dl.download(
+                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+                start="2026-01-01", end="2026-01-02",
+            )
+
+        assert fake_module.subset.call_count == 1
+        assert len(paths) == 1
+        assert paths[0].name == fname
+
+
+# ---------------------------------------------------------------------------
+# ScatterometerDownloader — antimeridian crossing
+# ---------------------------------------------------------------------------
+
+class TestScatterometerDownloaderAntimeridian:
+    def test_dry_run_prints_both_windows(self, tmp_path, capsys):
+        from sar_validation.downloaders.scatterometer_downloader import ScatterometerDownloader
+
+        dl = ScatterometerDownloader(output_dir=tmp_path, dry_run=True)
+        out = dl.download(
+            min_lon=135.0, max_lon=-120.0, min_lat=-15.0, max_lat=30.0,
+            start="2026-07-02", end="2026-07-03",
+        )
+        assert out == []
+        captured = capsys.readouterr().out.replace(" ", "")
+        assert "[135.0,180.0]" in captured
+        assert "[-180.0,-120.0]" in captured
+
+    def test_search_runs_once_per_window_and_dedupes_products(self, tmp_path, capsys):
+        from unittest.mock import patch, MagicMock
+        from sar_validation.downloaders.scatterometer_downloader import ScatterometerDownloader
+
+        dl = ScatterometerDownloader(output_dir=tmp_path, dry_run=False)
+        dl._token = "fake-token"
+
+        fake_eumdac = MagicMock()
+        fake_collection = MagicMock()
+        # "dup" is returned by both window searches and must be counted once.
+        # None of these IDs contain "metopb"/"metopc", so the per-product
+        # download loop skips them immediately — this test only exercises
+        # the search+dedup logic, not the download loop.
+        fake_collection.search.side_effect = [["dup", "east_only"], ["dup", "west_only"]]
+        fake_datastore = MagicMock()
+        fake_datastore.get_collection.return_value = fake_collection
+        fake_eumdac.DataStore.return_value = fake_datastore
+
+        with patch.dict("sys.modules", {"eumdac": fake_eumdac}):
+            result = dl.download(
+                min_lon=135.0, max_lon=-120.0, min_lat=-15.0, max_lat=30.0,
+                start="2026-07-02", end="2026-07-03",
+            )
+
+        assert result == []
+        assert fake_collection.search.call_count == 2
+        first_kwargs = fake_collection.search.call_args_list[0].kwargs
+        second_kwargs = fake_collection.search.call_args_list[1].kwargs
+        assert first_kwargs["bbox"] == "135.0,-15.0,180.0,30.0"
+        assert second_kwargs["bbox"] == "-180.0,-15.0,-120.0,30.0"
+        assert "Found 3 ASCAT products." in capsys.readouterr().out
+
+    def test_non_crossing_bbox_searches_once(self, tmp_path):
+        from unittest.mock import patch, MagicMock
+        from sar_validation.downloaders.scatterometer_downloader import ScatterometerDownloader
+
+        dl = ScatterometerDownloader(output_dir=tmp_path, dry_run=False)
+        dl._token = "fake-token"
+
+        fake_eumdac = MagicMock()
+        fake_collection = MagicMock()
+        fake_collection.search.return_value = []
+        fake_datastore = MagicMock()
+        fake_datastore.get_collection.return_value = fake_collection
+        fake_eumdac.DataStore.return_value = fake_datastore
+
+        with patch.dict("sys.modules", {"eumdac": fake_eumdac}):
+            dl.download(
+                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+                start="2026-01-01", end="2026-01-02",
+            )
+
+        assert fake_collection.search.call_count == 1
+        assert fake_collection.search.call_args.kwargs["bbox"] == "-20.0,35.0,0.0,60.0"
 
 
 # ---------------------------------------------------------------------------
@@ -512,13 +798,13 @@ _RECENT_END = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%
 
 
 class TestNOAAHFRadarDownload:
-    def test_dry_run_returns_none_and_no_fetch(self, tmp_path, capsys):
+    def test_dry_run_returns_empty_list_and_no_fetch(self, tmp_path, capsys):
         dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=True, resolution_km=6)
         with patch(
             "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
         ) as m:
             out = dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
-        assert out is None
+        assert out == []
         m.assert_not_called()
         assert "ucsdHfrW6.nc?" in capsys.readouterr().out
 
@@ -528,13 +814,13 @@ class TestNOAAHFRadarDownload:
             "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
         ) as m:
             out = dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
-        assert out is not None
-        assert out.parent == tmp_path
-        assert out.suffix == ".nc"
+        assert len(out) == 1
+        assert out[0].parent == tmp_path
+        assert out[0].suffix == ".nc"
         m.assert_called_once()
         called_url, called_path = m.call_args[0][0], m.call_args[0][1]
         assert "ucsdHfrW6.nc?" in called_url
-        assert str(out) == str(called_path)
+        assert str(out[0]) == str(called_path)
 
     def test_download_clamps_bbox_extending_past_region_edge(self, tmp_path):
         """A bbox reaching past a region's real grid edge must be clamped in
@@ -562,6 +848,45 @@ class TestNOAAHFRadarDownload:
         assert "[(30.25):(48.0)]" in called_url
         assert "[(30.0)" not in called_url
         assert "[(-126.0):(-115.8056)]" in called_url
+
+
+class TestNOAAHFRadarDownloaderAntimeridian:
+    def test_crossing_bbox_with_no_covering_region_on_either_side_raises(self, tmp_path):
+        # 135E..120W doesn't overlap US_WEST or US_EAST_GULF on either side
+        # of the split (NOAA's _match_region uses each window's *center*
+        # point, and neither window's center falls inside either region).
+        # Note: the unsplit pre-fix code also raises a ValueError matching
+        # this message for a min_lon > max_lon input (its own center-point
+        # math just lands on a different, still-uncovered point), so this
+        # test alone doesn't distinguish pre-fix from post-fix — it guards
+        # that the "truly nothing covers this" case keeps failing loudly
+        # after the fix too. The next test is the one that actually fails
+        # pre-fix.
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=True, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+        ) as m:
+            with pytest.raises(ValueError, match="No ERDDAP HF-radar dataset"):
+                dl.download(135.0, -120.0, -15.0, 30.0, _RECENT_START, _RECENT_END)
+        m.assert_not_called()
+
+    def test_crossing_bbox_downloads_the_side_whose_window_center_resolves(self, tmp_path):
+        # NOAA's region match is center-point-based (not overlap-area, unlike
+        # the Copernicus HFR regions), so only a window whose *own* center
+        # (after splitting) lands inside a supported region resolves. Here
+        # min_lon=179, max_lon=-66 splits into [179, 180] (center 179.5,
+        # 36.5 — matches nothing) and [-180, -66] (center -123.0, 36.5 —
+        # inside US_WEST's bbox). The raw (unsplit) request's own center,
+        # (56.5, 36.5), matches nothing — that's what makes this fail today.
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+        ) as m:
+            out = dl.download(179.0, -66.0, 35.0, 38.0, _RECENT_START, _RECENT_END)
+        assert len(out) == 1
+        m.assert_called_once()
+        called_url = m.call_args[0][0]
+        assert "ucsdHfrW6.nc?" in called_url
 
 
 # ---------------------------------------------------------------------------
@@ -793,7 +1118,7 @@ class TestHFRadarDownloaderGrid:
 
         dl = HFRadarDownloader(output_dir=tmp_path, dry_run=True)
         out = dl.download(-90.0, -60.0, 30.0, 40.0, "2026-06-05", "2026-06-06")
-        assert out is None
+        assert out == []
         captured = capsys.readouterr().out
         assert "US-EastGulfCoast" in captured
         assert "radar-total--US-EastGulfCoast" in captured
@@ -814,8 +1139,8 @@ class TestHFRadarDownloaderGrid:
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
             out = dl.download(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")
 
-        assert out is not None
-        assert out.exists()
+        assert len(out) == 1
+        assert out[0].exists()
         _, kwargs = fake_module.subset.call_args
         assert kwargs["dataset_part"] == "monthly-radar-total--US-EastGulfCoast"
         assert kwargs["minimum_longitude"] == -90.0
@@ -878,8 +1203,8 @@ class TestHFRadarDownloaderGrid:
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
             out = dl.download(-125.0, -119.0, 33.0, 38.0, recent_start, recent_end)
 
-        assert out is not None
-        assert out.exists()
+        assert len(out) == 1
+        assert out[0].exists()
         assert fake_module.subset.call_count == 2
         first_kwargs = fake_module.subset.call_args_list[0].kwargs
         second_kwargs = fake_module.subset.call_args_list[1].kwargs
@@ -899,6 +1224,48 @@ class TestHFRadarDownloaderGrid:
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
             with pytest.raises(FileNotFoundError):
                 dl.download(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")
+
+
+class TestHFRadarDownloaderGridAntimeridian:
+    def test_crossing_bbox_with_no_covering_region_on_either_side_raises(self, tmp_path):
+        # lat 0-5 doesn't overlap any HFR_REGIONS entry on either side of
+        # the split — the southernmost real region (US-Hawaii) starts at
+        # 14.5N, so no window can resolve a region. Note: the *unsplit*
+        # pre-fix code also raises a ValueError matching this same message
+        # for a min_lon > max_lon input (its overlap-area formula degrades
+        # to a spurious negative number for every region), so this test
+        # alone doesn't distinguish pre-fix from post-fix — it guards that
+        # the "truly nothing covers this" case keeps failing loudly after
+        # the fix too. The next test is the one that actually fails pre-fix.
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        dl = HFRadarDownloader(output_dir=tmp_path, dry_run=True)
+        with pytest.raises(ValueError, match="No Copernicus HF-radar region overlaps"):
+            dl.download(135.0, -120.0, 0.0, 5.0, "2026-07-02", "2026-07-03")
+
+    def test_crossing_bbox_downloads_the_side_that_resolves_to_a_region(self, tmp_path):
+        from pathlib import Path
+        from unittest.mock import patch, MagicMock
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        # US-Alaska's bbox (-174.10..-128.66) overlaps the [-180, -120]
+        # window but not the [135, 180] window, so only one window should
+        # produce a download.
+        dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False)
+        fake_module = MagicMock()
+
+        def fake_subset(**kwargs):
+            Path(kwargs["output_directory"], kwargs["output_filename"]).write_bytes(b"")
+
+        fake_module.subset.side_effect = fake_subset
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            out = dl.download(135.0, -120.0, 65.0, 75.0, "2026-01-01", "2026-01-02")
+
+        assert len(out) == 1
+        assert fake_module.subset.call_count == 1
+        _, kwargs = fake_module.subset.call_args
+        assert kwargs["minimum_longitude"] == -180.0
+        assert kwargs["maximum_longitude"] == -120.0
 
 
 # ---------------------------------------------------------------------------
@@ -922,7 +1289,7 @@ class TestHFRadarHistoricalDownloader:
 
         dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=True)
         out = dl.download(-90.0, -60.0, 30.0, 40.0, "2021-06-05", "2021-06-06")
-        assert out is None
+        assert out == []
         captured = capsys.readouterr().out
         assert "US-EastGulfCoast" in captured
         assert "GL_TV_HF_HFR-US-EastGulfCoast_Total_2021.nc" in captured
@@ -1002,12 +1369,43 @@ class TestHFRadarHistoricalDownloader:
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
             out = dl.download(-121.0, -120.0, 33.0, 34.0, "2019-01-01", "2019-01-01T04:00:00")
 
-        assert out is not None
-        assert out.exists()
-        result = xr.open_dataset(out)
+        assert len(out) == 1
+        assert out[0].exists()
+        result = xr.open_dataset(out[0])
         assert "time" in result.dims and "latitude" in result.dims and "longitude" in result.dims
         assert "DEPTH" not in result.dims
         assert result.sizes["time"] == 5
+
+
+class TestHFRadarHistoricalDownloaderAntimeridian:
+    def test_crossing_bbox_with_no_covering_region_on_either_side_raises(self, tmp_path):
+        # lat 0-5 doesn't overlap any HFR_REGIONS entry on either side of
+        # the split (the southernmost real region, US-Hawaii, starts at
+        # 14.5N). Note: the unsplit pre-fix code also raises a ValueError
+        # matching this message for a min_lon > max_lon input, so this test
+        # alone doesn't distinguish pre-fix from post-fix — it guards that
+        # the "truly nothing covers this" case keeps failing loudly after
+        # the fix too. The next test is the one that actually fails pre-fix.
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=True)
+        with pytest.raises(ValueError, match="No Copernicus HF-radar region overlaps"):
+            dl.download(135.0, -120.0, 0.0, 5.0, "2021-07-02", "2021-07-03")
+
+    def test_crossing_bbox_dry_run_resolves_the_side_that_has_a_region(self, tmp_path, capsys):
+        # US-Alaska's bbox (-174.10..-128.66, 68.01..74.03) overlaps the
+        # [-180, -120] window but not the [135, 180] window, so only that
+        # window should resolve a region.
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=True)
+        out = dl.download(135.0, -120.0, 69.0, 73.0, "2021-07-02", "2021-07-03")
+        assert out == []
+        assert "US-Alaska" in capsys.readouterr().out
 
 
 class TestOrchestratorHFRadarHistoricalWiring:
@@ -1028,3 +1426,63 @@ class TestOrchestratorHFRadarHistoricalWiring:
 
         assert ok is True
         mock_cls.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: orchestrator wiring for a Pacific-crossing recipe
+# ---------------------------------------------------------------------------
+
+class TestOrchestratorAntimeridianDryRun:
+    def test_pacific_crossing_recipe_wires_through_without_error(self, tmp_path):
+        from unittest.mock import patch
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import (
+            Recipe, RecipeConfig, GeographicBounds, TemporalBounds,
+            SARDataSpec, ValidationDataSource,
+        )
+
+        cfg = RecipeConfig(
+            name="pacific_dry_run_test",
+            variable="waves",
+            geographic_bounds=GeographicBounds(min_lon=135.0, max_lon=-120.0, min_lat=-15.0, max_lat=30.0),
+            temporal_bounds=TemporalBounds(start="2026-07-02", end="2026-07-03"),
+            sar_data=SARDataSpec(swath_mode=["WV", "SM"]),
+            validation_sources=[
+                ValidationDataSource(source_type="mooring"),
+                ValidationDataSource(source_type="tidal_gauge"),
+                ValidationDataSource(source_type="drifter"),
+                ValidationDataSource(source_type="altimeter"),
+            ],
+            output_dir=str(tmp_path),
+        )
+        recipe = Recipe(cfg)
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+
+        with patch(
+            "sar_validation.downloaders.sar_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader"
+        ) as mock_insitu_cls, patch(
+            "sar_validation.downloaders.altimeter_downloader.AltimeterDownloader"
+        ) as mock_alt_cls:
+            mock_sar_cls.return_value.download.return_value = []
+            mock_insitu_cls.return_value.download.return_value = []
+            mock_alt_cls.return_value.download.return_value = []
+            ok = orchestrator.download_all()
+
+        assert ok is True
+        _, sar_kwargs = mock_sar_cls.return_value.download.call_args
+        assert (sar_kwargs["min_lon"], sar_kwargs["max_lon"]) == (135.0, -120.0)
+        _, insitu_kwargs = mock_insitu_cls.return_value.download.call_args
+        assert (insitu_kwargs["min_lon"], insitu_kwargs["max_lon"]) == (135.0, -120.0)
+        _, alt_kwargs = mock_alt_cls.return_value.download.call_args
+        assert (alt_kwargs["min_lon"], alt_kwargs["max_lon"]) == (135.0, -120.0)
+
+    def test_waves_pacific_recipe_loads_with_crossing_convention(self):
+        from sar_validation.core.recipe import Recipe
+
+        recipe = Recipe.from_yaml("recipes/waves_pacific.yaml")
+        bounds = recipe.config.geographic_bounds
+        assert bounds.min_lon == 135.0
+        assert bounds.max_lon == -120.0
+        assert bounds.min_lon > bounds.max_lon  # crossing convention

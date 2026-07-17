@@ -27,7 +27,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GeographicBounds:
-    """Bounding box in decimal degrees (WGS-84)."""
+    """Bounding box in decimal degrees (WGS-84).
+
+    ``min_lon > max_lon`` means the box wraps through the antimeridian
+    (180 degrees) rather than being invalid — e.g. ``min_lon=135,
+    max_lon=-120`` covers the Pacific from 135E to 120W. Downloaders split
+    such a bbox into two non-crossing windows internally via
+    ``sar_validation.downloaders.base.split_antimeridian_bbox``.
+    """
     min_lon: float
     max_lon: float
     min_lat: float

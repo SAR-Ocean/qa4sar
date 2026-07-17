@@ -11,7 +11,7 @@ Library usage::
 
     from sar_validation.downloaders.insitu_downloader import InSituDownloader
     dl = InSituDownloader(output_dir=Path("data/run1/copernicus_insitu"))
-    path = dl.download(
+    paths = dl.download(
         min_lon=-20, max_lon=0, min_lat=35, max_lat=60,
         start="2026-01-01", end="2026-01-02",
         source_types=["mooring", "buoy"],
@@ -36,7 +36,7 @@ from typing import Optional
 
 import pandas as pd
 
-from .base import normalize_datetime, is_date_recent, build_output_dir
+from .base import normalize_datetime, is_date_recent, build_output_dir, split_antimeridian_bbox
 
 __all__ = [
     "InSituDownloader",
@@ -153,9 +153,10 @@ class InSituDownloader:
         end: str,
         source_types: Optional[list[str]] = None,
         dataset_part: Optional[str] = None,
-    ) -> Optional[Path]:
+    ) -> list[Path]:
         """
-        Download in-situ observations and save to a CSV.
+        Download in-situ observations and save one CSV per non-crossing
+        longitude window (see ``split_antimeridian_bbox``).
 
         Parameters
         ----------
@@ -168,8 +169,8 @@ class InSituDownloader:
 
         Returns
         -------
-        Path or None
-            Path to the downloaded CSV, or None in dry-run mode.
+        list[Path]
+            Paths to the downloaded CSVs (one per window that produced data).
         """
         try:
             import copernicusmarine
@@ -182,6 +183,29 @@ class InSituDownloader:
         start_dt = normalize_datetime(start)
         end_dt   = normalize_datetime(end)
 
+        downloaded: list[Path] = []
+        for win_min_lon, win_max_lon in split_antimeridian_bbox(min_lon, max_lon):
+            path = self._download_window(
+                copernicusmarine, win_min_lon, win_max_lon, min_lat, max_lat,
+                start_dt, end_dt, source_types, dataset_part,
+            )
+            if path is not None:
+                downloaded.append(path)
+        return downloaded
+
+    def _download_window(
+        self,
+        copernicusmarine,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start_dt: str,
+        end_dt: str,
+        source_types: Optional[list[str]],
+        dataset_part: Optional[str],
+    ) -> Optional[Path]:
+        """Download and save one CSV for a single (non-crossing) window."""
         expected_filename = _build_csv_filename(
             min_lon, max_lon, min_lat, max_lat,
             start_dt, end_dt, self.min_depth, self.max_depth,
@@ -197,21 +221,22 @@ class InSituDownloader:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Auto-detect dataset_part if not provided
-        if dataset_part is None:
-            dataset_part = "latest" if is_date_recent(end_dt) else "monthly"
+        resolved_part = dataset_part
+        if resolved_part is None:
+            resolved_part = "latest" if is_date_recent(end_dt) else "monthly"
 
         # Run the copernicusmarine subset call (downloads to CWD by default)
         print(f"Downloading in-situ data …")
         print(f"  Region: lon [{min_lon}, {max_lon}] lat [{min_lat}, {max_lat}]")
         print(f"  Time:   {start_dt} → {end_dt}")
         print(f"  Depth:  {self.min_depth} to {self.max_depth} m")
-        print(f"  Dataset: {dataset_part}")
+        print(f"  Dataset: {resolved_part}")
 
         # Try initial dataset_part, with fallback if data not available
         try:
             self._download_with_part(
                 copernicusmarine,
-                dataset_part,
+                resolved_part,
                 min_lon, max_lon, min_lat, max_lat,
                 start_dt, end_dt,
             )
@@ -220,7 +245,7 @@ class InSituDownloader:
             # Check if error is about data exceeding coordinates (date outside available range)
             if "exceed the dataset coordinates" in error_msg or "out of bounds" in error_msg.lower():
                 # Try the opposite dataset_part
-                alt_dataset_part = "monthly" if dataset_part == "latest" else "latest"
+                alt_dataset_part = "monthly" if resolved_part == "latest" else "latest"
                 print(f"  Retrying with dataset_part='{alt_dataset_part}' due to: {error_msg[:100]}…")
                 try:
                     self._download_with_part(
@@ -229,7 +254,7 @@ class InSituDownloader:
                         min_lon, max_lon, min_lat, max_lat,
                         start_dt, end_dt,
                     )
-                    dataset_part = alt_dataset_part
+                    resolved_part = alt_dataset_part
                 except Exception as e2:
                     # Both failed, raise the second error
                     raise e2
