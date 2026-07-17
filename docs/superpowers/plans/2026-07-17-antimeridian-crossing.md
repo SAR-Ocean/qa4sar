@@ -6,7 +6,7 @@
 
 **Architecture:** `GeographicBounds.min_lon > max_lon` means "wraps through 180°". A single new helper, `split_antimeridian_bbox()`, turns that into one or two non-crossing `(lon_min, lon_max)` windows. Every downloader's public entry point loops over those windows against its existing (unchanged) single-window query logic and merges/de-duplicates the results. The point-data domain crop and the collocation-diagnostics map get an OR-based (instead of AND-based) longitude test / a `central_longitude=180` projection for the crossing case.
 
-**Tech Stack:** Python 3.10, xarray, pandas, cartopy 0.25, matplotlib, copernicusmarine 2.4, eumdac, pytest.
+**Tech Stack:** Python >=3.10 (per `pyproject.toml`; verified against both the repo's `.venv` at 3.10.18 and a 3.14.5 conda env), xarray, pandas, cartopy 0.25, matplotlib, copernicusmarine 2.4, eumdac, pytest.
 
 ## Global Constraints
 
