@@ -684,6 +684,34 @@ class TestWvRvlProjection:
         # heading 90 -> heading_rad 0 -> projection = EWCT*cos0 + NSCT*sin0 = EWCT
         assert proj == pytest.approx(0.4, abs=1e-6)
 
+    def test_radvel_std_propagates(self):
+        from sar_validation.core.collocation import _collocate_wv_points
+
+        sar_lons = np.array([-19.5])
+        sar_lats = np.array([50.5])
+        sar_times = np.array([np.datetime64("2026-06-20T19:15:00", "ns")])
+        sar_point_vars = {
+            "rvlRadVel": np.array([1.0]),
+            "rvlRadVelStd": np.array([0.15]),
+            "rvlHeading": np.array([90.0]),
+        }
+        val = pd.DataFrame({
+            "lon": [-19.5],
+            "lat": [50.5],
+            "time": [pd.Timestamp("2026-06-20T19:20:00")],
+            "EWCT": [0.4],
+            "NSCT": [0.3],
+        })
+        matches = _collocate_wv_points(
+            sar_lons=sar_lons, sar_lats=sar_lats, sar_times=sar_times,
+            sar_point_vars=sar_point_vars, val_data=val, val_source="mooring",
+            footprint_radius_km=14.0, time_tolerance_minutes=30,
+            distance_weighting="equal", gaussian_sigma_km=5.0,
+            collocation_type="point_vs_point",
+        )
+        assert len(matches) == 1
+        assert matches[0].sar_data["rvlRadVelStd"] == pytest.approx(0.15, abs=1e-6)
+
 
 class TestRunCollocationCurrentsFromDatatree:
     def _currents_recipe(self):
@@ -750,6 +778,49 @@ class TestRunCollocationCurrentsFromDatatree:
         assert "val_rvlRadVel_projection" in result
         # heading 90 -> projection == EWCT == 0.4
         assert float(result["val_rvlRadVel_projection"].values[0]) == pytest.approx(0.4, abs=1e-5)
+
+    def test_grid_rvl_radvel_std_propagates(self, tmp_path):
+        import xarray as xr
+        from sar_validation.core.collocation import run_collocation
+
+        ny, nx = 5, 5
+        lon2d, lat2d = np.meshgrid(
+            np.linspace(-20.0, -19.0, nx), np.linspace(50.0, 51.0, ny)
+        )
+        sar = xr.Dataset(
+            {
+                "rvlRadVel": (("y", "x"), np.full((ny, nx), 0.5, dtype="float32")),
+                "rvlRadVelStd": (("y", "x"), np.full((ny, nx), 0.12, dtype="float32")),
+                "rvlHeading": (("y", "x"), np.full((ny, nx), 90.0, dtype="float32")),
+                "rvlIncidenceAngle": (("y", "x"), np.full((ny, nx), 30.0, dtype="float32")),
+            },
+            coords={
+                "lon": (("y", "x"), lon2d),
+                "lat": (("y", "x"), lat2d),
+                "time": np.datetime64("2026-06-20T19:15:00", "ns"),
+            },
+            attrs={"data_type": "sar_l2_ocn", "swath_mode": "IW/EW/SM",
+                   "measurement_type": "rvl"},
+        )
+        val = xr.Dataset(
+            {
+                "EWCT": (("point",), np.array([0.4], dtype="float32")),
+                "NSCT": (("point",), np.array([0.3], dtype="float32")),
+            },
+            coords={
+                "lon": (("point",), np.array([-19.5])),
+                "lat": (("point",), np.array([50.5])),
+                "time": (("point",), np.array([np.datetime64("2026-06-20T19:20:00", "ns")])),
+                "platform_type": (("point",), np.array(["mooring"])),
+            },
+            attrs={"data_type": "insitu_observations", "platform_type": "mooring"},
+        )
+        tree = xr.DataTree.from_dict({"/sar/scene1": sar, "/validation/mooring1": val})
+
+        result = run_collocation(self._currents_recipe(), tree, tmp_path)
+        assert result is not None
+        assert "sar_rvlRadVelStd" in result
+        assert float(result["sar_rvlRadVelStd"].values[0]) == pytest.approx(0.12, abs=1e-5)
 
 
 class TestProjectCurrentsToRadial:

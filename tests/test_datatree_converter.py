@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import math
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -49,6 +50,7 @@ def _make_ocn_safe(
     ny: int = 5,
     nx: int = 4,
     seed: int = 0,
+    land_rows: int = 0,
 ) -> Path:
     """
     Build a *.SAFE dir containing one '-ocn-' measurement NetCDF.
@@ -56,6 +58,10 @@ def _make_ocn_safe(
     rvl_swaths=None -> no rvl* variables written.
     rvl_swaths=S (wv=False) -> 3-D rvl (rvlAzSize, rvlRaSize, rvlSwath=S).
     wv=True -> 2-D 13x13 rvl (rvlAzSize, rvlRaSize), as in WV imagettes.
+    land_rows=N -> the first N rows of the rvlAzSize axis are written with
+        rvlLandFlag=1 (land) across every column/swath; the rest are 0.
+        land_rows=0 (default) omits rvlLandFlag entirely, simulating a
+        product that doesn't carry it.
     """
     rng = np.random.default_rng(seed)
     safe = tmp_path / safe_name
@@ -80,11 +86,54 @@ def _make_ocn_safe(
         data["rvlLat"] = (rdims, rng.uniform(50.0, 51.0, shape).astype("float32"))
         data["rvlHeading"] = (rdims, rng.uniform(0, 360, shape).astype("float32"))
         data["rvlIncidenceAngle"] = (rdims, rng.uniform(20, 45, shape).astype("float32"))
+        data["rvlRadVelStd"] = (rdims, rng.uniform(0.0, 0.5, shape).astype("float32"))
+        if land_rows > 0:
+            land_flag = np.zeros(shape, dtype="float32")
+            land_flag[:land_rows, ...] = 1.0
+            data["rvlLandFlag"] = (rdims, land_flag)
 
     ds = xr.Dataset(data, attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"})
     mode = "wv1" if wv else "ew"
     fname = f"s1a-{mode}-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
     ds.to_netcdf(meas / fname)
+    return safe
+
+
+def _make_wv_rvl_safe(
+    tmp_path: Path,
+    *,
+    land_rows_per_file: list[int],
+    seed: int = 0,
+) -> Path:
+    """
+    Build a WV *.SAFE dir with one 13x13-imagette RVL measurement file per
+    entry in land_rows_per_file. Entry i controls how many of that file's
+    13 rvlAzSize rows are land-flagged (0 = no rvlLandFlag var at all for
+    that file).
+    """
+    rng = np.random.default_rng(seed)
+    safe = tmp_path / "S1A_WV_OCN.SAFE"
+    meas = safe / "measurement"
+    meas.mkdir(parents=True)
+    shape, rdims = (13, 13), ("rvlAzSize", "rvlRaSize")
+
+    for i, land_rows in enumerate(land_rows_per_file):
+        data = {
+            "rvlRadVel": (rdims, rng.uniform(-3, 3, shape).astype("float32")),
+            "rvlLon": (rdims, rng.uniform(-20.0, -19.0, shape).astype("float32")),
+            "rvlLat": (rdims, rng.uniform(50.0, 51.0, shape).astype("float32")),
+            "rvlHeading": (rdims, rng.uniform(0, 360, shape).astype("float32")),
+            "rvlIncidenceAngle": (rdims, rng.uniform(20, 45, shape).astype("float32")),
+            "rvlRadVelStd": (rdims, rng.uniform(0.0, 0.5, shape).astype("float32")),
+        }
+        if land_rows > 0:
+            land_flag = np.zeros(shape, dtype="float32")
+            land_flag[:land_rows, :] = 1.0
+            data["rvlLandFlag"] = (rdims, land_flag)
+        ds_raw = xr.Dataset(data, attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"})
+        fname = f"s1a-wv1-ocn-vv-20260620t19152{i}-20260620t19162{i}-065057-08333{i}-001.nc"
+        ds_raw.to_netcdf(meas / fname)
+
     return safe
 
 
@@ -849,6 +898,192 @@ class TestExtractRvlGridData:
             safe / "measurement", safe, flatten_to_points=False
         )
         assert ds is None
+
+    def test_land_flag_masks_radvel_and_std_grid(self, tmp_path):
+        # Multi-swath EW-style grid with the first 2 of 5 azimuth rows
+        # land-flagged across every range cell and every swath.
+        safe = _make_ocn_safe(
+            tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=3, ny=5, nx=4, land_rows=2,
+        )
+        raw = xr.open_dataset(
+            safe / "measurement" / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+        raw_radvel = raw["rvlRadVel"].values.reshape(5, -1)  # (az=5, ra*swath=12)
+        expected_land_mean = float(np.nanmean(raw_radvel[:2, :]))
+        raw.close()
+
+        ds = DataTreeConverter._extract_rvl_grid_data(
+            safe / "measurement", safe, flatten_to_points=False
+        )
+        assert ds is not None
+
+        # rvlRadVel / rvlRadVelStd are NaN in the land rows, finite elsewhere.
+        assert np.isnan(ds["rvlRadVel"].values[:2, :]).all()
+        assert np.isfinite(ds["rvlRadVel"].values[2:, :]).all()
+        assert np.isnan(ds["rvlRadVelStd"].values[:2, :]).all()
+        assert np.isfinite(ds["rvlRadVelStd"].values[2:, :]).all()
+
+        # Geometry variables are untouched by the land mask.
+        assert np.isfinite(ds["rvlHeading"].values).all()
+        assert np.isfinite(ds["rvlIncidenceAngle"].values).all()
+
+        assert ds.attrs["rvl_land_pixel_count"] == 2 * 4 * 3  # land_rows * nx * rvl_swaths
+        assert ds.attrs["rvl_land_pixel_fraction"] == pytest.approx((2 * 4 * 3) / (5 * 4 * 3))
+        assert ds.attrs["rvl_land_mean_radvel"] == pytest.approx(expected_land_mean, abs=1e-5)
+
+    def test_zero_land_pixels_no_masking_grid(self, tmp_path):
+        # land_rows=0 (default) -> no rvlLandFlag written at all.
+        safe = _make_ocn_safe(tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=3, ny=5, nx=4)
+        ds = DataTreeConverter._extract_rvl_grid_data(
+            safe / "measurement", safe, flatten_to_points=False
+        )
+        assert ds is not None
+        assert np.isfinite(ds["rvlRadVel"].values).all()
+        assert ds.attrs["rvl_land_pixel_count"] == 0
+        assert math.isnan(ds.attrs["rvl_land_mean_radvel"])
+
+    def test_single_swath_land_flag_grid(self, tmp_path):
+        # SM/WV-style single-swath 2-D grid (13x13), 3 land rows.
+        safe = _make_ocn_safe(tmp_path, "S1A_SM_OCN.SAFE", rvl_swaths=1, wv=True, land_rows=3)
+        ds = DataTreeConverter._extract_rvl_grid_data(
+            safe / "measurement", safe, flatten_to_points=False
+        )
+        assert ds is not None
+        assert ds.sizes == {"y": 13, "x": 13}
+        assert np.isnan(ds["rvlRadVel"].values[:3, :]).all()
+        assert np.isfinite(ds["rvlRadVel"].values[3:, :]).all()
+        assert ds.attrs["rvl_land_pixel_count"] == 3 * 13
+
+    def test_land_flag_masks_points_single_file(self, tmp_path):
+        safe = _make_wv_rvl_safe(tmp_path, land_rows_per_file=[3])
+        raw = xr.open_dataset(sorted((safe / "measurement").glob("*.nc"))[0])
+        raw_radvel = raw["rvlRadVel"].values  # (13, 13)
+        expected_land_mean = float(np.nanmean(raw_radvel[:3, :]))
+        raw.close()
+
+        ds = DataTreeConverter._extract_rvl_grid_data(
+            safe / "measurement", safe, flatten_to_points=True
+        )
+        assert ds is not None
+        assert ds.sizes["point"] == 13 * 13
+        # Ravel order is row-major, so the first 3*13 points are the land rows.
+        assert np.isnan(ds["rvlRadVel"].values[: 3 * 13]).all()
+        assert np.isfinite(ds["rvlRadVel"].values[3 * 13 :]).all()
+        assert np.isnan(ds["rvlRadVelStd"].values[: 3 * 13]).all()
+        assert np.isfinite(ds["rvlHeading"].values).all()
+
+        assert ds.attrs["rvl_land_pixel_count"] == 3 * 13
+        assert ds.attrs["rvl_land_pixel_fraction"] == pytest.approx((3 * 13) / (13 * 13))
+        assert ds.attrs["rvl_land_mean_radvel"] == pytest.approx(expected_land_mean, abs=1e-5)
+
+    def test_land_flag_accumulates_across_files(self, tmp_path):
+        safe = _make_wv_rvl_safe(tmp_path, land_rows_per_file=[3, 5])
+        files = sorted((safe / "measurement").glob("*.nc"))
+        assert len(files) == 2
+        raw0, raw1 = xr.open_dataset(files[0]), xr.open_dataset(files[1])
+        land_sum = (
+            float(np.nansum(raw0["rvlRadVel"].values[:3, :]))
+            + float(np.nansum(raw1["rvlRadVel"].values[:5, :]))
+        )
+        raw0.close()
+        raw1.close()
+        expected_count = 3 * 13 + 5 * 13
+        expected_mean = land_sum / expected_count
+
+        ds = DataTreeConverter._extract_rvl_grid_data(
+            safe / "measurement", safe, flatten_to_points=True
+        )
+        assert ds is not None
+        assert ds.sizes["point"] == 2 * 13 * 13
+        assert ds.attrs["rvl_land_pixel_count"] == expected_count
+        assert ds.attrs["rvl_land_mean_radvel"] == pytest.approx(expected_mean, abs=1e-5)
+
+    def test_zero_land_points(self, tmp_path):
+        safe = _make_wv_rvl_safe(tmp_path, land_rows_per_file=[0])
+        ds = DataTreeConverter._extract_rvl_grid_data(
+            safe / "measurement", safe, flatten_to_points=True
+        )
+        assert ds is not None
+        assert np.isfinite(ds["rvlRadVel"].values).all()
+        assert ds.attrs["rvl_land_pixel_count"] == 0
+        assert math.isnan(ds.attrs["rvl_land_mean_radvel"])
+
+    def test_rvl_radvel_std_extracted_points(self, tmp_path):
+        safe = _make_wv_rvl_safe(tmp_path, land_rows_per_file=[0])
+        ds = DataTreeConverter._extract_rvl_grid_data(
+            safe / "measurement", safe, flatten_to_points=True
+        )
+        assert ds is not None
+        assert "rvlRadVelStd" in ds.data_vars
+        assert ds["rvlRadVelStd"].dims == ("point",)
+        assert ds.sizes["point"] == 13 * 13
+
+    def test_land_mean_radvel_excludes_nan_land_cells(self, tmp_path):
+        # A land-flagged cell can also have a NaN rvlRadVel (e.g. an
+        # edge-of-swath cell with no valid measurement). rvl_land_mean_radvel
+        # must match np.nanmean semantics: such a cell is dropped from BOTH
+        # the numerator and the denominator, in both the grid path and the
+        # points path — they must agree on the same input shape.
+        rdims = ("rvlAzSize", "rvlRaSize")
+
+        def _write_fixture(meas_dir: Path, fname: str, shape, land_rows: int):
+            # Reset the rng before each call so the grid and points fixtures
+            # draw the identical random sequence — otherwise the two
+            # fixtures would have different rvlRadVel arrays and the
+            # cross-branch agreement assertion below would be meaningless.
+            rng = np.random.default_rng(0)
+            meas_dir.mkdir(parents=True)
+            rvl_radvel = rng.uniform(-3, 3, shape).astype("float32")
+            land_flag = np.zeros(shape, dtype="float32")
+            land_flag[:land_rows, :] = 1.0
+            # Inject a NaN into a land-flagged cell.
+            rvl_radvel[0, 0] = np.nan
+            data = {
+                "rvlRadVel": (rdims, rvl_radvel),
+                "rvlLon": (rdims, rng.uniform(-20.0, -19.0, shape).astype("float32")),
+                "rvlLat": (rdims, rng.uniform(50.0, 51.0, shape).astype("float32")),
+                "rvlHeading": (rdims, rng.uniform(0, 360, shape).astype("float32")),
+                "rvlIncidenceAngle": (rdims, rng.uniform(20, 45, shape).astype("float32")),
+                "rvlRadVelStd": (rdims, rng.uniform(0.0, 0.5, shape).astype("float32")),
+                "rvlLandFlag": (rdims, land_flag),
+            }
+            ds_raw = xr.Dataset(data, attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"})
+            ds_raw.to_netcdf(meas_dir / fname)
+            return rvl_radvel
+
+        fname = "s1a-wv1-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+
+        # --- grid path (IW/EW/SM) ---
+        grid_safe = tmp_path / "grid" / "S1A_SM_OCN.SAFE"
+        grid_radvel = _write_fixture(grid_safe / "measurement", fname, (13, 13), land_rows=3)
+        expected_grid_mean = float(np.nanmean(grid_radvel[:3, :]))
+
+        grid_ds = DataTreeConverter._extract_rvl_grid_data(
+            grid_safe / "measurement", grid_safe, flatten_to_points=False
+        )
+        assert grid_ds is not None
+        assert grid_ds.attrs["rvl_land_mean_radvel"] == pytest.approx(
+            expected_grid_mean, abs=1e-5
+        )
+
+        # --- points path (WV) ---
+        points_safe = tmp_path / "points" / "S1A_WV_OCN.SAFE"
+        points_radvel = _write_fixture(points_safe / "measurement", fname, (13, 13), land_rows=3)
+        expected_points_mean = float(np.nanmean(points_radvel[:3, :]))
+
+        points_ds = DataTreeConverter._extract_rvl_grid_data(
+            points_safe / "measurement", points_safe, flatten_to_points=True
+        )
+        assert points_ds is not None
+        assert points_ds.attrs["rvl_land_mean_radvel"] == pytest.approx(
+            expected_points_mean, abs=1e-5
+        )
+
+        # Both paths compute the same conceptual metric over the same input
+        # shape and must agree.
+        assert grid_ds.attrs["rvl_land_mean_radvel"] == pytest.approx(
+            points_ds.attrs["rvl_land_mean_radvel"], abs=1e-5
+        )
 
 
 # ---------------------------------------------------------------------------

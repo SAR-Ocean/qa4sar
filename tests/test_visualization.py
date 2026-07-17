@@ -1707,6 +1707,292 @@ class TestValidationReportCurrentsPointSize:
         assert captured.get("point_size") == 40
 
 
+class TestPlotRvlLandQa:
+    def _make_sar_node(self, *, land_count=0, land_fraction=float("nan"), land_mean=float("nan")):
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
+        attrs = {"measurement_type": "rvl"}
+        if land_count:
+            attrs["rvl_land_pixel_count"] = land_count
+            attrs["rvl_land_pixel_fraction"] = land_fraction
+            attrs["rvl_land_mean_radvel"] = land_mean
+        return xr.Dataset(
+            {"rvlRadVel": (("y", "x"), np.full((y, x), 0.3))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T19:00:00")},
+            attrs=attrs,
+        )
+
+    def test_returns_none_when_no_scene_has_land(self):
+        from sar_validation.core.visualization import plot_rvl_land_qa
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": self._make_sar_node(land_count=0),
+        })
+        assert plot_rvl_land_qa(datatree) is None
+
+    def test_returns_none_when_no_sar_node(self):
+        from sar_validation.core.visualization import plot_rvl_land_qa
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        datatree = DataTreeConverter.to_datatree({})
+        assert plot_rvl_land_qa(datatree) is None
+
+    def test_returns_table_with_one_row_per_land_scene(self):
+        import matplotlib.pyplot as plt
+        from sar_validation.core.visualization import plot_rvl_land_qa
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": self._make_sar_node(land_count=0),
+            "sar/sceneB": self._make_sar_node(land_count=24, land_fraction=0.4, land_mean=0.71),
+        })
+        fig = plot_rvl_land_qa(datatree)
+        assert fig is not None
+        table = fig.axes[0].tables[0]
+        cells = table.get_celld()
+        n_rows = len({r for (r, _c) in cells.keys()})
+        assert n_rows == 2  # header + 1 data row (sceneA has no land, omitted)
+        assert cells[(1, 0)].get_text().get_text() == "sceneB"
+        assert cells[(1, 1)].get_text().get_text() == "24"
+        plt.close(fig)
+
+
+class TestValidationReportRvlLandQaPage:
+    def _sar_node(self, *, with_land: bool):
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
+        attrs = {}
+        if with_land:
+            attrs.update(
+                rvl_land_pixel_count=9, rvl_land_pixel_fraction=1.0, rvl_land_mean_radvel=0.65,
+            )
+        return xr.Dataset(
+            {"rvlRadVel": (("y", "x"), np.full((y, x), 0.3))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T19:00:00")},
+            attrs=attrs,
+        )
+
+    def _coll_ds(self):
+        return xr.Dataset({
+            "sar_rvlRadVel":             ("collocation", [0.3, 0.31, 0.29, 0.32]),
+            "val_rvlRadVel_projection":  ("collocation", [0.28, 0.30, 0.27, 0.31]),
+            "val_source":                ("collocation", ["hf_radar"] * 4),
+            "sar_scene_name":            ("collocation", ["sceneA"] * 4),
+            "val_lon":                   ("collocation", [-9.5, -9.4, -9.3, -9.2]),
+            "val_lat":                   ("collocation", [50.5, 50.6, 50.7, 50.8]),
+            # Present (unlike a minimal fixture omitting it) so that
+            # plot_scatter(color_by="temporal_offset") and
+            # plot_temporal_offset() don't emit "missing
+            # temporal_distance_minutes" warnings/None-returns — keeps this
+            # test's output pristine and its baseline page count stable.
+            "temporal_distance_minutes": ("collocation", [10.0, 20.0, 15.0, 25.0]),
+        })
+
+    def _count_image_pages(self, monkeypatch, datatree, recipe, tmp_path):
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+        from sar_validation.core.visualization import validation_report
+
+        recorded_figs = []
+        original_savefig = PdfPages.savefig
+
+        def recording_savefig(self, *args, **kwargs):
+            fig = args[0] if args else kwargs.get("figure")
+            recorded_figs.append(fig)
+            return original_savefig(self, *args, **kwargs)
+
+        monkeypatch.setattr(PdfPages, "savefig", recording_savefig)
+        validation_report(self._coll_ds(), datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        def is_image_page(fig):
+            return fig is not None and len(fig.axes) == 1 and len(fig.axes[0].images) > 0
+
+        return sum(1 for f in recorded_figs if is_image_page(f))
+
+    def test_qa_page_added_for_currents_with_land(self, tmp_path, monkeypatch):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe = Recipe(config=RecipeConfig(name="currents_test", variable="currents"))
+        # Baseline is asserted relative to the no-land run rather than a
+        # hardcoded absolute count: with this minimal collocation_ds, the
+        # per-pair scatter/geographic/residuals plots in validation_report
+        # already render successfully (they only warn, not fail, when
+        # temporal_distance_minutes is absent), so the diagnostics plot is
+        # not the only image page even before the QA page is added. What
+        # this test verifies is that adding land-flagged data contributes
+        # exactly one extra page (the QA table) on top of that baseline.
+        datatree_no_land = DataTreeConverter.to_datatree({"sar/sceneA": self._sar_node(with_land=False)})
+        baseline = self._count_image_pages(monkeypatch, datatree_no_land, recipe, tmp_path)
+
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": self._sar_node(with_land=True)})
+        assert self._count_image_pages(monkeypatch, datatree, recipe, tmp_path) == baseline + 1
+
+    def test_qa_page_omitted_for_currents_without_land(self, tmp_path, monkeypatch):
+        """Previously this test compared a no-land run's page count against
+        a *second, identically-configured* no-land run — a tautology that
+        would still pass even if the omission logic were completely broken
+        (both runs would inflate identically, since nothing actually
+        varies between them). This version instead (a) calls
+        plot_rvl_land_qa directly — the function actually responsible for
+        the omission — and asserts it returns None for a no-land datatree,
+        a real assertion that varies with its input and fails if that
+        function's `if not rows: return None` guard breaks; and (b)
+        compares the no-land page count against a genuinely different
+        *with-land* run of the same recipe (one fewer page), rather than
+        against another no-land run, so the comparison itself is capable of
+        failing if the wiring's `if fig_land_qa is not None:` guard is
+        removed and a page ends up added regardless of land presence.
+        """
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import plot_rvl_land_qa
+
+        recipe = Recipe(config=RecipeConfig(name="currents_test", variable="currents"))
+
+        datatree_no_land = DataTreeConverter.to_datatree({"sar/sceneA": self._sar_node(with_land=False)})
+        assert plot_rvl_land_qa(datatree_no_land) is None
+
+        no_land_count = self._count_image_pages(monkeypatch, datatree_no_land, recipe, tmp_path)
+
+        datatree_with_land = DataTreeConverter.to_datatree({"sar/sceneA": self._sar_node(with_land=True)})
+        with_land_count = self._count_image_pages(monkeypatch, datatree_with_land, recipe, tmp_path)
+
+        assert no_land_count == with_land_count - 1, (
+            "Expected exactly one fewer image page when no scene has "
+            "land-flagged cells (no QA page) than when a scene does."
+        )
+
+    def test_qa_page_omitted_for_non_currents_variable(self, tmp_path, monkeypatch):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe = Recipe(config=RecipeConfig(name="currents_test", variable="wind"))
+        datatree_no_land = DataTreeConverter.to_datatree({"sar/sceneA": self._sar_node(with_land=False)})
+        baseline = self._count_image_pages(monkeypatch, datatree_no_land, recipe, tmp_path)
+
+        # Land-flagged data present, but variable != "currents" — QA page
+        # must still be gated off, so the page count is unchanged from baseline.
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": self._sar_node(with_land=True)})
+        assert self._count_image_pages(monkeypatch, datatree, recipe, tmp_path) == baseline
+
+    def test_qa_page_immediately_follows_diagnostics_page(self, tmp_path, monkeypatch):
+        """Regression guard for the design-spec ordering requirement (3.b):
+        the QA page must be inserted right after the collocation-diagnostics
+        page, not appended at the end of the report.
+
+        Both the diagnostics page and the QA page end up as single-axis
+        "image pages" after ``_finalize_figure_for_report``/
+        ``_image_page_figure`` run, so a plain figure-object spy on
+        ``PdfPages.savefig`` (as used by ``_count_image_pages`` above)
+        cannot tell them apart. Instead we tag each page's *finalized*
+        Figure with a distinctive ``set_label`` marker:
+
+        * ``plot_rvl_land_qa`` is wrapped so its returned Figure carries a
+          ``_is_qa_source`` marker.
+        * ``_finalize_figure_for_report`` is wrapped so that, when it
+          finalizes a Figure carrying that marker, the *new* page Figure it
+          returns is labeled ``"__qa_page__"``.
+        * ``_image_page_figure`` is wrapped so that its *only* direct
+          (non-nested) call site in ``validation_report`` — the
+          diagnostics-PNG embed — is labeled ``"__diagnostics_page__"``;
+          all other calls to it happen nested inside
+          ``_finalize_figure_for_report`` and are left unlabeled there.
+
+        We then recover each page's position by label from the recorded
+        ``PdfPages.savefig`` call order and assert adjacency.
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+        import sar_validation.core.visualization as viz
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe = Recipe(config=RecipeConfig(name="currents_test", variable="currents"))
+        # plot_collocation_diagnostics returns None (no diagnostics page) unless
+        # the DataTree also has a "validation" node — the class-level _coll_ds/
+        # _sar_node fixtures used by the other tests in this class only build a
+        # bare "sar" node, which is enough for the QA-page gating tests but not
+        # for exercising diagnostics-page adjacency. Add a matching hf_radar
+        # validation node, in the same scene bounds/time window as
+        # _coll_ds()'s val_lon/val_lat/val_source rows, so the diagnostics page
+        # actually renders here.
+        hf_radar_ds = xr.Dataset(
+            {"rvlRadVel_projection": ("point", np.array([0.28, 0.30, 0.27, 0.31]))},
+            coords={
+                "lon": ("point", np.array([-9.5, -9.4, -9.3, -9.2])),
+                "lat": ("point", np.array([50.5, 50.6, 50.7, 50.8])),
+                "time": ("point", pd.date_range("2026-07-10T19:05", periods=4, freq="5min")),
+            },
+            attrs={"platform_type": "hf_radar"},
+        )
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": self._sar_node(with_land=True),
+            "validation/hf_radar": hf_radar_ds,
+        })
+
+        original_qa = viz.plot_rvl_land_qa
+
+        def spy_qa(dt):
+            fig = original_qa(dt)
+            if fig is not None:
+                fig._is_qa_source = True
+            return fig
+
+        original_finalize = viz._finalize_figure_for_report
+        original_image_page = viz._image_page_figure
+        state = {"inside_finalize": False}
+
+        def spy_image_page_figure(img, dpi=150):
+            result = original_image_page(img, dpi=dpi)
+            if not state["inside_finalize"]:
+                result.set_label("__diagnostics_page__")
+            return result
+
+        def spy_finalize(fig, png_path, dpi=150):
+            is_qa = getattr(fig, "_is_qa_source", False)
+            state["inside_finalize"] = True
+            try:
+                result = original_finalize(fig, png_path, dpi=dpi)
+            finally:
+                state["inside_finalize"] = False
+            if is_qa:
+                result.set_label("__qa_page__")
+            return result
+
+        monkeypatch.setattr(viz, "plot_rvl_land_qa", spy_qa)
+        monkeypatch.setattr(viz, "_image_page_figure", spy_image_page_figure)
+        monkeypatch.setattr(viz, "_finalize_figure_for_report", spy_finalize)
+
+        recorded_labels = []
+        original_savefig = PdfPages.savefig
+
+        def recording_savefig(self, *args, **kwargs):
+            fig = args[0] if args else kwargs.get("figure")
+            recorded_labels.append(fig.get_label() if fig is not None else None)
+            return original_savefig(self, *args, **kwargs)
+
+        monkeypatch.setattr(PdfPages, "savefig", recording_savefig)
+
+        viz.validation_report(self._coll_ds(), datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        assert "__diagnostics_page__" in recorded_labels, (
+            f"diagnostics page was not rendered: {recorded_labels}"
+        )
+        assert "__qa_page__" in recorded_labels, f"QA page was not rendered: {recorded_labels}"
+        diag_idx = recorded_labels.index("__diagnostics_page__")
+        qa_idx = recorded_labels.index("__qa_page__")
+        assert qa_idx == diag_idx + 1, (
+            "QA page must immediately follow the diagnostics page; got diagnostics "
+            f"at index {diag_idx}, QA at index {qa_idx} (full order: {recorded_labels})"
+        )
+
+
 class TestImagePageFigure:
     def test_figure_size_matches_image_pixel_dimensions(self):
         import numpy as np

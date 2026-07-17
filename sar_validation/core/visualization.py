@@ -1886,6 +1886,71 @@ def _finalize_figure_for_report(fig, png_path: Optional[Path], dpi: int = 150):
     return _image_page_figure(plt.imread(buf, format="png"), dpi=dpi)
 
 
+def plot_rvl_land_qa(datatree) -> Optional["plt.Figure"]:
+    """
+    Build a table figure listing, for every SAR RVL scene with at least one
+    land-flagged cell, the land pixel count/fraction and the pre-mask mean
+    ``rvlRadVel`` over those land cells (expected ~0 m/s — a meaningfully
+    non-zero value signals land contamination worth investigating).
+
+    Reads the ``rvl_land_pixel_count`` / ``rvl_land_pixel_fraction`` /
+    ``rvl_land_mean_radvel`` attrs stamped on each SAR node by
+    ``DataTreeConverter._extract_rvl_grid_data``.
+
+    Returns
+    -------
+    matplotlib.figure.Figure or None
+        None if *datatree* has no "sar" node, or no scene in it has any
+        land-flagged cells — callers should skip adding a page in that case.
+    """
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    if "sar" not in datatree.children:
+        return None
+
+    rows = []
+    for name, node in datatree["sar"].children.items():
+        attrs = node.to_dataset().attrs
+        land_count = attrs.get("rvl_land_pixel_count", 0)
+        if not land_count:
+            continue
+        rows.append((
+            name,
+            int(land_count),
+            100 * attrs.get("rvl_land_pixel_fraction", float("nan")),
+            attrs.get("rvl_land_mean_radvel", float("nan")),
+        ))
+
+    if not rows:
+        return None
+
+    fig, ax = plt.subplots(figsize=(11, 0.6 * len(rows) + 2))
+    ax.axis("off")
+    ax.set_title(
+        "RVL land-contamination QA — cells masked out of rvlRadVel/rvlRadVelStd",
+        fontsize=12, fontweight="bold",
+    )
+    table = ax.table(
+        cellText=[
+            [
+                scene,
+                str(count),
+                "n/a" if np.isnan(frac) else f"{frac:.1f}%",
+                "n/a" if np.isnan(mean) else f"{mean:.4f}",
+            ]
+            for scene, count, frac, mean in rows
+        ],
+        colLabels=["Scene", "Land pixels", "Land %", "Mean rvlRadVel over land (m/s)"],
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.5)
+    fig.tight_layout()
+    return fig
+
+
 def validation_report(
     collocation_ds,
     datatree,
@@ -2067,6 +2132,7 @@ def validation_report(
                 plt.close(fig)
 
     # Collocation diagnostics plot — generated once per recipe
+    diagnostics_inserted = False
     if base_dir is not None:
         try:
             diag_path = plot_collocation_diagnostics(
@@ -2087,8 +2153,26 @@ def validation_report(
                     0,
                     (f"Collocation diagnostics — {recipe.config.name}", _image_page_figure(diag_img)),
                 )
+                diagnostics_inserted = True
         except Exception as exc:
             logger.warning("plot_collocation_diagnostics failed: %s", exc)
+
+    # RVL land-contamination QA page — currents recipes only, and only when
+    # at least one scene actually has land-flagged cells (plot_rvl_land_qa
+    # returns None otherwise, so no empty page is added). Inserted right
+    # after the diagnostics page (index 1 if that page exists, else index 0
+    # so it becomes the first content page) rather than appended at the end,
+    # per the design spec.
+    if base_dir is not None and variable == "currents":
+        try:
+            fig_land_qa = plot_rvl_land_qa(datatree)
+            if fig_land_qa is not None:
+                pdf_pages.insert(
+                    1 if diagnostics_inserted else 0,
+                    ("RVL land-contamination QA", _finalize_figure_for_report(fig_land_qa, None)),
+                )
+        except Exception as exc:
+            logger.warning("plot_rvl_land_qa failed: %s", exc)
 
     # Combined PDF — saved alongside the validation_statistics_*.nc files
     if base_dir is not None and pdf_pages:

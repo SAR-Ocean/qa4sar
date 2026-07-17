@@ -1603,6 +1603,40 @@ class DataTreeConverter:
                     if "rvlIncidenceAngle" in ds_raw
                     else np.full_like(rvl_radvel, np.nan)
                 )
+                rvl_radvel_std = (
+                    _swaths_to_grid(ds_raw["rvlRadVelStd"].values)
+                    if "rvlRadVelStd" in ds_raw
+                    else np.full_like(rvl_radvel, np.nan)
+                )
+
+                # Land-flag masking. rvlLandFlag is set to 1 where land
+                # coverage of the cell exceeds 10%. Land-contaminated cells
+                # must not feed into currents validation, so rvlRadVel and
+                # rvlRadVelStd are NaN'd out there — but the pre-mask mean is
+                # kept as a QA stat since it is expected to be ~0 and a
+                # meaningfully non-zero value signals a data-quality issue.
+                # rvlHeading/rvlIncidenceAngle are geometry, not
+                # measurements, and are left unmasked.
+                land_pixel_count = 0
+                land_pixel_fraction = float("nan")
+                land_mean_radvel = float("nan")
+                if "rvlLandFlag" in ds_raw:
+                    rvl_landflag = _swaths_to_grid(ds_raw["rvlLandFlag"].values).astype(float)
+                    land_mask = rvl_landflag == 1
+                    total_classified = int(np.sum(~np.isnan(rvl_landflag)))
+                    land_pixel_count = int(np.sum(land_mask))
+                    if total_classified > 0:
+                        land_pixel_fraction = land_pixel_count / total_classified
+                    if land_pixel_count > 0:
+                        land_mean_radvel = float(np.nanmean(rvl_radvel[land_mask]))
+                        rvl_radvel = np.where(land_mask, np.nan, rvl_radvel)
+                        rvl_radvel_std = np.where(land_mask, np.nan, rvl_radvel_std)
+                        logger.warning(
+                            "scene %s: %d/%d RVL cells land-flagged (%.1f%%) — "
+                            "mean rvlRadVel over land = %.4f m/s (expected ~0)",
+                            safe_dir.name, land_pixel_count, total_classified,
+                            100 * land_pixel_fraction, land_mean_radvel,
+                        )
 
                 # Get acquisition time (scalar for grid)
                 time_str = ds_raw.attrs.get("firstMeasurementTime")
@@ -1629,6 +1663,7 @@ class DataTreeConverter:
                 # Create Dataset with 2D grid structure
                 data_vars = {
                     "rvlRadVel": (dims, rvl_radvel),
+                    "rvlRadVelStd": (dims, rvl_radvel_std),
                     "rvlHeading": (dims, rvl_heading),
                     "rvlIncidenceAngle": (dims, rvl_incidence),
                 }
@@ -1650,6 +1685,9 @@ class DataTreeConverter:
                 ds.attrs["safe_dir"] = safe_dir.name
                 ds.attrs["measurement_type"] = "rvl"
                 ds.attrs["grid_shape"] = rvl_radvel.shape
+                ds.attrs["rvl_land_pixel_count"] = land_pixel_count
+                ds.attrs["rvl_land_pixel_fraction"] = land_pixel_fraction
+                ds.attrs["rvl_land_mean_radvel"] = land_mean_radvel
 
                 logger.info(
                     "Extracted RVL grid %s from product %s",
@@ -1668,11 +1706,21 @@ class DataTreeConverter:
             point_lons: list[float] = []
             point_lats: list[float] = []
             point_radvel: list[float] = []
+            point_radvel_std: list[float] = []
             point_heading: list[float] = []
             point_incidence: list[float] = []
             point_times = []
             file_names = []
             rvl_attrs: Dict[str, Dict] = {}
+
+            # Land-flag QA accumulated across every imagette file in this
+            # scene (see the grid branch above for the rationale — same
+            # masking rule, same QA stats, just summed across files here
+            # since one WV scene is many small imagette files).
+            land_pixel_count_total = 0
+            total_classified_total = 0
+            land_radvel_sum = 0.0
+            land_radvel_finite_count_total = 0
 
             for nc_path in rvl_files:
                 try:
@@ -1689,7 +1737,7 @@ class DataTreeConverter:
                     if not rvl_attrs:
                         rvl_attrs = {
                             v: dict(ds_raw[v].attrs)
-                            for v in ("rvlRadVel", "rvlHeading", "rvlIncidenceAngle")
+                            for v in ("rvlRadVel", "rvlRadVelStd", "rvlHeading", "rvlIncidenceAngle")
                             if v in ds_raw
                         }
 
@@ -1708,6 +1756,27 @@ class DataTreeConverter:
                         if "rvlIncidenceAngle" in ds_raw
                         else np.full_like(rvl_radvel, np.nan)
                     )
+                    rvl_radvel_std = (
+                        ds_raw["rvlRadVelStd"].values.ravel()
+                        if "rvlRadVelStd" in ds_raw
+                        else np.full_like(rvl_radvel, np.nan)
+                    )
+
+                    # Land-flag masking (see the grid branch for rationale).
+                    # rvlHeading/rvlIncidenceAngle are left unmasked.
+                    if "rvlLandFlag" in ds_raw:
+                        rvl_landflag = ds_raw["rvlLandFlag"].values.ravel().astype(float)
+                        land_mask = rvl_landflag == 1
+                        total_classified_total += int(np.sum(~np.isnan(rvl_landflag)))
+                        file_land_count = int(np.sum(land_mask))
+                        if file_land_count > 0:
+                            land_pixel_count_total += file_land_count
+                            land_radvel_sum += float(np.nansum(rvl_radvel[land_mask]))
+                            land_radvel_finite_count_total += int(
+                                np.sum(land_mask & ~np.isnan(rvl_radvel))
+                            )
+                            rvl_radvel = np.where(land_mask, np.nan, rvl_radvel)
+                            rvl_radvel_std = np.where(land_mask, np.nan, rvl_radvel_std)
 
                     # Get acquisition time
                     m = re.search(r"(\d{8}t\d{6})", nc_path.stem, re.IGNORECASE)
@@ -1724,6 +1793,7 @@ class DataTreeConverter:
                     point_lons.extend(rvl_lons)
                     point_lats.extend(rvl_lats)
                     point_radvel.extend(rvl_radvel)
+                    point_radvel_std.extend(rvl_radvel_std)
                     point_heading.extend(rvl_heading)
                     point_incidence.extend(rvl_incidence)
                     point_times.extend([acq_time_ns] * n_points)
@@ -1741,6 +1811,7 @@ class DataTreeConverter:
             # Create Dataset with point dimension (flattened RVL grids)
             data_vars = {
                 "rvlRadVel": (("point",), np.asarray(point_radvel)),
+                "rvlRadVelStd": (("point",), np.asarray(point_radvel_std)),
                 "rvlHeading": (("point",), np.asarray(point_heading)),
                 "rvlIncidenceAngle": (("point",), np.asarray(point_incidence)),
             }
@@ -1752,6 +1823,22 @@ class DataTreeConverter:
                 "filename": (["point"], file_names),
             }
 
+            land_pixel_fraction = (
+                land_pixel_count_total / total_classified_total
+                if total_classified_total > 0 else float("nan")
+            )
+            land_mean_radvel = (
+                land_radvel_sum / land_radvel_finite_count_total
+                if land_radvel_finite_count_total > 0 else float("nan")
+            )
+            if land_pixel_count_total > 0:
+                logger.warning(
+                    "scene %s: %d/%d RVL cells land-flagged (%.1f%%) — "
+                    "mean rvlRadVel over land = %.4f m/s (expected ~0)",
+                    safe_dir.name, land_pixel_count_total, total_classified_total,
+                    100 * land_pixel_fraction, land_mean_radvel,
+                )
+
             ds = xr.Dataset(data_vars, coords=coords)
             apply_cf_metadata(ds, "sar", rvl_attrs)
             ds.attrs["data_type"] = "sar_l2_ocn"
@@ -1759,6 +1846,9 @@ class DataTreeConverter:
             ds.attrs["safe_dir"] = safe_dir.name
             ds.attrs["measurement_type"] = "rvl"
             ds.attrs["num_points"] = len(point_radvel)
+            ds.attrs["rvl_land_pixel_count"] = land_pixel_count_total
+            ds.attrs["rvl_land_pixel_fraction"] = land_pixel_fraction
+            ds.attrs["rvl_land_mean_radvel"] = land_mean_radvel
 
             logger.info(
                 "Extracted %d RVL points from product %s",
