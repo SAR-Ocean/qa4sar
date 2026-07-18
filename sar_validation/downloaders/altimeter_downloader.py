@@ -31,7 +31,10 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .base import normalize_datetime, build_output_dir, split_antimeridian_bbox
+from .base import (
+    normalize_datetime, build_output_dir, split_antimeridian_bbox,
+    copernicus_marine_download_kwargs,
+)
 
 __all__ = ["AltimeterDownloader"]
 
@@ -98,9 +101,11 @@ class AltimeterDownloader:
         self,
         output_dir: Path,
         dry_run: bool = False,
+        force_download: bool = False,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
+        self.force_download = force_download
 
     def download(
         self,
@@ -221,7 +226,7 @@ class AltimeterDownloader:
                             maximum_depth=0,
                             output_directory=self.output_dir,
                             output_filename=filename,
-                            force_download=False,
+                            **copernicus_marine_download_kwargs(self.force_download),
                         )
                         if dest_path.is_dir():
                             # copernicusmarine can't always merge the request

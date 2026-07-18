@@ -73,12 +73,14 @@ class SARDownloader:
         dry_run: bool = False,
         username: Optional[str] = None,
         password: Optional[str] = None,
+        force_download: bool = False,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
         self._username = username
         self._password = password
         self._client: Optional[CopernicusODataClient] = None
+        self.force_download = force_download
 
     def _get_client(self) -> CopernicusODataClient:
         if self._client is None:
@@ -187,9 +189,13 @@ class SARDownloader:
         downloaded: list[Path] = []
 
         for i, (_, row) in enumerate(df.iterrows(), start=1):
-            print(f"[{i}/{len(df)}] Downloading {row['Name']} …")
+            product_name = row["Name"]
+            if not self.force_download and (self.output_dir / product_name).exists():
+                print(f"[{i}/{len(df)}] Already downloaded: {product_name}")
+                continue
+            print(f"[{i}/{len(df)}] Downloading {product_name} …")
             try:
-                path = client.download_product(row["Id"], self.output_dir, row["Name"])
+                path = client.download_product(row["Id"], self.output_dir, product_name)
                 # Unzip if needed
                 if path.suffix == ".zip":
                     with zipfile.ZipFile(path, "r") as zf:

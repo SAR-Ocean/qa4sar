@@ -76,12 +76,14 @@ class ScatterometerDownloader:
         dry_run: bool = False,
         username: Optional[str] = None,
         password: Optional[str] = None,
+        force_download: bool = False,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
         self._username = username
         self._password = password
         self._token = None
+        self.force_download = force_download
 
     def _get_token(self):
         if self._token is None:
@@ -151,6 +153,12 @@ class ScatterometerDownloader:
         for product_id in products:
             product_str = str(product_id)
             if not any(sat in product_str.lower() for sat in SATELLITES):
+                continue
+
+            if not self.force_download and any(
+                product_str in f.name for f in self.output_dir.glob("*") if f.is_file()
+            ):
+                print(f"  Already downloaded: {product_id}")
                 continue
 
             try:

@@ -116,9 +116,10 @@ class HFRadarHistoricalDownloader:
         If True, print what would be downloaded without fetching anything.
     """
 
-    def __init__(self, output_dir: Path, dry_run: bool = False) -> None:
+    def __init__(self, output_dir: Path, dry_run: bool = False, force_download: bool = False) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
+        self.force_download = force_download
 
     def download(
         self,
@@ -181,6 +182,10 @@ class HFRadarHistoricalDownloader:
                 f"'{remote_filename}' for region '{region}' and subset to:\n  {dest_path}"
             )
             return None
+
+        if not self.force_download and dest_path.exists():
+            print(f"  Already downloaded: {dest_path}")
+            return dest_path
 
         try:
             import copernicusmarine

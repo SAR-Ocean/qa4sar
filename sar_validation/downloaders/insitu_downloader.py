@@ -137,11 +137,13 @@ class InSituDownloader:
         dry_run: bool = False,
         min_depth: float = -20.0,
         max_depth: float = 20.0,
+        force_download: bool = False,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
         self.min_depth = min_depth
         self.max_depth = max_depth
+        self.force_download = force_download
 
     def download(
         self,
@@ -217,6 +219,10 @@ class InSituDownloader:
                 f"[DRY RUN] Would download in-situ data to:\n  {dest_path}"
             )
             return None
+
+        if not self.force_download and dest_path.exists():
+            print(f"  Already downloaded: {dest_path}")
+            return dest_path
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -316,7 +322,6 @@ class InSituDownloader:
             end_datetime=end_dt,
             minimum_depth=self.min_depth,
             maximum_depth=self.max_depth,
-            force_download=False,
         )
 
 

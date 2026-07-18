@@ -68,3 +68,106 @@ class TestLoadPrecomputedStats:
         result = cli._load_precomputed_stats(recipe, collocation_ds, tmp_path, filename_suffix="_individual")
 
         assert set(result.keys()) == {"oswTotalHs_vs_VAVH"}
+
+
+class TestExecuteRecipeContinuesPastDownloadFailure:
+    def test_does_not_exit_when_download_all_returns_false(self, tmp_path, capsys):
+        from unittest.mock import patch
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-partial-failure",
+            variable="wind",
+            output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        with patch(
+            "sar_validation.core.orchestrator.DataOrchestrator.download_all",
+            return_value=False,
+        ):
+            # Must not raise SystemExit.
+            cli._execute_recipe(str(recipe_path), force_download=True)
+
+        out = capsys.readouterr().out
+        assert "continuing with available data" in out
+
+
+class TestLoadDownloadWarnings:
+    def test_no_metadata_file_returns_none(self, tmp_path):
+        assert cli._load_download_warnings(tmp_path) is None
+
+    def test_empty_errors_returns_none(self, tmp_path):
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({"errors": []}))
+        assert cli._load_download_warnings(tmp_path) is None
+
+    def test_returns_errors_list(self, tmp_path):
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(
+            json.dumps({"errors": ["altimeter download failed: timeout"]})
+        )
+        assert cli._load_download_warnings(tmp_path) == ["altimeter download failed: timeout"]
+
+
+class TestMethodRunsSuffixMapping:
+    def _write_recipe_with_skippable_download(self, tmp_path):
+        import json
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+        (tmp_path / "run").mkdir()
+        (tmp_path / "run" / "download_metadata.json").write_text(json.dumps({"errors": []}))
+        return recipe_path
+
+    def test_individual_alone_maps_to_individual_suffix(self, tmp_path):
+        from unittest.mock import patch
+
+        recipe_path = self._write_recipe_with_skippable_download(tmp_path)
+
+        with patch("sar_validation.cli._collocate_data") as mock_collocate:
+            cli._execute_recipe(
+                str(recipe_path), collocate=True,
+                layer_vs_layer_collocation_method="individual",
+            )
+
+        _, kwargs = mock_collocate.call_args
+        assert kwargs["filename_suffix"] == "_individual"
+        assert kwargs["layer_vs_layer_collocation_method"] == "individual"
+
+    def test_cell_averaging_alone_still_maps_to_empty_suffix(self, tmp_path):
+        from unittest.mock import patch
+
+        recipe_path = self._write_recipe_with_skippable_download(tmp_path)
+
+        with patch("sar_validation.cli._collocate_data") as mock_collocate:
+            cli._execute_recipe(
+                str(recipe_path), collocate=True,
+                layer_vs_layer_collocation_method="cell-averaging",
+            )
+
+        _, kwargs = mock_collocate.call_args
+        assert kwargs["filename_suffix"] == ""
+
+
+class TestExecuteRecipePassesForceDownloadToOrchestrator:
+    def test_force_download_flag_reaches_orchestrator_constructor(self, tmp_path):
+        from unittest.mock import patch
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        with patch("sar_validation.core.orchestrator.DataOrchestrator") as mock_cls:
+            mock_cls.return_value.download_all.return_value = True
+            mock_cls.return_value.base_dir = tmp_path / "run"
+            cli._execute_recipe(str(recipe_path), force_download=True)
+
+        assert mock_cls.call_args.kwargs["force_download"] is True

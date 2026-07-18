@@ -36,7 +36,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .base import normalize_datetime, is_date_recent, build_output_dir, split_antimeridian_bbox
+from .base import (
+    normalize_datetime, is_date_recent, build_output_dir, split_antimeridian_bbox,
+    copernicus_marine_download_kwargs,
+)
 from ._hf_radar_regions import HFR_REGIONS, resolve_hfr_region
 
 __all__ = ["HFRadarDownloader"]
@@ -75,9 +78,11 @@ class HFRadarDownloader:
         dry_run: bool = False,
         min_depth: float = -2.0,
         max_depth: float = 2.0,
+        force_download: bool = False,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
+        self.force_download = force_download
 
     def download(
         self,
@@ -210,7 +215,7 @@ class HFRadarDownloader:
             end_datetime=end_dt,
             output_directory=str(dest_path.parent),
             output_filename=dest_path.name,
-            force_download=True,
+            **copernicus_marine_download_kwargs(self.force_download),
         )
 
 

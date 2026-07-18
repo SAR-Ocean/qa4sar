@@ -463,6 +463,15 @@ def _create_recipe(
     print("Edit the file to adjust data sources and collocation settings.")
 
 
+# Filename suffix per layer-vs-layer collocation method. "both" mode writes
+# both suffixes directly (see method_runs below); a single method must map
+# to the SAME suffix "both" mode would use for it, so that e.g.
+# --layer-vs-layer-collocation-method individual alone reads/writes
+# collocation_results_individual.nc consistently across collocate/stats/plot
+# instead of the unsuffixed collocation_results.nc cell-averaging uses.
+_METHOD_SUFFIX = {"cell-averaging": "", "individual": "_individual"}
+
+
 def _execute_recipe(
     recipe_path: str,
     dry_run: bool = False,
@@ -491,7 +500,7 @@ def _execute_recipe(
     if output_dir:
         recipe.config.output_dir = output_dir
 
-    orchestrator = DataOrchestrator(recipe, dry_run=dry_run)
+    orchestrator = DataOrchestrator(recipe, dry_run=dry_run, force_download=force_download)
 
     # Skip download if data was already downloaded successfully and not forcing re-download
     if not dry_run and not force_download and _is_already_downloaded(orchestrator.base_dir):
@@ -509,8 +518,9 @@ def _execute_recipe(
             print("No data directories or files were created.")
             return
         elif not success:
-            print("\nOne or more downloads failed. Check download_metadata.json for details.")
-            sys.exit(1)
+            print("\nOne or more downloads failed — continuing with available data.")
+            print("Check download_metadata.json for details.")
+            print(f"Data directory: {orchestrator.base_dir}")
         else:
             print("\nAll downloads completed.")
             print(f"Data directory: {orchestrator.base_dir}")
@@ -527,7 +537,9 @@ def _execute_recipe(
         # outputs so neither run overwrites the other.
         method_runs = [("cell-averaging", ""), ("individual", "_individual")]
     else:
-        method_runs = [(layer_vs_layer_collocation_method, "")]
+        method_runs = [
+            (layer_vs_layer_collocation_method, _METHOD_SUFFIX[layer_vs_layer_collocation_method])
+        ]
 
     for method, suffix in method_runs:
         if collocate:
@@ -547,7 +559,10 @@ def _execute_recipe(
             _compute_stats(recipe, orchestrator.base_dir, filename_suffix=suffix)
 
         if plot:
-            _generate_plots(recipe, orchestrator.base_dir, filename_suffix=suffix)
+            _generate_plots(
+                recipe, orchestrator.base_dir, filename_suffix=suffix,
+                layer_vs_layer_collocation_method=method,
+            )
 
 
 def _is_already_downloaded(base_dir: Path) -> bool:
@@ -625,7 +640,11 @@ def _collocate_data(
     # there are zero collocated pairs, in which case every validation point
     # shows up as unmatched.
     try:
-        diag_path = plot_collocation_diagnostics(tree, collocation_ds, recipe, base_dir, filename_suffix=filename_suffix)
+        diag_path = plot_collocation_diagnostics(
+            tree, collocation_ds, recipe, base_dir,
+            filename_suffix=filename_suffix,
+            layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
+        )
         if diag_path:
             print(f"  Generated diagnostic plot: {diag_path.relative_to(base_dir.parent)}")
     except Exception as exc:
@@ -680,7 +699,10 @@ def _load_precomputed_stats(recipe, collocation_ds, base_dir: Path, filename_suf
     return stats_ds_map
 
 
-def _generate_plots(recipe, base_dir: Path, filename_suffix: str = "") -> None:
+def _generate_plots(
+    recipe, base_dir: Path, filename_suffix: str = "",
+    layer_vs_layer_collocation_method: str = "cell-averaging",
+) -> None:
     """Run step 5b: generate validation plots and save PDF to <base_dir>/, PNG to <base_dir>/plots/."""
     import xarray as xr
     from .core.visualization import validation_report
@@ -700,12 +722,33 @@ def _generate_plots(recipe, base_dir: Path, filename_suffix: str = "") -> None:
     datatree = xr.open_datatree(str(datatree_path), engine="netcdf4")
 
     stats_ds_map = _load_precomputed_stats(recipe, collocation_ds, base_dir, filename_suffix)
+    download_warnings = _load_download_warnings(base_dir)
 
     validation_report(collocation_ds, datatree, recipe,
                       stats_ds_map=stats_ds_map or None,
                       out_dir=base_dir,
-                      filename_suffix=filename_suffix)
+                      filename_suffix=filename_suffix,
+                      download_warnings=download_warnings,
+                      layer_vs_layer_collocation_method=layer_vs_layer_collocation_method)
     pdf_path = base_dir / f"validation_report{filename_suffix}.pdf"
     if pdf_path.exists():
         print(f"  PDF report saved to {pdf_path}")
     print(f"  Collocation diagnostics PNG saved to {base_dir / 'plots'}")
+
+
+def _load_download_warnings(base_dir: Path) -> Optional[list[str]]:
+    """Read download_metadata.json's ``errors`` list, if present, for
+    surfacing on the PDF cover page. Returns None if there's no metadata
+    file, it can't be parsed, or it has no errors."""
+    import json as _json
+
+    meta_path = base_dir / "download_metadata.json"
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path) as f:
+            meta = _json.load(f)
+    except Exception:
+        return None
+    errors = meta.get("errors") or []
+    return errors or None

@@ -41,9 +41,10 @@ class DataOrchestrator:
         If True, print download commands without executing them.
     """
 
-    def __init__(self, recipe: Recipe, dry_run: bool = False) -> None:
+    def __init__(self, recipe: Recipe, dry_run: bool = False, force_download: bool = False) -> None:
         self.recipe   = recipe
         self.dry_run  = dry_run
+        self.force_download = force_download
         self.base_dir = self._setup_base_dir()
         self.metadata: Dict[str, Any] = {
             "recipe_name": recipe.config.name,
@@ -139,6 +140,7 @@ class DataOrchestrator:
             dl = SARDownloader(
                 output_dir=out_dir,
                 dry_run=self.dry_run,
+                force_download=self.force_download,
             )
             paths = dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
@@ -179,6 +181,7 @@ class DataOrchestrator:
                 dry_run=self.dry_run,
                 min_depth=min_depth,
                 max_depth=max_depth,
+                force_download=self.force_download,
             )
             dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
@@ -226,7 +229,9 @@ class DataOrchestrator:
         out_dir = self.base_dir / "osi_saf_winds"
 
         try:
-            dl = ScatterometerDownloader(output_dir=out_dir, dry_run=self.dry_run)
+            dl = ScatterometerDownloader(
+                output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
+            )
             dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
@@ -259,6 +264,7 @@ class DataOrchestrator:
                 dry_run=self.dry_run,
                 min_depth=source.resolved_min_depth,
                 max_depth=source.resolved_max_depth,
+                force_download=self.force_download,
             )
             dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
@@ -295,6 +301,7 @@ class DataOrchestrator:
                 output_dir=out_dir,
                 dry_run=self.dry_run,
                 resolution_km=resolution_km,
+                force_download=self.force_download,
             )
             dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
@@ -321,7 +328,9 @@ class DataOrchestrator:
         out_dir = self.base_dir / "hf_radar_historical"
 
         try:
-            dl = HFRadarHistoricalDownloader(output_dir=out_dir, dry_run=self.dry_run)
+            dl = HFRadarHistoricalDownloader(
+                output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
+            )
             dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
@@ -355,7 +364,9 @@ class DataOrchestrator:
         out_dir = self.base_dir / "altimeter"
 
         try:
-            dl = AltimeterDownloader(output_dir=out_dir, dry_run=self.dry_run)
+            dl = AltimeterDownloader(
+                output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
+            )
             kwargs = {
                 "frequencies": self._ALTIMETER_FREQUENCIES_BY_VARIABLE.get(
                     cfg.variable, ["1hz", "5hz"]

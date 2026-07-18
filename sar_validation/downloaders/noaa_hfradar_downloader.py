@@ -169,10 +169,12 @@ class NOAAHFRadarDownloader:
     """
 
     def __init__(self, output_dir: Path, dry_run: bool = False,
-                 resolution_km: int = DEFAULT_RESOLUTION_KM) -> None:
+                 resolution_km: int = DEFAULT_RESOLUTION_KM,
+                 force_download: bool = False) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
         self.resolution_km = resolution_km
+        self.force_download = force_download
 
     def download(self, min_lon, max_lon, min_lat, max_lat,
                  start: str, end: str) -> list[Path]:
@@ -209,6 +211,10 @@ class NOAAHFRadarDownloader:
         min_lon, max_lon, min_lat, max_lat = clamp_to_region_bbox(
             min_lon, max_lon, min_lat, max_lat
         )
+        start_d = normalize_datetime(start).split("T")[0]
+        end_d = normalize_datetime(end).split("T")[0]
+        date_str = start_d if start_d == end_d else f"{start_d}_{end_d}"
+        out_path = self.output_dir / f"{dataset_id}_{self.resolution_km}km_{date_str}{filename_suffix}.nc"
         url = build_erddap_subset_url(
             dataset_id, min_lon, max_lon, min_lat, max_lat, start, end
         )
@@ -217,11 +223,11 @@ class NOAAHFRadarDownloader:
             print(f"[dry-run] NOAA HF-radar ({backend}) would download:\n  {url}")
             return None
 
+        if not self.force_download and out_path.exists():
+            print(f"  Already downloaded: {out_path}")
+            return out_path
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        start_d = normalize_datetime(start).split("T")[0]
-        end_d = normalize_datetime(end).split("T")[0]
-        date_str = start_d if start_d == end_d else f"{start_d}_{end_d}"
-        out_path = self.output_dir / f"{dataset_id}_{self.resolution_km}km_{date_str}{filename_suffix}.nc"
         urllib.request.urlretrieve(url, str(out_path))
         return out_path
 

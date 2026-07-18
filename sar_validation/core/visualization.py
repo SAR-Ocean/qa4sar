@@ -1226,6 +1226,7 @@ def plot_collocation_diagnostics(
     recipe,
     output_dir: Union[str, Path],
     filename_suffix: str = "",
+    layer_vs_layer_collocation_method: str = "cell-averaging",
 ) -> Union[Path, None]:
     """
     Plot collocation diagnostics: SAR scene bounds, and matched/unmatched
@@ -1267,6 +1268,12 @@ def plot_collocation_diagnostics(
         Appended to the output filename stem, e.g. ``"_individual"``. Lets
         diagnostic plots for two collocation methods coexist without
         overwriting each other.
+    layer_vs_layer_collocation_method : str
+        Which layer-vs-layer collocation method produced *collocation_ds*
+        ("cell-averaging" or "individual"). Individual-mode matches are far
+        denser than cell-averaging (one point per matched SAR pixel vs. one
+        per validation-instrument location), so this controls matched-layer
+        point transparency — see the alpha computation below.
 
     Returns
     -------
@@ -1508,14 +1515,23 @@ def plot_collocation_diagnostics(
     bounds = recipe.config.geographic_bounds
     variable = recipe.config.variable
 
-    # Matched-point styling depends on the recipe's variable type:
-    # - wind: layer-source matches (Tier 3) get a moderate alpha instead of
-    #   full opacity, since a dense swath (e.g. scatterometer) would
-    #   otherwise fully occlude a sparser layer source (e.g. radiometer)
-    #   plotted underneath it in the same tier.
+    # Matched-point styling depends on the recipe's variable type and, for
+    # layer-source matches, the collocation method that produced them:
+    # - individual-method matches are far denser than cell-averaging (one
+    #   point per matched SAR pixel vs. one per validation-instrument
+    #   location — routinely 100-500x more points for the same recipe), so
+    #   the same alpha used for cell-averaging would saturate into a solid
+    #   blob; a lower fixed alpha keeps density visible instead.
+    # - wind (cell-averaging): layer-source matches (Tier 3) get a moderate
+    #   alpha instead of full opacity, since a dense swath (e.g.
+    #   scatterometer) would otherwise fully occlude a sparser layer source
+    #   (e.g. radiometer) plotted underneath it in the same tier.
     # - waves: all matched points (Tier 3 + Tier 4) get a larger marker and
     #   a black edge, making individual matches easier to pick out.
-    matched_layer_alpha = 0.65 if variable == "wind" else 1.0
+    if layer_vs_layer_collocation_method == "individual":
+        matched_layer_alpha = 0.15
+    else:
+        matched_layer_alpha = 0.65 if variable == "wind" else 1.0
     if variable == "waves":
         matched_marker_size = 45
         matched_edgecolors = "black"
@@ -1974,6 +1990,8 @@ def validation_report(
     stats_ds_map: Optional[Dict[str, "xr.Dataset"]] = None,
     out_dir: Optional[Union[str, Path]] = None,
     filename_suffix: str = "",
+    download_warnings: Optional[list[str]] = None,
+    layer_vs_layer_collocation_method: str = "cell-averaging",
 ) -> Dict[str, list]:
     """
     Run all four plot functions for every (sar_var, val_var) pair inferred
@@ -2003,6 +2021,15 @@ def validation_report(
         Appended to PDF and collocation-diagnostics PNG filenames,
         e.g. ``"_individual"``. Lets reports from two collocation methods
         coexist without overwriting each other.
+    download_warnings : list[str], optional
+        Download-step error messages (from ``download_metadata.json``'s
+        ``errors`` list) to surface on the PDF cover page. None or an empty
+        list adds no warning text.
+    layer_vs_layer_collocation_method : str
+        Which layer-vs-layer collocation method produced *collocation_ds*
+        ("cell-averaging" or "individual"). Passed through to
+        :func:`plot_collocation_diagnostics` for method-aware matched-point
+        transparency.
 
     Returns
     -------
@@ -2152,7 +2179,9 @@ def validation_report(
     if base_dir is not None:
         try:
             diag_path = plot_collocation_diagnostics(
-                datatree, collocation_ds, recipe, base_dir, filename_suffix
+                datatree, collocation_ds, recipe, base_dir,
+                filename_suffix=filename_suffix,
+                layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
             )
             if diag_path is not None:
                 logger.info("Collocation diagnostics plot saved to %s", diag_path)
@@ -2210,6 +2239,12 @@ def validation_report(
                 f"Generated: {_dt.date.today().isoformat()}",
                 ha="center", va="center", fontsize=12,
             )
+            if download_warnings:
+                cover.text(
+                    0.5, 0.34,
+                    "⚠ " + "; ".join(download_warnings),
+                    ha="center", va="center", fontsize=9, color="firebrick", wrap=True,
+                )
             pdf.savefig(cover, bbox_inches="tight")
             plt.close(cover)
 

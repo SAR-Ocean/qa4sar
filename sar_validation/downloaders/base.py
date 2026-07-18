@@ -29,6 +29,7 @@ __all__ = [
     "is_date_recent",
     "build_output_dir",
     "split_antimeridian_bbox",
+    "copernicus_marine_download_kwargs",
 ]
 
 
@@ -410,3 +411,17 @@ def split_antimeridian_bbox(min_lon: float, max_lon: float) -> list[tuple[float,
     if min_lon <= max_lon:
         return [(min_lon, max_lon)]
     return [(min_lon, 180.0), (-180.0, max_lon)]
+
+
+def copernicus_marine_download_kwargs(force_download: bool) -> dict:
+    """
+    Return the ``skip_existing``/``overwrite`` kwargs for a
+    ``copernicusmarine.subset()``/``.get()`` call, matching this toolbox's
+    ``--force-download`` semantics.
+
+    ``copernicusmarine`` has no ``force_download`` parameter (the two real,
+    mutually-exclusive options are ``overwrite`` and ``skip_existing``) —
+    this is the single place that translates the toolbox's boolean flag into
+    the real API, so no downloader has to reason about the mapping itself.
+    """
+    return {"skip_existing": not force_download, "overwrite": force_download}

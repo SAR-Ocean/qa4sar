@@ -2196,3 +2196,111 @@ class TestPlotCollocationDiagnosticsAntimeridian:
         )
         img = mpimg.imread(str(out_path))
         assert img.shape[0] > 100 and img.shape[1] > 100
+
+
+class TestValidationReportDownloadWarnings:
+    def test_download_warning_appears_on_cover_page(
+        self, geo_datatree_and_collocation, tmp_path, monkeypatch
+    ):
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+        from sar_validation.core.visualization import validation_report
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
+
+        recorded_figs = []
+        original_savefig = PdfPages.savefig
+
+        def recording_savefig(self, *args, **kwargs):
+            fig = args[0] if args else kwargs.get("figure")
+            recorded_figs.append(fig)
+            return original_savefig(self, *args, **kwargs)
+
+        monkeypatch.setattr(PdfPages, "savefig", recording_savefig)
+        validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path,
+            download_warnings=["altimeter download failed: timeout"],
+        )
+        plt.close("all")
+
+        cover = recorded_figs[0]
+        cover_text = " ".join(t.get_text() for t in cover.texts)
+        assert "altimeter download failed: timeout" in cover_text
+
+    def test_no_warning_text_when_download_warnings_omitted(
+        self, geo_datatree_and_collocation, tmp_path, monkeypatch
+    ):
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+        from sar_validation.core.visualization import validation_report
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
+
+        recorded_figs = []
+        original_savefig = PdfPages.savefig
+
+        def recording_savefig(self, *args, **kwargs):
+            fig = args[0] if args else kwargs.get("figure")
+            recorded_figs.append(fig)
+            return original_savefig(self, *args, **kwargs)
+
+        monkeypatch.setattr(PdfPages, "savefig", recording_savefig)
+        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        cover = recorded_figs[0]
+        # Exactly the same two text() calls as before this change: title + variable/date.
+        assert len(cover.texts) == 2
+
+
+class TestPlotCollocationDiagnosticsIndividualMethodAlpha:
+    def test_individual_method_uses_low_fixed_alpha(
+        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
+    ):
+        import matplotlib.pyplot as plt
+        import sar_validation.core.visualization as viz
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        captured_alphas = []
+        original_scatter = plt.Axes.scatter
+
+        def spy_scatter(self, *args, **kwargs):
+            if "alpha" in kwargs:
+                captured_alphas.append(kwargs["alpha"])
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(plt.Axes, "scatter", spy_scatter)
+        viz.plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe, tmp_path,
+            layer_vs_layer_collocation_method="individual",
+        )
+
+        assert 0.15 in captured_alphas
+
+    def test_cell_averaging_default_keeps_todays_alpha(
+        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
+    ):
+        """Non-regression: omitting layer_vs_layer_collocation_method (or
+        passing 'cell-averaging' explicitly) must reproduce today's exact
+        variable-dependent alpha (0.65 for wind, matching diagnostics_recipe)."""
+        import matplotlib.pyplot as plt
+        import sar_validation.core.visualization as viz
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        captured_alphas = []
+        original_scatter = plt.Axes.scatter
+
+        def spy_scatter(self, *args, **kwargs):
+            if "alpha" in kwargs:
+                captured_alphas.append(kwargs["alpha"])
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(plt.Axes, "scatter", spy_scatter)
+        viz.plot_collocation_diagnostics(datatree, collocation_ds, diagnostics_recipe, tmp_path)
+
+        assert 0.15 not in captured_alphas
+        assert 0.65 in captured_alphas
