@@ -16,6 +16,7 @@ dependencies = [
     "numpy",
     "pandas",
     "scipy",           # scipy.spatial.cKDTree — collocation nearest-neighbour search
+    "netCDF4",         # xarray netcdf4 engine — datatree read/write in cli.py
     "pyyaml",
     "requests",
     "copernicusmarine>=2.0",
@@ -29,6 +30,7 @@ dev = [
     "pytest",
     "pytest-cov",
     "mypy",
+    "ruff",
     "matplotlib",
     "cartopy",
     "cmocean",
@@ -45,6 +47,20 @@ include = ["sar_validation*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["*.ipynb"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test modules deliberately import section-by-section (each downloader /
+# component gets its own section with its own imports), so module-level
+# imports below the top of the file are fine there.
+"tests/*" = ["E402"]
 
 [tool.mypy]
 python_version = "3.12"

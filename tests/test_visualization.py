@@ -7,13 +7,12 @@ import pandas as pd
 import pytest
 import xarray as xr
 
+from sar_validation.core.statistics import compute_statistics
 from sar_validation.core.visualization import (
-    plot_scatter,
     plot_residuals,
+    plot_scatter,
     plot_statistics,
 )
-from sar_validation.core.statistics import compute_statistics
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -132,6 +131,7 @@ class TestPlotScatter:
 
     def test_constant_values_no_runtime_warning(self):
         import warnings
+
         import matplotlib.pyplot as plt
 
         n = 5
@@ -142,13 +142,14 @@ class TestPlotScatter:
         })
         with warnings.catch_warnings():
             warnings.simplefilter("error", RuntimeWarning)
+            warnings.simplefilter("error", UserWarning)
             fig = plot_scatter(ds, "owiWindSpeed", "WSPD")
         assert fig is not None
         plt.close("all")
 
     def test_distinct_sources_get_distinct_markers(self, collocation_ds, monkeypatch):
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
 
         recorded_markers = []
         original_scatter = matplotlib.axes.Axes.scatter
@@ -174,8 +175,8 @@ class TestPlotScatterColorByTemporalOffset:
         plt.close(fig)
 
     def test_uses_distinct_markers_per_source(self, collocation_ds, monkeypatch):
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
 
         recorded_markers = []
         original_scatter = matplotlib.axes.Axes.scatter
@@ -204,8 +205,8 @@ class TestPlotScatterColorByTemporalOffset:
         plt.close(fig)
 
     def test_shares_one_color_scale_across_sources(self, collocation_ds, monkeypatch):
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
 
         recorded_clims = []
         original_scatter = matplotlib.axes.Axes.scatter
@@ -259,8 +260,8 @@ class TestPlotResiduals:
         spike that dwarfed every other source sharing the axes. Each source
         now gets its own subplot, but all subplots must still share one
         bin range so bars stay position-comparable."""
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
 
         n_wide = 20
         rng = np.random.default_rng(1)
@@ -294,6 +295,7 @@ class TestPlotResiduals:
 class TestPlotTemporalOffset:
     def test_returns_figure(self, collocation_ds):
         import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_temporal_offset
         fig = plot_temporal_offset(collocation_ds, "owiWindSpeed", "WSPD")
         assert fig is not None
@@ -301,6 +303,7 @@ class TestPlotTemporalOffset:
 
     def test_missing_temporal_column_returns_none(self):
         import warnings
+
         from sar_validation.core.visualization import plot_temporal_offset
         n = 5
         ds = xr.Dataset({
@@ -314,8 +317,9 @@ class TestPlotTemporalOffset:
         assert result is None
 
     def test_distinct_sources_get_distinct_markers(self, collocation_ds, monkeypatch):
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_temporal_offset
 
         recorded_markers = []
@@ -378,7 +382,8 @@ class TestSourceStyleMap:
         # unrelated sources silently collide (e.g. tidal_gauge landing on
         # altimeter's blue circle because the palette was one entry short).
         from sar_validation.core.visualization import (
-            _source_style_map, _canonical_source_order,
+            _canonical_source_order,
+            _source_style_map,
         )
         canonical = _canonical_source_order()
         style = _source_style_map(canonical)
@@ -409,8 +414,9 @@ class TestSourceStyleMap:
 
 class TestPlotGeographic:
     def test_distinct_sources_get_distinct_markers(self, geo_datatree_and_collocation, monkeypatch):
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_geographic
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -439,6 +445,7 @@ class TestPlotGeographic:
         swath-edge cells. pcolormesh rejects non-finite x/y outright, so
         plot_geographic must repair the coordinate grid rather than crash."""
         import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_geographic
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -471,6 +478,7 @@ class TestPlotGeographicTicks:
         must still show degree-labeled lon/lat ticks, just without
         gridliner's expensive label-placement machinery."""
         import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_geographic
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -499,8 +507,9 @@ class TestPlotGeographicTicks:
         """Regression test for tick-label alignment: _set_lonlat_ticks must
         read tick positions from the gridliner's own locator to guarantee
         labels and grid lines never diverge."""
-        import matplotlib.pyplot as plt
         import cartopy.crs as ccrs
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import _set_lonlat_ticks
 
         # Create a GeoAxes with PlateCarree projection
@@ -548,8 +557,9 @@ class TestPlotGeographicTicks:
         default locator (nbins=8) produces many closely-spaced,
         high-decimal-precision ticks that overlap into unreadable labels
         otherwise."""
-        import matplotlib.pyplot as plt
         import cartopy.crs as ccrs
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import _set_lonlat_ticks
 
         fig = plt.figure()
@@ -578,8 +588,9 @@ class TestPlotGeographicTicks:
         This reproduces the real bug found by rendering an actual report
         (a 5°-wide, 23°-tall WV scene), not just an isolated tick-value
         count."""
-        import matplotlib.pyplot as plt
         import cartopy.crs as ccrs
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import _set_lonlat_ticks
 
         fig, ax = plt.subplots(figsize=(7, 5), subplot_kw={"projection": ccrs.PlateCarree()})
@@ -607,10 +618,11 @@ class TestPlotGeographicCircularColormap:
         render with a shared cyclic colormap and fixed 0-360 color limits,
         not viridis + percentile-derived limits (meaningless for data that
         wraps at the 0/360 seam)."""
-        import matplotlib.pyplot as plt
         import matplotlib.axes
-        from sar_validation.core.visualization import plot_geographic
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
 
         datatree, collocation_ds = geo_datatree_and_collocation
         scene_ds = datatree["sar/sceneA"].to_dataset()
@@ -656,8 +668,9 @@ class TestPlotGeographicCircularColormap:
             assert norm.vmax == 360.0
 
     def test_non_circular_var_keeps_viridis_and_percentile_limits(self, geo_datatree_and_collocation, monkeypatch):
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_geographic
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -824,8 +837,12 @@ def geo_datatree_and_collocation_mixed_layer_counts():
 @pytest.fixture
 def diagnostics_recipe():
     from sar_validation.core.recipe import (
-        GeographicBounds, Recipe, RecipeConfig, ValidationDataSource,
-        CollocationType, PointVsLayerCollocation,
+        CollocationType,
+        GeographicBounds,
+        PointVsLayerCollocation,
+        Recipe,
+        RecipeConfig,
+        ValidationDataSource,
     )
     config = RecipeConfig(
         name="test_recipe",
@@ -900,8 +917,12 @@ def geo_datatree_and_collocation_dateline():
 @pytest.fixture
 def diagnostics_recipe_dateline():
     from sar_validation.core.recipe import (
-        GeographicBounds, Recipe, RecipeConfig, ValidationDataSource,
-        CollocationType, PointVsLayerCollocation,
+        CollocationType,
+        GeographicBounds,
+        PointVsLayerCollocation,
+        Recipe,
+        RecipeConfig,
+        ValidationDataSource,
     )
     config = RecipeConfig(
         name="test_recipe_dateline",
@@ -916,8 +937,12 @@ def diagnostics_recipe_dateline():
 @pytest.fixture
 def diagnostics_recipe_waves():
     from sar_validation.core.recipe import (
-        GeographicBounds, Recipe, RecipeConfig, ValidationDataSource,
-        CollocationType, PointVsLayerCollocation,
+        CollocationType,
+        GeographicBounds,
+        PointVsLayerCollocation,
+        Recipe,
+        RecipeConfig,
+        ValidationDataSource,
     )
     config = RecipeConfig(
         name="test_recipe",
@@ -935,8 +960,12 @@ def diagnostics_recipe_waves():
 @pytest.fixture
 def diagnostics_recipe_currents():
     from sar_validation.core.recipe import (
-        GeographicBounds, Recipe, RecipeConfig, ValidationDataSource,
-        CollocationType, PointVsLayerCollocation,
+        CollocationType,
+        GeographicBounds,
+        PointVsLayerCollocation,
+        Recipe,
+        RecipeConfig,
+        ValidationDataSource,
     )
     config = RecipeConfig(
         name="test_recipe",
@@ -955,8 +984,9 @@ class TestPlotCollocationDiagnostics:
     def test_distinct_sources_get_distinct_markers(
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
     ):
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -986,10 +1016,10 @@ class TestPlotCollocationDiagnosticsRefinement:
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
     ):
         """Verify unmatched points render in gray (#808080) with alpha=0.3."""
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_collocation_diagnostics
-        import matplotlib.colors as mcolors
 
         datatree, collocation_ds = geo_datatree_and_collocation
 
@@ -1025,8 +1055,9 @@ class TestPlotCollocationDiagnosticsRefinement:
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
     ):
         """Verify z-order places matched in-situ data above matched layer data."""
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -1114,8 +1145,9 @@ class TestPlotCollocationDiagnosticsRefinement:
         wind recipe alpha=0.65 (not full opacity — a dense source like
         scatterometer would otherwise fully occlude a sparser one, e.g.
         radiometer, drawn underneath it in the same tier)."""
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -1145,8 +1177,9 @@ class TestPlotCollocationDiagnosticsRefinement:
         self, geo_datatree_and_collocation_with_unmatched, diagnostics_recipe, tmp_path, monkeypatch
     ):
         """Verify unmatched layer-type (altimeter) points get per-source markers, not default 'o'."""
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
         datatree, collocation_ds = geo_datatree_and_collocation_with_unmatched
@@ -1185,8 +1218,9 @@ class TestPlotCollocationDiagnosticsRefinement:
         ones within each tier, so a sparse instrument (e.g. altimeter) ends
         up layered on top of a dense one (e.g. scatterometer) instead of
         being buried underneath it."""
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
         datatree, collocation_ds = geo_datatree_and_collocation_mixed_layer_counts
@@ -1230,8 +1264,9 @@ class TestPlotCollocationDiagnosticsRecipeVariableStyling:
     def test_wind_matched_layer_alpha_is_reduced(
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
     ):
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -1254,8 +1289,9 @@ class TestPlotCollocationDiagnosticsRecipeVariableStyling:
     def test_waves_matched_layer_alpha_stays_opaque(
         self, geo_datatree_and_collocation, diagnostics_recipe_waves, tmp_path, monkeypatch
     ):
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -1278,8 +1314,9 @@ class TestPlotCollocationDiagnosticsRecipeVariableStyling:
     def test_currents_matched_layer_alpha_stays_opaque(
         self, geo_datatree_and_collocation, diagnostics_recipe_currents, tmp_path, monkeypatch
     ):
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -1302,8 +1339,9 @@ class TestPlotCollocationDiagnosticsRecipeVariableStyling:
     def test_waves_matched_points_are_larger_with_black_edge(
         self, geo_datatree_and_collocation, diagnostics_recipe_waves, tmp_path, monkeypatch
     ):
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -1327,8 +1365,9 @@ class TestPlotCollocationDiagnosticsRecipeVariableStyling:
     def test_wind_matched_points_keep_default_size_and_no_edge(
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
     ):
-        import matplotlib.pyplot as plt
         import matplotlib.axes
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -1354,8 +1393,9 @@ class TestPlotCollocationDiagnosticsTicks:
     def test_overview_plot_gets_degree_formatted_ticks(
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path
     ):
-        import matplotlib.pyplot as plt
         import matplotlib.image as mpimg
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -1376,6 +1416,7 @@ class TestPlotCollocationDiagnosticsTicks:
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
     ):
         import matplotlib.pyplot as plt
+
         import sar_validation.core.visualization as viz
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -1399,8 +1440,9 @@ class TestPlotCollocationDiagnosticsTicks:
 class TestValidationReport:
     def test_includes_temporal_offset_plots(self, geo_datatree_and_collocation, tmp_path):
         import matplotlib.pyplot as plt
-        from sar_validation.core.visualization import validation_report
+
         from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
 
         datatree, collocation_ds = geo_datatree_and_collocation
         recipe = Recipe(config=RecipeConfig(name="test", variable="wind"))
@@ -1416,13 +1458,14 @@ class TestValidationReport:
 class TestValidationReportIncludesDiagnostics:
     def test_diagnostics_plot_included_in_report(self, geo_datatree_and_collocation, tmp_path):
         import matplotlib.pyplot as plt
-        from sar_validation.core.visualization import validation_report
+
         from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
 
         datatree, collocation_ds = geo_datatree_and_collocation
         recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
 
-        figures = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
 
         # Check that the collocation diagnostics plot PNG was created
         assert (tmp_path / "plots" / "collocation_diagnostics_test_recipe.png").exists()
@@ -1439,8 +1482,9 @@ class TestValidationReportIncludesDiagnostics:
         """
         import matplotlib.pyplot as plt
         from matplotlib.backends.backend_pdf import PdfPages
-        from sar_validation.core.visualization import validation_report
+
         from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
 
         datatree, collocation_ds = geo_datatree_and_collocation
         recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
@@ -1473,8 +1517,9 @@ class TestValidationReportIncludesDiagnostics:
         right after the cover) in the PDF."""
         import matplotlib.pyplot as plt
         from matplotlib.backends.backend_pdf import PdfPages
-        from sar_validation.core.visualization import validation_report
+
         from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
 
         datatree, collocation_ds = geo_datatree_and_collocation
         recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
@@ -1510,8 +1555,9 @@ class TestValidationReportClosesPageFigures:
         unlike the original heavy figures, they aren't tracked in
         `all_figures` / `figs`, so nothing else closes them."""
         import matplotlib.pyplot as plt
-        from sar_validation.core.visualization import validation_report
+
         from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
 
         datatree, collocation_ds = geo_datatree_and_collocation
         recipe = Recipe(config=RecipeConfig(name="test", variable="wind"))
@@ -1555,9 +1601,10 @@ class TestValidationReportWindDirectionFilter:
         """Altimeter (all-NaN WDIR) must not appear in the wind-direction
         scatter, but must appear in the wind-speed scatter."""
         import matplotlib.pyplot as plt
+
         import sar_validation.core.visualization as viz
-        from sar_validation.core.recipe import Recipe, RecipeConfig
         from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import Recipe, RecipeConfig
 
         # Minimal 1-scene SAR datatree so plot_geographic has something to draw.
         y, x = 3, 3
@@ -1668,6 +1715,7 @@ class TestPlotGeographicSceneFilter:
 
     def test_scenes_allowlist_renders_only_listed_scenes(self):
         import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_geographic
         datatree, coll = self._two_scene_datatree_and_coll()
 
@@ -1680,6 +1728,7 @@ class TestPlotGeographicSceneFilter:
 
     def test_scenes_none_renders_all_scenes(self):
         import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import plot_geographic
         datatree, coll = self._two_scene_datatree_and_coll()
 
@@ -1695,6 +1744,7 @@ class TestValidationReportSceneAllowlist:
         """validation_report must derive the geographic scene allowlist from
         sar_scene_name and pass it through as `scenes`."""
         import matplotlib.pyplot as plt
+
         import sar_validation.core.visualization as viz
         from sar_validation.core.recipe import Recipe, RecipeConfig
 
@@ -1723,9 +1773,10 @@ class TestValidationReportCurrentsPointSize:
         field underneath — validation_report must request a smaller marker
         for currents recipes so the SAR scene stays visible through them."""
         import matplotlib.pyplot as plt
+
         import sar_validation.core.visualization as viz
-        from sar_validation.core.recipe import Recipe, RecipeConfig
         from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import Recipe, RecipeConfig
 
         y, x = 3, 3
         lon2d, lat2d = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
@@ -1737,12 +1788,13 @@ class TestValidationReportCurrentsPointSize:
         datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
 
         coll = xr.Dataset({
-            "sar_rvlRadVel":            ("collocation", [0.3, 0.31, 0.29, 0.32]),
-            "val_rvlRadVel_projection": ("collocation", [0.28, 0.30, 0.27, 0.31]),
-            "val_source":               ("collocation", ["hf_radar"] * 4),
-            "sar_scene_name":           ("collocation", ["sceneA"] * 4),
-            "val_lon":                  ("collocation", [-9.5, -9.4, -9.3, -9.2]),
-            "val_lat":                  ("collocation", [50.5, 50.6, 50.7, 50.8]),
+            "sar_rvlRadVel":             ("collocation", [0.3, 0.31, 0.29, 0.32]),
+            "val_rvlRadVel_projection":  ("collocation", [0.28, 0.30, 0.27, 0.31]),
+            "val_source":                ("collocation", ["hf_radar"] * 4),
+            "sar_scene_name":            ("collocation", ["sceneA"] * 4),
+            "val_lon":                   ("collocation", [-9.5, -9.4, -9.3, -9.2]),
+            "val_lat":                   ("collocation", [50.5, 50.6, 50.7, 50.8]),
+            "temporal_distance_minutes": ("collocation", [10.0, 12.0, 8.0, 15.0]),
         })
 
         captured = {}
@@ -1761,6 +1813,7 @@ class TestValidationReportCurrentsPointSize:
 
     def test_wind_recipe_keeps_default_point_size(self, geo_datatree_and_collocation, tmp_path, monkeypatch):
         import matplotlib.pyplot as plt
+
         import sar_validation.core.visualization as viz
         from sar_validation.core.recipe import Recipe, RecipeConfig
 
@@ -1797,8 +1850,8 @@ class TestPlotRvlLandQa:
         )
 
     def test_returns_none_when_no_scene_has_land(self):
-        from sar_validation.core.visualization import plot_rvl_land_qa
         from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_rvl_land_qa
 
         datatree = DataTreeConverter.to_datatree({
             "sar/sceneA": self._make_sar_node(land_count=0),
@@ -1806,16 +1859,17 @@ class TestPlotRvlLandQa:
         assert plot_rvl_land_qa(datatree) is None
 
     def test_returns_none_when_no_sar_node(self):
-        from sar_validation.core.visualization import plot_rvl_land_qa
         from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_rvl_land_qa
 
         datatree = DataTreeConverter.to_datatree({})
         assert plot_rvl_land_qa(datatree) is None
 
     def test_returns_table_with_one_row_per_land_scene(self):
         import matplotlib.pyplot as plt
-        from sar_validation.core.visualization import plot_rvl_land_qa
+
         from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_rvl_land_qa
 
         datatree = DataTreeConverter.to_datatree({
             "sar/sceneA": self._make_sar_node(land_count=0),
@@ -1867,6 +1921,7 @@ class TestValidationReportRvlLandQaPage:
     def _count_image_pages(self, monkeypatch, datatree, recipe, tmp_path):
         import matplotlib.pyplot as plt
         from matplotlib.backends.backend_pdf import PdfPages
+
         from sar_validation.core.visualization import validation_report
 
         recorded_figs = []
@@ -1981,6 +2036,7 @@ class TestValidationReportRvlLandQaPage:
         """
         import matplotlib.pyplot as plt
         from matplotlib.backends.backend_pdf import PdfPages
+
         import sar_validation.core.visualization as viz
         from sar_validation.core.datatree_converter import DataTreeConverter
         from sar_validation.core.recipe import Recipe, RecipeConfig
@@ -2068,8 +2124,9 @@ class TestValidationReportRvlLandQaPage:
 
 class TestImagePageFigure:
     def test_figure_size_matches_image_pixel_dimensions(self):
-        import numpy as np
         import matplotlib.pyplot as plt
+        import numpy as np
+
         from sar_validation.core.visualization import _image_page_figure
 
         img = np.zeros((300, 450, 3), dtype=np.uint8)
@@ -2083,8 +2140,9 @@ class TestImagePageFigure:
 
 class TestFinalizeFigureForReport:
     def test_writes_png_closes_original_returns_image_page(self, tmp_path):
-        import matplotlib.pyplot as plt
         import matplotlib._pylab_helpers as pylab_helpers
+        import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import _finalize_figure_for_report
 
         fig, ax = plt.subplots()
@@ -2107,6 +2165,7 @@ class TestFinalizeFigureForReport:
 
     def test_none_png_path_skips_disk_write(self, tmp_path):
         import matplotlib.pyplot as plt
+
         from sar_validation.core.visualization import _finalize_figure_for_report
 
         fig, ax = plt.subplots()
@@ -2126,8 +2185,9 @@ class TestValidationReportOnlyDiagnosticsPngSaved:
         individual scatter/geographic/statistics/residuals/temporal-offset
         PNGs."""
         import matplotlib.pyplot as plt
-        from sar_validation.core.visualization import validation_report
+
         from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
 
         datatree, collocation_ds = geo_datatree_and_collocation
         recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
@@ -2188,6 +2248,7 @@ class TestPlotCollocationDiagnosticsAntimeridian:
         self, geo_datatree_and_collocation_dateline, diagnostics_recipe_dateline, tmp_path
     ):
         import matplotlib.image as mpimg
+
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
         datatree, collocation_ds = geo_datatree_and_collocation_dateline
@@ -2204,8 +2265,9 @@ class TestValidationReportDownloadWarnings:
     ):
         import matplotlib.pyplot as plt
         from matplotlib.backends.backend_pdf import PdfPages
-        from sar_validation.core.visualization import validation_report
+
         from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
 
         datatree, collocation_ds = geo_datatree_and_collocation
         recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
@@ -2234,8 +2296,9 @@ class TestValidationReportDownloadWarnings:
     ):
         import matplotlib.pyplot as plt
         from matplotlib.backends.backend_pdf import PdfPages
-        from sar_validation.core.visualization import validation_report
+
         from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
 
         datatree, collocation_ds = geo_datatree_and_collocation
         recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
@@ -2262,6 +2325,7 @@ class TestPlotCollocationDiagnosticsIndividualMethodAlpha:
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
     ):
         import matplotlib.pyplot as plt
+
         import sar_validation.core.visualization as viz
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -2288,6 +2352,7 @@ class TestPlotCollocationDiagnosticsIndividualMethodAlpha:
         passing 'cell-averaging' explicitly) must reproduce today's exact
         variable-dependent alpha (0.65 for wind, matching diagnostics_recipe)."""
         import matplotlib.pyplot as plt
+
         import sar_validation.core.visualization as viz
 
         datatree, collocation_ds = geo_datatree_and_collocation

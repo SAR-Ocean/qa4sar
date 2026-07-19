@@ -50,7 +50,7 @@ from typing import Iterable, Optional
 
 import requests
 
-from .base import normalize_datetime, build_output_dir
+from .base import build_output_dir, normalize_datetime
 
 __all__ = ["RadiometerDownloader", "SENSORS"]
 

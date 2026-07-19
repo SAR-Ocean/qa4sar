@@ -2,25 +2,19 @@
 
 from __future__ import annotations
 
-import json
-import tempfile
-from pathlib import Path
-
 import pytest
-import yaml
 
 from sar_validation.core.recipe import (
+    CollocationType,
+    GeographicBounds,
+    LayerVsLayerCollocation,
+    PointVsLayerCollocation,
     Recipe,
     RecipeConfig,
-    GeographicBounds,
-    TemporalBounds,
     SARDataSpec,
+    TemporalBounds,
     ValidationDataSource,
-    CollocationType,
-    PointVsLayerCollocation,
-    LayerVsLayerCollocation,
 )
-
 
 # ---------------------------------------------------------------------------
 # RecipeConfig defaults

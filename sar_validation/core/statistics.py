@@ -14,7 +14,7 @@ from typing import List, Optional, Union
 import numpy as np
 import xarray as xr
 
-from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg, infer_variable_pairs, filter_variable_pairs
+from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg, filter_variable_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +152,10 @@ def compute_statistics(
             if n > 1:
                 diff_rad = np.radians(diff)
                 resultant_length = np.hypot(np.mean(np.cos(diff_rad)), np.mean(np.sin(diff_rad)))
-                std = float(np.degrees(np.sqrt(-2.0 * np.log(resultant_length)))) if resultant_length > 0 else float("nan")
+                if resultant_length > 0:
+                    std = float(np.degrees(np.sqrt(-2.0 * np.log(resultant_length))))
+                else:
+                    std = float("nan")
             else:
                 std = float("nan")
             rmse = float(np.sqrt(np.mean(diff ** 2)))
@@ -250,8 +253,8 @@ def run_statistics(
     collocation_ds : xr.Dataset
         Dataset produced by step 3 (``collocation_results.nc``).
     recipe : Recipe
-        Recipe object; its ``config.variable`` field is used to infer the
-        (sar_var, val_var) pairs via :func:`~._variable_map.infer_variable_pairs`.
+        Recipe object; its ``config.variable`` field determines the
+        (sar_var, val_var) pairs via :func:`~._variable_map.filter_variable_pairs`.
     base_dir : str or Path
         Directory where statistics files will be written.
     filename_suffix : str
@@ -265,7 +268,6 @@ def run_statistics(
         Mapping ``"<sar_var>_vs_<val_var>"`` → statistics Dataset for each pair.
     """
     base_dir = Path(base_dir)
-    variable = recipe.config.variable
 
     try:
         pairs = filter_variable_pairs(recipe, collocation_ds)

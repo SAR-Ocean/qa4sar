@@ -16,14 +16,14 @@ hierarchical DataTree.
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import Any, Dict, Mapping, Optional, Union
 
 import numpy as np
 import pandas as pd
 import xarray as xr
-import logging
 
 from ._cf_metadata import apply_cf_metadata
 
@@ -655,7 +655,10 @@ class DataTreeConverter:
                 val = raw.attrs.get(attr)
                 if val:
                     try:
-                        t0 = np.datetime64(pd.Timestamp(val).tz_convert(None) if hasattr(pd.Timestamp(val), 'tz') and pd.Timestamp(val).tzinfo else pd.Timestamp(val), "ns")
+                        ts = pd.Timestamp(val)
+                        if ts.tzinfo is not None:
+                            ts = ts.tz_convert(None)
+                        t0 = np.datetime64(ts, "ns")
                         time_arr = np.full(n_points, t0)
                         break
                     except Exception:
@@ -1192,7 +1195,7 @@ class DataTreeConverter:
         xr.Dataset or None
             Dataset with ``data_type="radiometer"``, or None on failure.
         """
-        from ..downloaders._rss_bytemap import read_rss_bytemap, BYTEMAP_LAYOUT
+        from ..downloaders._rss_bytemap import BYTEMAP_LAYOUT, read_rss_bytemap
 
         path = Path(path)
         if not path.exists():

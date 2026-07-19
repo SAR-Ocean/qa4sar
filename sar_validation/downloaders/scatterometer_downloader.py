@@ -39,7 +39,6 @@ from __future__ import annotations
 # - REMSS: https://www.remss.com/
 #
 # Until this is implemented, historic data must be obtained manually.
-
 import argparse
 import json
 import shutil
@@ -48,7 +47,7 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-from .base import authenticate_eumdac, normalize_datetime, build_output_dir, split_antimeridian_bbox
+from .base import authenticate_eumdac, build_output_dir, normalize_datetime, split_antimeridian_bbox
 
 __all__ = ["ScatterometerDownloader"]
 

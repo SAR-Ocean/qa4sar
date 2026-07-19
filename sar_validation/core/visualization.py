@@ -31,13 +31,16 @@ import logging
 import math
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import xarray as xr
 from scipy import ndimage
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 __all__ = [
     "plot_scatter",
@@ -210,8 +213,7 @@ def _set_lonlat_ticks(ax, gl):
     that ``set_visible(True)`` would otherwise re-enable on the whole Axis
     artist; the original gridliner-only rendering never drew those, so this
     keeps pixel parity with the pre-fix appearance (labels only, no marks)."""
-    from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter  # noqa: PLC0415
-    import cartopy.crs as ccrs  # noqa: PLC0415
+    from cartopy.mpl.ticker import LatitudeFormatter, LongitudeFormatter  # noqa: PLC0415
 
     ax.xaxis.set_major_formatter(LongitudeFormatter())
     ax.yaxis.set_major_formatter(LatitudeFormatter())
@@ -375,8 +377,8 @@ def plot_scatter(
                         name="1:1", showlegend=True)
         return fig
 
-    import matplotlib.pyplot as plt  # noqa: PLC0415
     import matplotlib.lines as mlines  # noqa: PLC0415
+    import matplotlib.pyplot as plt  # noqa: PLC0415
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 6))
@@ -416,6 +418,12 @@ def plot_scatter(
 
     all_vals = np.concatenate([df[val_col].values, df[sar_col].values])
     vmin, vmax = float(np.nanmin(all_vals)), float(np.nanmax(all_vals))
+    if vmin == vmax:
+        # All values identical — pad to a non-degenerate range so
+        # set_xlim/set_ylim don't warn about singular limits.
+        pad = max(0.5, abs(vmin) * 0.05)
+        vmin -= pad
+        vmax += pad
     line11 = ax.plot([vmin, vmax], [vmin, vmax], "k--", linewidth=1, label="1:1")[0]
 
     if color_by_offset and offset_sm is not None:
@@ -619,7 +627,6 @@ def plot_geographic(
     # ── Static matplotlib + cartopy ─────────────────────────────────────────
     try:
         import cartopy.crs as ccrs  # noqa: PLC0415
-        import cartopy.feature as cfeature  # noqa: PLC0415
         HAS_CARTOPY = True
     except ImportError:
         HAS_CARTOPY = False
@@ -628,10 +635,10 @@ def plot_geographic(
             UserWarning, stacklevel=2,
         )
 
-    import matplotlib.pyplot as plt  # noqa: PLC0415
-    import matplotlib.colors as mcolors  # noqa: PLC0415
     import matplotlib.cm as mcm  # noqa: PLC0415
+    import matplotlib.colors as mcolors  # noqa: PLC0415
     import matplotlib.lines as mlines  # noqa: PLC0415
+    import matplotlib.pyplot as plt  # noqa: PLC0415
 
     # Colour limits — pooled from the SAR field *and* the validation values
     # (when present) so both layers share one scale and are directly
@@ -929,7 +936,6 @@ def plot_statistics(
 
     if interactive:
         _require("plotly")
-        import plotly.graph_objects as go  # noqa: PLC0415
         from plotly.subplots import make_subplots  # noqa: PLC0415
 
         fig = make_subplots(rows=1, cols=len(available),
@@ -1280,10 +1286,11 @@ def plot_collocation_diagnostics(
     Path or None
         Path to the saved PNG file, or None if plot could not be generated.
     """
-    from .collocation import LAYER_DATA_TYPES  # noqa: PLC0415
-    from .recipe import DEFAULT_LAYER_TYPE_SPECS  # noqa: PLC0415
     import matplotlib.pyplot as plt  # noqa: PLC0415
     import pandas as pd  # noqa: PLC0415
+
+    from .collocation import LAYER_DATA_TYPES  # noqa: PLC0415
+    from .recipe import DEFAULT_LAYER_TYPE_SPECS  # noqa: PLC0415
 
     output_dir = Path(output_dir)
     plots_dir = output_dir / "plots"
@@ -1292,9 +1299,7 @@ def plot_collocation_diagnostics(
     # Set up cartopy if available
     try:
         import cartopy.crs as ccrs  # noqa: PLC0415
-        HAS_CARTOPY = True
     except ImportError:
-        HAS_CARTOPY = False
         logger.debug("cartopy not installed — collocation_diagnostics plot unavailable.")
         return None
 
@@ -1907,6 +1912,7 @@ def _finalize_figure_for_report(fig, png_path: Optional[Path], dpi: int = 150):
     as a PDF page. Avoids drawing the same (often expensive) figure a
     second time via ``PdfPages.savefig``."""
     import io
+
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
     buf = io.BytesIO()
@@ -1918,7 +1924,7 @@ def _finalize_figure_for_report(fig, png_path: Optional[Path], dpi: int = 150):
     return _image_page_figure(plt.imread(buf, format="png"), dpi=dpi)
 
 
-def plot_rvl_land_qa(datatree) -> Optional["plt.Figure"]:
+def plot_rvl_land_qa(datatree) -> Optional["Figure"]:
     """
     Build a table figure listing, for every SAR RVL scene with at least one
     land-flagged cell, the land pixel count/fraction and the pre-mask mean
@@ -2036,8 +2042,9 @@ def validation_report(
     dict[str, list[matplotlib.figure.Figure]]
         ``"<sar_var>_vs_<val_var>"`` → list of Figure objects for that pair.
     """
-    from ._variable_map import infer_variable_pairs, filter_variable_pairs, CIRCULAR_VAL_VARS  # noqa: PLC0415
     import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    from ._variable_map import CIRCULAR_VAL_VARS, filter_variable_pairs  # noqa: PLC0415
 
     base_dir: Optional[Path] = None
     if out_dir is not None:
@@ -2221,8 +2228,9 @@ def validation_report(
 
     # Combined PDF — saved alongside the validation_statistics_*.nc files
     if base_dir is not None and pdf_pages:
-        from matplotlib.backends.backend_pdf import PdfPages  # noqa: PLC0415
         import datetime as _dt  # noqa: PLC0415
+
+        from matplotlib.backends.backend_pdf import PdfPages  # noqa: PLC0415
 
         pdf_path = base_dir / f"validation_report{filename_suffix}.pdf"
         with PdfPages(pdf_path) as pdf:

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import io
 import math
-import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -13,12 +11,14 @@ import pandas as pd
 import pytest
 import xarray as xr
 
-from sar_validation.core.datatree_converter import DataTreeConverter, _subset_point_ds
 from sar_validation.core.collocation import CollocatedPoint
+from sar_validation.core.datatree_converter import DataTreeConverter, _subset_point_ds
 from sar_validation.core.recipe import (
-    GeographicBounds, Recipe, RecipeConfig, TemporalBounds,
+    GeographicBounds,
+    Recipe,
+    RecipeConfig,
+    TemporalBounds,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -201,7 +201,7 @@ class TestFromInsituCsv:
     def test_point_dimension(self, tmp_path):
         path = _make_insitu_csv(tmp_path, rows=10)
         ds = DataTreeConverter.from_insitu_csv(path)
-        assert ds.dims["point"] == 10
+        assert ds.sizes["point"] == 10
 
     def test_returns_none_for_missing_file(self, tmp_path):
         ds = DataTreeConverter.from_insitu_csv(tmp_path / "nonexistent.csv")
@@ -445,7 +445,7 @@ class TestFromCollocations:
         colls = _make_collocations(3)
         ds = DataTreeConverter.from_collocations(colls)
         assert ds is not None
-        assert ds.dims["collocation"] == 3
+        assert ds.sizes["collocation"] == 3
         assert "sar_wind_speed" in ds
         assert "val_WSPD" in ds
         assert "spatial_distance_km" in ds
@@ -830,7 +830,7 @@ def _make_bytemap_gz(tmp_path: Path, sensor: str, filename: str, cells) -> Path:
 
     cells: list of (pass, var_idx, lat_idx, lon_idx, byte_value).
     """
-    from sar_validation.downloaders._rss_bytemap import BYTEMAP_LAYOUT, NPASS, NLAT, NLON
+    from sar_validation.downloaders._rss_bytemap import BYTEMAP_LAYOUT, NLAT, NLON, NPASS
     nvar = len(BYTEMAP_LAYOUT[sensor]["vars"])
     arr = np.full((NPASS, nvar, NLAT, NLON), 255, np.uint8)
     for (p, v, la, lo, val) in cells:

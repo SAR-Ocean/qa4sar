@@ -8,10 +8,9 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from sar_validation.core.statistics import compute_statistics, save_statistics, run_statistics
-from sar_validation.core._variable_map import infer_variable_pairs, filter_variable_pairs
+from sar_validation.core._variable_map import filter_variable_pairs, infer_variable_pairs
 from sar_validation.core.recipe import Recipe, RecipeConfig, SARDataSpec
-
+from sar_validation.core.statistics import compute_statistics, run_statistics, save_statistics
 
 # ---------------------------------------------------------------------------
 # Fixtures

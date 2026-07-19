@@ -9,15 +9,15 @@ Two collocation geometries are supported:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import xarray as xr
-import logging
 
 if TYPE_CHECKING:
     # scipy is only needed when collocation actually runs and is imported
@@ -286,7 +286,10 @@ def _equal_weights(distances: np.ndarray) -> np.ndarray:
 # data_type attribute values that indicate a gridded layer source
 LAYER_DATA_TYPES = {"scatterometer", "altimeter", "hf_radar", "hf_radar_grid", "radiometer"}
 # path-fragment fallbacks when attributes are absent
-LAYER_SOURCE_PATHS = {"osi_saf_winds", "scatterometer", "altimeter", "hf_radar", "hf_radar_grid", "hfr_noaa", "radiometer"}
+LAYER_SOURCE_PATHS = {
+    "osi_saf_winds", "scatterometer", "altimeter", "hf_radar",
+    "hf_radar_grid", "hfr_noaa", "radiometer",
+}
 
 
 def _detect_collocation_type(val_ds: "xr.Dataset", source_path: str) -> str:
@@ -441,8 +444,9 @@ class PointLayerCollocation:
         collocations: List[CollocatedPoint] = []
 
         # Pre-filters: eliminate validation rows that cannot match
-        # Use spatial_tolerance_km for initial bounding box
-        deg_buf = self.spatial_tolerance_km / 100.0   # Use spatial_tolerance_km for pre-filter; 100 converts from km to degrees (conservatively)
+        # Use spatial_tolerance_km for the initial bounding box; dividing
+        # by 100 converts km to degrees (conservatively).
+        deg_buf = self.spatial_tolerance_km / 100.0
         lon_min = float(np.nanmin(sar_lon)) - deg_buf # sar_lon is in degrees
         lon_max = float(np.nanmax(sar_lon)) + deg_buf
         lat_min = float(np.nanmin(sar_lat)) - deg_buf # sar_lat is in degrees
@@ -1125,6 +1129,7 @@ def run_collocation(
         Dataset of collocated pairs, or None if no matches were found.
     """
     from pathlib import Path as _Path
+
     from .datatree_converter import DataTreeConverter
 
     base_dir = _Path(base_dir)
@@ -1586,6 +1591,7 @@ class LayerLayerCollocation(PointLayerCollocation):
             List of collocated matches (one per matched SAR cell).
         """
         from datetime import timedelta as _td
+
         from scipy.spatial import cKDTree
 
         sar_times = _to_datetime_array(sar_time)

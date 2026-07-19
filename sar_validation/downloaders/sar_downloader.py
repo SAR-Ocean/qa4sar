@@ -22,15 +22,15 @@ import json
 import sys
 import zipfile
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import pandas as pd
 
 from .base import (
     CopernicusODataClient,
     authenticate_cdse,
-    normalize_datetime,
     build_output_dir,
+    normalize_datetime,
     split_antimeridian_bbox,
 )
 

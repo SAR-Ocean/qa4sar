@@ -13,7 +13,6 @@ Provides:
 from __future__ import annotations
 
 import base64
-import json
 import os
 from datetime import datetime, timedelta
 from pathlib import Path

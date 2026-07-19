@@ -52,11 +52,16 @@ Examples:
   sar-validate --create-recipe wind
   sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65
   sar-validate --create-recipe wind --start 2026-03-01 --end 2026-03-31
-  sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65 --start 2026-03-01 --end 2026-03-31
-  sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65 --start 2026-03-01 --end 2026-03-31 --recipe-name north_sea_march_2026
-  sar-validate --recipe recipes/wind_validation.yaml --dry-run #no data will be downloaded, just show what would be downloaded
-  sar-validate --recipe recipes/wind_validation.yaml # for downloading the data if there is not already a download_metadata.json file in the data folder
-  sar-validate --recipe recipes/wind_validation.yaml --force-download # overrides the download_metadata.json and redownloads the data
+  sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65 \\
+      --start 2026-03-01 --end 2026-03-31
+  sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65 \\
+      --start 2026-03-01 --end 2026-03-31 --recipe-name north_sea_march_2026
+  # Dry run: no data downloaded, just show what would be downloaded
+  sar-validate --recipe recipes/wind_validation.yaml --dry-run
+  # Download the data (skipped when download_metadata.json already exists in the data folder)
+  sar-validate --recipe recipes/wind_validation.yaml
+  # Ignore download_metadata.json and redownload the data
+  sar-validate --recipe recipes/wind_validation.yaml --force-download
   sar-validate --recipe recipes/wind_validation.yaml --convert
   sar-validate --recipe recipes/wind_validation.yaml --convert --collocate
   sar-validate --recipe recipes/wind_validation.yaml --stats
@@ -249,8 +254,13 @@ def _build_currents_config(limit: Optional[int] = None):
     unit-testable independent of the CLI's file-writing side effects.
     """
     from .core.recipe import (
-        RecipeConfig, GeographicBounds, SARDataSpec, ValidationDataSource,
-        CollocationType, PointVsLayerCollocation, LayerVsLayerCollocation,
+        CollocationType,
+        GeographicBounds,
+        LayerVsLayerCollocation,
+        PointVsLayerCollocation,
+        RecipeConfig,
+        SARDataSpec,
+        ValidationDataSource,
     )
 
     return RecipeConfig(
@@ -307,9 +317,15 @@ def _create_recipe(
     recipe_name: Optional[str] = None,
 ) -> None:
     from .core.recipe import (
-        Recipe, RecipeConfig, GeographicBounds, TemporalBounds,
-        SARDataSpec, ValidationDataSource, CollocationType,
-        PointVsLayerCollocation, LayerVsLayerCollocation,
+        CollocationType,
+        GeographicBounds,
+        LayerVsLayerCollocation,
+        PointVsLayerCollocation,
+        Recipe,
+        RecipeConfig,
+        SARDataSpec,
+        TemporalBounds,
+        ValidationDataSource,
     )
 
     templates = {
@@ -484,8 +500,8 @@ def _execute_recipe(
     collocation_log: bool = False,
     layer_vs_layer_collocation_method: str = "cell-averaging",
 ) -> None:
-    from .core.recipe import Recipe
     from .core.orchestrator import DataOrchestrator
+    from .core.recipe import Recipe
 
     path = Path(recipe_path)
     if not path.exists():
@@ -605,6 +621,7 @@ def _collocate_data(
 ) -> None:
     """Run step 3: load DataTree and run collocation."""
     import xarray as xr
+
     from .core.collocation import run_collocation
     from .core.visualization import plot_collocation_diagnostics
 
@@ -655,6 +672,7 @@ def _collocate_data(
 def _compute_stats(recipe, base_dir: Path, filename_suffix: str = "") -> None:
     """Run step 5a: compute validation statistics from collocation_results<suffix>.nc."""
     import xarray as xr
+
     from .core.statistics import run_statistics
 
     coll_path = base_dir / f"collocation_results{filename_suffix}.nc"
@@ -684,6 +702,7 @@ def _load_precomputed_stats(recipe, collocation_ds, base_dir: Path, filename_suf
     the keys the files were actually saved under.
     """
     import xarray as xr
+
     from .core._variable_map import filter_variable_pairs
 
     stats_ds_map = {}
@@ -705,6 +724,7 @@ def _generate_plots(
 ) -> None:
     """Run step 5b: generate validation plots and save PDF to <base_dir>/, PNG to <base_dir>/plots/."""
     import xarray as xr
+
     from .core.visualization import validation_report
 
     coll_path = base_dir / f"collocation_results{filename_suffix}.nc"

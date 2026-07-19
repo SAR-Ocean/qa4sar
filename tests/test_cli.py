@@ -73,6 +73,7 @@ class TestLoadPrecomputedStats:
 class TestExecuteRecipeContinuesPastDownloadFailure:
     def test_does_not_exit_when_download_all_returns_false(self, tmp_path, capsys):
         from unittest.mock import patch
+
         from sar_validation.core.recipe import Recipe, RecipeConfig
 
         recipe_path = tmp_path / "recipe.yaml"
@@ -115,6 +116,7 @@ class TestLoadDownloadWarnings:
 class TestMethodRunsSuffixMapping:
     def _write_recipe_with_skippable_download(self, tmp_path):
         import json
+
         from sar_validation.core.recipe import Recipe, RecipeConfig
 
         recipe_path = tmp_path / "recipe.yaml"
@@ -158,6 +160,7 @@ class TestMethodRunsSuffixMapping:
 class TestExecuteRecipePassesForceDownloadToOrchestrator:
     def test_force_download_flag_reaches_orchestrator_constructor(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.core.recipe import Recipe, RecipeConfig
 
         recipe_path = tmp_path / "recipe.yaml"

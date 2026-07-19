@@ -9,21 +9,18 @@ import pandas as pd
 import pytest
 
 from sar_validation.core.collocation import (
-    CollocatedPoint,
-    PointLayerCollocation,
+    LAYER_DATA_TYPES,
     LayerLayerCollocation,
-    _haversine_distance,
-    _haversine_distance_grid,
-    _to_datetime_array,
+    PointLayerCollocation,
     _detect_collocation_type,
+    _equal_weights,
     _gaussian_weights,
+    _haversine_distance,
     _inverse_distance_weights,
     _linear_weights,
-    _equal_weights,
     _project_currents_to_radial,
-    LAYER_DATA_TYPES,
+    _to_datetime_array,
 )
-
 
 # ---------------------------------------------------------------------------
 # Utility tests
@@ -716,7 +713,10 @@ class TestWvRvlProjection:
 class TestRunCollocationCurrentsFromDatatree:
     def _currents_recipe(self):
         from sar_validation.core.recipe import (
-            Recipe, RecipeConfig, GeographicBounds, TemporalBounds,
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
         )
         return Recipe(RecipeConfig(
             name="currents_it",
@@ -731,6 +731,7 @@ class TestRunCollocationCurrentsFromDatatree:
 
     def test_grid_rvl_projects_against_insitu(self, tmp_path):
         import xarray as xr
+
         from sar_validation.core.collocation import run_collocation
 
         # SAR RVL grid node (y, x) with a constant heading of 90 deg.
@@ -781,6 +782,7 @@ class TestRunCollocationCurrentsFromDatatree:
 
     def test_grid_rvl_radvel_std_propagates(self, tmp_path):
         import xarray as xr
+
         from sar_validation.core.collocation import run_collocation
 
         ny, nx = 5, 5

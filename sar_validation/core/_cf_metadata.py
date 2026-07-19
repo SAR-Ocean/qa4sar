@@ -171,11 +171,16 @@ _COLLOCATION_GEOMETRY_ATTRS: Dict[str, Dict[str, str]] = {
     "sar_lat": {"standard_name": "latitude", "long_name": "SAR cell latitude", "units": "degrees_north"},
     "val_lon": {"standard_name": "longitude", "long_name": "validation observation longitude", "units": "degrees_east"},
     "val_lat": {"standard_name": "latitude", "long_name": "validation observation latitude", "units": "degrees_north"},
-    "spatial_distance_km": {"long_name": "great-circle distance between SAR cell and validation observation", "units": "km"},
+    "spatial_distance_km": {
+        "long_name": "great-circle distance between SAR cell and validation observation",
+        "units": "km",
+    },
     # No units attr here: a timedelta-like units string ("minutes") makes
     # xarray decode the float column as timedelta64 on re-open, silently
     # changing its dtype for every reader.
-    "temporal_distance_minutes": {"long_name": "absolute time offset between SAR acquisition and validation observation, in minutes"},
+    "temporal_distance_minutes": {
+        "long_name": "absolute time offset between SAR acquisition and validation observation, in minutes",
+    },
     "time": {"standard_name": "time", "long_name": "SAR acquisition time"},
     "val_time": {"standard_name": "time", "long_name": "validation observation time"},
     "val_source": {"long_name": "validation platform type"},

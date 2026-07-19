@@ -36,7 +36,7 @@ from typing import Optional
 
 import pandas as pd
 
-from .base import normalize_datetime, is_date_recent, build_output_dir, split_antimeridian_bbox
+from .base import build_output_dir, is_date_recent, normalize_datetime, split_antimeridian_bbox
 
 __all__ = [
     "InSituDownloader",
@@ -102,8 +102,11 @@ def _build_csv_filename(
     min_depth: float, max_depth: float,
 ) -> str:
     """Return the filename that copernicusmarine creates for the subset call."""
-    lon_sfx = lambda v: "W" if v < 0 else "E"
-    lat_sfx = lambda v: "S" if v < 0 else "N"
+    def lon_sfx(v: float) -> str:
+        return "W" if v < 0 else "E"
+
+    def lat_sfx(v: float) -> str:
+        return "S" if v < 0 else "N"
     vars_str = "-".join(ALL_VARIABLES)
     start_d = start_dt.split("T")[0]
     end_d   = end_dt.split("T")[0]
@@ -232,7 +235,7 @@ class InSituDownloader:
             resolved_part = "latest" if is_date_recent(end_dt) else "monthly"
 
         # Run the copernicusmarine subset call (downloads to CWD by default)
-        print(f"Downloading in-situ data …")
+        print("Downloading in-situ data …")
         print(f"  Region: lon [{min_lon}, {max_lon}] lat [{min_lat}, {max_lat}]")
         print(f"  Time:   {start_dt} → {end_dt}")
         print(f"  Depth:  {self.min_depth} to {self.max_depth} m")

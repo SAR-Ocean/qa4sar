@@ -3,20 +3,21 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from sar_validation.downloaders.base import (
-    normalize_datetime, is_date_recent, split_antimeridian_bbox,
     copernicus_marine_download_kwargs,
+    is_date_recent,
+    normalize_datetime,
+    split_antimeridian_bbox,
 )
 from sar_validation.downloaders.insitu_downloader import (
-    SOURCE_TYPE_TO_PLATFORM,
     PLATFORM_CODE_TO_SOURCE_TYPE,
+    SOURCE_TYPE_TO_PLATFORM,
     _resolve_platform_codes,
 )
-
 
 # ---------------------------------------------------------------------------
 # Tests for normalize_datetime()
@@ -117,7 +118,6 @@ class TestIsDateRecent:
     def test_yesterday_is_recent(self, mock_datetime):
         """Yesterday should be considered recent (1 day ago)."""
         today = datetime(2026, 7, 2)
-        yesterday = datetime(2026, 7, 1)
         mock_datetime.now.return_value = today
         mock_datetime.fromisoformat = datetime.fromisoformat
         
@@ -128,7 +128,6 @@ class TestIsDateRecent:
     def test_30_days_ago_is_recent(self, mock_datetime):
         """30 days ago should be at the boundary of recent."""
         today = datetime(2026, 7, 2)
-        thirty_days_ago = datetime(2026, 6, 2)
         mock_datetime.now.return_value = today
         mock_datetime.fromisoformat = datetime.fromisoformat
         
@@ -139,7 +138,6 @@ class TestIsDateRecent:
     def test_31_days_ago_is_not_recent(self, mock_datetime):
         """31 days ago should exceed the 30-day threshold."""
         today = datetime(2026, 7, 2)
-        thirty_one_days_ago = datetime(2026, 6, 1)
         mock_datetime.now.return_value = today
         mock_datetime.fromisoformat = datetime.fromisoformat
         
@@ -150,7 +148,6 @@ class TestIsDateRecent:
     def test_old_date_is_not_recent(self, mock_datetime):
         """Date from several months ago should not be recent."""
         today = datetime(2026, 7, 2)
-        old_date = datetime(2026, 3, 15)
         mock_datetime.now.return_value = today
         mock_datetime.fromisoformat = datetime.fromisoformat
         
@@ -168,7 +165,6 @@ class TestIsDateRecent:
     def test_custom_threshold(self, mock_datetime):
         """Custom threshold should be respected."""
         today = datetime(2026, 7, 2)
-        sixty_days_ago = datetime(2026, 5, 3)
         mock_datetime.now.return_value = today
         mock_datetime.fromisoformat = datetime.fromisoformat
         
@@ -295,7 +291,6 @@ class TestSARDownloaderAntimeridian:
         }
 
     def test_query_splits_crossing_bbox_into_two_windows(self, tmp_path):
-        from unittest.mock import MagicMock
         from sar_validation.downloaders.sar_downloader import SARDownloader
 
         dl = SARDownloader(output_dir=tmp_path)
@@ -318,7 +313,6 @@ class TestSARDownloaderAntimeridian:
         assert sorted(df["Id"]) == ["a", "b"]
 
     def test_query_dedupes_product_returned_by_both_windows(self, tmp_path):
-        from unittest.mock import MagicMock
         from sar_validation.downloaders.sar_downloader import SARDownloader
 
         dl = SARDownloader(output_dir=tmp_path)
@@ -334,7 +328,6 @@ class TestSARDownloaderAntimeridian:
         assert len(df) == 1
 
     def test_query_non_crossing_bbox_calls_once(self, tmp_path):
-        from unittest.mock import MagicMock
         from sar_validation.downloaders.sar_downloader import SARDownloader
 
         dl = SARDownloader(output_dir=tmp_path)
@@ -365,7 +358,6 @@ class TestSARDownloaderForceDownload:
         }
 
     def test_skips_product_whose_directory_already_exists(self, tmp_path, capsys):
-        from unittest.mock import MagicMock
         from sar_validation.downloaders.sar_downloader import SARDownloader
 
         dl = SARDownloader(output_dir=tmp_path, dry_run=False)
@@ -383,7 +375,6 @@ class TestSARDownloaderForceDownload:
         assert "Already downloaded" in capsys.readouterr().out
 
     def test_force_download_redownloads_existing_product(self, tmp_path):
-        from unittest.mock import MagicMock
         from sar_validation.downloaders.sar_downloader import SARDownloader
 
         dl = SARDownloader(output_dir=tmp_path, dry_run=False, force_download=True)
@@ -410,7 +401,6 @@ class TestSARDownloaderForceDownload:
 class TestAltimeterDownloaderAntimeridian:
     def _patch_subset(self):
         from pathlib import Path
-        from unittest.mock import MagicMock
 
         fake_module = MagicMock()
 
@@ -422,6 +412,7 @@ class TestAltimeterDownloaderAntimeridian:
 
     def test_crossing_bbox_splits_into_two_windows_with_distinct_filenames(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.downloaders.altimeter_downloader import AltimeterDownloader
 
         dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
@@ -444,6 +435,7 @@ class TestAltimeterDownloaderAntimeridian:
 
     def test_non_crossing_bbox_keeps_single_call_and_original_filename(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.downloaders.altimeter_downloader import AltimeterDownloader
 
         dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
@@ -465,7 +457,6 @@ class TestAltimeterDownloaderAntimeridian:
 class TestAltimeterDownloaderForceDownload:
     def _patch_subset(self):
         from pathlib import Path
-        from unittest.mock import MagicMock
 
         fake_module = MagicMock()
 
@@ -477,6 +468,7 @@ class TestAltimeterDownloaderForceDownload:
 
     def test_default_skips_existing(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.downloaders.altimeter_downloader import AltimeterDownloader
 
         dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
@@ -495,6 +487,7 @@ class TestAltimeterDownloaderForceDownload:
 
     def test_force_download_overwrites(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.downloaders.altimeter_downloader import AltimeterDownloader
 
         dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False, force_download=True)
@@ -517,6 +510,7 @@ class TestAltimeterDownloaderForceDownload:
         inspect.signature) — passing it raises TypeError in real
         (non-mocked) usage."""
         from unittest.mock import patch
+
         from sar_validation.downloaders.altimeter_downloader import AltimeterDownloader
 
         dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
@@ -538,9 +532,11 @@ class TestAltimeterDownloaderForceDownload:
 
 class TestInSituDownloaderAntimeridian:
     def test_download_splits_crossing_bbox_into_two_windows(self, tmp_path):
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
         from sar_validation.downloaders.insitu_downloader import (
-            InSituDownloader, _build_csv_filename,
+            InSituDownloader,
+            _build_csv_filename,
         )
 
         # force_download=True: Task 8's dest_path.exists() pre-check would
@@ -576,9 +572,11 @@ class TestInSituDownloaderAntimeridian:
         assert paths[0].name != paths[1].name
 
     def test_non_crossing_bbox_calls_once_and_returns_single_path(self, tmp_path):
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
         from sar_validation.downloaders.insitu_downloader import (
-            InSituDownloader, _build_csv_filename,
+            InSituDownloader,
+            _build_csv_filename,
         )
 
         # force_download=True: see comment in the sibling test above — the
@@ -605,9 +603,11 @@ class TestInSituDownloaderAntimeridian:
 
 class TestInSituDownloaderForceDownload:
     def test_skips_download_when_file_already_exists(self, tmp_path):
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
         from sar_validation.downloaders.insitu_downloader import (
-            InSituDownloader, _build_csv_filename,
+            InSituDownloader,
+            _build_csv_filename,
         )
 
         dl = InSituDownloader(output_dir=tmp_path, dry_run=False)
@@ -628,9 +628,11 @@ class TestInSituDownloaderForceDownload:
         assert paths[0].name == fname
 
     def test_force_download_redownloads_existing_file(self, tmp_path):
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
         from sar_validation.downloaders.insitu_downloader import (
-            InSituDownloader, _build_csv_filename,
+            InSituDownloader,
+            _build_csv_filename,
         )
 
         dl = InSituDownloader(output_dir=tmp_path, dry_run=False, force_download=True)
@@ -652,9 +654,11 @@ class TestInSituDownloaderForceDownload:
     def test_force_download_kwarg_never_passed_to_subset(self, tmp_path):
         """Regression: copernicusmarine.subset() has no force_download
         parameter in the installed version."""
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
         from sar_validation.downloaders.insitu_downloader import (
-            InSituDownloader, _build_csv_filename,
+            InSituDownloader,
+            _build_csv_filename,
         )
 
         # No dest file pre-created: default force_download=False must still
@@ -701,7 +705,8 @@ class TestScatterometerDownloaderAntimeridian:
         assert "[-180.0,-120.0]" in captured
 
     def test_search_runs_once_per_window_and_dedupes_products(self, tmp_path, capsys):
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
         from sar_validation.downloaders.scatterometer_downloader import ScatterometerDownloader
 
         dl = ScatterometerDownloader(output_dir=tmp_path, dry_run=False)
@@ -733,7 +738,8 @@ class TestScatterometerDownloaderAntimeridian:
         assert "Found 3 ASCAT products." in capsys.readouterr().out
 
     def test_non_crossing_bbox_searches_once(self, tmp_path):
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
         from sar_validation.downloaders.scatterometer_downloader import ScatterometerDownloader
 
         dl = ScatterometerDownloader(output_dir=tmp_path, dry_run=False)
@@ -762,7 +768,8 @@ class TestScatterometerDownloaderAntimeridian:
 
 class TestScatterometerDownloaderForceDownload:
     def test_skips_product_whose_output_file_already_exists(self, tmp_path):
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
         from sar_validation.downloaders.scatterometer_downloader import ScatterometerDownloader
 
         dl = ScatterometerDownloader(output_dir=tmp_path, dry_run=False)
@@ -785,7 +792,8 @@ class TestScatterometerDownloaderForceDownload:
         fake_datastore.get_product.assert_not_called()
 
     def test_force_download_redownloads_existing_product(self, tmp_path):
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
         from sar_validation.downloaders.scatterometer_downloader import ScatterometerDownloader
 
         dl = ScatterometerDownloader(output_dir=tmp_path, dry_run=False, force_download=True)
@@ -850,7 +858,9 @@ class TestInsituPlatformCodeMapping:
 # ---------------------------------------------------------------------------
 
 from sar_validation.downloaders.radiometer_downloader import (
-    RadiometerDownloader, SENSORS, SUPPORTED_SENSORS,
+    SENSORS,
+    SUPPORTED_SENSORS,
+    RadiometerDownloader,
 )
 
 
@@ -921,9 +931,15 @@ class TestRadiometerDownloader:
 # ---------------------------------------------------------------------------
 
 import gzip
+
 import numpy as np
+
 from sar_validation.downloaders._rss_bytemap import (
-    read_rss_bytemap, BYTEMAP_LAYOUT, NPASS, NLAT, NLON,
+    BYTEMAP_LAYOUT,
+    NLAT,
+    NLON,
+    NPASS,
+    read_rss_bytemap,
 )
 
 
@@ -983,11 +999,11 @@ class TestReadRssBytemap:
 
 
 from sar_validation.downloaders.noaa_hfradar_downloader import (
-    select_erddap_dataset,
-    build_erddap_subset_url,
-    select_backend,
-    clamp_to_region_bbox,
     ERDDAP_BASE,
+    build_erddap_subset_url,
+    clamp_to_region_bbox,
+    select_backend,
+    select_erddap_dataset,
 )
 
 
@@ -1070,8 +1086,8 @@ class TestSelectBackend:
 
 
 from unittest.mock import patch
-from sar_validation.downloaders.noaa_hfradar_downloader import NOAAHFRadarDownloader
 
+from sar_validation.downloaders.noaa_hfradar_downloader import NOAAHFRadarDownloader
 
 # NOTE: the task brief's verbatim test used a hardcoded "2024-05-01" date for
 # `end`. select_backend() rejects any `end` older than the rolling ~90-day
@@ -1180,8 +1196,10 @@ class TestNOAAHFRadarDownloaderAntimeridian:
 class TestNOAAHFRadarDownloaderForceDownload:
     def test_skips_when_output_already_exists(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.downloaders.noaa_hfradar_downloader import (
-            NOAAHFRadarDownloader, select_erddap_dataset,
+            NOAAHFRadarDownloader,
+            select_erddap_dataset,
         )
 
         dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
@@ -1199,8 +1217,10 @@ class TestNOAAHFRadarDownloaderForceDownload:
 
     def test_force_download_refetches_existing_output(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.downloaders.noaa_hfradar_downloader import (
-            NOAAHFRadarDownloader, select_erddap_dataset,
+            NOAAHFRadarDownloader,
+            select_erddap_dataset,
         )
 
         dl = NOAAHFRadarDownloader(
@@ -1227,8 +1247,9 @@ class TestNOAAHFRadarDownloaderForceDownload:
 
 class TestOrchestratorHFRadarNOAAWiring:
     def test_dispatch_source_registers_hf_radar_noaa_handler(self):
-        from sar_validation.core.orchestrator import DataOrchestrator
         import inspect
+
+        from sar_validation.core.orchestrator import DataOrchestrator
 
         src = inspect.getsource(DataOrchestrator._dispatch_source)
         assert '"hf_radar_noaa"' in src
@@ -1240,7 +1261,10 @@ class TestOrchestratorHFRadarNOAAWiring:
     ):
         from sar_validation.core.orchestrator import DataOrchestrator
         from sar_validation.core.recipe import (
-            Recipe, RecipeConfig, GeographicBounds, TemporalBounds,
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
             ValidationDataSource,
         )
 
@@ -1454,7 +1478,8 @@ class TestHFRadarDownloaderGrid:
 
     def test_download_calls_subset_with_resolved_region_part(self, tmp_path):
         from pathlib import Path
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
         from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
 
         dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False)
@@ -1476,9 +1501,10 @@ class TestHFRadarDownloaderGrid:
         assert kwargs["maximum_longitude"] == -60.0
 
     def test_recent_date_uses_latest_part_when_region_has_one(self, tmp_path):
-        from pathlib import Path
-        from unittest.mock import patch, MagicMock
         from datetime import datetime, timedelta, timezone
+        from pathlib import Path
+        from unittest.mock import patch
+
         from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
 
         recent_end = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
@@ -1505,9 +1531,10 @@ class TestHFRadarDownloaderGrid:
         HFRadarDownloader(output_dir=tmp_path, dry_run=True, min_depth=-2.0, max_depth=2.0)
 
     def test_retries_with_monthly_part_when_latest_out_of_bounds(self, tmp_path):
-        from pathlib import Path
-        from unittest.mock import patch, MagicMock
         from datetime import datetime, timedelta, timezone
+        from pathlib import Path
+        from unittest.mock import patch
+
         from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
 
         recent_end = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
@@ -1541,7 +1568,8 @@ class TestHFRadarDownloaderGrid:
         assert second_kwargs["dataset_part"] == "monthly-radar-total--US-WestCoast"
 
     def test_raises_file_not_found_when_subset_writes_no_file(self, tmp_path):
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
         from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
 
         dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False)
@@ -1574,7 +1602,8 @@ class TestHFRadarDownloaderGridAntimeridian:
 
     def test_crossing_bbox_downloads_the_side_that_resolves_to_a_region(self, tmp_path):
         from pathlib import Path
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
         from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
 
         # US-Alaska's bbox (-174.10..-128.66) overlaps the [-180, -120]
@@ -1600,7 +1629,6 @@ class TestHFRadarDownloaderGridAntimeridian:
 class TestHFRadarDownloaderGridForceDownload:
     def _patch_subset(self):
         from pathlib import Path
-        from unittest.mock import MagicMock
 
         fake_module = MagicMock()
 
@@ -1612,6 +1640,7 @@ class TestHFRadarDownloaderGridForceDownload:
 
     def test_default_skips_existing(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
 
         dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False)
@@ -1626,6 +1655,7 @@ class TestHFRadarDownloaderGridForceDownload:
 
     def test_force_download_overwrites(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
 
         dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False, force_download=True)
@@ -1640,6 +1670,7 @@ class TestHFRadarDownloaderGridForceDownload:
 
     def test_force_download_kwarg_never_passed_to_subset(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
 
         dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False)
@@ -1656,7 +1687,7 @@ class TestHFRadarDownloaderGridForceDownload:
 # ---------------------------------------------------------------------------
 
 from dataclasses import dataclass, field
-from typing import List, Any
+from typing import Any, List
 
 
 @dataclass
@@ -1713,13 +1744,15 @@ class TestHFRadarHistoricalDownloader:
             dl.download(-90.0, -60.0, 30.0, 40.0, "2018-01-01", "2018-01-02")
 
     def test_download_gets_file_then_subsets_locally(self, tmp_path):
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
         from sar_validation.downloaders.hf_radar_historical_downloader import (
             HFRadarHistoricalDownloader,
         )
-        import xarray as xr
-        import numpy as np
-        import pandas as pd
 
         raw_dir = tmp_path / "_raw"
         raw_dir.mkdir()
@@ -1793,9 +1826,11 @@ class TestHFRadarHistoricalDownloaderAntimeridian:
 
 class TestHFRadarHistoricalDownloaderForceDownload:
     def test_skips_when_output_already_exists(self, tmp_path):
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
         from sar_validation.downloaders.hf_radar_historical_downloader import (
-            HFRadarHistoricalDownloader, DATASET_ID,
+            DATASET_ID,
+            HFRadarHistoricalDownloader,
         )
 
         dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=False)
@@ -1810,13 +1845,16 @@ class TestHFRadarHistoricalDownloaderForceDownload:
         assert out == [dest_path]
 
     def test_force_download_refetches_existing_output(self, tmp_path):
-        from unittest.mock import patch, MagicMock
-        from sar_validation.downloaders.hf_radar_historical_downloader import (
-            HFRadarHistoricalDownloader, DATASET_ID,
-        )
-        import xarray as xr
+        from unittest.mock import patch
+
         import numpy as np
         import pandas as pd
+        import xarray as xr
+
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            DATASET_ID,
+            HFRadarHistoricalDownloader,
+        )
 
         dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=False, force_download=True)
         dest_path = tmp_path / f"{DATASET_ID}_US-WestCoast_2019-01-01.nc"
@@ -1854,6 +1892,7 @@ class TestHFRadarHistoricalDownloaderForceDownload:
 class TestOrchestratorHFRadarHistoricalWiring:
     def test_dispatch_source_registers_hf_radar_historical_handler(self):
         from unittest.mock import patch
+
         from sar_validation.core.orchestrator import DataOrchestrator
         from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
 
@@ -1878,10 +1917,15 @@ class TestOrchestratorHFRadarHistoricalWiring:
 class TestOrchestratorAntimeridianDryRun:
     def test_pacific_crossing_recipe_wires_through_without_error(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.core.orchestrator import DataOrchestrator
         from sar_validation.core.recipe import (
-            Recipe, RecipeConfig, GeographicBounds, TemporalBounds,
-            SARDataSpec, ValidationDataSource,
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            SARDataSpec,
+            TemporalBounds,
+            ValidationDataSource,
         )
 
         cfg = RecipeConfig(
@@ -1967,6 +2011,7 @@ class TestOrchestratorForceDownloadWiring:
 
     def test_scatterometer_receives_force_download(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.core.recipe import ValidationDataSource
 
         orchestrator = self._make_orchestrator(tmp_path, force_download=True)
@@ -1979,6 +2024,7 @@ class TestOrchestratorForceDownloadWiring:
 
     def test_hf_radar_receives_force_download(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.core.recipe import ValidationDataSource
 
         orchestrator = self._make_orchestrator(tmp_path, force_download=True)
@@ -1989,6 +2035,7 @@ class TestOrchestratorForceDownloadWiring:
 
     def test_noaa_hfradar_receives_force_download(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.core.recipe import ValidationDataSource
 
         orchestrator = self._make_orchestrator(tmp_path, force_download=True)
@@ -2001,6 +2048,7 @@ class TestOrchestratorForceDownloadWiring:
 
     def test_hf_radar_historical_receives_force_download(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.core.recipe import ValidationDataSource
 
         orchestrator = self._make_orchestrator(tmp_path, force_download=True)
@@ -2015,6 +2063,7 @@ class TestOrchestratorForceDownloadWiring:
 
     def test_altimeter_receives_force_download(self, tmp_path):
         from unittest.mock import patch
+
         from sar_validation.core.recipe import ValidationDataSource
 
         orchestrator = self._make_orchestrator(tmp_path, force_download=True)

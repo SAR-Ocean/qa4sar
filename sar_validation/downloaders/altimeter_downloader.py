@@ -32,8 +32,10 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .base import (
-    normalize_datetime, build_output_dir, split_antimeridian_bbox,
+    build_output_dir,
     copernicus_marine_download_kwargs,
+    normalize_datetime,
+    split_antimeridian_bbox,
 )
 
 __all__ = ["AltimeterDownloader"]

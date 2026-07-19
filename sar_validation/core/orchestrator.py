@@ -16,10 +16,10 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-from .recipe import Recipe, RecipeConfig, GeographicBounds, TemporalBounds
 from ..downloaders.base import build_output_dir
+from .recipe import Recipe
 
 logger = logging.getLogger(__name__)
 
@@ -284,8 +284,8 @@ class DataOrchestrator:
 
     def _download_noaa_hfradar(self, source) -> bool:
         from ..downloaders.noaa_hfradar_downloader import (
-            NOAAHFRadarDownloader,
             DEFAULT_RESOLUTION_KM,
+            NOAAHFRadarDownloader,
         )
 
         cfg    = self.recipe.config
