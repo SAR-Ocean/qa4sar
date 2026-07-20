@@ -915,6 +915,53 @@ class TestExtractRvlGridData:
         # No data lost: every input cell survives (fixture has no NaNs).
         assert int(np.isfinite(ds["rvlRadVel"].values).sum()) == 5 * 4 * 5
 
+    def test_multiswath_merge_is_swath_contiguous(self, tmp_path):
+        # Sub-swath k occupies its own longitude block [k, k+0.03], ascending
+        # in range within the swath — mirroring real IW/EW products, where
+        # sub-swath index order matches ground-range order. The merged grid
+        # must lay swaths side by side along x, not interleave their columns
+        # (the interleave smears pcolormesh quads across the whole swath).
+        ny, nx, ns = 2, 4, 3
+        rdims = ("rvlAzSize", "rvlRaSize", "rvlSwath")
+        lon = np.zeros((ny, nx, ns), dtype="float32")
+        radvel = np.zeros((ny, nx, ns), dtype="float32")
+        for k in range(ns):
+            lon[:, :, k] = k + 0.01 * np.arange(nx, dtype="float32")
+            radvel[:, :, k] = k
+        lat = np.full((ny, nx, ns), 50.0, dtype="float32")
+
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        ds_raw = xr.Dataset(
+            {
+                "rvlRadVel": (rdims, radvel),
+                "rvlLon": (rdims, lon),
+                "rvlLat": (rdims, lat),
+            },
+            attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
+        )
+        ds_raw.to_netcdf(
+            meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+
+        ds = DataTreeConverter._extract_rvl_grid_data(
+            safe / "measurement", safe, flatten_to_points=False
+        )
+        assert ds is not None
+        merged_lon = ds["lon"].values
+        merged_radvel = ds["rvlRadVel"].values
+        assert merged_lon.shape == (ny, nx * ns)
+
+        # Longitudes increase monotonically across each row — the interleaved
+        # ordering zig-zags (0.00, 1.00, 2.00, 0.01, ...) and fails this.
+        assert (np.diff(merged_lon, axis=1) > 0).all()
+
+        # Values travel with their coordinates: columns [k*nx, (k+1)*nx) are
+        # exactly sub-swath k.
+        for k in range(ns):
+            assert (merged_radvel[:, k * nx:(k + 1) * nx] == k).all()
+
     def test_single_swath_2d_passes_through(self, tmp_path):
         # WV-style 13x13 2-D rvl, read through the grid (non-flatten) branch.
         safe = _make_ocn_safe(tmp_path, "S1A_SM_OCN.SAFE", rvl_swaths=1, wv=True)

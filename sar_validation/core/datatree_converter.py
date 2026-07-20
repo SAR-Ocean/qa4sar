@@ -1591,13 +1591,23 @@ class DataTreeConverter:
                 rvl_lons_full = ds_raw["rvlLon"].values
 
                 # RVL is 3-D (rvlAzSize, rvlRaSize, rvlSwath) for multi-swath
-                # modes (IW/EW). Merge the swath axis into the range axis so the
-                # grid keeps EVERY sub-swath — slicing [:, :, 0] would silently
-                # drop all but the first swath (4 of 5 for EW, 2 of 3 for IW).
-                # Single-swath products (SM) are already 2-D and pass through.
+                # modes (IW/EW). Concatenate the sub-swaths side by side along
+                # the range axis so the grid keeps EVERY sub-swath — slicing
+                # [:, :, 0] would silently drop all but the first swath
+                # (4 of 5 for EW, 2 of 3 for IW). Single-swath products (SM)
+                # are already 2-D and pass through.
                 def _swaths_to_grid(arr):
+                    # Lay sub-swaths side by side along the range axis, in
+                    # swath-index order (== ground-range order: iw1→iw3,
+                    # ew1→ew5). A plain C-order reshape would interleave
+                    # sub-swath columns instead, scrambling grid adjacency
+                    # and smearing pcolormesh quads across the whole swath.
                     arr = np.asarray(arr)
-                    return arr.reshape(arr.shape[0], -1) if arr.ndim == 3 else arr
+                    if arr.ndim != 3:
+                        return arr
+                    return np.concatenate(
+                        [arr[:, :, k] for k in range(arr.shape[2])], axis=1
+                    )
 
                 rvl_radvel = _swaths_to_grid(rvl_radvel_full)
                 rvl_lats = _swaths_to_grid(rvl_lats_full)
