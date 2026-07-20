@@ -11,7 +11,7 @@ near-real-time feed.
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict, Tuple, TypedDict
 
 __all__ = ["HFR_REGIONS", "resolve_hfr_region"]
 
@@ -48,7 +48,12 @@ _BBOXES: Dict[str, Tuple[float, float, float, float]] = {
     "WHub": (-6.13332986831665, -5.0837883949279785, 50.21573257446289, 51.01667022705078),
 }
 
-HFR_REGIONS: Dict[str, Dict[str, object]] = {
+class HfrRegion(TypedDict):
+    bbox: Tuple[float, float, float, float]
+    has_latest: bool
+
+
+HFR_REGIONS: Dict[str, HfrRegion] = {
     name: {"bbox": bbox, "has_latest": name not in _NO_LATEST}
     for name, bbox in _BBOXES.items()
 }

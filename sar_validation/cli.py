@@ -705,7 +705,7 @@ def _load_precomputed_stats(recipe, collocation_ds, base_dir: Path, filename_suf
 
     from .core._variable_map import filter_variable_pairs
 
-    stats_ds_map = {}
+    stats_ds_map: dict[str, xr.Dataset] = {}
     try:
         pairs = filter_variable_pairs(recipe, collocation_ds)
     except KeyError:

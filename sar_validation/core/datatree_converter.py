@@ -1681,7 +1681,7 @@ class DataTreeConverter:
                 dims = ("y", "x")
 
                 # Create Dataset with 2D grid structure
-                data_vars = {
+                data_vars: Dict[str, tuple] = {
                     "rvlRadVel": (dims, rvl_radvel),
                     "rvlRadVelStd": (dims, rvl_radvel_std),
                     "rvlHeading": (dims, rvl_heading),

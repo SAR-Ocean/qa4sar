@@ -38,5 +38,7 @@ jobs:
           "
       - name: Lint
         run: ruff check .
+      - name: Type check
+        run: python -m mypy -p sar_validation
       - name: Test
         run: pytest

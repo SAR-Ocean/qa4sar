@@ -1482,10 +1482,10 @@ def plot_collocation_diagnostics(
     categories = []
     for label in sorted(set(matched_by_category) | set(unmatched_by_category)):
         m_lon, m_lat, m_src = matched_by_category.get(label, (np.array([]), np.array([]), np.array([])))
-        u_lon, u_lat, u_src = unmatched_by_category.get(label, ([], [], []))
-        u_lon = np.array(u_lon)
-        u_lat = np.array(u_lat)
-        u_src = np.array(u_src)
+        u_lon_list, u_lat_list, u_src_list = unmatched_by_category.get(label, ([], [], []))
+        u_lon = np.array(u_lon_list)
+        u_lat = np.array(u_lat_list)
+        u_src = np.array(u_src_list)
         if len(m_lon) + len(u_lon) == 0:
             continue
         categories.append({
