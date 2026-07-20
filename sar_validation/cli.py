@@ -13,10 +13,10 @@ Usage
   sar-validate --create-recipe wind
 
   # Dry-run (see what would be downloaded)
-  sar-validate --recipe examples/wind_validation_example.yaml --dry-run
+  sar-validate --recipe recipes/wind_validation.yaml --dry-run
 
   # Execute a recipe (download all data)
-  sar-validate --recipe examples/wind_validation_example.yaml
+  sar-validate --recipe recipes/wind_validation.yaml
 """
 
 from __future__ import annotations

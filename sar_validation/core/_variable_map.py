@@ -121,7 +121,7 @@ def filter_variable_pairs(
     # For waves: expand to all available wave validation parameters
     if variable == "waves":
         # Wave validation parameter candidates (in preferred order)
-        wave_val_params = ["VHM0", "VAVH", "VGHS", "VAVH_UNFILTERED"]
+        wave_val_params = ["VHM0", "VAVH", "VGHS"]
 
         # Primary SAR wave-height variable: single-winner fallback driven by
         # which sar_<name> column actually exists in collocation_ds — NOT by
