@@ -204,12 +204,19 @@ Register at: https://eoportal.eumetsat.int
 
 ---
 
-## Running Tests
+## Running Tests and Checks
 
 ```bash
 pytest tests/ -v
 # With coverage:
 pytest tests/ --cov=sar_validation --cov-report=term-missing
+```
+
+Linting and type checking are both required to pass before merging:
+
+```bash
+ruff check .
+python -m mypy -p sar_validation
 ```
 
 ---

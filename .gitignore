@@ -44,6 +44,10 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# Superpowers documentation
+superpowers/
+AGENTS.md
+
 # Credentials (never commit these)
 *.credentials
 credentials
