@@ -47,6 +47,14 @@ include = ["sar_validation*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+    # cartopy 0.25's tick formatter reads Matplotlib's Formatter.locs,
+    # deprecated in mpl 3.11 and removed in 3.13 (~3000 hits per CI run on
+    # mpl 3.11; never fires on mpl <3.11). Remove this ignore together with
+    # the matplotlib<3.13 pin in .github/workflows/ci.yml once cartopy
+    # ships a fix.
+    "ignore:The locs attribute was deprecated in Matplotlib 3.11:matplotlib.MatplotlibDeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 120

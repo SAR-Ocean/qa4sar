@@ -14,8 +14,28 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - name: Cache Natural Earth data
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/cartopy
+          key: cartopy-natural-earth-10m-v1
       - name: Install package with dev extras
-        run: pip install -e .[dev]
+        # matplotlib pinned <3.13: cartopy 0.25's tick formatter uses
+        # Formatter.locs, deprecated in mpl 3.11 and removed in 3.13.
+        # Remove the pin (and the matching filterwarnings ignore in
+        # pyproject.toml) once cartopy ships a fix.
+        run: pip install -e .[dev] "matplotlib<3.13"
+      - name: Pre-fetch Natural Earth coastline data
+        # The 10m land + coastline shapefiles _land_coastline_features()
+        # needs; instant no-op when the cache above was hit. Keeping this a
+        # dedicated step (rather than letting pytest download lazily) makes
+        # cold-cache download time visible in the job timeline.
+        run: |
+          python -c "
+          import cartopy.io.shapereader as shpreader
+          for name in ('land', 'coastline'):
+              shpreader.natural_earth(resolution='10m', category='physical', name=name)
+          "
       - name: Lint
         run: ruff check .
       - name: Test
