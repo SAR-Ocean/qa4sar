@@ -1597,12 +1597,15 @@ class LayerLayerCollocation(PointLayerCollocation):
         sar_times = _to_datetime_array(sar_time)
         collocations: List[CollocatedPoint] = []
 
-        # Pre-filter scatterometer data: spatial and temporal bounds
+        # Pre-filter scatterometer data: spatial and temporal bounds.
+        # nanmin/nanmax: SAR grids commonly carry NaN lon/lat at masked or
+        # edge cells, and plain min/max would propagate that NaN into every
+        # bound, making the mask below all-False.
         deg_buf = self.spatial_tolerance_km / 55.0
-        lon_min = float(sar_lon.min()) - deg_buf
-        lon_max = float(sar_lon.max()) + deg_buf
-        lat_min = float(sar_lat.min()) - deg_buf
-        lat_max = float(sar_lat.max()) + deg_buf
+        lon_min = float(np.nanmin(sar_lon)) - deg_buf
+        lon_max = float(np.nanmax(sar_lon)) + deg_buf
+        lat_min = float(np.nanmin(sar_lat)) - deg_buf
+        lat_max = float(np.nanmax(sar_lat)) + deg_buf
         
         spatial_mask = (
             (val_data["lon"] >= lon_min) & (val_data["lon"] <= lon_max) &
@@ -1665,6 +1668,10 @@ class LayerLayerCollocation(PointLayerCollocation):
         sar_grid_y, sar_grid_x = sar_lon.shape
         sar_lon_flat = sar_lon.ravel()
         sar_lat_flat = sar_lat.ravel()
+        # cKDTree.query rejects NaN query points outright, and SAR grids can
+        # carry NaN lon/lat at masked/edge cells independently of the data
+        # variables, so this must be excluded up front alongside has_data_mask.
+        has_coord_mask = np.isfinite(sar_lon_flat) & np.isfinite(sar_lat_flat)
         var_names = list(sar_data.keys())
 
         # Process each SAR time
@@ -1677,7 +1684,7 @@ class LayerLayerCollocation(PointLayerCollocation):
             values_stack = np.stack(
                 [sar_data[var][t_idx].ravel() for var in var_names], axis=0
             )
-            has_data_mask = ~np.all(np.isnan(values_stack), axis=0)
+            has_data_mask = ~np.all(np.isnan(values_stack), axis=0) & has_coord_mask
             rejected_no_data += int(np.sum(~has_data_mask))
 
             candidate_cells = np.where(has_data_mask)[0]

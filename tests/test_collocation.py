@@ -410,6 +410,29 @@ class TestLayerLayerCollocation:
         val_speeds = sorted(r.val_data["wind_speed"] for r in results)
         assert val_speeds == [7.0, 7.5, 8.0, 8.5, 9.0]
 
+    def test_individual_method_handles_nan_grid_edges(self):
+        """Real S1 OCN grids have NaN lon/lat at masked/edge cells; the
+        'individual' method's spatial pre-filter must skip them with
+        nan-aware min/max rather than let a single NaN blank out the whole
+        bounding box (and therefore every match)."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        grid_lon[0, 0] = np.nan
+        grid_lat[0, 0] = np.nan
+
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            wind_speed=[8.5],
+        )
+        colloc = LayerLayerCollocation(
+            spatial_tolerance_km=200, time_tolerance_minutes=60,
+            aggregation_window_km=100, method="individual",
+        )
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
+
+        assert len(results) > 0
+        assert all(r.collocation_type == "layer_vs_layer" for r in results)
+
 
 # ---------------------------------------------------------------------------
 # _detect_collocation_type
