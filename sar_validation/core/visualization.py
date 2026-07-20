@@ -241,6 +241,28 @@ def _set_lonlat_ticks(ax, gl):
     ax.set_yticks(yticks, crs=ax.projection)
 
 
+def _pad_extent_to_min_aspect(ax, min_aspect: float = 1.0) -> None:
+    """Pad a geographic axes' latitude extent so height/width >= min_aspect.
+
+    Keeps every scene panel in a report portrait-or-square: without this,
+    a scene with a small latitude span (e.g. a handful of closely-spaced
+    imagettes) renders as a short, wide strip next to otherwise-portrait
+    satellite-track panels in the same figure.
+    """
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    width = x1 - x0
+    height = y1 - y0
+    if width <= 0 or height <= 0 or height / width >= min_aspect:
+        return
+    pad = (width * min_aspect - height) / 2
+    y0, y1 = max(y0 - pad, -90.0), min(y1 + pad, 90.0)
+    if hasattr(ax, "set_extent"):
+        ax.set_extent([x0, x1, y0, y1], crs=ax.projection)
+    else:
+        ax.set_ylim(y0, y1)
+
+
 def _fill_nan_nearest(a: np.ndarray) -> np.ndarray:
     """
     Fill NaN cells in a 2D array with the value of their nearest finite cell.
@@ -686,17 +708,50 @@ def plot_geographic(
     # (the default); two only if the caller opted into a distinct val_cmap.
     single_colorbar = val_sm is not None and effective_val_cmap == cmap
     right_margin = 0.88 if (val_sm is None or single_colorbar) else 0.80
-    subplot_kw = {"projection": ccrs.PlateCarree()} if HAS_CARTOPY else {}
+
+    # Per-scene antimeridian detection: a scene "crosses" when its raw
+    # (unshifted, [-180, 180]) lon coordinate spans more than 180 degrees —
+    # e.g. an imagette with points at 179E and 179W. Such a scene must get
+    # its own central_longitude=180 axes, otherwise a *shared*
+    # central_longitude=0 projection autoscales it to a full [-180, 180]
+    # world map with the swath split across both edges (this is a distinct
+    # bug from the one already fixed in plot_collocation_diagnostics — that
+    # function draws one map for the whole recipe bbox, this one draws one
+    # subplot per scene). Scenes without lon/lat coords count as
+    # non-crossing (the "no coords" branch below hides the axes anyway).
+    scene_crosses_dateline: Dict[str, bool] = {}
+    for scene_name in scene_names:
+        crosses = False
+        scene_ds_for_check = sar_node[scene_name].to_dataset()
+        if "lon" in scene_ds_for_check.coords:
+            lon_vals = np.asarray(scene_ds_for_check["lon"].values)
+            finite_lon = lon_vals[np.isfinite(lon_vals)]
+            if finite_lon.size:
+                crosses = bool(finite_lon.max() - finite_lon.min() > 180)
+        scene_crosses_dateline[scene_name] = crosses
+
+    def _scene_projection(scene_name):
+        if not HAS_CARTOPY:
+            return None
+        if scene_crosses_dateline.get(scene_name):
+            return ccrs.PlateCarree(central_longitude=180)
+        return ccrs.PlateCarree()
 
     def _build_figure(group_coll_ds, group_label):
         """Build one Figure for a sub-set of collocations."""
         nrows = math.ceil(len(scene_names) / ncols)
-        fig, axes = plt.subplots(
-            nrows, ncols,
-            figsize=(7 * ncols, 5 * nrows),
-            subplot_kw=subplot_kw,
-            squeeze=False,
-        )
+        fig = plt.figure(figsize=(7 * ncols, 5 * nrows))
+        axes = [
+            [
+                fig.add_subplot(
+                    nrows, ncols, r * ncols + c + 1,
+                    **({"projection": _scene_projection(scene_names[r * ncols + c])}
+                       if HAS_CARTOPY and (r * ncols + c) < len(scene_names) else {}),
+                )
+                for c in range(ncols)
+            ]
+            for r in range(nrows)
+        ]
 
         for idx, scene_name in enumerate(scene_names):
             r, c = divmod(idx, ncols)
@@ -849,6 +904,12 @@ def plot_geographic(
             ax.set_title(
                 f"{scene_name.split('/')[-1]}  ({n_dedup} obs)", fontsize=8
             )
+            # Also deferred until now, for the same reason as _set_lonlat_ticks
+            # below: it needs the finalized autoscaled extent from
+            # ax.get_xlim()/get_ylim(). Applies to both the HAS_CARTOPY
+            # (GeoAxes) and plain-matplotlib fallback path — the helper itself
+            # branches on hasattr(ax, "set_extent").
+            _pad_extent_to_min_aspect(ax)
             if HAS_CARTOPY:
                 # Deferred until now (rather than right after ax.gridlines above):
                 # this reads the finalized data extent via ax.get_xlim()/get_ylim(),
@@ -1563,12 +1624,13 @@ def plot_collocation_diagnostics(
     gl = ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
 
     # ── Set plot extent to the recipe's geographic bounds ────────────────
+    # In the central_longitude=180 axes frame, true longitude L maps to
+    # (L % 360) - 180, which turns the wrapped [min_lon, 180] +
+    # [-180, max_lon] range into one contiguous span with no wraparound.
+    def _shift(lon: float) -> float:
+        return (lon % 360) - 180
+
     if crosses_dateline:
-        # In the central_longitude=180 axes frame, true longitude L maps to
-        # (L % 360) - 180, which turns the wrapped [min_lon, 180] +
-        # [-180, max_lon] range into one contiguous span with no wraparound.
-        def _shift(lon: float) -> float:
-            return (lon % 360) - 180
         ax.set_extent(
             [_shift(bounds.min_lon), _shift(bounds.max_lon), bounds.min_lat, bounds.max_lat],
             crs=proj,
@@ -1578,6 +1640,16 @@ def plot_collocation_diagnostics(
                       crs=transform)
     _set_lonlat_ticks(ax, gl)
 
+    # Scene-box/footprint longitudes above are pre-shifted into the axes'
+    # own central_longitude=180 frame when crossing the dateline (so they
+    # form one contiguous span with no wraparound). They must therefore be
+    # plotted with a transform matching that same frame (``proj``) rather
+    # than the raw-lon ``transform`` — otherwise cartopy reprojects the
+    # already-shifted values a second time and they land far outside the
+    # visible extent. Non-crossing maps are unaffected: box_transform ==
+    # transform there.
+    box_transform = proj if crosses_dateline else transform
+
     # ── SAR coverage (zorder=1): Grid scenes → bounding box; sparse WV
     # imagettes → one footprint circle each (radius = the collocation footprint
     # radius), so it's visually clear that matches are only possible near each
@@ -1585,8 +1657,10 @@ def plot_collocation_diagnostics(
     for i, sb in enumerate(scene_bounds):
         lons_box = [sb["lon_min"], sb["lon_max"], sb["lon_max"], sb["lon_min"], sb["lon_min"]]
         lats_box = [sb["lat_min"], sb["lat_min"], sb["lat_max"], sb["lat_max"], sb["lat_min"]]
+        if crosses_dateline:
+            lons_box = [_shift(lon) for lon in lons_box]
         ax.plot(lons_box, lats_box, color="blue", linewidth=1.5,
-                transform=transform, zorder=1, label="SAR scene bounds" if i == 0 else "")
+                transform=box_transform, zorder=1, label="SAR scene bounds" if i == 0 else "")
 
     if footprint_points:
         theta = np.linspace(0, 2 * np.pi, 60)
@@ -1594,13 +1668,14 @@ def plot_collocation_diagnostics(
         for j, (flon, flat) in enumerate(footprint_points):
             # Approximate circle in lon/lat (lon degrees shrink by cos(lat)).
             cos_lat = max(np.cos(np.radians(flat)), 1e-6)
-            circ_lon = flon + (r_lat_deg / cos_lat) * np.cos(theta)
+            center_lon = _shift(flon) if crosses_dateline else flon
+            circ_lon = center_lon + (r_lat_deg / cos_lat) * np.cos(theta)
             circ_lat = flat + r_lat_deg * np.sin(theta)
             ax.plot(circ_lon, circ_lat, color="blue", linewidth=1.2,
-                    transform=transform, zorder=1,
+                    transform=box_transform, zorder=1,
                     label=f"SAR footprint (±{footprint_radius_km:.0f} km)" if j == 0 else "")
-            ax.scatter([flon], [flat], s=10, c="blue", marker="+",
-                       transform=transform, zorder=1)
+            ax.scatter([center_lon], [flat], s=10, c="blue", marker="+",
+                       transform=box_transform, zorder=1)
 
     # ── Tier 1 (zorder=2): unmatched layer data (non-in-situ categories) ────
     # Gray (#808080) with alpha=0.3, per-source markers, drawn first so matched

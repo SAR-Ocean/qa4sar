@@ -697,6 +697,246 @@ class TestPlotGeographicCircularColormap:
             assert not (norm.vmin == 0.0 and norm.vmax == 360.0)
 
 
+class TestPlotGeographicAntimeridian:
+    def test_scene_crossing_dateline_gets_own_central_longitude_180_projection(self):
+        """Regression test: a per-scene antimeridian bug distinct from the
+        one already fixed in plot_collocation_diagnostics. A WV-style scene
+        whose 1-D lon coordinate straddles the dateline (e.g. 178E..178W)
+        used to be drawn on the module's single shared
+        ``PlateCarree(central_longitude=0)`` axes, which autoscales to a
+        full [-180, 180] world map with the swath split across both edges.
+        Each per-scene subplot must instead get its own projection —
+        ``central_longitude=180`` when that scene's raw lons span more than
+        180 degrees — so the swath renders as one contiguous, narrow strip."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        n = 4
+        lon = np.array([178.0, 179.0, -179.0, -178.0])
+        lat = np.array([-1.0, -0.5, 0.5, 1.0])
+        wind = np.array([6.0, 6.5, 7.0, 7.5])
+        sar_ds = xr.Dataset(
+            {"owiWindSpeed": ("point", wind)},
+            coords={
+                "lon": ("point", lon),
+                "lat": ("point", lat),
+                "time": pd.Timestamp("2026-07-02T12:00:00"),
+            },
+        )
+        mooring_ds = xr.Dataset(
+            {"WSPD": ("point", np.array([6.0, 6.5, 7.0, 7.5]))},
+            coords={
+                "lon": ("point", np.array([178.2, 178.8, -178.8, -178.2])),
+                "lat": ("point", np.array([-0.8, -0.3, 0.3, 0.8])),
+                "time": ("point", pd.date_range("2026-07-02T12:05", periods=n, freq="5min")),
+            },
+            attrs={"platform_type": "mooring"},
+        )
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds,
+            "validation/mooring": mooring_ds,
+        })
+
+        collocation_ds = xr.Dataset({
+            "sar_owiWindSpeed":            ("collocation", np.array([6.1, 6.4, 6.9, 7.3])),
+            "val_WSPD":                    ("collocation", np.array([6.0, 6.5, 7.0, 7.5])),
+            "val_source":                  ("collocation", ["mooring"] * n),
+            "sar_scene_name":              ("collocation", ["sceneA"] * n),
+            "val_lon":                     ("collocation", np.array([178.2, 178.8, -178.8, -178.2])),
+            "val_lat":                     ("collocation", np.array([-0.8, -0.3, 0.3, 0.8])),
+            "val_id":                      ("collocation", ["mo0", "mo1", "mo2", "mo3"]),
+            "temporal_distance_minutes":   ("collocation", np.array([10.0, 20.0, 30.0, 40.0])),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-02T12:05", periods=n, freq="5min")),
+        )
+
+        fig = plot_geographic(datatree, collocation_ds, "owiWindSpeed", "WSPD", split_by=None)
+        fig.canvas.draw()
+        ax = fig.axes[0]
+
+        xlim = ax.get_xlim()
+        span = abs(xlim[1] - xlim[0])
+        assert span < 90, (
+            f"scene subplot autoscaled to a near-world extent {xlim} (span={span}) "
+            "instead of a narrow contiguous strip around the dateline"
+        )
+        assert ax.projection.proj4_params.get("lon_0") == 180
+
+        plt.close("all")
+
+    def test_non_crossing_scene_keeps_default_projection(self, geo_datatree_and_collocation):
+        """A scene whose lons do not straddle the dateline must be
+        unaffected: plain PlateCarree (central_longitude=0), matching
+        pre-fix behaviour."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        fig = plot_geographic(datatree, collocation_ds, "owiWindSpeed", "WSPD", split_by=None)
+        ax = fig.axes[0]
+
+        assert ax.projection.proj4_params.get("lon_0", 0) == 0
+        plt.close("all")
+
+
+class TestPlotGeographicPanelAspect:
+    def test_short_wide_scene_padded_to_min_aspect(self):
+        """Regression test: a scene with very few, tightly-clustered
+        imagettes (small latitude span relative to its longitude span) used
+        to autoscale to a short, wide box, visually inconsistent next to the
+        tall/portrait panels typical of WV-mode satellite tracks in the same
+        report. The rendered panel must never be shorter than it is wide."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        n = 2
+        lon = np.array([-10.0, -8.0])
+        lat = np.array([50.0, 50.3])
+        wind = np.array([6.0, 6.5])
+        sar_ds = xr.Dataset(
+            {"owiWindSpeed": ("point", wind)},
+            coords={
+                "lon": ("point", lon),
+                "lat": ("point", lat),
+                "time": pd.Timestamp("2026-07-02T12:00:00"),
+            },
+        )
+        mooring_ds = xr.Dataset(
+            {"WSPD": ("point", np.array([6.0, 6.5]))},
+            coords={
+                "lon": ("point", np.array([-9.8, -8.2])),
+                "lat": ("point", np.array([50.05, 50.25])),
+                "time": ("point", pd.date_range("2026-07-02T12:05", periods=n, freq="5min")),
+            },
+            attrs={"platform_type": "mooring"},
+        )
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds,
+            "validation/mooring": mooring_ds,
+        })
+
+        collocation_ds = xr.Dataset({
+            "sar_owiWindSpeed":            ("collocation", np.array([6.1, 6.4])),
+            "val_WSPD":                    ("collocation", np.array([6.0, 6.5])),
+            "val_source":                  ("collocation", ["mooring"] * n),
+            "sar_scene_name":              ("collocation", ["sceneA"] * n),
+            "val_lon":                     ("collocation", np.array([-9.8, -8.2])),
+            "val_lat":                     ("collocation", np.array([50.05, 50.25])),
+            "val_id":                      ("collocation", ["mo0", "mo1"]),
+            "temporal_distance_minutes":   ("collocation", np.array([10.0, 20.0])),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-02T12:05", periods=n, freq="5min")),
+        )
+
+        fig = plot_geographic(datatree, collocation_ds, "owiWindSpeed", "WSPD", split_by=None)
+        fig.canvas.draw()
+        ax = fig.axes[0]
+
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        width = x1 - x0
+        height = y1 - y0
+        assert height / width >= 1.0, (
+            f"panel rendered short-and-wide (width={width}, height={height}) instead of "
+            "portrait-or-square"
+        )
+
+        plt.close("all")
+
+    def test_already_portrait_scene_extent_unchanged(self):
+        """A scene whose natural autoscaled extent is already portrait
+        (height/width >= 1, similar to a real WV-mode satellite track
+        spanning many degrees of latitude but only a few of longitude) must
+        be completely unaffected by the padding helper: its aspect should
+        remain >= 1, i.e. no distortion is introduced where none is needed."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        n = 4
+        lon = np.array([-10.0, -9.3, -8.6, -7.9])
+        lat = np.array([10.0, 20.0, 30.0, 50.0])
+        wind = np.array([6.0, 6.5, 7.0, 7.5])
+        sar_ds = xr.Dataset(
+            {"owiWindSpeed": ("point", wind)},
+            coords={
+                "lon": ("point", lon),
+                "lat": ("point", lat),
+                "time": pd.Timestamp("2026-07-02T12:00:00"),
+            },
+        )
+        mooring_ds = xr.Dataset(
+            {"WSPD": ("point", np.array([6.0, 6.5, 7.0, 7.5]))},
+            coords={
+                "lon": ("point", lon),
+                "lat": ("point", lat),
+                "time": ("point", pd.date_range("2026-07-02T12:05", periods=n, freq="5min")),
+            },
+            attrs={"platform_type": "mooring"},
+        )
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds,
+            "validation/mooring": mooring_ds,
+        })
+
+        collocation_ds = xr.Dataset({
+            "sar_owiWindSpeed":            ("collocation", np.array([6.1, 6.4, 6.9, 7.3])),
+            "val_WSPD":                    ("collocation", np.array([6.0, 6.5, 7.0, 7.5])),
+            "val_source":                  ("collocation", ["mooring"] * n),
+            "sar_scene_name":              ("collocation", ["sceneA"] * n),
+            "val_lon":                     ("collocation", lon),
+            "val_lat":                     ("collocation", lat),
+            "val_id":                      ("collocation", ["mo0", "mo1", "mo2", "mo3"]),
+            "temporal_distance_minutes":   ("collocation", np.array([10.0, 20.0, 30.0, 40.0])),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-02T12:05", periods=n, freq="5min")),
+        )
+
+        fig = plot_geographic(datatree, collocation_ds, "owiWindSpeed", "WSPD", split_by=None)
+        fig.canvas.draw()
+        ax = fig.axes[0]
+
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+
+        # A trivial `>= 1.0` assertion on the ratio would pass even if the
+        # padding helper always widened the y-extent somewhat, since this
+        # scene's natural ratio (~19) is so far above 1 that mild padding
+        # wouldn't pull it back down that far. To genuinely pin "extent is
+        # unaffected by padding", independently derive the *expected*
+        # natural extent from the same lon/lat data using matplotlib's
+        # default autoscale margin (5% of span on each side, the same
+        # ``axes.xmargin``/``axes.ymargin`` defaults matplotlib/cartopy
+        # apply when autoscaling a scatter with no explicit limits) and
+        # assert the rendered extent matches it exactly (within floating
+        # tolerance) — proving `_pad_extent_to_min_aspect` took its
+        # early-return path and never touched the y-limits at all.
+        xmargin = plt.rcParams["axes.xmargin"]
+        ymargin = plt.rcParams["axes.ymargin"]
+        lon_span = lon.max() - lon.min()
+        lat_span = lat.max() - lat.min()
+        expected_x0 = lon.min() - xmargin * lon_span
+        expected_x1 = lon.max() + xmargin * lon_span
+        expected_y0 = lat.min() - ymargin * lat_span
+        expected_y1 = lat.max() + ymargin * lat_span
+
+        assert x0 == pytest.approx(expected_x0, abs=1e-6)
+        assert x1 == pytest.approx(expected_x1, abs=1e-6)
+        assert y0 == pytest.approx(expected_y0, abs=1e-6)
+        assert y1 == pytest.approx(expected_y1, abs=1e-6)
+
+        plt.close("all")
+
+
 @pytest.fixture
 def geo_datatree_and_collocation_with_unmatched():
     """Synthetic DataTree + collocation_ds with both matched and unmatched
@@ -2257,6 +2497,64 @@ class TestPlotCollocationDiagnosticsAntimeridian:
         )
         img = mpimg.imread(str(out_path))
         assert img.shape[0] > 100 and img.shape[1] > 100
+
+    def test_scene_bounds_line_plotted_in_projected_frame_when_crossing(
+        self, geo_datatree_and_collocation_dateline, diagnostics_recipe_dateline, tmp_path, monkeypatch
+    ):
+        """Regression test for a double-shift bug: when the recipe bbox
+        crosses the antimeridian, the SAR scene-bounds box longitudes are
+        pre-shifted into the central_longitude=180 axes frame (see
+        ``_shift`` in plot_collocation_diagnostics) so the box spans the
+        dateline as one contiguous range. Those already-shifted coordinates
+        must then be plotted with a transform that matches that frame
+        (``proj``), not the raw-lon ``PlateCarree()`` transform — otherwise
+        cartopy reprojects them a second time and the box lands far outside
+        the visible extent.
+
+        This test captures the exact ``ax.plot(...)`` call used to draw the
+        "SAR scene bounds" line, reprojects its data through the transform
+        it was actually plotted with into the axes' own projection, and
+        asserts the result falls within the axes' x-limits.
+        """
+        import cartopy.mpl.geoaxes as cgeoaxes
+
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation_dateline
+
+        calls = []
+        original_plot = cgeoaxes.GeoAxes.plot
+
+        def spy_plot(self, *args, **kwargs):
+            if kwargs.get("label") == "SAR scene bounds":
+                calls.append({
+                    "ax": self,
+                    "xdata": np.asarray(args[0]),
+                    "ydata": np.asarray(args[1]),
+                    "transform": kwargs.get("transform"),
+                })
+            return original_plot(self, *args, **kwargs)
+
+        monkeypatch.setattr(cgeoaxes.GeoAxes, "plot", spy_plot)
+
+        out_path = plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe_dateline, tmp_path,
+        )
+
+        assert out_path is not None
+        assert len(calls) == 1, "expected exactly one 'SAR scene bounds' plot call"
+
+        call = calls[0]
+        ax = call["ax"]
+        projected = ax.projection.transform_points(call["transform"], call["xdata"], call["ydata"])
+        x_proj = projected[:, 0]
+
+        xlim = ax.get_xlim()
+        lo, hi = min(xlim), max(xlim)
+        assert np.all(x_proj >= lo) and np.all(x_proj <= hi), (
+            f"scene-bounds box x-coords {x_proj} fall outside axes x-limits {xlim} "
+            "(likely double-shifted/double-transformed across the dateline)"
+        )
 
 
 class TestValidationReportDownloadWarnings:

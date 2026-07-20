@@ -294,6 +294,17 @@ class DataTreeConverter:
                 [c for c in df.columns if c not in pivot_id_cols],
             )
 
+        # Derive eastward/northward current components from speed + direction
+        # when the direct components are absent or all-NaN.
+        if "HCSP" in df.columns and "HCDT" in df.columns:
+            hcdt_rad = np.radians(df["HCDT"].to_numpy(dtype=float, na_value=np.nan))
+            hcsp = df["HCSP"].to_numpy(dtype=float, na_value=np.nan)
+            for col, trig in (("EWCT", np.sin), ("NSCT", np.cos)):
+                if col in df.columns and not df[col].isna().all():
+                    continue  # column has real data — leave it untouched
+                df[col] = hcsp * trig(hcdt_rad)
+                logger.debug("Derived %s from HCSP+HCDT", col)
+
         coord_cols = {"lon", "lat", "time", "platform_id", "platform_type"}
         data_cols  = [c for c in df.columns if c not in coord_cols]
 

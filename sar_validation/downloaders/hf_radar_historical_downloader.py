@@ -35,12 +35,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 from ._hf_radar_regions import resolve_hfr_region
 from .base import build_output_dir, normalize_datetime, split_antimeridian_bbox
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["HFRadarHistoricalDownloader"]
 
@@ -77,6 +81,13 @@ _REGION_FILENAMES = {
     "US-WestCoast": "GL_TV_HF_HFR-US-WestCoast_Total.nc",
     "Vestlandet": "GL_TV_HF_HFR-Vestlandet_Total.nc",
 }
+
+_MIN_AGE_DAYS: int = 365
+
+
+def _parse_iso_dt(s: str) -> datetime:
+    """Convert ISO date string from normalize_datetime to timezone-aware UTC datetime."""
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=timezone.utc)
 
 
 def _region_filename(region: str, start_dt: str, end_dt: str) -> str:
@@ -132,6 +143,15 @@ class HFRadarHistoricalDownloader:
     ) -> list[Path]:
         start_dt = normalize_datetime(start)
         end_dt = normalize_datetime(end)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_MIN_AGE_DAYS)
+        if _parse_iso_dt(end_dt) > cutoff:
+            logger.warning(
+                "Skipping delayed-mode HF-radar download: end date %s is less than "
+                "%d days old. The historical archive lags real-time by ~1 year. "
+                "Re-run after %s.",
+                end_dt, _MIN_AGE_DAYS, cutoff.strftime("%Y-%m-%d"),
+            )
+            return []
         windows = split_antimeridian_bbox(min_lon, max_lon)
 
         downloaded: list[Path] = []
