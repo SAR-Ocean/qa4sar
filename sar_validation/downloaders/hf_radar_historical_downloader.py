@@ -82,7 +82,7 @@ _REGION_FILENAMES = {
     "Vestlandet": "GL_TV_HF_HFR-Vestlandet_Total.nc",
 }
 
-_MIN_AGE_DAYS: int = 365
+_MIN_AGE_DAYS: int = 182
 
 
 def _parse_iso_dt(s: str) -> datetime:
@@ -147,7 +147,7 @@ class HFRadarHistoricalDownloader:
         if _parse_iso_dt(end_dt) > cutoff:
             logger.warning(
                 "Skipping delayed-mode HF-radar download: end date %s is less than "
-                "%d days old. The historical archive lags real-time by ~1 year. "
+                "%d days old. The historical archive lags real-time by ~6 months. "
                 "Re-run after %s.",
                 end_dt, _MIN_AGE_DAYS, cutoff.strftime("%Y-%m-%d"),
             )

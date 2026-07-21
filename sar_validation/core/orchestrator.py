@@ -206,9 +206,16 @@ class DataOrchestrator:
     def _dispatch_source(self, source) -> bool:
         handlers = {
             "scatterometer": self._download_scatterometer,
+            "scatterometer_hy2b": self._download_scatterometer_hy2b,
+            "scatterometer_hy2c": self._download_scatterometer_hy2c,
+            "scatterometer_oceansat3": self._download_scatterometer_oceansat3,
             "hf_radar":      self._download_hf_radar,
             "hf_radar_noaa": self._download_noaa_hfradar,
             "hf_radar_historical": self._download_hf_radar_historical,
+            "adcp_historical": self._download_adcp_historical,
+            "argo_historical": self._download_argo_historical,
+            "drifter_historical": self._download_drifter_historical,
+            "glider_historical": self._download_glider_historical,
             "altimeter":     self._download_altimeter,
             "radiometer":    self._download_radiometer,
         }
@@ -249,6 +256,46 @@ class DataOrchestrator:
                 "status": "failed", "error": msg
             }
             return False
+
+    def _download_scatterometer_ftp(self, source, satellite: str) -> bool:
+        from ..downloaders.scatterometer_ftp_downloader import ScatterometerFTPDownloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        temp   = cfg.temporal_bounds
+        out_dir = self.base_dir / f"scatterometer_{satellite}"
+
+        try:
+            dl = ScatterometerFTPDownloader(
+                satellite=satellite,
+                output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
+            )
+            dl.download(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=temp.start, end=temp.end,
+            )
+            self.metadata["downloads"][f"scatterometer_{satellite}"] = {
+                "status": "dry_run" if self.dry_run else "success",
+            }
+            return True
+        except Exception as exc:
+            msg = f"{satellite} FTP scatterometer download failed: {exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"][f"scatterometer_{satellite}"] = {
+                "status": "failed", "error": msg
+            }
+            return False
+
+    def _download_scatterometer_hy2b(self, source) -> bool:
+        return self._download_scatterometer_ftp(source, "hy2b")
+
+    def _download_scatterometer_hy2c(self, source) -> bool:
+        return self._download_scatterometer_ftp(source, "hy2c")
+
+    def _download_scatterometer_oceansat3(self, source) -> bool:
+        return self._download_scatterometer_ftp(source, "oceansat3")
 
     def _download_hf_radar(self, source) -> bool:
         from ..downloaders.hf_radar_downloader import HFRadarDownloader
@@ -346,6 +393,55 @@ class DataOrchestrator:
             self.metadata["errors"].append(msg)
             self.metadata["downloads"]["hf_radar_historical"] = {"status": "failed", "error": msg}
             return False
+
+    def _download_currents_historical(self, source, instrument: str) -> bool:
+        from ..downloaders.insitu_currents_historical_downloader import (
+            InSituCurrentsHistoricalDownloader,
+        )
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        temp   = cfg.temporal_bounds
+        out_dir = self.base_dir / f"{instrument}_historical"
+
+        try:
+            dl = InSituCurrentsHistoricalDownloader(
+                instrument=instrument,
+                output_dir=out_dir,
+                dry_run=self.dry_run,
+                min_depth=source.resolved_min_depth,
+                max_depth=source.resolved_max_depth,
+                force_download=self.force_download,
+            )
+            dl.download(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=temp.start, end=temp.end,
+            )
+            self.metadata["downloads"][f"{instrument}_historical"] = {
+                "status": "dry_run" if self.dry_run else "success",
+            }
+            return True
+        except Exception as exc:
+            msg = f"{instrument} delayed-mode currents download failed: {exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"][f"{instrument}_historical"] = {
+                "status": "failed", "error": msg
+            }
+            return False
+
+    def _download_adcp_historical(self, source) -> bool:
+        return self._download_currents_historical(source, "adcp")
+
+    def _download_argo_historical(self, source) -> bool:
+        return self._download_currents_historical(source, "argo")
+
+    def _download_drifter_historical(self, source) -> bool:
+        return self._download_currents_historical(source, "drifter")
+
+    def _download_glider_historical(self, source) -> bool:
+        return self._download_currents_historical(source, "glider")
 
     # Altimeter download frequencies, keyed by recipe variable. Wind never
     # needs 5 Hz (no WIND_SPEED there, and 5x the point density for no

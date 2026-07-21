@@ -1462,3 +1462,40 @@ class TestBuildDatatreeHfRadarHistorical:
             "hf_radar_historical" in p and "hf_radar_noaa" not in p
             for p in node_paths
         )
+
+
+class TestBuildDatatreeScatterometerFTPVariants:
+    @pytest.mark.parametrize("subdir_name", [
+        "scatterometer_hy2b", "scatterometer_hy2c", "scatterometer_oceansat3",
+    ])
+    def test_folder_becomes_validation_node(self, tmp_path, subdir_name):
+        base = tmp_path / "run"
+        (base / subdir_name).mkdir(parents=True)
+        _make_scatterometer_nc_at(
+            base / subdir_name, lons=[-5.0, -6.0], lats=[55.0, 56.0],
+        )
+        tree = DataTreeConverter.convert_downloaded_data(base)
+        assert tree is not None
+        node_paths = [node.path for node in tree.subtree]
+        assert any(subdir_name in p for p in node_paths)
+
+
+class TestBuildDatatreeCurrentsHistorical:
+    @pytest.mark.parametrize("instrument", [
+        "adcp_historical", "argo_historical", "drifter_historical", "glider_historical",
+    ])
+    def test_folder_becomes_validation_node(self, tmp_path, instrument):
+        base = tmp_path / "run"
+        subdir = base / instrument
+        subdir.mkdir(parents=True)
+        csv_path = _make_insitu_csv(subdir)
+        # from_insitu_csv expects EWCT/NSCT-capable columns; the shared
+        # _make_insitu_csv fixture already writes WSPD/WDIR + platform_type,
+        # which is enough to exercise the folder-discovery wiring itself.
+        tree = DataTreeConverter.convert_downloaded_data(base)
+        assert tree is not None
+        node_paths = [node.path for node in tree.subtree]
+        # Substring check (not exact equality) matching the existing
+        # TestBuildDatatreeHfRadarHistorical convention — DataTree node
+        # paths carry a leading "/" this key doesn't include.
+        assert any(f"validation/{instrument}/{csv_path.stem}" in p for p in node_paths)

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from sar_validation.downloaders.base import (
+    authenticate_osi_saf_ftp,
     copernicus_marine_download_kwargs,
     is_date_recent,
     normalize_datetime,
@@ -275,6 +277,48 @@ class TestCopernicusMarineDownloadKwargs:
         assert copernicus_marine_download_kwargs(force_download=True) == {
             "skip_existing": False, "overwrite": True,
         }
+
+
+# ---------------------------------------------------------------------------
+# Tests for authenticate_osi_saf_ftp()
+# ---------------------------------------------------------------------------
+
+class TestAuthenticateOsiSafFtp:
+    def test_explicit_args_win_over_everything(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("OSI_SAF_FTP_USERNAME", "env_user")
+        monkeypatch.setenv("OSI_SAF_FTP_PASSWORD", "env_pass")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        username, password = authenticate_osi_saf_ftp("explicit_user", "explicit_pass")
+        assert (username, password) == ("explicit_user", "explicit_pass")
+
+    def test_env_vars_used_when_args_absent(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("OSI_SAF_FTP_USERNAME", "env_user")
+        monkeypatch.setenv("OSI_SAF_FTP_PASSWORD", "env_pass")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        username, password = authenticate_osi_saf_ftp()
+        assert (username, password) == ("env_user", "env_pass")
+
+    def test_falls_back_to_credentials_file(self, monkeypatch, tmp_path):
+        import json
+
+        monkeypatch.delenv("OSI_SAF_FTP_USERNAME", raising=False)
+        monkeypatch.delenv("OSI_SAF_FTP_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        cred_file = tmp_path / ".eumetsat_osi_saf_wind_credentials"
+        cred_file.write_text(json.dumps({"username": "file_user", "password": "file_pass"}))
+
+        username, password = authenticate_osi_saf_ftp()
+        assert (username, password) == ("file_user", "file_pass")
+
+    def test_raises_runtime_error_when_nothing_resolves(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("OSI_SAF_FTP_USERNAME", raising=False)
+        monkeypatch.delenv("OSI_SAF_FTP_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        with pytest.raises(RuntimeError, match="OSI-SAF FTP credentials not found"):
+            authenticate_osi_saf_ftp()
 
 
 # ---------------------------------------------------------------------------
@@ -1910,6 +1954,56 @@ class TestOrchestratorHFRadarHistoricalWiring:
         mock_cls.assert_called_once()
 
 
+class TestOrchestratorScatterometerFTPWiring:
+    @pytest.mark.parametrize("source_type,satellite", [
+        ("scatterometer_hy2b", "hy2b"),
+        ("scatterometer_hy2c", "hy2c"),
+        ("scatterometer_oceansat3", "oceansat3"),
+    ])
+    def test_dispatch_source_registers_handler_with_right_satellite(self, source_type, satellite):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(name="test", variable="wind"))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        source = ValidationDataSource(source_type=source_type)
+
+        with patch(
+            "sar_validation.downloaders.scatterometer_ftp_downloader.ScatterometerFTPDownloader"
+        ) as mock_cls:
+            mock_cls.return_value.download.return_value = []
+            ok = orchestrator._dispatch_source(source)
+
+        assert ok is True
+        assert mock_cls.call_args.kwargs["satellite"] == satellite
+
+
+class TestOrchestratorCurrentsHistoricalWiring:
+    @pytest.mark.parametrize("source_type,instrument", [
+        ("adcp_historical", "adcp"),
+        ("argo_historical", "argo"),
+        ("drifter_historical", "drifter"),
+        ("glider_historical", "glider"),
+    ])
+    def test_dispatch_source_registers_handler_with_right_instrument(self, source_type, instrument):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(name="test", variable="currents"))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        source = ValidationDataSource(source_type=source_type)
+
+        with patch(
+            "sar_validation.downloaders.insitu_currents_historical_downloader."
+            "InSituCurrentsHistoricalDownloader"
+        ) as mock_cls:
+            mock_cls.return_value.download.return_value = []
+            ok = orchestrator._dispatch_source(source)
+
+        assert ok is True
+        assert mock_cls.call_args.kwargs["instrument"] == instrument
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: orchestrator wiring for a Pacific-crossing recipe
 # ---------------------------------------------------------------------------
@@ -2058,6 +2152,37 @@ class TestOrchestratorForceDownloadWiring:
             mock_cls.return_value.download.return_value = []
             orchestrator._download_hf_radar_historical(
                 ValidationDataSource(source_type="hf_radar_historical")
+            )
+        assert mock_cls.call_args.kwargs["force_download"] is True
+
+    def test_scatterometer_ftp_receives_force_download(self, tmp_path):
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import ValidationDataSource
+
+        orchestrator = self._make_orchestrator(tmp_path, force_download=True)
+        with patch(
+            "sar_validation.downloaders.scatterometer_ftp_downloader.ScatterometerFTPDownloader"
+        ) as mock_cls:
+            mock_cls.return_value.download.return_value = []
+            orchestrator._download_scatterometer_hy2b(
+                ValidationDataSource(source_type="scatterometer_hy2b")
+            )
+        assert mock_cls.call_args.kwargs["force_download"] is True
+
+    def test_currents_historical_receives_force_download(self, tmp_path):
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import ValidationDataSource
+
+        orchestrator = self._make_orchestrator(tmp_path, force_download=True)
+        with patch(
+            "sar_validation.downloaders.insitu_currents_historical_downloader."
+            "InSituCurrentsHistoricalDownloader"
+        ) as mock_cls:
+            mock_cls.return_value.download.return_value = []
+            orchestrator._download_adcp_historical(
+                ValidationDataSource(source_type="adcp_historical")
             )
         assert mock_cls.call_args.kwargs["force_download"] is True
 

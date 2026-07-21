@@ -284,6 +284,13 @@ def _build_currents_config(limit: Optional[int] = None):
             ValidationDataSource(source_type="drifter"),
             ValidationDataSource(source_type="ferrybox"),
             ValidationDataSource(source_type="mooring"),
+            # Delayed-mode (6mo+ old) current observations — Copernicus
+            # Marine product 013_044, EWCT/NSCT only. Each individually
+            # gated at download time by its own recency guard.
+            ValidationDataSource(source_type="adcp_historical"),
+            ValidationDataSource(source_type="argo_historical"),
+            ValidationDataSource(source_type="drifter_historical"),
+            ValidationDataSource(source_type="glider_historical"),
         ],
         collocation=CollocationType(
             point_vs_layer=PointVsLayerCollocation(),
@@ -297,6 +304,123 @@ def _build_currents_config(limit: Optional[int] = None):
                     "hf_radar_grid": {
                         "time_tolerance_minutes": 20,
                         "aggregation_window_km": 6.0,
+                        "distance_weighting": "equal",
+                    },
+                }
+            ),
+        ),
+    )
+
+
+def _build_wind_config(limit: Optional[int] = None):
+    """Build the 'wind' recipe template's RecipeConfig.
+
+    Extracted from ``_create_recipe`` so the template content is
+    unit-testable independent of the CLI's file-writing side effects,
+    mirroring ``_build_currents_config``.
+    """
+    from .core.recipe import (
+        CollocationType,
+        GeographicBounds,
+        LayerVsLayerCollocation,
+        PointVsLayerCollocation,
+        RecipeConfig,
+        SARDataSpec,
+        ValidationDataSource,
+    )
+
+    return RecipeConfig(
+        name="Wind Validation",
+        description=(
+            "Validate Sentinel-1 IW/EW mode wind speed and direction\n"
+            "against moorings, buoys, ASCAT scatterometer, HY-2B/HY-2C/\n"
+            "Oceansat-3 scatterometer, 1 Hz altimeter, and RSS radiometer\n"
+            "(AMSR2) ocean winds."
+        ),
+        variable="wind",
+        variable_specs={"components": ["speed", "direction"]},
+        geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+        sar_data=SARDataSpec(swath_mode=["IW", "EW"], max_downloads=limit),
+        validation_sources=[
+            ValidationDataSource(source_type="mooring"),
+            ValidationDataSource(source_type="buoy"),
+            ValidationDataSource(source_type="ferrybox"),
+            ValidationDataSource(source_type="drifter"),
+            ValidationDataSource(source_type="tidal_gauge"),
+            ValidationDataSource(source_type="scatterometer"),
+            ValidationDataSource(source_type="altimeter"),
+            ValidationDataSource(source_type="radiometer"),
+            # KNMI OSI-SAF FTP, recent-only (3-day window), 25 km.
+            ValidationDataSource(source_type="scatterometer_hy2b"),
+            ValidationDataSource(source_type="scatterometer_hy2c"),
+            ValidationDataSource(source_type="scatterometer_oceansat3"),
+        ],
+        collocation=CollocationType(
+            point_vs_layer=PointVsLayerCollocation(),
+            layer_vs_layer=LayerVsLayerCollocation(
+                layer_type_specs={
+                    "scatterometer": {
+                        "time_tolerance_minutes": 180,
+                        "aggregation_window_km": 12.5,
+                        "distance_weighting": "equal",
+                    },
+                    # 25 km grid, distinct from ASCAT's 12.5 km above.
+                    "scatterometer_hy2b": {
+                        "time_tolerance_minutes": 180,
+                        "aggregation_window_km": 25.0,
+                        "distance_weighting": "equal",
+                    },
+                    "scatterometer_hy2c": {
+                        "time_tolerance_minutes": 180,
+                        "aggregation_window_km": 25.0,
+                        "distance_weighting": "equal",
+                    },
+                    "scatterometer_oceansat3": {
+                        "time_tolerance_minutes": 180,
+                        "aggregation_window_km": 25.0,
+                        "distance_weighting": "equal",
+                    },
+                    # Wind recipes only ever download 1 Hz altimeter data
+                    # (no WIND_SPEED at 5 Hz) — see DEFAULT_LAYER_TYPE_SPECS
+                    # in recipe.py for the matching aggregation window.
+                    "altimeter_1hz": {
+                        "time_tolerance_minutes": 180,
+                        "aggregation_window_km": 7.0,
+                        "distance_weighting": "equal",
+                    },
+                    # RSS radiometers all share the 0.25° (~25 km) grid, so
+                    # the specs default alike. Per-sensor keys keep each one
+                    # individually tunable; collocation resolves a node's
+                    # 'radiometer' layer type to 'radiometer_<sensor>'.
+                    # AMSR2 is NetCDF; GMI/SSMIS/WindSat are RSS bytemaps.
+                    "radiometer_amsr2": {
+                        "time_tolerance_minutes": 180,
+                        "aggregation_window_km": 25.0,
+                        "distance_weighting": "equal",
+                    },
+                    "radiometer_gmi": {
+                        "time_tolerance_minutes": 180,
+                        "aggregation_window_km": 25.0,
+                        "distance_weighting": "equal",
+                    },
+                    "radiometer_ssmis_f16": {
+                        "time_tolerance_minutes": 180,
+                        "aggregation_window_km": 25.0,
+                        "distance_weighting": "equal",
+                    },
+                    "radiometer_ssmis_f17": {
+                        "time_tolerance_minutes": 180,
+                        "aggregation_window_km": 25.0,
+                        "distance_weighting": "equal",
+                    },
+                    "radiometer_ssmis_f18": {
+                        "time_tolerance_minutes": 180,
+                        "aggregation_window_km": 25.0,
+                        "distance_weighting": "equal",
+                    },
+                    "radiometer_windsat": {
+                        "time_tolerance_minutes": 180,
+                        "aggregation_window_km": 25.0,
                         "distance_weighting": "equal",
                     },
                 }
@@ -329,83 +453,7 @@ def _create_recipe(
     )
 
     templates = {
-        "wind": RecipeConfig(
-            name="Wind Validation",
-            description=(
-                "Validate Sentinel-1 IW/EW mode wind speed and direction\n"
-                "against moorings, buoys, ASCAT scatterometer, 1 Hz altimeter,\n"
-                "and RSS radiometer (AMSR2) ocean winds."
-            ),
-            variable="wind",
-            variable_specs={"components": ["speed", "direction"]},
-            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
-            sar_data=SARDataSpec(swath_mode=["IW", "EW"], max_downloads=limit),
-            validation_sources=[
-                ValidationDataSource(source_type="mooring"),
-                ValidationDataSource(source_type="buoy"),
-                ValidationDataSource(source_type="ferrybox"),
-                ValidationDataSource(source_type="drifter"),
-                ValidationDataSource(source_type="tidal_gauge"),
-                ValidationDataSource(source_type="scatterometer"),
-                ValidationDataSource(source_type="altimeter"),
-                ValidationDataSource(source_type="radiometer"),
-            ],
-            collocation=CollocationType(
-                point_vs_layer=PointVsLayerCollocation(),
-                layer_vs_layer=LayerVsLayerCollocation(
-                    layer_type_specs={
-                        "scatterometer": {
-                            "time_tolerance_minutes": 180,
-                            "aggregation_window_km": 12.5,
-                            "distance_weighting": "equal",
-                        },
-                        # Wind recipes only ever download 1 Hz altimeter data
-                        # (no WIND_SPEED at 5 Hz) — see DEFAULT_LAYER_TYPE_SPECS
-                        # in recipe.py for the matching aggregation window.
-                        "altimeter_1hz": {
-                            "time_tolerance_minutes": 180,
-                            "aggregation_window_km": 7.0,
-                            "distance_weighting": "equal",
-                        },
-                        # RSS radiometers all share the 0.25° (~25 km) grid, so
-                        # the specs default alike. Per-sensor keys keep each one
-                        # individually tunable; collocation resolves a node's
-                        # 'radiometer' layer type to 'radiometer_<sensor>'.
-                        # AMSR2 is NetCDF; GMI/SSMIS/WindSat are RSS bytemaps.
-                        "radiometer_amsr2": {
-                            "time_tolerance_minutes": 180,
-                            "aggregation_window_km": 25.0,
-                            "distance_weighting": "equal",
-                        },
-                        "radiometer_gmi": {
-                            "time_tolerance_minutes": 180,
-                            "aggregation_window_km": 25.0,
-                            "distance_weighting": "equal",
-                        },
-                        "radiometer_ssmis_f16": {
-                            "time_tolerance_minutes": 180,
-                            "aggregation_window_km": 25.0,
-                            "distance_weighting": "equal",
-                        },
-                        "radiometer_ssmis_f17": {
-                            "time_tolerance_minutes": 180,
-                            "aggregation_window_km": 25.0,
-                            "distance_weighting": "equal",
-                        },
-                        "radiometer_ssmis_f18": {
-                            "time_tolerance_minutes": 180,
-                            "aggregation_window_km": 25.0,
-                            "distance_weighting": "equal",
-                        },
-                        "radiometer_windsat": {
-                            "time_tolerance_minutes": 180,
-                            "aggregation_window_km": 25.0,
-                            "distance_weighting": "equal",
-                        },
-                    }
-                ),
-            ),
-        ),
+        "wind": _build_wind_config(limit),
         "currents": _build_currents_config(limit),
         "waves": RecipeConfig(
             name="Wave Height Validation",

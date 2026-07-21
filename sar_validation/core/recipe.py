@@ -153,6 +153,13 @@ _RADIOMETER_DEFAULT = {"time_tolerance_minutes": 180, "aggregation_window_km": 2
 
 DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
     "scatterometer":  {"time_tolerance_minutes": 180, "aggregation_window_km": 12.5, "distance_weighting": "equal"},
+    # HY-2B/HY-2C/Oceansat-3 (KNMI OSI-SAF FTP, recent-only) are 25 km
+    # products, distinct from ASCAT's 12.5 km coastal-wind grid above.
+    "scatterometer_hy2b": {"time_tolerance_minutes": 180, "aggregation_window_km": 25.0, "distance_weighting": "equal"},
+    "scatterometer_hy2c": {"time_tolerance_minutes": 180, "aggregation_window_km": 25.0, "distance_weighting": "equal"},
+    "scatterometer_oceansat3": {
+        "time_tolerance_minutes": 180, "aggregation_window_km": 25.0, "distance_weighting": "equal"
+    },
     "altimeter_1hz":  {"time_tolerance_minutes": 180, "aggregation_window_km": 7.0,  "distance_weighting": "equal"},
     "altimeter_5hz":  {"time_tolerance_minutes": 180, "aggregation_window_km": 1.4,  "distance_weighting": "equal"},
     "hf_radar":       {"time_tolerance_minutes": 20,  "aggregation_window_km": 5.0,  "distance_weighting": "equal"},

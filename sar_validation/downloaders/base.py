@@ -13,6 +13,7 @@ Provides:
 from __future__ import annotations
 
 import base64
+import json
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,6 +25,7 @@ __all__ = [
     "CopernicusODataClient",
     "authenticate_cdse",
     "authenticate_eumdac",
+    "authenticate_osi_saf_ftp",
     "normalize_datetime",
     "is_date_recent",
     "build_output_dir",
@@ -304,6 +306,48 @@ def authenticate_eumdac(
 
     token = eumdac.AccessToken((username, password))
     return token
+
+
+def authenticate_osi_saf_ftp(
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+) -> Tuple[str, str]:
+    """
+    Resolve OSI-SAF wind FTP (ftppro.knmi.nl) credentials.
+
+    Priority order:
+      1. Explicit arguments
+      2. Environment variables  OSI_SAF_FTP_USERNAME / OSI_SAF_FTP_PASSWORD
+      3. ~/.eumetsat_osi_saf_wind_credentials  (JSON: {"username": ..., "password": ...})
+
+    Raises RuntimeError if no credentials are found.
+    """
+    if username and password:
+        return username, password
+
+    username = username or os.environ.get("OSI_SAF_FTP_USERNAME")
+    password = password or os.environ.get("OSI_SAF_FTP_PASSWORD")
+    if username and password:
+        return username, password
+
+    cred_file = Path.home() / ".eumetsat_osi_saf_wind_credentials"
+    if cred_file.exists():
+        with open(cred_file) as f:
+            creds = json.load(f)
+        username = username or creds.get("username")
+        password = password or creds.get("password")
+        if username and password:
+            return username, password
+
+    raise RuntimeError(
+        "OSI-SAF FTP credentials not found.\n"
+        "Options:\n"
+        "  1. Store in ~/.eumetsat_osi_saf_wind_credentials as "
+        "'{\"username\": \"...\", \"password\": \"...\"}'\n"
+        "  2. Set OSI_SAF_FTP_USERNAME / OSI_SAF_FTP_PASSWORD environment variables\n"
+        "  3. Pass --username / --password on the command line\n"
+        "Register at: https://osi-saf.eumetsat.int/register"
+    )
 
 
 # ---------------------------------------------------------------------------

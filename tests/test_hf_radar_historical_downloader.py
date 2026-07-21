@@ -1,8 +1,8 @@
 """Tests for the recency guard in HFRadarHistoricalDownloader.download().
 
-The delayed-mode Copernicus archive lags real-time by roughly a year, so
+The delayed-mode Copernicus archive lags real-time by roughly 6 months, so
 ``download()`` short-circuits (logs a warning, returns ``[]``) whenever the
-requested end date is younger than ``_MIN_AGE_DAYS`` (365) days old, before
+requested end date is younger than ``_MIN_AGE_DAYS`` (182) days old, before
 attempting any region resolution or network access. These tests use end
 dates computed relative to the real wall-clock time (no time-freezing
 required) to keep the guard's behaviour deterministic without touching the
@@ -27,7 +27,7 @@ _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT = -90.0, -60.0, 30.0, 40.0
 
 class TestHFRadarHistoricalRecencyGuard:
     def test_recent_end_date_returns_empty_without_touching_network(self, tmp_path, caplog):
-        """An end date well inside the ~1yr archive lag must short-circuit
+        """An end date well inside the ~6 month archive lag must short-circuit
         before any region resolution or download attempt is made, logging a
         warning explaining why nothing was fetched."""
         now = datetime.now(timezone.utc)

@@ -2199,9 +2199,16 @@ class DataTreeConverter:
         - ``copernicus_insitu/*.csv``  → ``validation/<stem>`` nodes
         - ``osi_saf_winds/*.nc``       → ``validation/osi_saf_winds/<stem>`` nodes
         - ``scatterometer/*.nc``       → ``validation/scatterometer/<stem>`` nodes
+        - ``scatterometer_hy2b/*.nc``       → ``validation/scatterometer_hy2b/<stem>`` nodes
+        - ``scatterometer_hy2c/*.nc``       → ``validation/scatterometer_hy2c/<stem>`` nodes
+        - ``scatterometer_oceansat3/*.nc``  → ``validation/scatterometer_oceansat3/<stem>`` nodes
         - ``hfr_noaa/*.nc``            → ``validation/hfr_noaa/<stem>`` nodes
         - ``hf_radar/*.nc``            → ``validation/hf_radar/<stem>`` nodes
         - ``hf_radar_historical/*.nc`` → ``validation/hf_radar_historical/<stem>`` nodes
+        - ``adcp_historical/*.csv``    → ``validation/adcp_historical/<stem>`` nodes
+        - ``argo_historical/*.csv``    → ``validation/argo_historical/<stem>`` nodes
+        - ``drifter_historical/*.csv`` → ``validation/drifter_historical/<stem>`` nodes
+        - ``glider_historical/*.csv``  → ``validation/glider_historical/<stem>`` nodes
         - ``altimeter/*.nc``           → ``validation/altimeter/<stem>`` nodes
 
         Parameters
@@ -2267,8 +2274,33 @@ class DataTreeConverter:
                     datasets[f"validation/{csv_path.stem}"] = ds
                     logger.info("Converted in-situ CSV: %s", csv_path.name)
 
-        # Scatterometer / OSI-SAF winds (standardised to point dimension)
-        for subdir_name in ("osi_saf_winds", "scatterometer"):
+        # Delayed-mode in-situ current observations (Copernicus Marine
+        # 013_044) — ADCP/Argo/drifter/glider, one dedicated folder per
+        # instrument so provenance is distinguishable from the NRT
+        # `copernicus_insitu` block above (which lumps everything under a
+        # generic "insitu" source_type label).
+        for instrument in (
+            "adcp_historical", "argo_historical", "drifter_historical", "glider_historical",
+        ):
+            subdir = base_dir / instrument
+            if subdir.exists():
+                for csv_path in sorted(subdir.glob("*.csv")):
+                    ds = _filtered(
+                        DataTreeConverter.from_insitu_csv(csv_path, source_type=instrument),
+                        csv_path.name,
+                    )
+                    if ds is not None:
+                        datasets[f"validation/{instrument}/{csv_path.stem}"] = ds
+                        logger.info("Converted %s CSV: %s", instrument, csv_path.name)
+
+        # Scatterometer / OSI-SAF winds (standardised to point dimension).
+        # scatterometer_hy2b/hy2c/oceansat3 are the KNMI OSI-SAF FTP,
+        # recent-only 25km sources; from_scatterometer_nc handles them
+        # unchanged (verified against real sample files — see design doc).
+        for subdir_name in (
+            "osi_saf_winds", "scatterometer",
+            "scatterometer_hy2b", "scatterometer_hy2c", "scatterometer_oceansat3",
+        ):
             subdir = base_dir / subdir_name
             if subdir.exists():
                 for nc_path in sorted(subdir.glob("*.nc")):

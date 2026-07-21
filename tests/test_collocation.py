@@ -482,6 +482,70 @@ class TestHfRadarGridDispatch:
         assert spec["distance_weighting"] == "equal"
 
 
+class TestResolveLayerTypeScatterometerVariants:
+    def test_hy2b_path_resolves_to_its_own_spec_key(self):
+        import xarray as xr
+
+        from sar_validation.core.collocation import _resolve_layer_type
+        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+
+        ds = xr.Dataset(attrs={"data_type": "scatterometer"})
+        layer_type = _resolve_layer_type(
+            ds, "validation/scatterometer_hy2b/some_file", DEFAULT_LAYER_TYPE_SPECS
+        )
+        assert layer_type == "scatterometer_hy2b"
+
+    def test_oceansat3_path_resolves_to_its_own_spec_key(self):
+        import xarray as xr
+
+        from sar_validation.core.collocation import _resolve_layer_type
+        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+
+        ds = xr.Dataset(attrs={"data_type": "scatterometer"})
+        layer_type = _resolve_layer_type(
+            ds, "validation/scatterometer_oceansat3/some_file", DEFAULT_LAYER_TYPE_SPECS
+        )
+        assert layer_type == "scatterometer_oceansat3"
+
+    def test_plain_ascat_path_still_resolves_to_bare_scatterometer(self):
+        """Regression guard: the refinement must not over-match ASCAT nodes."""
+        import xarray as xr
+
+        from sar_validation.core.collocation import _resolve_layer_type
+        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+
+        ds = xr.Dataset(attrs={"data_type": "scatterometer"})
+        layer_type = _resolve_layer_type(
+            ds, "validation/scatterometer/some_file", DEFAULT_LAYER_TYPE_SPECS
+        )
+        assert layer_type == "scatterometer"
+
+    def test_altimeter_frequency_refinement_still_works(self):
+        """Regression guard: extracting the helper must preserve existing behavior."""
+        import xarray as xr
+
+        from sar_validation.core.collocation import _resolve_layer_type
+        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+
+        ds = xr.Dataset(attrs={"data_type": "altimeter", "frequency": "5hz"})
+        layer_type = _resolve_layer_type(
+            ds, "validation/altimeter/Cryosat-2", DEFAULT_LAYER_TYPE_SPECS
+        )
+        assert layer_type == "altimeter_5hz"
+
+
+class TestScatterometerVariantDefaultSpecs:
+    @pytest.mark.parametrize("key", [
+        "scatterometer_hy2b", "scatterometer_hy2c", "scatterometer_oceansat3",
+    ])
+    def test_25km_spec_present(self, key):
+        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+        spec = DEFAULT_LAYER_TYPE_SPECS[key]
+        assert spec["aggregation_window_km"] == 25.0
+        assert spec["time_tolerance_minutes"] == 180
+        assert spec["distance_weighting"] == "equal"
+
+
 # ---------------------------------------------------------------------------
 # Former stub tests (now verify classes are functional)
 # ---------------------------------------------------------------------------

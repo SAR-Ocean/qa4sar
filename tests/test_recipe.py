@@ -245,6 +245,7 @@ class TestCurrentsTemplate:
         assert source_types == [
             "hf_radar", "hf_radar_historical", "hf_radar_noaa",
             "drifter", "ferrybox", "mooring",
+            "adcp_historical", "argo_historical", "drifter_historical", "glider_historical",
         ]
 
         assert recipe.sar_data.max_downloads == 7
@@ -259,3 +260,48 @@ class TestCurrentsTemplate:
         # The gridded product has no depth axis; the recipe shouldn't imply one.
         assert hf_radar_src.min_depth is None
         assert hf_radar_src.max_depth is None
+
+
+class TestCurrentsTemplateDelayedInstruments:
+    def test_all_four_delayed_instruments_present_by_default(self):
+        from sar_validation import cli
+
+        recipe = cli._build_currents_config(limit=None)
+        source_types = {s.source_type for s in recipe.validation_sources}
+        assert {
+            "adcp_historical", "argo_historical", "drifter_historical", "glider_historical",
+        }.issubset(source_types)
+
+
+class TestWindTemplate:
+    def test_includes_ftp_scatterometer_sources(self):
+        from sar_validation import cli
+
+        recipe = cli._build_wind_config(limit=None)
+        source_types = {s.source_type for s in recipe.validation_sources}
+        assert {
+            "scatterometer_hy2b", "scatterometer_hy2c", "scatterometer_oceansat3",
+        }.issubset(source_types)
+        assert "scatterometer" in source_types  # ASCAT/EUMDAC untouched
+
+    def test_ftp_scatterometer_sources_have_25km_layer_specs(self):
+        from sar_validation import cli
+
+        recipe = cli._build_wind_config(limit=None)
+        specs = recipe.collocation.layer_vs_layer.layer_type_specs
+        for key in ("scatterometer_hy2b", "scatterometer_hy2c", "scatterometer_oceansat3"):
+            assert specs[key]["aggregation_window_km"] == 25.0
+        assert specs["scatterometer"]["aggregation_window_km"] == 12.5
+
+    def test_preserves_existing_wind_content(self):
+        """The extraction into a builder must not drop any existing sources/specs."""
+        from sar_validation import cli
+
+        recipe = cli._build_wind_config(limit=3)
+        source_types = [s.source_type for s in recipe.validation_sources]
+        assert source_types == [
+            "mooring", "buoy", "ferrybox", "drifter", "tidal_gauge",
+            "scatterometer", "altimeter", "radiometer",
+            "scatterometer_hy2b", "scatterometer_hy2c", "scatterometer_oceansat3",
+        ]
+        assert recipe.sar_data.max_downloads == 3
