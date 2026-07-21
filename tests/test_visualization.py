@@ -2051,7 +2051,10 @@ class TestValidationReportCurrentsPointSize:
 
         assert captured.get("point_size") == 15
 
-    def test_wind_recipe_keeps_default_point_size(self, geo_datatree_and_collocation, tmp_path, monkeypatch):
+    def test_wind_recipe_uses_adaptive_point_size(self, geo_datatree_and_collocation, tmp_path, monkeypatch):
+        """Wind recipes now use adaptive point sizing for scatterometer data
+        to avoid occluding the SAR field. For sparse data (<300 pts/scene),
+        use point_size=15. For dense data (>300 pts/scene), use point_size=5."""
         import matplotlib.pyplot as plt
 
         import sar_validation.core.visualization as viz
@@ -2070,7 +2073,9 @@ class TestValidationReportCurrentsPointSize:
         viz.validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
         plt.close("all")
 
-        assert captured.get("point_size") == 40
+        # geo_datatree_and_collocation has 4 points in 1 scene = 4 points/scene
+        # which is < 300, so should use point_size=15
+        assert captured.get("point_size") == 15
 
 
 class TestPlotRvlLandQa:

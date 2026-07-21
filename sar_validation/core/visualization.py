@@ -2176,7 +2176,20 @@ def validation_report(
             # tiles edge-to-edge and completely hides the SAR field
             # underneath it — use a smaller marker for currents recipes so
             # the SAR scene stays visible through the validation points.
-            geo_point_size = 15 if variable == "currents" else 40
+            # Scatterometer (wind/waves) similarly occludes the SAR field;
+            # for wind, use adaptive sizing: if >~300 points per scene,
+            # use smaller markers (10), else 15. Currents always 15, other
+            # variables default to 40.
+            if variable == "currents":
+                geo_point_size = 15
+            elif variable == "wind":
+                # Adaptive sizing: if scatterometer data is very dense
+                # (>~300 pts/scene), use smaller markers to avoid occluding
+                # the SAR field.
+                avg_points_per_scene = len(pair_ds) / max(1, len(matched_scenes or []))
+                geo_point_size = 5 if avg_points_per_scene > 300 else 15
+            else:
+                geo_point_size = 40
             geo_result = plot_geographic(
                 datatree, pair_ds, sar_var, val_var, scenes=matched_scenes,
                 point_size=geo_point_size,
