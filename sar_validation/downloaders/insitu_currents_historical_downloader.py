@@ -45,6 +45,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import pandas as pd
+
 from .base import (
     build_output_dir,
     copernicus_marine_download_kwargs,
@@ -206,6 +208,14 @@ class InSituCurrentsHistoricalDownloader:
                 f"copernicusmarine download completed but produced no file for "
                 f"{self.instrument} in [{start_dt}, {end_dt}] (dataset_id='{dataset_id}')."
             )
+
+        if pd.read_csv(dest_path).empty:
+            logger.warning(
+                "No %s delayed-mode currents data in [%s, %s]; removing empty output.",
+                self.instrument, start_dt, end_dt,
+            )
+            dest_path.unlink()
+            return None
 
         print(f"  Saved to {dest_path}")
         return dest_path

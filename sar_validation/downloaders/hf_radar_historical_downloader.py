@@ -50,6 +50,12 @@ __all__ = ["HFRadarHistoricalDownloader"]
 
 DATASET_ID = "cmems_obs-ins_glo_phy-cur_my_radar-total_irr"
 
+# Fixed, run-independent location for the raw multi-year archive files
+# (100s of MB each, one per region, covering that region's entire record).
+# Every run reuses whatever's already here via copernicusmarine.get's
+# skip_existing=True, instead of re-fetching into a fresh per-run folder.
+_ARCHIVE_CACHE_DIR = Path("data") / "_archive_cache" / "hf_radar_historical"
+
 # Regions present in the delayed-mode archive, verified via
 # copernicusmarine.get(dataset_id=DATASET_ID, dry_run=True) on 2026-07-15.
 # Regions in HFR_REGIONS but absent here (GoS, Granitola, WHub) have no
@@ -189,7 +195,20 @@ class HFRadarHistoricalDownloader:
         end_dt: str,
         filename_suffix: str,
     ) -> Optional[Path]:
-        remote_filename = _region_filename(region, start_dt, end_dt)
+        try:
+            remote_filename = _region_filename(region, start_dt, end_dt)
+        except ValueError as exc:
+            # No delayed-mode archive exists for this region, or (for the
+            # split-by-year US-EastGulfCoast case) not for this year. This
+            # is a "no data available" outcome, not a real failure — the
+            # caller falls back to the NRT downloader. NotImplementedError
+            # (multi-year-spanning request) is a different, genuine
+            # limitation and is intentionally not caught here.
+            logger.warning(
+                "Skipping delayed-mode HF-radar download for region '%s': %s",
+                region, exc,
+            )
+            return None
 
         start_d = start_dt.split("T")[0]
         end_d = end_dt.split("T")[0]
@@ -217,7 +236,7 @@ class HFRadarHistoricalDownloader:
         import xarray as xr
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        raw_cache_dir = self.output_dir / "_raw_archive"
+        raw_cache_dir = _ARCHIVE_CACHE_DIR
         raw_cache_dir.mkdir(parents=True, exist_ok=True)
 
         print("Fetching Copernicus HF-radar delayed-mode archive …")
@@ -260,10 +279,14 @@ class HFRadarHistoricalDownloader:
                 )
             )
             if normalized.sizes.get("time", 0) == 0:
-                raise FileNotFoundError(
-                    f"Copernicus HF-radar historical archive for region '{region}' has "
-                    f"no data in [{start_dt}, {end_dt}]."
+                logger.warning(
+                    "No delayed-mode HF-radar data for region '%s' in [%s, %s] "
+                    "(the archive's real coverage may not extend this far "
+                    "yet, even though the request is old enough per the "
+                    "recency guard).",
+                    region, start_dt, end_dt,
                 )
+                return None
             normalized.to_netcdf(dest_path)
         finally:
             raw.close()

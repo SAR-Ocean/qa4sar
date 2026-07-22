@@ -56,7 +56,9 @@ class TestRecencyGuard:
         def fake_subset(**kwargs):
             # Simulate copernicusmarine writing the requested file — the
             # downloader checks dest_path.exists() after the call.
-            Path(kwargs["output_directory"], kwargs["output_filename"]).write_bytes(b"")
+            Path(kwargs["output_directory"], kwargs["output_filename"]).write_text(
+                "time,EWCT,NSCT\n2024-01-01T00:00:00,0.1,0.2\n"
+            )
 
         fake_module.subset.side_effect = fake_subset
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
@@ -77,7 +79,9 @@ class TestSubsetCall:
         fake_module = MagicMock()
 
         def fake_subset(**kwargs):
-            Path(kwargs["output_directory"], kwargs["output_filename"]).write_bytes(b"")
+            Path(kwargs["output_directory"], kwargs["output_filename"]).write_text(
+                "time,EWCT,NSCT\n2024-01-01T00:00:00,0.1,0.2\n"
+            )
 
         fake_module.subset.side_effect = fake_subset
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
@@ -97,7 +101,9 @@ class TestSubsetCall:
         fake_module = MagicMock()
 
         def fake_subset(**kwargs):
-            Path(kwargs["output_directory"], kwargs["output_filename"]).write_bytes(b"")
+            Path(kwargs["output_directory"], kwargs["output_filename"]).write_text(
+                "time,EWCT,NSCT\n2024-01-01T00:00:00,0.1,0.2\n"
+            )
 
         fake_module.subset.side_effect = fake_subset
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
@@ -105,6 +111,54 @@ class TestSubsetCall:
 
         assert "force_download" not in fake_module.subset.call_args.kwargs
         assert fake_module.subset.call_args.kwargs["skip_existing"] is True
+
+    def test_empty_subset_result_returns_empty_and_removes_file(self, tmp_path, caplog):
+        from pathlib import Path
+
+        now = datetime.now(timezone.utc)
+        end = (now - timedelta(days=200)).strftime("%Y-%m-%d")
+        start = (now - timedelta(days=201)).strftime("%Y-%m-%d")
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="drifter", output_dir=tmp_path)
+        fake_module = MagicMock()
+
+        def fake_subset(**kwargs):
+            # copernicusmarine "succeeds" but the requested window has no
+            # matching rows — only the CSV header is written.
+            Path(kwargs["output_directory"], kwargs["output_filename"]).write_text(
+                "time,EWCT,NSCT\n"
+            )
+
+        fake_module.subset.side_effect = fake_subset
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}), \
+             caplog.at_level(logging.WARNING):
+            out = dl.download(_MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT, start, end)
+
+        assert out == []
+        assert list(tmp_path.glob("*.csv")) == []
+        assert any("drifter" in r.message and "No" in r.message for r in caplog.records)
+
+    def test_nonempty_subset_result_still_returns_the_path(self, tmp_path):
+        from pathlib import Path
+
+        now = datetime.now(timezone.utc)
+        end = (now - timedelta(days=200)).strftime("%Y-%m-%d")
+        start = (now - timedelta(days=201)).strftime("%Y-%m-%d")
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="drifter", output_dir=tmp_path)
+        fake_module = MagicMock()
+
+        def fake_subset(**kwargs):
+            Path(kwargs["output_directory"], kwargs["output_filename"]).write_text(
+                "time,EWCT,NSCT\n2024-01-01T00:00:00,0.1,0.2\n"
+            )
+
+        fake_module.subset.side_effect = fake_subset
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            out = dl.download(_MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT, start, end)
+
+        assert len(out) == 1
+        assert out[0].exists()
 
 
 class TestForceDownload:

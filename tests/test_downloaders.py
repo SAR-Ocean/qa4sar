@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1752,15 +1753,21 @@ class TestHFRadarHistoricalDownloader:
         assert "US-EastGulfCoast" in captured
         assert "GL_TV_HF_HFR-US-EastGulfCoast_Total_2021.nc" in captured
 
-    def test_unavailable_region_raises_clear_error(self, tmp_path):
+    def test_unavailable_region_returns_empty(self, tmp_path, caplog):
         from sar_validation.downloaders.hf_radar_historical_downloader import (
             HFRadarHistoricalDownloader,
         )
 
         dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=True)
-        # GoS (Italy) has an NRT feed but no delayed-mode archive.
-        with pytest.raises(ValueError, match="no delayed-mode HF-radar archive"):
-            dl.download(13.5, 15.5, 40.0, 41.0, "2021-01-01", "2021-01-02")
+        # GoS (Italy) has an NRT feed but no delayed-mode archive. This must
+        # not raise — the orchestrator's NRT-fallback logic (see
+        # orchestrator.py's _HISTORICAL_FIRST_PAIRS) depends on an empty
+        # list, not an exception, to know it should try hf_radar instead.
+        with caplog.at_level(logging.WARNING):
+            out = dl.download(13.5, 15.5, 40.0, 41.0, "2021-01-01", "2021-01-02")
+
+        assert out == []
+        assert any("no delayed-mode HF-radar archive" in r.message for r in caplog.records)
 
     def test_multi_year_request_not_yet_supported(self, tmp_path):
         from sar_validation.downloaders.hf_radar_historical_downloader import (
@@ -1771,7 +1778,7 @@ class TestHFRadarHistoricalDownloader:
         with pytest.raises(NotImplementedError, match="single calendar year"):
             dl.download(-90.0, -60.0, 30.0, 40.0, "2020-12-30", "2021-01-02")
 
-    def test_year_outside_split_archive_range_raises_clear_error(self, tmp_path):
+    def test_year_outside_split_archive_range_returns_empty(self, tmp_path, caplog):
         from sar_validation.downloaders.hf_radar_historical_downloader import (
             HFRadarHistoricalDownloader,
         )
@@ -1779,13 +1786,16 @@ class TestHFRadarHistoricalDownloader:
         dl = HFRadarHistoricalDownloader(output_dir=tmp_path, dry_run=True)
         # US-EastGulfCoast's historical archive is split into one file per
         # year, only for 2019-2024; a request for 2018 falls outside that
-        # range and should raise a clear, actionable error rather than a
-        # silent bad file lookup.
-        with pytest.raises(
-            ValueError,
-            match="No US-EastGulfCoast historical archive for year 2018",
-        ):
-            dl.download(-90.0, -60.0, 30.0, 40.0, "2018-01-01", "2018-01-02")
+        # range. Must return [] (not raise) for the same reason as the
+        # unavailable-region case above.
+        with caplog.at_level(logging.WARNING):
+            out = dl.download(-90.0, -60.0, 30.0, 40.0, "2018-01-01", "2018-01-02")
+
+        assert out == []
+        assert any(
+            "No US-EastGulfCoast historical archive for year 2018" in r.message
+            for r in caplog.records
+        )
 
     def test_download_gets_file_then_subsets_locally(self, tmp_path):
         from unittest.mock import patch
@@ -1835,6 +1845,59 @@ class TestHFRadarHistoricalDownloader:
         assert "time" in result.dims and "latitude" in result.dims and "longitude" in result.dims
         assert "DEPTH" not in result.dims
         assert result.sizes["time"] == 5
+
+    def test_archive_with_no_data_in_requested_window_returns_empty(self, tmp_path, caplog):
+        """Reproduces the ARPAS report: the archive file exists and opens
+        fine, but its real TIME coverage doesn't reach the requested window
+        (e.g. the region's delayed-mode processing lags further behind than
+        the fixed _MIN_AGE_DAYS guard assumes). Must return [] so the
+        orchestrator can fall back to the NRT downloader, not raise."""
+        from unittest.mock import patch
+
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        raw_dir = tmp_path / "_raw"
+        raw_dir.mkdir()
+        raw_path = raw_dir / "GL_TV_HF_HFR-US-WestCoast_Total.nc"
+        # Archive only covers early 2019; the request below (2021) falls
+        # entirely outside this range, mirroring ARPAS's real archive
+        # (covers 2022-11-11..2025-07-03) vs. a request past 2025-07-03.
+        times = pd.date_range("2019-01-01", periods=5, freq="1h")
+        shape = (5, 1, 2, 2)
+        ds = xr.Dataset(
+            {
+                "EWCT": (("TIME", "DEPTH", "LATITUDE", "LONGITUDE"), np.random.rand(*shape)),
+                "NSCT": (("TIME", "DEPTH", "LATITUDE", "LONGITUDE"), np.random.rand(*shape)),
+            },
+            coords={
+                "TIME": times, "DEPTH": [0.0],
+                "LATITUDE": [33.0, 34.0], "LONGITUDE": [-121.0, -120.0],
+            },
+        )
+        ds.to_netcdf(raw_path)
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path / "out", dry_run=False)
+        fake_module = MagicMock()
+
+        def fake_get(**kwargs):
+            return FileGetResult(files=[type("F", (), {"file_path": raw_path})()])
+
+        fake_module.get.side_effect = fake_get
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}), \
+             caplog.at_level(logging.WARNING):
+            out = dl.download(-121.0, -120.0, 33.0, 34.0, "2021-06-05", "2021-06-06")
+
+        assert out == []
+        # self.output_dir.mkdir() already ran earlier in _download_region_window,
+        # so the directory exists — it just must contain no .nc output.
+        assert list((tmp_path / "out").glob("*.nc")) == []
+        assert any("US-WestCoast" in r.message and "2021-06-05" in r.message for r in caplog.records)
 
 
 class TestHFRadarHistoricalDownloaderAntimeridian:
@@ -1932,6 +1995,39 @@ class TestHFRadarHistoricalDownloaderForceDownload:
 
         fake_module.get.assert_called_once()
 
+    def test_raw_archive_fetched_into_shared_cache_dir_not_per_run_output_dir(
+        self, tmp_path, monkeypatch
+    ):
+        """The raw multi-year archive (100s of MB) must be fetched into a
+        fixed, run-independent cache directory, not tmp_path/output_dir/
+        _raw_archive — otherwise every dated run folder re-downloads the
+        same file. monkeypatch the module's cache-dir constant so the test
+        doesn't touch the real repo-relative data/_archive_cache/ path."""
+        from unittest.mock import patch
+
+        import sar_validation.downloaders.hf_radar_historical_downloader as hf_hist_mod
+
+        shared_cache = tmp_path / "shared_cache"
+        monkeypatch.setattr(hf_hist_mod, "_ARCHIVE_CACHE_DIR", shared_cache)
+
+        per_run_output = tmp_path / "run1" / "hf_radar_historical"
+        dl = hf_hist_mod.HFRadarHistoricalDownloader(output_dir=per_run_output, dry_run=False)
+
+        fake_module = MagicMock()
+
+        def fake_get(**kwargs):
+            raise FileNotFoundError("no archive file matched (test stub, not exercised further)")
+
+        fake_module.get.side_effect = fake_get
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            with pytest.raises(FileNotFoundError):
+                dl.download(-90.0, -60.0, 30.0, 40.0, "2021-06-05", "2021-06-06")
+
+        get_kwargs = fake_module.get.call_args.kwargs
+        assert get_kwargs["output_directory"] == str(shared_cache)
+        assert shared_cache.exists()
+        assert not (per_run_output / "_raw_archive").exists()
+
 
 class TestOrchestratorHFRadarHistoricalWiring:
     def test_dispatch_source_registers_hf_radar_historical_handler(self):
@@ -2002,6 +2098,233 @@ class TestOrchestratorCurrentsHistoricalWiring:
 
         assert ok is True
         assert mock_cls.call_args.kwargs["instrument"] == instrument
+
+
+class TestOrchestratorHistoricalFirstDedup:
+    def test_hf_radar_skipped_when_historical_covers_the_window(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(
+            name="test-dedup-hfradar-skip",
+            variable="currents",
+            output_dir=str(tmp_path),
+            validation_sources=[
+                ValidationDataSource(source_type="hf_radar"),
+                ValidationDataSource(source_type="hf_radar_historical"),
+            ],
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+
+        with patch(
+            "sar_validation.downloaders.sar_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.hf_radar_historical_downloader.HFRadarHistoricalDownloader"
+        ) as mock_hist_cls, patch(
+            "sar_validation.downloaders.hf_radar_downloader.HFRadarDownloader"
+        ) as mock_nrt_cls:
+            mock_sar_cls.return_value.download.return_value = []
+            mock_hist_cls.return_value.download.return_value = [tmp_path / "one.nc"]
+            ok = orchestrator.download_all()
+
+        assert ok is True
+        mock_hist_cls.return_value.download.assert_called_once()
+        mock_nrt_cls.return_value.download.assert_not_called()
+        assert orchestrator.metadata["downloads"]["hf_radar"]["status"] == "skipped"
+        assert orchestrator.metadata["downloads"]["hf_radar_historical"]["file_count"] == 1
+
+    def test_hf_radar_dispatched_when_historical_returns_empty(self, tmp_path):
+        """Also covers the ARPAS report: historical resolving a region but
+        finding no data for this window (recency guard, archive-coverage
+        gap, or unmapped region) must still let NRT fill in."""
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(
+            name="test-dedup-hfradar-fallback",
+            variable="currents",
+            output_dir=str(tmp_path),
+            validation_sources=[
+                ValidationDataSource(source_type="hf_radar"),
+                ValidationDataSource(source_type="hf_radar_historical"),
+            ],
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+
+        with patch(
+            "sar_validation.downloaders.sar_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.hf_radar_historical_downloader.HFRadarHistoricalDownloader"
+        ) as mock_hist_cls, patch(
+            "sar_validation.downloaders.hf_radar_downloader.HFRadarDownloader"
+        ) as mock_nrt_cls:
+            mock_sar_cls.return_value.download.return_value = []
+            mock_hist_cls.return_value.download.return_value = []
+            mock_nrt_cls.return_value.download.return_value = []
+            ok = orchestrator.download_all()
+
+        assert ok is True
+        mock_nrt_cls.return_value.download.assert_called_once()
+        assert orchestrator.metadata["downloads"]["hf_radar"]["status"] == "dry_run"
+        assert orchestrator.metadata["downloads"]["hf_radar_historical"]["file_count"] == 0
+
+    def test_hf_radar_alone_unaffected_by_dedup_logic(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(
+            name="test-dedup-no-pair",
+            variable="currents",
+            output_dir=str(tmp_path),
+            validation_sources=[ValidationDataSource(source_type="hf_radar")],
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+
+        with patch(
+            "sar_validation.downloaders.sar_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.hf_radar_downloader.HFRadarDownloader"
+        ) as mock_nrt_cls:
+            mock_sar_cls.return_value.download.return_value = []
+            mock_nrt_cls.return_value.download.return_value = []
+            ok = orchestrator.download_all()
+
+        assert ok is True
+        mock_nrt_cls.return_value.download.assert_called_once()
+        assert orchestrator.metadata["downloads"]["hf_radar"]["status"] == "dry_run"
+
+    def test_drifter_excluded_from_nrt_batch_when_historical_covers_it(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(
+            name="test-dedup-drifter-skip",
+            variable="currents",
+            output_dir=str(tmp_path),
+            validation_sources=[
+                ValidationDataSource(source_type="drifter"),
+                ValidationDataSource(source_type="drifter_historical"),
+                ValidationDataSource(source_type="mooring"),
+            ],
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+
+        with patch(
+            "sar_validation.downloaders.sar_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.insitu_currents_historical_downloader."
+            "InSituCurrentsHistoricalDownloader"
+        ) as mock_hist_cls, patch(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader"
+        ) as mock_insitu_cls:
+            mock_sar_cls.return_value.download.return_value = []
+            mock_hist_cls.return_value.download.return_value = [tmp_path / "drifter.csv"]
+            mock_insitu_cls.return_value.download.return_value = []
+            ok = orchestrator.download_all()
+
+        assert ok is True
+        assert orchestrator.metadata["downloads"]["insitu"]["source_types"] == ["mooring"]
+
+    def test_drifter_kept_in_nrt_batch_when_historical_returns_empty(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(
+            name="test-dedup-drifter-fallback",
+            variable="currents",
+            output_dir=str(tmp_path),
+            validation_sources=[
+                ValidationDataSource(source_type="drifter"),
+                ValidationDataSource(source_type="drifter_historical"),
+                ValidationDataSource(source_type="mooring"),
+            ],
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+
+        with patch(
+            "sar_validation.downloaders.sar_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.insitu_currents_historical_downloader."
+            "InSituCurrentsHistoricalDownloader"
+        ) as mock_hist_cls, patch(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader"
+        ) as mock_insitu_cls:
+            mock_sar_cls.return_value.download.return_value = []
+            mock_hist_cls.return_value.download.return_value = []
+            mock_insitu_cls.return_value.download.return_value = []
+            ok = orchestrator.download_all()
+
+        assert ok is True
+        source_types = orchestrator.metadata["downloads"]["insitu"]["source_types"]
+        assert sorted(source_types) == ["drifter", "mooring"]
+
+    def test_insitu_batch_fully_skipped_when_only_drifter_and_historical_covers_it(
+        self, tmp_path
+    ):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(
+            name="test-dedup-insitu-full-skip",
+            variable="currents",
+            output_dir=str(tmp_path),
+            validation_sources=[
+                ValidationDataSource(source_type="drifter"),
+                ValidationDataSource(source_type="drifter_historical"),
+            ],
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+
+        with patch(
+            "sar_validation.downloaders.sar_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.insitu_currents_historical_downloader."
+            "InSituCurrentsHistoricalDownloader"
+        ) as mock_hist_cls, patch(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader"
+        ) as mock_insitu_cls:
+            mock_sar_cls.return_value.download.return_value = []
+            mock_hist_cls.return_value.download.return_value = [tmp_path / "drifter.csv"]
+            ok = orchestrator.download_all()
+
+        assert ok is True
+        mock_insitu_cls.assert_not_called()
+        assert "insitu" not in orchestrator.metadata["downloads"]
+
+    def test_insitu_batch_depth_window_ignores_excluded_drifter(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(
+            name="test-dedup-depth-window",
+            variable="currents",
+            output_dir=str(tmp_path),
+            validation_sources=[
+                ValidationDataSource(source_type="drifter", min_depth=-500.0, max_depth=500.0),
+                ValidationDataSource(source_type="drifter_historical"),
+                ValidationDataSource(source_type="mooring"),  # default -20/20
+            ],
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+
+        with patch(
+            "sar_validation.downloaders.sar_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.insitu_currents_historical_downloader."
+            "InSituCurrentsHistoricalDownloader"
+        ) as mock_hist_cls, patch(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader"
+        ) as mock_insitu_cls:
+            mock_sar_cls.return_value.download.return_value = []
+            mock_hist_cls.return_value.download.return_value = [tmp_path / "drifter.csv"]
+            mock_insitu_cls.return_value.download.return_value = []
+            orchestrator.download_all()
+
+        # drifter's -500/500 depth override must not widen the NRT batch's
+        # depth window, since drifter itself was excluded from that batch.
+        _, insitu_ctor_kwargs = mock_insitu_cls.call_args
+        assert insitu_ctor_kwargs["min_depth"] == -20.0
+        assert insitu_ctor_kwargs["max_depth"] == 20.0
 
 
 # ---------------------------------------------------------------------------

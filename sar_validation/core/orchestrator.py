@@ -28,6 +28,27 @@ __all__ = ["DataOrchestrator"]
 # In-situ platform types handled by the InSituDownloader
 _INSITU_TYPES = {"mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"}
 
+# Delayed-mode ("historical") source_types, dispatched before any NRT
+# source so their actual results can inform whether the NRT counterpart is
+# still needed. hf_radar_historical/adcp_historical/argo_historical/
+# glider_historical have no NRT pairing entry below (glider/adcp/argo have
+# no NRT counterpart at all; hf_radar's pairing is expressed via
+# _HISTORICAL_FIRST_PAIRS instead of this set).
+_HISTORICAL_FIRST_TYPES = {
+    "hf_radar_historical", "adcp_historical", "argo_historical",
+    "drifter_historical", "glider_historical",
+}
+
+# NRT source_type -> its delayed-mode counterpart. When the historical side
+# is present in the recipe and produced at least one file for this run's
+# window, the NRT side is skipped (hf_radar) or excluded from the batched
+# NRT in-situ call (drifter) rather than re-downloading the same physical
+# observations from a lower-QC pipeline.
+_HISTORICAL_FIRST_PAIRS = {
+    "hf_radar": "hf_radar_historical",
+    "drifter": "drifter_historical",
+}
+
 
 class DataOrchestrator:
     """
@@ -99,23 +120,71 @@ class DataOrchestrator:
         if not self._download_sar():
             ok = False
 
-        # 2. Group in-situ sources and download as one batch
+        # 2. Delayed-mode ("*_historical") sources first. hf_radar and the
+        # NRT in-situ batch (below) consult file_count from these results
+        # to avoid re-downloading the same physical observations from the
+        # NRT feed once the historical/reprocessed data already covers
+        # this run's window.
+        historical_had_data: Dict[str, bool] = {}
+        for source in self.recipe.config.validation_sources:
+            if source.source_type not in _HISTORICAL_FIRST_TYPES:
+                continue
+            if not self._dispatch_source(source):
+                ok = False
+            file_count = self.metadata["downloads"].get(
+                source.source_type, {}
+            ).get("file_count", 0)
+            historical_had_data[source.source_type] = file_count > 0
+
+        # 3. Group in-situ sources and download as one batch, dropping any
+        # NRT type whose paired historical source already covered this
+        # window (in practice, only "drifter" is ever a pair key here).
         insitu_sources = [
             s for s in self.recipe.config.validation_sources
             if s.source_type in _INSITU_TYPES
         ]
-        if insitu_sources:
-            source_types = [s.source_type for s in insitu_sources]
-            # Use the most permissive depth window across all in-situ sources
-            min_depth = min(s.resolved_min_depth for s in insitu_sources)
-            max_depth = max(s.resolved_max_depth for s in insitu_sources)
+        source_types = [
+            s.source_type for s in insitu_sources
+            if not historical_had_data.get(_HISTORICAL_FIRST_PAIRS.get(s.source_type, ""))
+        ]
+        if source_types:
+            # Use the most permissive depth window across the in-situ
+            # sources actually being requested (excludes any source dropped
+            # above, so an excluded source's depth override can't widen a
+            # batch it's no longer part of).
+            min_depth = min(
+                s.resolved_min_depth for s in insitu_sources
+                if s.source_type in source_types
+            )
+            max_depth = max(
+                s.resolved_max_depth for s in insitu_sources
+                if s.source_type in source_types
+            )
             if not self._download_insitu(source_types, min_depth, max_depth):
                 ok = False
+        elif insitu_sources:
+            logger.info(
+                "Skipping NRT in-situ batch: every requested platform type "
+                "is covered by a historical source for this window."
+            )
 
-        # 3. Other sources one by one
+        # 4. Other sources one by one
         for source in self.recipe.config.validation_sources:
             if source.source_type in _INSITU_TYPES:
                 continue   # handled above
+            if source.source_type in _HISTORICAL_FIRST_TYPES:
+                continue   # already dispatched in step 2
+            paired_historical = _HISTORICAL_FIRST_PAIRS.get(source.source_type)
+            if paired_historical and historical_had_data.get(paired_historical):
+                self.metadata["downloads"][source.source_type] = {
+                    "status": "skipped",
+                    "reason": f"covered by {paired_historical}",
+                }
+                logger.info(
+                    "Skipping %s: covered by %s for this window.",
+                    source.source_type, paired_historical,
+                )
+                continue
             if not self._dispatch_source(source):
                 ok = False
 
@@ -378,13 +447,14 @@ class DataOrchestrator:
             dl = HFRadarHistoricalDownloader(
                 output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
             )
-            dl.download(
+            downloaded = dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=temp.start, end=temp.end,
-            )
+            ) or []
             self.metadata["downloads"]["hf_radar_historical"] = {
                 "status": "dry_run" if self.dry_run else "success",
+                "file_count": len(downloaded),
             }
             return True
         except Exception as exc:
@@ -413,13 +483,14 @@ class DataOrchestrator:
                 max_depth=source.resolved_max_depth,
                 force_download=self.force_download,
             )
-            dl.download(
+            downloaded = dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=temp.start, end=temp.end,
-            )
+            ) or []
             self.metadata["downloads"][f"{instrument}_historical"] = {
                 "status": "dry_run" if self.dry_run else "success",
+                "file_count": len(downloaded),
             }
             return True
         except Exception as exc:
