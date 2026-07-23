@@ -204,13 +204,21 @@ class InSituCurrentsHistoricalDownloader:
         )
 
         if not dest_path.exists():
-            raise FileNotFoundError(
-                f"copernicusmarine download completed but produced no file for "
-                f"{self.instrument} in [{start_dt}, {end_dt}] (dataset_id='{dataset_id}')."
+            # copernicusmarine.subset() doesn't always write a header-only
+            # CSV for a genuinely empty result -- sometimes it writes no
+            # file at all. This is the same "no data" outcome as the
+            # empty-CSV case just below, not a real failure: treat it the
+            # same way (debug-log, no exception) so the caller's success
+            # path -- and its output-directory cleanup -- still runs.
+            logger.debug(
+                "No %s delayed-mode currents data in [%s, %s]; copernicusmarine "
+                "wrote no output file.",
+                self.instrument, start_dt, end_dt,
             )
+            return None
 
         if pd.read_csv(dest_path).empty:
-            logger.warning(
+            logger.debug(
                 "No %s delayed-mode currents data in [%s, %s]; removing empty output.",
                 self.instrument, start_dt, end_dt,
             )

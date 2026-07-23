@@ -1899,6 +1899,60 @@ class TestHFRadarHistoricalDownloader:
         assert list((tmp_path / "out").glob("*.nc")) == []
         assert any("US-WestCoast" in r.message and "2021-06-05" in r.message for r in caplog.records)
 
+    def test_out_of_order_timestamps_elsewhere_in_archive_do_not_break_slicing(self, tmp_path):
+        """Reproduces the DeltaEbro report: a handful of out-of-order TIME
+        values anywhere in the multi-year archive (e.g. from delayed QC
+        reprocessing swapping two adjacent hourly readings) make pandas
+        refuse *any* label-based time slice on that file -- even for a
+        request nowhere near the bad points -- unless TIME is sorted
+        first."""
+        from unittest.mock import patch
+
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        raw_dir = tmp_path / "_raw"
+        raw_dir.mkdir()
+        raw_path = raw_dir / "GL_TV_HF_HFR-US-WestCoast_Total.nc"
+        times = list(pd.date_range("2019-01-01", periods=10, freq="1h"))
+        # Swap two adjacent timestamps near the end out of order, far from
+        # the requested window below -- mirrors DeltaEbro's real archive,
+        # which has out-of-order timestamps in 2025 that broke a 2019
+        # request.
+        times[8], times[9] = times[9], times[8]
+        times = pd.DatetimeIndex(times)
+        shape = (10, 1, 2, 2)
+        ds = xr.Dataset(
+            {
+                "EWCT": (("TIME", "DEPTH", "LATITUDE", "LONGITUDE"), np.random.rand(*shape)),
+                "NSCT": (("TIME", "DEPTH", "LATITUDE", "LONGITUDE"), np.random.rand(*shape)),
+            },
+            coords={
+                "TIME": times, "DEPTH": [0.0],
+                "LATITUDE": [33.0, 34.0], "LONGITUDE": [-121.0, -120.0],
+            },
+        )
+        ds.to_netcdf(raw_path)
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path / "out", dry_run=False)
+        fake_module = MagicMock()
+
+        def fake_get(**kwargs):
+            return FileGetResult(files=[type("F", (), {"file_path": raw_path})()])
+
+        fake_module.get.side_effect = fake_get
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            out = dl.download(-121.0, -120.0, 33.0, 34.0, "2019-01-01T00:00:00", "2019-01-01T03:00:00")
+
+        assert len(out) == 1
+        result = xr.open_dataset(out[0])
+        assert result.sizes["time"] == 4
+
 
 class TestHFRadarHistoricalDownloaderAntimeridian:
     def test_crossing_bbox_with_no_covering_region_on_either_side_raises(self, tmp_path):

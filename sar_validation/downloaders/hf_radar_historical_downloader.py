@@ -271,7 +271,7 @@ class HFRadarHistoricalDownloader:
                 raw[["EWCT", "NSCT"] + [v for v in _ancillary_vars if v in raw]]
                 .squeeze("DEPTH", drop=True)
                 .rename({"TIME": "time", "LATITUDE": "latitude", "LONGITUDE": "longitude"})
-                .sortby(["latitude", "longitude"])
+                .sortby(["time", "latitude", "longitude"])
                 .sel(
                     time=slice(start_dt, end_dt),
                     latitude=slice(min_lat, max_lat),

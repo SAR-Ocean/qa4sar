@@ -94,6 +94,54 @@ class TestExecuteRecipeContinuesPastDownloadFailure:
         assert "continuing with available data" in out
 
 
+class TestExecuteRecipePrintsFinalWarningsSummary:
+    def test_prints_notices_and_errors_at_the_end_of_the_run(self, tmp_path, capsys):
+        """A notice fired early (e.g. during Step 1's download phase) must
+        still be visible at the very end of the run, after Steps 2/3/5a/5b
+        have printed a lot more output -- not just as a log line that
+        scrolls past mid-run."""
+        import json
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "notices": ["No delayed-mode in-situ current data found (adcp, argo) for this window."],
+        }))
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-final-summary", variable="wind", output_dir=str(run_dir),
+        )).to_yaml(recipe_path)
+
+        cli._execute_recipe(str(recipe_path))
+
+        out = capsys.readouterr().out
+        assert "Warnings from this run:" in out
+        assert "No delayed-mode in-situ current data found (adcp, argo) for this window." in out
+
+    def test_no_warnings_prints_no_summary_block(self, tmp_path, capsys):
+        import json
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "download_metadata.json").write_text(json.dumps({"errors": [], "notices": []}))
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-no-warnings", variable="wind", output_dir=str(run_dir),
+        )).to_yaml(recipe_path)
+
+        cli._execute_recipe(str(recipe_path))
+
+        out = capsys.readouterr().out
+        assert "Warnings from this run:" not in out
+
+
 class TestLoadDownloadWarnings:
     def test_no_metadata_file_returns_none(self, tmp_path):
         assert cli._load_download_warnings(tmp_path) is None
@@ -105,6 +153,45 @@ class TestLoadDownloadWarnings:
         assert cli._load_download_warnings(tmp_path) is None
 
     def test_returns_errors_list(self, tmp_path):
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(
+            json.dumps({"errors": ["altimeter download failed: timeout"]})
+        )
+        assert cli._load_download_warnings(tmp_path) == ["altimeter download failed: timeout"]
+
+    def test_returns_notices_list_alongside_errors(self, tmp_path):
+        """notices (e.g. "no delayed-mode currents data found") must also
+        surface on the PDF cover page, same as errors -- a notice isn't a
+        failure, but the user still needs to see it without scrolling back
+        through the whole run's console output."""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(
+            json.dumps({
+                "errors": ["altimeter download failed: timeout"],
+                "notices": ["No delayed-mode in-situ current data found (adcp, argo) for this window."],
+            })
+        )
+        assert cli._load_download_warnings(tmp_path) == [
+            "altimeter download failed: timeout",
+            "No delayed-mode in-situ current data found (adcp, argo) for this window.",
+        ]
+
+    def test_notices_only_still_returns_a_list(self, tmp_path):
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(
+            json.dumps({
+                "errors": [],
+                "notices": ["No delayed-mode in-situ current data found (adcp, argo) for this window."],
+            })
+        )
+        assert cli._load_download_warnings(tmp_path) == [
+            "No delayed-mode in-situ current data found (adcp, argo) for this window.",
+        ]
+
+    def test_missing_notices_key_is_backward_compatible(self, tmp_path):
         import json
 
         (tmp_path / "download_metadata.json").write_text(

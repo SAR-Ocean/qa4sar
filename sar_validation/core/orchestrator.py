@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
@@ -49,6 +50,13 @@ _HISTORICAL_FIRST_PAIRS = {
     "drifter": "drifter_historical",
 }
 
+# Delayed-mode in-situ current instruments that share a single combined
+# "no data" message (see _report_combined_currents_status) instead of each
+# logging its own -- fixed order controls the message's word order.
+_CURRENTS_INSTRUMENT_TYPES = (
+    "adcp_historical", "argo_historical", "drifter_historical", "glider_historical",
+)
+
 
 class DataOrchestrator:
     """
@@ -75,6 +83,12 @@ class DataOrchestrator:
             "temporal_bounds":   recipe.config.temporal_bounds.to_dict(),
             "downloads": {},
             "errors":    [],
+            # Non-failure, user-facing observations (e.g. "no data found for
+            # this window") -- distinct from "errors", which
+            # _is_already_downloaded (cli.py) treats as "something went
+            # wrong, don't skip re-download next time". A notice must never
+            # trigger that.
+            "notices":   [],
         }
 
     # ------------------------------------------------------------------
@@ -98,6 +112,13 @@ class DataOrchestrator:
             base.mkdir(parents=True, exist_ok=True)
             logger.info("Base directory: %s", base)
         return base
+
+    def _cleanup_if_empty(self, out_dir: Path) -> None:
+        """Remove out_dir if the download produced no files anywhere under
+        it (including nested, otherwise-empty subdirectories). Directories
+        that already contain at least one file are left untouched."""
+        if out_dir.exists() and not any(p.is_file() for p in out_dir.rglob("*")):
+            shutil.rmtree(out_dir)
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -135,6 +156,8 @@ class DataOrchestrator:
                 source.source_type, {}
             ).get("file_count", 0)
             historical_had_data[source.source_type] = file_count > 0
+
+        self._report_combined_currents_status()
 
         # 3. Group in-situ sources and download as one batch, dropping any
         # NRT type whose paired historical source already covered this
@@ -216,6 +239,7 @@ class DataOrchestrator:
                     min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                     start=temp.start,      end=temp.end,
                 )
+                self._cleanup_if_empty(out_dir)
                 self.metadata["downloads"]["sar"] = {
                     "status": "dry_run" if self.dry_run else "success",
                     "files":  [str(p) for p in paths],
@@ -245,6 +269,7 @@ class DataOrchestrator:
                 modes=cfg.sar_data.swath_mode or None,
                 limit=cfg.sar_data.max_downloads,
             )
+            self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["sar"] = {
                 "status": "dry_run" if self.dry_run else "success",
                 "files":  [str(p) for p in paths],
@@ -285,6 +310,7 @@ class DataOrchestrator:
                 start=temp.start,       end=temp.end,
                 source_types=source_types,
             )
+            self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["insitu"] = {
                 "status":       "dry_run" if self.dry_run else "success",
                 "source_types": source_types,
@@ -298,6 +324,30 @@ class DataOrchestrator:
                 "status": "failed", "error": msg, "source_types": source_types
             }
             return False
+
+    def _report_combined_currents_status(self) -> None:
+        """Log one combined warning for the four delayed-mode in-situ
+        current instruments (adcp/argo/drifter/glider) when every one of
+        them present in this recipe produced zero files, instead of each
+        instrument logging its own near-identical warning."""
+        if self.dry_run:
+            return
+        attempted = [
+            t for t in _CURRENTS_INSTRUMENT_TYPES
+            if any(s.source_type == t for s in self.recipe.config.validation_sources)
+        ]
+        if not attempted:
+            return
+        all_empty = all(
+            self.metadata["downloads"].get(t, {}).get("status") != "failed"
+            and self.metadata["downloads"].get(t, {}).get("file_count", 0) == 0
+            for t in attempted
+        )
+        if all_empty:
+            names = ", ".join(t.replace("_historical", "") for t in attempted)
+            msg = f"No delayed-mode in-situ current data found ({names}) for this window."
+            logger.warning(msg)
+            self.metadata["notices"].append(msg)
 
     def _dispatch_source(self, source) -> bool:
         handlers = {
@@ -341,6 +391,7 @@ class DataOrchestrator:
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=temp.start, end=temp.end,
             )
+            self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["scatterometer"] = {
                 "status": "dry_run" if self.dry_run else "success",
             }
@@ -372,6 +423,7 @@ class DataOrchestrator:
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=temp.start, end=temp.end,
             )
+            self._cleanup_if_empty(out_dir)
             self.metadata["downloads"][f"scatterometer_{satellite}"] = {
                 "status": "dry_run" if self.dry_run else "success",
             }
@@ -415,6 +467,7 @@ class DataOrchestrator:
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=temp.start, end=temp.end,
             )
+            self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["hf_radar"] = {
                 "status": "dry_run" if self.dry_run else "success",
             }
@@ -452,6 +505,7 @@ class DataOrchestrator:
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=temp.start, end=temp.end,
             )
+            self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["hf_radar_noaa"] = {
                 "status": "dry_run" if self.dry_run else "success",
             }
@@ -480,6 +534,7 @@ class DataOrchestrator:
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=temp.start, end=temp.end,
             ) or []
+            self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["hf_radar_historical"] = {
                 "status": "dry_run" if self.dry_run else "success",
                 "file_count": len(downloaded),
@@ -516,6 +571,7 @@ class DataOrchestrator:
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=temp.start, end=temp.end,
             ) or []
+            self._cleanup_if_empty(out_dir)
             self.metadata["downloads"][f"{instrument}_historical"] = {
                 "status": "dry_run" if self.dry_run else "success",
                 "file_count": len(downloaded),
@@ -574,6 +630,7 @@ class DataOrchestrator:
                 start=temp.start, end=temp.end,
                 **kwargs,
             )
+            self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["altimeter"] = {
                 "status": "dry_run" if self.dry_run else "success",
                 "files":  [str(p) for p in paths],
@@ -603,6 +660,7 @@ class DataOrchestrator:
                 start=temp.start, end=temp.end,
                 **kwargs,
             )
+            self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["radiometer"] = {
                 "status": "dry_run" if self.dry_run else "success",
                 "files":  [str(p) for p in paths],
@@ -633,6 +691,7 @@ class DataOrchestrator:
                 max_depth=source.resolved_max_depth,
                 archive_path=source.download_kwargs.get("ismn_archive_path"),
             )
+            self._cleanup_if_empty(out_dir)
             if self.dry_run:
                 status = "dry_run"
             elif paths:

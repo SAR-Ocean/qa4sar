@@ -296,15 +296,11 @@ def _build_currents_config(limit: Optional[int] = None):
             point_vs_layer=PointVsLayerCollocation(),
             layer_vs_layer=LayerVsLayerCollocation(
                 layer_type_specs={
-                    "hf_radar": {
-                        "time_tolerance_minutes": 60,
-                        "aggregation_window_km": 5.0,
-                        "distance_weighting": "equal",
-                    },
                     "hf_radar_grid": {
-                        "time_tolerance_minutes": 20,
+                        "time_tolerance_minutes": 30,
                         "aggregation_window_km": 6.0,
                         "distance_weighting": "equal",
+                        "dedup_nearest_in_time": True,
                     },
                 }
             ),
@@ -681,6 +677,15 @@ def _execute_recipe(
                 layer_vs_layer_collocation_method=method,
             )
 
+    # Reprint any warnings/notices at the very end of the run: they may
+    # have fired during Step 1 (download), long before Steps 2/3/5a/5b's
+    # own console output scrolled them out of view.
+    warnings = _load_download_warnings(orchestrator.base_dir)
+    if warnings:
+        print("\nWarnings from this run:")
+        for w in warnings:
+            print(f"  - {w}")
+
 
 def _is_already_downloaded(base_dir: Path) -> bool:
     """Return True if *base_dir* has a download_metadata.json with no errors."""
@@ -858,9 +863,12 @@ def _generate_plots(
 
 
 def _load_download_warnings(base_dir: Path) -> Optional[list[str]]:
-    """Read download_metadata.json's ``errors`` list, if present, for
-    surfacing on the PDF cover page. Returns None if there's no metadata
-    file, it can't be parsed, or it has no errors."""
+    """Read download_metadata.json's ``errors`` and ``notices`` lists, if
+    present, for surfacing on the PDF cover page. ``notices`` are
+    non-failure observations (e.g. "no data found for this window") that
+    still deserve a durable, easy-to-find spot rather than only a
+    console-log line that scrolls past during a long run. Returns None if
+    there's no metadata file, it can't be parsed, or it has neither."""
     import json as _json
 
     meta_path = base_dir / "download_metadata.json"
@@ -871,5 +879,5 @@ def _load_download_warnings(base_dir: Path) -> Optional[list[str]]:
             meta = _json.load(f)
     except Exception:
         return None
-    errors = meta.get("errors") or []
-    return errors or None
+    warnings = (meta.get("errors") or []) + (meta.get("notices") or [])
+    return warnings or None

@@ -231,10 +231,17 @@ class TestCurrentsTemplate:
         specs = recipe.collocation.layer_vs_layer.layer_type_specs
         assert "hf_radar_grid" in specs
         assert specs["hf_radar_grid"] == {
-            "time_tolerance_minutes": 20,
+            "time_tolerance_minutes": 30,
             "aggregation_window_km": 6.0,
             "distance_weighting": "equal",
+            "dedup_nearest_in_time": True,
         }
+        # The bare "hf_radar" key is dead config: every HF-radar source is
+        # tagged data_type="hf_radar_grid" by the one converter that
+        # produces this data, so "hf_radar_grid" is the only key collocation
+        # ever actually resolves to. Removed rather than left as confusing,
+        # unreachable tuning.
+        assert "hf_radar" not in specs
 
     def test_preserves_existing_currents_content(self):
         """The extraction into a builder must not drop any existing sources/specs."""
@@ -260,6 +267,33 @@ class TestCurrentsTemplate:
         # The gridded product has no depth axis; the recipe shouldn't imply one.
         assert hf_radar_src.min_depth is None
         assert hf_radar_src.max_depth is None
+
+
+class TestCurrentsRecipeYamlFilesHfRadarGridSpec:
+    """Every packaged currents_*.yaml recipe must carry the same
+    hf_radar_grid tolerance/dedup fix as the cli.py template it was
+    generated from -- a recipe's own layer_type_specs override wins over
+    the Python-side default, so fixing only the default wouldn't have
+    fixed the Finnmark bug for any already-written recipe file."""
+
+    def test_all_currents_recipes_have_updated_hf_radar_grid_spec(self):
+        import pathlib
+
+        recipes_dir = pathlib.Path(__file__).resolve().parent.parent / "recipes"
+        paths = sorted(recipes_dir.glob("currents_*.yaml"))
+        assert len(paths) >= 13
+
+        for path in paths:
+            recipe = Recipe.from_yaml(path)
+            specs = recipe.config.collocation.layer_vs_layer.layer_type_specs
+            spec = specs["hf_radar_grid"]
+            assert spec["time_tolerance_minutes"] == 30, path
+            assert spec["dedup_nearest_in_time"] is True, path
+            # Bare "hf_radar" is dead config (data_type is always
+            # "hf_radar_grid" for every HF-radar source) -- removed from
+            # every packaged recipe rather than left as confusing,
+            # unreachable tuning.
+            assert "hf_radar" not in specs, path
 
 
 class TestCurrentsTemplateDelayedInstruments:

@@ -131,12 +131,46 @@ class TestSubsetCall:
 
         fake_module.subset.side_effect = fake_subset
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}), \
-             caplog.at_level(logging.WARNING):
+             caplog.at_level(logging.DEBUG):
             out = dl.download(_MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT, start, end)
 
         assert out == []
         assert list(tmp_path.glob("*.csv")) == []
+        # This message is intentionally logged at DEBUG, not WARNING: the
+        # orchestrator now owns the user-facing "no data" message for the
+        # four delayed-mode currents instruments combined (one message
+        # instead of four) -- see _report_combined_currents_status.
         assert any("drifter" in r.message and "No" in r.message for r in caplog.records)
+
+    def test_no_file_written_at_all_is_treated_as_no_data_not_a_failure(self, tmp_path, caplog):
+        """Real-world Copernicus Marine behaviour (confirmed 2026-07-23 by a
+        live DeltaEbro run): for a genuinely empty result, subset() sometimes
+        writes no output file at all -- not even a header-only CSV -- rather
+        than always producing the empty-CSV case covered by
+        test_empty_subset_result_returns_empty_and_removes_file above. This
+        used to raise FileNotFoundError, which orchestrator.py treats as a
+        hard failure: it skips _cleanup_if_empty (only called on the success
+        path), leaving an empty output directory behind, and it reports
+        "failed" instead of the intended combined "no data" message. Must
+        return None like the empty-CSV case, not raise."""
+        now = datetime.now(timezone.utc)
+        end = (now - timedelta(days=200)).strftime("%Y-%m-%d")
+        start = (now - timedelta(days=201)).strftime("%Y-%m-%d")
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="adcp", output_dir=tmp_path)
+        fake_module = MagicMock()
+
+        def fake_subset(**kwargs):
+            pass  # "succeeds" but writes nothing, per the real observed behaviour
+
+        fake_module.subset.side_effect = fake_subset
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}), \
+             caplog.at_level(logging.DEBUG):
+            out = dl.download(_MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT, start, end)
+
+        assert out == []
+        assert list(tmp_path.glob("*.csv")) == []
+        assert any("adcp" in r.message and "No" in r.message for r in caplog.records)
 
     def test_nonempty_subset_result_still_returns_the_path(self, tmp_path):
         from pathlib import Path

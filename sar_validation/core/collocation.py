@@ -1596,6 +1596,7 @@ class LayerLayerCollocation(PointLayerCollocation):
         distance_weighting: str = "equal",
         gaussian_sigma_km: float = 12.5,
         emit_diagnostics: bool = False,
+        dedup_nearest_in_time: bool = False,
         method: str = "cell-averaging",
     ) -> None:
         """
@@ -1619,6 +1620,12 @@ class LayerLayerCollocation(PointLayerCollocation):
             Gaussian sigma if using Gaussian weighting (12.5 km default).
         emit_diagnostics : bool
             If True, emit detailed per-cell diagnostic logging.
+        dedup_nearest_in_time : bool
+            When True, a validation point (keyed by platform_id if present,
+            else its own (lon, lat)) contributes only its single
+            closest-in-time reading per SAR time index, instead of one
+            collocation per candidate reading inside the tolerance window.
+            Default False (unchanged historical behaviour).
         method : str
             Collocation method: "cell-averaging" (clusters scatterometer into grid cells, aggregates SAR)
             or "individual" (matches each SAR pixel to closest scatterometer point, allowing reuse).
@@ -1631,6 +1638,7 @@ class LayerLayerCollocation(PointLayerCollocation):
             validation_temporal_averaging_minutes=validation_temporal_averaging_minutes,
             distance_weighting=distance_weighting,
             gaussian_sigma_km=gaussian_sigma_km,
+            dedup_nearest_in_time=dedup_nearest_in_time,
         )
         self.method = method
         self.emit_diagnostics = emit_diagnostics

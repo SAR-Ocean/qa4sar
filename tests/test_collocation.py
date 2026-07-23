@@ -415,6 +415,55 @@ class TestLayerLayerCollocation:
         assert colloc.distance_weighting == "equal"  # Uniform for regular grid
         assert colloc.validation_temporal_averaging_minutes == 60  # ±1 hour window
 
+    def test_layer_collocation_dedup_nearest_in_time_defaults_to_false(self):
+        colloc = LayerLayerCollocation()
+        assert colloc.dedup_nearest_in_time is False
+
+    def test_dedup_nearest_in_time_keeps_only_nearest_reading_per_cell(self):
+        """A gridded HF-radar cell reporting hourly, with two candidate
+        readings inside a wide time-tolerance window, must contribute only
+        its single closest-in-time reading -- not one collocation per
+        candidate hour. Regression guard for the Finnmark fix, where
+        widening hf_radar_grid's time_tolerance_minutes to guarantee hourly
+        coverage would otherwise start producing duplicate matches per
+        cell."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        val = _make_val_dataframe(
+            lons=[0.0, 0.0], lats=[52.0, 52.0],
+            times=[datetime(2026, 1, 1, 11, 45, 0), datetime(2026, 1, 1, 12, 20, 0)],
+            EWCT=[1.0, 2.0], NSCT=[0.5, 0.6],
+        )
+
+        colloc = LayerLayerCollocation(
+            spatial_tolerance_km=200, time_tolerance_minutes=30,
+            aggregation_window_km=100, dedup_nearest_in_time=True,
+        )
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "hf_radar_grid")
+
+        assert len(results) == 1
+        assert results[0].val_data["EWCT"] == 1.0
+        assert results[0].temporal_distance_minutes == 15.0
+
+    def test_dedup_nearest_in_time_false_keeps_every_reading(self):
+        """Default behaviour (dedup off) must be unchanged: both candidate
+        readings produce their own collocation."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        val = _make_val_dataframe(
+            lons=[0.0, 0.0], lats=[52.0, 52.0],
+            times=[datetime(2026, 1, 1, 11, 45, 0), datetime(2026, 1, 1, 12, 20, 0)],
+            EWCT=[1.0, 2.0], NSCT=[0.5, 0.6],
+        )
+
+        colloc = LayerLayerCollocation(
+            spatial_tolerance_km=200, time_tolerance_minutes=30,
+            aggregation_window_km=100,
+        )
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "hf_radar_grid")
+
+        assert len(results) == 2
+
     def test_aggregates_sar_around_each_point(self):
         """Test that SAR values are aggregated around each scatterometer point.
 
@@ -551,8 +600,13 @@ class TestHfRadarGridDispatch:
         from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
         spec = DEFAULT_LAYER_TYPE_SPECS["hf_radar_grid"]
         assert spec["aggregation_window_km"] == 6.0
-        assert spec["time_tolerance_minutes"] == 20
+        assert spec["time_tolerance_minutes"] == 30
         assert spec["distance_weighting"] == "equal"
+        assert spec["dedup_nearest_in_time"] is True
+        # Bare "hf_radar" is dead config -- data_type is always
+        # "hf_radar_grid" for every HF-radar source today, so this key was
+        # never actually reachable. Removed.
+        assert "hf_radar" not in DEFAULT_LAYER_TYPE_SPECS
 
 
 class TestResolveLayerTypeScatterometerVariants:
