@@ -357,6 +357,18 @@ class PointLayerCollocation:
         - ``"equal"`` — Uniform weights
     gaussian_sigma_km : float
         Standard deviation (km) for Gaussian weighting. Default: 5.0 km.
+    dedup_nearest_in_time : bool
+        When False (default), every validation observation within
+        ``time_tolerance_minutes`` of a SAR acquisition produces its own
+        `CollocatedPoint` — the historical behaviour, relied on by
+        scatterometer/buoy/mooring sources where repeated readings at one
+        location are genuinely distinct passes/looks worth comparing
+        independently. When True, only the reading closest in time per
+        (station, SAR acquisition) is kept — for sources like ISMN, which
+        report far more densely (hourly) than the SAR revisit time, so a
+        wide ``time_tolerance_minutes`` (needed to tolerate reporting gaps)
+        would otherwise multiply one physical station into dozens of
+        near-duplicate collocations of the same slowly-evolving quantity.
     """
 
     #: Collocation type label stored on each CollocatedPoint result.
@@ -372,6 +384,7 @@ class PointLayerCollocation:
         distance_weighting: str = "gaussian",
         gaussian_sigma_km: float = 5.0,
         emit_diagnostics: bool = False,
+        dedup_nearest_in_time: bool = False,
     ) -> None:
         self.spatial_tolerance_km = spatial_tolerance_km
         self.time_tolerance_minutes = time_tolerance_minutes
@@ -380,6 +393,7 @@ class PointLayerCollocation:
         self.validation_temporal_averaging_minutes = validation_temporal_averaging_minutes
         self.distance_weighting = distance_weighting
         self.gaussian_sigma_km = gaussian_sigma_km
+        self.dedup_nearest_in_time = dedup_nearest_in_time
 
         if interpolation_method not in ("nearest", "linear", "cubic"):
             raise ValueError(
@@ -405,6 +419,7 @@ class PointLayerCollocation:
         val_data: pd.DataFrame,
         val_source: str,
         sar_scene_name: str = "",
+        grid_tree: Optional[Tuple["cKDTree", np.ndarray, int]] = None,
     ) -> List[CollocatedPoint]:
         """
         Match validation observations to the SAR grid using distance-weighted aggregation.
@@ -433,6 +448,14 @@ class PointLayerCollocation:
             Label for the validation source (e.g. ``"buoy"``).
         sar_scene_name : str
             Name of the SAR scene node in the DataTree.
+        grid_tree : tuple, optional
+            Pre-built ``(tree, flat_idx, n_x)`` from :meth:`_build_grid_tree`
+            for this scene's ``(sar_lon, sar_lat)`` grid. ``run_collocation``
+            builds this once per SAR scene and passes it to every
+            validation source matched against that scene, since rebuilding
+            a KD-tree over a large grid (e.g. CLMS Surface Soil Moisture's
+            ~28M-cell 1 km Europe grid) per validation file is expensive.
+            Built here if omitted (e.g. when calling this method directly).
 
         Returns
         -------
@@ -527,10 +550,26 @@ class PointLayerCollocation:
             return float(val_data_sorted[col].values[j])
 
         # KD-tree over the SAR grid cells (unit-sphere Cartesian coordinates,
-        # see _lonlat_to_unit_xyz) built once per scene: each validation
-        # point then queries only its local neighbourhood instead of
-        # computing a Haversine distance to every grid cell.
-        grid_tree = self._build_grid_tree(sar_lon, sar_lat)
+        # see _lonlat_to_unit_xyz): each validation point then queries only
+        # its local neighbourhood instead of computing a Haversine distance
+        # to every grid cell. Reuse the caller's pre-built tree when given
+        # (see the `grid_tree` parameter); only build one here as a fallback
+        # for direct calls.
+        if grid_tree is None:
+            grid_tree = self._build_grid_tree(sar_lon, sar_lat)
+
+        # A wide time_tolerance_minutes (e.g. ISMN's 720 min, to tolerate
+        # reporting gaps) combined with a densely-reporting source (ISMN
+        # reports hourly) means many validation rows from the *same*
+        # station can fall within tolerance of one SAR time. Keep only the
+        # reading closest in time per (station, SAR time) — the loop below
+        # still emits a CollocatedPoint per (row, t_idx) match, but only
+        # the best one per key survives into the final result. Distinct
+        # SAR times for the same station stay separate (each is a genuine
+        # comparison against a different overpass); keyed by platform_id
+        # when available, else by the validation point's own coordinates
+        # (still constant for one physical station's repeated readings).
+        best_matches: Dict[Tuple[Any, int], "CollocatedPoint"] = {}
 
         # Process each validation observation
         for idx, val_row in val_data_filtered.iterrows():
@@ -641,27 +680,41 @@ class PointLayerCollocation:
                     else val_source
                 )
 
-                # Create CollocatedPoint
-                collocations.append(
-                    CollocatedPoint(
-                        sar_lon=s_lon,
-                        sar_lat=s_lat,
-                        sar_time=s_time,
-                        sar_data=sar_aggregated,
-                        val_lon=v_lon,
-                        val_lat=v_lat,
-                        val_time=v_time,
-                        val_data=val_aggregated,
-                        spatial_distance_km=spatial_dist,
-                        temporal_distance_minutes=temporal_dist,
-                        val_source=point_val_source,
-                        val_id=val_row.get("platform_id"),
-                        collocation_type=self.collocation_type,
-                        sar_y_idx=y_idx,
-                        sar_x_idx=x_idx,
-                        sar_scene_name=sar_scene_name,
-                    )
+                # Create CollocatedPoint. When dedup_nearest_in_time is set,
+                # keep only the closest-in-time match per (station, SAR
+                # time) — see best_matches above; otherwise every match is
+                # kept (historical behaviour).
+                point = CollocatedPoint(
+                    sar_lon=s_lon,
+                    sar_lat=s_lat,
+                    sar_time=s_time,
+                    sar_data=sar_aggregated,
+                    val_lon=v_lon,
+                    val_lat=v_lat,
+                    val_time=v_time,
+                    val_data=val_aggregated,
+                    spatial_distance_km=spatial_dist,
+                    temporal_distance_minutes=temporal_dist,
+                    val_source=point_val_source,
+                    val_id=val_row.get("platform_id"),
+                    collocation_type=self.collocation_type,
+                    sar_y_idx=y_idx,
+                    sar_x_idx=x_idx,
+                    sar_scene_name=sar_scene_name,
                 )
+
+                if not self.dedup_nearest_in_time:
+                    collocations.append(point)
+                    continue
+
+                station_key = point.val_id if pd.notna(point.val_id) else (v_lon, v_lat)
+                dedup_key = (station_key, t_idx)
+                existing = best_matches.get(dedup_key)
+                if existing is None or temporal_dist < existing.temporal_distance_minutes:
+                    best_matches[dedup_key] = point
+
+        if self.dedup_nearest_in_time:
+            collocations = list(best_matches.values())
 
         logger.info(
             "%s: found %d matches from %d validation observations (source=%s)",
@@ -1389,6 +1442,17 @@ def run_collocation(
                 logger.warning("SAR node '%s' has no (y, x) variables — skipping.", sar_name)
                 continue
 
+            # Built once per SAR scene and reused across every validation
+            # source matched against it below (both point_vs_layer and
+            # layer_vs_layer resolve to PointLayerCollocation.collocate(),
+            # which accepts a pre-built tree). Rebuilding this per
+            # validation file — the previous behavior — is fine for a
+            # handful of large, pre-batched validation sources, but
+            # pathological for many small per-source files against a large
+            # grid (e.g. ISMN's one-CSV-per-station output matched against
+            # the ~28M-cell CLMS Surface Soil Moisture 1 km Europe grid).
+            grid_tree = PointLayerCollocation._build_grid_tree(sar_lon, sar_lat)
+
             # Run the three passes in order
             for ctype, sources in buckets.items():
                 if not sources:
@@ -1397,6 +1461,9 @@ def run_collocation(
                     # Apply per-source kwargs overrides
                     per_source_kwargs = source_metadata.get(val_name, {}).get("colloc_kwargs", {})
                     merged_kwargs = _merge_collocation_kwargs(global_coll_kwargs, per_source_kwargs)
+
+                    df = val_dfs[val_name]
+                    source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
 
                     # For layer_vs_layer, apply layer-type-specific specs from recipe
                     if ctype == "layer_vs_layer" and layer_vs_layer_specs:
@@ -1412,10 +1479,21 @@ def run_collocation(
                         # Add layer-vs-layer collocation method
                         merged_kwargs["method"] = layer_vs_layer_collocation_method
 
-                    colloc = _COLLOC_CLASSES[ctype](**merged_kwargs)
+                    if ctype == "point_vs_layer" and source_label == "ismn":
+                        # ISMN reports far more densely (hourly) than the SAR
+                        # revisit time, and needs a wide time_tolerance_minutes
+                        # to tolerate reporting gaps — without deduping, every
+                        # in-tolerance hourly reading becomes its own
+                        # collocation, multiplying one station into dozens of
+                        # near-duplicate matches against the same SAR
+                        # overpass. Other point_vs_layer sources (moorings,
+                        # buoys) keep the historical one-match-per-reading
+                        # behaviour, where repeated readings at a location are
+                        # genuinely distinct passes worth comparing
+                        # independently.
+                        merged_kwargs["dedup_nearest_in_time"] = True
 
-                    df = val_dfs[val_name]
-                    source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
+                    colloc = _COLLOC_CLASSES[ctype](**merged_kwargs)
 
                     matches = colloc.collocate(
                         sar_data=sar_data_3d,
@@ -1425,6 +1503,7 @@ def run_collocation(
                         val_data=df,
                         val_source=source_label,
                         sar_scene_name=sar_name,
+                        grid_tree=grid_tree,
                     )
                     all_collocations.extend(matches)
                     logger.info(
@@ -1852,12 +1931,17 @@ class LayerLayerCollocation(PointLayerCollocation):
         val_data: pd.DataFrame,
         val_source: str,
         sar_scene_name: str = "",
+        grid_tree: Optional[Tuple["cKDTree", np.ndarray, int]] = None,
     ) -> List[CollocatedPoint]:
         """
         Match scatterometer to SAR using selected collocation method.
 
         Dispatches to either individual point-to-point or cell-averaging methods
-        based on self.method setting.
+        based on self.method setting. ``grid_tree`` (see
+        ``PointLayerCollocation.collocate``) is only used by the
+        cell-averaging path, which delegates to that method; the individual
+        (SAR-anchor) path builds its own KD-tree over the validation points
+        instead, so it ignores this parameter.
 
         Parameters
         ----------
@@ -1886,7 +1970,8 @@ class LayerLayerCollocation(PointLayerCollocation):
         else:
             # Default to cell-averaging
             return self._collocate_cell_averaging(
-                sar_data, sar_lon, sar_lat, sar_time, val_data, val_source, sar_scene_name
+                sar_data, sar_lon, sar_lat, sar_time, val_data, val_source, sar_scene_name,
+                grid_tree=grid_tree,
             )
 
     def _collocate_cell_averaging(
@@ -1898,6 +1983,7 @@ class LayerLayerCollocation(PointLayerCollocation):
         val_data: pd.DataFrame,
         val_source: str,
         sar_scene_name: str = "",
+        grid_tree: Optional[Tuple["cKDTree", np.ndarray, int]] = None,
     ) -> List[CollocatedPoint]:
         """
         Match scatterometer points to SAR grid using spatial aggregation
@@ -1936,4 +2022,5 @@ class LayerLayerCollocation(PointLayerCollocation):
         return PointLayerCollocation.collocate(
             self, sar_data, sar_lon, sar_lat, sar_time,
             val_data, val_source, sar_scene_name,
+            grid_tree=grid_tree,
         )

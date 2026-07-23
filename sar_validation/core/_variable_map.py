@@ -40,6 +40,9 @@ VARIABLE_PAIRS: dict[str, List[Tuple[str, str]]] = {
         ("oswHs",                       "VHM0"),  # WV mode partition Hs (legacy fallback)
         ("owiHs",    "VHM0"),  # IW/EW mode OWI grid (fallback)
     ],
+    "soil_moisture": [
+        ("sarSSM", "SOIL_MOISTURE"),
+    ],
 }
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
 
+    from .recipe import GeographicBounds
+
 __all__ = [
     "plot_scatter",
     "plot_geographic",
@@ -315,6 +317,23 @@ def _deduplicate_obs(df, sar_col: str, val_col: str):
     return df.groupby(id_cols, dropna=False, sort=False).agg(agg).reset_index()
 
 
+def _labeled_var(collocation_ds, col_name: str, var_code: str) -> str:
+    """
+    Return ``"<var_code> (<units>)"`` using the CF ``units`` attribute on
+    ``col_name`` in *collocation_ds*, or just ``var_code`` if that column
+    is absent or carries no ``units`` attribute.
+
+    Units are stamped onto every ``sar_<var>``/``val_<var>`` collocation
+    column by ``annotate_collocation_ds`` (see ``_cf_metadata.py``), so
+    this works for any variable pair without per-variable special-casing —
+    e.g. ``"WSPD"`` → ``"WSPD (m s-1)"``, ``"sarSSM"`` → ``"sarSSM (%)"``.
+    """
+    units = None
+    if col_name in collocation_ds:
+        units = collocation_ds[col_name].attrs.get("units")
+    return f"{var_code} ({units})" if units else var_code
+
+
 # ---------------------------------------------------------------------------
 # 1. Scatter plot
 # ---------------------------------------------------------------------------
@@ -470,8 +489,8 @@ def plot_scatter(
             va="top", ha="left", fontsize=8,
             bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.7))
 
-    ax.set_xlabel(val_var)
-    ax.set_ylabel(sar_var)
+    ax.set_xlabel(_labeled_var(collocation_ds, val_col, val_var))
+    ax.set_ylabel(_labeled_var(collocation_ds, sar_col, sar_var))
     n_raw, n_obs = len(df_raw), len(df)
     if n_raw != n_obs:
         ax.set_title(f"{sar_var} vs {val_var}  (N={n_obs} obs, avg {n_raw // max(n_obs, 1)} px/obs)")
@@ -516,6 +535,7 @@ def plot_geographic(
     split_by: str = "collocation_type",
     scenes: Optional[Sequence[str]] = None,
     interactive: bool = False,
+    geographic_bounds: Optional["GeographicBounds"] = None,
 ):
     """
     Geographic overview: SAR field as background + collocated points overlaid.
@@ -556,6 +576,16 @@ def plot_geographic(
         Pass ``None`` for a single combined figure.
     interactive : bool
         Return a folium Map instead of matplotlib.
+    geographic_bounds : GeographicBounds, optional
+        Clamp each static (non-interactive) subplot's extent to the
+        recipe's requested bounding box instead of the SAR field's full
+        native extent — e.g. CLMS Surface Soil Moisture's grid covers all
+        of mainland Europe regardless of what a recipe actually requested,
+        so without this every scene panel shows far more than was asked
+        for. Ignored when the bounding box itself crosses the antimeridian
+        (``min_lon > max_lon``) and the scene's own projection does not,
+        since a plain (non-recentred) axes can't cleanly represent that
+        span — the scene keeps its native extent in that case.
 
     Returns
     -------
@@ -662,23 +692,62 @@ def plot_geographic(
     import matplotlib.lines as mlines  # noqa: PLC0415
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
-    # Colour limits — pooled from the SAR field *and* the validation values
-    # (when present) so both layers share one scale and are directly
-    # comparable by colour (same across all figures/groups).
-    all_field_vals = []
-    for scene_name in scene_names:
-        arr = _sar_field(sar_node[scene_name].to_dataset(), sar_var)
-        if arr is not None:
-            all_field_vals.append(arr[np.isfinite(arr)])
-    flat = np.concatenate(all_field_vals) if all_field_vals else np.array([])
-
     finite_v = np.array([])
     if val_col_present:
         finite_v = collocation_ds[val_col].values
         finite_v = finite_v[np.isfinite(finite_v)]
 
+    sar_units = None
+    if sar_var in sar_node[scene_names[0]].to_dataset().variables if scene_names else False:
+        sar_units = sar_node[scene_names[0]].to_dataset()[sar_var].attrs.get("units")
+    val_units = collocation_ds[val_col].attrs.get("units") if val_col_present else None
+    domains_differ = val_col_present and sar_units is not None and val_units is not None and sar_units != val_units
+
+    # When the SAR field and validation series live in different physical
+    # domains (e.g. soil_moisture: SAR's relative saturation index in "%"
+    # vs. ISMN's volumetric fraction in "1"), convert the SAR *field*
+    # itself into the validation domain before plotting, so the whole map
+    # (background + points) shares one meaningful colour scale — rather
+    # than showing two separate colorbars, which is confusing to read at
+    # a glance. This uses a single CDF-matching transform fit once from
+    # every collocated pair (pooled across groups, for display purposes
+    # only — statistics still use add_rescaled_sar_column's per-group
+    # rescaling) and applied to every scene's full grid, not just
+    # collocated pixels. Falls back to two separate colorbars (one per
+    # layer's own percentile range) if there isn't enough collocated data
+    # to fit a transform.
+    sar_field_transform = None
+    if domains_differ:
+        assert val_var is not None   # implied by domains_differ requiring val_col_present
+        from .statistics import fit_sar_to_val_transform  # noqa: PLC0415
+        sar_field_transform = fit_sar_to_val_transform(collocation_ds, sar_var, val_var)
+        if sar_field_transform is None:
+            logger.warning(
+                "plot_geographic: could not fit a SAR-to-validation-domain "
+                "transform (not enough collocated pairs) — falling back to "
+                "two separate colorbars for %s vs %s.", sar_var, val_var,
+            )
+
+    # Colour limits — pooled from the SAR field *and* the validation values
+    # so both layers share one scale and are directly comparable by
+    # colour (same across all figures/groups): the default behaviour, and
+    # also correct once the field above has been converted into the
+    # validation domain.
+    all_field_vals = []
+    for scene_name in scene_names:
+        arr = _sar_field(sar_node[scene_name].to_dataset(), sar_var)
+        if arr is not None:
+            if sar_field_transform is not None:
+                arr = sar_field_transform(arr)
+            all_field_vals.append(arr[np.isfinite(arr)])
+    flat = np.concatenate(all_field_vals) if all_field_vals else np.array([])
+
     from ._variable_map import CIRCULAR_VAL_VARS  # noqa: PLC0415
     is_circular = val_var in CIRCULAR_VAL_VARS
+
+    # Only genuinely un-convertible domain mismatches still need separate
+    # ranges/colorbars below.
+    needs_separate_scale = domains_differ and sar_field_transform is None
 
     # Circular variables (e.g. WDIR) skip percentile pooling: 0-360 is a
     # fixed, physically meaningful range, and percentile-clamping a value
@@ -686,6 +755,9 @@ def plot_geographic(
     if is_circular:
         cmap = "twilight"
         vmin, vmax = 0.0, 360.0
+    elif needs_separate_scale:
+        vmin = float(np.nanpercentile(flat, 2)) if len(flat) else 0.0
+        vmax = float(np.nanpercentile(flat, 98)) if len(flat) else 1.0
     else:
         pooled = np.concatenate([flat, finite_v]) if len(flat) or len(finite_v) else np.array([0.0, 1.0])
         vmin = float(np.nanpercentile(pooled, 2))
@@ -700,13 +772,23 @@ def plot_geographic(
 
     val_norm = val_sm = None
     if len(finite_v) > 0:
-        val_norm = norm
+        if needs_separate_scale:
+            val_vmin = float(np.nanpercentile(finite_v, 2))
+            val_vmax = float(np.nanpercentile(finite_v, 98))
+            if val_vmin == val_vmax:
+                val_vmin -= 0.5
+                val_vmax += 0.5
+            val_norm = mcolors.Normalize(vmin=val_vmin, vmax=val_vmax)
+        else:
+            val_norm = norm
         val_sm = mcm.ScalarMappable(cmap=effective_val_cmap, norm=val_norm)
         val_sm.set_array([])
 
     # One shared colorbar when both layers use the same palette+scale
-    # (the default); two only if the caller opted into a distinct val_cmap.
-    single_colorbar = val_sm is not None and effective_val_cmap == cmap
+    # (the default, and also true once a units mismatch was resolved by
+    # converting the field above); two if the caller opted into a
+    # distinct val_cmap, or if a units mismatch couldn't be converted.
+    single_colorbar = val_sm is not None and effective_val_cmap == cmap and not needs_separate_scale
     right_margin = 0.88 if (val_sm is None or single_colorbar) else 0.80
 
     # Per-scene antimeridian detection: a scene "crosses" when its raw
@@ -773,6 +855,8 @@ def plot_geographic(
 
             arr = _sar_field(scene_ds, sar_var)
             if arr is not None:
+                if sar_field_transform is not None:
+                    arr = sar_field_transform(arr)
                 kw = {"transform": transform} if transform else {}
                 # Check if data is gridded (2D) or point-based (1D)
                 if arr.ndim == 1:
@@ -904,6 +988,26 @@ def plot_geographic(
             ax.set_title(
                 f"{scene_name.split('/')[-1]}  ({n_dedup} obs)", fontsize=8
             )
+            # Clamp to the recipe's requested bbox instead of the SAR
+            # field's full native extent (e.g. CLMS SSM's grid covers all
+            # of mainland Europe regardless of what was actually
+            # requested). Applied before _pad_extent_to_min_aspect so the
+            # aspect padding below operates on the clamped box, not the
+            # unclamped one.
+            if (
+                geographic_bounds is not None
+                and geographic_bounds.min_lon <= geographic_bounds.max_lon
+                and not scene_crosses_dateline.get(scene_name)
+            ):
+                if HAS_CARTOPY:
+                    ax.set_extent(
+                        [geographic_bounds.min_lon, geographic_bounds.max_lon,
+                         geographic_bounds.min_lat, geographic_bounds.max_lat],
+                        crs=transform,
+                    )
+                else:
+                    ax.set_xlim(geographic_bounds.min_lon, geographic_bounds.max_lon)
+                    ax.set_ylim(geographic_bounds.min_lat, geographic_bounds.max_lat)
             # Also deferred until now, for the same reason as _set_lonlat_ticks
             # below: it needs the finalized autoscaled extent from
             # ax.get_xlim()/get_ylim(). Applies to both the HAS_CARTOPY
@@ -921,15 +1025,25 @@ def plot_geographic(
         for idx in range(len(scene_names), nrows * ncols):
             axes[idx // ncols][idx % ncols].set_visible(False)
 
+        # Once the field has been converted into the validation domain,
+        # label it with the validation column's units, not the SAR
+        # column's original ones — matching what's actually displayed.
+        sar_label = (
+            _labeled_var(collocation_ds, f"val_{val_var}", sar_var)
+            if sar_field_transform is not None
+            else _labeled_var(collocation_ds, f"sar_{sar_var}", sar_var)
+        )
+        val_label = _labeled_var(collocation_ds, f"val_{val_var}", val_var) if val_var else None
+
         fig.subplots_adjust(right=right_margin)
         cbar_ax = fig.add_axes((right_margin + 0.01, 0.15, 0.015, 0.70))
         if single_colorbar:
-            fig.colorbar(sar_sm, cax=cbar_ax, label=f"{sar_var} / {val_var}")
+            fig.colorbar(sar_sm, cax=cbar_ax, label=f"{sar_label} / {val_label}")
         else:
-            fig.colorbar(sar_sm, cax=cbar_ax, label=f"SAR {sar_var}")
+            fig.colorbar(sar_sm, cax=cbar_ax, label=f"SAR {sar_label}")
             if val_sm is not None:
                 val_cbar_ax = fig.add_axes((right_margin + 0.055, 0.15, 0.015, 0.70))
-                fig.colorbar(val_sm, cax=val_cbar_ax, label=f"In-situ {val_var}")
+                fig.colorbar(val_sm, cax=val_cbar_ax, label=f"In-situ {val_label}")
 
         title = f"SAR {sar_var}"
         if val_var:
@@ -1079,6 +1193,12 @@ def plot_residuals(
         warnings.warn(f"No valid data for {sar_col} vs {val_col}.")
         return None
 
+    # A residual's units are whatever domain both sides share (val's, for
+    # a soil-moisture pair after add_rescaled_sar_column; the same domain
+    # by construction for every other existing variable pair).
+    val_units = collocation_ds[val_col].attrs.get("units")
+    residual_label = f"{sar_var} − {val_var}" + (f" ({val_units})" if val_units else "")
+
     df = collocation_ds[[sar_col, val_col, "val_source"]].to_dataframe().dropna(
         subset=[sar_col, val_col]
     )
@@ -1105,7 +1225,7 @@ def plot_residuals(
             barmode="overlay",
             opacity=0.6,
             nbins=40,
-            labels={"residual": f"{sar_var} − {val_var}", "val_source": "Source"},
+            labels={"residual": residual_label, "val_source": "Source"},
             title=title,
         )
         return fig
@@ -1119,7 +1239,7 @@ def plot_residuals(
             fig = ax.get_figure()
         ax.hist(df["residual"].dropna(), bins=30, density=True, alpha=0.7, color="#1f77b4")
         ax.axvline(0, color="black", linewidth=1, linestyle="--")
-        ax.set_xlabel(f"{sar_var} − {val_var}")
+        ax.set_xlabel(residual_label)
         ax.set_ylabel("Density")
         ax.set_title(title)
         ax.grid(True, linewidth=0.4)
@@ -1148,7 +1268,7 @@ def plot_residuals(
         sub = df.loc[df["val_source"] == src, "residual"].dropna()
         sub_ax.hist(sub, bins=30, range=shared_range, density=True, alpha=0.7, color=color_map[src])
         sub_ax.axvline(0, color="black", linewidth=1, linestyle="--")
-        sub_ax.set_xlabel(f"{sar_var} − {val_var}")
+        sub_ax.set_xlabel(residual_label)
         sub_ax.set_ylabel("Density")
         sub_ax.set_title(f"{src} (N={len(sub)})", fontsize=9)
         sub_ax.grid(True, linewidth=0.4)
@@ -1208,6 +1328,9 @@ def plot_temporal_offset(
         warnings.warn(f"No valid data for {sar_col} vs {val_col} (missing {missing}).")
         return None
 
+    val_units = collocation_ds[val_col].attrs.get("units")
+    residual_label = f"|{sar_var} − {val_var}|" + (f" ({val_units})" if val_units else "")
+
     extra_cols = [c for c in ("val_id", "val_lat", "val_lon") if c in collocation_ds]
     base_cols = [sar_col, val_col, "val_source", "temporal_distance_minutes"] + extra_cols
     df_raw = collocation_ds[base_cols].to_dataframe()
@@ -1238,10 +1361,10 @@ def plot_temporal_offset(
             color="val_source" if by_source else None,
             labels={
                 "temporal_distance_minutes": "Temporal offset (min)",
-                "abs_residual": f"|{sar_var} - {val_var}|",
+                "abs_residual": residual_label,
                 "val_source": "Source",
             },
-            title=f"|{sar_var} - {val_var}| vs. temporal offset",
+            title=f"{residual_label} vs. temporal offset",
         )
         return fig
 
@@ -1276,7 +1399,7 @@ def plot_temporal_offset(
             bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.7))
 
     ax.set_xlabel("Temporal offset (min)")
-    ax.set_ylabel(f"|{sar_var} − {val_var}|")
+    ax.set_ylabel(residual_label)
     ax.set_title(f"{sar_var} vs {val_var} — residual magnitude vs. temporal offset")
     ax.grid(True, linewidth=0.4)
     fig.tight_layout()
@@ -1286,6 +1409,28 @@ def plot_temporal_offset(
 # ---------------------------------------------------------------------------
 # 4b. Collocation diagnostics plot
 # ---------------------------------------------------------------------------
+
+def _downsampled_valid_pixel_coords(
+    valid_mask: np.ndarray, lons: np.ndarray, lats: np.ndarray, target_count: int = 3000,
+) -> list:
+    """
+    Return (lon, lat) centers of a strided subsample of *valid_mask*'s True
+    cells, capped at roughly *target_count* points.
+
+    Cheap enough to scatter-plot even for a multi-million-cell grid (e.g.
+    CLMS Surface Soil Moisture's ~28M-cell continental raster), while still
+    tracing the actual overpass-swath shape instead of a bounding rectangle
+    over the grid's full nominal extent.
+    """
+    total = int(valid_mask.sum())
+    if total == 0:
+        return []
+    stride = max(1, int(np.sqrt(total / target_count)))
+    strided_mask = valid_mask[::stride, ::stride]
+    ys, xs = np.where(strided_mask)
+    lon_sub = lons[::stride, ::stride][ys, xs]
+    lat_sub = lats[::stride, ::stride][ys, xs]
+    return list(zip(lon_sub.tolist(), lat_sub.tolist()))
 
 def plot_collocation_diagnostics(
     datatree,
@@ -1372,6 +1517,9 @@ def plot_collocation_diagnostics(
 
     scene_bounds = []            # bounding boxes for grid-mode (IW/EW) scenes
     footprint_points: list[tuple[float, float]] = []  # (lon, lat) per sparse WV-mode imagette
+    # (lon, lat) of actual valid-data pixels for overpass-mosaic products
+    # (soil_moisture) — see is_overpass_mosaic below.
+    coverage_points: list[tuple[float, float]] = []
     # (time_min, time_max) per scene that has a usable time coordinate — used
     # to decide which validation points were even temporally eligible to
     # match any SAR acquisition, before we get to spatial matching at all.
@@ -1382,6 +1530,15 @@ def plot_collocation_diagnostics(
     footprint_radius_km = getattr(
         recipe.config.collocation, "sar_footprint_radius_km", 14.0
     )
+    # CLMS Surface Soil Moisture's grid has valid lon/lat everywhere across
+    # the continent, but the actual retrieved value is NaN except along
+    # that day's satellite overpass swaths — a min/max lon/lat bounding
+    # rectangle (which the else-branch below uses for every other grid
+    # product, where it's accurate) would therefore claim coverage across
+    # mostly-empty regions. Scope this to soil_moisture specifically:
+    # other grid products (wind/currents/waves) are single-swath and their
+    # bounding rectangle already matches their real footprint.
+    is_overpass_mosaic = recipe.config.variable == "soil_moisture"
 
     for scene_name in scene_names:
         scene_ds = sar_node[scene_name].to_dataset()
@@ -1408,10 +1565,24 @@ def plot_collocation_diagnostics(
 
         valid_mask = np.isfinite(lons_flat) & np.isfinite(lats_flat)
         if valid_mask.any():
+            data_vars = list(scene_ds.data_vars)
             if is_wv_scene:
                 footprint_points.extend(
                     zip(lons_flat[valid_mask].tolist(), lats_flat[valid_mask].tolist())
                 )
+            elif is_overpass_mosaic and len(lons.shape) > 1 and data_vars:
+                data_valid = np.isfinite(scene_ds[data_vars[0]].values)
+                if data_valid.shape == lons.shape:
+                    coverage_points.extend(
+                        _downsampled_valid_pixel_coords(data_valid, lons, lats)
+                    )
+                else:
+                    scene_bounds.append({
+                        "lon_min": float(np.nanmin(lons_flat[valid_mask])),
+                        "lon_max": float(np.nanmax(lons_flat[valid_mask])),
+                        "lat_min": float(np.nanmin(lats_flat[valid_mask])),
+                        "lat_max": float(np.nanmax(lats_flat[valid_mask])),
+                    })
             else:
                 scene_bounds.append({
                     "lon_min": float(np.nanmin(lons_flat[valid_mask])),
@@ -1428,20 +1599,32 @@ def plot_collocation_diagnostics(
             if len(scene_times) > 0:
                 scene_time_windows.append((scene_times.min(), scene_times.max()))
 
-    if not scene_bounds and not footprint_points:
+    if not scene_bounds and not footprint_points and not coverage_points:
         logger.warning("plot_collocation_diagnostics: Could not extract SAR scene bounds.")
         return None
 
     # ── Extract all validation data ─────────────────────────────────────
+    # No 'validation' node at all (e.g. a validation source collected zero
+    # files -- an unconfigured/awaiting ISMN archive, say) is a stricter
+    # case than "zero collocated pairs": there isn't even a validation
+    # point to mark unmatched. Still plot the SAR coverage rather than
+    # bailing out, so a recipe with real SAR data but no validation data
+    # yet still gets the diagnostic (and not a silently-missing plot).
     all_val_data = _extract_validation_data_for_plot(datatree)
     if not all_val_data:
-        logger.warning("plot_collocation_diagnostics: No validation data found in DataTree.")
-        return None
-
-    all_val_lons = all_val_data["lons"]
-    all_val_lats = all_val_data["lats"]
-    all_val_times = all_val_data["times"]
-    platform_types_arr = np.array(all_val_data["platform_types"])
+        logger.warning(
+            "plot_collocation_diagnostics: No validation data found in "
+            "DataTree -- plotting SAR coverage only."
+        )
+        all_val_lons = np.array([])
+        all_val_lats = np.array([])
+        all_val_times = np.array([])
+        platform_types_arr = np.array([])
+    else:
+        all_val_lons = all_val_data["lons"]
+        all_val_lats = all_val_data["lats"]
+        all_val_times = all_val_data["times"]
+        platform_types_arr = np.array(all_val_data["platform_types"])
 
     # ── Resolve the time tolerance each point would actually be matched
     # with, mirroring run_collocation's own resolution (collocation.py) so
@@ -1556,8 +1739,7 @@ def plot_collocation_diagnostics(
         })
 
     if not categories:
-        logger.warning("plot_collocation_diagnostics: No classifiable validation points.")
-        return None
+        logger.debug("plot_collocation_diagnostics: No classifiable validation points -- SAR coverage only.")
 
     logger.debug(
         "Classification: %s",
@@ -1676,6 +1858,16 @@ def plot_collocation_diagnostics(
                     label=f"SAR footprint (±{footprint_radius_km:.0f} km)" if j == 0 else "")
             ax.scatter([center_lon], [flat], s=10, c="blue", marker="+",
                        transform=box_transform, zorder=1)
+
+    if coverage_points:
+        cov_lons = [
+            (_shift(lon) if crosses_dateline else lon) for lon, _ in coverage_points
+        ]
+        cov_lats = [lat for _, lat in coverage_points]
+        ax.scatter(
+            cov_lons, cov_lats, s=3, c="blue", alpha=0.4, marker=".",
+            transform=box_transform, zorder=1, label="SAR coverage (overpasses)",
+        )
 
     # ── Tier 1 (zorder=2): unmatched layer data (non-in-situ categories) ────
     # Gray (#808080) with alpha=0.3, per-source markers, drawn first so matched
@@ -2157,6 +2349,30 @@ def validation_report(
             if val_var in CIRCULAR_VAL_VARS else collocation_ds
         )
 
+        # Soil moisture: the raw SAR series lives in a different physical
+        # domain than the validation series (e.g. a relative SAR
+        # saturation index vs. ISMN's absolute volumetric content) —
+        # compute_statistics_soil_moisture already CDF-matches them before
+        # computing bias/RMSE, but that rescaled series was previously
+        # discarded, so every point-based plot below was comparing raw,
+        # non-comparable values. Substitute the rescaled series here once,
+        # so scatter/residuals/temporal-offset all compare like with like.
+        #
+        # plot_geographic is the one exception: it keeps the pre-rescale
+        # `pair_ds` (as `geo_pair_ds` below) deliberately, and fits its own
+        # whole-field transform internally (fit_sar_to_val_transform) from
+        # the *raw* sar_<var>/val_<var> pairs. If it were handed the
+        # already-rescaled column instead, it would fit a transform whose
+        # training "source" is already in the validation domain (~0.05-0.5)
+        # and then apply that transform to the real, raw SAR field
+        # (~0-100) — wildly out of the fitted range, producing nonsense
+        # (confirmed against real data: predicted values above 300 for a
+        # variable that should span roughly 0-1).
+        geo_pair_ds = pair_ds
+        if variable == "soil_moisture":
+            from .statistics import add_rescaled_sar_column  # noqa: PLC0415
+            pair_ds = add_rescaled_sar_column(pair_ds, sar_var, val_var)
+
         logger.info("Generating plots for %s vs %s …", sar_var, val_var)
 
         # Scatter
@@ -2178,8 +2394,9 @@ def validation_report(
             # the SAR scene stays visible through the validation points.
             # Scatterometer (wind/waves) similarly occludes the SAR field;
             # for wind, use adaptive sizing: if >~300 points per scene,
-            # use smaller markers (10), else 15. Currents always 15, other
-            # variables default to 40.
+            # use smaller markers (10), else 15. Currents always 15,
+            # soil_moisture (ISMN, dense within-Europe coverage) always 10,
+            # other variables default to 40.
             if variable == "currents":
                 geo_point_size = 15
             elif variable == "wind":
@@ -2188,11 +2405,16 @@ def validation_report(
                 # the SAR field.
                 avg_points_per_scene = len(pair_ds) / max(1, len(matched_scenes or []))
                 geo_point_size = 5 if avg_points_per_scene > 300 else 15
+            elif variable == "soil_moisture":
+                geo_point_size = 10
             else:
                 geo_point_size = 40
             geo_result = plot_geographic(
-                datatree, pair_ds, sar_var, val_var, scenes=matched_scenes,
+                datatree, geo_pair_ds, sar_var, val_var, scenes=matched_scenes,
                 point_size=geo_point_size,
+                geographic_bounds=(
+                    recipe.config.geographic_bounds if variable == "soil_moisture" else None
+                ),
             )
             if isinstance(geo_result, dict):
                 for group, fig_geo in geo_result.items():

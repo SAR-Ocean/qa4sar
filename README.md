@@ -3,7 +3,7 @@
 A standalone Python package for validating Sentinel-1 L2_OCN (Level 2 Ocean) products
 against multi-source in-situ and satellite observations.
 
-Supports validation of **wind** (speed + direction), **ocean currents**, and **significant wave height**.
+Supports validation of **wind** (speed + direction), **ocean currents**, **significant wave height**, and **soil moisture**.
 
 ---
 
@@ -73,6 +73,8 @@ sar_validation/
     ├── scatterometer_downloader.py  # ASCAT (MetOp) via EUMETSAT EUMDAC
     ├── altimeter_downloader.py      # Along-track SWH/wind via Copernicus Marine
     ├── radiometer_downloader.py     # RSS radiometer ocean winds (AMSR2 NetCDF + GMI/SSMIS/WindSat bytemaps)
+    ├── soil_moisture_downloader.py   # Sentinel-1 CLMS Surface Soil Moisture via Copernicus Dataspace (CDSE)
+    ├── ismn_downloader.py            # ISMN local-archive station selector (no download API)
     └── _rss_bytemap.py              # Decoder for RSS binary bytemap (.gz) radiometer products
 ```
 
@@ -96,6 +98,7 @@ pip install -e .
 sar-validate --create-recipe wind
 sar-validate --create-recipe currents
 sar-validate --create-recipe waves
+sar-validate --create-recipe soil_moisture
 ```
 
 This writes a YAML recipe to `recipes/<name>_validation.yaml`.  
@@ -160,6 +163,19 @@ plt.show()
 | HF Radar | ocean currents | `hf_radar_downloader` | Copernicus Marine |
 | ASCAT (MetOp-B/C) | wind | `scatterometer_downloader` | EUMETSAT EUMDAC |
 | Radiometer — AMSR2 (NetCDF); GMI, SSMIS F16/F17/F18, WindSat (binary bytemaps) | wind (+ direction from WindSat) | `radiometer_downloader` | RSS `data.remss.com` (public HTTPS) |
+| Sentinel-1 CLMS Surface Soil Moisture | soil moisture | `soil_moisture_downloader` | Copernicus Dataspace (CDSE) |
+| ISMN (International Soil Moisture Network) | soil moisture | `ismn_downloader` | Manual portal download (no API) |
+
+> **Note:** The Sentinel-1 CLMS Surface Soil Moisture downloader's CDSE query
+> parameters (`DATASET_IDENTIFIER`, `PRODUCT_EXTENT` in
+> `sar_validation/downloaders/soil_moisture_downloader.py`) and GeoTIFF value
+> decoding (`from_sar_l3_ssm_geotiff` in `sar_validation/core/datatree_converter.py`)
+> have been confirmed against a real downloaded CEURO product (embedded
+> `scale_factor`/`add_offset`/`flag_values`/geospatial-extent GDAL tags) and a
+> successful end-to-end recipe run. Each CDSE product is served as a zip
+> containing a soil-moisture GeoTIFF plus a sibling uncertainty-layer GeoTIFF
+> (and, separately, a redundant NetCDF variant) — both are downloaded/unzipped
+> and filtered automatically, no manual handling needed.
 
 ### Collocation types
 
@@ -201,6 +217,20 @@ chmod 600 ~/.eumdac/credentials
 Or use environment variables: `EUMDAC_USERNAME` / `EUMDAC_PASSWORD`.
 
 Register at: https://eoportal.eumetsat.int
+
+### ISMN — for soil moisture in-situ validation
+
+ISMN has no download API. Register at https://ismn.earth/en/dataviewer/,
+filter by bounding box / date range / depth / variable ("soil moisture") on
+the portal, and download the resulting zip. Running the recipe before the
+archive exists prints these exact filter values so they can be
+copy-pasted into the portal form, along with the recommended download
+options: **CEOP-formatted** (variables stored in separate files, zipped),
+**"Good" quality flags only**, and **gap filling disabled**, plus the
+exact folder to drop the downloaded zip into — no recipe edits needed,
+just drop it in and re-run. To reuse one archive across multiple recipes
+instead, set its path explicitly as `ismn_archive_path` in the recipe's
+`download_kwargs` for the `ismn` validation source.
 
 ---
 

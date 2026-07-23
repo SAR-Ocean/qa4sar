@@ -197,11 +197,38 @@ class DataOrchestrator:
     # ------------------------------------------------------------------
 
     def _download_sar(self) -> bool:
-        from ..downloaders.sar_downloader import SARDownloader
-
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
         temp   = cfg.temporal_bounds
+
+        if cfg.sar_data.product_level == "L3_SSM":
+            from ..downloaders.soil_moisture_downloader import SoilMoistureDownloader
+
+            out_dir = self.base_dir / "S1_L3_SSM"
+            try:
+                ssm_dl = SoilMoistureDownloader(
+                    output_dir=out_dir,
+                    dry_run=self.dry_run,
+                    force_download=self.force_download,
+                )
+                paths = ssm_dl.download(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=temp.start,      end=temp.end,
+                )
+                self.metadata["downloads"]["sar"] = {
+                    "status": "dry_run" if self.dry_run else "success",
+                    "files":  [str(p) for p in paths],
+                }
+                return True
+            except Exception as exc:
+                msg = f"SAR (CLMS SSM) download failed: {exc}"
+                logger.error(msg)
+                self.metadata["errors"].append(msg)
+                self.metadata["downloads"]["sar"] = {"status": "failed", "error": msg}
+                return False
+
+        from ..downloaders.sar_downloader import SARDownloader
 
         out_dir = self.base_dir / "S1_L2_OCN"
 
@@ -287,6 +314,7 @@ class DataOrchestrator:
             "glider_historical": self._download_glider_historical,
             "altimeter":     self._download_altimeter,
             "radiometer":    self._download_radiometer,
+            "ismn":          self._download_ismn,
         }
         handler = handlers.get(source.source_type)
         if handler is None:
@@ -585,6 +613,46 @@ class DataOrchestrator:
             logger.error(msg)
             self.metadata["errors"].append(msg)
             self.metadata["downloads"]["radiometer"] = {"status": "failed", "error": msg}
+            return False
+
+    def _download_ismn(self, source) -> bool:
+        from ..downloaders.ismn_downloader import ISMNDownloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        temp   = cfg.temporal_bounds
+        out_dir = self.base_dir / "ismn"
+
+        try:
+            dl = ISMNDownloader(output_dir=out_dir, dry_run=self.dry_run)
+            paths = dl.download(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=temp.start, end=temp.end,
+                min_depth=source.resolved_min_depth,
+                max_depth=source.resolved_max_depth,
+                archive_path=source.download_kwargs.get("ismn_archive_path"),
+            )
+            if self.dry_run:
+                status = "dry_run"
+            elif paths:
+                status = "success"
+            else:
+                # Not a failure -- the manually-downloaded archive just
+                # isn't there yet (see ISMNDownloader's printed portal
+                # instructions). Reporting "success" here would hide that
+                # zero files were actually collected.
+                status = "awaiting_manual_archive"
+            self.metadata["downloads"]["ismn"] = {
+                "status": status,
+                "files":  [str(p) for p in paths],
+            }
+            return True
+        except Exception as exc:
+            msg = f"ISMN selection failed: {exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"]["ismn"] = {"status": "failed", "error": msg}
             return False
 
     # ------------------------------------------------------------------

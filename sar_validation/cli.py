@@ -9,7 +9,7 @@ Usage
   # List example recipes
   sar-validate --list-recipes
 
-  # Create a recipe template (wind | currents | waves)
+  # Create a recipe template (wind | currents | waves | soil_moisture)
   sar-validate --create-recipe wind
 
   # Dry-run (see what would be downloaded)
@@ -82,7 +82,7 @@ Examples:
     parser.add_argument(
         "--create-recipe",
         metavar="NAME",
-        help="Create a recipe template: wind | currents | waves",
+        help="Create a recipe template: wind | currents | waves | soil_moisture",
     )
     parser.add_argument(
         "--limit",
@@ -429,6 +429,58 @@ def _build_wind_config(limit: Optional[int] = None):
     )
 
 
+def _build_soil_moisture_config(limit: Optional[int] = None):
+    """Build the 'soil_moisture' recipe template's RecipeConfig.
+
+    Extracted from ``_create_recipe`` so the template content is
+    unit-testable independent of the CLI's file-writing side effects,
+    mirroring ``_build_wind_config``/``_build_currents_config``.
+    """
+    from .core.recipe import (
+        CollocationType,
+        GeographicBounds,
+        PointVsLayerCollocation,
+        RecipeConfig,
+        SARDataSpec,
+        ValidationDataSource,
+    )
+
+    return RecipeConfig(
+        name="Soil Moisture Validation",
+        description=(
+            "Validate Sentinel-1 CLMS Surface Soil Moisture (1 km, Europe,\n"
+            "daily) against ISMN in-situ stations."
+        ),
+        variable="soil_moisture",
+        variable_specs={"components": ["soil_moisture"]},
+        # Narrower than the ocean templates' Europe default — matches the
+        # CLMS SSM 1km product's documented extent more tightly.
+        geographic_bounds=GeographicBounds(-10.0, 30.0, 35.0, 60.0),
+        sar_data=SARDataSpec(satellite="Sentinel-1", product_level="L3_SSM", max_downloads=limit),
+        validation_sources=[
+            # download_kwargs left empty on purpose — first run prints ISMN
+            # portal instructions rather than needing a placeholder path.
+            # min_depth/max_depth here (~0-5 cm) match C-band Sentinel-1's
+            # sensing depth; a future NISAR (L-band) recipe would instead
+            # use a deeper window (~0-0.25 m), set the same way.
+            ValidationDataSource(source_type="ismn", min_depth=0.0, max_depth=0.05),
+        ],
+        collocation=CollocationType(
+            # Pixel-scale tolerances, not the ocean buoy-footprint defaults:
+            # a 1 km SAR pixel and a point ISMN station don't need a 25 km
+            # buoy-scale aggregation window, and the product is daily (not
+            # 30-minutes-tolerance) — only a calendar-day match matters.
+            point_vs_layer=PointVsLayerCollocation(
+                spatial_tolerance_km=2.0,
+                aggregation_window_km=1.0,
+                distance_weighting="equal",
+                interpolation_method="nearest",
+                time_tolerance_minutes=720,
+            ),
+        ),
+    )
+
+
 def _create_recipe(
     name: str,
     limit: Optional[int] = None,
@@ -455,6 +507,7 @@ def _create_recipe(
     templates = {
         "wind": _build_wind_config(limit),
         "currents": _build_currents_config(limit),
+        "soil_moisture": _build_soil_moisture_config(limit),
         "waves": RecipeConfig(
             name="Wave Height Validation",
             description=(

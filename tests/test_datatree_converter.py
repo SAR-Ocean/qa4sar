@@ -12,7 +12,7 @@ import pytest
 import xarray as xr
 
 from sar_validation.core.collocation import CollocatedPoint
-from sar_validation.core.datatree_converter import DataTreeConverter, _subset_point_ds
+from sar_validation.core.datatree_converter import DataTreeConverter, _parse_ssm_timestamp, _subset_point_ds
 from sar_validation.core.recipe import (
     GeographicBounds,
     Recipe,
@@ -377,6 +377,77 @@ def _make_altimeter_nc(tmp_path: Path, n: int = 5) -> Path:
     return path
 
 
+def _make_ssm_geotiff(tmp_path: Path, nrows: int = 3, ncols: int = 4) -> Path:
+    """Write a small synthetic CLMS SSM GeoTIFF (uint8, EPSG:4326), with the
+    same embedded GDAL tags (nodata, scale_factor, add_offset, flag_values)
+    confirmed against a real downloaded product — see design spec §9 /
+    from_sar_l3_ssm_geotiff's docstring."""
+    import rasterio
+    from rasterio.transform import from_origin
+
+    data = np.array(
+        [[100, 120, 255, 60],
+         [20, 251, 40, 80],
+         [140, 160, 180, 255]],
+        dtype=np.uint8,
+    )[:nrows, :ncols]
+    transform = from_origin(-10.0, 55.0, 1.0, 1.0)  # west, north, xsize, ysize
+
+    path = tmp_path / "c_gls_SSM1km-SSM_202601010000_CEURO_S1CSAR_V1.1.1.tiff"
+    with rasterio.open(
+        path, "w", driver="GTiff",
+        height=data.shape[0], width=data.shape[1],
+        count=1, dtype=data.dtype,
+        crs="EPSG:4326", transform=transform, nodata=255,
+    ) as dst:
+        dst.write(data, 1)
+        dst.scales = (0.5,)
+        dst.offsets = (0.0,)
+        dst.update_tags(1, flag_values="{241, 242, 251, 252, 253}")
+    return path
+
+
+class TestFromSarL3SsmGeotiff:
+    def test_missing_file_returns_none(self, tmp_path):
+        result = DataTreeConverter.from_sar_l3_ssm_geotiff(tmp_path / "missing.tif")
+        assert result is None
+
+    def test_decodes_grid_and_masks_no_data(self, tmp_path):
+        path = _make_ssm_geotiff(tmp_path)
+        ds = DataTreeConverter.from_sar_l3_ssm_geotiff(path)
+
+        assert ds is not None
+        assert ds.attrs["data_type"] == "sar_l3_ssm"
+        assert "sarSSM" in ds
+        assert ds["sarSSM"].dims == ("y", "x")
+        assert ds["lon"].dims == ("y", "x")
+        assert ds["lat"].dims == ("y", "x")
+        # DN=255 (no-data, missing_value tag) must be masked to NaN.
+        assert np.isnan(ds["sarSSM"].values[0, 2])
+        # DN=251 (a named QC flag_values code, WaterMask) must also be
+        # masked to NaN, distinct from the no-data handling above.
+        assert np.isnan(ds["sarSSM"].values[1, 1])
+        # DN=100 -> 100*0.5 + 0.0 = 50% saturation (real scale_factor/add_offset).
+        assert ds["sarSSM"].values[0, 0] == pytest.approx(50.0)
+
+    def test_time_parsed_from_filename(self, tmp_path):
+        path = _make_ssm_geotiff(tmp_path)
+        ds = DataTreeConverter.from_sar_l3_ssm_geotiff(path)
+        assert pd.Timestamp(ds["time"].values) == pd.Timestamp("2026-01-01T00:00:00")
+
+    def test_parse_ssm_timestamp_8_digit_date_only(self):
+        """Test that an 8-digit YYYYMMDD token defaults to midnight."""
+        filename = "c_gls_SSM1km_20260115_CEURO_S1CSAR_V1.1.1.tif"
+        result = _parse_ssm_timestamp(filename)
+        assert pd.Timestamp(result) == pd.Timestamp("2026-01-15T00:00:00")
+
+    def test_parse_ssm_timestamp_no_date_token_raises(self):
+        """Test that a filename with no date token raises ValueError."""
+        filename = "no_date_here.tif"
+        with pytest.raises(ValueError, match="Could not find a date token"):
+            _parse_ssm_timestamp(filename)
+
+
 class TestFromAltimeter:
     def test_wind_speed_renamed_to_wspd(self, tmp_path):
         path = _make_altimeter_nc(tmp_path)
@@ -676,6 +747,69 @@ class TestConvertDownloadedDataFiltering:
             (subgroup,) = group.groups.values()
             filters = subgroup.variables["WSPD"].filters()
             assert filters["zlib"]
+
+    def test_s1_l3_ssm_geotiffs_land_under_sar_node(self, tmp_path):
+        # SoilMoistureDownloader unzips each product into its own subfolder
+        # (one "-SSM_" GeoTIFF alongside a sibling "-NOISE_" file) — mirror
+        # that nested layout here rather than a flat S1_L3_SSM/*.tif.
+        ssm_dir = tmp_path / "S1_L3_SSM"
+        product_dir = ssm_dir / "c_gls_SSM1km_202601010000_CEURO_S1CSAR_V1.1.1_cog"
+        product_dir.mkdir(parents=True)
+        _make_ssm_geotiff(product_dir)
+
+        tree = DataTreeConverter.convert_downloaded_data(tmp_path)
+
+        assert tree is not None
+        assert "sar" in tree.children
+        sar_names = list(tree["sar"].children)
+        assert any("c_gls_SSM1km" in name for name in sar_names)
+
+    def test_s1_l3_ssm_ignores_noise_layer_geotiff(self, tmp_path):
+        """The sibling -NOISE_ uncertainty-layer GeoTIFF (extracted
+        alongside -SSM_ in the same product folder) must not be discovered
+        as if it were its own SAR scene."""
+        ssm_dir = tmp_path / "S1_L3_SSM"
+        product_dir = ssm_dir / "c_gls_SSM1km_202601010000_CEURO_S1CSAR_V1.1.1_cog"
+        product_dir.mkdir(parents=True)
+        ssm_path = _make_ssm_geotiff(product_dir)
+        noise_path = product_dir / ssm_path.name.replace("-SSM_", "-NOISE_")
+        noise_path.write_bytes(ssm_path.read_bytes())
+
+        tree = DataTreeConverter.convert_downloaded_data(tmp_path)
+
+        assert tree is not None
+        sar_names = list(tree["sar"].children)
+        assert len(sar_names) == 1
+        assert "NOISE" not in sar_names[0]
+
+
+class TestConvertDownloadedDataIsmn:
+    def test_ismn_csv_lands_under_validation_ismn(self, tmp_path):
+        ismn_dir = tmp_path / "ismn"
+        ismn_dir.mkdir()
+        df = pd.DataFrame({
+            "platform_id":   ["station_a"] * 3,
+            "platform_type": ["ismn"] * 3,
+            "time":          pd.date_range("2026-01-01", periods=3, freq="D"),
+            "lon":           [10.0] * 3,
+            "lat":           [45.0] * 3,
+            "depth":         [0.0] * 3,
+            "variable":      ["SOIL_MOISTURE"] * 3,
+            "value":         [0.20, 0.21, 0.19],
+        })
+        df.to_csv(ismn_dir / "ismn_station_a_sensor1.csv", index=False)
+
+        tree = DataTreeConverter.convert_downloaded_data(tmp_path)
+
+        assert tree is not None
+        assert "validation" in tree.children
+        assert "ismn" in tree["validation"].children
+        node_names = list(tree["validation"]["ismn"].children)
+        assert any("ismn_station_a_sensor1" in name for name in node_names)
+
+        ds = tree["validation"]["ismn"]["ismn_station_a_sensor1"].to_dataset()
+        assert ds.attrs["data_type"] == "insitu_observations"
+        assert "SOIL_MOISTURE" in ds
 
 
 # ---------------------------------------------------------------------------

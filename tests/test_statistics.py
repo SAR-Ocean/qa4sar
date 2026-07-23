@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -82,6 +83,300 @@ class TestComputeStatistics:
         ds = compute_statistics(collocation_ds, "owiWindSpeed", "WSPD")
         total_n = int(ds["N"].sum())
         assert total_n == 40
+
+
+# ---------------------------------------------------------------------------
+# compute_statistics_soil_moisture (pytesmo CDF-matching + ubRMSD)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def soil_moisture_collocation_ds():
+    """Synthetic soil-moisture collocation dataset, single source."""
+    n = 30
+    rng = np.random.default_rng(7)
+    val_vals = rng.uniform(0.05, 0.35, size=n)          # ISMN volumetric fraction
+    sar_vals = val_vals * 150.0 + rng.normal(0, 2, n)    # SAR in a different domain (% saturation-like)
+
+    return xr.Dataset({
+        "sar_sarSSM":        ("collocation", sar_vals),
+        "val_SOIL_MOISTURE": ("collocation", val_vals),
+        "val_source":        ("collocation", ["ismn"] * n),
+    })
+
+
+class _FakeCdfMatchScale:
+    """Stand-in for pytesmo.scaling.scale(method='cdf_match', reference_index=1).
+
+    Rescales column 0 (SAR) linearly onto column 1 (val)'s mean/std — good
+    enough to exercise the statistics-module wiring without depending on
+    pytesmo's real CDF-matching implementation.
+    """
+
+    def __call__(self, df, method="cdf_match", reference_index=1, **kwargs):
+        # Real pytesmo.scaling.scale holds the column at `reference_index`
+        # fixed and rescales every other column onto it; for this 2-column
+        # (sar, val) case, that's whichever column isn't the reference.
+        out = df.copy()
+        ref_col = df.columns[reference_index]
+        src_col = df.columns[1 - reference_index]
+        src = df[src_col].values
+        ref = df[ref_col].values
+        rescaled = (src - src.mean()) / src.std() * ref.std() + ref.mean()
+        out[src_col] = rescaled
+        return out
+
+
+def _fake_ubrmsd(sar_vals, val_vals):
+    diff = sar_vals - sar_vals.mean() - (val_vals - val_vals.mean())
+    return float(np.sqrt(np.mean(diff ** 2)))
+
+
+def _patched_pytesmo_modules():
+    fake_scaling = MagicMock()
+    fake_scaling.scale = _FakeCdfMatchScale()
+    fake_metrics = MagicMock()
+    fake_metrics.ubrmsd = _fake_ubrmsd
+    fake_pytesmo = MagicMock()
+    return {
+        "pytesmo": fake_pytesmo,
+        "pytesmo.scaling": fake_scaling,
+        "pytesmo.metrics": fake_metrics,
+    }
+
+
+class TestComputeStatisticsSoilMoisture:
+    def test_returns_dataset_with_ubrmsd(self, soil_moisture_collocation_ds):
+        from sar_validation.core.statistics import compute_statistics_soil_moisture
+
+        with patch.dict("sys.modules", _patched_pytesmo_modules()):
+            ds = compute_statistics_soil_moisture(
+                soil_moisture_collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            )
+
+        assert ds is not None
+        for metric in ("N", "bias", "std", "rmse", "correlation", "scatter_index", "ubrmsd"):
+            assert metric in ds.data_vars, f"Missing metric: {metric}"
+
+    def test_correlation_high_after_rescaling(self, soil_moisture_collocation_ds):
+        from sar_validation.core.statistics import compute_statistics_soil_moisture
+
+        with patch.dict("sys.modules", _patched_pytesmo_modules()):
+            ds = compute_statistics_soil_moisture(
+                soil_moisture_collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            )
+        # SAR was built as a noisy linear function of val, so correlation
+        # should be strong even before considering the rescaling.
+        assert float(ds["correlation"].values[0]) > 0.9
+
+    def test_missing_column_returns_none(self, soil_moisture_collocation_ds):
+        from sar_validation.core.statistics import compute_statistics_soil_moisture
+
+        with patch.dict("sys.modules", _patched_pytesmo_modules()):
+            ds = compute_statistics_soil_moisture(
+                soil_moisture_collocation_ds, "sarSSM", "NOT_A_REAL_VAR",
+            )
+        assert ds is None
+
+    def test_degenerate_cdf_match_skips_group_instead_of_reporting_nan(
+        self, soil_moisture_collocation_ds, caplog,
+    ):
+        """Real pytesmo can silently CDF-match to an all-NaN series when its
+        percentile binning degenerates for a small/coarsely-quantized sample
+        (observed against a real collocation run) — this must be skipped
+        with a warning, not surfaced as a row of NaN metrics that looks like
+        a normally-computed (near-)zero-signal result.
+        """
+        from sar_validation.core.statistics import compute_statistics_soil_moisture
+
+        fake_scaling = MagicMock()
+        fake_scaling.scale = MagicMock(
+            side_effect=lambda df, **kwargs: df.assign(**{df.columns[0]: np.nan})
+        )
+        fake_metrics = MagicMock()
+        fake_metrics.ubrmsd = _fake_ubrmsd
+        modules = {"pytesmo": MagicMock(), "pytesmo.scaling": fake_scaling, "pytesmo.metrics": fake_metrics}
+
+        with patch.dict("sys.modules", modules):
+            ds = compute_statistics_soil_moisture(
+                soil_moisture_collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            )
+        assert ds is None
+        assert "degenerated to all-NaN" in caplog.text
+
+    def test_skips_groups_with_fewer_than_2_pairs(self):
+        """Test that groups with <2 valid pairs are skipped, not included with garbage values.
+
+        The CDF-matching operation requires at least 2 points. Groups with only 1 pair
+        should be silently excluded (with a warning) rather than crashing or producing
+        invalid output.
+        """
+        from sar_validation.core.statistics import compute_statistics_soil_moisture
+
+        rng = np.random.default_rng(42)
+
+        # Create a dataset with two groups:
+        # - "ismn_many": 5 valid pairs (should be included)
+        # - "ismn_few": 1 valid pair (should be skipped)
+        val_vals_many = rng.uniform(0.05, 0.35, size=5)
+        sar_vals_many = val_vals_many * 150.0 + rng.normal(0, 2, 5)
+
+        val_vals_few = np.array([0.15])
+        sar_vals_few = np.array([22.5])
+
+        val_vals = np.concatenate([val_vals_many, val_vals_few])
+        sar_vals = np.concatenate([sar_vals_many, sar_vals_few])
+        sources = ["ismn_many"] * 5 + ["ismn_few"] * 1
+
+        ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", sar_vals),
+            "val_SOIL_MOISTURE": ("collocation", val_vals),
+            "val_source":        ("collocation", sources),
+        })
+
+        with patch.dict("sys.modules", _patched_pytesmo_modules()):
+            result = compute_statistics_soil_moisture(ds, "sarSSM", "SOIL_MOISTURE")
+
+        # The result should not be None (ismn_many has >= 2 pairs)
+        assert result is not None
+
+        # The source coordinate should only contain the larger group
+        source_labels = set(result["source"].values)
+        assert "ismn_many" in source_labels, "Large group (5 pairs) should be included"
+        assert "ismn_few" not in source_labels, "Small group (1 pair) should be skipped"
+
+        # Verify that the included group has the correct count
+        assert int(result["N"].values[0]) == 5, "Included group should have N=5"
+
+
+class TestAddRescaledSarColumn:
+    def test_rescaled_sar_lands_in_val_domain(self, soil_moisture_collocation_ds):
+        from sar_validation.core.statistics import add_rescaled_sar_column
+
+        val_vals = soil_moisture_collocation_ds["val_SOIL_MOISTURE"].values
+
+        with patch.dict("sys.modules", _patched_pytesmo_modules()):
+            out = add_rescaled_sar_column(
+                soil_moisture_collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            )
+
+        rescaled = out["sar_sarSSM"].values
+        assert not np.any(np.isnan(rescaled))
+        # The fake CDF-match linearly matches mean/std onto val's — a much
+        # tighter check than "just don't crash": confirms the values
+        # actually moved into val's numeric domain, not just no NaNs.
+        assert rescaled.mean() == pytest.approx(val_vals.mean(), abs=1e-6)
+        assert rescaled.std() == pytest.approx(val_vals.std(), abs=1e-6)
+
+    def test_does_not_mutate_original_dataset(self, soil_moisture_collocation_ds):
+        from sar_validation.core.statistics import add_rescaled_sar_column
+
+        original_sar = soil_moisture_collocation_ds["sar_sarSSM"].values.copy()
+
+        with patch.dict("sys.modules", _patched_pytesmo_modules()):
+            add_rescaled_sar_column(soil_moisture_collocation_ds, "sarSSM", "SOIL_MOISTURE")
+
+        np.testing.assert_array_equal(
+            soil_moisture_collocation_ds["sar_sarSSM"].values, original_sar,
+        )
+
+    def test_rescaled_column_attrs_copied_from_val(self):
+        import xarray as xr
+
+        from sar_validation.core.statistics import add_rescaled_sar_column
+
+        ds = xr.Dataset({
+            "sar_sarSSM": ("collocation", np.array([50.0, 60.0, 55.0], dtype=float)),
+            "val_SOIL_MOISTURE": xr.DataArray(
+                np.array([0.2, 0.25, 0.22]), dims="collocation",
+                attrs={"units": "1", "long_name": "ISMN soil moisture"},
+            ),
+            "val_source": ("collocation", ["ismn"] * 3),
+        })
+
+        with patch.dict("sys.modules", _patched_pytesmo_modules()):
+            out = add_rescaled_sar_column(ds, "sarSSM", "SOIL_MOISTURE")
+
+        assert out["sar_sarSSM"].attrs["units"] == "1"
+        assert out["sar_sarSSM"].attrs["long_name"] == "ISMN soil moisture"
+
+    def test_missing_column_returns_unchanged_copy(self, soil_moisture_collocation_ds, caplog):
+        from sar_validation.core.statistics import add_rescaled_sar_column
+
+        with patch.dict("sys.modules", _patched_pytesmo_modules()):
+            out = add_rescaled_sar_column(soil_moisture_collocation_ds, "sarSSM", "NOT_A_REAL_VAR")
+
+        np.testing.assert_array_equal(
+            out["sar_sarSSM"].values, soil_moisture_collocation_ds["sar_sarSSM"].values,
+        )
+        assert "not found" in caplog.text
+
+    def test_small_group_left_as_nan(self):
+        import xarray as xr
+
+        from sar_validation.core.statistics import add_rescaled_sar_column
+
+        ds = xr.Dataset({
+            "sar_sarSSM": ("collocation", np.array([50.0, 60.0, 55.0, 58.0, 52.0, 90.0])),
+            "val_SOIL_MOISTURE": ("collocation", np.array([0.20, 0.25, 0.22, 0.24, 0.21, 0.30])),
+            "val_source": ("collocation", ["ismn_many"] * 5 + ["ismn_one"]),
+        })
+
+        with patch.dict("sys.modules", _patched_pytesmo_modules()):
+            out = add_rescaled_sar_column(ds, "sarSSM", "SOIL_MOISTURE")
+
+        rescaled = out["sar_sarSSM"].values
+        assert not np.any(np.isnan(rescaled[:5])), "5-pair group should be rescaled"
+        assert np.isnan(rescaled[5]), "1-pair group can't CDF-match — left as NaN"
+
+
+class TestCdfMatchingBinsResizedWarningSuppressed:
+    """Real (unmocked) pytesmo.cdf_matching resizes its bins and emits
+    'UserWarning: The bins have been resized' whenever nsamples * (100 /
+    nbins) / 100 < minobs=20 -- an expected, routine side effect of our own
+    deliberately small nbins cap (see _cdf_match_sar_series), not a sign of
+    a problem. Lotte saw this leak straight to a real CLI run's console;
+    it must not propagate to callers of either public entry point."""
+
+    def test_add_rescaled_sar_column_suppresses_it(self, soil_moisture_collocation_ds):
+        from sar_validation.core.statistics import add_rescaled_sar_column
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            add_rescaled_sar_column(soil_moisture_collocation_ds, "sarSSM", "SOIL_MOISTURE")
+
+        assert not any("bins have been resized" in str(w.message).lower() for w in caught)
+
+    def test_fit_sar_to_val_transform_suppresses_it(self, soil_moisture_collocation_ds):
+        from sar_validation.core.statistics import fit_sar_to_val_transform
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fit_sar_to_val_transform(soil_moisture_collocation_ds, "sarSSM", "SOIL_MOISTURE")
+
+        assert not any("bins have been resized" in str(w.message).lower() for w in caught)
+
+
+class TestRunStatisticsSoilMoistureDispatch:
+    def test_soil_moisture_variable_uses_pytesmo_path(self, tmp_path, soil_moisture_collocation_ds):
+        from sar_validation.core.statistics import run_statistics
+
+        recipe = Recipe(RecipeConfig(name="test", variable="soil_moisture"))
+
+        with patch.dict("sys.modules", _patched_pytesmo_modules()):
+            results = run_statistics(soil_moisture_collocation_ds, recipe, tmp_path)
+
+        assert "sarSSM_vs_SOIL_MOISTURE" in results
+        assert "ubrmsd" in results["sarSSM_vs_SOIL_MOISTURE"].data_vars
+
+    def test_wind_variable_does_not_require_pytesmo(self, tmp_path, collocation_ds):
+        from sar_validation.core.statistics import run_statistics
+
+        recipe = Recipe(RecipeConfig(name="test", variable="wind"))
+        # No pytesmo mock installed — if run_statistics tried to import it
+        # for a non-soil-moisture recipe, this would raise ImportError.
+        results = run_statistics(collocation_ds, recipe, tmp_path)
+        assert "owiWindSpeed_vs_WSPD" in results
+        assert "ubrmsd" not in results["owiWindSpeed_vs_WSPD"].data_vars
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +525,10 @@ class TestVariableMap:
         assert ("oswTotalHs", "VHM0") in pairs
         assert ("oswHs", "VHM0") in pairs
 
+    def test_soil_moisture_pairs(self):
+        pairs = infer_variable_pairs("soil_moisture")
+        assert pairs == [("sarSSM", "SOIL_MOISTURE")]
+
     def test_unknown_raises(self):
         with pytest.raises(KeyError):
             infer_variable_pairs("invalid_variable")
@@ -336,3 +635,20 @@ class TestFilterVariablePairs:
         })
         pairs = filter_variable_pairs(recipe, ds)
         assert pairs == [("owiSignificantWaveHeight", "VAVH")]
+
+
+class TestFilterVariablePairsSoilMoisture:
+    def test_pair_present_when_columns_exist(self):
+        recipe = Recipe(RecipeConfig(name="test", variable="soil_moisture"))
+        ds = xr.Dataset({
+            "sar_sarSSM":         ("collocation", [50.0, 60.0]),
+            "val_SOIL_MOISTURE":  ("collocation", [0.2, 0.25]),
+        })
+        pairs = filter_variable_pairs(recipe, ds)
+        assert pairs == [("sarSSM", "SOIL_MOISTURE")]
+
+    def test_pair_absent_when_columns_missing(self):
+        recipe = Recipe(RecipeConfig(name="test", variable="soil_moisture"))
+        ds = xr.Dataset({"sar_owiWindSpeed": ("collocation", [1.0])})
+        pairs = filter_variable_pairs(recipe, ds)
+        assert pairs == []

@@ -111,10 +111,17 @@ class ValidationDataSource:
 
 @dataclass
 class SARDataSpec:
-    """Specification for the SAR L2_OCN product to validate."""
+    """Specification for the SAR product to validate."""
     satellite: str = "Sentinel-1"
     product_level: str = "L2_OCN"
+    """
+    ``"L2_OCN"`` (wind/currents/waves, via ``SARDownloader``) or
+    ``"L3_SSM"`` (soil moisture, via ``SoilMoistureDownloader``).
+    """
     swath_mode: List[str] = field(default_factory=lambda: ["IW", "EW"])
+    """SAR beam mode(s), e.g. ``["IW", "EW"]`` or ``["WV"]``. Unused for
+    ``product_level="L3_SSM"`` (no WV/IW/EW mode concept for a daily
+    merged raster)."""
     max_downloads: Optional[int] = None   # None → download all found products
 
     def to_dict(self) -> Dict[str, Any]:
@@ -248,7 +255,7 @@ class RecipeConfig:
 
     # --- Required fields (no default) ---
     name: str
-    variable: str       # "wind" | "currents" | "waves"
+    variable: str       # "wind" | "currents" | "waves" | "soil_moisture"
 
     # --- Optional metadata ---
     description: str = ""

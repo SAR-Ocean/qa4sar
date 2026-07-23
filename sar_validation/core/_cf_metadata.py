@@ -91,6 +91,9 @@ INSITU_VARIABLE_ATTRS: Dict[str, Dict[str, str]] = {
              "long_name": "practical salinity", "units": "1e-3"},
     "SLEV": {"standard_name": "water_surface_height_above_reference_datum",
              "long_name": "observed sea level", "units": "m"},
+    "SOIL_MOISTURE": {"standard_name": "volume_fraction_of_water_in_soil",
+                      "long_name": "ISMN in-situ volumetric soil moisture",
+                      "units": "m3 m-3"},
 }
 
 #: Descriptive attrs, kept when copying from a raw product variable.

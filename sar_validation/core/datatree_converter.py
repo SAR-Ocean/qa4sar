@@ -177,6 +177,25 @@ def _build_subset_kwargs(recipe) -> Dict[str, Any]:
     }
 
 
+def _parse_ssm_timestamp(filename: str) -> np.datetime64:
+    """
+    Extract the acquisition timestamp from a CLMS SSM filename.
+
+    CLMS filenames embed a ``YYYYMMDDHHMM`` (or ``YYYYMMDD``) token, e.g.
+    ``c_gls_SSM1km_202601010000_CEURO_S1CSAR_V1.1.1.tif``. This parser
+    accepts either width.
+    """
+    match = re.search(r"(\d{12}|\d{8})", filename)
+    if not match:
+        raise ValueError(f"Could not find a date token in SSM filename: {filename}")
+    token = match.group(1)
+    if len(token) == 8:
+        token += "0000"
+    return np.datetime64(
+        f"{token[0:4]}-{token[4:6]}-{token[6:8]}T{token[8:10]}:{token[10:12]}:00"
+    )
+
+
 class DataTreeConverter:
     """Convert various data formats to standardised xarray objects."""
 
@@ -208,6 +227,75 @@ class DataTreeConverter:
 
         ds.attrs.setdefault("data_type", "sar_l2_ocn")
         ds.attrs.setdefault("source", "Sentinel-1")
+        return ds
+
+    @staticmethod
+    def from_sar_l3_ssm_geotiff(tif_path: Union[str, Path]) -> Optional[xr.Dataset]:
+        """
+        Open a Sentinel-1 CLMS Surface Soil Moisture GeoTIFF and return a
+        standardised Dataset with a native ``(y, x)`` grid — the same
+        grid-shape-role SAR L2_OCN products use, so it reuses the existing
+        grid-collocation path unchanged.
+
+        Decodes the GeoTIFF's own embedded GDAL tags (no-data value,
+        ``scale_factor``/``add_offset``, and named QC ``flag_values``) into
+        a physical ``sarSSM`` percent-saturation grid, and derives 2-D
+        ``lon``/``lat`` coordinates from the raster's affine transform/CRS.
+
+        Parameters
+        ----------
+        tif_path : str or Path
+            Path to a CLMS SSM GeoTIFF (as downloaded by
+            ``SoilMoistureDownloader``).
+
+        Returns
+        -------
+        xr.Dataset or None
+            None if the file does not exist.
+        """
+        import rioxarray  # noqa: F401 — lazy import; registers the .rio accessor
+
+        tif_path = Path(tif_path)
+        if not tif_path.exists():
+            logger.warning("GeoTIFF not found: %s", tif_path)
+            return None
+
+        # masked=True replaces the file's own no-data value (missing_value
+        # GDAL tag, 255 for this product) with NaN; it does not apply
+        # scale_factor/add_offset, which are handled explicitly below.
+        raw = rioxarray.open_rasterio(tif_path, masked=True)
+        assert isinstance(raw, xr.DataArray), (
+            f"Expected a single-band GeoTIFF DataArray, got {type(raw)}: {tif_path}"
+        )
+        raw = raw.squeeze("band", drop=True)
+
+        # CLMS SSM decoding — confirmed against a real downloaded product's
+        # embedded GDAL tags: scale_factor=0.5, add_offset=0.0, units="%",
+        # flag_values={241,242,251,252,253} (ExceedingMin/ExceedingMax/
+        # WaterMask/SensitivityMask/SlopeMask QC flags, masked to NaN like
+        # real no-data — these are specific reserved DNs, not a range).
+        scale = float(raw.attrs.get("scale_factor", 1.0))
+        offset = float(raw.attrs.get("add_offset", 0.0))
+        flag_values = raw.attrs.get("flag_values", [])
+        if len(flag_values):
+            raw = raw.where(~raw.isin(flag_values))
+        valid = raw * scale + offset
+
+        lon2d, lat2d = np.meshgrid(raw["x"].values, raw["y"].values)
+
+        ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), valid.values)},
+            coords={
+                "lon":  (("y", "x"), lon2d),
+                "lat":  (("y", "x"), lat2d),
+                "time": _parse_ssm_timestamp(tif_path.name),
+            },
+        )
+        apply_cf_metadata(ds, "sar", {
+            "sarSSM": {"long_name": "Sentinel-1 CLMS surface soil moisture (percent saturation)", "units": "%"},
+        })
+        ds.attrs["data_type"] = "sar_l3_ssm"
+        ds.attrs["source"]    = "Sentinel-1 CLMS SSM"
         return ds
 
     @staticmethod
@@ -2196,6 +2284,7 @@ class DataTreeConverter:
         Discovery rules
         ---------------
         - ``S1_L2_OCN/*.SAFE``        → ``sar/<SAFE-name>`` nodes
+        - ``S1_L3_SSM/*.tif``          → ``sar/<stem>`` nodes
         - ``copernicus_insitu/*.csv``  → ``validation/<stem>`` nodes
         - ``osi_saf_winds/*.nc``       → ``validation/osi_saf_winds/<stem>`` nodes
         - ``scatterometer/*.nc``       → ``validation/scatterometer/<stem>`` nodes
@@ -2209,6 +2298,7 @@ class DataTreeConverter:
         - ``argo_historical/*.csv``    → ``validation/argo_historical/<stem>`` nodes
         - ``drifter_historical/*.csv`` → ``validation/drifter_historical/<stem>`` nodes
         - ``glider_historical/*.csv``  → ``validation/glider_historical/<stem>`` nodes
+        - ``ismn/*.csv``                → ``validation/ismn/<stem>`` nodes
         - ``altimeter/*.nc``           → ``validation/altimeter/<stem>`` nodes
 
         Parameters
@@ -2262,6 +2352,29 @@ class DataTreeConverter:
                     datasets[f"sar/{safe_dir.name}"] = ds
                     logger.info("Converted SAR SAFE: %s", safe_dir.name)
 
+        # Sentinel-1 CLMS Surface Soil Moisture GeoTIFFs (1 km, Europe,
+        # daily). Kept on a native (y, x) grid like S1_L2_OCN so
+        # collocation's grid path handles it unchanged; no domain-filtering
+        # needed since the product is already Europe-only and 1 km (not a
+        # full-orbit swath like scatterometer).
+        ssm_dir = base_dir / "S1_L3_SSM"
+        if ssm_dir.exists():
+            from ..downloaders.soil_moisture_downloader import _SSM_FILENAME_MARKER
+
+            # SoilMoistureDownloader unzips each product into its own
+            # subfolder (a "-SSM_" GeoTIFF alongside a sibling "-NOISE_"
+            # uncertainty-layer GeoTIFF it doesn't return) — search
+            # recursively and keep only the soil-moisture file.
+            tif_paths = [
+                p for p in list(ssm_dir.rglob("*.tif")) + list(ssm_dir.rglob("*.tiff"))
+                if _SSM_FILENAME_MARKER in p.name
+            ]
+            for tif_path in sorted(tif_paths):
+                ds = DataTreeConverter.from_sar_l3_ssm_geotiff(tif_path)
+                if ds is not None:
+                    datasets[f"sar/{tif_path.stem}"] = ds
+                    logger.info("Converted SSM GeoTIFF: %s", tif_path.name)
+
         # In-situ CSV (Copernicus Marine)
         insitu_dir = base_dir / "copernicus_insitu"
         if insitu_dir.exists():
@@ -2292,6 +2405,19 @@ class DataTreeConverter:
                     if ds is not None:
                         datasets[f"validation/{instrument}/{csv_path.stem}"] = ds
                         logger.info("Converted %s CSV: %s", instrument, csv_path.name)
+
+        # Manually-downloaded ISMN soil-moisture station CSVs (same
+        # long-format schema as the Copernicus Marine in-situ CSVs above —
+        # from_insitu_csv needs no changes). Not domain-filtered like the
+        # satellite layer sources below: ISMNDownloader already writes only
+        # in-bbox/in-window stations.
+        ismn_dir = base_dir / "ismn"
+        if ismn_dir.exists():
+            for csv_path in sorted(ismn_dir.glob("*.csv")):
+                ds = DataTreeConverter.from_insitu_csv(csv_path, source_type="ismn")
+                if ds is not None:
+                    datasets[f"validation/ismn/{csv_path.stem}"] = ds
+                    logger.info("Converted ISMN CSV: %s", csv_path.name)
 
         # Scatterometer / OSI-SAF winds (standardised to point dimension).
         # scatterometer_hy2b/hy2c/oceansat3 are the KNMI OSI-SAF FTP,

@@ -29,11 +29,12 @@ pipeline:
 | 4 — Statistics | Bias, RMSE, correlation, scatter index per platform type | `validation_statistics_*.nc/.csv` |
 | 5 — Report | Scatter/geographic/residual plots + PDF report | `plots/`, `validation_report.pdf` |
 
-Three validated quantities are supported — **wind** (speed + direction,
+Four validated quantities are supported — **wind** (speed + direction,
 OWI grids), **currents** (RVL radial velocity), **waves** (significant wave
-height, OSW/WV imagettes) — against in-situ platforms (moorings, buoys,
-drifters, ferryboxes, tidal gauges), ASCAT scatterometer, satellite
-altimeters, RSS radiometers (AMSR2), and HF radar.
+height, OSW/WV imagettes), **soil moisture** (Sentinel-1 CLMS SSM 1 km
+Europe rasters) — against in-situ platforms (moorings, buoys, drifters,
+ferryboxes, tidal gauges), ASCAT scatterometer, satellite altimeters, RSS
+radiometers (AMSR2), HF radar, and ISMN soil-moisture stations.
 
 > Code: `sar_validation/cli.py` (pipeline driver), `core/recipe.py`
 > (recipe schema), `core/orchestrator.py` (step 1).
@@ -426,3 +427,173 @@ categories coarse enough to be statistically meaningful while still
 separating fundamentally different measurement systems.
 
 > Code: `core/statistics.py` (`compute_statistics`, `run_statistics`).
+
+---
+
+## 8. Soil moisture (Sentinel-1 CLMS SSM + ISMN)
+
+### 8.1 Why pytesmo CDF-matching + ubRMSD, not the shared bias/RMSE path
+
+Sentinel-1 CLMS SSM and ISMN in-situ measurements live in different
+physical domains (a percent-saturation-like SAR index vs. ISMN's
+volumetric m³/m³), so a raw `sar - val` difference is not meaningful. The
+soil-moisture recipe rescales the **SAR** series onto the **ISMN**
+series' domain via `pytesmo.scaling.scale(method="cdf_match")` before
+computing bias/RMSE/correlation — the satellite product is adjusted to
+match the in-situ reference, not the reverse, so ISMN's
+physically-interpretable volumetric units stay the common comparison
+domain (matching standard practice, e.g. ESA CCI SM is CDF-matched to its
+reference). A new `ubrmsd` metric (unbiased RMS difference, from
+`pytesmo.metrics.ubrmsd`) is reported alongside the existing metrics,
+since it is the standard soil-moisture literature metric.
+
+This is implemented as a new parallel function,
+`compute_statistics_soil_moisture`, rather than a branch inside the shared
+`compute_statistics` — there is no existing plug-in point for external
+metrics libraries, and `pytesmo`/`ismn` are optional dependencies (the
+`soil_moisture` extra) that the rest of the toolbox must not require.
+
+### 8.2 Depth sign convention: positive below ground, not negative below sea surface
+
+Every other validation source's `min_depth`/`max_depth` is negative
+(metres below sea surface, per `DEFAULT_MIN_DEPTH`/`DEFAULT_MAX_DEPTH` in
+`core/recipe.py`). ISMN depths are the opposite: **positive metres below
+ground**. No dataclass change was needed — `ValidationDataSource.min_depth`/
+`max_depth` are already plain floats — but the soil-moisture recipe
+template sets them explicitly (`min_depth=0.0, max_depth=0.05`, matching
+C-band Sentinel-1's ~5 cm sensing depth) rather than relying on the
+ocean-oriented global defaults. A future NISAR (L-band) recipe would use a
+deeper window (~0-0.25 m) the same way.
+
+### 8.3 Collocation tolerances are pixel-scale, not buoy-footprint-scale
+
+The soil-moisture template's `point_vs_layer` collocation
+(`spatial_tolerance_km=2.0`, `aggregation_window_km=1.0`,
+`distance_weighting="equal"`, `time_tolerance_minutes=720`) is
+deliberately much tighter than the ocean default
+(`aggregation_window_km=5.0`, Gaussian weighting, 30-minute tolerance): a
+1 km SAR pixel and a point ISMN station don't need a 25 km buoy-scale
+footprint, and the product is a daily composite, so only a same-calendar-day
+match is meaningful (±12 h tolerance).
+
+### 8.4 Why ISMN has no automated downloader
+
+ISMN (https://ismn.earth) has no public download API — only a
+registration-gated web portal. `ISMNDownloader` is therefore a
+**local-archive selector**, not a network client: it expects a
+manually-downloaded zip/folder, and on first run without one it prints the
+exact bbox/date/depth/variable filter values to paste into the portal
+form, along with the run's own ISMN output folder to drop the resulting
+zip into — `download()` auto-detects the most-recently-modified `*.zip`
+sitting there, so no recipe edits are needed for the common one-archive-
+per-run case. Since the portal itself supports the same filters, one
+manually-downloaded archive can also be scoped tightly and reused across
+multiple recipes whose windows fall inside it, by setting its path
+explicitly via the `ismn` validation source's
+`download_kwargs: {ismn_archive_path: ...}` (which still takes priority
+over auto-detection when set).
+
+The printed instructions also recommend three portal download options:
+**CEOP-formatted** archives (variables in separate files, zipped) — the
+`ismn` Python package auto-detects this format from the file structure
+(confirmed against the installed package's `filehandlers.py`, which reads
+`ceop_sep` and `header_values` both natively; only the legacy single-file
+CEOP format was dropped upstream), and CEOP is the more actively-maintained
+of the two;
+**"Good" quality flags only** — flagged-bad observations would otherwise
+corrupt validation statistics, and `ISMNDownloader` itself does no
+quality-flag filtering, so this is enforced at download time instead;
+**gap filling disabled** — this toolbox's `point_vs_layer` collocation
+matches on actual observation timestamps within a tolerance window, not a
+fixed calendar grid, so NaN-filled placeholder rows (to guarantee 24
+points/day) add nothing but archive size and get dropped downstream anyway.
+
+### 8.5 Report plots compare the CDF-matched pair, not the raw one
+
+§8.1's CDF-matching happens inside `compute_statistics_soil_moisture` and,
+originally, was discarded once the metrics were computed — so
+`validation_report`'s scatter/geographic/residual plots were still reading
+the **raw** `sar_sarSSM`/`val_SOIL_MOISTURE` columns from
+`collocation_results.nc` directly. Since those live in different physical
+domains (confirmed against a real run: `sar_sarSSM` 2.75-100 "%",
+`val_SOIL_MOISTURE` 0.047-0.78 "1"), every plot was comparing
+non-comparable values — points didn't cluster anywhere near the 1:1 line,
+and there was no principled way to read the result.
+
+`statistics.add_rescaled_sar_column(collocation_ds, sar_var, val_var)`
+reuses the same per-group CDF-matching (`_cdf_match_sar_series`, factored
+out of `_rescale_and_compute_soil_moisture_stats` so both call sites share
+one implementation) to return a copy of the collocation Dataset with
+`sar_<var>`'s values replaced by their rescaled equivalent — units/long_name
+attrs copied from the validation column, since the values now live in that
+domain. `validation_report` calls this once per pair, only when
+`recipe.config.variable == "soil_moisture"`, before `plot_scatter`,
+`plot_residuals`, and `plot_temporal_offset` run, so those point-based plots
+compare like with like.
+
+`plot_geographic` is the deliberate exception: it keeps the **pre-rescale**
+collocation Dataset (`geo_pair_ds` in `validation_report`'s loop), not the
+rescaled one. Its background SAR field comes from the full `(y, x)` grid in
+`datatree.nc`, not from `collocation_ds`, and can't be point-rescaled the
+same way — CDF-matching needs a paired validation value, which only exists
+at collocated points, not at every background pixel. Instead,
+`statistics.fit_sar_to_val_transform(collocation_ds, sar_var, val_var)` fits
+a `pytesmo.cdf_matching.CDFMatching` transform on the collocated
+`(sar_<var>, val_<var>)` pairs and returns a callable that `plot_geographic`
+applies to *every* pixel of the SAR field, converting the whole background
+layer into the validation's domain so one shared, meaningful colorbar covers
+both. This transform must be fit from the **raw** SAR/validation pairs, not
+the already-rescaled ones — fitting on rescaled input and then applying the
+result to the real, raw SAR field (still 0-100) extrapolates wildly, since
+the fit's training domain no longer matches what it's applied to (confirmed
+against real data: predicted values above 300 for a variable that should
+span roughly 0-1). This is why `validation_report` threads two separate
+dataset variables through its per-pair loop — the rescaled one for
+scatter/residuals/temporal-offset, the original raw one for
+`plot_geographic`.
+
+When there isn't enough collocated data to fit a transform (fewer than two
+valid pairs, or the underlying CDF-matching degenerates), `plot_geographic`
+falls back to giving the SAR field and the validation points independent
+percentile ranges and colorbars instead — better two honestly-scaled
+colorbars than one silently wrong or crashing one. Recipes where both sides
+already share units (wind, currents, waves) skip all of this — pooling one
+colorbar directly is still correct there.
+
+Axis/colorbar labels also now append each variable's CF `units` attribute
+generically (`_labeled_var` in `visualization.py`) — a side benefit for
+every existing variable pair (e.g. `"WSPD (m s-1)"`), not just soil moisture.
+
+### 8.6 ISMN stations deduped to their nearest-in-time reading per SAR scene
+
+ISMN's recommended recipe tolerance (`time_tolerance_minutes: 720`, ±12h) is
+deliberately wide, to tolerate ISMN's own reporting gaps. But ISMN reports
+hourly — far more densely than one daily SAR overpass — so without any
+further change, every hourly reading within that ±12h window became its own
+separate collocation. Confirmed against a real 118-station recipe run: one
+station alone produced ~25 matches against a single SAR scene (all sharing
+the same `sar_y_idx`/`sar_x_idx`, differing only in which hourly ISMN
+reading they carried), inflating a real run from a sane station-count to
+1517 total collocations.
+
+The obvious fix — "only keep the closest-in-time validation reading" —
+can't apply unconditionally to `PointLayerCollocation.collocate()`, which is
+shared by every point-type source (moorings, buoys, ISMN). Two pre-existing
+tests (`test_no_temporal_averaging_uses_raw_value`,
+`test_each_point_matched_independently`) document a deliberate, opposite
+choice for scatterometer/buoy/mooring sources: repeated readings at one
+location, different times, are genuinely distinct satellite passes/looks,
+and are each kept as an independent collocation on purpose. ISMN's case is
+different — its hourly readings aren't distinct "looks", just dense
+oversampling of one slowly-evolving quantity relative to the SAR revisit
+time.
+
+So the dedup is opt-in: `PointLayerCollocation(dedup_nearest_in_time=False)`
+by default (unchanged behaviour for every existing source), and
+`collocate()` only groups-and-keeps-nearest (by `val_id` when present, else
+by the validation point's own `(lon, lat)`, per SAR acquisition) when the
+flag is set. `run_collocation` sets it automatically, only for sources
+whose `platform_type` attr is `"ismn"` — every other point_vs_layer source
+is completely unaffected. Confirmed against the same real recipe: 1517 →
+61 collocations (54 unique stations, most matched against one of 3 SAR
+scenes, a few against more).

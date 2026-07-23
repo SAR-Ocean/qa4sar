@@ -174,3 +174,55 @@ class TestExecuteRecipePassesForceDownloadToOrchestrator:
             cli._execute_recipe(str(recipe_path), force_download=True)
 
         assert mock_cls.call_args.kwargs["force_download"] is True
+
+
+class TestBuildSoilMoistureConfig:
+    def test_recipe_shape(self):
+        from sar_validation.cli import _build_soil_moisture_config
+
+        cfg = _build_soil_moisture_config()
+
+        assert cfg.variable == "soil_moisture"
+        assert cfg.sar_data.satellite == "Sentinel-1"
+        assert cfg.sar_data.product_level == "L3_SSM"
+        assert len(cfg.validation_sources) == 1
+        source = cfg.validation_sources[0]
+        assert source.source_type == "ismn"
+        assert source.min_depth == 0.0
+        assert source.max_depth == 0.05
+        assert source.download_kwargs == {}
+
+    def test_default_geographic_bounds(self):
+        from sar_validation.cli import _build_soil_moisture_config
+
+        cfg = _build_soil_moisture_config()
+        bounds = cfg.geographic_bounds
+        assert (bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat) == (
+            -10.0, 30.0, 35.0, 60.0,
+        )
+
+    def test_collocation_defaults_are_pixel_scale(self):
+        from sar_validation.cli import _build_soil_moisture_config
+
+        cfg = _build_soil_moisture_config()
+        pvl = cfg.collocation.point_vs_layer
+        assert pvl.spatial_tolerance_km == 2.0
+        assert pvl.aggregation_window_km == 1.0
+        assert pvl.distance_weighting == "equal"
+        assert pvl.interpolation_method == "nearest"
+        assert pvl.time_tolerance_minutes == 720
+
+    def test_limit_forwarded_to_max_downloads(self):
+        from sar_validation.cli import _build_soil_moisture_config
+
+        cfg = _build_soil_moisture_config(limit=5)
+        assert cfg.sar_data.max_downloads == 5
+
+    def test_registered_under_create_recipe(self, tmp_path, monkeypatch):
+        from sar_validation.cli import _create_recipe
+
+        monkeypatch.chdir(tmp_path)
+        _create_recipe("soil_moisture")
+
+        recipe_path = tmp_path / "recipes" / "soil_moisture_validation.yaml"
+        assert recipe_path.exists()

@@ -291,6 +291,79 @@ class TestPointLayerCollocation:
         assert len(results) > 0
         assert results[0].val_source == "insitu"
 
+    def test_wide_tolerance_keeps_only_nearest_reading_per_station(self):
+        """A station reporting hourly, matched against one SAR time with a
+        wide time tolerance (e.g. ISMN's 720 min), must contribute only its
+        single closest-in-time reading — not one collocation per hourly
+        reading in the window. Regression test for the real-data bug where
+        one ISMN station produced ~25 collocations against a single SAR
+        overpass instead of 1."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        # 5 hourly readings from ONE station, spanning the SAR time
+        # (12:00). The 11:00 reading (60 min away) is the unique closest.
+        hours = [9, 10, 11, 14, 15]
+        val = _make_val_dataframe(
+            lons=[0.0] * 5, lats=[52.0] * 5,
+            times=[datetime(2026, 1, 1, h, 0, 0) for h in hours],
+            WSPD=[float(h) for h in hours],
+            platform_id=["StationA"] * 5,
+        )
+
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=720,
+                                        aggregation_window_km=100, dedup_nearest_in_time=True)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "ismn")
+
+        assert len(results) == 1
+        assert results[0].val_data["WSPD"] == 11.0
+        assert results[0].temporal_distance_minutes == 60.0
+
+    def test_wide_tolerance_keeps_distinct_stations_separate(self):
+        """Distinct stations (different platform_id, e.g. co-located
+        sensors at the same physical site reporting independently) must
+        each keep their own nearest-in-time reading — the dedup must not
+        collapse across stations."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        val = _make_val_dataframe(
+            lons=[0.0, 0.0], lats=[52.0, 52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0), datetime(2026, 1, 1, 12, 0, 0)],
+            WSPD=[7.0, 9.0],
+            platform_id=["SensorA", "SensorB"],
+        )
+
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=720,
+                                        aggregation_window_km=100, dedup_nearest_in_time=True)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "ismn")
+
+        assert len(results) == 2
+        assert {r.val_id for r in results} == {"SensorA", "SensorB"}
+
+    def test_wide_tolerance_dedup_falls_back_to_lonlat_without_platform_id(self):
+        """When no platform_id column is present, dedup must fall back to
+        (lon, lat) so distinct validation points still aren't collapsed
+        together, while repeated readings from the exact same point are."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        val = _make_val_dataframe(
+            lons=[0.0, 0.0, 0.5], lats=[52.0, 52.0, 52.5],
+            times=[
+                datetime(2026, 1, 1, 10, 0, 0),
+                datetime(2026, 1, 1, 12, 0, 0),
+                datetime(2026, 1, 1, 12, 0, 0),
+            ],
+            WSPD=[6.0, 8.0, 10.0],
+        )
+
+        colloc = PointLayerCollocation(spatial_tolerance_km=500, time_tolerance_minutes=720,
+                                        aggregation_window_km=100, dedup_nearest_in_time=True)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "ismn")
+
+        # (0.0, 52.0) contributes one reading (the 12:00 one, closer than
+        # 10:00); (0.5, 52.5) contributes its own separate reading.
+        assert len(results) == 2
+        assert {r.val_data["WSPD"] for r in results} == {8.0, 10.0}
+
 
 # ---------------------------------------------------------------------------
 # LayerLayerCollocation
@@ -910,6 +983,213 @@ class TestRunCollocationCurrentsFromDatatree:
         assert result is not None
         assert "sar_rvlRadVelStd" in result
         assert float(result["sar_rvlRadVelStd"].values[0]) == pytest.approx(0.12, abs=1e-5)
+
+
+class TestGridTreeReuseAcrossValidationSources:
+    """Regression test for a real performance bug: `run_collocation`'s
+    grid-based (IW/EW) path used to rebuild `PointLayerCollocation`'s KD-tree
+    once per validation *file*, not once per SAR scene. That's fine for a
+    handful of large, pre-batched validation sources, but pathological for
+    many small per-source files (e.g. ISMN's one-CSV-per-station output)
+    matched against a large grid (e.g. CLMS Surface Soil Moisture's
+    ~28M-cell 1 km Europe grid): a real recipe run with 118 ISMN stations
+    took minutes rebuilding the same tree 118 times per SAR scene before
+    this fix. See collocation.py's `grid_tree` parameter/build-once comment.
+    """
+
+    def _currents_recipe(self):
+        from sar_validation.core.recipe import (
+            CollocationType,
+            GeographicBounds,
+            PointVsLayerCollocation,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+        )
+        return Recipe(RecipeConfig(
+            name="grid_tree_reuse_it",
+            variable="currents",
+            geographic_bounds=GeographicBounds(-21.0, -18.0, 49.0, 52.0),
+            temporal_bounds=TemporalBounds("2026-06-20T18:00:00", "2026-06-20T23:00:00"),
+            # Wide enough to catch all three mooring points below, which
+            # are deliberately offset from the nearest grid node by ~11 km
+            # (more than the 5 km default) so each exercises a distinct
+            # KD-tree neighbourhood query rather than all landing on the
+            # same grid cell.
+            collocation=CollocationType(
+                point_vs_layer=PointVsLayerCollocation(aggregation_window_km=20.0),
+            ),
+        ))
+
+    def test_build_grid_tree_called_once_per_sar_scene_not_per_validation_source(self, tmp_path):
+        from unittest.mock import patch
+
+        import xarray as xr
+
+        from sar_validation.core.collocation import PointLayerCollocation, run_collocation
+
+        ny, nx = 5, 5
+        lon2d, lat2d = np.meshgrid(
+            np.linspace(-20.0, -19.0, nx), np.linspace(50.0, 51.0, ny)
+        )
+        sar = xr.Dataset(
+            {"rvlRadVel": (("y", "x"), np.full((ny, nx), 0.5, dtype="float32"))},
+            coords={
+                "lon": (("y", "x"), lon2d),
+                "lat": (("y", "x"), lat2d),
+                "time": np.datetime64("2026-06-20T19:15:00", "ns"),
+            },
+            attrs={"data_type": "sar_l2_ocn", "swath_mode": "IW/EW/SM",
+                   "measurement_type": "rvl"},
+        )
+
+        def _mooring(lon, lat):
+            return xr.Dataset(
+                {
+                    "EWCT": (("point",), np.array([0.4], dtype="float32")),
+                    "NSCT": (("point",), np.array([0.3], dtype="float32")),
+                },
+                coords={
+                    "lon": (("point",), np.array([lon])),
+                    "lat": (("point",), np.array([lat])),
+                    "time": (("point",), np.array([np.datetime64("2026-06-20T19:20:00", "ns")])),
+                    "platform_type": (("point",), np.array(["mooring"])),
+                },
+                attrs={"data_type": "insitu_observations", "platform_type": "mooring"},
+            )
+
+        # Three separate validation nodes (as ISMNDownloader's one-CSV-per-
+        # station output produces) matched against the same single SAR scene.
+        tree = xr.DataTree.from_dict({
+            "/sar/scene1": sar,
+            "/validation/mooring1": _mooring(-19.5, 50.5),
+            "/validation/mooring2": _mooring(-19.6, 50.4),
+            "/validation/mooring3": _mooring(-19.4, 50.6),
+        })
+
+        with patch.object(
+            PointLayerCollocation, "_build_grid_tree",
+            wraps=PointLayerCollocation._build_grid_tree,
+        ) as mock_build:
+            result = run_collocation(self._currents_recipe(), tree, tmp_path)
+
+        assert result is not None
+        assert result.sizes.get("collocation", 0) == 3
+        assert mock_build.call_count == 1
+
+
+class TestRunCollocationIsmnNearestInTimeDedup:
+    """Regression test for the real-data bug where one ISMN station
+    reporting hourly, matched against a single SAR overpass with a wide
+    time_tolerance_minutes (720 min, needed to tolerate ISMN reporting
+    gaps), produced ~25 collocations instead of 1. run_collocation must
+    set dedup_nearest_in_time=True only for platform_type == "ismn"
+    sources — other point_vs_layer sources (moorings here) keep every
+    in-tolerance reading, per their own pre-existing tested behaviour."""
+
+    def _soil_moisture_recipe(self, time_tolerance_minutes: int = 720):
+        from sar_validation.core.recipe import (
+            CollocationType,
+            GeographicBounds,
+            PointVsLayerCollocation,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+        )
+        return Recipe(RecipeConfig(
+            name="soil_moisture_it",
+            variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-21.0, -18.0, 49.0, 52.0),
+            temporal_bounds=TemporalBounds("2026-06-20T00:00:00", "2026-06-20T23:59:00"),
+            collocation=CollocationType(
+                point_vs_layer=PointVsLayerCollocation(
+                    time_tolerance_minutes=time_tolerance_minutes,
+                    aggregation_window_km=20.0,
+                ),
+            ),
+        ))
+
+    def _sar_grid(self):
+        import xarray as xr
+
+        ny, nx = 5, 5
+        lon2d, lat2d = np.meshgrid(
+            np.linspace(-20.0, -19.0, nx), np.linspace(50.0, 51.0, ny)
+        )
+        return xr.Dataset(
+            {"sarSSM": (("y", "x"), np.full((ny, nx), 30.0, dtype="float32"))},
+            coords={
+                "lon": (("y", "x"), lon2d),
+                "lat": (("y", "x"), lat2d),
+                "time": np.datetime64("2026-06-20T12:00:00", "ns"),
+            },
+            attrs={"data_type": "sar_l3_ssm"},
+        )
+
+    def _ismn_station(self, lon, lat, n_hourly_readings=10):
+        import xarray as xr
+
+        times = np.array(
+            [np.datetime64("2026-06-20T00:00:00", "ns") + np.timedelta64(h, "h")
+             for h in range(n_hourly_readings)]
+        )
+        return xr.Dataset(
+            {"SOIL_MOISTURE": (("point",), np.linspace(0.1, 0.2, n_hourly_readings, dtype="float32"))},
+            coords={
+                "lon": (("point",), np.full(n_hourly_readings, lon)),
+                "lat": (("point",), np.full(n_hourly_readings, lat)),
+                "time": (("point",), times),
+                "platform_type": (("point",), np.array(["ismn"] * n_hourly_readings)),
+            },
+            attrs={"data_type": "insitu_observations", "platform_type": "ismn"},
+        )
+
+    def test_ismn_station_collapses_to_one_match_per_scene(self, tmp_path):
+        import xarray as xr
+
+        from sar_validation.core.collocation import run_collocation
+
+        tree = xr.DataTree.from_dict({
+            "/sar/scene1": self._sar_grid(),
+            "/validation/ismn1": self._ismn_station(-19.5, 50.5, n_hourly_readings=24),
+        })
+
+        result = run_collocation(self._soil_moisture_recipe(), tree, tmp_path)
+
+        assert result is not None
+        assert result.sizes.get("collocation", 0) == 1
+
+    def test_mooring_source_unaffected_keeps_every_reading(self, tmp_path):
+        """Same wide tolerance, same repeated-readings-at-one-location
+        shape, but platform_type='mooring' instead of 'ismn' — must NOT be
+        deduped (matches TestPointLayerCollocation's existing
+        test_no_temporal_averaging_uses_raw_value expectation)."""
+        import xarray as xr
+
+        from sar_validation.core.collocation import run_collocation
+
+        mooring = xr.Dataset(
+            {"EWCT": (("point",), np.linspace(0.1, 0.2, 24, dtype="float32"))},
+            coords={
+                "lon": (("point",), np.full(24, -19.5)),
+                "lat": (("point",), np.full(24, 50.5)),
+                "time": (("point",), np.array(
+                    [np.datetime64("2026-06-20T00:00:00", "ns") + np.timedelta64(h, "h")
+                     for h in range(24)]
+                )),
+                "platform_type": (("point",), np.array(["mooring"] * 24)),
+            },
+            attrs={"data_type": "insitu_observations", "platform_type": "mooring"},
+        )
+        tree = xr.DataTree.from_dict({
+            "/sar/scene1": self._sar_grid(),
+            "/validation/mooring1": mooring,
+        })
+
+        result = run_collocation(self._soil_moisture_recipe(), tree, tmp_path)
+
+        assert result is not None
+        assert result.sizes.get("collocation", 0) == 24
 
 
 class TestProjectCurrentsToRadial:

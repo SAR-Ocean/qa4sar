@@ -20,11 +20,14 @@ dependencies = [
     "pyyaml",
     "requests",
     "copernicusmarine>=2.0",
+    "rioxarray",       # GeoTIFF ingestion — Sentinel-1 CLMS Surface Soil Moisture
+    "rasterio",        # rioxarray's raster I/O backend
 ]
 
 [project.optional-dependencies]
 plot = ["matplotlib", "cartopy", "cmocean", "plotly", "folium"]
 eumdac = ["eumdac"]
+soil_moisture = ["pytesmo", "ismn"]
 test = ["pytest", "pytest-cov"]
 dev = [
     "pytest",
@@ -37,6 +40,8 @@ dev = [
     "plotly",
     "folium",
     "eumdac",
+    "pytesmo",
+    "ismn",
 ]
 
 [project.scripts]

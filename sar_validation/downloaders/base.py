@@ -168,6 +168,69 @@ class CopernicusODataClient:
             )
         return records
 
+    def query_clms_products(
+        self,
+        dataset_identifier: str,
+        start_date: str,
+        end_date: str,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        top: int = 100,
+    ) -> list[dict]:
+        """
+        Query CLMS (Copernicus Land Monitoring Service) products from the
+        CDSE catalogue, e.g. Surface Soil Moisture rasters.
+
+        Same polygon/pagination machinery as :meth:`query_products`, but
+        filters on the ``datasetIdentifier`` attribute (CLMS's own
+        product-family key) instead of ``productType`` (used by
+        SENTINEL-1 OCN).
+
+        Returns a list of product dicts with keys:
+            Id, Name, ContentDate_Start, ContentDate_End, ContentLength_GB, Online
+        """
+        self._ensure_token()
+
+        polygon = (
+            f"POLYGON(({min_lon} {min_lat},{min_lon} {max_lat},"
+            f"{max_lon} {max_lat},{max_lon} {min_lat},{min_lon} {min_lat}))"
+        )
+        filters = [
+            "Collection/Name eq 'CLMS'",
+            (
+                "Attributes/OData.CSC.StringAttribute/any("
+                f"att:att/Name eq 'datasetIdentifier' and "
+                f"att/OData.CSC.StringAttribute/Value eq '{dataset_identifier}')"
+            ),
+            f"ContentDate/Start gt {start_date}",
+            f"ContentDate/Start lt {end_date}",
+            f"OData.CSC.Intersects(area=geography'SRID=4326;{polygon}')",
+        ]
+        params = {
+            "$filter": " and ".join(filters),
+            "$orderby": "ContentDate/Start desc",
+            "$top": str(top),
+            "$expand": "Attributes",
+        }
+        resp = self.session.get(self.CATALOGUE_URL, params=params, timeout=60)
+        resp.raise_for_status()
+
+        records = []
+        for prod in resp.json().get("value", []):
+            records.append(
+                {
+                    "Id": prod.get("Id"),
+                    "Name": prod.get("Name"),
+                    "ContentDate_Start": prod.get("ContentDate", {}).get("Start"),
+                    "ContentDate_End": prod.get("ContentDate", {}).get("End"),
+                    "ContentLength_GB": prod.get("ContentLength", 0) / (1024 ** 3),
+                    "Online": prod.get("Online"),
+                }
+            )
+        return records
+
     # ------------------------------------------------------------------
     # Download
     # ------------------------------------------------------------------
