@@ -585,6 +585,14 @@ class TestDetectCollocationTypeImport:
         assert _detect_collocation_type(ds, "validation/scatterometer/file") == "layer_vs_layer"
 
 
+def test_scatterometer_ssm_is_a_layer_data_type():
+    assert "scatterometer_ssm" in LAYER_DATA_TYPES
+
+
+def test_radiometer_ssm_is_a_layer_data_type():
+    assert "radiometer_ssm" in LAYER_DATA_TYPES
+
+
 class TestHfRadarGridDispatch:
     def test_data_type_routes_to_layer(self):
         import xarray as xr
@@ -659,6 +667,27 @@ class TestResolveLayerTypeScatterometerVariants:
             ds, "validation/altimeter/Cryosat-2", DEFAULT_LAYER_TYPE_SPECS
         )
         assert layer_type == "altimeter_5hz"
+
+    def test_resolve_layer_type_refines_radiometer_ssm_by_sensor(self):
+        import xarray as xr
+
+        from sar_validation.core.collocation import _resolve_layer_type
+        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+
+        ds_amsr = xr.Dataset(attrs={"data_type": "radiometer_ssm", "sensor": "amsr"})
+        ds_smap = xr.Dataset(attrs={"data_type": "radiometer_ssm", "sensor": "smap"})
+
+        assert _resolve_layer_type(ds_amsr, "validation/amsr_ssm/f1", DEFAULT_LAYER_TYPE_SPECS) == "amsr_ssm"
+        assert _resolve_layer_type(ds_smap, "validation/smap_ssm/f1", DEFAULT_LAYER_TYPE_SPECS) == "smap_ssm"
+
+    def test_resolve_layer_type_refines_radiometer_ssm_for_smos(self):
+        import xarray as xr
+
+        from sar_validation.core.collocation import _resolve_layer_type
+        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+
+        ds_smos = xr.Dataset(attrs={"data_type": "radiometer_ssm", "sensor": "smos"})
+        assert _resolve_layer_type(ds_smos, "validation/smos_ssm/f1", DEFAULT_LAYER_TYPE_SPECS) == "smos_ssm"
 
 
 class TestScatterometerVariantDefaultSpecs:
@@ -1038,6 +1067,161 @@ class TestRunCollocationCurrentsFromDatatree:
         assert "sar_rvlRadVelStd" in result
         assert float(result["sar_rvlRadVelStd"].values[0]) == pytest.approx(0.12, abs=1e-5)
 
+    def test_wv_mode_multi_point_time_array_does_not_crash(self, tmp_path):
+        """Regression test: a WV-mode SAR node's ``time`` coordinate is
+        ``("point",)``-dimensioned -- one timestamp per imagette, not a
+        single scalar like grid-mode (IW/EW/SM) scenes. `run_collocation`
+        builds ``sar_scene_times`` from every SAR node up front (for the
+        ISMN pre-averaging step), and used to call
+        ``pd.Timestamp(ds["time"].values)`` directly on that array, which
+        raises ``TypeError: Cannot convert input [...] of type
+        numpy.ndarray to Timestamp``. This crashed on ANY recipe with a
+        WV-mode scene, including this one, which has no ISMN/soil-moisture
+        source at all -- confirming the crash was in the shared
+        SAR-time-extraction code, not the ISMN branch itself."""
+        import xarray as xr
+
+        from sar_validation.core.collocation import run_collocation
+
+        # Two WV imagettes at different acquisition times -- this is what
+        # made the old scalar pd.Timestamp(...) call raise.
+        sar = xr.Dataset(
+            {
+                "rvlRadVel": (("point",), np.array([1.0, -0.5], dtype="float32")),
+                "rvlHeading": (("point",), np.array([90.0, 90.0], dtype="float32")),
+            },
+            coords={
+                "lon": (("point",), np.array([-19.5, -18.7])),
+                "lat": (("point",), np.array([50.5, 51.2])),
+                "time": (("point",), np.array([
+                    np.datetime64("2026-06-20T19:15:00", "ns"),
+                    np.datetime64("2026-06-20T19:16:40", "ns"),
+                ])),
+            },
+            attrs={"data_type": "sar_l2_ocn", "swath_mode": "WV",
+                   "measurement_type": "rvl"},
+        )
+        # A non-ISMN (mooring) in-situ source sitting on top of the first
+        # imagette only.
+        val = xr.Dataset(
+            {
+                "EWCT": (("point",), np.array([0.4], dtype="float32")),
+                "NSCT": (("point",), np.array([0.3], dtype="float32")),
+            },
+            coords={
+                "lon": (("point",), np.array([-19.5])),
+                "lat": (("point",), np.array([50.5])),
+                "time": (("point",), np.array([np.datetime64("2026-06-20T19:20:00", "ns")])),
+                "platform_type": (("point",), np.array(["mooring"])),
+            },
+            attrs={"data_type": "insitu_observations", "platform_type": "mooring"},
+        )
+        tree = xr.DataTree.from_dict({"/sar/scene1": sar, "/validation/mooring1": val})
+
+        result = run_collocation(self._currents_recipe(), tree, tmp_path)
+
+        assert result is not None
+        assert result.sizes.get("collocation", 0) == 1
+        assert "val_rvlRadVel_projection" in result
+        assert float(result["val_rvlRadVel_projection"].values[0]) == pytest.approx(0.4, abs=1e-5)
+
+    def test_sar_node_without_time_coord_does_not_crash(self, tmp_path):
+        """A SAR node with no `time` coordinate at all must be skipped
+        gracefully (as the per-scene loop below already does), not crash
+        the earlier sar_scene_times construction that runs before that
+        loop ever gets a chance to skip it."""
+        import xarray as xr
+
+        from sar_validation.core.collocation import run_collocation
+
+        sar_no_time = xr.Dataset(
+            {"rvlRadVel": (("y", "x"), np.full((3, 3), 1.0, dtype="float32"))},
+            coords={
+                "lon": (("y", "x"), np.linspace(-20.0, -19.0, 9).reshape(3, 3)),
+                "lat": (("y", "x"), np.linspace(50.0, 51.0, 9).reshape(3, 3)),
+            },
+            attrs={"data_type": "sar_l2_ocn"},
+        )
+        mooring = xr.Dataset(
+            {"EWCT": (("point",), np.array([0.4], dtype="float32")),
+             "NSCT": (("point",), np.array([0.3], dtype="float32"))},
+            coords={
+                "lon": (("point",), np.array([-19.5])),
+                "lat": (("point",), np.array([50.5])),
+                "time": (("point",), np.array([np.datetime64("2026-06-20T12:00:00", "ns")])),
+                "platform_type": (("point",), np.array(["mooring"])),
+            },
+            attrs={"data_type": "insitu_observations", "platform_type": "mooring"},
+        )
+        tree = xr.DataTree.from_dict({
+            "/sar/scene_no_time": sar_no_time,
+            "/validation/mooring1": mooring,
+        })
+
+        result = run_collocation(self._currents_recipe(), tree, tmp_path)
+
+        assert result is None
+
+    def test_sar_node_with_nat_time_does_not_crash(self, tmp_path):
+        """A SAR node whose acquisition time is NaT (a real, documented
+        fallback elsewhere in datatree_converter.py) must not crash
+        sar_scene_times's construction or the merge_asof call inside
+        _average_within_sar_tolerance.
+
+        Note: reproducing the actual observed crash requires a validation
+        source with ``platform_type == "ismn"`` (the brief's originally
+        proposed test used a plain "mooring" source, which never reaches
+        ``_average_within_sar_tolerance`` -- only the point_vs_layer/"ismn"
+        and layer_vs_layer/SSM-satellite branches call it -- so that
+        version passed vacuously even against the unfixed code). Against
+        unfixed code this raises ``ValueError: Merge keys contain null
+        values on right side`` from inside ``pd.merge_asof``, exactly as
+        the brief predicted, once the source is relabelled "ismn" so the
+        averaging branch is actually exercised."""
+        import xarray as xr
+
+        from sar_validation.core.collocation import run_collocation
+
+        sar_nat = xr.Dataset(
+            {"rvlRadVel": (("y", "x"), np.full((3, 3), 1.0, dtype="float32"))},
+            coords={
+                "lon": (("y", "x"), np.linspace(-20.0, -19.0, 9).reshape(3, 3)),
+                "lat": (("y", "x"), np.linspace(50.0, 51.0, 9).reshape(3, 3)),
+                "time": np.datetime64("NaT", "ns"),
+            },
+            attrs={"data_type": "sar_l2_ocn"},
+        )
+        sar_valid = xr.Dataset(
+            {"rvlRadVel": (("y", "x"), np.full((3, 3), 1.0, dtype="float32"))},
+            coords={
+                "lon": (("y", "x"), np.linspace(-20.0, -19.0, 9).reshape(3, 3)),
+                "lat": (("y", "x"), np.linspace(50.0, 51.0, 9).reshape(3, 3)),
+                "time": np.datetime64("2026-06-20T12:00:00", "ns"),
+            },
+            attrs={"data_type": "sar_l2_ocn"},
+        )
+        ismn_station = xr.Dataset(
+            {"EWCT": (("point",), np.array([0.4], dtype="float32")),
+             "NSCT": (("point",), np.array([0.3], dtype="float32"))},
+            coords={
+                "lon": (("point",), np.array([-19.5])),
+                "lat": (("point",), np.array([50.5])),
+                "time": (("point",), np.array([np.datetime64("2026-06-20T12:00:00", "ns")])),
+                "platform_type": (("point",), np.array(["ismn"])),
+            },
+            attrs={"data_type": "insitu_observations", "platform_type": "ismn"},
+        )
+        tree = xr.DataTree.from_dict({
+            "/sar/scene_nat": sar_nat,
+            "/sar/scene_valid": sar_valid,
+            "/validation/station1": ismn_station,
+        })
+
+        result = run_collocation(self._currents_recipe(), tree, tmp_path)
+
+        assert result is not None
+        assert result.sizes.get("collocation", 0) == 1
+
 
 class TestGridTreeReuseAcrossValidationSources:
     """Regression test for a real performance bug: `run_collocation`'s
@@ -1132,14 +1316,18 @@ class TestGridTreeReuseAcrossValidationSources:
         assert mock_build.call_count == 1
 
 
-class TestRunCollocationIsmnNearestInTimeDedup:
-    """Regression test for the real-data bug where one ISMN station
-    reporting hourly, matched against a single SAR overpass with a wide
-    time_tolerance_minutes (720 min, needed to tolerate ISMN reporting
-    gaps), produced ~25 collocations instead of 1. run_collocation must
-    set dedup_nearest_in_time=True only for platform_type == "ismn"
-    sources — other point_vs_layer sources (moorings here) keep every
-    in-tolerance reading, per their own pre-existing tested behaviour."""
+class TestRunCollocationIsmnTemporalAveraging:
+    """ISMN reports hourly -- far more densely than one daily SAR
+    overpass -- so every hourly reading within the wide
+    time_tolerance_minutes (720 min, needed to tolerate ISMN's own
+    reporting gaps) must collapse into a single station-day value.
+    Previously this collapsed via "keep only the nearest reading", which
+    is a real bias: since the SAR scene is always stamped at midnight, the
+    nearest reading is always a nighttime one. run_collocation must
+    instead average every in-tolerance reading -- only for platform_type
+    == "ismn" sources; other point_vs_layer sources (moorings here) keep
+    every in-tolerance reading, per their own pre-existing tested
+    behaviour."""
 
     def _soil_moisture_recipe(self, time_tolerance_minutes: int = 720):
         from sar_validation.core.recipe import (
@@ -1198,7 +1386,7 @@ class TestRunCollocationIsmnNearestInTimeDedup:
             attrs={"data_type": "insitu_observations", "platform_type": "ismn"},
         )
 
-    def test_ismn_station_collapses_to_one_match_per_scene(self, tmp_path):
+    def test_ismn_station_collapses_to_one_averaged_match_per_scene(self, tmp_path):
         import xarray as xr
 
         from sar_validation.core.collocation import run_collocation
@@ -1212,11 +1400,18 @@ class TestRunCollocationIsmnNearestInTimeDedup:
 
         assert result is not None
         assert result.sizes.get("collocation", 0) == 1
+        # linspace(0.1, 0.2, 24) mean -- confirms the surviving value is
+        # the true average of all 24 hourly readings, not just the single
+        # nearest-to-scene-time (midnight) reading picked out of them.
+        expected_mean = float(np.linspace(0.1, 0.2, 24, dtype="float32").mean())
+        assert float(result["val_SOIL_MOISTURE"].values[0]) == pytest.approx(
+            expected_mean, abs=1e-4
+        )
 
     def test_mooring_source_unaffected_keeps_every_reading(self, tmp_path):
         """Same wide tolerance, same repeated-readings-at-one-location
         shape, but platform_type='mooring' instead of 'ismn' — must NOT be
-        deduped (matches TestPointLayerCollocation's existing
+        averaged/deduped (matches TestPointLayerCollocation's existing
         test_no_temporal_averaging_uses_raw_value expectation)."""
         import xarray as xr
 
@@ -1246,6 +1441,273 @@ class TestRunCollocationIsmnNearestInTimeDedup:
         assert result.sizes.get("collocation", 0) == 24
 
 
+class TestRunCollocationSatelliteSsmTemporalAveraging:
+    """ASCAT/AMSR2/SMAP/SMOS soil-moisture sources can have both an
+    ascending and descending overpass of the same grid cell within the
+    ±12h tolerance around a midnight-stamped S1 SSM scene. run_collocation
+    must blend them into a single day value per cell -- both to remove
+    any day/night imbalance (same treatment as ISMN, see
+    TestRunCollocationIsmnTemporalAveraging) and to shrink the point count
+    for these dense gridded sources. See docs/design-choices.md §8.7."""
+
+    def _sar_grid(self):
+        import xarray as xr
+
+        ny, nx = 5, 5
+        lon2d, lat2d = np.meshgrid(
+            np.linspace(9.0, 11.0, nx), np.linspace(44.0, 46.0, ny)
+        )
+        return xr.Dataset(
+            {"sarSSM": (("y", "x"), np.full((ny, nx), 30.0, dtype="float32"))},
+            coords={
+                "lon": (("y", "x"), lon2d),
+                "lat": (("y", "x"), lat2d),
+                "time": np.datetime64("2026-06-20T00:00:00", "ns"),
+            },
+            attrs={"data_type": "sar_l3_ssm"},
+        )
+
+    def _amsr_ssm_two_passes(self, lon=10.0, lat=45.0):
+        import xarray as xr
+
+        # Descending (early morning) and ascending (evening) passes of
+        # "the same" grid cell on the same day, both within +/-12h of the
+        # midnight SAR scene: 06:00 (-6h from previous midnight -> +18h
+        # is out of range, so use -6h/+6h around the scene itself).
+        times = np.array([
+            np.datetime64("2026-06-19T18:00:00", "ns"),  # 6h before scene
+            np.datetime64("2026-06-20T06:00:00", "ns"),  # 6h after scene
+        ])
+        return xr.Dataset(
+            {"SOIL_MOISTURE": (("point",), np.array([0.15, 0.25], dtype="float32"))},
+            coords={
+                "lon": (("point",), np.array([lon, lon])),
+                "lat": (("point",), np.array([lat, lat])),
+                "time": (("point",), times),
+            },
+            attrs={"data_type": "radiometer_ssm", "sensor": "amsr", "platform_type": "amsr_ssm"},
+        )
+
+    def _soil_moisture_recipe(self):
+        from sar_validation.core.recipe import (
+            CollocationType,
+            GeographicBounds,
+            LayerVsLayerCollocation,
+            PointVsLayerCollocation,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+        )
+        return Recipe(RecipeConfig(
+            name="soil_moisture_satellite_it",
+            variable="soil_moisture",
+            geographic_bounds=GeographicBounds(8.0, 12.0, 43.0, 47.0),
+            temporal_bounds=TemporalBounds("2026-06-19T00:00:00", "2026-06-21T00:00:00"),
+            collocation=CollocationType(
+                point_vs_layer=PointVsLayerCollocation(aggregation_window_km=20.0),
+                layer_vs_layer=LayerVsLayerCollocation(),
+            ),
+        ))
+
+    def test_am_pm_passes_blend_into_one_day_value(self, tmp_path):
+        import xarray as xr
+
+        from sar_validation.core.collocation import run_collocation
+
+        tree = xr.DataTree.from_dict({
+            "/sar/scene1": self._sar_grid(),
+            "/validation/amsr_ssm": self._amsr_ssm_two_passes(),
+        })
+
+        result = run_collocation(self._soil_moisture_recipe(), tree, tmp_path)
+
+        assert result is not None
+        assert result.sizes.get("collocation", 0) == 1
+        assert float(result["val_SOIL_MOISTURE"].values[0]) == pytest.approx(0.20, abs=1e-4)
+
+    def _amsr_ssm_single_pass(self, time_str, value, lon=10.0, lat=45.0):
+        import xarray as xr
+
+        return xr.Dataset(
+            {"SOIL_MOISTURE": (("point",), np.array([value], dtype="float32"))},
+            coords={
+                "lon": (("point",), np.array([lon])),
+                "lat": (("point",), np.array([lat])),
+                "time": (("point",), np.array([np.datetime64(time_str, "ns")])),
+            },
+            attrs={"data_type": "radiometer_ssm", "sensor": "amsr", "platform_type": "amsr_ssm"},
+        )
+
+    def test_am_pm_passes_in_separate_files_still_blend(self, tmp_path):
+        """The real file layout: AMSR2 delivers each overpass as its own
+        file, which becomes its own datatree node
+        (validation/amsr_ssm/<stem>). Two such sibling nodes -- one per
+        pass -- must still blend into a single day value, the same as
+        when both passes happen to be in one file (the synthetic shape
+        test_am_pm_passes_blend_into_one_day_value already covers)."""
+        import xarray as xr
+
+        from sar_validation.core.collocation import run_collocation
+
+        tree = xr.DataTree.from_dict({
+            "/sar/scene1": self._sar_grid(),
+            "/validation/amsr_ssm/granule_am": self._amsr_ssm_single_pass(
+                "2026-06-19T18:00:00", 0.15,
+            ),
+            "/validation/amsr_ssm/granule_pm": self._amsr_ssm_single_pass(
+                "2026-06-20T06:00:00", 0.25,
+            ),
+        })
+
+        result = run_collocation(self._soil_moisture_recipe(), tree, tmp_path)
+
+        assert result is not None
+        assert result.sizes.get("collocation", 0) == 1
+        assert float(result["val_SOIL_MOISTURE"].values[0]) == pytest.approx(0.20, abs=1e-4)
+
+    def test_distinct_satellite_sources_never_mixed_together(self, tmp_path):
+        """The averaging step must run strictly per validation source: an
+        ASCAT reading and a SMAP reading at the same location/time must
+        never be blended into one averaged value, only ever averaged with
+        other readings of their own source. This is a structural property
+        of the per-val_name loop in run_collocation (each source's
+        DataFrame is built and averaged independently), not something the
+        averaging helper itself enforces -- this test guards against a
+        future refactor accidentally pooling sources before averaging."""
+        import xarray as xr
+
+        from sar_validation.core.collocation import run_collocation
+
+        ascat = xr.Dataset(
+            {"SOIL_MOISTURE": (("point",), np.array([40.0], dtype="float32"))},
+            coords={
+                "lon": (("point",), np.array([10.0])),
+                "lat": (("point",), np.array([45.0])),
+                "time": (("point",), np.array([np.datetime64("2026-06-20T03:00:00", "ns")])),
+            },
+            attrs={"data_type": "scatterometer_ssm", "platform_type": "ascat_ssm"},
+        )
+        smap = xr.Dataset(
+            {"SOIL_MOISTURE": (("point",), np.array([0.30], dtype="float32"))},
+            coords={
+                "lon": (("point",), np.array([10.0])),
+                "lat": (("point",), np.array([45.0])),
+                "time": (("point",), np.array([np.datetime64("2026-06-20T03:00:00", "ns")])),
+            },
+            attrs={"data_type": "radiometer_ssm", "sensor": "smap", "platform_type": "smap_ssm"},
+        )
+        tree = xr.DataTree.from_dict({
+            "/sar/scene1": self._sar_grid(),
+            "/validation/ascat_ssm": ascat,
+            "/validation/smap_ssm": smap,
+        })
+
+        result = run_collocation(self._soil_moisture_recipe(), tree, tmp_path)
+
+        assert result is not None
+        # Two separate collocations (one per source), not one blended
+        # 20.15 (mean of 40.0 % and 0.30 m3/m3, which would also be
+        # physically meaningless -- different units entirely).
+        assert result.sizes.get("collocation", 0) == 2
+        val_sources = set(result["val_source"].values.tolist())
+        assert val_sources == {"ascat_ssm", "smap_ssm"}
+        values_by_source = dict(zip(
+            result["val_source"].values.tolist(),
+            result["val_SOIL_MOISTURE"].values.tolist(),
+        ))
+        assert values_by_source["ascat_ssm"] == pytest.approx(40.0)
+        assert values_by_source["smap_ssm"] == pytest.approx(0.30)
+
+    def test_gportal_snap_uses_native_degree_grid_not_km_conversion(self, tmp_path):
+        """G-Portal AMSR2's real grid-centre formula (see
+        ``_from_amsr_ssm_gportal_l3_grid``, ``-180 + (i+0.5)*(360/nx)``
+        with nx=3600) places every centre at an exact X.X5 offset -- e.g.
+        9.05, 9.15, 9.25, 9.35, .... Two such REAL adjacent centres, 9.15
+        and 9.25, are used here (9.00/9.10 never actually occur on this
+        grid and don't exercise the bug).
+
+        Both 9.15 and 9.25 sit exactly on a rounding tie under the old
+        ``np.round(v / 0.1) * 0.1`` snap (91.500...06 and 92.5 in step
+        units), which NumPy's round-half-to-even resolves to the SAME
+        bucket (9.2) -- silently merging two genuinely adjacent native
+        cells. Grouping on the raw (exact) lon/lat instead -- since a
+        fixed grid reports IDENTICAL coordinates for repeated readings of
+        the same cell, per docs/design-choices.md §8.7 -- must keep them
+        as two separate, unblended collocations."""
+        import xarray as xr
+
+        from sar_validation.core.collocation import run_collocation
+
+        distinct_pair = xr.Dataset(
+            {"SOIL_MOISTURE": (("point",), np.array([0.10, 0.30], dtype="float32"))},
+            coords={
+                "lon": (("point",), np.array([9.15, 9.25])),
+                "lat": (("point",), np.array([45.00, 45.00])),
+                "time": (("point",), np.array([
+                    np.datetime64("2026-06-19T18:00:00", "ns"),
+                    np.datetime64("2026-06-20T06:00:00", "ns"),
+                ])),
+            },
+            attrs={
+                "data_type": "radiometer_ssm", "sensor": "amsr", "platform_type": "amsr_ssm",
+                "native_grid_deg": 0.1,
+            },
+        )
+        tree = xr.DataTree.from_dict({
+            "/sar/scene1": self._sar_grid(),
+            "/validation/amsr_ssm": distinct_pair,
+        })
+
+        result = run_collocation(self._soil_moisture_recipe(), tree, tmp_path)
+
+        assert result is not None
+        # Must stay as two separate, unblended collocations -- not merged
+        # into one averaged 0.20 the way the old round-half-to-even tie
+        # would.
+        assert result.sizes.get("collocation", 0) == 2
+        values = sorted(float(v) for v in result["val_SOIL_MOISTURE"].values)
+        assert values == pytest.approx([0.10, 0.30], abs=1e-4)
+
+    def test_gportal_grid_ties_do_not_merge_adjacent_cells(self, tmp_path):
+        """Five consecutive real G-Portal native grid centres (9.05,
+        9.15, 9.25, 9.35, 9.45) must ALL stay as distinct collocations.
+
+        Under the old ``np.round(v / 0.1) * 0.1`` snap, 9.15 and 9.25
+        both resolve to bucket 9.2 (a round-half-to-even tie), so only 4
+        of these 5 cells would have survived as distinct groups. With
+        Fix 1 (group on raw lon/lat for native_grid_deg sources, no
+        snap), all 5 must remain distinct."""
+        import xarray as xr
+
+        from sar_validation.core.collocation import run_collocation
+
+        lons = [9.05, 9.15, 9.25, 9.35, 9.45]
+        values = [0.10, 0.20, 0.30, 0.40, 0.50]
+        ds = xr.Dataset(
+            {"SOIL_MOISTURE": (("point",), np.array(values, dtype="float32"))},
+            coords={
+                "lon": (("point",), np.array(lons)),
+                "lat": (("point",), np.full(len(lons), 45.0)),
+                "time": (("point",), np.array(
+                    [np.datetime64("2026-06-20T03:00:00", "ns")] * len(lons)
+                )),
+            },
+            attrs={
+                "data_type": "radiometer_ssm", "sensor": "amsr", "platform_type": "amsr_ssm",
+                "native_grid_deg": 0.1,
+            },
+        )
+        tree = xr.DataTree.from_dict({
+            "/sar/scene1": self._sar_grid(),
+            "/validation/amsr_ssm": ds,
+        })
+
+        result = run_collocation(self._soil_moisture_recipe(), tree, tmp_path)
+
+        assert result is not None
+        assert result.sizes.get("collocation", 0) == 5
+
+
 class TestProjectCurrentsToRadial:
     def test_due_east_current_zero_heading(self):
         # heading 0° → LOS is heading-90° = -90°; cos(-90)=0, sin(-90)=-1.
@@ -1263,3 +1725,186 @@ class TestProjectCurrentsToRadial:
         expected = (ewct * np.cos(np.radians(heading - 90.0))
                     + nsct * np.sin(np.radians(heading - 90.0)))
         assert _project_currents_to_radial(ewct, nsct, heading) == pytest.approx(expected)
+
+
+class TestAverageWithinSarTolerance:
+    """Unit tests for the pre-collocation temporal-averaging helper used
+    by run_collocation for soil-moisture sources (ISMN stations and
+    ASCAT/AMSR2/SMAP/SMOS grid cells). See
+    docs/superpowers/specs/2026-07-29-soil-moisture-temporal-averaging-design.md."""
+
+    def test_averages_all_readings_within_tolerance_for_one_station(self):
+        from sar_validation.core.collocation import _average_within_sar_tolerance
+
+        # 5 hourly readings from one station, all within +/-12h of a
+        # midnight SAR scene.
+        hours = [0, 4, 6, 8, 12]
+        val = _make_val_dataframe(
+            lons=[0.0] * 5, lats=[52.0] * 5,
+            times=[datetime(2026, 1, 1, h, 0, 0) for h in hours],
+            SOIL_MOISTURE=[0.10, 0.12, 0.20, 0.28, 0.30],
+            platform_id=["StationA"] * 5,
+        )
+        sar_times = [datetime(2026, 1, 1, 0, 0, 0)]
+
+        result = _average_within_sar_tolerance(
+            val, sar_times, group_cols=["platform_id"], time_tolerance_minutes=720,
+        )
+
+        assert len(result) == 1
+        assert result.iloc[0]["SOIL_MOISTURE"] == pytest.approx(0.20)
+        assert result.iloc[0]["platform_id"] == "StationA"
+        assert result.iloc[0]["time"] == datetime(2026, 1, 1, 0, 0, 0)
+
+    def test_keeps_distinct_stations_separate(self):
+        from sar_validation.core.collocation import _average_within_sar_tolerance
+
+        val = _make_val_dataframe(
+            lons=[0.0, 1.0], lats=[52.0, 53.0],
+            times=[datetime(2026, 1, 1, 3, 0, 0), datetime(2026, 1, 1, 3, 0, 0)],
+            SOIL_MOISTURE=[0.10, 0.40],
+            platform_id=["StationA", "StationB"],
+        )
+        sar_times = [datetime(2026, 1, 1, 0, 0, 0)]
+
+        result = _average_within_sar_tolerance(
+            val, sar_times, group_cols=["platform_id"], time_tolerance_minutes=720,
+        )
+
+        assert len(result) == 2
+        assert set(result["platform_id"]) == {"StationA", "StationB"}
+
+    def test_falls_back_to_lonlat_grouping_without_platform_id(self):
+        from sar_validation.core.collocation import _average_within_sar_tolerance
+
+        val = _make_val_dataframe(
+            lons=[0.0, 0.0], lats=[52.0, 52.0],
+            times=[datetime(2026, 1, 1, 3, 0, 0), datetime(2026, 1, 1, 9, 0, 0)],
+            SOIL_MOISTURE=[0.10, 0.30],
+        )
+        sar_times = [datetime(2026, 1, 1, 0, 0, 0)]
+
+        result = _average_within_sar_tolerance(
+            val, sar_times, group_cols=["lon", "lat"], time_tolerance_minutes=720,
+        )
+
+        assert len(result) == 1
+        assert result.iloc[0]["SOIL_MOISTURE"] == pytest.approx(0.20)
+
+    def test_drops_readings_outside_tolerance_of_every_sar_time(self):
+        from sar_validation.core.collocation import _average_within_sar_tolerance
+
+        val = _make_val_dataframe(
+            lons=[0.0, 0.0], lats=[52.0, 52.0],
+            times=[datetime(2026, 1, 1, 3, 0, 0), datetime(2026, 1, 2, 15, 0, 0)],
+            SOIL_MOISTURE=[0.10, 0.90],
+            platform_id=["StationA", "StationA"],
+        )
+        # 15:00 on day 2 is 39h after the single SAR scene -- outside
+        # +/-12h tolerance, must be dropped rather than pulled in.
+        sar_times = [datetime(2026, 1, 1, 0, 0, 0)]
+
+        result = _average_within_sar_tolerance(
+            val, sar_times, group_cols=["platform_id"], time_tolerance_minutes=720,
+        )
+
+        assert len(result) == 1
+        assert result.iloc[0]["SOIL_MOISTURE"] == pytest.approx(0.10)
+
+    def test_assigns_readings_to_nearest_of_multiple_sar_scenes(self):
+        from sar_validation.core.collocation import _average_within_sar_tolerance
+
+        val = _make_val_dataframe(
+            lons=[0.0, 0.0, 0.0, 0.0], lats=[52.0, 52.0, 52.0, 52.0],
+            times=[
+                datetime(2026, 1, 1, 3, 0, 0), datetime(2026, 1, 1, 9, 0, 0),
+                datetime(2026, 1, 2, 3, 0, 0), datetime(2026, 1, 2, 9, 0, 0),
+            ],
+            SOIL_MOISTURE=[0.10, 0.20, 0.50, 0.70],
+            platform_id=["StationA"] * 4,
+        )
+        sar_times = [datetime(2026, 1, 1, 0, 0, 0), datetime(2026, 1, 2, 0, 0, 0)]
+
+        result = _average_within_sar_tolerance(
+            val, sar_times, group_cols=["platform_id"], time_tolerance_minutes=720,
+        )
+
+        assert len(result) == 2
+        by_time = {row["time"]: row["SOIL_MOISTURE"] for _, row in result.iterrows()}
+        assert by_time[datetime(2026, 1, 1, 0, 0, 0)] == pytest.approx(0.15)
+        assert by_time[datetime(2026, 1, 2, 0, 0, 0)] == pytest.approx(0.60)
+
+    def test_spatial_snap_groups_nearby_swath_pixels_together(self):
+        from sar_validation.core.collocation import _average_within_sar_tolerance, _snap_to_grid
+
+        # Two AMSR2 AU_Land-style swath pixels a few hundred metres apart
+        # (not bit-identical, unlike a fixed grid) representing an
+        # ascending and a descending pass of "the same" cell.
+        val = _make_val_dataframe(
+            lons=[10.001, 10.003], lats=[45.002, 45.004],
+            times=[datetime(2026, 1, 1, 4, 0, 0), datetime(2026, 1, 1, 10, 0, 0)],
+            SOIL_MOISTURE=[0.15, 0.25],
+        )
+        deg_step = 25.0 / 111.0  # AMSR default aggregation_window_km
+        val = val.copy()
+        val["_snap_lon"] = _snap_to_grid(val["lon"].values, deg_step)
+        val["_snap_lat"] = _snap_to_grid(val["lat"].values, deg_step)
+
+        sar_times = [datetime(2026, 1, 1, 0, 0, 0)]
+        result = _average_within_sar_tolerance(
+            val, sar_times, group_cols=["_snap_lon", "_snap_lat"], time_tolerance_minutes=720,
+        )
+
+        assert len(result) == 1
+        assert result.iloc[0]["SOIL_MOISTURE"] == pytest.approx(0.20)
+
+    def test_nat_in_validation_time_column_is_dropped_not_crashed(self):
+        """A NaT entry in the validation DataFrame's own ``time`` column
+        (the LEFT side of the internal pd.merge_asof) must not crash --
+        this is reachable on real data via from_amsr_ssm's NSIDC-0451
+        branch, which sets time=NaT when time_coverage_start is missing
+        from the file (see docs/design-choices.md and
+        _subset_point_ds's docstring: NaT-timed points are deliberately
+        kept, not dropped, upstream of this averaging step). The NaT
+        reading itself must be excluded from the group's average, while
+        the group's other valid readings still average correctly."""
+        from sar_validation.core.collocation import _average_within_sar_tolerance
+
+        val = _make_val_dataframe(
+            lons=[0.0, 0.0, 0.0], lats=[52.0, 52.0, 52.0],
+            times=[
+                datetime(2026, 1, 1, 3, 0, 0),
+                pd.NaT,
+                datetime(2026, 1, 1, 9, 0, 0),
+            ],
+            SOIL_MOISTURE=[0.10, 999.0, 0.30],
+            platform_id=["StationA", "StationA", "StationA"],
+        )
+        sar_times = [datetime(2026, 1, 1, 0, 0, 0)]
+
+        result = _average_within_sar_tolerance(
+            val, sar_times, group_cols=["platform_id"], time_tolerance_minutes=720,
+        )
+
+        assert len(result) == 1
+        # The NaT row's 999.0 reading must not pollute the average.
+        assert result.iloc[0]["SOIL_MOISTURE"] == pytest.approx(0.20)
+
+    def test_all_nat_readings_for_a_group_produce_no_output_rows(self):
+        """If every reading for a group has a NaT time, that group must
+        simply produce zero output rows, not a crash."""
+        from sar_validation.core.collocation import _average_within_sar_tolerance
+
+        val = _make_val_dataframe(
+            lons=[0.0, 0.0], lats=[52.0, 52.0],
+            times=[pd.NaT, pd.NaT],
+            SOIL_MOISTURE=[0.10, 0.30],
+            platform_id=["StationA", "StationA"],
+        )
+        sar_times = [datetime(2026, 1, 1, 0, 0, 0)]
+
+        result = _average_within_sar_tolerance(
+            val, sar_times, group_cols=["platform_id"], time_tolerance_minutes=720,
+        )
+
+        assert len(result) == 0

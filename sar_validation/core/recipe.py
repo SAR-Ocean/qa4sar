@@ -182,6 +182,29 @@ DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
     "radiometer_ssmis_f18": dict(_RADIOMETER_DEFAULT),
     "radiometer_windsat":   dict(_RADIOMETER_DEFAULT),
     "radiometer_amsre":     dict(_RADIOMETER_DEFAULT),
+    # Soil-moisture satellite sources — 12h tolerance (not the 180min wind
+    # default): soil moisture changes slowly relative to a roughly-daily
+    # overpass. See design-choices.md §8.7. Keyed by data_type
+    # ("scatterometer_ssm"/"radiometer_ssm"/"<sensor>_ssm"), NOT by
+    # source_type — see from_ascat_ssm's data_type tag and
+    # _resolve_layer_type.
+    "scatterometer_ssm": {"time_tolerance_minutes": 720, "aggregation_window_km": 12.5, "distance_weighting": "equal"},
+    # Bare key is the fallback for any radiometer-family soil-moisture
+    # node whose data_type is the generic "radiometer_ssm" rather than
+    # a sensor-refined "<sensor>_ssm" -- mirrors the "radiometer" bare
+    # key's role above. from_amsr_ssm/from_smap_ssm/from_smos_ssm all
+    # stamp data_type="radiometer_ssm" literally on the datatree node
+    # itself (sensor-level refinement to amsr_ssm/smap_ssm/smos_ssm only
+    # happens downstream, in _resolve_layer_type during collocation) --
+    # this entry was documented in the comment above but missing from
+    # this dict, so any code reading data_type directly off a node
+    # (e.g. plot_collocation_diagnostics's unmatched-point path) fell
+    # through to the recipe's generic point_vs_layer default instead of
+    # the intended 720-minute soil-moisture tolerance.
+    "radiometer_ssm": {"time_tolerance_minutes": 720, "aggregation_window_km": 25.0, "distance_weighting": "equal"},
+    "amsr_ssm":  {"time_tolerance_minutes": 720, "aggregation_window_km": 25.0, "distance_weighting": "equal"},
+    "smap_ssm":  {"time_tolerance_minutes": 720, "aggregation_window_km": 9.0,  "distance_weighting": "equal"},
+    "smos_ssm":  {"time_tolerance_minutes": 720, "aggregation_window_km": 35.0, "distance_weighting": "equal"},
 }
 
 

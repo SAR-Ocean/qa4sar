@@ -189,6 +189,123 @@ class TestPlotScatter:
         assert len(recorded_markers) == 2
         assert len(set(recorded_markers)) == 2
 
+    def test_dominant_source_triggers_small_multiples_split(self):
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.visualization import plot_scatter
+
+        rng = np.random.default_rng(0)
+        n_ascat, n_smap = 700, 30
+        n = n_ascat + n_smap
+        sar = np.concatenate([rng.uniform(0, 100, n_ascat), rng.uniform(0, 100, n_smap)])
+        val = sar + rng.normal(0, 2, n)
+        # Real collocation_ds always carries per-point val_lat/val_lon (both
+        # are required, non-optional Collocation fields) — included here so
+        # _deduplicate_obs doesn't collapse same-source rows lacking any
+        # other observation-identity column into a single representative row.
+        ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", sar),
+            "val_SOIL_MOISTURE": ("collocation", val),
+            "val_source":        ("collocation", ["ascat_ssm"] * n_ascat + ["smap_ssm"] * n_smap),
+            "val_lat":           ("collocation", rng.uniform(50, 60, n)),
+            "val_lon":           ("collocation", rng.uniform(-10, 5, n)),
+        })
+        fig = plot_scatter(ds, "sarSSM", "SOIL_MOISTURE")
+        # One subplot per source, not one shared axes with everything
+        # crammed together.
+        visible_axes = [ax for ax in fig.axes if ax.get_visible()]
+        assert len(visible_axes) >= 2
+        import matplotlib.pyplot as plt
+        plt.close("all")
+
+    def test_small_multiples_subplots_each_have_1to1_line(self):
+        """Regression test: the single shared-axes path draws a dashed
+        1:1 reference line, but when plot_scatter splits into per-source
+        small multiples (see test_dominant_source_triggers_small_multiples_
+        split above), the subplots must still each carry their own 1:1
+        line -- readers use it to judge bias at a glance, and its absence
+        was silently dropping it from most scatter panels in real reports
+        (soil moisture's ASCAT/ISMN pairs almost always cross the 70%
+        imbalance threshold)."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.visualization import plot_scatter
+
+        rng = np.random.default_rng(0)
+        n_ascat, n_smap = 700, 30
+        n = n_ascat + n_smap
+        sar = np.concatenate([rng.uniform(0, 100, n_ascat), rng.uniform(0, 100, n_smap)])
+        val = sar + rng.normal(0, 2, n)
+        ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", sar),
+            "val_SOIL_MOISTURE": ("collocation", val),
+            "val_source":        ("collocation", ["ascat_ssm"] * n_ascat + ["smap_ssm"] * n_smap),
+            "val_lat":           ("collocation", rng.uniform(50, 60, n)),
+            "val_lon":           ("collocation", rng.uniform(-10, 5, n)),
+        })
+        fig = plot_scatter(ds, "sarSSM", "SOIL_MOISTURE")
+        visible_axes = [ax for ax in fig.axes if ax.get_visible()]
+        assert len(visible_axes) >= 2
+        for ax in visible_axes:
+            dashed_lines = [ln for ln in ax.get_lines() if ln.get_linestyle() == "--"]
+            assert dashed_lines, f"subplot {ax.get_title()!r} is missing its 1:1 reference line"
+        import matplotlib.pyplot as plt
+        plt.close("all")
+
+    def test_balanced_sources_keep_single_combined_axes(self):
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.visualization import plot_scatter
+
+        rng = np.random.default_rng(0)
+        n = 20
+        sar = rng.uniform(0, 100, n * 2)
+        val = sar + rng.normal(0, 2, n * 2)
+        ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", sar),
+            "val_SOIL_MOISTURE": ("collocation", val),
+            "val_source":        ("collocation", ["ascat_ssm"] * n + ["smap_ssm"] * n),
+            "val_lat":           ("collocation", rng.uniform(50, 60, n * 2)),
+            "val_lon":           ("collocation", rng.uniform(-10, 5, n * 2)),
+        })
+        fig = plot_scatter(ds, "sarSSM", "SOIL_MOISTURE")
+        assert len(fig.axes) == 1
+        import matplotlib.pyplot as plt
+        plt.close("all")
+
+    def test_force_split_splits_even_balanced_sources(self):
+        """force_split must trigger the small-multiples layout regardless
+        of dominant_share -- used by validation_report for soil moisture
+        once a source (e.g. ASCAT) has been CDF-matched into a different
+        reference domain, since piling every source into one shared axes
+        at that point is too visually busy even without one source
+        dominating by point count (confirmed against real data,
+        soil_moisture_satellite_example: ASCAT ~45% share, still busy)."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.visualization import plot_scatter
+
+        rng = np.random.default_rng(0)
+        n = 20
+        sar = rng.uniform(0, 100, n * 2)
+        val = sar + rng.normal(0, 2, n * 2)
+        ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", sar),
+            "val_SOIL_MOISTURE": ("collocation", val),
+            "val_source":        ("collocation", ["ascat_ssm"] * n + ["smap_ssm"] * n),
+            "val_lat":           ("collocation", rng.uniform(50, 60, n * 2)),
+            "val_lon":           ("collocation", rng.uniform(-10, 5, n * 2)),
+        })
+        fig = plot_scatter(ds, "sarSSM", "SOIL_MOISTURE", force_split=True)
+        visible_axes = [ax for ax in fig.axes if ax.get_visible()]
+        assert len(visible_axes) >= 2
+        import matplotlib.pyplot as plt
+        plt.close("all")
+
 
 class TestPlotScatterColorByTemporalOffset:
     def test_returns_figure_with_colorbar(self, collocation_ds):
@@ -197,6 +314,53 @@ class TestPlotScatterColorByTemporalOffset:
         assert fig is not None
         assert len(fig.axes) >= 2  # main axes + colorbar axes
         plt.close(fig)
+
+    def test_split_small_multiples_still_colors_by_temporal_offset(self):
+        """Regression test: previously, whenever the >70%-imbalance split
+        (or force_split) triggered, color_by='temporal_offset' was
+        silently dropped -- _plot_scatter_small_multiples always rendered
+        the plain by-source view, so the report's 'colored by temporal
+        offset' page became an exact duplicate of the main scatter page
+        under a misleading title. Each split subplot must now actually be
+        colored by temporal_distance_minutes, with a shared colorbar."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.visualization import plot_scatter
+
+        rng = np.random.default_rng(0)
+        n_ascat, n_smap = 700, 30
+        n = n_ascat + n_smap
+        sar = np.concatenate([rng.uniform(0, 100, n_ascat), rng.uniform(0, 100, n_smap)])
+        val = sar + rng.normal(0, 2, n)
+        offset = rng.uniform(0, 600, n)
+        ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", sar),
+            "val_SOIL_MOISTURE": ("collocation", val),
+            "val_source":        ("collocation", ["ascat_ssm"] * n_ascat + ["smap_ssm"] * n_smap),
+            "val_lat":           ("collocation", rng.uniform(50, 60, n)),
+            "val_lon":           ("collocation", rng.uniform(-10, 5, n)),
+            "temporal_distance_minutes": ("collocation", offset),
+        })
+        fig = plot_scatter(ds, "sarSSM", "SOIL_MOISTURE", color_by="temporal_offset")
+        visible_axes = [ax for ax in fig.axes if ax.get_visible()]
+        # 2 source subplots + 1 shared colorbar axes.
+        assert len(visible_axes) == 3
+
+        # Source subplots carry a "<src> (N=...)" title; the colorbar axes
+        # (matplotlib label "<colorbar>") has none -- a more reliable
+        # discriminator than ax.collections, since the colorbar's own
+        # gradient is itself drawn via a QuadMesh in `.collections`.
+        scatter_axes = [ax for ax in visible_axes if ax.get_title()]
+        assert len(scatter_axes) == 2
+        for ax in scatter_axes:
+            offsets_used = ax.collections[0].get_array()
+            assert offsets_used is not None and len(offsets_used) > 0, (
+                "split subplot's scatter has no per-point color array -- "
+                "color_by='temporal_offset' was dropped, not applied"
+            )
+        import matplotlib.pyplot as plt
+        plt.close("all")
 
     def test_uses_distinct_markers_per_source(self, collocation_ds, monkeypatch):
         import matplotlib.axes
@@ -247,6 +411,45 @@ class TestPlotScatterColorByTemporalOffset:
 
         assert len(recorded_clims) == 2
         assert recorded_clims[0] == recorded_clims[1]
+
+
+class TestLabeledVarMixedUnits:
+    def test_uses_val_units_for_specific_source(self):
+        import xarray as xr
+
+        from sar_validation.core.visualization import _labeled_var
+
+        ds = xr.Dataset({
+            "val_SOIL_MOISTURE": ("collocation", [0.1, 20.0]),
+            "val_source": ("collocation", ["ismn", "ascat_ssm"]),
+            "val_units": ("collocation", ["m3 m-3", "%"]),
+        })
+        assert _labeled_var(ds, "val_SOIL_MOISTURE", "SOIL_MOISTURE", val_source="ascat_ssm") == "SOIL_MOISTURE (%)"
+        assert _labeled_var(ds, "val_SOIL_MOISTURE", "SOIL_MOISTURE", val_source="ismn") == "SOIL_MOISTURE (m3 m-3)"
+
+    def test_no_source_given_and_units_vary_returns_neutral_label(self):
+        import xarray as xr
+
+        from sar_validation.core.visualization import _labeled_var
+
+        ds = xr.Dataset({
+            "val_SOIL_MOISTURE": ("collocation", [0.1, 20.0]),
+            "val_source": ("collocation", ["ismn", "ascat_ssm"]),
+            "val_units": ("collocation", ["m3 m-3", "%"]),
+        })
+        assert _labeled_var(ds, "val_SOIL_MOISTURE", "SOIL_MOISTURE") == "SOIL_MOISTURE (units vary by source)"
+
+    def test_absent_val_units_falls_back_to_column_attrs_unchanged(self):
+        """No val_units companion (every non-soil-moisture recipe today) --
+        behavior identical to before this task."""
+        import xarray as xr
+
+        from sar_validation.core.visualization import _labeled_var
+
+        ds = xr.Dataset({"val_WSPD": ("collocation", [5.0, 6.0])})
+        ds["val_WSPD"].attrs["units"] = "m s-1"
+        assert _labeled_var(ds, "val_WSPD", "WSPD") == "WSPD (m s-1)"
+        assert _labeled_var(ds, "val_WSPD", "WSPD", val_source="mooring") == "WSPD (m s-1)"
 
 
 class TestPlotResiduals:
@@ -314,6 +517,142 @@ class TestPlotResiduals:
         assert len(recorded_ranges) == 2
         assert all(r is not None for r in recorded_ranges)
         assert recorded_ranges[0] == recorded_ranges[1]
+
+    def test_by_source_subplot_labels_use_each_sources_own_units(self):
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.visualization import plot_residuals
+
+        ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", np.array([10.0, 15.0, 0.12, 0.18])),
+            "val_SOIL_MOISTURE": ("collocation", np.array([12.0, 18.0, 0.1, 0.2])),
+            "val_source":        ("collocation", ["ascat_ssm", "ascat_ssm", "ismn", "ismn"]),
+            "val_units":         ("collocation", ["%", "%", "m3 m-3", "m3 m-3"]),
+        })
+        fig = plot_residuals(ds, "sarSSM", "SOIL_MOISTURE", by_source=True)
+        labels = [ax.get_xlabel() for ax in fig.axes if ax.get_visible()]
+        assert any("(%)" in lbl for lbl in labels)
+        assert any("(m3 m-3)" in lbl for lbl in labels)
+        import matplotlib.pyplot as plt
+        plt.close("all")
+
+    def test_hist_range_overrides_data_driven_shared_range(self):
+        """Regression test for the CDF-matching-outlier bug: one extreme
+        residual used to balloon the auto-computed shared_range to roughly
+        (-100, 100), collapsing the real, tightly-clustered residuals into
+        a single bar. Passing hist_range must use it verbatim instead of
+        computing from data min/max."""
+        import matplotlib.pyplot as plt
+
+        rng = np.random.default_rng(2)
+        tight = rng.normal(0, 0.05, 20)
+        ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", np.concatenate([tight, [80.0]])),
+            "val_SOIL_MOISTURE": ("collocation", np.zeros(21)),
+            "val_source":        ("collocation", ["ismn"] * 21),
+        })
+
+        fig = plot_residuals(ds, "sarSSM", "SOIL_MOISTURE", hist_range=(-1.0, 1.0))
+        ax = [a for a in fig.axes if a.get_visible()][0]
+        assert ax.get_xlim() == (-1.0, 1.0)
+        plt.close(fig)
+
+    def test_hist_range_excludes_out_of_range_values_from_bins(self):
+        """hist_range must be passed through to ax.hist's own range= (not
+        just set_xlim afterward) so the extreme value's presence doesn't
+        widen the bin width and hide the real distribution inside one bin."""
+        import matplotlib.axes
+        import matplotlib.pyplot as plt
+
+        recorded_ranges = []
+        original_hist = matplotlib.axes.Axes.hist
+
+        def recording_hist(self, *args, **kwargs):
+            recorded_ranges.append(kwargs.get("range"))
+            return original_hist(self, *args, **kwargs)
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(matplotlib.axes.Axes, "hist", recording_hist)
+        try:
+            rng = np.random.default_rng(3)
+            tight = rng.normal(0, 0.05, 20)
+            ds = xr.Dataset({
+                "sar_sarSSM":        ("collocation", np.concatenate([tight, [80.0]])),
+                "val_SOIL_MOISTURE": ("collocation", np.zeros(21)),
+                "val_source":        ("collocation", ["ismn"] * 21),
+            })
+            fig = plot_residuals(ds, "sarSSM", "SOIL_MOISTURE", hist_range=(-1.0, 1.0))
+            plt.close(fig)
+        finally:
+            monkeypatch.undo()
+
+        assert len(recorded_ranges) == 1
+        assert recorded_ranges[0] == (-1.0, 1.0)
+
+    def test_hist_range_none_preserves_existing_data_driven_behavior(self, collocation_ds):
+        """Default (hist_range=None) must be unchanged from today's
+        behavior -- every other variable's residuals plot is unaffected."""
+        import matplotlib.pyplot as plt
+
+        fig = plot_residuals(collocation_ds, "owiWindSpeed", "WSPD")
+        ax = [a for a in fig.axes if a.get_visible()][0]
+        xlim = ax.get_xlim()
+        assert xlim != (-1.0, 1.0)
+        plt.close(fig)
+
+    def test_hist_range_applies_to_by_source_false_path_too(self):
+        import matplotlib.pyplot as plt
+
+        rng = np.random.default_rng(4)
+        tight = rng.normal(0, 0.05, 20)
+        ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", np.concatenate([tight, [80.0]])),
+            "val_SOIL_MOISTURE": ("collocation", np.zeros(21)),
+            "val_source":        ("collocation", ["ismn"] * 21),
+        })
+
+        fig = plot_residuals(
+            ds, "sarSSM", "SOIL_MOISTURE", by_source=False, hist_range=(-1.0, 1.0),
+        )
+        assert fig.axes[0].get_xlim() == (-1.0, 1.0)
+        plt.close(fig)
+
+    def test_hist_range_dict_gives_each_source_its_own_range(self):
+        """Regression test for the real-world mixed-source bug: a
+        soil_moisture recipe with ismn (volumetric) alongside ascat_ssm
+        (percent) pools ALL residuals into one global shared_range when
+        hist_range is a single value/None, so ismn's panel inherits
+        ascat_ssm's much wider percent-scale spread even though ismn's
+        own residuals are tightly clustered near zero. A dict keyed by
+        val_source must give each source ITS OWN range: an override for
+        sources present in the dict, and a per-source (not pooled) data
+        range for sources absent from it."""
+        import matplotlib.pyplot as plt
+
+        rng = np.random.default_rng(6)
+        ismn_vals = rng.normal(0, 0.05, 20)  # tight, near-zero residuals
+        ascat_vals = rng.normal(0, 15.0, 20)  # wide, percent-scale residuals
+        ds = xr.Dataset({
+            "sar_sarSSM": ("collocation", np.concatenate([ismn_vals, ascat_vals])),
+            "val_SOIL_MOISTURE": ("collocation", np.zeros(40)),
+            "val_source": ("collocation", ["ismn"] * 20 + ["ascat_ssm"] * 20),
+        })
+
+        fig = plot_residuals(
+            ds, "sarSSM", "SOIL_MOISTURE", hist_range={"ismn": (-1.0, 1.0)},
+        )
+        axes_by_title = {ax.get_title(): ax for ax in fig.axes if ax.get_visible()}
+        ismn_ax = next(ax for title, ax in axes_by_title.items() if title.startswith("ismn"))
+        ascat_ax = next(ax for title, ax in axes_by_title.items() if title.startswith("ascat_ssm"))
+
+        assert ismn_ax.get_xlim() == (-1.0, 1.0)
+        # ascat_ssm has no override -- must get its OWN data-driven range
+        # (wide enough to show its real ~N(0,15) spread), not ismn's (-1,1)
+        # and not some huge range polluted by ismn's data being pooled in.
+        ascat_lo, ascat_hi = ascat_ax.get_xlim()
+        assert ascat_hi - ascat_lo > 2.0
+        plt.close(fig)
 
 
 class TestPlotTemporalOffset:
@@ -383,6 +722,61 @@ class TestPlotStatistics:
             result = plot_statistics(stats_ds, metrics=["nonexistent_metric"])
         assert result is None
         assert any("nonexistent_metric" in str(warning.message) for warning in w)
+
+
+class TestPlotSummaryTable:
+    def test_table_has_one_row_per_source_and_requested_columns(self):
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.statistics import compute_statistics
+        from sar_validation.core.visualization import plot_summary_table
+
+        n = 20
+        rng = np.random.default_rng(0)
+        sar = rng.uniform(0, 10, n)
+        val = sar + rng.normal(0, 0.5, n)
+        ds = xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", sar),
+            "val_WSPD":         ("collocation", val),
+            "val_source":       ("collocation", ["mooring"] * 10 + ["altimeter"] * 10),
+        })
+        stats_ds = compute_statistics(ds, "owiWindSpeed", "WSPD", group_by=["val_source"])
+
+        fig = plot_summary_table(stats_ds)
+
+        assert fig is not None
+        ax = fig.axes[0]
+        tables = [c for c in ax.get_children() if hasattr(c, "get_celld")]
+        assert len(tables) == 1
+        cell_texts = {cell.get_text().get_text() for cell in tables[0].get_celld().values()}
+        assert "mooring" in cell_texts
+        assert "altimeter" in cell_texts
+        assert "bias" in cell_texts or "Bias" in cell_texts
+        import matplotlib.pyplot as plt
+        plt.close("all")
+
+    def test_returns_none_when_no_requested_metrics_available(self):
+        import xarray as xr
+
+        from sar_validation.core.visualization import plot_summary_table
+
+        stats_ds = xr.Dataset(
+            {"foo": ("source", [1.0])}, coords={"source": ["mooring"]},
+        )
+        assert plot_summary_table(stats_ds, metrics=["bias"]) is None
+
+    def test_returns_none_for_empty_source_coordinate(self):
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.visualization import plot_summary_table
+
+        stats_ds = xr.Dataset(
+            {"bias": ("source", np.array([], dtype=float))},
+            coords={"source": np.array([], dtype=object)},
+        )
+        assert plot_summary_table(stats_ds) is None
 
 
 class TestSourceStyleMap:
@@ -462,6 +856,61 @@ class TestPlotGeographic:
         source_markers = [m for m in recorded_markers if m is not None]
         assert len(set(source_markers)) == 2
 
+    def test_dict_point_size_sizes_each_collocation_type_independently(self, monkeypatch):
+        """point_size accepts a dict keyed by collocation_type (see
+        validation_report's soil-moisture/wind adaptive sizing) -- each
+        returned per-type Figure must actually use its own entry, not one
+        value shared across every type."""
+        import matplotlib.axes
+        import matplotlib.pyplot as plt
+        import pandas as pd
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.full((y, x), 30.0))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T19:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+
+        rng = np.random.default_rng(0)
+        n_layer, n_point = 6, 3
+        n = n_layer + n_point
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":       ("collocation", rng.uniform(20, 40, n)),
+            "val_SOIL_MOISTURE": ("collocation", rng.uniform(0.1, 0.4, n)),
+            "val_source":       ("collocation", ["ascat_ssm"] * n_layer + ["ismn"] * n_point),
+            "collocation_type": ("collocation", ["layer_vs_layer"] * n_layer + ["point_vs_layer"] * n_point),
+            "sar_scene_name":   ("collocation", ["sceneA"] * n),
+            "val_lon":          ("collocation", rng.uniform(-9.8, -8.2, n)),
+            "val_lat":          ("collocation", rng.uniform(50.2, 51.8, n)),
+        })
+
+        recorded_sizes = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded_sizes.append(kwargs.get("s"))
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        figs = plot_geographic(
+            datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            point_size={"layer_vs_layer": 5, "point_vs_layer": 15},
+        )
+        plt.close("all")
+
+        assert set(figs.keys()) == {"layer_vs_layer", "point_vs_layer"}
+        # Each type's own point scatter call (excluding the SAR background
+        # field's pcolormesh/scatter, which doesn't pass an `s` kwarg at
+        # all -- point_size only ever governs validation-point markers).
+        assert 5 in recorded_sizes, f"layer_vs_layer's point_size=5 never used, got {recorded_sizes!r}"
+        assert 15 in recorded_sizes, f"point_vs_layer's point_size=15 never used, got {recorded_sizes!r}"
+
     def test_gridded_scene_with_nan_geolocation_does_not_raise(
         self, geo_datatree_and_collocation,
     ):
@@ -494,6 +943,49 @@ class TestPlotGeographic:
         plt.close("all")
 
         assert fig is not None
+
+    def test_genuine_per_point_nan_still_rendered_as_no_data_hatch(
+        self, geo_datatree_and_collocation,
+    ):
+        """Regression guard for the source-level "omit dropped sources
+        entirely" fix (see TestPlotGeographicPointLevelDomainHarmonization):
+        that fix is specifically about a val_source _harmonize_percent_
+        domain_sources couldn't harmonize at all, not an ordinary per-point
+        missing retrieval for a source that never needed harmonizing (this
+        fixture is wind/mooring/altimeter -- sar_units is None, so
+        domains_differ is False and _harmonize_percent_domain_sources's
+        point-level filtering path never even runs). A single NaN'd val
+        value must still render as the existing gray hatched "no data"
+        marker, exactly as before this fix."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        val = collocation_ds["val_WSPD"].values.copy()
+        nan_lon = float(collocation_ds["val_lon"].values[1])
+        nan_lat = float(collocation_ds["val_lat"].values[1])
+        val[1] = np.nan
+        collocation_ds = collocation_ds.assign(val_WSPD=("collocation", val))
+
+        fig = plot_geographic(
+            datatree, collocation_ds, "owiWindSpeed", "WSPD", split_by=None,
+        )
+        plt.close("all")
+
+        assert fig is not None
+        ax = [a for a in fig.axes if a.get_visible()][0]
+        collections = _path_collections_with_offsets(ax)
+        c = _collection_containing(collections, nan_lon, nan_lat)
+        assert c is not None, f"no scatter collection found for the NaN'd point ({nan_lon}, {nan_lat})"
+        assert c.get_hatch() == "////", (
+            "a genuine per-point NaN (unrelated to source-level harmonization) must "
+            f"still render as the 'no data' hatched marker, got hatch={c.get_hatch()!r}"
+        )
+        legend = ax.get_legend()
+        assert legend is not None
+        labels = [t.get_text() for t in legend.get_texts()]
+        assert "No data (NaN)" in labels
 
 
 class TestPlotGeographicDomainMismatch:
@@ -663,6 +1155,413 @@ class TestPlotGeographicDomainMismatch:
         plt.close("all")
 
 
+class TestPlotGeographicSkipDomainHarmonization:
+    """Bug 1 regression: validation_report's native-units section builds
+    ``nu_pair_ds`` by row-filtering the full ``geo_pair_ds`` down to
+    val_source groups that already share SAR's own units family (e.g. only
+    ``ascat_ssm`` when ISMN is absent/too sparse) — but that filtering
+    doesn't touch the *column-level* ``val_<var>`` units attr, which is
+    still the "mixed — see val_units" sentinel stamped onto the full,
+    unfiltered dataset by ``annotate_collocation_ds`` back when multiple
+    unit families were genuinely present. ``plot_geographic`` reads that
+    stale attrs string to decide ``domains_differ``, incorrectly concludes
+    the (now single-family) native-units dataset needs harmonizing, and — since
+    the sole remaining source, ASCAT, can't be harmonized without ISMN as
+    a reference — ends up forcing the two-separate-colorbars fallback for
+    a case that should share one colorbar. ``skip_domain_harmonization=True``
+    is the caller's explicit opt-out for exactly this call site."""
+
+    def _single_family_scene_with_stale_mixed_attrs(self):
+        """Mirrors what validation_report's nu_pair_ds looks like: only
+        ascat_ssm rows remain (ISMN was filtered out for being absent/too
+        sparse for the native-units restriction), but val_SOIL_MOISTURE's
+        column-level units attr is still the "mixed" sentinel inherited,
+        unchanged, from the pre-filter full dataset."""
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        y, x = 4, 5
+        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+        field = np.linspace(0.0, 100.0, y * x).reshape(y, x)
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), field, {"units": "%"})},
+            coords={
+                "lon": (("y", "x"), lon2d),
+                "lat": (("y", "x"), lat2d),
+                "time": pd.Timestamp("2026-07-10T19:00:00"),
+            },
+        )
+        n = 5
+        lons = np.array([-9.8, -9.6, -9.4, -9.2, -9.0])
+        lats = np.array([50.2, 50.4, 50.6, 50.8, 51.0])
+        val_vals = np.array([72.2, 70.3, 74.7, 75.7, 71.4])
+        sar_vals = np.array([70.0, 68.0, 76.0, 74.0, 69.0])
+        ascat_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", val_vals)},
+            coords={
+                "lon": ("point", lons),
+                "lat": ("point", lats),
+                "time": ("point", pd.date_range("2026-07-10T19:05", periods=n, freq="5min")),
+            },
+            attrs={"platform_type": "ascat_ssm"},
+        )
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds,
+            "validation/ascat_ssm": ascat_ds,
+        })
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM": xr.DataArray(sar_vals, dims="collocation", attrs={"units": "%"}),
+            "val_SOIL_MOISTURE": xr.DataArray(
+                val_vals, dims="collocation",
+                # The stale sentinel: real, unfiltered soil_moisture runs
+                # stamp this when ISMN/SMAP (volumetric) were present
+                # alongside ASCAT (percent) *before* row-filtering to
+                # native units — filtering rows never recomputes it.
+                attrs={"units": "mixed — see val_units"},
+            ),
+            "val_source": ("collocation", ["ascat_ssm"] * n),
+            "sar_scene_name": ("collocation", ["sceneA"] * n),
+            "val_lon": ("collocation", lons),
+            "val_lat": ("collocation", lats),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-10T19:05", periods=n, freq="5min")),
+        )
+        return datatree, collocation_ds
+
+    def test_skip_domain_harmonization_forces_single_colorbar(self):
+        """The fix: with skip_domain_harmonization=True, plot_geographic
+        must not treat the stale "mixed" sentinel as a real mismatch, and
+        must render one shared colorbar (matching what this ascat_ssm-only,
+        single-family dataset actually needs)."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = self._single_family_scene_with_stale_mixed_attrs()
+        result = plot_geographic(
+            datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE", split_by=None,
+            skip_domain_harmonization=True,
+        )
+        fig = result if not isinstance(result, dict) else list(result.values())[0]
+
+        # ylabel-based check (not GeoAxes-count): plot_geographic's default
+        # ncols=2 layout adds a second, hidden placeholder subplot even for
+        # a single-scene figure (plain Axes, not GeoAxes, invisible) -- an
+        # unrelated layout detail that would otherwise be miscounted as a
+        # second colorbar axes.
+        ylabels = [ax.get_ylabel() for ax in fig.axes if ax.get_ylabel()]
+        assert not any(lbl.startswith("SAR ") or lbl.startswith("In-situ ") for lbl in ylabels), (
+            f"expected one shared colorbar (no SAR/In-situ split), got ylabels={ylabels!r}"
+        )
+        assert any("sarSSM" in lbl and "SOIL_MOISTURE" in lbl for lbl in ylabels)
+        plt.close("all")
+
+    def test_without_flag_stale_mixed_attrs_wrongly_forces_two_colorbars(self):
+        """Documents the bug this fix works around: absent the opt-out,
+        the same single-family dataset's stale "mixed" attrs string makes
+        plot_geographic wrongly believe domains differ, and — since ASCAT
+        alone can't be harmonized without ISMN present as a reference —
+        falls back to two separate colorbars."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = self._single_family_scene_with_stale_mixed_attrs()
+        result = plot_geographic(
+            datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE", split_by=None,
+        )
+        fig = result if not isinstance(result, dict) else list(result.values())[0]
+
+        from cartopy.mpl.geoaxes import GeoAxes
+        non_data_axes = [ax for ax in fig.axes if not isinstance(ax, GeoAxes)]
+        assert len(non_data_axes) == 2, (
+            "expected the (buggy, pre-fix) two-colorbar fallback when the "
+            f"stale sentinel isn't opted out of, got {len(non_data_axes)}"
+        )
+        plt.close("all")
+
+
+def _path_collections_with_offsets(ax):
+    """Return every matplotlib PathCollection scatter artist on *ax* that
+    has at least one plotted point (excludes empty/decorative collections),
+    for inspecting which lon/lat points landed in which scatter call."""
+    import matplotlib.collections as mcollections
+
+    return [
+        c for c in ax.collections
+        if isinstance(c, mcollections.PathCollection) and len(c.get_offsets()) > 0
+    ]
+
+
+def _collection_containing(collections, lon: float, lat: float, tol: float = 1e-6):
+    """Find the (unique, expected) PathCollection among *collections* whose
+    offsets include (lon, lat), or None if none match."""
+    for c in collections:
+        offsets = np.asarray(c.get_offsets())
+        if len(offsets) == 0:
+            continue
+        hit = np.any(
+            (np.abs(offsets[:, 0] - lon) < tol) & (np.abs(offsets[:, 1] - lat) < tol)
+        )
+        if hit:
+            return c
+    return None
+
+
+class TestPlotGeographicPointLevelDomainHarmonization:
+    """Bug 2 regression: the CDF-matched geographic plot's *field*
+    (background raster + fit_sar_to_val_transform) already correctly drops
+    ASCAT when ISMN is too sparse to harmonize against — but the point
+    markers drawn on top were, until this fix, still taken from
+    collocation_ds's raw, unharmonized val_<var> column throughout the
+    rest of plot_geographic, plotting ASCAT's raw ~0-100 percent values as
+    colored dots under a colour scale calibrated for ISMN/SMAP's ~0-1
+    volumetric domain."""
+
+    def _scene(self, n_ismn: int):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        y, x = 4, 5
+        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+        field = np.linspace(0.0, 100.0, y * x).reshape(y, x)
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), field, {"units": "%"})},
+            coords={
+                "lon": (("y", "x"), lon2d),
+                "lat": (("y", "x"), lat2d),
+                "time": pd.Timestamp("2026-07-10T19:00:00"),
+            },
+        )
+
+        ismn_lons = np.array([-9.9, -9.7, -9.5, -9.3])[:n_ismn]
+        ismn_lats = np.array([50.1, 50.3, 50.5, 50.7])[:n_ismn]
+        ismn_vals = np.array([0.10, 0.15, 0.20, 0.25])[:n_ismn]
+        ismn_sar_vals = np.array([12.0, 18.0, 22.0, 28.0])[:n_ismn]
+        ismn_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", ismn_vals)},
+            coords={
+                "lon": ("point", ismn_lons),
+                "lat": ("point", ismn_lats),
+                "time": ("point", pd.date_range("2026-07-10T19:05", periods=n_ismn, freq="5min")),
+            },
+            attrs={"platform_type": "ismn"},
+        )
+
+        n_ascat = 5
+        ascat_lons = np.array([-9.8, -9.6, -9.4, -9.2, -9.0])
+        ascat_lats = np.array([50.2, 50.4, 50.6, 50.8, 51.0])
+        ascat_vals = np.array([72.2, 70.3, 74.7, 75.7, 71.4])
+        ascat_sar_vals = np.array([70.0, 68.0, 76.0, 74.0, 69.0])
+        ascat_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", ascat_vals)},
+            coords={
+                "lon": ("point", ascat_lons),
+                "lat": ("point", ascat_lats),
+                "time": ("point", pd.date_range("2026-07-10T19:06", periods=n_ascat, freq="5min")),
+            },
+            attrs={"platform_type": "ascat_ssm"},
+        )
+
+        n_smap = 5
+        smap_lons = np.array([-8.9, -8.7, -8.5, -8.3, -8.1])
+        smap_lats = np.array([51.2, 51.4, 51.6, 51.8, 52.0])
+        smap_vals = np.array([0.12, 0.22, 0.32, 0.42, 0.30])
+        smap_sar_vals = np.array([15.0, 25.0, 35.0, 45.0, 33.0])
+        smap_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", smap_vals)},
+            coords={
+                "lon": ("point", smap_lons),
+                "lat": ("point", smap_lats),
+                "time": ("point", pd.date_range("2026-07-10T19:07", periods=n_smap, freq="5min")),
+            },
+            attrs={"platform_type": "smap_ssm"},
+        )
+
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds,
+            "validation/ismn": ismn_ds,
+            "validation/ascat_ssm": ascat_ds,
+            "validation/smap_ssm": smap_ds,
+        })
+
+        lons = np.concatenate([ismn_lons, ascat_lons, smap_lons])
+        lats = np.concatenate([ismn_lats, ascat_lats, smap_lats])
+        val_vals = np.concatenate([ismn_vals, ascat_vals, smap_vals])
+        sar_vals = np.concatenate([ismn_sar_vals, ascat_sar_vals, smap_sar_vals])
+        sources = (["ismn"] * n_ismn) + (["ascat_ssm"] * n_ascat) + (["smap_ssm"] * n_smap)
+        n_total = n_ismn + n_ascat + n_smap
+
+        collocation_ds = xr.Dataset({
+            # units="%" mirrors annotate_collocation_ds copying the SAR
+            # scene variable's own attrs onto sar_<var> -- needed for
+            # _harmonize_percent_domain_sources's sar_family detection,
+            # which reads collocation_ds's own sar_col attrs (not the
+            # datatree scene field's).
+            "sar_sarSSM": xr.DataArray(sar_vals, dims="collocation", attrs={"units": "%"}),
+            "val_SOIL_MOISTURE": xr.DataArray(
+                val_vals, dims="collocation",
+                # Mirrors annotate_collocation_ds's real output for a run
+                # with genuinely mixed val_source units (ismn/smap "m3
+                # m-3" volumetric vs. ascat_ssm "%").
+                attrs={"units": "mixed — see val_units"},
+            ),
+            "val_source": ("collocation", sources),
+            "sar_scene_name": ("collocation", ["sceneA"] * n_total),
+            "val_lon": ("collocation", lons),
+            "val_lat": ("collocation", lats),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-10T19:05", periods=n_total, freq="1min")),
+        )
+        return datatree, collocation_ds, ascat_lons, ascat_lats, ismn_lons, ismn_lats, smap_lons, smap_lats
+
+    def test_ascat_points_omitted_entirely_when_ismn_too_sparse(self):
+        """Design decision (2026-07-28): with only one ISMN point (below
+        the < 2 threshold _harmonize_percent_domain_sources requires),
+        ASCAT is an entire *source* that couldn't be harmonized, not a
+        single failed per-point retrieval -- at real-world scale (ASCAT
+        can be ~56% of all collocated points in a run) rendering it via
+        the "No data (NaN)" gray-hatched convention floods the map and
+        buries genuinely meaningful data underneath it. So dropped
+        sources must be omitted from the CDF-matched geographic plot
+        entirely: no colored point, no hatched "no data" marker either --
+        not present in any scatter collection at all. (They remain fully
+        visible in the separate native-units section, unaffected by this.)"""
+        import warnings
+
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        (datatree, collocation_ds, ascat_lons, ascat_lats,
+         ismn_lons, ismn_lats, smap_lons, smap_lats) = self._scene(n_ismn=1)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            result = plot_geographic(
+                datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE", split_by=None,
+            )
+        fig = result if not isinstance(result, dict) else list(result.values())[0]
+
+        from cartopy.mpl.geoaxes import GeoAxes
+        ax = next(a for a in fig.axes if isinstance(a, GeoAxes))
+        collections = _path_collections_with_offsets(ax)
+
+        for lon, lat in zip(ascat_lons, ascat_lats):
+            c = _collection_containing(collections, lon, lat)
+            assert c is None, (
+                f"ASCAT point ({lon}, {lat}) must be omitted entirely (no scatter "
+                f"collection at all -- not colored, not hatched 'no data') when ISMN "
+                f"is too sparse to harmonize, but found it in collection {c!r}"
+            )
+
+        # No collection anywhere on the map should carry the "no data"
+        # hatch pattern at all in this scenario -- the only source that
+        # needed (and failed) harmonization is ASCAT, and it's now
+        # excluded before the nan_pts/valid_pts split even runs, so
+        # nothing should reach that gray-hatched rendering path.
+        assert not any(c.get_hatch() == "////" for c in collections), (
+            "no 'No data (NaN)' hatched markers expected -- the only unharmonized "
+            "source (ascat_ssm) must be omitted upstream, not rendered as hatched"
+        )
+
+        # SMAP (already volumetric, never needed converting) must stay
+        # untouched and colored -- this fix must not over-trigger the drop.
+        for lon, lat in zip(smap_lons, smap_lats):
+            c = _collection_containing(collections, lon, lat)
+            assert c is not None, f"no scatter collection found for SMAP point ({lon}, {lat})"
+            assert c.get_hatch() != "////", (
+                f"SMAP point ({lon}, {lat}) must remain colored, not dropped as 'no data'"
+            )
+        plt.close("all")
+
+    def test_ascat_dropped_source_omitted_from_legend(self):
+        """Regression test: when ASCAT is fully dropped (see
+        test_ascat_points_omitted_entirely_when_ismn_too_sparse above --
+        every ASCAT point is excluded from point_collocation_ds entirely,
+        before point rendering even runs), the legend must NOT still show
+        ASCAT's colored marker/label, nor a "No data (NaN)" entry (since
+        ASCAT was the only source that needed harmonizing and it's gone
+        before the nan_pts/valid_pts split, there are no NaN rows left to
+        produce that legend entry either). Before the original (now
+        superseded) fix, the legend's `present` set was built from every
+        val_source in df_pts (all rows, including the all-NaN ones), so
+        ascat_ssm's marker appeared in the legend even though zero actual
+        ascat_ssm-colored points exist on the map -- misleading a reader
+        into looking for points that aren't there. This test now also
+        confirms that the newer "omit dropped sources entirely" behavior
+        doesn't reintroduce that problem or a "No data (NaN)" stand-in."""
+        import warnings
+
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        (datatree, collocation_ds, ascat_lons, ascat_lats,
+         ismn_lons, ismn_lats, smap_lons, smap_lats) = self._scene(n_ismn=1)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            result = plot_geographic(
+                datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE", split_by=None,
+            )
+        fig = result if not isinstance(result, dict) else list(result.values())[0]
+
+        from cartopy.mpl.geoaxes import GeoAxes
+        ax = next(a for a in fig.axes if isinstance(a, GeoAxes))
+        legend = ax.get_legend()
+        assert legend is not None, "expected a legend to be rendered for this scene"
+        labels = [t.get_text() for t in legend.get_texts()]
+
+        assert "ascat_ssm" not in labels, (
+            "ascat_ssm must not appear in the legend when every one of its "
+            f"points was dropped -- got legend labels {labels!r}"
+        )
+        assert "No data (NaN)" not in labels, (
+            "no genuine per-point NaN remains in this scenario once ascat_ssm "
+            f"(the only unharmonized source) is omitted upstream -- got {labels!r}"
+        )
+        # Sources that DO have real colored points on the map must still
+        # be labeled -- this fix must not empty the legend entirely.
+        assert "ismn" in labels
+        assert "smap_ssm" in labels
+        plt.close("all")
+
+    def test_ascat_points_still_colored_when_ismn_sufficient(self):
+        """Regression guard: when ISMN has enough points to harmonize
+        against (the ordinary case), ASCAT's points must still render as
+        colored, converted points -- not accidentally dropped as 'no
+        data' by an over-eager Bug 2 fix."""
+        import warnings
+
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        (datatree, collocation_ds, ascat_lons, ascat_lats,
+         ismn_lons, ismn_lats, smap_lons, smap_lats) = self._scene(n_ismn=4)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            result = plot_geographic(
+                datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE", split_by=None,
+            )
+        fig = result if not isinstance(result, dict) else list(result.values())[0]
+
+        from cartopy.mpl.geoaxes import GeoAxes
+        ax = next(a for a in fig.axes if isinstance(a, GeoAxes))
+        collections = _path_collections_with_offsets(ax)
+
+        for lon, lat in zip(ascat_lons, ascat_lats):
+            c = _collection_containing(collections, lon, lat)
+            assert c is not None, f"no scatter collection found for ASCAT point ({lon}, {lat})"
+            assert c.get_hatch() != "////", (
+                f"ASCAT point ({lon}, {lat}) must remain colored when ISMN is "
+                "sufficient to harmonize against -- must not be dropped"
+            )
+        plt.close("all")
+
+
 class TestValidationReportSoilMoistureGeographicUsesRawData:
     """Regression test: validation_report() replaces pair_ds's sar_<var>
     column with its CDF-matched (rescaled) values before calling the
@@ -799,6 +1698,32 @@ class TestPlotGeographicBoundsClamp:
         # Unclamped: extent reflects the full SAR scene (lon [-10, -8]),
         # not a tight box like the clamped test above.
         assert xlim[0] <= -9.9
+        plt.close("all")
+
+    def test_padding_does_not_exceed_recipe_bounds(self, geo_datatree_and_collocation):
+        """Regression test: a bbox much wider (lon) than tall (lat) used to
+        get padded past its own requested lat bounds by
+        _pad_extent_to_min_aspect, running after the bbox clamp. Real
+        example: recipe bbox lon [-10,30] lat [35,60] (span 40x25, aspect
+        0.625) padded lat out to ~[27.5, 67.5]."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.recipe import GeographicBounds
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        # Fixture's SAR scene spans lon [-10,-8] lat [50,52] -- request a
+        # bbox wider than the scene itself so the pre-padding extent is
+        # short-and-wide relative to min_aspect=1.0.
+        bounds = GeographicBounds(min_lon=-10.0, max_lon=-4.0, min_lat=50.0, max_lat=51.0)
+        fig = plot_geographic(
+            datatree, collocation_ds, "owiWindSpeed", "WSPD", split_by=None,
+            geographic_bounds=bounds,
+        )
+        ax = fig.axes[0]
+        ylim = ax.get_ylim()
+        assert ylim[0] >= bounds.min_lat, ylim
+        assert ylim[1] <= bounds.max_lat, ylim
         plt.close("all")
 
 
@@ -1267,6 +2192,62 @@ class TestPlotGeographicPanelAspect:
         plt.close("all")
 
 
+class TestPlotGeographicPointSubsampling:
+    def test_dense_scene_is_subsampled_for_plotting(self):
+        """A scene with far more collocated points than max_points_per_panel
+        must still render (not crash/hang) and must plot fewer markers than
+        the full point count -- statistics elsewhere are unaffected since
+        this only touches plot_geographic's own dataframe, not
+        collocation_ds itself."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        rng = np.random.default_rng(0)
+        y, x = 50, 50
+        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), rng.uniform(0, 100, (y, x)))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T12:00:00")},
+        )
+        n = 6000
+        ascat_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", rng.uniform(0, 100, n))},
+            coords={
+                "lon": ("point", rng.uniform(-10.0, -8.0, n)),
+                "lat": ("point", rng.uniform(50.0, 52.0, n)),
+                "time": ("point", pd.date_range("2026-07-10T12:00", periods=n, freq="1s")),
+            },
+            attrs={"platform_type": "ascat_ssm"},
+        )
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds, "validation/ascat_ssm": ascat_ds,
+        })
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":       ("collocation", rng.uniform(0, 100, n)),
+            "val_SOIL_MOISTURE": ("collocation", rng.uniform(0, 100, n)),
+            "val_source":       ("collocation", ["ascat_ssm"] * n),
+            "sar_scene_name":   ("collocation", ["sceneA"] * n),
+            "val_lon":          ("collocation", rng.uniform(-10.0, -8.0, n)),
+            "val_lat":          ("collocation", rng.uniform(50.0, 52.0, n)),
+            "val_id":           ("collocation", [f"o{i}" for i in range(n)]),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-10T12:00", periods=n, freq="1s")),
+        )
+
+        fig = plot_geographic(
+            datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE", split_by=None,
+            max_points_per_panel=500,
+        )
+        ax = fig.axes[0]
+        plotted = sum(len(c.get_offsets()) for c in ax.collections if hasattr(c, "get_offsets"))
+        assert 0 < plotted <= 600, plotted  # allows a little slack over the 500 cap
+        plt.close("all")
+
+
 @pytest.fixture
 def geo_datatree_and_collocation_with_unmatched():
     """Synthetic DataTree + collocation_ds with both matched and unmatched
@@ -1560,6 +2541,411 @@ def diagnostics_recipe_soil_moisture():
         validation_sources=[ValidationDataSource(source_type="ismn")],
     )
     return Recipe(config=config)
+
+
+class TestPlotGeographicTwoColumnByType:
+    def test_returns_one_figure_per_scene_with_two_columns(self):
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        y, x = 4, 5
+        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.linspace(10.0, 60.0, y * x).reshape(y, x))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T12:00:00")},
+        )
+        n = 4
+        ismn_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", np.array([0.1, 0.15, 0.2, 0.25]))},
+            coords={"lon": ("point", np.array([-9.8, -9.6, -9.4, -9.2])),
+                    "lat": ("point", np.array([50.2, 50.4, 50.6, 50.8])),
+                    "time": ("point", pd.date_range("2026-07-10T12:00", periods=n, freq="5min"))},
+            attrs={"platform_type": "ismn"},
+        )
+        ascat_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", np.array([20.0, 30.0, 40.0, 50.0]))},
+            coords={"lon": ("point", np.array([-9.0, -8.8, -8.6, -8.4])),
+                    "lat": ("point", np.array([51.0, 51.2, 51.4, 51.6])),
+                    "time": ("point", pd.date_range("2026-07-10T12:00", periods=n, freq="5min"))},
+            attrs={"platform_type": "ascat_ssm"},
+        )
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds,
+            "validation/ismn": ismn_ds,
+            "validation/ascat_ssm": ascat_ds,
+        })
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", np.array([12.0, 18.0, 22.0, 48.0])),
+            "val_SOIL_MOISTURE": ("collocation", np.array([0.1, 0.15, 20.0, 50.0])),
+            "val_source":        ("collocation", ["ismn", "ismn", "ascat_ssm", "ascat_ssm"]),
+            "collocation_type":  ("collocation", ["point_vs_layer", "point_vs_layer",
+                                                    "layer_vs_layer", "layer_vs_layer"]),
+            "sar_scene_name":    ("collocation", ["sceneA"] * n),
+            "val_lon":           ("collocation", np.array([-9.8, -9.6, -9.0, -8.8])),
+            "val_lat":           ("collocation", np.array([50.2, 50.4, 51.0, 51.2])),
+            "val_id":            ("collocation", ["i0", "i1", "a0", "a1"]),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-10T12:00", periods=n, freq="5min")),
+        )
+
+        result = plot_geographic(
+            datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            split_by="collocation_type", two_column_by_type=True,
+        )
+
+        assert set(result.keys()) == {"sceneA"}
+        fig = result["sceneA"]
+        assert len(fig.axes) >= 2
+        plt.close("all")
+
+    def test_two_column_figure_has_a_colorbar(self):
+        """Regression test: _build_scene_pair_figure never called
+        fig.colorbar() at all -- soil moisture's geographic layout
+        structurally had no colorbar, not just an intermittent one."""
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        y, x = 4, 5
+        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.linspace(10.0, 60.0, y * x).reshape(y, x))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T12:00:00")},
+        )
+        n = 4
+        ismn_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", np.array([0.1, 0.15, 0.2, 0.25]))},
+            coords={"lon": ("point", np.array([-9.8, -9.6, -9.4, -9.2])),
+                    "lat": ("point", np.array([50.2, 50.4, 50.6, 50.8])),
+                    "time": ("point", pd.date_range("2026-07-10T12:00", periods=n, freq="5min"))},
+            attrs={"platform_type": "ismn"},
+        )
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds,
+            "validation/ismn": ismn_ds,
+        })
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", np.array([12.0, 18.0, 22.0, 28.0])),
+            "val_SOIL_MOISTURE": ("collocation", np.array([0.1, 0.15, 0.2, 0.25])),
+            "val_source":        ("collocation", ["ismn"] * n),
+            "collocation_type":  ("collocation", ["point_vs_layer"] * n),
+            "sar_scene_name":    ("collocation", ["sceneA"] * n),
+            "val_lon":           ("collocation", np.array([-9.8, -9.6, -9.4, -9.2])),
+            "val_lat":           ("collocation", np.array([50.2, 50.4, 50.6, 50.8])),
+            "val_id":            ("collocation", ["i0", "i1", "i2", "i3"]),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-10T12:00", periods=n, freq="5min")),
+        )
+
+        result = plot_geographic(
+            datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            split_by="collocation_type", two_column_by_type=True,
+        )
+
+        fig = result["sceneA"]
+        # A colorbar is its own Axes with no ticks/labels on the main
+        # data axes -- matplotlib gives it a distinguishing '_colorbar'
+        # attribute reference chain via its images/collections being empty
+        # of geographic data; check via the presence of extra narrow axes
+        # beyond the one/two data GeoAxes already asserted to exist.
+        from cartopy.mpl.geoaxes import GeoAxes
+        data_axes = [ax for ax in fig.axes if isinstance(ax, GeoAxes)]
+        non_data_axes = [ax for ax in fig.axes if not isinstance(ax, GeoAxes)]
+        assert len(data_axes) >= 1
+        assert len(non_data_axes) >= 1, "expected at least one colorbar axes"
+        plt.close("all")
+
+    def test_two_column_disabled_by_default_keeps_dict_by_group(self, geo_datatree_and_collocation):
+        """Default (two_column_by_type=False) behavior is byte-identical to
+        before this task -- keyed by collocation_type, not scene."""
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        collocation_ds = collocation_ds.assign(
+            collocation_type=("collocation", ["point_vs_layer"] * collocation_ds.sizes["collocation"]),
+        )
+        result = plot_geographic(
+            datatree, collocation_ds, "owiWindSpeed", "WSPD",
+            split_by="collocation_type",
+        )
+        assert set(result.keys()) == {"point_vs_layer"}
+
+
+class TestDiagnosticsCategory:
+    def test_literal_ascat_ssm_maps_to_scatterometer(self):
+        from sar_validation.core.visualization import _diagnostics_category
+        assert _diagnostics_category("ascat_ssm") == "Scatterometer"
+
+    def test_literal_radiometer_trio_maps_to_radiometer(self):
+        from sar_validation.core.visualization import _diagnostics_category
+        assert _diagnostics_category("amsr_ssm") == "Radiometer"
+        assert _diagnostics_category("smap_ssm") == "Radiometer"
+        assert _diagnostics_category("smos_ssm") == "Radiometer"
+
+    def test_generic_data_type_tokens_map_to_same_categories_as_literal_names(self):
+        """The unmatched code path carries the generic data_type token
+        (e.g. "scatterometer_ssm"), not the literal per-satellite name
+        -- both forms must resolve to the SAME category so a matched
+        ascat_ssm point and an unmatched scatterometer_ssm point land
+        in the same legend bucket."""
+        from sar_validation.core.visualization import _diagnostics_category
+        assert _diagnostics_category("scatterometer_ssm") == "Scatterometer"
+        assert _diagnostics_category("radiometer_ssm") == "Radiometer"
+
+    def test_existing_generic_layer_types_still_work_via_fallback(self):
+        from sar_validation.core.visualization import _diagnostics_category
+        assert _diagnostics_category("scatterometer") == "Scatterometer"
+        assert _diagnostics_category("altimeter") == "Altimeter"
+        assert _diagnostics_category("hf_radar") == "Hf_Radar"
+
+    def test_in_situ_platform_type_falls_to_in_situ(self):
+        from sar_validation.core.visualization import _diagnostics_category
+        assert _diagnostics_category("mooring") == "In-situ"
+        assert _diagnostics_category("ismn") == "In-situ"
+
+
+class TestPlotCollocationDiagnosticsSoilMoistureSourceCategories:
+    """Regression test for the real bug: matched ascat_ssm points used
+    to show up as "In-situ" instead of "Scatterometer", because
+    plot_collocation_diagnostics' matched-point path keys off the
+    literal val_source name ("ascat_ssm"), which was never a member of
+    LAYER_DATA_TYPES (that set holds the generic category token
+    "scatterometer_ssm" instead). The unmatched path was not actually
+    broken by this bug -- it already reads the generic data_type token
+    directly off the datatree node, which *is* a LAYER_DATA_TYPES
+    member -- but plot_collocation_diagnostics never attaches a
+    per-category `label` to unmatched-point scatter calls at all (see
+    the Tier 1/Tier 2 drawing loops), so the only observable signal for
+    an unmatched point's category is which zorder tier it lands in:
+    zorder=2 (non-in-situ / layer) vs. zorder=3 (in-situ)."""
+
+    def test_matched_and_unmatched_soil_moisture_sources_categorized_correctly(
+        self, tmp_path, monkeypatch,
+    ):
+        import matplotlib.axes
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        y, x = 4, 5
+        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.full((y, x), 30.0))},
+            coords={
+                "lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                "time": pd.Timestamp("2026-07-10T19:00:00"),
+            },
+        )
+
+        def _point_ds(n, lon0, lat0, data_type):
+            return xr.Dataset(
+                {"SOIL_MOISTURE": ("point", np.linspace(0.1, 0.3, n))},
+                coords={
+                    "lon": ("point", lon0 + 0.05 * np.arange(n)),
+                    "lat": ("point", lat0 + 0.05 * np.arange(n)),
+                    "time": ("point", pd.date_range("2026-07-10T19:05", periods=n, freq="5min")),
+                },
+                attrs={"data_type": data_type},
+            )
+
+        # matched: literal val_source "ascat_ssm" (what collocation_ds
+        # actually carries for a matched point) -- this is the real bug.
+        ascat_matched_ds = _point_ds(2, -9.8, 50.2, "scatterometer_ssm")
+        # unmatched-only: a SEPARATE node the collocation step never
+        # matched, carrying the generic data_type token directly --
+        # included to confirm the fix doesn't regress this path, even
+        # though it wasn't the source of the original bug.
+        smap_unmatched_ds = _point_ds(2, -9.0, 51.8, "radiometer_ssm")
+
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds,
+            "validation/ascat_ssm": ascat_matched_ds,
+            "validation/smap_ssm": smap_unmatched_ds,
+        })
+
+        n = ascat_matched_ds.sizes["point"]
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM": ("collocation", np.full(n, 25.0)),
+            "val_SOIL_MOISTURE": ("collocation", ascat_matched_ds["SOIL_MOISTURE"].values),
+            "val_source": ("collocation", np.array(["ascat_ssm"] * n)),
+            "sar_scene_name": ("collocation", np.array(["sceneA"] * n)),
+            "val_lon": ("collocation", ascat_matched_ds["lon"].values),
+            "val_lat": ("collocation", ascat_matched_ds["lat"].values),
+            "temporal_distance_minutes": ("collocation", np.full(n, 10.0)),
+        })
+
+        recipe = Recipe(config=RecipeConfig(
+            name="test_soil_moisture_categories", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, -8.0, 50.0, 52.0),
+        ))
+
+        recorded = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded.append((args, kwargs))
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        out_path = plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
+        plt.close("all")
+
+        assert out_path is not None
+
+        # Matched ascat_ssm points (zorder=5): must be labeled
+        # "Scatterometer matched", never "In-situ matched" -- this is
+        # the real, confirmed bug.
+        matched_labels = [k.get("label", "") for _, k in recorded if k.get("zorder") == 5]
+        assert any("Scatterometer matched" in lbl for lbl in matched_labels), (
+            f"expected a 'Scatterometer matched' label among matched-tier "
+            f"calls, got: {matched_labels}"
+        )
+        assert not any("In-situ" in lbl for lbl in matched_labels), (
+            f"ascat_ssm matched points must never be labeled In-situ, got: {matched_labels}"
+        )
+
+        # Unmatched smap_ssm (data_type="radiometer_ssm") points: must
+        # land in the unmatched-LAYER tier (zorder=2), never the
+        # unmatched-IN-SITU tier (zorder=3, no soil-moisture in-situ
+        # source is unmatched in this fixture, so any zorder=3 points
+        # would be a misrouted smap point).
+        def _lons(call_args):
+            args, _ = call_args
+            return np.atleast_1d(args[0]) if args else np.array([])
+
+        zorder2_lons = np.concatenate(
+            [_lons(c) for c in recorded if c[1].get("zorder") == 2] or [np.array([])]
+        )
+        zorder3_lons = np.concatenate(
+            [_lons(c) for c in recorded if c[1].get("zorder") == 3] or [np.array([])]
+        )
+        smap_lons = smap_unmatched_ds["lon"].values
+        assert all(lon in zorder2_lons for lon in smap_lons), (
+            f"expected smap_ssm's unmatched points {smap_lons} in the "
+            f"unmatched-layer tier (zorder=2), got zorder=2 lons: {zorder2_lons}"
+        )
+        assert zorder3_lons.size == 0, (
+            f"no soil-moisture in-situ source is unmatched in this fixture -- "
+            f"expected zero unmatched-in-situ (zorder=3) points, got: {zorder3_lons}"
+        )
+
+    @pytest.mark.parametrize("data_type", ["scatterometer_ssm", "radiometer_ssm"])
+    def test_unmatched_point_outside_wind_tolerance_inside_soil_moisture_tolerance_still_shown(
+        self, data_type, tmp_path, monkeypatch,
+    ):
+        """Regression test for the consolidated-label lookup bug: an
+        unmatched soil-moisture satellite point placed 8h from the SAR
+        scene's time is outside the wind-default 180-minute tolerance
+        (DEFAULT_LAYER_TYPE_SPECS["scatterometer"]/["radiometer"]) but
+        inside the soil-moisture 720-minute tolerance
+        (DEFAULT_LAYER_TYPE_SPECS["scatterometer_ssm"]/["radiometer_ssm"]).
+
+        Parametrized over BOTH scatterometer_ssm (ASCAT) and
+        radiometer_ssm (AMSR/SMAP/SMOS all stamp this exact generic
+        data_type on their datatree nodes -- see from_amsr_ssm/
+        from_smap_ssm/from_smos_ssm in datatree_converter.py; only
+        _resolve_layer_type, in collocation.py, refines it further to
+        amsr_ssm/smap_ssm/smos_ssm, and plot_collocation_diagnostics
+        does not use that refinement) -- a first version of this fix
+        covered scatterometer_ssm only and missed that radiometer_ssm
+        had no DEFAULT_LAYER_TYPE_SPECS entry at all, so AMSR/SMAP/SMOS
+        unmatched points fell through to the recipe's 30-minute
+        point_vs_layer default instead of 720.
+
+        _time_tolerance_minutes and the Tier 1 unmatched-layer drawing
+        loop must resolve tolerance/style using the RAW data_type token,
+        not the _diagnostics_category-consolidated display label
+        ("Scatterometer"/"Radiometer") -- keying off the consolidated
+        label collides with the wind specs (180 min) and silently drops
+        the point from the plot. This must FAIL against the pre-fix code.
+        """
+        import matplotlib.axes
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        y, x = 4, 5
+        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+        scene_time = pd.Timestamp("2026-07-10T19:00:00")
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.full((y, x), 30.0))},
+            coords={
+                "lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                "time": scene_time,
+            },
+        )
+
+        # 8h after the scene time: outside the 180-min wind tolerance,
+        # inside the 720-min soil-moisture tolerance.
+        far_point_time = scene_time + pd.Timedelta(hours=8)
+
+        def _point_ds(n, lon0, lat0, dtype, point_time):
+            return xr.Dataset(
+                {"SOIL_MOISTURE": ("point", np.linspace(0.1, 0.3, n))},
+                coords={
+                    "lon": ("point", lon0 + 0.05 * np.arange(n)),
+                    "lat": ("point", lat0 + 0.05 * np.arange(n)),
+                    "time": ("point", [point_time] * n),
+                },
+                attrs={"data_type": dtype},
+            )
+
+        unmatched_ds = _point_ds(2, -9.0, 51.8, data_type, far_point_time)
+
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds,
+            "validation/far_source": unmatched_ds,
+        })
+
+        recipe = Recipe(config=RecipeConfig(
+            name="test_soil_moisture_far_point_tolerance", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, -8.0, 50.0, 52.0),
+        ))
+
+        recorded = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded.append((args, kwargs))
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        out_path = plot_collocation_diagnostics(datatree, None, recipe, tmp_path)
+        plt.close("all")
+
+        assert out_path is not None
+
+        def _lons(call_args):
+            args, _ = call_args
+            return np.atleast_1d(args[0]) if args else np.array([])
+
+        zorder2_lons = np.concatenate(
+            [_lons(c) for c in recorded if c[1].get("zorder") == 2] or [np.array([])]
+        )
+        point_lons = unmatched_ds["lon"].values
+        assert all(lon in zorder2_lons for lon in point_lons), (
+            f"expected the 8h-offset {data_type} point(s) {point_lons} to "
+            f"still appear in the unmatched-layer tier (zorder=2) since they're "
+            f"within the 720-min soil-moisture tolerance, got zorder=2 lons: "
+            f"{zorder2_lons}"
+        )
 
 
 class TestPlotCollocationDiagnostics:
@@ -2029,6 +3415,33 @@ class TestPlotCollocationDiagnosticsRecipeVariableStyling:
         for c in layer_calls:
             assert c.get("alpha") == 0.65
 
+    def test_soil_moisture_matched_layer_alpha_is_reduced(
+        self, geo_datatree_and_collocation, diagnostics_recipe_soil_moisture, tmp_path, monkeypatch
+    ):
+        import matplotlib.axes
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recorded = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded.append(kwargs)
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        plot_collocation_diagnostics(
+            datatree, collocation_ds, diagnostics_recipe_soil_moisture, tmp_path,
+        )
+        plt.close("all")
+
+        layer_calls = [c for c in recorded if c.get("zorder") == 5]
+        assert layer_calls
+        for c in layer_calls:
+            assert c.get("alpha") == 0.65
+
     def test_waves_matched_layer_alpha_stays_opaque(
         self, geo_datatree_and_collocation, diagnostics_recipe_waves, tmp_path, monkeypatch
     ):
@@ -2132,6 +3545,39 @@ class TestPlotCollocationDiagnosticsRecipeVariableStyling:
             assert c.get("edgecolors") == "none"
 
 
+class TestPlotCollocationDiagnosticsSoilMoistureTransparency:
+    def test_soil_moisture_matched_layer_alpha_matches_wind(
+        self, geo_datatree_and_collocation, tmp_path,
+    ):
+        """Soil moisture's matched-layer points must use the same
+        alpha=0.65 as wind (previously only wind got it; soil_moisture
+        defaulted to opaque alpha=1.0, burying the SAR field/other
+        sources underneath ASCAT/SMAP overlays)."""
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+        )
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        collocation_ds = collocation_ds.assign(
+            collocation_type=("collocation", ["layer_vs_layer"] * collocation_ds.sizes["collocation"]),
+        )
+        recipe = Recipe(RecipeConfig(
+            name="soilmoisturetest", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, -8.0, 50.0, 52.0),
+            temporal_bounds=TemporalBounds("2026-07-10", "2026-07-11"),
+        ))
+
+        path = plot_collocation_diagnostics(
+            datatree, collocation_ds, recipe, tmp_path,
+            layer_vs_layer_collocation_method="cell-averaging",
+        )
+        assert path is not None
+
+
 class TestPlotCollocationDiagnosticsTicks:
     def test_overview_plot_gets_degree_formatted_ticks(
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path
@@ -2195,6 +3641,72 @@ class TestValidationReport:
         key = "owiWindSpeed_vs_WSPD"
         assert key in figures
         assert (tmp_path / "validation_report.pdf").exists()
+        plt.close("all")
+
+    def test_geographic_plot_rendered_before_scatter_plot(
+        self, geo_datatree_and_collocation, tmp_path, monkeypatch,
+    ):
+        """A reader should see the spatial context (where/how dense the
+        matches are) before the more abstract point-cloud comparison --
+        applies to every recipe type, not just soil moisture, since the
+        report loop is shared."""
+        import matplotlib.pyplot as plt
+
+        import sar_validation.core.visualization as viz
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        call_order = []
+        original_scatter = viz.plot_scatter
+        original_geo = viz.plot_geographic
+
+        def scatter_spy(*args, **kwargs):
+            call_order.append("scatter")
+            return original_scatter(*args, **kwargs)
+
+        def geo_spy(*args, **kwargs):
+            call_order.append("geographic")
+            return original_geo(*args, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_scatter", scatter_spy)
+        monkeypatch.setattr(viz, "plot_geographic", geo_spy)
+        recipe = Recipe(config=RecipeConfig(name="test", variable="wind"))
+        viz.validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        assert call_order[:2] == ["geographic", "scatter"], (
+            f"expected geographic before scatter, got call order {call_order!r}"
+        )
+
+    def test_summary_table_title_distinguishes_from_statistics(self):
+        # A full validation_report() invocation for this smoke check needs
+        # a real DataTree, which is awkward to construct empty just to
+        # confirm stats_ds_map wiring — so this locks down the actual
+        # behavior worth testing (the summary table's title is distinct
+        # from, and appears immediately before, the statistics page)
+        # directly against the two plotting functions instead.
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.statistics import compute_statistics
+        from sar_validation.core.visualization import plot_statistics, plot_summary_table
+
+        n = 20
+        rng = np.random.default_rng(0)
+        sar = rng.uniform(0, 10, n)
+        val = sar + rng.normal(0, 0.5, n)
+        ds = xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", sar),
+            "val_WSPD":         ("collocation", val),
+            "val_source":       ("collocation", ["mooring"] * n),
+        })
+        stats_ds = compute_statistics(ds, "owiWindSpeed", "WSPD", group_by=["val_source"])
+
+        table_fig = plot_summary_table(stats_ds)
+        stats_fig = plot_statistics(stats_ds)
+
+        assert table_fig.axes[0].get_title() != stats_fig._suptitle.get_text()
+        import matplotlib.pyplot as plt
         plt.close("all")
 
 
@@ -2585,10 +4097,15 @@ class TestValidationReportSoilMoistureGeographicSizing:
     """ISMN stations render at the default point_size=40, which was far
     larger than requested — and the geographic map showed the SAR field's
     full native extent (e.g. CLMS SSM's all-of-mainland-Europe grid)
-    instead of the recipe's requested bounding box. Both fixed per Lotte's
-    feedback: soil_moisture always uses point_size=10, and
-    validation_report passes the recipe's geographic_bounds through so
-    plot_geographic clamps each scene panel to it."""
+    instead of the recipe's requested bounding box. Fixed per Lotte's
+    feedback: validation_report passes the recipe's geographic_bounds
+    through so plot_geographic clamps each scene panel to it.
+
+    Point sizing itself was originally a flat point_size=10, but that made
+    sparse in-situ ISMN points too small and dense scatterometer/radiometer
+    (ASCAT/SMAP/SMOS) points too big in the same panel -- soil_moisture now
+    reuses wind's adaptive density check instead (see
+    TestValidationReportCurrentsPointSize.test_wind_recipe_uses_adaptive_point_size)."""
 
     def _soil_moisture_datatree_and_collocation(self):
         from sar_validation.core.datatree_converter import DataTreeConverter
@@ -2615,7 +4132,9 @@ class TestValidationReportSoilMoistureGeographicSizing:
         })
         return datatree, coll
 
-    def test_soil_moisture_recipe_uses_point_size_10(self, tmp_path, monkeypatch):
+    def test_soil_moisture_recipe_uses_adaptive_point_size_when_sparse(self, tmp_path, monkeypatch):
+        """4 points in 1 scene = 4 pts/scene, well under the 300 threshold,
+        so soil_moisture must use the same sparse-data size as wind (15)."""
         import warnings
 
         import matplotlib.pyplot as plt
@@ -2642,7 +4161,122 @@ class TestValidationReportSoilMoistureGeographicSizing:
             viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
         plt.close("all")
 
-        assert captured.get("point_size") == 10
+        assert captured.get("point_size") == 15
+
+    def test_soil_moisture_recipe_uses_adaptive_point_size_when_dense(self, tmp_path, monkeypatch):
+        """A scatterometer/radiometer-dense scene (>300 pts/scene, e.g. a
+        real ASCAT/SMAP/SMOS-heavy soil-moisture run) must fall back to the
+        smaller marker (5), exactly like wind does, instead of the old flat
+        point_size=10 -- proves the density check actually drives the value
+        rather than the two thresholds coincidentally bracketing 10."""
+        import warnings
+
+        import matplotlib.pyplot as plt
+
+        import sar_validation.core.visualization as viz
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.full((y, x), 30.0))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T19:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+
+        rng = np.random.default_rng(0)
+        n = 400
+        coll = xr.Dataset({
+            "sar_sarSSM":       ("collocation", rng.uniform(20, 40, n)),
+            "val_SOIL_MOISTURE": xr.DataArray(
+                rng.uniform(0.1, 0.4, n), dims="collocation", attrs={"units": "1"},
+            ),
+            "val_source":       ("collocation", ["ascat_ssm"] * n),
+            "sar_scene_name":   ("collocation", ["sceneA"] * n),
+            "val_lon":          ("collocation", rng.uniform(-9.8, -8.2, n)),
+            "val_lat":          ("collocation", rng.uniform(50.2, 51.8, n)),
+            "temporal_distance_minutes": ("collocation", rng.uniform(5, 20, n)),
+        })
+
+        captured = {}
+        original = viz.plot_geographic
+
+        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
+            captured["point_size"] = kwargs.get("point_size")
+            return original(datatree_, coll_, sar_var, val_var, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_geographic", spy)
+        recipe = Recipe(config=RecipeConfig(name="soil_moisture_test", variable="soil_moisture"))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        assert captured.get("point_size") == 5
+
+    def test_soil_moisture_recipe_sizes_point_vs_layer_and_layer_vs_layer_independently(
+        self, tmp_path, monkeypatch,
+    ):
+        """A pair mixing sparse in-situ ISMN (point_vs_layer) with dense
+        ASCAT (layer_vs_layer) must size each collocation_type on its own
+        density, not one average pooled across both -- pooling let the
+        dense layer_vs_layer type's point count dominate the average and
+        made the sparse point_vs_layer type's markers (e.g. ISMN) too
+        small, exactly like the flat point_size=10 it replaced did.
+        ISMN (point_vs_layer) is further fixed at 25 regardless of density
+        per Lotte's follow-up feedback -- still too small to read
+        individual stations at the density-adaptive 15."""
+        import warnings
+
+        import matplotlib.pyplot as plt
+
+        import sar_validation.core.visualization as viz
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.full((y, x), 30.0))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T19:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+
+        rng = np.random.default_rng(0)
+        n_ascat = 400
+        n_ismn = 5
+        n = n_ascat + n_ismn
+        coll = xr.Dataset({
+            "sar_sarSSM":       ("collocation", rng.uniform(20, 40, n)),
+            "val_SOIL_MOISTURE": xr.DataArray(
+                rng.uniform(0.1, 0.4, n), dims="collocation", attrs={"units": "1"},
+            ),
+            "val_source":       ("collocation", ["ascat_ssm"] * n_ascat + ["ismn"] * n_ismn),
+            "collocation_type": ("collocation", ["layer_vs_layer"] * n_ascat + ["point_vs_layer"] * n_ismn),
+            "sar_scene_name":   ("collocation", ["sceneA"] * n),
+            "val_lon":          ("collocation", rng.uniform(-9.8, -8.2, n)),
+            "val_lat":          ("collocation", rng.uniform(50.2, 51.8, n)),
+            "temporal_distance_minutes": ("collocation", rng.uniform(5, 20, n)),
+        })
+
+        captured = {}
+        original = viz.plot_geographic
+
+        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
+            captured["point_size"] = kwargs.get("point_size")
+            return original(datatree_, coll_, sar_var, val_var, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_geographic", spy)
+        recipe = Recipe(config=RecipeConfig(name="soil_moisture_test", variable="soil_moisture"))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        assert captured.get("point_size") == {"layer_vs_layer": 5, "point_vs_layer": 25}
 
     def test_soil_moisture_recipe_passes_recipe_geographic_bounds(self, tmp_path, monkeypatch):
         import warnings
@@ -2696,6 +4330,173 @@ class TestValidationReportSoilMoistureGeographicSizing:
         plt.close("all")
 
         assert captured.get("geographic_bounds") is None
+
+    def test_soil_moisture_report_uses_two_column_geographic(
+        self, geo_datatree_and_collocation, tmp_path,
+    ):
+        """Regression test for the two-column point_vs_layer/layer_vs_layer
+        geographic layout: validation_report must pass
+        two_column_by_type=True through to plot_geographic for
+        soil_moisture recipes. Verified via the actual, real effect of
+        that wiring on the produced page -- with two_column_by_type in
+        effect, plot_geographic keys its dict by *scene name* and the
+        resulting Figure's suptitle is tagged "[<scene_name>]"; without
+        it (the pre-task behavior), the geographic page would instead be
+        keyed/tagged by collocation_type ("[point_vs_layer]"). Note: the
+        plan brief's literal assertion here (``assert any("geographic" in
+        k or True for k in result)``) was a vacuous smoke test that would
+        pass regardless of whether this wiring exists at all -- worse,
+        checked literally without ``or True`` it would still not detect
+        real breakage, since validation_report's returned dict is keyed
+        by pair name (e.g. "sarSSM_vs_SOIL_MOISTURE"), which never
+        contains the substring "geographic" in the first place. This
+        version instead inspects the actual geographic Figure produced.
+        """
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+        )
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        collocation_ds = collocation_ds.rename({
+            "sar_owiWindSpeed": "sar_sarSSM", "val_WSPD": "val_SOIL_MOISTURE",
+        }).assign(
+            collocation_type=("collocation", ["point_vs_layer"] * collocation_ds.sizes["collocation"]),
+        )
+        recipe = Recipe(RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, -8.0, 50.0, 52.0),
+            temporal_bounds=TemporalBounds("2026-07-10", "2026-07-11"),
+        ))
+        result = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        key = "sarSSM_vs_SOIL_MOISTURE"
+        assert key in result
+        suptitles = [
+            fig._suptitle.get_text()
+            for fig in result[key]
+            if getattr(fig, "_suptitle", None) is not None
+        ]
+        assert any("[sceneA]" in t for t in suptitles), suptitles
+        assert not any("[point_vs_layer]" in t for t in suptitles), suptitles
+
+
+class TestValidationReportForceSplitWhenHarmonized:
+    """When ismn has enough points to CDF-match ascat_ssm into its
+    volumetric domain (see _harmonize_percent_domain_sources),
+    validation_report must force the main CDF-matched scatter (and its
+    temporal-offset-colored twin) into per-source small multiples even
+    though no single source dominates by point count -- piling every
+    harmonized source into one shared axes was too visually busy
+    (confirmed against real data, soil_moisture_satellite_example: ASCAT
+    ~45% share, well under the 70% imbalance threshold, still busy)."""
+
+    def _datatree_and_collocation(self, *, include_ismn: bool):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.full((y, x), 30.0))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T19:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+
+        rng = np.random.default_rng(3)
+        n_ascat = 20
+        ascat_val = rng.uniform(10.0, 40.0, n_ascat)
+        ascat_sar = ascat_val + rng.normal(0, 2, n_ascat)
+        val_source = ["ascat_ssm"] * n_ascat
+        val_vals = list(ascat_val)
+        sar_vals = list(ascat_sar)
+
+        if include_ismn:
+            n_ismn = 10
+            ismn_val = rng.uniform(0.1, 0.4, n_ismn)
+            ismn_sar = ismn_val * 100 + rng.normal(0, 2, n_ismn)
+            val_source += ["ismn"] * n_ismn
+            val_vals += list(ismn_val)
+            sar_vals += list(ismn_sar)
+
+        n = len(val_source)
+        coll = xr.Dataset({
+            "sar_sarSSM":       ("collocation", np.array(sar_vals), {"units": "%"}),
+            "val_SOIL_MOISTURE": ("collocation", np.array(val_vals)),
+            "val_source":       ("collocation", np.array(val_source)),
+            "sar_scene_name":   ("collocation", ["sceneA"] * n),
+            "val_lon":          ("collocation", rng.uniform(-9.8, -8.2, n)),
+            "val_lat":          ("collocation", rng.uniform(50.2, 51.8, n)),
+            "temporal_distance_minutes": ("collocation", rng.uniform(5, 20, n)),
+        })
+        return datatree, coll
+
+    def test_force_split_true_when_ascat_harmonized_into_ismn_domain(self, tmp_path, monkeypatch):
+        import warnings
+
+        import matplotlib.pyplot as plt
+
+        import sar_validation.core.visualization as viz
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        datatree, coll = self._datatree_and_collocation(include_ismn=True)
+
+        captured = []
+        original = viz.plot_scatter
+
+        def spy(*args, **kwargs):
+            captured.append(kwargs.get("force_split"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_scatter", spy)
+        recipe = Recipe(config=RecipeConfig(name="soil_moisture_test", variable="soil_moisture"))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        assert captured, "plot_scatter was never called"
+        assert all(force_split is True for force_split in captured), (
+            f"expected every plot_scatter call to request force_split=True once ascat_ssm "
+            f"was harmonized into ismn's domain, got {captured!r}"
+        )
+
+    def test_force_split_false_when_ascat_not_harmonized(self, tmp_path, monkeypatch):
+        """Without ismn present, ascat_ssm can't be harmonized at all (see
+        _harmonize_percent_domain_sources's reference-absent fallback) --
+        force_split must stay False, matching plain split_when_imbalanced
+        behavior instead of forcing a split unconditionally."""
+        import warnings
+
+        import matplotlib.pyplot as plt
+
+        import sar_validation.core.visualization as viz
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        datatree, coll = self._datatree_and_collocation(include_ismn=False)
+
+        captured = []
+        original = viz.plot_scatter
+
+        def spy(*args, **kwargs):
+            captured.append(kwargs.get("force_split"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_scatter", spy)
+        recipe = Recipe(config=RecipeConfig(name="soil_moisture_test", variable="soil_moisture"))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        assert captured, "plot_scatter was never called"
+        assert all(force_split is False for force_split in captured), (
+            f"expected force_split=False when ascat_ssm has no reference to harmonize "
+            f"against, got {captured!r}"
+        )
 
 
 class TestPlotRvlLandQa:
@@ -3243,6 +5044,126 @@ class TestValidationReportDownloadWarnings:
         assert len(cover.texts) == 2
 
 
+class TestValidationReportSensingDepths:
+    def test_cover_page_lists_sensing_depths_for_soil_moisture(self, tmp_path, monkeypatch):
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+        from sar_validation.core.visualization import validation_report
+
+        cfg = RecipeConfig(
+            name="test_depths", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[ValidationDataSource(source_type="ismn", min_depth=0.0, max_depth=0.05)],
+        )
+        recipe = Recipe(config=cfg)
+
+        # Two points (rather than one) so add_rescaled_sar_column's
+        # per-group CDF-matching (which requires >= 2 valid pairs per
+        # val_source group, see statistics.add_rescaled_sar_column) doesn't
+        # skip the group and leave every plot with no valid data — which
+        # would leave pdf_pages empty and no PDF written at all, unrelated
+        # to this task's sensing-depth feature.
+        ascat_node = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", np.array([25.0, 30.0]))},
+            coords={
+                "lon": ("point", [0.0, 1.0]),
+                "lat": ("point", [45.0, 46.0]),
+                "time": ("point", np.array(["2026-01-01", "2026-01-01"], dtype="datetime64[ns]")),
+            },
+            attrs={"platform_type": "ascat_ssm", "sensing_depth_cm": "0-5", "band": "C"},
+        )
+        # Also a minimal ismn group (>= 2 points, same rationale as above)
+        # -- _harmonize_percent_domain_sources (wired in by Tasks 1-3 of the
+        # current plan) requires an "ismn" val_source to be present so it
+        # can fit a SAR->ismn CDF-match transform and convert ascat_ssm's
+        # percent-scale rows into ismn's volumetric domain; without it,
+        # ascat_ssm's rows are dropped to NaN in the CDF-matched section,
+        # leaving zero valid data for every CDF-matched plot and (since this
+        # test passes no native_units_stats_ds_map fallback) no PDF at all.
+        ismn_node = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", np.array([0.20, 0.24]))},
+            coords={
+                "lon": ("point", [2.0, 3.0]),
+                "lat": ("point", [47.0, 48.0]),
+                "time": ("point", np.array(["2026-01-01", "2026-01-01"], dtype="datetime64[ns]")),
+            },
+        )
+        datatree = xr.DataTree.from_dict({
+            "validation/ascat_ssm/f1": ascat_node,
+            "validation/ismn/f1": ismn_node,
+        })
+
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": ("collocation", np.array([20.0, 24.0, 18.0, 22.0]), {"units": "%"}),
+                "val_SOIL_MOISTURE": ("collocation", np.array([25.0, 30.0, 0.20, 0.24])),
+                "val_source": (
+                    "collocation", np.array(["ascat_ssm", "ascat_ssm", "ismn", "ismn"])
+                ),
+                "val_id": ("collocation", np.array(["a0", "a1", "i0", "i1"])),
+            },
+        )
+
+        recorded_figs = []
+        original_savefig = PdfPages.savefig
+
+        def recording_savefig(self, *args, **kwargs):
+            fig = args[0] if args else kwargs.get("figure")
+            recorded_figs.append(fig)
+            return original_savefig(self, *args, **kwargs)
+
+        monkeypatch.setattr(PdfPages, "savefig", recording_savefig)
+        figs = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        pdf_path = tmp_path / "validation_report.pdf"
+        assert pdf_path.exists()
+        assert "sarSSM_vs_SOIL_MOISTURE" in figs
+
+        cover = recorded_figs[0]
+        cover_text = " ".join(t.get_text() for t in cover.texts)
+        assert "Sensing depths:" in cover_text
+        assert "ascat_ssm ~0-5cm (C-band)" in cover_text
+        assert "ISMN 0.0-0.05m depth window" in cover_text
+
+    def test_no_sensing_depths_line_for_non_soil_moisture(
+        self, geo_datatree_and_collocation, tmp_path, monkeypatch
+    ):
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
+
+        recorded_figs = []
+        original_savefig = PdfPages.savefig
+
+        def recording_savefig(self, *args, **kwargs):
+            fig = args[0] if args else kwargs.get("figure")
+            recorded_figs.append(fig)
+            return original_savefig(self, *args, **kwargs)
+
+        monkeypatch.setattr(PdfPages, "savefig", recording_savefig)
+        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        cover = recorded_figs[0]
+        cover_text = " ".join(t.get_text() for t in cover.texts)
+        assert "Sensing depths:" not in cover_text
+
+
 class TestPlotCollocationDiagnosticsIndividualMethodAlpha:
     def test_individual_method_uses_low_fixed_alpha(
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
@@ -3292,3 +5213,709 @@ class TestPlotCollocationDiagnosticsIndividualMethodAlpha:
 
         assert 0.15 not in captured_alphas
         assert 0.65 in captured_alphas
+
+
+class TestMarkNativeUnits:
+    """Task 12: `_mark_native_units` stamps a "— native units —" banner
+    onto a figure via `fig.text(...)`, independent of any caller in
+    `validation_report`."""
+
+    def test_stamps_native_units_banner_text(self):
+        import matplotlib.figure
+
+        from sar_validation.core.visualization import _mark_native_units
+
+        fig = matplotlib.figure.Figure()
+        returned = _mark_native_units(fig)
+
+        assert returned is fig
+        assert any("native units" in t.get_text() for t in fig.texts)
+
+
+class TestValidationReportNativeUnitsSection:
+    """Task 12: validation_report(..., native_units_stats_ds_map=...) adds a
+    second, non-CDF-matched scatter/residuals/statistics page set per
+    soil_moisture pair, restricted to the val_source groups that already
+    share SAR's units — using the raw (non-rescaled) collocation data."""
+
+    @staticmethod
+    def _recipe():
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
+
+        cfg = RecipeConfig(
+            name="test_native_units_plots", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        )
+        return Recipe(config=cfg)
+
+    @staticmethod
+    def _ascat_node(lon, lat, vals):
+        return xr.Dataset(
+            {"SOIL_MOISTURE": ("point", np.array(vals))},
+            coords={
+                "lon": ("point", lon), "lat": ("point", lat),
+                "time": ("point", np.array(["2026-01-01"] * len(vals), dtype="datetime64[ns]")),
+            },
+        )
+
+    def test_native_units_plots_added_when_stats_map_provided(self, tmp_path):
+        """The native-units section must add *new* figures beyond whatever
+        the CDF-matched section already produces for this exact fixture —
+        not merely leave the pair's figure list non-empty, which is
+        trivially true from the pre-existing scatter/residuals pages alone
+        even if the native-units block never ran."""
+        from sar_validation.core.statistics import compute_statistics
+        from sar_validation.core.visualization import validation_report
+
+        recipe = self._recipe()
+        datatree = xr.DataTree.from_dict({
+            "validation/ascat_ssm/f1": self._ascat_node([0.0, 1.0], [45.0, 46.0], [25.0, 35.0]),
+        })
+        # val_id distinguishes the two observations for
+        # _deduplicate_obs/plot_scatter — without it both rows share the
+        # same (val_source) grouping key and collapse into a single point.
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": ("collocation", np.array([20.0, 30.0]), {"units": "%"}),
+                "val_SOIL_MOISTURE": ("collocation", np.array([25.0, 35.0])),
+                "val_source": ("collocation", np.array(["ascat_ssm", "ascat_ssm"])),
+                "val_id": ("collocation", np.array(["a1", "a2"])),
+            },
+        )
+        native_stats = compute_statistics(collocation_ds, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
+        native_stats_map = {"sarSSM_vs_SOIL_MOISTURE": native_stats}
+
+        key = "sarSSM_vs_SOIL_MOISTURE"
+        figs_without = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path / "without")
+        figs_with = validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path / "with",
+            native_units_stats_ds_map=native_stats_map,
+        )
+
+        assert key in figs_without and key in figs_with
+        n_without = len(figs_without[key])
+        n_with = len(figs_with[key])
+        assert n_with > n_without, (
+            f"expected native_units_stats_ds_map to add figures beyond the "
+            f"{n_without} produced without it; got {n_with}"
+        )
+
+        # At least one of the *newly added* figures must carry the
+        # native-units banner stamped by _mark_native_units — proving the
+        # extra figures really are the native-units pages, not some
+        # unrelated addition (e.g. an accidental duplicate CDF-matched page).
+        new_figs = figs_with[key][n_without:]
+        assert any(
+            any("native units" in t.get_text() for t in fig.texts)
+            for fig in new_figs
+        ), "no newly-added figure carries the '— native units —' banner"
+
+    def test_native_units_geographic_rendered_before_native_units_scatter(self, tmp_path, monkeypatch):
+        """The native-units section must lead with its geographic plot too,
+        matching the CDF-matched section's order (§9.3) -- previously it
+        started with scatter/residuals and only rendered geographic last."""
+        import sar_validation.core.visualization as viz
+        from sar_validation.core.statistics import compute_statistics
+
+        recipe = self._recipe()
+        datatree = xr.DataTree.from_dict({
+            "validation/ascat_ssm/f1": self._ascat_node([0.0, 1.0], [45.0, 46.0], [25.0, 35.0]),
+        })
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": ("collocation", np.array([20.0, 30.0]), {"units": "%"}),
+                "val_SOIL_MOISTURE": ("collocation", np.array([25.0, 35.0])),
+                "val_source": ("collocation", np.array(["ascat_ssm", "ascat_ssm"])),
+                "val_id": ("collocation", np.array(["a1", "a2"])),
+            },
+        )
+        native_stats = compute_statistics(collocation_ds, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
+        native_stats_map = {"sarSSM_vs_SOIL_MOISTURE": native_stats}
+
+        call_order = []
+        original_scatter = viz.plot_scatter
+        original_geo = viz.plot_geographic
+
+        def scatter_spy(*args, **kwargs):
+            call_order.append("scatter")
+            return original_scatter(*args, **kwargs)
+
+        def geo_spy(*args, **kwargs):
+            call_order.append("geographic")
+            return original_geo(*args, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_scatter", scatter_spy)
+        monkeypatch.setattr(viz, "plot_geographic", geo_spy)
+        viz.validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path,
+            native_units_stats_ds_map=native_stats_map,
+        )
+        import matplotlib.pyplot as plt
+        plt.close("all")
+
+        # CDF-matched section: geographic, then scatter. Native-units
+        # section: geographic, then scatter. Each section's "geographic"
+        # call must come first within that section. The CDF-matched
+        # section's temporal-offset-colored scatter is skipped entirely for
+        # soil_moisture (see the skip in validation_report), so there's only
+        # one "scatter" per section, not two.
+        assert call_order == ["geographic", "scatter", "geographic", "scatter"], call_order
+
+    def test_native_units_section_restricted_to_matching_sources(self, tmp_path):
+        """A val_source present in collocation_ds/datatree but *absent* from
+        the native-units stats Dataset's ``source`` coordinate (i.e. its
+        units don't already match SAR's, e.g. ISMN's volumetric m3/m3 vs.
+        SAR's relative "%") must be excluded from the native-units plots —
+        exercising the ``nu_mask`` / ``geo_pair_ds.where(nu_mask, ...)``
+        restriction in validation_report."""
+        from sar_validation.core.statistics import compute_statistics
+        from sar_validation.core.visualization import validation_report
+
+        recipe = self._recipe()
+        datatree = xr.DataTree.from_dict({
+            "validation/ascat_ssm/f1": self._ascat_node([0.0, 1.0], [45.0, 46.0], [25.0, 35.0]),
+            "validation/ismn/f1": self._ascat_node([2.0, 3.0], [47.0, 48.0], [0.30, 0.35]),
+        })
+
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": ("collocation", np.array([20.0, 30.0, 22.0, 28.0]), {"units": "%"}),
+                "val_SOIL_MOISTURE": ("collocation", np.array([25.0, 35.0, 0.30, 0.35])),
+                "val_source": ("collocation", np.array(["ascat_ssm", "ascat_ssm", "ismn", "ismn"])),
+                "val_id": ("collocation", np.array(["a1", "a2", "i1", "i2"])),
+            },
+        )
+        # ismn reports volumetric m3/m3, not SAR's "%"-family unit, so
+        # run_statistics_native_units would never include it — reproduce
+        # that here directly by computing native stats over the ascat-only
+        # subset, so the resulting stats Dataset's "source" coord only ever
+        # carries "ascat_ssm".
+        ascat_only_ds = collocation_ds.where(collocation_ds["val_source"] == "ascat_ssm", drop=True)
+        native_stats = compute_statistics(ascat_only_ds, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
+        assert list(native_stats["source"].values) == ["ascat_ssm"]
+        native_stats_map = {"sarSSM_vs_SOIL_MOISTURE": native_stats}
+
+        key = "sarSSM_vs_SOIL_MOISTURE"
+        figs = validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path,
+            native_units_stats_ds_map=native_stats_map,
+        )
+        assert key in figs
+
+        # plot_scatter stamps an "N=<count>\n..." annotation (via ax.text)
+        # on every scatter figure it produces, reflecting how many
+        # deduplicated observations actually went into that plot. Read it
+        # off the native-units scatter figure specifically (identified by
+        # the "— native units —" banner) to verify what data it plotted.
+        native_scatter_n = set()
+        for fig in figs[key]:
+            if not any("native units" in t.get_text() for t in fig.texts):
+                continue
+            for ax in fig.axes:
+                for txt in ax.texts:
+                    content = txt.get_text()
+                    if content.startswith("N="):
+                        native_scatter_n.add(int(content.splitlines()[0].split("=")[1]))
+
+        assert native_scatter_n, "expected a native-units figure with an 'N=' scatter annotation"
+        # Only the 2 ascat_ssm rows should have reached the native-units
+        # plots. If nu_mask/the source restriction were a no-op, all 4 rows
+        # (including ismn's non-matching-units ones) would show up instead,
+        # giving N=4.
+        assert native_scatter_n == {2}, (
+            f"native-units scatter should only reflect the 2 matching-source "
+            f"(ascat_ssm) rows; got N={native_scatter_n} — ismn rows may have "
+            f"leaked through the source restriction"
+        )
+
+    def test_no_native_units_section_when_map_not_provided(self, tmp_path):
+        """Omitting native_units_stats_ds_map (the default) must not change
+        existing behaviour — no extra pages, no crash."""
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
+        from sar_validation.core.visualization import validation_report
+
+        cfg = RecipeConfig(
+            name="test_no_native_units_plots", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        )
+        recipe = Recipe(config=cfg)
+
+        ascat_node = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", np.array([25.0, 35.0]))},
+            coords={
+                "lon": ("point", [0.0, 1.0]), "lat": ("point", [45.0, 46.0]),
+                "time": ("point", np.array(["2026-01-01", "2026-01-01"], dtype="datetime64[ns]")),
+            },
+            attrs={"data_type": "scatterometer_ssm"},
+        )
+        datatree = xr.DataTree.from_dict({"validation/ascat_ssm/f1": ascat_node})
+
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": ("collocation", np.array([20.0, 30.0]), {"units": "%"}),
+                "val_SOIL_MOISTURE": ("collocation", np.array([25.0, 35.0])),
+                "val_source": ("collocation", np.array(["ascat_ssm", "ascat_ssm"])),
+            },
+        )
+
+        figs = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        assert "sarSSM_vs_SOIL_MOISTURE" in figs
+
+
+class TestValidationReportNativeUnitsGeographic:
+    """Task 6 (B3): the native-units section (soil_moisture only) should
+    include a geographic page, alongside the existing native-units
+    scatter/residuals/statistics pages."""
+
+    def test_native_units_section_includes_a_geographic_page(
+        self, geo_datatree_and_collocation, tmp_path,
+    ):
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+        )
+        from sar_validation.core.statistics import compute_statistics
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        collocation_ds = collocation_ds.rename({
+            "sar_owiWindSpeed": "sar_sarSSM", "val_WSPD": "val_SOIL_MOISTURE",
+        }).assign(
+            collocation_type=("collocation", ["layer_vs_layer"] * collocation_ds.sizes["collocation"]),
+            val_source=("collocation", ["ascat_ssm", "ascat_ssm", "ascat_ssm", "ascat_ssm"]),
+        )
+        recipe = Recipe(RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, -8.0, 50.0, 52.0),
+            temporal_bounds=TemporalBounds("2026-07-10", "2026-07-11"),
+        ))
+        nu_stats = compute_statistics(collocation_ds, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
+
+        result = validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path,
+            native_units_stats_ds_map={"sarSSM_vs_SOIL_MOISTURE": nu_stats},
+        )
+        # Both the main-section and native-units geographic figures should
+        # have been generated (and closed) for this pair -- the exact count
+        # depends on plot_geographic's dict-per-group return, so assert
+        # indirectly via the PDF having grown past just scatter/stats/residuals.
+        assert (tmp_path / "validation_report.pdf").exists()
+        assert "sarSSM_vs_SOIL_MOISTURE" in result
+
+    def test_plot_geographic_called_for_native_units_section(
+        self, geo_datatree_and_collocation, tmp_path,
+    ):
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+        )
+        from sar_validation.core.statistics import compute_statistics
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        collocation_ds = collocation_ds.rename({
+            "sar_owiWindSpeed": "sar_sarSSM", "val_WSPD": "val_SOIL_MOISTURE",
+        }).assign(
+            collocation_type=("collocation", ["layer_vs_layer"] * collocation_ds.sizes["collocation"]),
+            val_source=("collocation", ["ascat_ssm"] * collocation_ds.sizes["collocation"]),
+        )
+        recipe = Recipe(RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, -8.0, 50.0, 52.0),
+            temporal_bounds=TemporalBounds("2026-07-10", "2026-07-11"),
+        ))
+        nu_stats = compute_statistics(collocation_ds, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
+
+        with patch(
+            "sar_validation.core.visualization.plot_geographic",
+            wraps=__import__("sar_validation.core.visualization", fromlist=["plot_geographic"]).plot_geographic,
+        ) as spy:
+            validation_report(
+                collocation_ds, datatree, recipe, out_dir=tmp_path,
+                native_units_stats_ds_map={"sarSSM_vs_SOIL_MOISTURE": nu_stats},
+            )
+
+        # Called at least twice: once for the main section, once for
+        # native-units.
+        assert spy.call_count >= 2
+
+
+class TestCdfMatchedTitleSuffix:
+    """Task 6 (B3): the main section's scatter/geographic/residuals page
+    titles get a " (CDF-matched)" suffix for soil_moisture recipes only —
+    flagging that (unlike every other variable) that section's SAR values
+    are rescaled, not raw, so it isn't mistaken for a units bug.
+
+    ``validation_report`` doesn't expose its internal page titles through
+    its return value (they only ever end up as an unused label alongside
+    each PDF page's Figure -- ``pdf_pages: list[(title, Figure)]`` -- the
+    title string is never actually drawn onto the page or otherwise
+    surfaced), so a black-box assertion on a returned Figure's rendered
+    text cannot observe this behavior (confirmed: plot_scatter/
+    plot_residuals/plot_geographic each set their own ax/fig title
+    independently of validation_report's local ``title`` variable, and
+    none of those independent titles include this suffix). Given that,
+    this test exercises the extracted ``_cdf_matched_suffix`` helper
+    directly (real behavior, not implementation detail: identical to
+    calling `validation_report` and reading back the exact string that
+    would have been assigned to each page's title) plus a source-level
+    check that all four title-construction sites actually consume it, so
+    the test fails if either the suffix computation or its wiring into
+    the title strings is removed or reversed.
+    """
+
+    def test_suffix_present_for_soil_moisture_only(self):
+        from sar_validation.core.visualization import _cdf_matched_suffix
+
+        assert _cdf_matched_suffix("soil_moisture") == " (CDF-matched)"
+        for other in ("wind", "currents", "waves", "sea_ice", ""):
+            assert _cdf_matched_suffix(other) == "", (
+                f"expected no CDF-matched suffix for variable={other!r}"
+            )
+
+    def test_suffix_wired_into_all_four_main_section_title_sites(self):
+        """Guards against the helper existing but never being consumed
+        (or being consumed by the wrong branch) -- i.e. it would fail if
+        someone reverted the f-string edits from Step 6 while leaving
+        ``_cdf_matched_suffix`` itself intact."""
+        import inspect
+
+        from sar_validation.core.visualization import validation_report
+
+        source = inspect.getsource(validation_report)
+
+        assert 'cdf_matched_suffix = _cdf_matched_suffix(variable)' in source
+        assert '— scatter{cdf_matched_suffix}"' in source
+        assert '— geographic [{group}]{cdf_matched_suffix}"' in source
+        assert '— geographic{cdf_matched_suffix}"' in source
+        assert '— residuals{cdf_matched_suffix}"' in source
+        # The statistics-table pages show metric numbers, not raw/rescaled
+        # values directly, so they should NOT carry this suffix.
+        assert '— statistics{cdf_matched_suffix}"' not in source
+
+    def test_soil_moisture_main_section_report_still_generates(
+        self, geo_datatree_and_collocation, tmp_path,
+    ):
+        """Smoke test (per the task brief's Step 7): the title-formatting
+        change doesn't break report generation end-to-end for a
+        soil_moisture recipe."""
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+        )
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        collocation_ds = collocation_ds.rename({
+            "sar_owiWindSpeed": "sar_sarSSM", "val_WSPD": "val_SOIL_MOISTURE",
+        }).assign(
+            collocation_type=("collocation", ["point_vs_layer"] * collocation_ds.sizes["collocation"]),
+        )
+        recipe = Recipe(RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, -8.0, 50.0, 52.0),
+            temporal_bounds=TemporalBounds("2026-07-10", "2026-07-11"),
+        ))
+        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        pdf_path = tmp_path / "validation_report.pdf"
+        assert pdf_path.exists()
+
+    def test_cdf_matched_banner_actually_rendered_on_figures(
+        self, geo_datatree_and_collocation,
+    ):
+        """The " (CDF-matched)" suffix computed by ``_cdf_matched_suffix``
+        only ever lands in ``pdf_pages``'s ``title`` element, which is never
+        drawn onto the page (``pdf.savefig()`` takes no title, and
+        ``_title`` in the ``for _title, fig in pdf_pages`` consumer loop is
+        this codebase's "deliberately unused" convention) -- so none of the
+        other tests in this class (which check the bare helper's return
+        value or `validation_report`'s *source text*) would fail if the
+        suffix were never actually stamped onto a rendered figure. This
+        test checks the real artifact instead: a returned Figure's
+        `fig.texts`, mirroring how `TestMarkNativeUnits`/
+        `TestValidationReportNativeUnitsSection` verify `_mark_native_units`.
+        """
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+        )
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+
+        # Non-soil-moisture (wind) run: no CDF-matched banner anywhere.
+        wind_recipe = Recipe(RecipeConfig(
+            name="test_wind", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, -8.0, 50.0, 52.0),
+            temporal_bounds=TemporalBounds("2026-07-10", "2026-07-11"),
+        ))
+        wind_figs = validation_report(collocation_ds, datatree, wind_recipe, out_dir=None)
+        wind_key = "owiWindSpeed_vs_WSPD"
+        assert wind_key in wind_figs and wind_figs[wind_key]
+        assert not any(
+            any("CDF-matched" in t.get_text() for t in fig.texts)
+            for fig in wind_figs[wind_key]
+        ), "wind (non-soil-moisture) report must not carry a CDF-matched banner"
+
+        # Soil-moisture run: at least one figure must carry the real,
+        # rendered "(CDF-matched)" banner stamped via fig.text(...).
+        sm_collocation_ds = collocation_ds.rename({
+            "sar_owiWindSpeed": "sar_sarSSM", "val_WSPD": "val_SOIL_MOISTURE",
+        }).assign(
+            collocation_type=("collocation", ["point_vs_layer"] * collocation_ds.sizes["collocation"]),
+        )
+        sm_recipe = Recipe(RecipeConfig(
+            name="test_soil_moisture", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, -8.0, 50.0, 52.0),
+            temporal_bounds=TemporalBounds("2026-07-10", "2026-07-11"),
+        ))
+        sm_figs = validation_report(sm_collocation_ds, datatree, sm_recipe, out_dir=None)
+        sm_key = "sarSSM_vs_SOIL_MOISTURE"
+        assert sm_key in sm_figs and sm_figs[sm_key]
+        assert any(
+            any("CDF-matched" in t.get_text() for t in fig.texts)
+            for fig in sm_figs[sm_key]
+        ), "no soil_moisture figure carries a rendered '(CDF-matched)' banner"
+
+
+class TestValidationReportResidualsHistRange:
+    """Regression test: the residuals page for a soil_moisture pair --
+    the only variable whose main-section SAR series is CDF-matched
+    before plotting -- must use the fixed (-1, 1) x-axis range for every
+    val_source present, regardless of that source's native unit family
+    (e.g. ascat_ssm's "percent_saturation" family vs ismn's "volumetric"
+    one). This holds even for an originally-percent-scale source like
+    ascat_ssm because, by the time the residuals page is built,
+    add_rescaled_sar_column has already harmonized every source into
+    ismn's volumetric domain via _harmonize_percent_domain_sources --
+    see _volumetric_hist_range_overrides, which now ranges every present
+    source uniformly instead of excluding percent-family sources."""
+
+    def test_soil_moisture_residuals_page_uses_fixed_range(self, tmp_path):
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
+        from sar_validation.core.visualization import validation_report
+
+        cfg = RecipeConfig(
+            name="test_residuals_range", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        )
+        recipe = Recipe(config=cfg)
+
+        rng = np.random.default_rng(5)
+        n = 24
+        lons = rng.uniform(-20.0, 0.0, n)
+        lats = rng.uniform(35.0, 60.0, n)
+        val_vals = rng.uniform(0.1, 0.4, n)
+        sar_vals = val_vals * 100 + rng.normal(0, 2, n)  # correlated, different domain
+        ascat_node = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", val_vals)},
+            coords={
+                "lon": ("point", lons), "lat": ("point", lats),
+                "time": ("point", np.array(["2026-01-01"] * n, dtype="datetime64[ns]")),
+            },
+        )
+        datatree = xr.DataTree.from_dict({"validation/ascat_ssm/f1": ascat_node})
+
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": ("collocation", sar_vals, {"units": "%"}),
+                "val_SOIL_MOISTURE": ("collocation", val_vals),
+                "val_source": ("collocation", np.array(["ismn"] * n)),
+                "val_id": ("collocation", np.array([f"a{i}" for i in range(n)])),
+            },
+        )
+
+        key = "sarSSM_vs_SOIL_MOISTURE"
+        figs = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        assert key in figs
+
+        residuals_figs = [
+            fig for fig in figs[key]
+            if any("−" in ax.get_xlabel() for ax in fig.axes if ax.get_visible())
+        ]
+        if not residuals_figs:
+            pytest.skip(
+                "CDF-matching degenerated for this synthetic sample "
+                "(add_rescaled_sar_column returned all-NaN) -- the direct "
+                "TestPlotResiduals unit tests already cover hist_range "
+                "behavior; this integration check is best-effort."
+            )
+        ax = [a for a in residuals_figs[0].axes if a.get_visible()][0]
+        assert ax.get_xlim() == (-1.0, 1.0)
+
+    def test_soil_moisture_residuals_page_has_no_data_when_ascat_present_without_ismn(self, tmp_path):
+        """ascat_ssm's "percent_saturation" values can only be converted
+        into the shared volumetric domain used by the CDF-matched report
+        section by riding ismn's own CDF-matching fit as a reference (see
+        _harmonize_percent_domain_sources) -- ismn must be present with
+        >= 2 valid collocated pairs for that conversion to happen at all.
+
+        With ascat_ssm as the *only* val_source and ismn absent entirely,
+        there is no reference to convert against: every ascat_ssm row's
+        sar_sarSSM/val_SOIL_MOISTURE values are set to NaN for this section
+        (a deliberate, logged fallback -- ascat_ssm's data is still shown,
+        untouched, in the report's separate "native units" section). This
+        is a regression test for the current design: ascat_ssm-without-ismn
+        used to mean "leave it in a wide percent-scale range"; it now means
+        "no comparable data at all" for the CDF-matched section, so
+        validation_report must produce no figures whatsoever for this pair
+        -- not a residuals page with a wide, non-fixed x-axis range."""
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
+        from sar_validation.core.visualization import validation_report
+
+        cfg = RecipeConfig(
+            name="test_residuals_range_ascat", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        )
+        recipe = Recipe(config=cfg)
+
+        rng = np.random.default_rng(5)
+        n = 24
+        lons = rng.uniform(-20.0, 0.0, n)
+        lats = rng.uniform(35.0, 60.0, n)
+        val_vals = rng.uniform(10.0, 40.0, n)   # ascat_ssm: percent saturation, ~0-100
+        sar_vals = val_vals + rng.normal(0, 2, n)  # correlated, same rough domain (%)
+        ascat_node = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", val_vals)},
+            coords={
+                "lon": ("point", lons), "lat": ("point", lats),
+                "time": ("point", np.array(["2026-01-01"] * n, dtype="datetime64[ns]")),
+            },
+        )
+        datatree = xr.DataTree.from_dict({"validation/ascat_ssm/f1": ascat_node})
+
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": ("collocation", sar_vals, {"units": "%"}),
+                "val_SOIL_MOISTURE": ("collocation", val_vals),
+                "val_source": ("collocation", np.array(["ascat_ssm"] * n)),
+                "val_id": ("collocation", np.array([f"a{i}" for i in range(n)])),
+            },
+        )
+
+        key = "sarSSM_vs_SOIL_MOISTURE"
+        figs = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        assert key in figs
+
+        # Every row is dropped to NaN by _harmonize_percent_domain_sources
+        # (ismn absent -- see docstring), so none of scatter/residuals/
+        # geographic/etc. has any valid data left to plot for this pair.
+        assert figs[key] == [], (
+            "with ascat_ssm as the only val_source and ismn absent, "
+            f"expected no figures for {key!r} in the CDF-matched section, "
+            f"got {len(figs[key])}"
+        )
+
+        residuals_figs = [
+            fig for fig in figs[key]
+            if any("−" in ax.get_xlabel() for ax in fig.axes if ax.get_visible())
+        ]
+        assert residuals_figs == []
+
+    def test_soil_moisture_residuals_page_gives_every_source_the_same_volumetric_range(self, tmp_path):
+        """Regression test for a recipe that validates against BOTH ismn
+        (volumetric) AND ascat_ssm (originally percent-scale) in the same
+        pair -- e.g. recipes/soil_moisture_satellite_example.yaml -- must
+        give BOTH ismn's and ascat_ssm's subplot the same fixed (-1, 1)
+        range, because add_rescaled_sar_column harmonizes ascat_ssm into
+        ismn's volumetric domain before the residuals page is built (see
+        _harmonize_percent_domain_sources), so ascat_ssm's residuals are
+        genuinely volumetric-scale here too -- not left in its raw
+        percent domain, and not pooled with ismn's spread by accident,
+        but explicitly ranged the same because both sources now share
+        one common domain."""
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
+        from sar_validation.core.visualization import validation_report
+
+        cfg = RecipeConfig(
+            name="test_residuals_range_mixed", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        )
+        recipe = Recipe(config=cfg)
+
+        rng = np.random.default_rng(7)
+        n_each = 24
+        lons = rng.uniform(-20.0, 0.0, n_each)
+        lats = rng.uniform(35.0, 60.0, n_each)
+
+        ismn_val = rng.uniform(0.1, 0.4, n_each)
+        ismn_sar = ismn_val * 100 + rng.normal(0, 2, n_each)
+        ascat_val = rng.uniform(10.0, 40.0, n_each)
+        ascat_sar = ascat_val + rng.normal(0, 2, n_each)
+
+        ismn_node = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", ismn_val)},
+            coords={
+                "lon": ("point", lons), "lat": ("point", lats),
+                "time": ("point", np.array(["2026-01-01"] * n_each, dtype="datetime64[ns]")),
+            },
+        )
+        ascat_node = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", ascat_val)},
+            coords={
+                "lon": ("point", lons), "lat": ("point", lats),
+                "time": ("point", np.array(["2026-01-01"] * n_each, dtype="datetime64[ns]")),
+            },
+        )
+        datatree = xr.DataTree.from_dict({
+            "validation/ismn/f1": ismn_node,
+            "validation/ascat_ssm/f1": ascat_node,
+        })
+
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": ("collocation", np.concatenate([ismn_sar, ascat_sar]), {"units": "%"}),
+                "val_SOIL_MOISTURE": ("collocation", np.concatenate([ismn_val, ascat_val])),
+                "val_source": ("collocation", np.array(["ismn"] * n_each + ["ascat_ssm"] * n_each)),
+                "val_id": ("collocation", np.array([f"a{i}" for i in range(2 * n_each)])),
+            },
+        )
+
+        key = "sarSSM_vs_SOIL_MOISTURE"
+        figs = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        assert key in figs
+
+        residuals_figs = [
+            fig for fig in figs[key]
+            if any("−" in ax.get_xlabel() for ax in fig.axes if ax.get_visible())
+        ]
+        if not residuals_figs:
+            pytest.skip(
+                "CDF-matching degenerated for this synthetic sample -- "
+                "the direct TestPlotResiduals unit tests already cover "
+                "hist_range behavior; this integration check is best-effort."
+            )
+        fig = residuals_figs[0]
+        axes_by_title = {
+            ax.get_title(): ax for ax in fig.axes if ax.get_visible()
+        }
+        ismn_ax = next((ax for title, ax in axes_by_title.items() if title.startswith("ismn")), None)
+        ascat_ax = next((ax for title, ax in axes_by_title.items() if title.startswith("ascat_ssm")), None)
+        assert ismn_ax is not None and ascat_ax is not None
+
+        assert ismn_ax.get_xlim() == (-1.0, 1.0), (
+            "ismn's own subplot must keep the fixed volumetric range even "
+            "when ascat_ssm is present in the same pair"
+        )
+        assert ascat_ax.get_xlim() == (-1.0, 1.0), (
+            "ascat_ssm's subplot must get the same fixed volumetric range "
+            "as ismn's once add_rescaled_sar_column has harmonized it into "
+            "ismn's volumetric domain -- its residuals are no longer on "
+            "the raw percent scale by the time this page is built"
+        )

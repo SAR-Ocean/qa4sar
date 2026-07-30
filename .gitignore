@@ -25,6 +25,7 @@ handy_notebooks/
 # Created recipes
 *.yaml
 !recipes/currents_*.yaml
+!recipes/soil_moisture_satellite_example.yaml
 
 # Jupyter notebooks checkpoints
 .ipynb_checkpoints/

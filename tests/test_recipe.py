@@ -339,3 +339,36 @@ class TestWindTemplate:
             "scatterometer_hy2b", "scatterometer_hy2c", "scatterometer_oceansat3",
         ]
         assert recipe.sar_data.max_downloads == 3
+
+
+def test_default_layer_type_specs_has_scatterometer_ssm():
+    from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+
+    # Keyed "scatterometer_ssm" (matching from_ascat_ssm's data_type tag),
+    # not "ascat_ssm" (the source_type/platform_type/output-subfolder name)
+    # -- there's only one scatterometer_ssm source today, so no
+    # _resolve_layer_type refinement branch renames it, unlike radiometer_ssm.
+    assert DEFAULT_LAYER_TYPE_SPECS["scatterometer_ssm"] == {
+        "time_tolerance_minutes": 720,
+        "aggregation_window_km": 12.5,
+        "distance_weighting": "equal",
+    }
+
+
+def test_default_layer_type_specs_has_amsr_and_smap_ssm():
+    from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+
+    assert DEFAULT_LAYER_TYPE_SPECS["amsr_ssm"] == {
+        "time_tolerance_minutes": 720, "aggregation_window_km": 25.0, "distance_weighting": "equal",
+    }
+    assert DEFAULT_LAYER_TYPE_SPECS["smap_ssm"] == {
+        "time_tolerance_minutes": 720, "aggregation_window_km": 9.0, "distance_weighting": "equal",
+    }
+
+
+def test_default_layer_type_specs_has_smos_ssm():
+    from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+
+    assert DEFAULT_LAYER_TYPE_SPECS["smos_ssm"] == {
+        "time_tolerance_minutes": 720, "aggregation_window_km": 35.0, "distance_weighting": "equal",
+    }

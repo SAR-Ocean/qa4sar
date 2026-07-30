@@ -11,7 +11,12 @@ import xarray as xr
 
 from sar_validation.core._variable_map import filter_variable_pairs, infer_variable_pairs
 from sar_validation.core.recipe import Recipe, RecipeConfig, SARDataSpec
-from sar_validation.core.statistics import compute_statistics, run_statistics, save_statistics
+from sar_validation.core.statistics import (
+    add_rescaled_sar_column,
+    compute_statistics,
+    run_statistics,
+    save_statistics,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -126,6 +131,35 @@ class _FakeCdfMatchScale:
         return out
 
 
+class _FakeCdfMatching:
+    """Stand-in for pytesmo.cdf_matching.CDFMatching.
+
+    Stores reference (val) data and rescales arbitrary input data onto it
+    using the same linear mean/std approach as _FakeCdfMatchScale.
+    """
+
+    def __init__(self, nbins=10, minobs=20):
+        self.nbins = nbins
+        self.minobs = minobs
+        self.ref_mean = None
+        self.ref_std = None
+        self.src_mean = None
+        self.src_std = None
+
+    def fit(self, src_vals, ref_vals):
+        """Store reference and source statistics for later prediction."""
+        self.ref_mean = np.mean(ref_vals)
+        self.ref_std = np.std(ref_vals)
+        self.src_mean = np.mean(src_vals)
+        self.src_std = np.std(src_vals)
+
+    def predict(self, src_vals):
+        """Rescale input values onto the reference's domain."""
+        if self.src_std == 0 or self.ref_std == 0:
+            return src_vals.copy()
+        return (src_vals - self.src_mean) / self.src_std * self.ref_std + self.ref_mean
+
+
 def _fake_ubrmsd(sar_vals, val_vals):
     diff = sar_vals - sar_vals.mean() - (val_vals - val_vals.mean())
     return float(np.sqrt(np.mean(diff ** 2)))
@@ -136,11 +170,14 @@ def _patched_pytesmo_modules():
     fake_scaling.scale = _FakeCdfMatchScale()
     fake_metrics = MagicMock()
     fake_metrics.ubrmsd = _fake_ubrmsd
+    fake_cdf_matching = MagicMock()
+    fake_cdf_matching.CDFMatching = _FakeCdfMatching
     fake_pytesmo = MagicMock()
     return {
         "pytesmo": fake_pytesmo,
         "pytesmo.scaling": fake_scaling,
         "pytesmo.metrics": fake_metrics,
+        "pytesmo.cdf_matching": fake_cdf_matching,
     }
 
 
@@ -247,6 +284,62 @@ class TestComputeStatisticsSoilMoisture:
         # Verify that the included group has the correct count
         assert int(result["N"].values[0]) == 5, "Included group should have N=5"
 
+    def test_ascat_row_reports_volumetric_domain_stats(self):
+        """The ASCAT row in the CDF-matched statistics table must reflect
+        volumetric-domain bias/rmse/ubrmsd (small numbers, ~0-1 scale), not
+        percent-domain ones (~0-100 scale) -- consistent with what the
+        CDF-matched plots now show (Task 2)."""
+        from sar_validation.core.statistics import compute_statistics_soil_moisture
+
+        rng = np.random.default_rng(31)
+        n_ismn, n_ascat = 15, 15
+        ismn_val = rng.uniform(0.05, 0.35, n_ismn)
+        ismn_sar = ismn_val * 150.0 + rng.normal(0, 1, n_ismn)
+        ascat_val = rng.uniform(10.0, 90.0, n_ascat)
+        ascat_sar = ascat_val + rng.normal(0, 1, n_ascat)
+
+        ds = xr.Dataset({
+            "sar_sarSSM": xr.DataArray(
+                np.concatenate([ismn_sar, ascat_sar]), dims="collocation", attrs={"units": "%"},
+            ),
+            "val_SOIL_MOISTURE": xr.DataArray(
+                np.concatenate([ismn_val, ascat_val]), dims="collocation",
+                attrs={"units": "mixed — see val_units"},
+            ),
+            "val_source": ("collocation", ["ismn"] * n_ismn + ["ascat_ssm"] * n_ascat),
+            "val_units": ("collocation", np.array(["1"] * n_ismn + ["%"] * n_ascat)),
+        })
+
+        with patch.dict("sys.modules", _patched_pytesmo_modules()):
+            stats_ds = compute_statistics_soil_moisture(ds, "sarSSM", "SOIL_MOISTURE")
+
+        assert stats_ds is not None
+        ascat_idx = list(stats_ds["source"].values).index("ascat_ssm")
+        assert abs(float(stats_ds["bias"].values[ascat_idx])) < 1.0
+        assert float(stats_ds["rmse"].values[ascat_idx]) < 1.0
+
+    def test_ascat_row_absent_when_ismn_missing(self):
+        """No reference source to convert onto -- ASCAT must be dropped
+        from the CDF-matched statistics table entirely for this run, not
+        reported with (wrong) percent-domain numbers."""
+        from sar_validation.core.statistics import compute_statistics_soil_moisture
+
+        rng = np.random.default_rng(32)
+        n = 10
+        ascat_val = rng.uniform(10.0, 90.0, n)
+        ascat_sar = ascat_val + rng.normal(0, 1, n)
+
+        ds = xr.Dataset({
+            "sar_sarSSM": xr.DataArray(ascat_sar, dims="collocation", attrs={"units": "%"}),
+            "val_SOIL_MOISTURE": ("collocation", ascat_val),
+            "val_source": ("collocation", ["ascat_ssm"] * n),
+        })
+
+        with patch.dict("sys.modules", _patched_pytesmo_modules()):
+            stats_ds = compute_statistics_soil_moisture(ds, "sarSSM", "SOIL_MOISTURE")
+
+        assert stats_ds is None
+
 
 class TestAddRescaledSarColumn:
     def test_rescaled_sar_lands_in_val_domain(self, soil_moisture_collocation_ds):
@@ -328,6 +421,84 @@ class TestAddRescaledSarColumn:
         assert not np.any(np.isnan(rescaled[:5])), "5-pair group should be rescaled"
         assert np.isnan(rescaled[5]), "1-pair group can't CDF-match — left as NaN"
 
+    def test_ascat_group_converted_to_volumetric_and_not_double_matched(self):
+        """ASCAT's group must be harmonized into ISMN's domain (Task 1),
+        not additionally re-matched by add_rescaled_sar_column's own
+        per-group _cdf_match_sar_series loop -- that would double-apply
+        CDF-matching and corrupt the values."""
+        rng = np.random.default_rng(21)
+        n_ismn, n_ascat = 15, 15
+        ismn_val = rng.uniform(0.05, 0.35, n_ismn)
+        ismn_sar = ismn_val * 150.0 + rng.normal(0, 1, n_ismn)
+        ascat_val = rng.uniform(10.0, 90.0, n_ascat)
+        ascat_sar = ascat_val + rng.normal(0, 1, n_ascat)
+
+        ds = xr.Dataset({
+            "sar_sarSSM": xr.DataArray(
+                np.concatenate([ismn_sar, ascat_sar]), dims="collocation", attrs={"units": "%"},
+            ),
+            "val_SOIL_MOISTURE": xr.DataArray(
+                np.concatenate([ismn_val, ascat_val]), dims="collocation",
+                attrs={"units": "mixed — see val_units"},
+            ),
+            "val_source": ("collocation", ["ismn"] * n_ismn + ["ascat_ssm"] * n_ascat),
+            "val_units": ("collocation", np.array(["1"] * n_ismn + ["%"] * n_ascat)),
+        })
+
+        with patch.dict("sys.modules", _patched_pytesmo_modules()):
+            out = add_rescaled_sar_column(ds, "sarSSM", "SOIL_MOISTURE")
+
+        is_ascat = np.array(out["val_source"].values) == "ascat_ssm"
+        assert np.nanmax(out["sar_sarSSM"].values[is_ascat]) < 1.0
+        assert not np.any(np.isnan(out["sar_sarSSM"].values[is_ascat]))
+
+    def test_ascat_group_dropped_when_ismn_absent(self, caplog):
+        """When ISMN isn't present to define the reference transform,
+        ASCAT's rows must come back NaN, not silently left in the percent
+        domain (which would reintroduce the original mixed-domain bug)."""
+        rng = np.random.default_rng(22)
+        n = 10
+        ascat_val = rng.uniform(10.0, 90.0, n)
+        ascat_sar = ascat_val + rng.normal(0, 1, n)
+
+        ds = xr.Dataset({
+            "sar_sarSSM": xr.DataArray(ascat_sar, dims="collocation", attrs={"units": "%"}),
+            "val_SOIL_MOISTURE": ("collocation", ascat_val),
+            "val_source": ("collocation", ["ascat_ssm"] * n),
+        })
+
+        with patch.dict("sys.modules", _patched_pytesmo_modules()):
+            out = add_rescaled_sar_column(ds, "sarSSM", "SOIL_MOISTURE")
+
+        assert np.all(np.isnan(out["sar_sarSSM"].values))
+
+
+class TestAddRescaledSarColumnInheritsHonestMixedUnitsLabel:
+    def test_rescaled_column_gets_mixed_marker_when_val_col_is_mixed(self):
+        """add_rescaled_sar_column does `out[sar_col].attrs =
+        dict(out[val_col].attrs)` -- once annotate_collocation_ds (see
+        test_cf_metadata.py) stops lying about val_SOIL_MOISTURE's units
+        for a mixed-source run, this blind copy automatically becomes
+        correct too, with no source change needed here. This test pins
+        that down as an explicit regression guard."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.statistics import add_rescaled_sar_column
+
+        n = 40
+        rng = np.random.default_rng(0)
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM": ("collocation", rng.uniform(0, 100, n)),
+            "val_SOIL_MOISTURE": ("collocation", rng.uniform(0, 100, n)),
+            "val_source": ("collocation", ["ascat_ssm"] * n),
+        })
+        collocation_ds["val_SOIL_MOISTURE"].attrs["units"] = "mixed — see val_units"
+
+        out = add_rescaled_sar_column(collocation_ds, "sarSSM", "SOIL_MOISTURE")
+
+        assert out["sar_sarSSM"].attrs.get("units") == "mixed — see val_units"
+
 
 class TestCdfMatchingBinsResizedWarningSuppressed:
     """Real (unmocked) pytesmo.cdf_matching resizes its bins and emits
@@ -354,6 +525,281 @@ class TestCdfMatchingBinsResizedWarningSuppressed:
             fit_sar_to_val_transform(soil_moisture_collocation_ds, "sarSSM", "SOIL_MOISTURE")
 
         assert not any("bins have been resized" in str(w.message).lower() for w in caught)
+
+
+class TestHarmonizePercentDomainSources:
+    """_harmonize_percent_domain_sources converts a percent-domain
+    val_source (e.g. ASCAT, "%") into the reference source's (ISMN's)
+    volumetric domain, by reusing the CDF-match transform fit from
+    SAR-vs-ISMN pairs -- since SAR's own raw retrieval shares ASCAT's "%"
+    domain (see design-choices.md SS8.7), that same transform is valid
+    applied to ASCAT's raw values too."""
+
+    def _mixed_ds(self, n_ismn=15, n_ascat=15, sar_units="%"):
+        rng = np.random.default_rng(11)
+        ismn_val = rng.uniform(0.05, 0.35, n_ismn)
+        ismn_sar = ismn_val * 150.0 + rng.normal(0, 1, n_ismn)
+        ascat_val = rng.uniform(10.0, 90.0, n_ascat)   # ASCAT's own "%" scale
+        ascat_sar = ascat_val + rng.normal(0, 1, n_ascat)
+
+        sar_vals = np.concatenate([ismn_sar, ascat_sar])
+        val_vals = np.concatenate([ismn_val, ascat_val])
+        sources = ["ismn"] * n_ismn + ["ascat_ssm"] * n_ascat
+
+        return xr.Dataset({
+            "sar_sarSSM": xr.DataArray(
+                sar_vals, dims="collocation", attrs={"units": sar_units},
+            ),
+            "val_SOIL_MOISTURE": xr.DataArray(
+                val_vals, dims="collocation", attrs={"units": "mixed — see val_units"},
+            ),
+            "val_source": ("collocation", sources),
+            "val_units": (
+                "collocation", np.array(["1"] * n_ismn + ["%"] * n_ascat),
+            ),
+            "val_long_name": (
+                "collocation",
+                np.array(["ISMN soil moisture"] * n_ismn + ["ASCAT soil moisture"] * n_ascat),
+            ),
+        })
+
+    def test_ascat_values_move_into_ismns_numeric_range(self):
+        from sar_validation.core.statistics import _harmonize_percent_domain_sources
+
+        ds = self._mixed_ds()
+        out, converted, dropped = _harmonize_percent_domain_sources(ds, "sarSSM", "SOIL_MOISTURE")
+
+        assert converted == {"ascat_ssm"}
+        assert dropped == set(), "successful conversion must not also report the source as dropped"
+        is_ascat = np.array(out["val_source"].values) == "ascat_ssm"
+        ascat_val_converted = out["val_SOIL_MOISTURE"].values[is_ascat]
+        ascat_sar_converted = out["sar_sarSSM"].values[is_ascat]
+        # Was ~10-90 (percent); must now land near ISMN's ~0.05-0.35 range.
+        assert np.nanmax(ascat_val_converted) < 1.0
+        assert np.nanmax(ascat_sar_converted) < 1.0
+        # ISMN's own rows must be untouched.
+        is_ismn = np.array(out["val_source"].values) == "ismn"
+        np.testing.assert_array_equal(
+            out["val_SOIL_MOISTURE"].values[is_ismn], ds["val_SOIL_MOISTURE"].values[is_ismn],
+        )
+
+    def test_val_units_companion_updated_for_converted_rows(self):
+        from sar_validation.core.statistics import _harmonize_percent_domain_sources
+
+        ds = self._mixed_ds()
+        out, _converted, _dropped = _harmonize_percent_domain_sources(ds, "sarSSM", "SOIL_MOISTURE")
+
+        is_ascat = np.array(out["val_source"].values) == "ascat_ssm"
+        assert all(u == "1" for u in np.array(out["val_units"].values)[is_ascat])
+        assert all(
+            n == "ISMN soil moisture" for n in np.array(out["val_long_name"].values)[is_ascat]
+        )
+        # Every source now shares one family -- the column-level "mixed"
+        # sentinel must collapse back to a real units string.
+        assert out["val_SOIL_MOISTURE"].attrs["units"] == "1"
+
+    def test_reference_source_absent_drops_percent_sources(self, caplog):
+        from sar_validation.core.statistics import _harmonize_percent_domain_sources
+
+        ds = self._mixed_ds(n_ismn=0, n_ascat=10)
+        ds = ds.isel(collocation=slice(0, 10))  # ismn rows were 0-length anyway
+
+        out, converted, dropped = _harmonize_percent_domain_sources(ds, "sarSSM", "SOIL_MOISTURE")
+
+        assert converted == set()
+        assert dropped == {"ascat_ssm"}, (
+            "ascat_ssm needed converting but couldn't (reference absent) -- must be "
+            "reported as dropped, distinct from 'nothing needed converting'"
+        )
+        assert np.all(np.isnan(out["val_SOIL_MOISTURE"].values))
+        assert np.all(np.isnan(out["sar_sarSSM"].values))
+        assert "absent" in caplog.text
+
+    def test_reference_source_too_sparse_drops_percent_sources(self, caplog):
+        from sar_validation.core.statistics import _harmonize_percent_domain_sources
+
+        ds = self._mixed_ds(n_ismn=1, n_ascat=10)
+
+        out, converted, dropped = _harmonize_percent_domain_sources(ds, "sarSSM", "SOIL_MOISTURE")
+
+        assert converted == set()
+        assert dropped == {"ascat_ssm"}, (
+            "ascat_ssm needed converting but couldn't (reference too sparse) -- must be "
+            "reported as dropped, distinct from 'nothing needed converting'"
+        )
+        is_ascat = np.array(out["val_source"].values) == "ascat_ssm"
+        assert np.all(np.isnan(out["val_SOIL_MOISTURE"].values[is_ascat]))
+        assert "< 2 valid" in caplog.text
+
+    def test_no_percent_domain_source_present_is_a_true_noop(self):
+        """No ASCAT-like source present (e.g. a plain ISMN-only run, or any
+        non-soil-moisture recipe) -- must return the exact same object, not
+        even a copy, since every call site invokes this unconditionally."""
+        from sar_validation.core.statistics import _harmonize_percent_domain_sources
+
+        ds = xr.Dataset({
+            "sar_sarSSM": xr.DataArray(
+                np.array([10.0, 20.0, 30.0]), dims="collocation", attrs={"units": "%"},
+            ),
+            "val_SOIL_MOISTURE": ("collocation", np.array([0.1, 0.2, 0.3])),
+            "val_source": ("collocation", ["ismn"] * 3),
+        })
+
+        out, converted, dropped = _harmonize_percent_domain_sources(ds, "sarSSM", "SOIL_MOISTURE")
+
+        assert out is ds
+        assert converted == set()
+        assert dropped == set()
+
+    def test_non_soil_moisture_dataset_is_a_true_noop(self):
+        """A wind/wave/currents-shaped dataset (val_source labels never in
+        _VAL_SOURCE_UNITS_FAMILY) must also short-circuit to a no-op."""
+        from sar_validation.core.statistics import _harmonize_percent_domain_sources
+
+        ds = xr.Dataset({
+            "sar_owiWindSpeed": xr.DataArray(
+                np.array([5.0, 6.0, 7.0]), dims="collocation", attrs={"units": "m s-1"},
+            ),
+            "val_WSPD": ("collocation", np.array([5.1, 6.1, 7.1])),
+            "val_source": ("collocation", ["mooring"] * 3),
+        })
+
+        out, converted, dropped = _harmonize_percent_domain_sources(ds, "owiWindSpeed", "WSPD")
+
+        assert out is ds
+        assert converted == set()
+        assert dropped == set()
+
+    def test_cdf_matching_fit_failure_drops_percent_sources(self, caplog):
+        """If CDFMatching.fit() raises an exception (e.g. degenerate
+        reference values), _harmonize_percent_domain_sources must degrade
+        gracefully: drop the to-be-converted rows to NaN, log a warning,
+        and return empty converted_sources -- not propagate the exception."""
+        from sar_validation.core.statistics import _harmonize_percent_domain_sources
+
+        ds = self._mixed_ds(n_ismn=15, n_ascat=10)
+
+        with patch("pytesmo.cdf_matching.CDFMatching.fit") as mock_fit:
+            mock_fit.side_effect = ValueError("degenerate reference values")
+            out, converted, dropped = _harmonize_percent_domain_sources(ds, "sarSSM", "SOIL_MOISTURE")
+
+        assert converted == set()
+        assert dropped == {"ascat_ssm"}, (
+            "ascat_ssm needed converting but couldn't (fit raised) -- must be "
+            "reported as dropped, distinct from 'nothing needed converting'"
+        )
+        is_ascat = np.array(out["val_source"].values) == "ascat_ssm"
+        assert np.all(np.isnan(out["val_SOIL_MOISTURE"].values[is_ascat]))
+        assert np.all(np.isnan(out["sar_sarSSM"].values[is_ascat]))
+        # ISMN's own rows must remain untouched.
+        is_ismn = np.array(out["val_source"].values) == "ismn"
+        np.testing.assert_array_equal(
+            out["val_SOIL_MOISTURE"].values[is_ismn], ds["val_SOIL_MOISTURE"].values[is_ismn],
+        )
+        assert "CDF-matching fit failed" in caplog.text
+
+
+class TestFitSarToValTransformHarmonizesFirst:
+    def test_transform_maps_ascat_field_into_ismn_range_not_its_own(self):
+        """Before this fix, fit_sar_to_val_transform pooled every
+        val_source's raw pairs with no grouping -- a transform fit that way
+        on mixed percent+volumetric data is nonsense. After harmonizing
+        first, a raw-percent SAR field value should map into ISMN's
+        volumetric range, not stay near its own raw percent value."""
+        from sar_validation.core.statistics import fit_sar_to_val_transform
+
+        rng = np.random.default_rng(41)
+        n_ismn, n_ascat = 15, 15
+        ismn_val = rng.uniform(0.05, 0.35, n_ismn)
+        ismn_sar = ismn_val * 150.0 + rng.normal(0, 1, n_ismn)
+        ascat_val = rng.uniform(10.0, 90.0, n_ascat)
+        ascat_sar = ascat_val + rng.normal(0, 1, n_ascat)
+
+        ds = xr.Dataset({
+            "sar_sarSSM": xr.DataArray(
+                np.concatenate([ismn_sar, ascat_sar]), dims="collocation", attrs={"units": "%"},
+            ),
+            "val_SOIL_MOISTURE": xr.DataArray(
+                np.concatenate([ismn_val, ascat_val]), dims="collocation",
+                attrs={"units": "mixed — see val_units"},
+            ),
+            "val_source": ("collocation", ["ismn"] * n_ismn + ["ascat_ssm"] * n_ascat),
+            "val_units": ("collocation", np.array(["1"] * n_ismn + ["%"] * n_ascat)),
+        })
+
+        transform = fit_sar_to_val_transform(ds, "sarSSM", "SOIL_MOISTURE")
+        assert transform is not None
+
+        # A raw SAR field value in ASCAT's percent range (~50) must map
+        # near ISMN's volumetric range (~0.05-0.35), not stay near 50.
+        mapped = transform(np.array([50.0]))
+        assert mapped[0] < 1.0
+
+    def test_pairs_raw_sar_with_harmonized_val_not_harmonized_sar(self):
+        """Regression test for the bug fixed alongside this test: before
+        the fix, fit_sar_to_val_transform built its fitting DataFrame from
+        harmonized[[sar_col, val_col]] -- i.e. BOTH columns from the
+        harmonize step. That's wrong for this function specifically: ASCAT
+        rows' sar_col had already been run through the percent->volumetric
+        transform once (down to ISMN's tiny ~0.05-0.6 numeric range), while
+        ISMN rows' sar_col stayed raw percent (~7-53). With ASCAT vastly
+        outnumbering ISMN -- the realistic case (thousands vs. dozens of
+        collocated points) -- the pooled sar_col input was dominated by
+        ASCAT's tiny converted sub-population, skewing the percentile
+        binning so badly that a genuinely raw field value in ISMN's OWN
+        native sar range (~7-53) mapped far outside ISMN's own volumetric
+        range (~0.05-0.35).
+
+        After the fix, sar_col always comes straight from collocation_ds
+        (raw, untouched by harmonize) and only val_col is harmonized, so
+        the fit's x-domain is consistently raw percent regardless of how
+        lopsided the group sizes are."""
+        from sar_validation.core.statistics import fit_sar_to_val_transform
+
+        rng = np.random.default_rng(7)
+        # Realistic imbalance: ISMN in the dozens, ASCAT in the hundreds.
+        n_ismn, n_ascat = 18, 300
+        ismn_val = rng.uniform(0.05, 0.35, n_ismn)
+        ismn_sar = ismn_val * 150.0 + rng.normal(0, 1, n_ismn)
+        ascat_val = rng.uniform(10.0, 90.0, n_ascat)
+        ascat_sar = ascat_val + rng.normal(0, 1, n_ascat)
+
+        ds = xr.Dataset({
+            "sar_sarSSM": xr.DataArray(
+                np.concatenate([ismn_sar, ascat_sar]), dims="collocation", attrs={"units": "%"},
+            ),
+            "val_SOIL_MOISTURE": xr.DataArray(
+                np.concatenate([ismn_val, ascat_val]), dims="collocation",
+                attrs={"units": "mixed — see val_units"},
+            ),
+            "val_source": ("collocation", ["ismn"] * n_ismn + ["ascat_ssm"] * n_ascat),
+            "val_units": ("collocation", np.array(["1"] * n_ismn + ["%"] * n_ascat)),
+        })
+
+        transform = fit_sar_to_val_transform(ds, "sarSSM", "SOIL_MOISTURE")
+        assert transform is not None
+
+        # RAW field values spanning ISMN's own raw sar range (~7-53) --
+        # exactly what a real, untouched SAR scene pixel looks like --
+        # must map into ISMN's own volumetric range (~0.05-0.35), with a
+        # little headroom for fit noise. The pre-fix bug mapped the median
+        # of this same range to ~0.56 (verified against the pre-fix
+        # construction while writing this test) -- well outside ISMN's
+        # range -- because ASCAT's tiny converted sar sub-population (300
+        # points squeezed into ~0.05-0.6) swamped ISMN's raw ~7-53 points
+        # in the pooled percentile binning.
+        lo, mid, hi = np.percentile(ismn_sar, [10, 50, 90])
+        mapped = transform(np.array([lo, mid, hi]))
+
+        assert np.all(np.isfinite(mapped))
+        margin = 0.1
+        assert np.all(mapped > ismn_val.min() - margin)
+        assert np.all(mapped < ismn_val.max() + margin)
+
+        # The fit must also be monotonic (increasing raw sar -> increasing
+        # mapped value) across ISMN's own range -- a sign the x-domain
+        # wasn't left bimodal/skewed by mixing raw and converted scales.
+        assert mapped[0] < mapped[1] < mapped[2]
 
 
 class TestRunStatisticsSoilMoistureDispatch:
@@ -505,6 +951,83 @@ class TestSaveStatistics:
 
 
 # ---------------------------------------------------------------------------
+# run_statistics_native_units
+# ---------------------------------------------------------------------------
+
+class TestRunStatisticsNativeUnits:
+    def _make_recipe(self, tmp_path):
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+        )
+
+        cfg = RecipeConfig(
+            name="test_native_units",
+            variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        )
+        return Recipe(config=cfg)
+
+    def test_only_matching_unit_sources_included(self, tmp_path):
+        from sar_validation.core.statistics import run_statistics_native_units
+
+        recipe = self._make_recipe(tmp_path)
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": (
+                    "collocation", np.array([20.0, 30.0, 40.0, 50.0]),
+                    {"units": "%"},
+                ),
+                "val_SOIL_MOISTURE": ("collocation", np.array([25.0, 35.0, 0.15, 0.20])),
+                "val_source": ("collocation", np.array(["ascat_ssm", "ascat_ssm", "ismn", "ismn"])),
+            },
+        )
+
+        results = run_statistics_native_units(collocation_ds, recipe, tmp_path)
+
+        assert "sarSSM_vs_SOIL_MOISTURE" in results
+        stats_ds = results["sarSSM_vs_SOIL_MOISTURE"]
+        # Only ascat_ssm shares SAR's "%" family — ismn (volumetric) excluded.
+        assert list(stats_ds["source"].values) == ["ascat_ssm"]
+        assert (tmp_path / "validation_statistics_sarSSM_vs_SOIL_MOISTURE_native_units.nc").exists()
+        assert (tmp_path / "validation_statistics_sarSSM_vs_SOIL_MOISTURE_native_units.csv").exists()
+
+    def test_no_matching_sources_produces_no_output(self, tmp_path):
+        from sar_validation.core.statistics import run_statistics_native_units
+
+        recipe = self._make_recipe(tmp_path)
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": ("collocation", np.array([20.0, 30.0]), {"units": "%"}),
+                "val_SOIL_MOISTURE": ("collocation", np.array([0.15, 0.20])),
+                "val_source": ("collocation", np.array(["ismn", "ismn"])),
+            },
+        )
+
+        results = run_statistics_native_units(collocation_ds, recipe, tmp_path)
+
+        assert results == {}
+        assert not (tmp_path / "validation_statistics_sarSSM_vs_SOIL_MOISTURE_native_units.nc").exists()
+
+    def test_non_soil_moisture_recipe_returns_empty(self, tmp_path):
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
+        from sar_validation.core.statistics import run_statistics_native_units
+
+        cfg = RecipeConfig(
+            name="test_wind", variable="wind",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        )
+        recipe = Recipe(config=cfg)
+        collocation_ds = xr.Dataset({"sar_owiWindSpeed": ("collocation", np.array([1.0]))})
+
+        assert run_statistics_native_units(collocation_ds, recipe, tmp_path) == {}
+
+
+# ---------------------------------------------------------------------------
 # _variable_map
 # ---------------------------------------------------------------------------
 
@@ -652,3 +1175,9 @@ class TestFilterVariablePairsSoilMoisture:
         ds = xr.Dataset({"sar_owiWindSpeed": ("collocation", [1.0])})
         pairs = filter_variable_pairs(recipe, ds)
         assert pairs == []
+
+
+def test_val_source_units_family_includes_smos_ssm():
+    from sar_validation.core.statistics import _VAL_SOURCE_UNITS_FAMILY
+
+    assert _VAL_SOURCE_UNITS_FAMILY["smos_ssm"] == "volumetric"

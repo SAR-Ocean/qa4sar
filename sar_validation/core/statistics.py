@@ -35,6 +35,7 @@ __all__ = [
     "fit_sar_to_val_transform",
     "save_statistics",
     "run_statistics",
+    "run_statistics_native_units",
 ]
 
 
@@ -272,25 +273,15 @@ def _cdf_match_sar_series(
     return sar_rescaled
 
 
-def _rescale_and_compute_soil_moisture_stats(
-    sar_vals: np.ndarray, val_vals: np.ndarray,
-) -> Optional[dict]:
+def _soil_moisture_metrics(sar_rescaled: np.ndarray, val_vals: np.ndarray) -> dict:
     """
-    Rescale the SAR series onto the ISMN series' domain via CDF-matching,
-    then compute the same metrics as :func:`compute_statistics` on the
-    rescaled pair, plus ubRMSD.
-
-    Returns
-    -------
-    dict or None
-        None if CDF-matching itself degenerates — see
-        :func:`_cdf_match_sar_series`.
+    bias/std/rmse/correlation/scatter_index/ubrmsd for an already-matched
+    (sar_rescaled, val_vals) pair -- no CDF-matching performed here. Shared
+    by :func:`_rescale_and_compute_soil_moisture_stats` (which CDF-matches
+    first) and :func:`compute_statistics_soil_moisture`'s converted-group
+    branch (already matched by :func:`_harmonize_percent_domain_sources`).
     """
     from pytesmo.metrics import ubrmsd
-
-    sar_rescaled = _cdf_match_sar_series(sar_vals, val_vals)
-    if sar_rescaled is None:
-        return None
 
     diff = sar_rescaled - val_vals
     n = len(sar_rescaled)
@@ -313,6 +304,26 @@ def _rescale_and_compute_soil_moisture_stats(
     }
 
 
+def _rescale_and_compute_soil_moisture_stats(
+    sar_vals: np.ndarray, val_vals: np.ndarray,
+) -> Optional[dict]:
+    """
+    Rescale the SAR series onto the ISMN series' domain via CDF-matching,
+    then compute the same metrics as :func:`compute_statistics` on the
+    rescaled pair, plus ubRMSD.
+
+    Returns
+    -------
+    dict or None
+        None if CDF-matching itself degenerates — see
+        :func:`_cdf_match_sar_series`.
+    """
+    sar_rescaled = _cdf_match_sar_series(sar_vals, val_vals)
+    if sar_rescaled is None:
+        return None
+    return _soil_moisture_metrics(sar_rescaled, val_vals)
+
+
 def compute_statistics_soil_moisture(
     collocation_ds: xr.Dataset,
     sar_var: str,
@@ -322,13 +333,16 @@ def compute_statistics_soil_moisture(
     """
     Soil-moisture variant of :func:`compute_statistics`.
 
-    Before computing bias/RMSE/correlation, the SAR series is CDF-matched
-    onto the ISMN series' domain via ``pytesmo.scaling.scale`` — the
-    satellite retrieval is rescaled to match the in-situ reference's
-    dynamic range, not the reverse (matching standard soil-moisture
-    validation practice, e.g. ESA CCI SM). Metrics are then computed on the
-    rescaled pair, plus a new ``ubrmsd`` field via
-    ``pytesmo.metrics.ubrmsd``.
+    Before computing bias/RMSE/correlation, :func:`_harmonize_percent_domain_sources`
+    converts any val_source sharing SAR's own raw units family (e.g. ASCAT's
+    "%") into the reference source's (ISMN's) volumetric domain — for those
+    groups, metrics are computed directly via :func:`_soil_moisture_metrics`
+    (already matched). Every other group is CDF-matched onto its own domain
+    as before, via :func:`_rescale_and_compute_soil_moisture_stats` — the
+    satellite retrieval is rescaled to match the in-situ reference's dynamic
+    range, not the reverse (matching standard soil-moisture validation
+    practice, e.g. ESA CCI SM). A new ``ubrmsd`` field is added via
+    ``pytesmo.metrics.ubrmsd`` either way.
 
     Same signature/return shape as :func:`compute_statistics` (with the
     added ``ubrmsd`` data variable), engaged only when
@@ -348,7 +362,9 @@ def compute_statistics_soil_moisture(
         )
         return None
 
-    df = collocation_ds[[sar_col, val_col, *group_by]].to_dataframe()
+    harmonized, converted_sources, _dropped = _harmonize_percent_domain_sources(collocation_ds, sar_var, val_var)
+
+    df = harmonized[[sar_col, val_col, *group_by]].to_dataframe()
     df = df.dropna(subset=[sar_col, val_col])
 
     if df.empty:
@@ -372,11 +388,17 @@ def compute_statistics_soil_moisture(
                 label,
             )
             continue
-        record = _rescale_and_compute_soil_moisture_stats(sar_vals, val_vals)
-        if record is None:
-            continue
-        records.append(record)
-        source_labels.append(str(label))
+        record: Optional[dict] = None
+        if str(label) in converted_sources:
+            record = _soil_moisture_metrics(sar_vals, val_vals)
+            records.append(record)
+            source_labels.append(str(label))
+        else:
+            record = _rescale_and_compute_soil_moisture_stats(sar_vals, val_vals)
+            if record is None:
+                continue
+            records.append(record)
+            source_labels.append(str(label))
 
     if not records:
         return None
@@ -422,6 +444,13 @@ def add_rescaled_sar_column(
     same rescaled values available to the plotting layer, so a report
     generated for ``variable == "soil_moisture"`` compares like with like.
 
+    Before the per-group loop below, :func:`_harmonize_percent_domain_sources`
+    converts any val_source sharing SAR's own raw units family (e.g. ASCAT's
+    "%") into the reference source's (ISMN's) volumetric domain — those
+    groups are then skipped in the loop below (already matched) rather than
+    re-matched onto their own now-volumetric val values, which would
+    double-apply CDF-matching.
+
     Points in a group too small to CDF-match, or whose CDF-matching
     degenerates (see :func:`_cdf_match_sar_series`), are left as NaN —
     matching the same per-group exclusion :func:`compute_statistics_soil_moisture`
@@ -452,14 +481,19 @@ def add_rescaled_sar_column(
 
     sar_col = f"sar_{sar_var}"
     val_col = f"val_{val_var}"
-    out = collocation_ds.copy(deep=True)
 
-    if sar_col not in out or val_col not in out:
+    if sar_col not in collocation_ds or val_col not in collocation_ds:
         logger.warning(
             "add_rescaled_sar_column: variable(s) %s not found — returning unchanged.",
-            [c for c in (sar_col, val_col) if c not in out],
+            [c for c in (sar_col, val_col) if c not in collocation_ds],
         )
-        return out
+        return collocation_ds.copy(deep=True)
+
+    out, converted_sources, _dropped = _harmonize_percent_domain_sources(collocation_ds, sar_var, val_var)
+
+    # Ensure we have a copy if _harmonize_percent_domain_sources returned the original
+    if out is collocation_ds:
+        out = out.copy(deep=True)
 
     n = out.sizes.get("collocation", out[sar_col].size)
     rescaled = np.full(n, np.nan)
@@ -473,6 +507,14 @@ def add_rescaled_sar_column(
         groups = df.groupby("_group")
 
     for label, grp in groups:
+        if str(label) in converted_sources:
+            # Already matched onto the reference domain by
+            # _harmonize_percent_domain_sources above -- re-matching here
+            # would double-apply CDF-matching.
+            valid_idx = grp[[sar_col, val_col]].dropna().index
+            positions = df.index.get_indexer(valid_idx)
+            rescaled[positions] = grp.loc[valid_idx, sar_col].values
+            continue
         valid = grp[[sar_col, val_col]].dropna()
         if len(valid) < 2:
             continue
@@ -502,6 +544,22 @@ def fit_sar_to_val_transform(
     arbitrary SAR values (e.g. a full SAR scene's ``(y, x)`` grid, not just
     the collocated subset) into the validation series' domain.
 
+    Before fitting, :func:`_harmonize_percent_domain_sources` converts any
+    val_source sharing SAR's own raw units family (e.g. ASCAT's "%") into
+    the reference source's (ISMN's) volumetric domain — but only its
+    ``val_<val_var>`` *target* values are taken from that harmonized
+    dataset here. Each row's ``sar_<sar_var>`` *input* stays the RAW,
+    un-harmonized value from *collocation_ds*, since the fitted transform
+    is meant to be applied later to a genuinely raw SAR scene field
+    (always in SAR's own native units, e.g. percent) — not to a value
+    that has already been run through one percent→volumetric conversion.
+    Pairing a harmonized ``sar_col`` for ASCAT rows with a still-raw one
+    for ISMN rows would pool two very different numeric scales as input
+    to the same fit and skew the percentile binning; pooling raw percent
+    and raw volumetric pairs with no harmonization at all (the original
+    pre-fix behavior) was similarly nonsensical, just via the opposite
+    column.
+
     Intended for plotting a SAR *field* (not just collocated points) in a
     validation variable's units — e.g. ``plot_geographic``'s background
     layer, which can't use :func:`add_rescaled_sar_column` directly since
@@ -528,7 +586,19 @@ def fit_sar_to_val_transform(
     if sar_col not in collocation_ds or val_col not in collocation_ds:
         return None
 
-    df = collocation_ds[[sar_col, val_col]].to_dataframe().dropna()
+    harmonized, _converted, _dropped = _harmonize_percent_domain_sources(collocation_ds, sar_var, val_var)
+
+    # val_col: harmonized target (unified domain, e.g. ASCAT's proxy
+    # volumetric value). sar_col: RAW input straight from collocation_ds,
+    # never run through the harmonize step — see the docstring above.
+    # collocation_ds and harmonized share the same "collocation"
+    # dim/coord and row order (harmonize either returns collocation_ds
+    # itself unchanged, or a deep=True copy with values overwritten
+    # in-place, never reordered/filtered), so aligning by that shared
+    # index is safe.
+    df = harmonized[[val_col]].to_dataframe()
+    df[sar_col] = collocation_ds[sar_col].to_dataframe()[sar_col]
+    df = df.dropna()
     if len(df) < 2:
         return None
 
@@ -557,6 +627,172 @@ def fit_sar_to_val_transform(
         return out.reshape(arr.shape)
 
     return _transform
+
+
+def _harmonize_percent_domain_sources(
+    collocation_ds: xr.Dataset,
+    sar_var: str,
+    val_var: str,
+    reference_source: str = "ismn",
+) -> tuple[xr.Dataset, set[str], set[str]]:
+    """
+    Convert every val_source sharing SAR's own raw units family (e.g.
+    ASCAT's "%", the same domain as Sentinel-1 SSM's own retrieval) into
+    reference_source's own domain (ISMN's volumetric fraction), so the
+    CDF-matched report section shows every source on one consistent scale.
+
+    Mechanism: SAR's own raw retrieval lives in the same physical domain as
+    the sources being converted (see design-choices.md SS8.7), so the CDF-
+    matching transform already fit for SAR-vs-reference_source pairs is
+    equally valid applied to those sources' own raw values -- this avoids
+    needing to collocate e.g. ASCAT against ISMN directly (they are never
+    paired with each other, only each with SAR).
+
+    val_source groups already sharing reference_source's own units family
+    (e.g. ISMN/SMAP/SMOS, all volumetric) are returned untouched --
+    downstream callers (add_rescaled_sar_column, compute_statistics_soil_moisture)
+    handle those with their own normal per-group CDF-matching.
+
+    "Needs converting" is detected via the existing _VAL_SOURCE_UNITS_FAMILY
+    lookup (the same one run_statistics_native_units already uses), not by
+    inspecting a per-row units companion -- so this function is a true no-op
+    (returns collocation_ds itself, no copy) for every non-soil-moisture
+    recipe and every soil-moisture recipe whose val_source labels aren't in
+    that dict.
+
+    Returns
+    -------
+    (harmonized_ds, converted_sources, dropped_sources)
+        harmonized_ds : xr.Dataset
+            collocation_ds unchanged (same object) if nothing needed
+            converting; otherwise a deep copy with the converted sources'
+            sar_<sar_var> and val_<val_var> values replaced, their
+            val_units/val_long_name companion rows (if present) updated to
+            reference_source's own units/long_name, and val_<val_var>'s
+            column-level units attr collapsed from the "mixed — see
+            val_units" sentinel to a real units string if every present
+            source now shares one family.
+        converted_sources : set[str]
+            val_source labels that were rewritten. Empty if nothing needed
+            converting, OR if conversion was attempted but reference_source
+            was absent/too sparse to fit a transform (see below) -- in that
+            case the to-be-converted sources' rows are set to NaN instead,
+            logged, and excluded from converted_sources so callers don't
+            try to skip re-matching a group whose rows are now all-NaN.
+        dropped_sources : set[str]
+            val_source labels that were identified as needing conversion
+            (part of ``to_convert``) but couldn't be -- reference_source
+            was absent, too sparse (< 2 valid collocated pairs), or its own
+            CDF-matching fit raised. Their sar_<sar_var>/val_<val_var> rows
+            are the same NaN'd-out rows excluded from converted_sources
+            above; this set lets callers distinguish "this source needed no
+            conversion at all" (empty dropped_sources, possibly non-empty
+            converted_sources) from "this source WAS supposed to be
+            converted but got dropped" (non-empty dropped_sources) --
+            both cases otherwise look identical via converted_sources alone
+            (empty). Always empty when to_convert is empty (the true no-op
+            fast path) or when every source in to_convert was converted
+            successfully.
+    """
+    sar_col = f"sar_{sar_var}"
+    val_col = f"val_{val_var}"
+    if sar_col not in collocation_ds or val_col not in collocation_ds or "val_source" not in collocation_ds:
+        return collocation_ds, set(), set()
+
+    sar_family = _normalize_units_family(collocation_ds[sar_col].attrs.get("units", ""))
+    reference_family = _VAL_SOURCE_UNITS_FAMILY.get(reference_source)
+    present_sources = set(str(s) for s in collocation_ds["val_source"].values)
+    to_convert = {
+        s for s in present_sources
+        if _VAL_SOURCE_UNITS_FAMILY.get(s) is not None
+        and _VAL_SOURCE_UNITS_FAMILY.get(s) == sar_family
+        and _VAL_SOURCE_UNITS_FAMILY.get(s) != reference_family
+    }
+    if not to_convert:
+        return collocation_ds, set(), set()
+
+    def _drop_rows(reason: str) -> xr.Dataset:
+        logger.warning(
+            "_harmonize_percent_domain_sources: %s -- dropping %s from the "
+            "CDF-matched section for this run (still available in native "
+            "units). %s", reason, sorted(to_convert), reason,
+        )
+        out = collocation_ds.copy(deep=True)
+        drop_mask = out["val_source"].isin(list(to_convert))
+        out[sar_col] = out[sar_col].where(~drop_mask)
+        out[val_col] = out[val_col].where(~drop_mask)
+        return out
+
+    if reference_source not in present_sources:
+        return _drop_rows(f"reference source {reference_source!r} is absent"), set(), set(to_convert)
+
+    df = collocation_ds[[sar_col, val_col, "val_source"]].to_dataframe()
+    ref_mask = df["val_source"].astype(str) == reference_source
+    ref_df = df.loc[ref_mask, [sar_col, val_col]].dropna()
+    if len(ref_df) < 2:
+        return (
+            _drop_rows(f"reference source {reference_source!r} has < 2 valid collocated pairs"),
+            set(),
+            set(to_convert),
+        )
+
+    from pytesmo.cdf_matching import CDFMatching
+
+    nbins = max(2, min(10, len(ref_df) // 20))
+    matcher = CDFMatching(nbins=nbins, minobs=20)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message=re.escape(_BINS_RESIZED_MESSAGE), category=UserWarning,
+        )
+        try:
+            matcher.fit(
+                ref_df[sar_col].values.astype(float), ref_df[val_col].values.astype(float),
+            )
+        except Exception as exc:
+            return (
+                _drop_rows(f"reference source {reference_source!r}'s CDF-matching fit failed: {exc}"),
+                set(),
+                set(to_convert),
+            )
+
+        out = collocation_ds.copy(deep=True)
+        convert_mask = out["val_source"].isin(list(to_convert)).values
+        sar_raw = out[sar_col].values.astype(float)
+        val_raw = out[val_col].values.astype(float)
+        valid = convert_mask & np.isfinite(sar_raw) & np.isfinite(val_raw)
+
+        sar_out = sar_raw.copy()
+        val_out = val_raw.copy()
+        if valid.any():
+            sar_out[valid] = matcher.predict(sar_raw[valid])
+            val_out[valid] = matcher.predict(val_raw[valid])
+    sar_out[convert_mask & ~valid] = np.nan
+    val_out[convert_mask & ~valid] = np.nan
+    out[sar_col].values = sar_out
+    out[val_col].values = val_out
+
+    if "val_units" in out:
+        ref_row_idx = np.flatnonzero(np.array(out["val_source"].values, dtype=str) == reference_source)
+        if len(ref_row_idx):
+            new_units = str(out["val_units"].values[ref_row_idx[0]])
+            val_units_arr = out["val_units"].values.copy()
+            val_units_arr[convert_mask] = new_units
+            out["val_units"].values = val_units_arr
+
+            new_long_name = None
+            if "val_long_name" in out:
+                new_long_name = str(out["val_long_name"].values[ref_row_idx[0]])
+                val_long_name_arr = out["val_long_name"].values.copy()
+                val_long_name_arr[convert_mask] = new_long_name
+                out["val_long_name"].values = val_long_name_arr
+
+            if len(set(out["val_units"].values.tolist())) == 1:
+                out[val_col].attrs["units"] = new_units
+                out[sar_col].attrs["units"] = new_units
+                if new_long_name is not None:
+                    out[val_col].attrs["long_name"] = new_long_name
+
+    return out, to_convert, set()
 
 
 # ---------------------------------------------------------------------------
@@ -651,4 +887,91 @@ def run_statistics(
 
     if not results:
         logger.warning("run_statistics: no statistics produced (check variable names).")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Native-units statistics pass (soil moisture only)
+# ---------------------------------------------------------------------------
+
+#: Unit family per validation-source platform type, used to gate the
+#: native-units statistics pass (run_statistics_native_units). Keyed by
+#: val_source, NOT read off the pooled val_<var> column — a single
+#: collocation_results.nc column mixes multiple sources' raw values (e.g.
+#: ASCAT's "%" alongside ISMN's "m3 m-3"), so a column-level units attr
+#: cannot represent per-row units once they're pooled. See
+#: design-choices.md §8.7.
+_VAL_SOURCE_UNITS_FAMILY: dict[str, str] = {
+    "ismn": "volumetric",
+    "ascat_ssm": "percent_saturation",
+    "amsr_ssm": "volumetric",
+    "smap_ssm": "volumetric",
+    "smos_ssm": "volumetric",
+}
+
+
+def _normalize_units_family(units: str) -> str:
+    """Map a CF units string to a coarse family for the native-units gate."""
+    u = (units or "").strip().lower()
+    if u in ("%", "percent"):
+        return "percent_saturation"
+    if u in ("m3 m-3", "m3/m3", "cm3 cm-3", "cm3/cm3", "1"):
+        return "volumetric"
+    return u or "unknown"
+
+
+def run_statistics_native_units(
+    collocation_ds: xr.Dataset,
+    recipe,
+    base_dir: Union[str, Path],
+    filename_suffix: str = "",
+) -> dict[str, xr.Dataset]:
+    """
+    Second, non-CDF-matched statistics pass for soil_moisture recipes.
+
+    Computes the plain, generic :func:`compute_statistics` (no rescaling)
+    for each ``(sar_var, val_var)`` pair, then keeps only the ``source``
+    entries (val_source platform types) whose unit family
+    (:data:`_VAL_SOURCE_UNITS_FAMILY`) matches the SAR variable's own
+    ``units`` attribute family. Written to
+    ``validation_statistics_<sar_var>_vs_<val_var>_native_units<filename_suffix>.nc/.csv``,
+    only when at least one matching-unit source is present for that pair.
+
+    No-op (returns ``{}``) for any recipe whose ``config.variable`` is not
+    ``"soil_moisture"``.
+    """
+    base_dir = Path(base_dir)
+    if recipe.config.variable != "soil_moisture":
+        return {}
+
+    try:
+        pairs = filter_variable_pairs(recipe, collocation_ds)
+    except KeyError as exc:
+        logger.error("run_statistics_native_units: %s", exc)
+        return {}
+
+    results: dict[str, xr.Dataset] = {}
+    for sar_var, val_var in pairs:
+        sar_col = f"sar_{sar_var}"
+        if sar_col not in collocation_ds:
+            continue
+        sar_family = _normalize_units_family(collocation_ds[sar_col].attrs.get("units", ""))
+
+        stats_ds = compute_statistics(collocation_ds, sar_var, val_var, group_by=["val_source"])
+        if stats_ds is None:
+            continue
+
+        matching = [
+            s for s in stats_ds["source"].values
+            if _VAL_SOURCE_UNITS_FAMILY.get(str(s)) == sar_family
+        ]
+        if not matching:
+            continue
+        stats_ds = stats_ds.sel(source=matching)
+
+        key = f"{sar_var}_vs_{val_var}"
+        out_path = base_dir / f"validation_statistics_{key}_native_units{filename_suffix}.nc"
+        save_statistics(stats_ds, out_path)
+        results[key] = stats_ds
+
     return results

@@ -903,6 +903,612 @@ class DataTreeConverter:
         return ds
 
     @staticmethod
+    def from_ascat_ssm(path: Union[str, Path]) -> Optional[xr.Dataset]:
+        """
+        Open an ASCAT Soil Moisture (SOMO12) product via the TU Wien
+        ``ascat`` package's format-agnostic reader (transparently handles
+        .nc/.bfr/.nat — see ``ascat.eumetsat.level2.AscatL2File``) and
+        return a standardised Dataset with a flat ``point`` dimension.
+
+        CONFIRMED against a real downloaded product: a genuine
+        ``EO:EUM:DAT:METOP:SOMO12`` ``.nat`` file (METOP-B, 2024-01-02)
+        fetched via EUMDAC was read successfully by ``AscatL2File(...).read(
+        generic=True, to_xarray=True)``, yielding generic ``sm``/``lon``/
+        ``lat``/``time`` fields as assumed below; the resulting
+        ``SOIL_MOISTURE`` values fell in the expected 0-100 (percent
+        saturation) range across 26789 points.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to the downloaded ASCAT SSM product file.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="scatterometer_ssm"``, or None on failure.
+        """
+        path = Path(path)
+        if not path.exists():
+            logger.warning("ASCAT SSM file not found: %s", path)
+            return None
+
+        try:
+            from ascat.eumetsat.level2 import AscatL2File
+
+            reader = AscatL2File(str(path))
+            data, _metadata = reader.read(generic=True, to_xarray=True)
+        except Exception as exc:
+            logger.warning("Could not read ASCAT SSM file %s: %s", path, exc)
+            return None
+
+        if not isinstance(data, xr.Dataset) or "sm" not in data:
+            logger.warning("No usable 'sm' field in %s.", path.name)
+            return None
+
+        if not ("lon" in data and "lat" in data and "time" in data):
+            logger.warning(
+                "Missing lon/lat/time field(s) in %s (available: %s).",
+                path.name,
+                list(data.coords) + list(data.data_vars),
+            )
+            return None
+
+        lon = ((data["lon"].values.ravel() + 180) % 360) - 180
+        lat = data["lat"].values.ravel()
+        time_vals = pd.to_datetime(data["time"].values.ravel())
+        sm = data["sm"].values.ravel().astype(float)
+
+        valid = ~np.isnan(sm)
+        if not valid.any():
+            logger.warning("from_ascat_ssm: all cells NaN in %s.", path.name)
+            return None
+
+        var_attrs = {
+            "SOIL_MOISTURE": {
+                "units": "%",
+                "standard_name": "soil_moisture_saturation",
+                "long_name": "ASCAT surface soil moisture (~0-5cm, C-band)",
+            }
+        }
+        ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", sm[valid])},
+            coords={
+                "lon":  ("point", lon[valid]),
+                "lat":  ("point", lat[valid]),
+                "time": ("point", time_vals.values[valid]),
+            },
+        )
+        apply_cf_metadata(ds, "scatterometer_ssm", var_attrs)
+
+        ds.attrs["data_type"]        = "scatterometer_ssm"
+        ds.attrs["platform_type"]    = "ascat_ssm"
+        ds.attrs["source"]           = "ASCAT Soil Moisture 12.5km Swath Grid (EO:EUM:DAT:METOP:SOMO12)"
+        ds.attrs["sensing_depth_cm"] = "0-5"
+        ds.attrs["band"]             = "C"
+        ds.attrs["filename"]         = path.name
+
+        return ds
+
+    @staticmethod
+    def from_amsr_ssm(path: Union[str, Path]) -> Optional[xr.Dataset]:
+        """
+        Open an AMSR-E/AMSR2 soil-moisture product and return a
+        standardised Dataset with a flat ``point`` dimension. Three on-disk
+        formats are supported, auto-detected from the file's own group
+        layout:
+
+        - **JAXA G-Portal L3SGSMC** (L3 daily 0.1-degree global grid;
+          what :class:`~sar_validation.downloaders.gportal_downloader.
+          GPortalAMSR2Downloader` actually delivers -- ``GW1AM2_
+          YYYYMMDD_01D_EQM[AD]_L3SGSMCHF*.h5``) -- detected via root-level
+          ``Geophysical Data``/``Time Information`` datasets and delegated
+          to :meth:`_from_amsr_ssm_gportal_l3_grid`. **Confirmed against a
+          real downloaded granule** (GW1AM2_20250701_01D_EQMA_
+          L3SGSMCHF3300300.h5) -- this is the format actually seen in
+          practice; the NSIDC-0451 branch below has not been.
+        - **NSIDC-0451** (L3 daily global grid; used for dates on or
+          before 2023-12-31, per the orchestrator's ``_NSIDC_0451_CUTOFF``)
+          -- handled below.
+        - **AU_Land_NRT_R02**/**AU_Land** (L2B half-orbit swath,
+          HDF-EOS5; the historical-coverage-extension replacement for
+          NSIDC-0451, used for dates after that cutoff) -- detected via
+          the presence of an ``HDFEOS/SWATHS`` group and delegated to
+          :meth:`_from_amsr_ssm_au_land_swath`.
+
+        Field names for the NSIDC-0451 branch are assumed from the
+        NSIDC-0451 v3.1 technical readme: ``vsm`` (surface, <=2cm,
+        volumetric soil moisture, X-band 10.7 GHz), ``longitude``/
+        ``latitude`` as flat root-level datasets, plus a
+        ``time_coverage_start`` file attribute. This has not been confirmed
+        against a real downloaded file (see the plan's open items) -- if
+        the real product nests these under a group (e.g.
+        ``/Data Fields/vsm``), the ``f["vsm"]``/``f["longitude"]``/
+        ``f["latitude"]`` lookups below will need updating.
+        NSIDC-0451 uses -9999.0 as its fill value (not NaN) -- cells equal
+        to this value are dropped.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to the downloaded HDF5 file.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="radiometer_ssm"``, ``sensor="amsr"``,
+            or None on failure.
+        """
+        import h5py
+
+        path = Path(path)
+        if not path.exists():
+            logger.warning("AMSR SSM file not found: %s", path)
+            return None
+
+        try:
+            with h5py.File(path, "r") as f:
+                if "HDFEOS/SWATHS" in f:
+                    return DataTreeConverter._from_amsr_ssm_au_land_swath(f, path)
+                if "Geophysical Data" in f and "Time Information" in f:
+                    return DataTreeConverter._from_amsr_ssm_gportal_l3_grid(f, path)
+                # ... existing NSIDC-0451 L3 daily-grid parsing continues below,
+                # unchanged ...
+                if not ("vsm" in f and "longitude" in f and "latitude" in f):
+                    logger.warning(
+                        "Missing vsm/longitude/latitude field(s) in %s (available: %s).",
+                        path.name, list(f.keys()),
+                    )
+                    return None
+                sm = np.asarray(f["vsm"][:], dtype=float).ravel()
+                lon = np.asarray(f["longitude"][:], dtype=float).ravel()
+                lat = np.asarray(f["latitude"][:], dtype=float).ravel()
+                time_attr = f.attrs.get("time_coverage_start")
+        except Exception as exc:
+            logger.warning("Could not read AMSR SSM file %s: %s", path, exc)
+            return None
+
+        lon = ((lon + 180) % 360) - 180
+
+        valid = (sm != -9999.0) & ~np.isnan(sm)
+        if not valid.any():
+            logger.warning("from_amsr_ssm: all cells invalid in %s.", path.name)
+            return None
+
+        if time_attr:
+            time_val = pd.Timestamp(time_attr.decode() if isinstance(time_attr, bytes) else time_attr)
+        else:
+            logger.warning("No time_coverage_start in %s; using NaT.", path.name)
+            time_val = pd.NaT
+        n_valid = int(valid.sum())
+        time_arr = np.full(n_valid, np.datetime64(time_val, "ns"))
+
+        var_attrs = {
+            "SOIL_MOISTURE": {
+                "units": "m3 m-3",
+                "standard_name": "volume_fraction_of_water_in_soil",
+                "long_name": "AMSR-E/2 surface soil moisture (~0-1cm, X/Ka-band)",
+            }
+        }
+        ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", sm[valid])},
+            coords={
+                "lon":  ("point", lon[valid]),
+                "lat":  ("point", lat[valid]),
+                "time": ("point", time_arr),
+            },
+        )
+        apply_cf_metadata(ds, "radiometer_ssm", var_attrs)
+
+        ds.attrs["data_type"]        = "radiometer_ssm"
+        ds.attrs["platform_type"]    = "amsr_ssm"
+        ds.attrs["sensor"]           = "amsr"
+        ds.attrs["source"]           = "AMSR-E/AMSR2 Daily Global Land Parameters (NSIDC-0451)"
+        ds.attrs["sensing_depth_cm"] = "0-1"
+        ds.attrs["band"]             = "X/Ka"
+        ds.attrs["filename"]         = path.name
+
+        return ds
+
+    @staticmethod
+    def _from_amsr_ssm_au_land_swath(f: Any, path: Path) -> Optional[xr.Dataset]:
+        """
+        Parse an ``AU_Land``/``AU_Land_NRT_R02`` L2B half-orbit swath
+        granule (HDF-EOS5 format) -- the historical-coverage-extension
+        replacement for the fully-discontinued NSIDC-0451 L3 daily grid.
+
+        Field paths (``HDFEOS/SWATHS/AMSR2_Land/Data Fields/Soil_Moisture``
+        etc.) are a best-effort guess based on NSIDC's ``au_land-v001-
+        userguide.pdf`` Table 2 and the general HDF-EOS5 swath convention
+        used by other NSIDC AMSR products -- **this has not been confirmed
+        against a real downloaded granule** (no NASA Earthdata credentials
+        were available when this method was introduced; unlike
+        :meth:`from_ascat_ssm`, which *is* backed by a real downloaded
+        product). If a real granule uses different field names or group
+        nesting, the lookups below will raise ``KeyError`` and this method
+        returns None rather than propagating the exception or producing
+        wrong data -- update the paths here (and the synthetic-HDF5 test
+        fixture in ``TestFromAmsrSsmAuLandFormat``) once a real granule can
+        be inspected.
+        """
+        try:
+            swath_group = f["HDFEOS/SWATHS/AMSR2_Land"]
+            sm = swath_group["Data Fields/Soil_Moisture"][:]
+            lat = swath_group["Geolocation Fields/Latitude"][:]
+            lon = swath_group["Geolocation Fields/Longitude"][:]
+            time_raw = swath_group["Geolocation Fields/Time"][:]
+        except KeyError as exc:
+            logger.warning(
+                "from_amsr_ssm: AU_Land swath file %s is missing an expected "
+                "field/group (%s) -- field layout is unconfirmed against a "
+                "real granule (see docstring); refusing to guess.",
+                path.name, exc,
+            )
+            return None
+
+        valid = ~np.isnan(sm)
+        if not valid.any():
+            logger.warning("from_amsr_ssm: all cells invalid in %s.", path.name)
+            return None
+
+        time_vals = pd.to_datetime(time_raw[valid], unit="s")
+        var_attrs = {
+            "SOIL_MOISTURE": {
+                "units": "m3 m-3",
+                "standard_name": "volume_fraction_of_water_in_soil",
+                "long_name": "AMSR-E/2 surface soil moisture (~0-1cm, X/Ka-band)",
+            }
+        }
+        ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", sm[valid].astype(float))},
+            coords={
+                "lon":  ("point", lon[valid].astype(float)),
+                "lat":  ("point", lat[valid].astype(float)),
+                "time": ("point", time_vals.values),
+            },
+        )
+        apply_cf_metadata(ds, "radiometer_ssm", var_attrs)
+
+        ds.attrs["data_type"]        = "radiometer_ssm"
+        ds.attrs["platform_type"]    = "amsr_ssm"
+        ds.attrs["sensor"]           = "amsr"
+        ds.attrs["source"]           = "AMSR-E/AMSR2 Unified L2B Half-Orbit SSM (AU_Land/AU_Land_NRT_R02)"
+        ds.attrs["sensing_depth_cm"] = "0-1"
+        ds.attrs["band"]             = "X/Ka"
+        ds.attrs["filename"]         = path.name
+
+        return ds
+
+    @staticmethod
+    def _from_amsr_ssm_gportal_l3_grid(f: Any, path: Path) -> Optional[xr.Dataset]:
+        """
+        Parse a JAXA G-Portal AMSR2 L3 daily 0.1-degree global soil-moisture
+        grid (``GW1AM2_YYYYMMDD_01D_EQM[AD]_L3SGSMCHF*.h5``) -- the format
+        actually delivered by :class:`~sar_validation.downloaders.
+        gportal_downloader.GPortalAMSR2Downloader`, distinct from both the
+        NSIDC-0451 grid and the AU_Land swath formats above.
+
+        **Confirmed against a real downloaded granule**
+        (GW1AM2_20250701_01D_EQMA_L3SGSMCHF3300300.h5): ``Geophysical
+        Data`` is a root-level ``(1800, 3600, 1)`` int16 dataset (its
+        ``SCALE FACTOR``/``UNIT`` attrs give raw*0.1 = percent volumetric
+        soil moisture -- confirmed by its own ``GeophysicalName`` file
+        attribute, "Soil Moisture Content"); ``Time Information`` is a
+        sibling ``(1800, 3600)`` int16 dataset in minutes-since-00:00-UTC
+        of the granule's date (consistent with the file's own
+        ``ObservationStartDateTime``/``ObservationEndDateTime`` attrs).
+        There are no on-disk longitude/latitude fields -- the grid is a
+        fixed global 0.1 degree EQR grid (JAXA GCOM-W's standard L3 grid
+        definition): row 0 = 89.95 N downward, column 0 = -179.95 E
+        eastward. ``-32768``/``-32767`` are sentinel codes (no-retrieval /
+        missing-observation respectively, not physical readings) -- any
+        negative raw value is treated as invalid.
+        """
+        try:
+            sm_raw = np.asarray(f["Geophysical Data"][:, :, 0], dtype=np.int32)
+            time_raw = np.asarray(f["Time Information"][:], dtype=np.int32)
+        except KeyError as exc:
+            logger.warning(
+                "from_amsr_ssm: missing expected field in G-Portal L3 grid "
+                "file %s (%s).", path.name, exc,
+            )
+            return None
+
+        # Both the reading and its per-pixel observation time must be valid
+        # -- a soil-moisture value collocation can't use without a real
+        # timestamp is as useless as no reading at all, and pushing NaT
+        # handling downstream into collocation's temporal-distance math
+        # would be fragile. ~15% of otherwise-valid-sm cells in the
+        # confirmed test granule lack a valid Time Information value.
+        valid = (sm_raw >= 0) & (time_raw >= 0)
+        if not valid.any():
+            logger.warning("from_amsr_ssm: all cells invalid in %s.", path.name)
+            return None
+
+        date_match = re.search(r"_(\d{8})_", path.name)
+        if date_match is None:
+            logger.warning(
+                "from_amsr_ssm: could not parse a YYYYMMDD date from filename "
+                "%s.", path.name,
+            )
+            return None
+        granule_date = pd.Timestamp(date_match.group(1))
+
+        sm_scale = float(np.asarray(f["Geophysical Data"].attrs.get("SCALE FACTOR", [0.1]))[0])
+        sm_percent = sm_raw[valid].astype(float) * sm_scale
+        sm = sm_percent / 100.0   # percent -> m3 m-3 volumetric fraction
+
+        ny, nx = sm_raw.shape
+        lat_1d = 90.0 - (np.arange(ny) + 0.5) * (180.0 / ny)
+        lon_1d = -180.0 + (np.arange(nx) + 0.5) * (360.0 / nx)
+        lat2d, lon2d = np.meshgrid(lat_1d, lon_1d, indexing="ij")
+
+        time_scale = float(np.asarray(f["Time Information"].attrs.get("SCALE FACTOR", [1.0]))[0])
+        minutes = time_raw[valid].astype(float) * time_scale
+        time_vals = (granule_date + pd.to_timedelta(minutes, unit="m")).values
+
+        var_attrs = {
+            "SOIL_MOISTURE": {
+                "units": "m3 m-3",
+                "standard_name": "volume_fraction_of_water_in_soil",
+                "long_name": "AMSR-E/2 surface soil moisture (~0-1cm, X/Ka-band)",
+            }
+        }
+        ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", sm)},
+            coords={
+                "lon":  ("point", lon2d[valid]),
+                "lat":  ("point", lat2d[valid]),
+                "time": ("point", time_vals),
+            },
+        )
+        apply_cf_metadata(ds, "radiometer_ssm", var_attrs)
+
+        ds.attrs["data_type"]        = "radiometer_ssm"
+        ds.attrs["platform_type"]    = "amsr_ssm"
+        ds.attrs["sensor"]           = "amsr"
+        ds.attrs["source"]           = "AMSR2 L3 Daily 0.1-degree Global Soil Moisture (JAXA G-Portal L3SGSMC)"
+        ds.attrs["sensing_depth_cm"] = "0-1"
+        ds.attrs["band"]             = "X/Ka"
+        ds.attrs["filename"]         = path.name
+        ds.attrs["native_grid_deg"] = 0.1
+
+        return ds
+
+    @staticmethod
+    def from_smap_ssm(path: Union[str, Path]) -> Optional[xr.Dataset]:
+        """
+        Open a SMAP Enhanced L2 Radiometer Soil Moisture product
+        (SPL2SMP_E, HDF5) and return a standardised Dataset with a flat
+        ``point`` dimension.
+
+        CONFIRMED against a real downloaded product
+        (``SMAP_L2_SM_P_E_55665_A_20250703T162602_R19240_001.h5``): fields
+        do live under the ``Soil_Moisture_Retrieval_Data`` HDF5 group as
+        ``soil_moisture``, ``longitude``, ``latitude``, ``tb_time_utc``
+        (per-cell ISO-8601 timestamp string), and ``soil_moisture`` uses
+        -9999.0 as its fill value (not NaN). Resulting SOIL_MOISTURE range
+        for that file: 0.02-0.79 m3/m3 (116711 of 264701 cells retained).
+
+        ``tb_time_utc`` carries its OWN, independent fill convention:
+        confirmed 118 of 264701 cells in that same file used a literal
+        ``"***"`` placeholder for the fractional-seconds digits (e.g.
+        ``"2025-07-03T17:19:25.***Z"``), at cells where ``soil_moisture``
+        itself was otherwise valid -- a strict ``pd.to_datetime`` on these
+        raises ``ValueError`` and aborts the whole conversion. Parsed with
+        ``errors="coerce"`` instead (turning unparseable strings into
+        ``NaT``) and dropped via the same validity mask as the
+        soil_moisture fill value.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to the downloaded HDF5 file.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="radiometer_ssm"``, ``sensor="smap"``,
+            or None on failure.
+        """
+        import h5py
+
+        path = Path(path)
+        if not path.exists():
+            logger.warning("SMAP SSM file not found: %s", path)
+            return None
+
+        try:
+            with h5py.File(path, "r") as f:
+                if "Soil_Moisture_Retrieval_Data" not in f:
+                    logger.warning(
+                        "Missing Soil_Moisture_Retrieval_Data group in %s (available: %s).",
+                        path.name, list(f.keys()),
+                    )
+                    return None
+                grp = f["Soil_Moisture_Retrieval_Data"]
+                required = ("soil_moisture", "longitude", "latitude", "tb_time_utc")
+                if not all(field in grp for field in required):
+                    logger.warning(
+                        "Missing soil_moisture/longitude/latitude/tb_time_utc field(s) in %s (available: %s).",
+                        path.name, list(grp.keys()),
+                    )
+                    return None
+                sm = np.asarray(grp["soil_moisture"][:], dtype=float).ravel()
+                lon = np.asarray(grp["longitude"][:], dtype=float).ravel()
+                lat = np.asarray(grp["latitude"][:], dtype=float).ravel()
+                time_raw = np.asarray(grp["tb_time_utc"][:]).ravel()
+        except Exception as exc:
+            logger.warning("Could not read SMAP SSM file %s: %s", path, exc)
+            return None
+
+        lon = ((lon + 180) % 360) - 180
+
+        # tb_time_utc carries its own, independent fill convention: some
+        # cells use a literal "***" placeholder for the fractional-seconds
+        # digits (e.g. "2025-07-03T17:19:25.***Z") even when soil_moisture
+        # itself is valid at that cell -- confirmed against a real
+        # downloaded SPL2SMP_E granule (118 of 264701 cells). errors="coerce"
+        # turns those into NaT rather than raising, so they can be dropped
+        # via the same validity mask as the -9999.0 soil_moisture fill.
+        time_strs = [
+            t.decode() if isinstance(t, bytes) else str(t)
+            for t in time_raw
+        ]
+        # Explicit format (rather than letting pandas infer it) keeps this
+        # vectorized -- mixing valid timestamps with "***"-fill strings
+        # defeats pandas' format auto-detection, which otherwise silently
+        # falls back to a much slower per-element dateutil parse (real
+        # files carry ~2.6e5 cells).
+        time_parsed = pd.to_datetime(time_strs, format="%Y-%m-%dT%H:%M:%S.%fZ", errors="coerce")
+
+        valid = (sm != -9999.0) & ~np.isnan(sm) & ~time_parsed.isna()
+        if not valid.any():
+            logger.warning("from_smap_ssm: all cells invalid in %s.", path.name)
+            return None
+
+        sm = sm[valid]
+        lon = lon[valid]
+        lat = lat[valid]
+        time_arr = time_parsed[valid].values
+
+        var_attrs = {
+            "SOIL_MOISTURE": {
+                "units": "m3 m-3",
+                "standard_name": "volume_fraction_of_water_in_soil",
+                "long_name": "SMAP surface soil moisture (~0-5cm, L-band)",
+            }
+        }
+        ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", sm)},
+            coords={
+                "lon":  ("point", lon),
+                "lat":  ("point", lat),
+                "time": ("point", time_arr),
+            },
+        )
+        apply_cf_metadata(ds, "radiometer_ssm", var_attrs)
+
+        ds.attrs["data_type"]        = "radiometer_ssm"
+        ds.attrs["platform_type"]    = "smap_ssm"
+        ds.attrs["sensor"]           = "smap"
+        ds.attrs["source"]           = "SMAP Enhanced L2 Radiometer Soil Moisture (SPL2SMP_E)"
+        ds.attrs["sensing_depth_cm"] = "0-5"
+        ds.attrs["band"]             = "L"
+        ds.attrs["filename"]         = path.name
+
+        return ds
+
+    @staticmethod
+    def from_smos_ssm(path: Union[str, Path]) -> Optional[xr.Dataset]:
+        """
+        Open a SMOS soil-moisture product (ESA Online Dissemination,
+        SM_OPER_MIR_SMUDP2, NetCDF) and return a standardised Dataset with
+        a flat ``point`` dimension.
+
+        CONFIRMED against a real downloaded product (fetched via the OADS
+        portal, NRT_Open/MIR_SMNRT2, 2025-07-02): field names are
+        **lowercase** (``soil_moisture``/``longitude``/``latitude``), NOT
+        the capitalised names originally assumed here. There is also no
+        single ``time`` variable -- per-point acquisition time is instead
+        split across two integer fields, ``days_since_01-01-2000`` (days
+        since the SMOS epoch 2000-01-01T00:00:00) and
+        ``seconds_since_midnight`` (seconds within that day), combined
+        below. Confirmed the real product is plain NetCDF at the top level
+        (no ``.tgz``/``.HDR`` extraction needed).
+
+        Confirmed soil_moisture has no ``-999.0``-style fill sentinel in
+        real data (a full real granule's min/max were both plain physical
+        values in ``[0, 1]``, no NaN) -- validity is primarily via
+        ``~np.isnan`` (matching whatever fill/missing-value decoding
+        ``xr.open_dataset``'s default ``mask_and_scale=True`` already
+        applied), with the ``-999.0`` check kept alongside it only as
+        cheap, harmless insurance in case some other file/swath does use
+        that sentinel.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to the downloaded NetCDF file.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="radiometer_ssm"``, ``sensor="smos"``,
+            or None on failure.
+        """
+        path = Path(path)
+        if not path.exists():
+            logger.warning("SMOS SSM file not found: %s", path)
+            return None
+
+        try:
+            raw = xr.open_dataset(path)
+        except Exception as exc:
+            logger.warning("Could not open %s: %s", path, exc)
+            return None
+
+        required = (
+            "soil_moisture", "longitude", "latitude",
+            "days_since_01-01-2000", "seconds_since_midnight",
+        )
+        if not all(field in raw.variables for field in required):
+            logger.warning(
+                "Missing soil_moisture/longitude/latitude/"
+                "days_since_01-01-2000/seconds_since_midnight field(s) in "
+                "%s (available: %s).",
+                path.name, list(raw.variables),
+            )
+            raw.close()
+            return None
+
+        lon = ((raw["longitude"].values.ravel() + 180) % 360) - 180
+        lat = raw["latitude"].values.ravel()
+        smos_epoch = pd.Timestamp("2000-01-01")
+        days = raw["days_since_01-01-2000"].values.ravel().astype("int64")
+        seconds = raw["seconds_since_midnight"].values.ravel().astype("int64")
+        time_arr = (
+            smos_epoch
+            + pd.to_timedelta(days, unit="D")
+            + pd.to_timedelta(seconds, unit="s")
+        )
+        sm = raw["soil_moisture"].values.ravel().astype(float)
+
+        valid = ~np.isnan(sm) & (sm != -999.0)
+        if not valid.any():
+            logger.warning("from_smos_ssm: all cells invalid in %s.", path.name)
+            raw.close()
+            return None
+
+        var_attrs = {
+            "SOIL_MOISTURE": {
+                "units": "m3 m-3",
+                "standard_name": "volume_fraction_of_water_in_soil",
+                "long_name": "SMOS surface soil moisture (~0-5cm, L-band)",
+            }
+        }
+        ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", sm[valid])},
+            coords={
+                "lon":  ("point", lon[valid]),
+                "lat":  ("point", lat[valid]),
+                "time": ("point", time_arr.values[valid]),
+            },
+        )
+        apply_cf_metadata(ds, "radiometer_ssm", var_attrs)
+
+        ds.attrs["data_type"]        = "radiometer_ssm"
+        ds.attrs["platform_type"]    = "smos_ssm"
+        ds.attrs["sensor"]           = "smos"
+        ds.attrs["source"]           = "SMOS Soil Moisture (ESA Online Dissemination, SM_OPER_MIR_SMUDP2)"
+        ds.attrs["sensing_depth_cm"] = "0-5"
+        ds.attrs["band"]             = "L"
+        ds.attrs["filename"]         = path.name
+
+        raw.close()
+        return ds
+
+    @staticmethod
     def from_hf_radar_grid(
         nc_path: Union[str, Path],
         u_var: str = "water_u",
@@ -2299,6 +2905,10 @@ class DataTreeConverter:
         - ``drifter_historical/*.csv`` → ``validation/drifter_historical/<stem>`` nodes
         - ``glider_historical/*.csv``  → ``validation/glider_historical/<stem>`` nodes
         - ``ismn/*.csv``                → ``validation/ismn/<stem>`` nodes
+        - ``ascat_ssm/*``               → ``validation/ascat_ssm/<stem>`` nodes
+        - ``amsr_ssm/*.h5``             → ``validation/amsr_ssm/<stem>`` nodes
+        - ``smap_ssm/*.h5``             → ``validation/smap_ssm/<stem>`` nodes
+        - ``smos_ssm/*.nc``             → ``validation/smos_ssm/<stem>`` nodes
         - ``altimeter/*.nc``           → ``validation/altimeter/<stem>`` nodes
 
         Parameters
@@ -2437,6 +3047,72 @@ class DataTreeConverter:
                     if ds is not None:
                         datasets[f"validation/{subdir_name}/{nc_path.stem}"] = ds
                         logger.info("Converted %s (scatterometer): %s", subdir_name, nc_path.name)
+
+        # ASCAT Soil Moisture (SOMO12, historical-only — see design doc).
+        # Files are read format-agnostically by the ``ascat`` package
+        # (.nc/.bfr/.nat all funnel through from_ascat_ssm). EUMDAC delivers
+        # each order alongside sidecar metadata files (confirmed against a
+        # real download: EOPMetadata.xml, manifest.xml sitting in the same
+        # flat directory as the .nat products) -- skip non-data extensions
+        # rather than attempting (and noisily failing to) convert them.
+        _ASCAT_DATA_SUFFIXES = (
+            ".nc", ".nc.gz", ".bfr", ".bfr.gz", ".buf", ".buf.gz", ".nat", ".nat.gz",
+        )
+        subdir = base_dir / "ascat_ssm"
+        if subdir.exists():
+            for f in sorted(subdir.iterdir()):
+                if not f.is_file():
+                    continue
+                name_lower = f.name.lower()
+                if not name_lower.endswith(_ASCAT_DATA_SUFFIXES):
+                    continue
+                ds = _filtered(DataTreeConverter.from_ascat_ssm(f), f.name)
+                if ds is not None:
+                    datasets[f"validation/ascat_ssm/{f.stem}"] = ds
+                    logger.info("Converted ASCAT SSM: %s", f.name)
+
+        # AMSR-E/AMSR2 Daily Global Land Parameters (NSIDC-0451, HDF5, ``.h5``)
+        # or AU_Land_NRT_R02/AU_Land (HDF-EOS5 swath, conventionally ``.he5``).
+        subdir = base_dir / "amsr_ssm"
+        if subdir.exists():
+            for f in sorted(list(subdir.glob("*.h5")) + list(subdir.glob("*.he5"))):
+                ds = _filtered(DataTreeConverter.from_amsr_ssm(f), f.name)
+                if ds is not None:
+                    datasets[f"validation/amsr_ssm/{f.stem}"] = ds
+                    logger.info("Converted AMSR SSM: %s", f.name)
+
+        # SMAP Enhanced L2 Radiometer Soil Moisture (SPL2SMP_E, HDF5).
+        subdir = base_dir / "smap_ssm"
+        if subdir.exists():
+            for f in sorted(subdir.glob("*.h5")):
+                ds = _filtered(DataTreeConverter.from_smap_ssm(f), f.name)
+                if ds is not None:
+                    datasets[f"validation/smap_ssm/{f.stem}"] = ds
+                    logger.info("Converted SMAP SSM: %s", f.name)
+
+        # SMOS soil moisture (ESA Online Dissemination FTPS, NetCDF).
+        subdir = base_dir / "smos_ssm"
+        if subdir.exists():
+            nc_paths = sorted(subdir.glob("*.nc"))
+            if not nc_paths and any(f.is_file() for f in subdir.iterdir()):
+                # It is currently unconfirmed whether ESA serves this product
+                # as NetCDF or as a .tgz archive (see from_smos_ssm's
+                # docstring) -- SMOSDownloader accepts both and reports a
+                # successful download either way, so a directory full of
+                # .tgz (or any other non-.nc) files here would otherwise
+                # silently yield zero SMOS collocations with no warning
+                # surfaced anywhere.
+                logger.warning(
+                    "SMOS downloads present in %s but none match *.nc — if "
+                    "these are .tgz archives, they are not yet extracted; "
+                    "see from_smos_ssm's docstring.",
+                    subdir,
+                )
+            for f in nc_paths:
+                ds = _filtered(DataTreeConverter.from_smos_ssm(f), f.name)
+                if ds is not None:
+                    datasets[f"validation/smos_ssm/{f.stem}"] = ds
+                    logger.info("Converted SMOS SSM: %s", f.name)
 
         # NOAA HFRnet gridded RTV currents (flattened to points, tagged
         # hf_radar_grid). Domain-filtered like the scatterometer path.

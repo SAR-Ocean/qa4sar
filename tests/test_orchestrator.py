@@ -169,6 +169,200 @@ class TestDownloadIsmnDispatch:
         assert mock_instance.download.call_args.kwargs["archive_path"] is None
 
 
+class TestDownloadAscatSsmDispatch:
+    def test_ascat_ssm_source_type_dispatches_to_ascat_ssm_downloader(self, tmp_path):
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[ValidationDataSource(source_type="ascat_ssm")],
+        )
+        recipe = Recipe(cfg)
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader"
+        ) as mock_cls:
+            mock_instance = MagicMock()
+            mock_instance.download.return_value = []
+            mock_cls.return_value = mock_instance
+
+            ok = orchestrator._dispatch_source(cfg.validation_sources[0])
+
+        assert ok is True
+        mock_cls.assert_called_once()
+        assert mock_cls.call_args.kwargs["output_dir"] == tmp_path / "ascat_ssm"
+        assert orchestrator.metadata["downloads"]["ascat_ssm"]["status"] == "dry_run"
+
+    def test_ascat_ssm_metadata_records_files_list(self, tmp_path):
+        """Matches the established pattern used by _download_earthdata_ssm/
+        _download_smos_ssm -- ``metadata["downloads"]["ascat_ssm"]`` must
+        also carry the downloaded file paths, not just a status string."""
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[ValidationDataSource(source_type="ascat_ssm")],
+        )
+        recipe = Recipe(cfg)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+
+        downloaded_path = tmp_path / "ascat_ssm" / "ASCA_SMR_02_M02_fake.nc"
+
+        with patch(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader"
+        ) as mock_cls:
+            mock_instance = MagicMock()
+            mock_instance.download.return_value = [downloaded_path]
+            mock_cls.return_value = mock_instance
+
+            ok = orchestrator._dispatch_source(cfg.validation_sources[0])
+
+        assert ok is True
+        assert orchestrator.metadata["downloads"]["ascat_ssm"]["files"] == [str(downloaded_path)]
+
+    def test_ascat_ssm_download_failure_is_recorded_in_metadata(self, tmp_path):
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[ValidationDataSource(source_type="ascat_ssm")],
+        )
+        recipe = Recipe(cfg)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader"
+        ) as mock_cls:
+            mock_cls.side_effect = RuntimeError("boom")
+            ok = orchestrator._dispatch_source(cfg.validation_sources[0])
+
+        assert ok is False
+        assert orchestrator.metadata["downloads"]["ascat_ssm"]["status"] == "failed"
+        assert "boom" in orchestrator.metadata["errors"][0]
+
+
+class TestDownloadTemporalPadding:
+    """A multi-day soil_moisture recipe's first/last SAR scene needs
+    validation data from *outside* the literal requested date range to
+    fill its own +-time_tolerance collocation window -- e.g. day 1's
+    window extends 12h before the requested start. Previously,
+    ascat_ssm/amsr_ssm/smap_ssm download requests used the recipe's raw
+    start/end with no margin, so the first/last SAR scene in a run got
+    silently starved of validation data relative to scenes in the middle
+    of the range (visible as day 1/day 3 having far fewer matches, and
+    far less "unmatched" clutter on the diagnostics plot, than day 2).
+    Fixed by padding every validation-source download's start/end by that
+    source's own resolved collocation time-tolerance."""
+
+    def _recipe(self, **collocation_kwargs) -> Recipe:
+        from sar_validation.core.recipe import CollocationType
+
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-02-01", "2026-02-03"),
+            sar_data=SARDataSpec(product_level="L3_SSM"),
+            validation_sources=[
+                ValidationDataSource(source_type="ascat_ssm"),
+                ValidationDataSource(source_type="ismn"),
+            ],
+            collocation=CollocationType(**collocation_kwargs) if collocation_kwargs else CollocationType(),
+        )
+        return Recipe(cfg)
+
+    def test_resolve_temporal_padding_minutes_uses_default_layer_type_spec(self):
+        from sar_validation.core.orchestrator import _resolve_temporal_padding_minutes
+
+        cfg = self._recipe().config
+        # ascat_ssm's spec lives under "scatterometer_ssm" (its data_type
+        # tag), not its own source_type -- built into
+        # DEFAULT_LAYER_TYPE_SPECS regardless of recipe overrides.
+        assert _resolve_temporal_padding_minutes(cfg, "ascat_ssm") == 720.0
+        assert _resolve_temporal_padding_minutes(cfg, "amsr_ssm") == 720.0
+        assert _resolve_temporal_padding_minutes(cfg, "smap_ssm") == 720.0
+        assert _resolve_temporal_padding_minutes(cfg, "smos_ssm") == 720.0
+
+    def test_resolve_temporal_padding_minutes_falls_back_to_point_vs_layer_default(self):
+        from sar_validation.core.orchestrator import _resolve_temporal_padding_minutes
+
+        cfg = self._recipe().config
+        # "ismn" has no DEFAULT_LAYER_TYPE_SPECS entry -- falls back to the
+        # (unconfigured, so 30-min default) point_vs_layer tolerance.
+        assert _resolve_temporal_padding_minutes(cfg, "ismn") == 30.0
+
+    def test_resolve_temporal_padding_minutes_per_source_override_wins(self):
+        from sar_validation.core.orchestrator import _resolve_temporal_padding_minutes
+        from sar_validation.core.recipe import CollocationType
+
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-02-01", "2026-02-03"),
+            validation_sources=[
+                ValidationDataSource(
+                    source_type="ascat_ssm", collocation_kwargs={"time_tolerance_minutes": 45},
+                ),
+            ],
+            collocation=CollocationType(),
+        )
+        assert _resolve_temporal_padding_minutes(cfg, "ascat_ssm") == 45.0
+
+    def test_padded_temporal_bounds_pads_symmetrically(self):
+        from sar_validation.core.orchestrator import _padded_temporal_bounds
+
+        cfg = self._recipe().config
+        start, end = _padded_temporal_bounds(cfg, "ascat_ssm")
+        assert start == "2026-01-31T12:00:00"
+        assert end == "2026-02-03T12:00:00"
+
+    def test_ascat_ssm_download_receives_padded_bounds(self, tmp_path):
+        """The actual downloader call must see the padded start/end, not
+        the recipe's literal requested range."""
+        cfg = self._recipe().config
+        recipe = Recipe(cfg)
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader"
+        ) as mock_cls:
+            mock_instance = MagicMock()
+            mock_instance.download.return_value = []
+            mock_cls.return_value = mock_instance
+
+            orchestrator._dispatch_source(cfg.validation_sources[0])
+
+        call_kwargs = mock_instance.download.call_args.kwargs
+        assert call_kwargs["start"] == "2026-01-31T12:00:00"
+        assert call_kwargs["end"] == "2026-02-03T12:00:00"
+
+    def test_sar_download_is_not_padded(self, tmp_path):
+        """SAR scenes define the reference times other sources are padded
+        around -- padding the SAR request itself would fetch scenes
+        outside what the recipe actually asked for."""
+        cfg = self._recipe().config
+        recipe = Recipe(cfg)
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.soil_moisture_downloader.SoilMoistureDownloader"
+        ) as mock_cls:
+            mock_instance = MagicMock()
+            mock_instance.download.return_value = []
+            mock_cls.return_value = mock_instance
+
+            orchestrator._download_sar()
+
+        call_kwargs = mock_instance.download.call_args.kwargs
+        assert call_kwargs["start"] == "2026-02-01"
+        assert call_kwargs["end"] == "2026-02-03"
+
+
 class TestIsmnDownloadStatusReporting:
     """No ISMN archive collected must not be reported as 'success' -- that
     misled Lotte into thinking a run had worked when the ISMN step had
@@ -392,3 +586,251 @@ class TestCombinedCurrentsHistoricalStatusMessage:
         assert not any(
             "No delayed-mode in-situ current data found" in r.message for r in caplog.records
         )
+
+
+def test_dispatch_source_routes_amsr_ssm(tmp_path):
+    from unittest.mock import MagicMock
+
+    orch = DataOrchestrator.__new__(DataOrchestrator)
+    orch._download_amsr_ssm = MagicMock(return_value=True)
+    source = MagicMock(source_type="amsr_ssm")
+
+    result = orch._dispatch_source(source)
+
+    assert result is True
+    orch._download_amsr_ssm.assert_called_once_with(source)
+
+
+def test_dispatch_source_routes_smap_ssm(tmp_path):
+    from unittest.mock import MagicMock
+
+    orch = DataOrchestrator.__new__(DataOrchestrator)
+    orch._download_smap_ssm = MagicMock(return_value=True)
+    source = MagicMock(source_type="smap_ssm")
+
+    result = orch._dispatch_source(source)
+
+    assert result is True
+    orch._download_smap_ssm.assert_called_once_with(source)
+
+
+def test_dispatch_source_routes_smos_ssm(tmp_path):
+    from unittest.mock import MagicMock
+
+    orch = DataOrchestrator.__new__(DataOrchestrator)
+    orch._download_smos_ssm = MagicMock(return_value=True)
+    source = MagicMock(source_type="smos_ssm")
+
+    result = orch._dispatch_source(source)
+
+    assert result is True
+    orch._download_smos_ssm.assert_called_once_with(source)
+
+
+class TestPerSourceDownloadGating:
+    def _recipe_with_ascat_and_smos(self):
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[
+                ValidationDataSource(source_type="ascat_ssm"),
+                ValidationDataSource(source_type="smos_ssm"),
+            ],
+        )
+        return Recipe(cfg)
+
+    def test_already_succeeded_source_is_not_redispatched(self, tmp_path):
+        import json
+
+        recipe = self._recipe_with_ascat_and_smos()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        # Simulate a previous run: ascat_ssm succeeded, smos_ssm failed.
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "downloads": {
+                "ascat_ssm": {"status": "success", "files": ["a.nat"]},
+                "smos_ssm": {"status": "failed", "error": "timed out"},
+            },
+            "errors": ["SMOS SSM download failed: timed out"],
+            "notices": [],
+        }))
+        # Re-construct so __init__ picks up the metadata file just written.
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        orchestrator._previous_downloads = orchestrator._load_previous_downloads()
+
+        with patch.object(DataOrchestrator, "_download_ascat_ssm") as mock_ascat, \
+             patch.object(DataOrchestrator, "_download_smos_ssm", return_value=False) as mock_smos, \
+             patch.object(DataOrchestrator, "_download_sar", return_value=True):
+            orchestrator.download_all()
+
+        mock_ascat.assert_not_called()
+        mock_smos.assert_called_once()
+        assert orchestrator.metadata["downloads"]["ascat_ssm"]["status"] == "success"
+
+    def test_force_download_bypasses_gating(self, tmp_path):
+        import json
+
+        recipe = self._recipe_with_ascat_and_smos()
+        orchestrator = DataOrchestrator(recipe, dry_run=False, force_download=True)
+        orchestrator.base_dir = tmp_path
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "downloads": {"ascat_ssm": {"status": "success", "files": ["a.nat"]}},
+            "errors": [], "notices": [],
+        }))
+        orchestrator = DataOrchestrator(recipe, dry_run=False, force_download=True)
+        orchestrator.base_dir = tmp_path
+        orchestrator._previous_downloads = orchestrator._load_previous_downloads()
+
+        with patch.object(DataOrchestrator, "_download_ascat_ssm", return_value=True) as mock_ascat, \
+             patch.object(DataOrchestrator, "_download_smos_ssm", return_value=True), \
+             patch.object(DataOrchestrator, "_download_sar", return_value=True):
+            orchestrator.download_all()
+
+        mock_ascat.assert_called_once()
+
+    def test_no_previous_metadata_dispatches_everything(self, tmp_path):
+        recipe = self._recipe_with_ascat_and_smos()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path  # no download_metadata.json written
+
+        with patch.object(DataOrchestrator, "_download_ascat_ssm", return_value=True) as mock_ascat, \
+             patch.object(DataOrchestrator, "_download_smos_ssm", return_value=True) as mock_smos, \
+             patch.object(DataOrchestrator, "_download_sar", return_value=True):
+            orchestrator.download_all()
+
+        mock_ascat.assert_called_once()
+        mock_smos.assert_called_once()
+
+
+class TestAmsrCoverageCutoffNotice:
+    def _recipe_with_amsr(self, end_date: str):
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", end_date),
+            validation_sources=[ValidationDataSource(source_type="amsr_ssm")],
+        )
+        return Recipe(cfg)
+
+    def test_notice_added_when_request_exceeds_known_coverage(self, tmp_path):
+        recipe = self._recipe_with_amsr("2026-01-02")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
+        ) as mock_cls, patch(
+            "sar_validation.downloaders.gportal_downloader.GPortalAMSR2Downloader"
+        ) as mock_gportal_cls:
+            mock_instance = MagicMock()
+            mock_instance.download.return_value = []
+            mock_cls.return_value = mock_instance
+            mock_gportal_cls.return_value.download.return_value = []
+
+            orchestrator._download_amsr_ssm(recipe.config.validation_sources[0])
+
+        assert any(
+            "AMSR-E/2" in n and "2025-09-01" in n for n in orchestrator.metadata["notices"]
+        )
+        assert orchestrator.metadata["downloads"]["amsr_ssm"]["status"] == "success"
+        # A notice, not an error -- must not trip _is_already_downloaded's gate.
+        assert orchestrator.metadata["errors"] == []
+
+    def test_no_notice_when_within_coverage_and_files_found(self, tmp_path):
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2020-01-01", "2020-01-02"),
+            validation_sources=[ValidationDataSource(source_type="amsr_ssm")],
+        )
+        recipe = Recipe(cfg)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
+        ) as mock_cls:
+            mock_instance = MagicMock()
+            mock_instance.download.return_value = [tmp_path / "granule.h5"]
+            mock_cls.return_value = mock_instance
+
+            orchestrator._download_amsr_ssm(recipe.config.validation_sources[0])
+
+        assert orchestrator.metadata["notices"] == []
+
+    def test_selects_au_land_nrt_for_post_2023_dates(self, tmp_path):
+        recipe = self._recipe_with_amsr("2025-07-04")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
+        ) as mock_cls, patch(
+            "sar_validation.downloaders.gportal_downloader.GPortalAMSR2Downloader"
+        ) as mock_gportal_cls:
+            mock_instance = MagicMock()
+            mock_instance.download.return_value = []
+            mock_cls.return_value = mock_instance
+            mock_gportal_cls.return_value.download.return_value = []
+
+            orchestrator._download_amsr_ssm(recipe.config.validation_sources[0])
+
+        assert mock_cls.call_args.kwargs["dataset"] == "AU_Land_NRT_R02"
+
+    def test_notice_added_when_gportal_fallback_also_finds_nothing(self, tmp_path):
+        """Within AMSR's known coverage window (no coverage-cutoff notice),
+        if NASA Earthdata returns 0 granules AND the G-Portal SFTP fallback
+        also finds 0 files, the run must not silently report "success" with
+        no explanation -- confirmed against a real recipe run where G-Portal
+        logged "Found 0 AMSR2 file(s) in window." with no resulting notice
+        at all, indistinguishable from a genuinely successful download."""
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2025-07-01", "2025-07-03"),
+            validation_sources=[ValidationDataSource(source_type="amsr_ssm")],
+        )
+        recipe = Recipe(cfg)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
+        ) as mock_cls, patch(
+            "sar_validation.downloaders.gportal_downloader.GPortalAMSR2Downloader"
+        ) as mock_gportal_cls:
+            mock_instance = MagicMock()
+            mock_instance.download.return_value = []
+            mock_cls.return_value = mock_instance
+            mock_gportal_cls.return_value.download.return_value = []
+
+            orchestrator._download_amsr_ssm(recipe.config.validation_sources[0])
+
+        assert any(
+            "G-Portal" in n and "0 files" in n for n in orchestrator.metadata["notices"]
+        )
+        assert orchestrator.metadata["downloads"]["amsr_ssm"]["status"] == "success"
+        assert orchestrator.metadata["errors"] == []
+
+    def test_selects_nsidc0451_for_historical_dates(self, tmp_path):
+        recipe = self._recipe_with_amsr("2023-06-01")
+        # Override start so it's before end.
+        recipe.config.temporal_bounds.start = "2023-05-01"
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
+        ) as mock_cls, patch(
+            "sar_validation.downloaders.gportal_downloader.GPortalAMSR2Downloader"
+        ) as mock_gportal_cls:
+            mock_instance = MagicMock()
+            mock_instance.download.return_value = []
+            mock_cls.return_value = mock_instance
+            mock_gportal_cls.return_value.download.return_value = []
+
+            orchestrator._download_amsr_ssm(recipe.config.validation_sources[0])
+
+        assert mock_cls.call_args.kwargs["dataset"] == "NSIDC-0451"

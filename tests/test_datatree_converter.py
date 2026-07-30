@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -491,7 +492,7 @@ class TestAnnotateCollocationDs:
         val_ds = xr.Dataset({
             "WSPD": ("point", [7.0],
                      {"standard_name": "wind_speed", "units": "m s-1"}),
-        })
+        }, attrs={"platform_type": "mooring"})
         tree = DataTreeConverter.to_datatree({"sar/scene1": sar_ds, "validation/src": val_ds})
 
         coll_ds = DataTreeConverter.from_collocations(_make_collocations(2))
@@ -1633,3 +1634,573 @@ class TestBuildDatatreeCurrentsHistorical:
         # TestBuildDatatreeHfRadarHistorical convention — DataTree node
         # paths carry a leading "/" this key doesn't include.
         assert any(f"validation/{instrument}/{csv_path.stem}" in p for p in node_paths)
+
+
+class TestFromASCATSsm:
+    def test_returns_none_for_missing_file(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        result = DataTreeConverter.from_ascat_ssm(tmp_path / "does_not_exist.nc")
+        assert result is None
+
+    def test_converts_synthetic_file_via_ascat_package(self, tmp_path, monkeypatch):
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        fake_nc = tmp_path / "fake_ascat_ssm.nc"
+        fake_nc.write_bytes(b"")  # AscatL2File is mocked below, content unused
+
+        synthetic = xr.Dataset(
+            {
+                "sm": ("obs", np.array([25.0, 50.0, np.nan, 75.0])),
+            },
+            coords={
+                "lon": ("obs", np.array([-10.0, -5.0, 0.0, 5.0])),
+                "lat": ("obs", np.array([40.0, 45.0, 50.0, 55.0])),
+                "time": ("obs", pd.to_datetime(
+                    ["2026-01-01T00:00:00"] * 4
+                ).values),
+            },
+        )
+
+        fake_reader = MagicMock()
+        fake_reader.read.return_value = (synthetic, {})
+        fake_ascat_module = MagicMock()
+        fake_ascat_module.AscatL2File.return_value = fake_reader
+
+        with patch.dict("sys.modules", {"ascat.eumetsat.level2": fake_ascat_module}):
+            ds = DataTreeConverter.from_ascat_ssm(fake_nc)
+
+        assert ds is not None
+        assert "SOIL_MOISTURE" in ds
+        assert ds["SOIL_MOISTURE"].attrs["units"] == "%"
+        assert ds.attrs["data_type"] == "scatterometer_ssm"
+        assert ds.attrs["sensing_depth_cm"] == "0-5"
+        assert ds.attrs["band"] == "C"
+        # The NaN cell (index 2) must be dropped.
+        assert ds.sizes["point"] == 3
+        assert set(ds["SOIL_MOISTURE"].values) == {25.0, 50.0, 75.0}
+
+    def test_returns_none_when_lon_missing_from_reader_output(self, tmp_path):
+        """A real product missing lon/lat/time must not raise a KeyError
+        that would propagate out of convert_downloaded_data and abort the
+        whole conversion batch -- from_ascat_ssm must guard against it and
+        return None instead, same as from_scatterometer_nc does."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        fake_nc = tmp_path / "fake_ascat_ssm_no_lon.nc"
+        fake_nc.write_bytes(b"")  # AscatL2File is mocked below, content unused
+
+        # Has "sm" but no "lon" coord/var at all.
+        synthetic = xr.Dataset(
+            {"sm": ("obs", np.array([25.0, 50.0]))},
+        )
+
+        fake_reader = MagicMock()
+        fake_reader.read.return_value = (synthetic, {})
+        fake_ascat_module = MagicMock()
+        fake_ascat_module.AscatL2File.return_value = fake_reader
+
+        with patch.dict("sys.modules", {"ascat.eumetsat.level2": fake_ascat_module}):
+            ds = DataTreeConverter.from_ascat_ssm(fake_nc)
+
+        assert ds is None
+
+
+class TestFromAmsrSsm:
+    def test_returns_none_for_missing_file(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        result = DataTreeConverter.from_amsr_ssm(tmp_path / "does_not_exist.h5")
+        assert result is None
+
+    def test_converts_synthetic_h5_file(self, tmp_path):
+        import h5py
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        h5_path = tmp_path / "fake_nsidc0451.h5"
+        with h5py.File(h5_path, "w") as f:
+            f.create_dataset("vsm", data=np.array([0.10, 0.25, -9999.0, 0.40], dtype=np.float32))
+            f.create_dataset("longitude", data=np.array([-10.0, -5.0, 0.0, 5.0], dtype=np.float32))
+            f.create_dataset("latitude", data=np.array([40.0, 45.0, 50.0, 55.0], dtype=np.float32))
+            f.attrs["time_coverage_start"] = "2026-07-01T00:00:00"
+
+        ds = DataTreeConverter.from_amsr_ssm(h5_path)
+
+        assert ds is not None
+        assert "SOIL_MOISTURE" in ds
+        assert ds["SOIL_MOISTURE"].attrs["units"] == "m3 m-3"
+        assert ds.attrs["data_type"] == "radiometer_ssm"
+        assert ds.attrs["sensor"] == "amsr"
+        assert ds.attrs["sensing_depth_cm"] == "0-1"
+        assert ds.attrs["band"] == "X/Ka"
+        # The fill-value cell (-9999.0, index 2) must be dropped.
+        assert ds.sizes["point"] == 3
+
+    def test_returns_none_for_corrupted_file(self, tmp_path):
+        """A corrupted/truncated/non-HDF5 file at the AMSR SSM path must be
+        caught by from_amsr_ssm's own guard and return None -- not raise --
+        since convert_downloaded_data's per-file loop has no surrounding
+        try/except of its own and an unhandled exception here would abort
+        the entire conversion batch, not just this one file. This covers
+        the format-detection ``h5py.File`` open added for the AU_Land
+        branch, which must stay inside the existing try/except."""
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        bad_path = tmp_path / "corrupted.h5"
+        bad_path.write_bytes(b"this is not a valid hdf5 file")
+
+        result = DataTreeConverter.from_amsr_ssm(bad_path)
+
+        assert result is None
+
+    def test_returns_none_when_vsm_missing_from_file(self, tmp_path):
+        """A real product missing the vsm/longitude/latitude field(s) must
+        not raise a KeyError that would propagate out of
+        convert_downloaded_data and abort the whole conversion batch --
+        from_amsr_ssm must guard against it and return None instead, same
+        as from_ascat_ssm/from_scatterometer_nc do."""
+        import h5py
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        h5_path = tmp_path / "fake_nsidc0451_no_vsm.h5"
+        with h5py.File(h5_path, "w") as f:
+            # Has longitude/latitude but no vsm at all.
+            f.create_dataset("longitude", data=np.array([-10.0, -5.0], dtype=np.float32))
+            f.create_dataset("latitude", data=np.array([40.0, 45.0], dtype=np.float32))
+
+        ds = DataTreeConverter.from_amsr_ssm(h5_path)
+
+        assert ds is None
+
+
+class TestFromAmsrSsmAuLandFormat:
+    def test_reads_au_land_swath_granule(self, tmp_path):
+        import h5py
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        path = tmp_path / "AMSR2_AU_Land_sample.he5"
+        with h5py.File(path, "w") as f:
+            swath = f.create_group("HDFEOS/SWATHS/AMSR2_Land")
+            data_fields = swath.create_group("Data Fields")
+            geo_fields = swath.create_group("Geolocation Fields")
+            data_fields.create_dataset(
+                "Soil_Moisture", data=np.array([0.05, 0.12, np.nan, 0.30], dtype="float32"),
+            )
+            geo_fields.create_dataset("Latitude", data=np.array([50.0, 50.5, 51.0, 51.5], dtype="float32"))
+            geo_fields.create_dataset("Longitude", data=np.array([-9.0, -8.5, -8.0, -7.5], dtype="float32"))
+            geo_fields.create_dataset(
+                "Time", data=np.array([1.7e9, 1.7e9 + 60, 1.7e9 + 120, 1.7e9 + 180], dtype="float64"),
+            )
+
+        ds = DataTreeConverter.from_amsr_ssm(path)
+
+        assert ds is not None
+        assert ds.sizes["point"] == 3  # the NaN row is dropped
+        assert float(ds["SOIL_MOISTURE"].values[0]) == pytest.approx(0.05)
+        assert ds.attrs["platform_type"] == "amsr_ssm"
+        assert ds.attrs["data_type"] == "radiometer_ssm"
+        assert ds.attrs["sensor"] == "amsr"
+
+
+class TestFromAmsrSsmGPortalL3GridFormat:
+    """The format actually delivered by GPortalAMSR2Downloader (confirmed
+    against a real downloaded granule -- see from_amsr_ssm's docstring):
+    root-level "Geophysical Data"/"Time Information" datasets on a fixed
+    0.1-degree global grid, not the hypothetical NSIDC-0451 vsm/longitude/
+    latitude layout nor the AU_Land HDF-EOS5 swath layout."""
+
+    def _write_granule(self, path, sm_grid, time_grid, sm_scale=0.1, time_scale=1.0):
+        import h5py
+
+        with h5py.File(path, "w") as f:
+            sm_ds = f.create_dataset(
+                "Geophysical Data", data=sm_grid[:, :, None].astype("int16"),
+            )
+            sm_ds.attrs["SCALE FACTOR"] = [sm_scale]
+            sm_ds.attrs["UNIT"] = b"%"
+            time_ds = f.create_dataset("Time Information", data=time_grid.astype("int16"))
+            time_ds.attrs["SCALE FACTOR"] = [time_scale]
+            time_ds.attrs["UNIT"] = b"min"
+
+    def test_reads_gportal_l3_grid_granule(self, tmp_path):
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        path = tmp_path / "GW1AM2_20250701_01D_EQMA_L3SGSMCHF3300300.h5"
+        # A tiny 2x2 grid: one valid cell (raw sm=300 -> 30% -> 0.30 m3 m-3,
+        # raw time=120min -> 02:00), one sm-invalid (-32768 sentinel), one
+        # time-invalid (-32767 sentinel, must be dropped despite a valid
+        # sm reading), one fully valid second cell.
+        sm_grid = np.array([[300, -32768], [400, -32767]], dtype=np.int16)
+        time_grid = np.array([[120, 0], [-32767, 300]], dtype=np.int16)
+        self._write_granule(path, sm_grid, time_grid)
+
+        ds = DataTreeConverter.from_amsr_ssm(path)
+
+        assert ds is not None
+        assert ds.sizes["point"] == 1
+        assert float(ds["SOIL_MOISTURE"].values[0]) == pytest.approx(0.30)
+        assert ds["SOIL_MOISTURE"].attrs["units"] == "m3 m-3"
+        assert ds.attrs["data_type"] == "radiometer_ssm"
+        assert ds.attrs["platform_type"] == "amsr_ssm"
+        assert ds.attrs["sensor"] == "amsr"
+        assert str(ds["time"].values[0])[:16] == "2025-07-01T02:00"
+
+    def test_all_cells_invalid_returns_none(self, tmp_path):
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        path = tmp_path / "GW1AM2_20250701_01D_EQMA_L3SGSMCHF3300300.h5"
+        sm_grid = np.array([[-32768, -32767]], dtype=np.int16)
+        time_grid = np.array([[0, 0]], dtype=np.int16)
+        self._write_granule(path, sm_grid, time_grid)
+
+        assert DataTreeConverter.from_amsr_ssm(path) is None
+
+    def test_unparseable_filename_date_returns_none(self, tmp_path):
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        path = tmp_path / "no_date_here.h5"
+        sm_grid = np.array([[300]], dtype=np.int16)
+        time_grid = np.array([[120]], dtype=np.int16)
+        self._write_granule(path, sm_grid, time_grid)
+
+        assert DataTreeConverter.from_amsr_ssm(path) is None
+
+    def test_gportal_stamps_native_grid_deg_attr(self, tmp_path):
+        """G-Portal's L3SGSMC format is a fixed 0.1x0.1-degree global EQR
+        grid (not km-based/equal-area) -- collocation's spatial snap must
+        use this exact native step directly rather than converting a
+        generic aggregation_window_km through /111.0, which would coarsen
+        it into merging up to 9 native cells together. See
+        docs/design-choices.md §8.7 addendum."""
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        path = tmp_path / "GW1AM2_20250701_01D_EQMA_L3SGSMCHF3300300.h5"
+        sm_grid = np.array([[300, 400]], dtype=np.int16)
+        time_grid = np.array([[120, 130]], dtype=np.int16)
+        self._write_granule(path, sm_grid, time_grid)
+
+        ds = DataTreeConverter.from_amsr_ssm(path)
+
+        assert ds is not None
+        assert ds.attrs["native_grid_deg"] == pytest.approx(0.1)
+
+
+class TestConvertDownloadedDataAmsrHe5Discovery:
+    """AU_Land_NRT_R02/AU_Land is an HDF-EOS5 product, which conventionally
+    ships with a ``.he5`` extension (unlike NSIDC-0451's plain ``.h5``).
+    convert_downloaded_data's amsr_ssm file-discovery loop must find these
+    too, not just ``*.h5``, or real AU_Land downloads would silently never
+    be converted."""
+
+    def test_he5_file_in_amsr_ssm_subdir_is_discovered_and_converted(self, tmp_path):
+        import h5py
+        import numpy as np
+
+        amsr_dir = tmp_path / "amsr_ssm"
+        amsr_dir.mkdir()
+        path = amsr_dir / "AMSR2_AU_Land_sample.he5"
+        with h5py.File(path, "w") as f:
+            swath = f.create_group("HDFEOS/SWATHS/AMSR2_Land")
+            data_fields = swath.create_group("Data Fields")
+            geo_fields = swath.create_group("Geolocation Fields")
+            data_fields.create_dataset(
+                "Soil_Moisture", data=np.array([0.05, 0.12], dtype="float32"),
+            )
+            geo_fields.create_dataset("Latitude", data=np.array([50.0, 50.5], dtype="float32"))
+            geo_fields.create_dataset("Longitude", data=np.array([-9.0, -8.5], dtype="float32"))
+            geo_fields.create_dataset(
+                "Time", data=np.array([1.7e9, 1.7e9 + 60], dtype="float64"),
+            )
+
+        tree = DataTreeConverter.convert_downloaded_data(tmp_path)
+
+        assert tree is not None
+        node_paths = [node.path for node in tree.subtree]
+        assert any(p.endswith(f"validation/amsr_ssm/{path.stem}") for p in node_paths)
+
+
+class TestFromSmapSsm:
+    def test_returns_none_for_missing_file(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        result = DataTreeConverter.from_smap_ssm(tmp_path / "does_not_exist.h5")
+        assert result is None
+
+    def test_converts_synthetic_h5_file(self, tmp_path):
+        import h5py
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        h5_path = tmp_path / "fake_spl2smp_e.h5"
+        with h5py.File(h5_path, "w") as f:
+            grp = f.create_group("Soil_Moisture_Retrieval_Data")
+            grp.create_dataset("soil_moisture", data=np.array([0.10, 0.25, -9999.0, 0.40], dtype=np.float32))
+            grp.create_dataset("longitude", data=np.array([-10.0, -5.0, 0.0, 5.0], dtype=np.float32))
+            grp.create_dataset("latitude", data=np.array([40.0, 45.0, 50.0, 55.0], dtype=np.float32))
+            grp.create_dataset(
+                "tb_time_utc",
+                data=np.array([b"2026-07-01T01:00:00.000Z"] * 4, dtype="S24"),
+            )
+
+        ds = DataTreeConverter.from_smap_ssm(h5_path)
+
+        assert ds is not None
+        assert "SOIL_MOISTURE" in ds
+        assert ds["SOIL_MOISTURE"].attrs["units"] == "m3 m-3"
+        assert ds.attrs["data_type"] == "radiometer_ssm"
+        assert ds.attrs["sensor"] == "smap"
+        assert ds.attrs["sensing_depth_cm"] == "0-5"
+        assert ds.attrs["band"] == "L"
+        assert ds.sizes["point"] == 3
+
+    def test_drops_cells_with_malformed_fill_pattern_time_string(self, tmp_path):
+        """Real SPL2SMP_E data (confirmed against a downloaded granule) uses
+        a literal "***" placeholder for tb_time_utc's fractional-seconds
+        digits at some cells where soil_moisture is otherwise valid -- a
+        strict pd.to_datetime on these raises ValueError and crashes the
+        whole conversion. Cells with this pattern must be dropped (as if
+        invalid), not raise."""
+        import h5py
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        h5_path = tmp_path / "fake_spl2smp_e_bad_time.h5"
+        with h5py.File(h5_path, "w") as f:
+            grp = f.create_group("Soil_Moisture_Retrieval_Data")
+            # 3 cells: two with valid soil_moisture, one -9999.0 fill.
+            # Of the two valid-soil_moisture cells, one has a malformed
+            # "***" time string despite its soil_moisture being fine.
+            grp.create_dataset("soil_moisture", data=np.array([0.10, 0.25, -9999.0], dtype=np.float32))
+            grp.create_dataset("longitude", data=np.array([-10.0, -5.0, 0.0], dtype=np.float32))
+            grp.create_dataset("latitude", data=np.array([40.0, 45.0, 50.0], dtype=np.float32))
+            grp.create_dataset(
+                "tb_time_utc",
+                data=np.array(
+                    [b"2025-07-03T17:19:25.***Z", b"2025-07-03T17:20:01.506Z", b"2025-07-03T17:20:02.000Z"],
+                    dtype="S24",
+                ),
+            )
+
+        ds = DataTreeConverter.from_smap_ssm(h5_path)
+
+        assert ds is not None
+        # Only the second cell (valid soil_moisture AND valid time) survives.
+        assert ds.sizes["point"] == 1
+        assert float(ds["SOIL_MOISTURE"].values[0]) == pytest.approx(0.25)
+
+    def test_returns_none_when_soil_moisture_missing_from_file(self, tmp_path):
+        """A real product missing the soil_moisture/longitude/latitude/
+        tb_time_utc field(s) must not raise a KeyError that would propagate
+        out of convert_downloaded_data and abort the whole conversion batch
+        -- from_smap_ssm must guard against it and return None instead, same
+        as from_amsr_ssm does."""
+        import h5py
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        h5_path = tmp_path / "fake_spl2smp_e_no_sm.h5"
+        with h5py.File(h5_path, "w") as f:
+            # Has longitude/latitude but no soil_moisture/tb_time_utc at all.
+            grp = f.create_group("Soil_Moisture_Retrieval_Data")
+            grp.create_dataset("longitude", data=np.array([-10.0, -5.0], dtype=np.float32))
+            grp.create_dataset("latitude", data=np.array([40.0, 45.0], dtype=np.float32))
+
+        ds = DataTreeConverter.from_smap_ssm(h5_path)
+
+        assert ds is None
+
+
+class TestFromSmosSsm:
+    def test_returns_none_for_missing_file(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        result = DataTreeConverter.from_smos_ssm(tmp_path / "does_not_exist.nc")
+        assert result is None
+
+    def test_converts_synthetic_netcdf_file(self, tmp_path):
+        """Fixture uses the field names/time convention CONFIRMED against a
+        real downloaded SMOS product (see from_smos_ssm's docstring):
+        lowercase soil_moisture/longitude/latitude, and per-point time
+        split across days_since_01-01-2000 (int, days since 2000-01-01)
+        and seconds_since_midnight (int, seconds within that day) rather
+        than a single time field -- e.g. days=9314, seconds=521 is
+        2025-07-02T00:08:41, matching a real product's own filename-
+        encoded acquisition window almost exactly."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "SM_OPER_MIR_SMUDP2_fake.nc"
+        raw = xr.Dataset(
+            {"soil_moisture": ("obs", np.array([0.10, 0.25, -999.0, 0.40]))},
+            coords={
+                "longitude": ("obs", np.array([-10.0, -5.0, 0.0, 5.0])),
+                "latitude": ("obs", np.array([40.0, 45.0, 50.0, 55.0])),
+                "days_since_01-01-2000": ("obs", np.array([9314, 9314, 9314, 9314], dtype="int32")),
+                "seconds_since_midnight": ("obs", np.array([521, 520, 519, 518], dtype="int32")),
+            },
+        )
+        raw.to_netcdf(nc_path)
+
+        ds = DataTreeConverter.from_smos_ssm(nc_path)
+
+        assert ds is not None
+        assert "SOIL_MOISTURE" in ds
+        assert ds["SOIL_MOISTURE"].attrs["units"] == "m3 m-3"
+        assert ds.attrs["data_type"] == "radiometer_ssm"
+        assert ds.attrs["sensor"] == "smos"
+        assert ds.attrs["sensing_depth_cm"] == "0-5"
+        assert ds.attrs["band"] == "L"
+        # The -999.0 point is dropped -- 4 input points, 3 valid.
+        assert ds.sizes["point"] == 3
+        assert ds["time"].values[0] == np.datetime64("2025-07-02T00:08:41")
+
+    def test_returns_none_when_soil_moisture_missing_from_file(self, tmp_path):
+        """A real product missing the soil_moisture/longitude/latitude/
+        days_since_01-01-2000/seconds_since_midnight field(s) must not
+        raise a KeyError that would propagate out of
+        convert_downloaded_data and abort the whole conversion batch --
+        from_smos_ssm must guard against it and return None instead, same
+        as from_amsr_ssm/from_smap_ssm do."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "SM_OPER_MIR_SMUDP2_no_sm.nc"
+        # Has longitude/latitude but no soil_moisture/time fields at all.
+        raw = xr.Dataset(
+            coords={
+                "longitude": ("obs", np.array([-10.0, -5.0])),
+                "latitude": ("obs", np.array([40.0, 45.0])),
+            },
+        )
+        raw.to_netcdf(nc_path)
+
+        ds = DataTreeConverter.from_smos_ssm(nc_path)
+
+        assert ds is None
+
+
+class TestConvertDownloadedDataSmosTgzWarning:
+    """A real SMOS product might ship as a .tgz (see from_smos_ssm's
+    docstring) which convert_downloaded_data does not extract/convert --
+    if that happens, it must at least surface a warning instead of silently
+    reporting zero SMOS collocations with no explanation anywhere."""
+
+    def test_warns_when_only_tgz_files_present(self, tmp_path, caplog):
+        smos_dir = tmp_path / "smos_ssm"
+        smos_dir.mkdir()
+        (smos_dir / "SM_OPER_MIR_SMUDP2_fake.tgz").write_bytes(b"fake archive")
+
+        with caplog.at_level("WARNING"):
+            tree = DataTreeConverter.convert_downloaded_data(tmp_path)
+
+        assert tree is None
+        assert any(
+            "smos_ssm" in record.message and ".nc" in record.message
+            for record in caplog.records
+        )
+
+    def test_no_warning_when_nc_files_present(self, tmp_path, caplog):
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        smos_dir = tmp_path / "smos_ssm"
+        smos_dir.mkdir()
+        raw = xr.Dataset(
+            {"Soil_Moisture": ("obs", np.array([0.10, 0.25]))},
+            coords={
+                "Longitude": ("obs", np.array([-10.0, -5.0])),
+                "Latitude": ("obs", np.array([40.0, 45.0])),
+                "time": ("obs", pd.to_datetime(["2026-07-01T00:00:00"] * 2).values),
+            },
+        )
+        raw.to_netcdf(smos_dir / "SM_OPER_MIR_SMUDP2_fake.nc")
+
+        with caplog.at_level("WARNING"):
+            DataTreeConverter.convert_downloaded_data(tmp_path)
+
+        assert not any("smos_ssm" in record.message for record in caplog.records)
+
+    def test_no_warning_when_directory_empty(self, tmp_path, caplog):
+        smos_dir = tmp_path / "smos_ssm"
+        smos_dir.mkdir()
+
+        with caplog.at_level("WARNING"):
+            DataTreeConverter.convert_downloaded_data(tmp_path)
+
+        assert not any("smos_ssm" in record.message for record in caplog.records)
+
+
+class TestConvertDownloadedDataAscatSidecarFiles:
+    """A real EUMDAC ASCAT SSM order (confirmed against a real download)
+    delivers sidecar metadata files (EOPMetadata.xml, manifest.xml) sitting
+    flat alongside the .nat data products in the same directory --
+    convert_downloaded_data must skip these, not attempt (and noisily fail)
+    to convert them via the ascat package."""
+
+    def test_sidecar_xml_files_are_skipped_without_warning(self, tmp_path, caplog, monkeypatch):
+        from unittest.mock import MagicMock, patch
+
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        ascat_dir = tmp_path / "ascat_ssm"
+        ascat_dir.mkdir()
+        (ascat_dir / "EOPMetadata.xml").write_text("<xml/>")
+        (ascat_dir / "manifest.xml").write_text("<xml/>")
+        nat_path = ascat_dir / "ASCA_SMR_02_M01_20250703T000000Z.nat"
+        nat_path.write_bytes(b"fake nat content")
+
+        synthetic = xr.Dataset(
+            {"sm": ("obs", np.array([25.0]))},
+            coords={
+                "lon": ("obs", np.array([0.0])),
+                "lat": ("obs", np.array([45.0])),
+                "time": ("obs", pd.to_datetime(["2025-07-03T00:00:00"]).values),
+            },
+        )
+        fake_reader = MagicMock()
+        fake_reader.read.return_value = (synthetic, {})
+        fake_ascat_module = MagicMock()
+        fake_ascat_module.AscatL2File.return_value = fake_reader
+
+        with patch.dict("sys.modules", {"ascat.eumetsat.level2": fake_ascat_module}):
+            with caplog.at_level("WARNING"):
+                tree = DataTreeConverter.convert_downloaded_data(tmp_path)
+
+        # Only the real .nat file should ever reach AscatL2File -- the two
+        # XML sidecars must never trigger an attempted read (and therefore
+        # never log a "format unknown" warning).
+        assert fake_ascat_module.AscatL2File.call_count == 1
+        assert str(nat_path) in str(fake_ascat_module.AscatL2File.call_args)
+        assert not any("format unknown" in record.message for record in caplog.records)
+        assert tree is not None

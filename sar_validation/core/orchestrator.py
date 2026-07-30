@@ -17,7 +17,7 @@ import logging
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ..downloaders.base import build_output_dir
 from .recipe import Recipe
@@ -57,6 +57,86 @@ _CURRENTS_INSTRUMENT_TYPES = (
     "adcp_historical", "argo_historical", "drifter_historical", "glider_historical",
 )
 
+#: AMSR-E/2's combined coverage across NSIDC-0451 (ends 2023-12-31) and its
+#: replacement AU_Land_NRT_R02/AU_Land (both frozen 2025-09-01, per NSIDC's
+#: "AMSR2 SIPS stopped processing AMSR Unified data sets" notice) — the
+#: later of the two, since _download_amsr_ssm switches datasets at
+#: 2023-12-31 (see Task 7). ISO date string, compared against the
+#: recipe's temporal_bounds.end.
+_AMSR_COVERAGE_CUTOFF = "2025-09-01"
+
+#: NSIDC-0451's own coverage ends here; AU_Land_NRT_R02 picks up from
+#: roughly this point through _AMSR_COVERAGE_CUTOFF.
+_NSIDC_0451_CUTOFF = "2023-12-31"
+
+# ASCAT's collocation spec lives under its data_type tag "scatterometer_ssm"
+# in DEFAULT_LAYER_TYPE_SPECS, not its own source_type "ascat_ssm" -- see
+# that dict's comment and collocation.py's _resolve_layer_type. Every other
+# soil-moisture/layer source_type matches its DEFAULT_LAYER_TYPE_SPECS key
+# directly, so only this one needs an alias.
+_TOLERANCE_LOOKUP_ALIASES = {"ascat_ssm": "scatterometer_ssm"}
+
+
+def _resolve_temporal_padding_minutes(cfg, *source_types: str) -> float:
+    """
+    Largest collocation time-tolerance, in minutes, that applies to any of
+    *source_types* -- mirrors collocation.py's own resolution order
+    (per-source override, then layer_vs_layer.layer_type_specs, then the
+    point_vs_layer default/validation_temporal_averaging_minutes) closely
+    enough to safely pad a *download* request window, without needing a
+    live datatree/node (this runs before anything has been downloaded or
+    converted).
+
+    Used to pad each downloader's requested start/end so every SAR scene's
+    real collocation window is fully covered by downloaded data -- even
+    the first/last scene in a multi-day request, whose window extends past
+    the literal requested start/end. Without this, a source whose download
+    stops exactly at the requested boundary silently starves the outermost
+    SAR scenes of validation data relative to scenes further from the
+    range's edges (see the collocation-diagnostics plot's day-1/day-3 vs.
+    day-2 asymmetry this was written to fix).
+    """
+    from .recipe import DEFAULT_LAYER_TYPE_SPECS
+
+    coll_cfg = cfg.collocation
+    layer_specs = dict(DEFAULT_LAYER_TYPE_SPECS)
+    if coll_cfg.layer_vs_layer is not None:
+        layer_specs.update(coll_cfg.layer_vs_layer.layer_type_specs)
+    pvl = coll_cfg.point_vs_layer
+    fallback = max(pvl.time_tolerance_minutes, pvl.validation_temporal_averaging_minutes)
+
+    source_overrides = {
+        s.source_type: s.collocation_kwargs["time_tolerance_minutes"]
+        for s in cfg.validation_sources
+        if s.collocation_kwargs and "time_tolerance_minutes" in s.collocation_kwargs
+    }
+
+    tolerances = []
+    for st in source_types:
+        if st in source_overrides:
+            tolerances.append(float(source_overrides[st]))
+            continue
+        key = _TOLERANCE_LOOKUP_ALIASES.get(st, st)
+        tolerances.append(float(layer_specs[key]["time_tolerance_minutes"]) if key in layer_specs else fallback)
+    return max(tolerances) if tolerances else fallback
+
+
+def _padded_temporal_bounds(cfg, *source_types: str) -> "tuple[str, str]":
+    """(start, end) ISO strings, padded symmetrically by
+    :func:`_resolve_temporal_padding_minutes` on each side of
+    ``cfg.temporal_bounds`` -- for passing to a downloader's own
+    ``start``/``end`` arguments. Does not mutate ``cfg.temporal_bounds``
+    itself, since other logic (output folder naming, coverage-cutoff
+    comparisons, metadata) must keep using the literal requested range.
+    """
+    import pandas as pd
+
+    pad = pd.Timedelta(minutes=_resolve_temporal_padding_minutes(cfg, *source_types))
+    temp = cfg.temporal_bounds
+    start = (pd.Timestamp(temp.start) - pad).isoformat()
+    end = (pd.Timestamp(temp.end) + pad).isoformat()
+    return start, end
+
 
 class DataOrchestrator:
     """
@@ -75,6 +155,7 @@ class DataOrchestrator:
         self.dry_run  = dry_run
         self.force_download = force_download
         self.base_dir = self._setup_base_dir()
+        self._previous_downloads: Dict[str, Any] = self._load_previous_downloads()
         self.metadata: Dict[str, Any] = {
             "recipe_name": recipe.config.name,
             "variable":    recipe.config.variable,
@@ -120,6 +201,34 @@ class DataOrchestrator:
         if out_dir.exists() and not any(p.is_file() for p in out_dir.rglob("*")):
             shutil.rmtree(out_dir)
 
+    def _load_previous_downloads(self) -> Dict[str, Any]:
+        """Read the ``downloads`` section of a prior run's
+        ``download_metadata.json`` in ``self.base_dir``, if present.
+
+        Used by :meth:`_already_succeeded` so a rerun triggered by one
+        source's failure (e.g. SMOS) doesn't force every other,
+        already-succeeded source (e.g. ASCAT) to re-authenticate and
+        re-dispatch — see design-choices.md's per-source gating fix.
+        """
+        meta_path = self.base_dir / "download_metadata.json"
+        if not meta_path.exists():
+            return {}
+        try:
+            with open(meta_path) as f:
+                return json.load(f).get("downloads", {})
+        except Exception:
+            return {}
+
+    def _already_succeeded(self, source_type: str) -> bool:
+        """True if *source_type* succeeded in the previous run recorded in
+        ``self._previous_downloads`` and ``force_download`` isn't set."""
+        if self.force_download:
+            return False
+        prev = self._previous_downloads.get(source_type)
+        if prev is None:
+            return False
+        return prev.get("status") == "success"
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -138,7 +247,10 @@ class DataOrchestrator:
         ok = True
 
         # 1. SAR data
-        if not self._download_sar():
+        if self._already_succeeded("sar"):
+            self.metadata["downloads"]["sar"] = self._previous_downloads["sar"]
+            logger.info("Skipping SAR download: already succeeded in a previous run.")
+        elif not self._download_sar():
             ok = False
 
         # 2. Delayed-mode ("*_historical") sources first. hf_radar and the
@@ -206,6 +318,13 @@ class DataOrchestrator:
                 logger.info(
                     "Skipping %s: covered by %s for this window.",
                     source.source_type, paired_historical,
+                )
+                continue
+            if self._already_succeeded(source.source_type):
+                self.metadata["downloads"][source.source_type] = self._previous_downloads[source.source_type]
+                logger.info(
+                    "Skipping %s: already succeeded in a previous run.",
+                    source.source_type,
                 )
                 continue
             if not self._dispatch_source(source):
@@ -292,7 +411,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        temp   = cfg.temporal_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, *source_types)
 
         out_dir = self.base_dir / "copernicus_insitu"
 
@@ -307,7 +426,7 @@ class DataOrchestrator:
             dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=temp.start,       end=temp.end,
+                start=pad_start,        end=pad_end,
                 source_types=source_types,
             )
             self._cleanup_if_empty(out_dir)
@@ -365,6 +484,10 @@ class DataOrchestrator:
             "altimeter":     self._download_altimeter,
             "radiometer":    self._download_radiometer,
             "ismn":          self._download_ismn,
+            "ascat_ssm":     self._download_ascat_ssm,
+            "amsr_ssm":      self._download_amsr_ssm,
+            "smap_ssm":      self._download_smap_ssm,
+            "smos_ssm":      self._download_smos_ssm,
         }
         handler = handlers.get(source.source_type)
         if handler is None:
@@ -379,7 +502,10 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        temp   = cfg.temporal_bounds
+        # Fixed literal, not source.source_type: this handler is only ever
+        # dispatched for source_type "scatterometer" (see _dispatch_source),
+        # and some existing tests call it directly with source=None.
+        pad_start, pad_end = _padded_temporal_bounds(cfg, "scatterometer")
         out_dir = self.base_dir / "osi_saf_winds"
 
         try:
@@ -389,7 +515,7 @@ class DataOrchestrator:
             dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=temp.start, end=temp.end,
+                start=pad_start, end=pad_end,
             )
             self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["scatterometer"] = {
@@ -405,12 +531,182 @@ class DataOrchestrator:
             }
             return False
 
+    def _download_ascat_ssm(self, source) -> bool:
+        from ..downloaders.ascat_soil_moisture_downloader import ASCATSoilMoistureDownloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        out_dir = self.base_dir / "ascat_ssm"
+
+        try:
+            dl = ASCATSoilMoistureDownloader(
+                output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
+            )
+            paths = dl.download(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=pad_start, end=pad_end,
+            )
+            self._cleanup_if_empty(out_dir)
+            self.metadata["downloads"]["ascat_ssm"] = {
+                "status": "dry_run" if self.dry_run else "success",
+                "files":  [str(p) for p in paths],
+            }
+            return True
+        except Exception as exc:
+            msg = f"ASCAT SSM download failed: {exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"]["ascat_ssm"] = {
+                "status": "failed", "error": msg
+            }
+            return False
+
+    def _download_earthdata_ssm(
+        self, source, dataset: str, version: Optional[str], out_subdir: str,
+        coverage_cutoff: Optional[str] = None,
+    ) -> bool:
+        from ..downloaders.earthdata_soil_moisture_downloader import EarthdataSoilMoistureDownloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        temp   = cfg.temporal_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        out_dir = self.base_dir / out_subdir
+
+        try:
+            dl = EarthdataSoilMoistureDownloader(
+                dataset=dataset, version=version, output_dir=out_dir, dry_run=self.dry_run,
+            )
+            paths = dl.download(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=pad_start, end=pad_end,
+            )
+            self._cleanup_if_empty(out_dir)
+            if not paths and coverage_cutoff and temp.end > coverage_cutoff:
+                # Use human-readable name for AMSR datasets for clarity
+                display_name = (
+                    "AMSR-E/2" if dataset in ("NSIDC-0451", "AU_Land_NRT_R02", "AU_Land") else dataset
+                )
+                self.metadata["notices"].append(
+                    f"{display_name}: requested range ends {temp.end}, after this "
+                    f"source's known coverage cutoff ({coverage_cutoff}) — "
+                    f"0 granules found (expected, not an error)."
+                )
+            self.metadata["downloads"][out_subdir] = {
+                "status": "dry_run" if self.dry_run else "success",
+                "files":  [str(p) for p in paths],
+            }
+            return True
+        except Exception as exc:
+            msg = f"{dataset} download failed: {exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"][out_subdir] = {"status": "failed", "error": msg}
+            return False
+
+    def _download_amsr_ssm(self, source) -> bool:
+        temp = self.recipe.config.temporal_bounds
+        if temp.end <= _NSIDC_0451_CUTOFF:
+            dataset = "NSIDC-0451"
+        else:
+            dataset = "AU_Land_NRT_R02"
+        ok = self._download_earthdata_ssm(
+            source, dataset=dataset, version=None, out_subdir="amsr_ssm",
+            coverage_cutoff=_AMSR_COVERAGE_CUTOFF,
+        )
+        if ok and not self.metadata["downloads"].get("amsr_ssm", {}).get("files"):
+            self._try_gportal_amsr_fallback()
+        return ok
+
+    def _try_gportal_amsr_fallback(self) -> None:
+        """
+        Best-effort fallback when NASA Earthdata's AMSR2 coverage
+        (frozen at _AMSR_COVERAGE_CUTOFF) returns zero files: try JAXA's
+        own G-Portal SFTP archive for the same window. A failure here
+        (missing credentials, discovery failure, connection error) is
+        recorded as a notice, not an error -- this is a best-effort
+        second attempt, not a required source.
+        """
+        from ..downloaders.gportal_downloader import GPortalAMSR2Downloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, "amsr_ssm")
+        out_dir = self.base_dir / "amsr_ssm"
+
+        try:
+            dl = GPortalAMSR2Downloader(
+                output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
+                allow_prompt=False,
+            )
+            paths = dl.download(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=pad_start, end=pad_end,
+            )
+            self._cleanup_if_empty(out_dir)
+            entry = self.metadata["downloads"].setdefault("amsr_ssm", {})
+            entry["files"] = [str(p) for p in paths]
+            entry["status"] = "dry_run" if self.dry_run else "success"
+            entry["gportal_fallback"] = True
+            if not paths and not self.dry_run:
+                # 0 files here is a normal, non-error outcome (e.g. no AMSR2
+                # coverage for this window at all) -- but reported entirely
+                # silently, "status": "success" with 0 files is otherwise
+                # indistinguishable from a genuine download, and no notice
+                # exists to explain it (unlike the coverage-cutoff notice
+                # above, which only fires once the requested range is known
+                # to be past AMSR-E/2's coverage entirely).
+                self.metadata["notices"].append(
+                    "AMSR2: G-Portal fallback also found 0 files in window — "
+                    "no AMSR2 soil-moisture data available for this run from "
+                    "either source."
+                )
+        except Exception as exc:
+            msg = f"G-Portal AMSR2 fallback failed: {exc}"
+            logger.warning(msg)
+            self.metadata["notices"].append(msg)
+
+    def _download_smap_ssm(self, source) -> bool:
+        return self._download_earthdata_ssm(source, dataset="SPL2SMP_E", version="006", out_subdir="smap_ssm")
+
+    def _download_smos_ssm(self, source) -> bool:
+        from ..downloaders.smos_downloader import SMOSDownloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        out_dir = self.base_dir / "smos_ssm"
+
+        try:
+            dl = SMOSDownloader(output_dir=out_dir, dry_run=self.dry_run)
+            paths = dl.download(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=pad_start, end=pad_end,
+            )
+            self._cleanup_if_empty(out_dir)
+            self.metadata["downloads"]["smos_ssm"] = {
+                "status": "dry_run" if self.dry_run else "success",
+                "files":  [str(p) for p in paths],
+            }
+            return True
+        except Exception as exc:
+            msg = f"SMOS SSM download failed: {exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"]["smos_ssm"] = {"status": "failed", "error": msg}
+            return False
+
     def _download_scatterometer_ftp(self, source, satellite: str) -> bool:
         from ..downloaders.scatterometer_ftp_downloader import ScatterometerFTPDownloader
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        temp   = cfg.temporal_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
         out_dir = self.base_dir / f"scatterometer_{satellite}"
 
         try:
@@ -421,7 +717,7 @@ class DataOrchestrator:
             dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=temp.start, end=temp.end,
+                start=pad_start, end=pad_end,
             )
             self._cleanup_if_empty(out_dir)
             self.metadata["downloads"][f"scatterometer_{satellite}"] = {
@@ -451,7 +747,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        temp   = cfg.temporal_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, "hf_radar_grid")
         out_dir = self.base_dir / "hf_radar"
 
         try:
@@ -465,7 +761,7 @@ class DataOrchestrator:
             dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=temp.start, end=temp.end,
+                start=pad_start, end=pad_end,
             )
             self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["hf_radar"] = {
@@ -487,7 +783,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        temp   = cfg.temporal_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, "hf_radar_grid")
         out_dir = self.base_dir / "hfr_noaa"
         # Resolution is an optional per-source override, forwarded via the
         # established ValidationDataSource.download_kwargs channel.
@@ -503,7 +799,7 @@ class DataOrchestrator:
             dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=temp.start, end=temp.end,
+                start=pad_start, end=pad_end,
             )
             self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["hf_radar_noaa"] = {
@@ -522,7 +818,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        temp   = cfg.temporal_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, "hf_radar_grid")
         out_dir = self.base_dir / "hf_radar_historical"
 
         try:
@@ -532,7 +828,7 @@ class DataOrchestrator:
             downloaded = dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=temp.start, end=temp.end,
+                start=pad_start, end=pad_end,
             ) or []
             self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["hf_radar_historical"] = {
@@ -554,7 +850,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        temp   = cfg.temporal_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
         out_dir = self.base_dir / f"{instrument}_historical"
 
         try:
@@ -569,7 +865,7 @@ class DataOrchestrator:
             downloaded = dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=temp.start, end=temp.end,
+                start=pad_start, end=pad_end,
             ) or []
             self._cleanup_if_empty(out_dir)
             self.metadata["downloads"][f"{instrument}_historical"] = {
@@ -611,7 +907,12 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        temp   = cfg.temporal_bounds
+        # DEFAULT_LAYER_TYPE_SPECS keys altimeter by frequency
+        # ("altimeter_1hz"/"altimeter_5hz"), not the bare "altimeter"
+        # source_type -- pass both so the padding lookup finds their
+        # (equal, 180min) tolerance regardless of which frequency this
+        # recipe's variable actually requests.
+        pad_start, pad_end = _padded_temporal_bounds(cfg, "altimeter_1hz", "altimeter_5hz")
         out_dir = self.base_dir / "altimeter"
 
         try:
@@ -627,7 +928,7 @@ class DataOrchestrator:
             paths = dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=temp.start, end=temp.end,
+                start=pad_start, end=pad_end,
                 **kwargs,
             )
             self._cleanup_if_empty(out_dir)
@@ -648,7 +949,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        temp   = cfg.temporal_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
         out_dir = self.base_dir / "radiometer"
 
         try:
@@ -657,7 +958,7 @@ class DataOrchestrator:
             paths = dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=temp.start, end=temp.end,
+                start=pad_start, end=pad_end,
                 **kwargs,
             )
             self._cleanup_if_empty(out_dir)
@@ -678,7 +979,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        temp   = cfg.temporal_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
         out_dir = self.base_dir / "ismn"
 
         try:
@@ -686,7 +987,7 @@ class DataOrchestrator:
             paths = dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=temp.start, end=temp.end,
+                start=pad_start, end=pad_end,
                 min_depth=source.resolved_min_depth,
                 max_depth=source.resolved_max_depth,
                 archive_path=source.download_kwargs.get("ismn_archive_path"),

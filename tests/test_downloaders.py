@@ -323,6 +323,448 @@ class TestAuthenticateOsiSafFtp:
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Tests for authenticate_gportal()
+# ---------------------------------------------------------------------------
+
+class TestAuthenticateGportal:
+    def test_explicit_args_take_priority(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.base import authenticate_gportal
+
+        monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
+        monkeypatch.delenv("GPORTAL_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        user, pwd = authenticate_gportal(username="alice", password="secret")
+        assert (user, pwd) == ("alice", "secret")
+
+    def test_env_vars_used_when_no_explicit_args(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.base import authenticate_gportal
+
+        monkeypatch.setenv("GPORTAL_USERNAME", "bob")
+        monkeypatch.setenv("GPORTAL_PASSWORD", "hunter2")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        user, pwd = authenticate_gportal()
+        assert (user, pwd) == ("bob", "hunter2")
+
+    def test_falls_back_to_credentials_file(self, monkeypatch, tmp_path):
+        import json
+
+        from sar_validation.downloaders.base import authenticate_gportal
+
+        monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
+        monkeypatch.delenv("GPORTAL_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        cred_file = tmp_path / ".jaxa_gportal_credentials"
+        cred_file.write_text(json.dumps({"username": "file_user", "password": "file_pass"}))
+
+        user, pwd = authenticate_gportal()
+        assert (user, pwd) == ("file_user", "file_pass")
+
+    def test_prompts_interactively_when_nothing_else_resolves(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.base import authenticate_gportal
+
+        monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
+        monkeypatch.delenv("GPORTAL_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr("builtins.input", lambda prompt: "prompted_user")
+        monkeypatch.setattr("getpass.getpass", lambda prompt: "prompted_pass")
+
+        user, pwd = authenticate_gportal()
+        assert (user, pwd) == ("prompted_user", "prompted_pass")
+
+    def test_interactive_prompt_not_persisted_to_credentials_file(self, monkeypatch, tmp_path):
+        """Deliberate deviation from every other authenticate_* helper:
+        entered credentials must never be written to disk, per design."""
+        from sar_validation.downloaders.base import authenticate_gportal
+
+        monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
+        monkeypatch.delenv("GPORTAL_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr("builtins.input", lambda prompt: "prompted_user")
+        monkeypatch.setattr("getpass.getpass", lambda prompt: "prompted_pass")
+
+        authenticate_gportal()
+        assert not (tmp_path / ".jaxa_gportal_credentials").exists()
+
+    def test_allow_prompt_false_raises_instead_of_prompting(self, monkeypatch, tmp_path):
+        """allow_prompt=False (used by the orchestrator's automatic G-Portal
+        AMSR2 fallback) must raise RuntimeError instead of reaching the
+        interactive input()/getpass.getpass() prompt when nothing resolves
+        from explicit args/env vars/credentials file -- an unattended
+        pipeline run must never block on a password prompt nobody expected
+        to be asked for."""
+        from sar_validation.downloaders.base import authenticate_gportal
+
+        monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
+        monkeypatch.delenv("GPORTAL_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("input()/getpass.getpass() must not be called when allow_prompt=False")
+
+        monkeypatch.setattr("builtins.input", _fail_if_called)
+        monkeypatch.setattr("getpass.getpass", _fail_if_called)
+
+        with pytest.raises(RuntimeError, match="G-Portal credentials not found"):
+            authenticate_gportal(allow_prompt=False)
+
+
+# Tests for authenticate_smos_ftp()
+# ---------------------------------------------------------------------------
+
+class TestAuthenticateSmosFtp:
+    def test_explicit_args_take_priority(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.base import authenticate_smos_ftp
+
+        monkeypatch.delenv("SMOS_FTP_USERNAME", raising=False)
+        monkeypatch.delenv("SMOS_FTP_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        user, pwd = authenticate_smos_ftp(username="alice", password="secret")
+        assert (user, pwd) == ("alice", "secret")
+
+    def test_env_vars_used_when_no_explicit_args(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.base import authenticate_smos_ftp
+
+        monkeypatch.setenv("SMOS_FTP_USERNAME", "bob")
+        monkeypatch.setenv("SMOS_FTP_PASSWORD", "hunter2")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        user, pwd = authenticate_smos_ftp()
+        assert (user, pwd) == ("bob", "hunter2")
+
+    def test_falls_back_to_credentials_file(self, monkeypatch, tmp_path):
+        import json
+
+        from sar_validation.downloaders.base import authenticate_smos_ftp
+
+        monkeypatch.delenv("SMOS_FTP_USERNAME", raising=False)
+        monkeypatch.delenv("SMOS_FTP_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        cred_file = tmp_path / ".esa_smos_credentials"
+        cred_file.write_text(json.dumps({"username": "file_user", "password": "file_pass"}))
+
+        user, pwd = authenticate_smos_ftp()
+        assert (user, pwd) == ("file_user", "file_pass")
+
+    def test_raises_when_nothing_configured(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.base import authenticate_smos_ftp
+
+        monkeypatch.delenv("SMOS_FTP_USERNAME", raising=False)
+        monkeypatch.delenv("SMOS_FTP_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        with pytest.raises(RuntimeError, match="SMOS"):
+            authenticate_smos_ftp()
+
+
+# ---------------------------------------------------------------------------
+# SMOSDownloader
+# ---------------------------------------------------------------------------
+
+class TestSMOSDownloader:
+    def test_dry_run_prints_params_without_network(self, tmp_path, capsys):
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        dl = SMOSDownloader(output_dir=tmp_path, dry_run=True, username="u", password="p")
+        out = dl.download(
+            min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+            start="2026-07-01", end="2026-07-02",
+        )
+        assert out == []
+        captured = capsys.readouterr().out
+        assert "DRY RUN" in captured
+        assert "smos-diss.eo.esa.int" in captured
+
+    def test_download_logs_in_lists_and_fetches_products(self, tmp_path):
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        dl._login = MagicMock()
+        dl._list_products_for_day = MagicMock(return_value=[
+            {"filename": "SM_1.nc", "download_href": "/oads/access/login?r=x&d=SM_1.nc"},
+        ])
+
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(
+            status_code=200, content=b"fake-netcdf-bytes",
+        )
+        with patch(
+            "sar_validation.downloaders.smos_downloader.requests.Session",
+            return_value=fake_session,
+        ):
+            result = dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-01",
+            )
+
+        dl._login.assert_called_once_with(fake_session, "u", "p")
+        assert result == [tmp_path / "SM_1.nc"]
+        assert (tmp_path / "SM_1.nc").read_bytes() == b"fake-netcdf-bytes"
+
+    def test_already_downloaded_file_is_skipped(self, tmp_path):
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        (tmp_path / "SM_1.nc").write_bytes(b"already here")
+        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        dl._login = MagicMock()
+        dl._list_products_for_day = MagicMock(return_value=[
+            {"filename": "SM_1.nc", "download_href": "/oads/access/login?r=x&d=SM_1.nc"},
+        ])
+        fake_session = MagicMock()
+
+        with patch(
+            "sar_validation.downloaders.smos_downloader.requests.Session",
+            return_value=fake_session,
+        ):
+            result = dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-01",
+            )
+
+        fake_session.get.assert_not_called()
+        assert result == [tmp_path / "SM_1.nc"]
+
+    def test_only_nc_and_tgz_filenames_are_downloaded(self, tmp_path):
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        dl._login = MagicMock()
+        dl._list_products_for_day = MagicMock(return_value=[
+            {"filename": "SM_1.nc", "download_href": "/oads/access/login?r=x&d=SM_1.nc"},
+            {"filename": "readme.txt", "download_href": "/oads/access/login?r=x&d=readme.txt"},
+        ])
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(status_code=200, content=b"data")
+
+        with patch(
+            "sar_validation.downloaders.smos_downloader.requests.Session",
+            return_value=fake_session,
+        ):
+            result = dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-01",
+            )
+
+        assert result == [tmp_path / "SM_1.nc"]
+
+
+# ---------------------------------------------------------------------------
+# SMOSDownloader — OADS product listing
+# ---------------------------------------------------------------------------
+
+class TestSMOSListProductsForDay:
+    def test_parses_product_list_html(self, tmp_path):
+        """Fixture mirrors the REAL *authenticated* portal response (a real
+        user's logged-in session, confirmed live): the download link is a
+        direct URL (/oads/data/NRT_Open/<filename>), not the login-gated
+        redirect an unauthenticated fetch sees, and it carries an extra
+        target="_blank" attribute between href and the closing '>' -- the
+        original regex assumed '>' came immediately after href's closing
+        quote and silently matched 0 products against this real page."""
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        html = """
+        <div class="productContainer">
+        <h5 id="SM_OPER_1.nc" class="productTitle">SM_OPER_1.nc</h5>
+        <div class="productLinks">
+        <a href="/oads/data/NRT_Open/SM_OPER_1.nc" target="_blank">Download Product</a>
+        </div></div>
+        <div class="productContainer">
+        <h5 id="SM_OPER_2.nc" class="productTitle">SM_OPER_2.nc</h5>
+        <div class="productLinks">
+        <a href="/oads/data/NRT_Open/SM_OPER_2.nc" target="_blank">Download Product</a>
+        </div></div>
+        """
+        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        fake_session = MagicMock()
+        fake_session.post.return_value = MagicMock(status_code=200, text=html)
+
+        from datetime import date
+        products = dl._list_products_for_day(fake_session, date(2025, 7, 3))
+
+        assert [p["filename"] for p in products] == [
+            "SM_OPER_1.nc",
+            "SM_OPER_2.nc",
+        ]
+        assert products[0]["download_href"] == "/oads/data/NRT_Open/SM_OPER_1.nc"
+
+        fake_session.post.assert_called_once()
+        call = fake_session.post.call_args
+        assert call.args[0] == "https://smos-diss.eo.esa.int/oads/access/collection/NRT_Open/tree"
+        assert call.kwargs["data"] == {
+            "p0": "MIR_SMNRT2", "p1": "2025", "p2": "07", "p3": "03",
+        }
+
+    def test_empty_day_returns_empty_list(self, tmp_path):
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        fake_session = MagicMock()
+        fake_session.post.return_value = MagicMock(status_code=200, text="<div>No products</div>")
+
+        from datetime import date
+        products = dl._list_products_for_day(fake_session, date(2025, 7, 3))
+
+        assert products == []
+
+    def test_decodes_html_entities_in_href(self, tmp_path):
+        """HTML-entity-encoded ampersands (&amp;) in href attributes are
+        decoded to plain & -- exercised via the older, login-gated-redirect
+        href shape (which does carry query-string ampersands), still a
+        real shape this parser must handle for an unauthenticated or
+        differently-configured fetch, alongside the direct-download shape
+        the primary test above covers."""
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        html = """
+        <div class="productContainer">
+        <h5 id="SM_OPER_1.nc" class="productTitle">SM_OPER_1.nc</h5>
+        <div class="productLinks">
+        <a href="/oads/access/login?r=collection%2FNRT_Open%2Ftree&amp;d=SM_OPER_1.nc">Download Product</a>
+        </div></div>
+        """
+        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        fake_session = MagicMock()
+        fake_session.post.return_value = MagicMock(status_code=200, text=html)
+
+        from datetime import date
+        products = dl._list_products_for_day(fake_session, date(2025, 7, 3))
+
+        assert len(products) == 1
+        # The decoded href should have plain & (not &amp;)
+        assert products[0]["download_href"] == "/oads/access/login?r=collection%2FNRT_Open%2Ftree&d=SM_OPER_1.nc"
+        assert "&amp;" not in products[0]["download_href"]
+
+
+# ---------------------------------------------------------------------------
+# SMOSDownloader — OADS SAML2/WSO2 SSO login
+# ---------------------------------------------------------------------------
+
+class TestSMOSOadsLogin:
+    def test_full_saml_round_trip(self, tmp_path):
+        """The login flow: GET the login page (redirects to the IdP with a
+        sessionDataKey), POST credentials to the IdP's samlsso endpoint,
+        then POST the returned SAMLResponse form back to the service
+        provider's ACS endpoint.
+
+        Fixture HTML mirrors the REAL live page byte-for-byte in the two
+        respects that broke the original (double-quote-only) regexes
+        against the real server: the login form's action is a *relative*
+        URL (``action="../samlsso"``), and the sessionDataKey hidden
+        input's value is *single*-quoted (``value='...'``) while other
+        attributes on the same page use double quotes — confirmed live
+        against smos-diss.eo.esa.int/oads/access/login (redirects to
+        eoiam-idp.eo.esa.int), not a guessed/idealized shape.
+        """
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        idp_login_page = """
+        <form class="ui large form" action="../samlsso"
+              method="post" id="loginForm">
+        <input id="tocommonauth" name="tocommonauth" type="hidden" value="true">
+        <input type="hidden" name="sessionDataKey"
+            value='abc123' />
+        </form>
+        """
+        # Real captured response (see a real user's ~/.esa_smos_credentials
+        # run): the ACS form's own attributes are double-quoted, but its
+        # SAMLResponse/RelayState <input> name= and value= attributes are
+        # BOTH single-quoted -- a different, inconsistent style from the
+        # login form above, which is exactly why a fix that only made
+        # value= quote-agnostic (and left name= hardcoded to ") still
+        # failed against this real page.
+        saml_response_page = """
+        <form id="samlsso-response-form" method="post" action="https://smos-diss.eo.esa.int/Shibboleth.sso/SAML2/POST">
+        <input type='hidden' name='RelayState' value='https://smos-diss.eo.esa.int/oads/access/login'/>
+        <input type='hidden' name='SAMLResponse' value='opaque-blob=='/>
+        </form>
+        """
+
+        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        fake_session = MagicMock()
+        # url= is the post-redirect URL requests.Session().get() lands on --
+        # the relative "../samlsso" action must resolve against THIS, not
+        # against OADS_LOGIN_URL.
+        fake_session.get.return_value = MagicMock(
+            status_code=200, text=idp_login_page,
+            url="https://eoiam-idp.eo.esa.int/authenticationendpoint/login.do?sessionDataKey=abc123",
+        )
+        fake_session.post.return_value = MagicMock(
+            status_code=200, text=saml_response_page,
+            url="https://eoiam-idp.eo.esa.int/samlsso",
+        )
+
+        dl._login(fake_session, "u", "p")
+
+        # Step 1: GET the login page to obtain the sessionDataKey.
+        fake_session.get.assert_any_call(
+            "https://smos-diss.eo.esa.int/oads/access/login", timeout=60,
+        )
+        # Step 2: POST credentials to the IdP -- the relative "../samlsso"
+        # action must have been resolved to an absolute URL before posting.
+        idp_post_call = fake_session.post.call_args_list[0]
+        assert idp_post_call.args[0] == "https://eoiam-idp.eo.esa.int/samlsso"
+        assert idp_post_call.kwargs["data"]["username"] == "u"
+        assert idp_post_call.kwargs["data"]["password"] == "p"
+        assert idp_post_call.kwargs["data"]["sessionDataKey"] == "abc123"
+        # Step 3: POST the SAMLResponse back to the ACS endpoint.
+        acs_post_call = fake_session.post.call_args_list[1]
+        assert acs_post_call.args[0] == "https://smos-diss.eo.esa.int/Shibboleth.sso/SAML2/POST"
+        assert acs_post_call.kwargs["data"]["SAMLResponse"] == "opaque-blob=="
+
+    def test_raises_when_login_form_not_found(self, tmp_path):
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(status_code=200, text="<html>unexpected</html>",
+                                                     url="https://eoiam-idp.eo.esa.int/samlsso")
+
+        with pytest.raises(RuntimeError, match="SMOS OADS login"):
+            dl._login(fake_session, "u", "p")
+
+    def test_raises_and_saves_debug_html_when_saml_response_missing(self, tmp_path):
+        """When the IdP responds to the credential POST with something
+        other than the expected auto-submit SAMLResponse form (e.g.
+        rejected credentials, an MFA prompt, or a changed layout), the
+        raw response body is saved for inspection and the error message
+        says where -- this failure mode was previously unhandled beyond a
+        generic message, and is the one a real (non-sandboxed) user run
+        actually hit."""
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        idp_login_page = """
+        <form class="ui large form" action="../samlsso"
+              method="post" id="loginForm">
+        <input type="hidden" name="sessionDataKey"
+            value='abc123' />
+        </form>
+        """
+        rejected_credentials_page = "<html><body>Invalid credentials for user someone</body></html>"
+
+        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(
+            status_code=200, text=idp_login_page,
+            url="https://eoiam-idp.eo.esa.int/authenticationendpoint/login.do?sessionDataKey=abc123",
+        )
+        fake_session.post.return_value = MagicMock(
+            status_code=200, text=rejected_credentials_page,
+            url="https://eoiam-idp.eo.esa.int/samlsso",
+        )
+
+        with pytest.raises(RuntimeError, match="no SAMLResponse returned"):
+            dl._login(fake_session, "u", "p")
+
+        debug_path = tmp_path / "smos_saml_debug.html"
+        assert debug_path.exists()
+        assert debug_path.read_text() == rejected_credentials_page
+
+
+# ---------------------------------------------------------------------------
 # SARDownloader — antimeridian crossing
 # ---------------------------------------------------------------------------
 
@@ -867,6 +1309,200 @@ class TestScatterometerDownloaderForceDownload:
             )
 
         fake_datastore.get_product.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# ASCAT Soil Moisture downloader — antimeridian support
+# ---------------------------------------------------------------------------
+
+class TestASCATSoilMoistureDownloaderAntimeridian:
+    def test_dry_run_prints_both_windows(self, tmp_path, capsys):
+        from sar_validation.downloaders.ascat_soil_moisture_downloader import ASCATSoilMoistureDownloader
+
+        dl = ASCATSoilMoistureDownloader(output_dir=tmp_path, dry_run=True)
+        out = dl.download(
+            min_lon=135.0, max_lon=-120.0, min_lat=-15.0, max_lat=30.0,
+            start="2026-07-02", end="2026-07-03",
+        )
+        assert out == []
+        captured = capsys.readouterr().out.replace(" ", "")
+        assert "[135.0,180.0]" in captured
+        assert "[-180.0,-120.0]" in captured
+
+    def test_search_runs_once_per_window_and_dedupes_products(self, tmp_path, capsys):
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.ascat_soil_moisture_downloader import ASCATSoilMoistureDownloader
+
+        dl = ASCATSoilMoistureDownloader(output_dir=tmp_path, dry_run=False)
+        dl._token = "fake-token"
+
+        fake_eumdac = MagicMock()
+        fake_collection = MagicMock()
+        fake_collection.search.side_effect = [["dup", "east_only"], ["dup", "west_only"]]
+        fake_datastore = MagicMock()
+        fake_datastore.get_collection.return_value = fake_collection
+        fake_eumdac.DataStore.return_value = fake_datastore
+
+        with patch.dict("sys.modules", {"eumdac": fake_eumdac}):
+            result = dl.download(
+                min_lon=135.0, max_lon=-120.0, min_lat=-15.0, max_lat=30.0,
+                start="2026-07-02", end="2026-07-03",
+            )
+
+        assert result == []
+        assert fake_collection.search.call_count == 2
+        assert "Found 3 ASCAT SSM products." in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# ASCAT Soil Moisture downloader — per-product existence check
+# ---------------------------------------------------------------------------
+
+class TestASCATSoilMoistureDownloaderForceDownload:
+    # Real EUMETSAT SOMO12 product IDs use short satellite codes M01/M02/M03,
+    # never the literal strings "metopb"/"metopc" (unlike the OSI-104 wind
+    # collection). Fake IDs below mirror that real shape.
+    REAL_PRODUCT_ID = "ASCA_SMR_02_M02_20260705204500Z_20260705222658Z_N_O_20260705214249Z"
+
+    def test_skips_product_whose_output_file_already_exists(self, tmp_path):
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.ascat_soil_moisture_downloader import ASCATSoilMoistureDownloader
+
+        dl = ASCATSoilMoistureDownloader(output_dir=tmp_path, dry_run=False)
+        dl._token = "fake-token"
+        (tmp_path / f"{self.REAL_PRODUCT_ID}.nc").write_bytes(b"")
+
+        fake_eumdac = MagicMock()
+        fake_collection = MagicMock()
+        fake_collection.search.return_value = [self.REAL_PRODUCT_ID]
+        fake_datastore = MagicMock()
+        fake_datastore.get_collection.return_value = fake_collection
+        fake_eumdac.DataStore.return_value = fake_datastore
+
+        with patch.dict("sys.modules", {"eumdac": fake_eumdac}):
+            dl.download(
+                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+                start="2026-07-02", end="2026-07-03",
+            )
+
+        fake_datastore.get_product.assert_not_called()
+
+    def test_downloads_product_with_real_metop_satellite_code(self, tmp_path):
+        """Regression test: real SOMO12 product IDs contain M01/M02/M03, not
+        the literal strings "metopb"/"metopc". The satellite-code filter must
+        not silently skip every product on account of that."""
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.ascat_soil_moisture_downloader import ASCATSoilMoistureDownloader
+
+        dl = ASCATSoilMoistureDownloader(output_dir=tmp_path, dry_run=False)
+        dl._token = "fake-token"
+
+        fake_eumdac = MagicMock()
+        fake_collection = MagicMock()
+        fake_collection.search.return_value = [self.REAL_PRODUCT_ID]
+        fake_datastore = MagicMock()
+        fake_datastore.get_collection.return_value = fake_collection
+        fake_eumdac.DataStore.return_value = fake_datastore
+
+        fake_file = MagicMock()
+        fake_file.name = f"{self.REAL_PRODUCT_ID}.nc"
+        fake_file.read.side_effect = [b"data", b""]
+        fake_product = MagicMock()
+        fake_product.open.return_value.__enter__.return_value = fake_file
+        fake_product.open.return_value.__exit__.return_value = False
+        fake_datastore.get_product.return_value = fake_product
+
+        with patch.dict("sys.modules", {"eumdac": fake_eumdac}):
+            downloaded = dl.download(
+                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+                start="2026-07-02", end="2026-07-03",
+            )
+
+        fake_datastore.get_product.assert_called_once()
+        assert downloaded == [tmp_path / f"{self.REAL_PRODUCT_ID}.nc"]
+
+    def test_uses_somo12_collection_id(self, tmp_path):
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.ascat_soil_moisture_downloader import (
+            COLLECTION_ID,
+            ASCATSoilMoistureDownloader,
+        )
+
+        assert COLLECTION_ID == "EO:EUM:DAT:METOP:SOMO12"
+
+        dl = ASCATSoilMoistureDownloader(output_dir=tmp_path, dry_run=False)
+        dl._token = "fake-token"
+
+        fake_eumdac = MagicMock()
+        fake_collection = MagicMock()
+        fake_collection.search.return_value = []
+        fake_datastore = MagicMock()
+        fake_datastore.get_collection.return_value = fake_collection
+        fake_eumdac.DataStore.return_value = fake_datastore
+
+        with patch.dict("sys.modules", {"eumdac": fake_eumdac}):
+            dl.download(
+                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+                start="2026-07-02", end="2026-07-03",
+            )
+
+        fake_datastore.get_collection.assert_called_once_with(COLLECTION_ID)
+
+
+# ---------------------------------------------------------------------------
+# ASCAT Soil Moisture downloader — zip-branch extraction
+# ---------------------------------------------------------------------------
+
+class TestASCATSoilMoistureDownloaderZipExtraction:
+    def test_extracted_files_are_returned_and_counted(self, tmp_path):
+        """When a product arrives as a .zip, the extracted file(s) must be
+        appended to the returned ``downloaded`` list (and hence counted in
+        the printed "Downloaded N file(s)" total) -- not silently dropped
+        after extraction."""
+        import io
+        import zipfile
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.ascat_soil_moisture_downloader import ASCATSoilMoistureDownloader
+
+        product_id = "ASCA_SMR_02_M02_20260705204500Z_20260705222658Z_N_O_20260705214249Z"
+        inner_name = f"{product_id}.nat"
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr(inner_name, b"fake ascat product bytes")
+        zip_bytes = buf.getvalue()
+
+        dl = ASCATSoilMoistureDownloader(output_dir=tmp_path, dry_run=False)
+        dl._token = "fake-token"
+
+        fake_eumdac = MagicMock()
+        fake_collection = MagicMock()
+        fake_collection.search.return_value = [product_id]
+        fake_datastore = MagicMock()
+        fake_datastore.get_collection.return_value = fake_collection
+        fake_eumdac.DataStore.return_value = fake_datastore
+
+        fake_file = MagicMock()
+        fake_file.name = f"{product_id}.zip"
+        fake_file.read.side_effect = [zip_bytes, b""]
+        fake_product = MagicMock()
+        fake_product.open.return_value.__enter__.return_value = fake_file
+        fake_product.open.return_value.__exit__.return_value = False
+        fake_datastore.get_product.return_value = fake_product
+
+        with patch.dict("sys.modules", {"eumdac": fake_eumdac}):
+            downloaded = dl.download(
+                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+                start="2026-07-02", end="2026-07-03",
+            )
+
+        assert downloaded == [tmp_path / inner_name]
+        assert (tmp_path / inner_name).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -2128,6 +2764,94 @@ class TestOrchestratorScatterometerFTPWiring:
         assert mock_cls.call_args.kwargs["satellite"] == satellite
 
 
+class TestOrchestratorGPortalAmsrFallback:
+    def test_gportal_not_tried_when_earthdata_returns_files(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(name="test", variable="soil_moisture"))
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        source = ValidationDataSource(source_type="amsr_ssm")
+
+        with patch(
+            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
+        ) as mock_earthdata_cls, patch(
+            "sar_validation.downloaders.gportal_downloader.GPortalAMSR2Downloader"
+        ) as mock_gportal_cls:
+            mock_earthdata_cls.return_value.download.return_value = [tmp_path / "file1.h5"]
+            ok = orchestrator._dispatch_source(source)
+
+        assert ok is True
+        mock_gportal_cls.assert_not_called()
+
+    def test_gportal_tried_when_earthdata_returns_zero_files(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(name="test", variable="soil_moisture"))
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        source = ValidationDataSource(source_type="amsr_ssm")
+
+        with patch(
+            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
+        ) as mock_earthdata_cls, patch(
+            "sar_validation.downloaders.gportal_downloader.GPortalAMSR2Downloader"
+        ) as mock_gportal_cls:
+            mock_earthdata_cls.return_value.download.return_value = []
+            mock_gportal_cls.return_value.download.return_value = [tmp_path / "gportal_file.h5"]
+            ok = orchestrator._dispatch_source(source)
+
+        assert ok is True
+        mock_gportal_cls.assert_called_once()
+        assert orchestrator.metadata["downloads"]["amsr_ssm"]["files"] == [str(tmp_path / "gportal_file.h5")]
+        assert orchestrator.metadata["downloads"]["amsr_ssm"]["gportal_fallback"] is True
+
+    def test_gportal_fallback_constructed_with_allow_prompt_false(self, tmp_path):
+        """The automatic fallback path must never block an unattended
+        pipeline run on an interactive G-Portal password prompt -- it must
+        always construct GPortalAMSR2Downloader with allow_prompt=False,
+        regardless of what credentials happen to be configured."""
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(name="test", variable="soil_moisture"))
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        source = ValidationDataSource(source_type="amsr_ssm")
+
+        with patch(
+            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
+        ) as mock_earthdata_cls, patch(
+            "sar_validation.downloaders.gportal_downloader.GPortalAMSR2Downloader"
+        ) as mock_gportal_cls:
+            mock_earthdata_cls.return_value.download.return_value = []
+            mock_gportal_cls.return_value.download.return_value = []
+            orchestrator._dispatch_source(source)
+
+        mock_gportal_cls.assert_called_once()
+        assert mock_gportal_cls.call_args.kwargs["allow_prompt"] is False
+
+    def test_gportal_failure_logged_as_notice_not_error(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(name="test", variable="soil_moisture"))
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        source = ValidationDataSource(source_type="amsr_ssm")
+
+        with patch(
+            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
+        ) as mock_earthdata_cls, patch(
+            "sar_validation.downloaders.gportal_downloader.GPortalAMSR2Downloader"
+        ) as mock_gportal_cls:
+            mock_earthdata_cls.return_value.download.return_value = []
+            mock_gportal_cls.return_value.download.side_effect = RuntimeError("no credentials")
+            ok = orchestrator._dispatch_source(source)
+
+        assert ok is True
+        assert any("no credentials" in n for n in orchestrator.metadata["notices"])
+        assert orchestrator.metadata["errors"] == []
+
+
 class TestOrchestratorCurrentsHistoricalWiring:
     @pytest.mark.parametrize("source_type,instrument", [
         ("adcp_historical", "adcp"),
@@ -2582,3 +3306,84 @@ class TestOrchestratorForceDownloadWiring:
             mock_cls.return_value.download.return_value = []
             orchestrator._download_sar()
         assert mock_cls.call_args.kwargs["force_download"] is False
+
+# ---------------------------------------------------------------------------
+# EarthdataSoilMoistureDownloader
+# ---------------------------------------------------------------------------
+
+class TestEarthdataSoilMoistureDownloader:
+    def test_dry_run_prints_params_without_network(self, tmp_path, capsys):
+        from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
+            EarthdataSoilMoistureDownloader,
+        )
+
+        dl = EarthdataSoilMoistureDownloader(
+            dataset="NSIDC-0451", output_dir=tmp_path, dry_run=True,
+        )
+        out = dl.download(
+            min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+            start="2026-07-01", end="2026-07-02",
+        )
+        assert out == []
+        captured = capsys.readouterr().out
+        assert "NSIDC-0451" in captured
+        assert "DRY RUN" in captured
+
+    def test_search_and_download_amsr(self, tmp_path):
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
+            EarthdataSoilMoistureDownloader,
+        )
+
+        dl = EarthdataSoilMoistureDownloader(dataset="NSIDC-0451", output_dir=tmp_path)
+
+        fake_earthaccess = MagicMock()
+        fake_earthaccess.search_data.return_value = ["granule1", "granule2"]
+        fake_earthaccess.download.return_value = [
+            str(tmp_path / "file1.h5"), str(tmp_path / "file2.h5"),
+        ]
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            result = dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        fake_earthaccess.login.assert_called_once()
+        fake_earthaccess.search_data.assert_called_once_with(
+            short_name="NSIDC-0451",
+            version=None,
+            bounding_box=(-10.0, 40.0, 10.0, 55.0),
+            temporal=("2026-07-01T00:00:00", "2026-07-02T00:00:00"),
+        )
+        assert result == [tmp_path / "file1.h5", tmp_path / "file2.h5"]
+
+    def test_search_with_version_for_smap(self, tmp_path):
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
+            EarthdataSoilMoistureDownloader,
+        )
+
+        dl = EarthdataSoilMoistureDownloader(
+            dataset="SPL2SMP_E", version="006", output_dir=tmp_path,
+        )
+
+        fake_earthaccess = MagicMock()
+        fake_earthaccess.search_data.return_value = []
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            result = dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        assert result == []
+        fake_earthaccess.search_data.assert_called_once_with(
+            short_name="SPL2SMP_E",
+            version="006",
+            bounding_box=(-10.0, 40.0, 10.0, 55.0),
+            temporal=("2026-07-01T00:00:00", "2026-07-02T00:00:00"),
+        )
+        fake_earthaccess.download.assert_not_called()

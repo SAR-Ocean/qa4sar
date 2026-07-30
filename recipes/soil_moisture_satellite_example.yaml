@@ -1,0 +1,46 @@
+name: soil_moisture_satellite_example
+description: 'Validate Sentinel-1 CLMS Surface Soil Moisture against ISMN
+  and satellite scatterometer/radiometer soil-moisture products.'
+version: '1.0'
+variable: soil_moisture
+variable_specs:
+  components:
+  - soil_moisture
+geographic_bounds:
+  min_lon: -10.0
+  max_lon: 30.0
+  min_lat: 35.0
+  max_lat: 60.0
+temporal_bounds:
+  start: '2025-07-02 23:59:59'
+  end: '2025-07-04 00:00:00'
+sar_data:
+  satellite: Sentinel-1
+  product_level: L3_SSM
+  swath_mode:
+  - IW
+  - EW
+  max_downloads: null
+validation_sources:
+- source_type: ismn
+  min_depth: 0.0
+  max_depth: 0.05
+- source_type: ascat_ssm
+  download_kwargs: {}
+- source_type: amsr_ssm
+  download_kwargs: {}
+- source_type: smap_ssm
+  download_kwargs: {}
+- source_type: smos_ssm
+  download_kwargs: {}
+collocation:
+  point_vs_layer:
+    time_tolerance_minutes: 720
+    spatial_tolerance_km: 2.0
+    interpolation_method: nearest
+    aggregation_window_km: 1.0
+    validation_temporal_averaging_minutes: 30
+    distance_weighting: equal
+    gaussian_sigma_km: 2.0
+  sar_footprint_radius_km: 14.0
+output_dir: null

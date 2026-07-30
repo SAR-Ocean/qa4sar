@@ -36,6 +36,7 @@ __all__ = [
     "_resolve_layer_type",
     "LAYER_DATA_TYPES",
     "LAYER_SOURCE_PATHS",
+    "SSM_SATELLITE_LAYER_TYPES",
 ]
 
 
@@ -285,11 +286,15 @@ def _equal_weights(distances: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 # data_type attribute values that indicate a gridded layer source
-LAYER_DATA_TYPES = {"scatterometer", "altimeter", "hf_radar", "hf_radar_grid", "radiometer"}
+LAYER_DATA_TYPES = {
+    "scatterometer", "altimeter", "hf_radar", "hf_radar_grid", "radiometer",
+    "scatterometer_ssm", "radiometer_ssm",
+}
 # path-fragment fallbacks when attributes are absent
 LAYER_SOURCE_PATHS = {
     "osi_saf_winds", "scatterometer", "altimeter", "hf_radar",
-    "hf_radar_grid", "hfr_noaa", "radiometer",
+    "hf_radar_grid", "hfr_noaa", "radiometer", "ascat_ssm", "amsr_ssm", "smap_ssm",
+    "smos_ssm",
 }
 
 
@@ -959,6 +964,12 @@ def _resolve_layer_type(val_ds: "xr.Dataset", val_name: str, layer_vs_layer_spec
             layer_type = "hf_radar"
         elif "hfr_noaa" in path_parts or "hf_radar_grid" in path_parts:
             layer_type = "hf_radar_grid"
+        elif "amsr_ssm" in path_parts:
+            layer_type = "amsr_ssm"
+        elif "smap_ssm" in path_parts:
+            layer_type = "smap_ssm"
+        elif "smos_ssm" in path_parts:
+            layer_type = "smos_ssm"
 
     if layer_type == "scatterometer":
         for variant in ("scatterometer_hy2b", "scatterometer_hy2c", "scatterometer_oceansat3"):
@@ -972,8 +983,193 @@ def _resolve_layer_type(val_ds: "xr.Dataset", val_name: str, layer_vs_layer_spec
         sensor = val_ds.attrs.get("sensor", "").lower()
         if sensor and f"radiometer_{sensor}" in layer_vs_layer_specs:
             layer_type = f"radiometer_{sensor}"
+    elif layer_type == "radiometer_ssm":
+        # AMSR-E/2 and SMAP soil moisture share data_type="radiometer_ssm";
+        # refine to the sensor-specific spec key (amsr_ssm / smap_ssm),
+        # mirroring the radiometer_<sensor> refinement above.
+        sensor = val_ds.attrs.get("sensor", "").lower()
+        sensor_key = f"{sensor}_ssm"
+        if sensor and sensor_key in layer_vs_layer_specs:
+            layer_type = sensor_key
 
     return layer_type
+
+
+#: layer_vs_layer types that receive pre-collocation ±time_tolerance
+#: temporal averaging (soil-moisture satellite sources) instead of the
+#: default "keep every reading" behaviour -- see run_collocation and
+#: _average_within_sar_tolerance below.
+SSM_SATELLITE_LAYER_TYPES = {
+    "scatterometer_ssm", "radiometer_ssm", "amsr_ssm", "smap_ssm", "smos_ssm",
+}
+
+
+def _snap_to_grid(values: np.ndarray, step_deg: float) -> np.ndarray:
+    """
+    Round coordinates to the nearest multiple of ``step_deg``.
+
+    Gives repeated readings of "the same" underlying satellite grid cell an
+    identical grouping key even when the source reports lon/lat as a
+    continuously-varying swath (e.g. AMSR2's AU_Land half-orbit format)
+    rather than a fixed grid -- a no-op for sources already on a fixed
+    grid, since repeated cells already share identical lon/lat.
+    """
+    return np.round(values / step_deg) * step_deg
+
+
+def _average_within_sar_tolerance(
+    val_df: pd.DataFrame,
+    sar_times: List[datetime],
+    group_cols: List[str],
+    time_tolerance_minutes: float,
+) -> pd.DataFrame:
+    """
+    Collapse *val_df* to one row per (group_cols..., matched SAR time) by
+    averaging every numeric column across all readings within
+    ``time_tolerance_minutes`` of that SAR time.
+
+    Each reading is assigned to its single *nearest* SAR time (via
+    ``pd.merge_asof(direction="nearest")``), not every SAR time within
+    tolerance -- correct as long as consecutive SAR times are spaced more
+    than ``2 * time_tolerance_minutes`` apart, true for soil moisture's
+    daily scenes with a 12h tolerance. Readings outside tolerance of every
+    SAR time are dropped (they could not have collocated with anything
+    anyway). The output's ``time`` column is set to the matched SAR time,
+    not the mean of the grouped readings' own times, so downstream
+    temporal-distance calculations see ~0 for these pre-averaged rows.
+
+    Parameters
+    ----------
+    val_df : pd.DataFrame
+        Must have ``lon``, ``lat``, ``time`` columns plus any number of
+        variable columns. May also have ``platform_id``/``platform_type``.
+    sar_times : list[datetime]
+        Every SAR scene's acquisition time in this collocation run.
+    group_cols : list[str]
+        Column(s) identifying "the same physical location" -- e.g.
+        ``["platform_id"]`` for ISMN stations (or ``["lon", "lat"]`` when
+        no platform_id column exists), or ``["_snap_lon", "_snap_lat"]``
+        for gridded satellite sources (see ``_snap_to_grid``).
+    time_tolerance_minutes : float
+        The collocation pass's own time tolerance.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (group_cols..., matched SAR time), with numeric
+        columns averaged and ``lon``/``lat`` set to the group's mean
+        coordinate (unchanged if ``lon``/``lat`` are themselves the
+        group_cols).
+    """
+    if val_df.empty or not sar_times:
+        return val_df.iloc[0:0]
+
+    working = val_df.copy()
+    working["_val_time_ns"] = pd.to_datetime(working["time"]).values.astype("datetime64[ns]")
+    # A NaT in the validation source's own time column is a real,
+    # documented case (e.g. from_amsr_ssm's NSIDC-0451 branch sets
+    # time=NaT when time_coverage_start is missing from the file, and
+    # such points are deliberately kept upstream rather than dropped --
+    # see _subset_point_ds's docstring). pd.merge_asof rejects a null
+    # merge key on either side identically, so drop these here, the same
+    # graceful-drop treatment already applied to the SAR side's times.
+    working = working[working["_val_time_ns"].notna()].reset_index(drop=True)
+    if working.empty:
+        return val_df.iloc[0:0]
+    working = working.sort_values("_val_time_ns").reset_index(drop=True)
+
+    sar_times_ns = pd.to_datetime(sorted(sar_times)).values.astype("datetime64[ns]")
+    sar_df = pd.DataFrame({"_sar_time_ns": sar_times_ns})
+
+    merged = pd.merge_asof(
+        working, sar_df,
+        left_on="_val_time_ns", right_on="_sar_time_ns",
+        direction="nearest",
+        tolerance=pd.Timedelta(minutes=time_tolerance_minutes),
+    )
+    merged = merged.dropna(subset=["_sar_time_ns"]).reset_index(drop=True)
+    if merged.empty:
+        return merged.drop(columns=["_val_time_ns", "_sar_time_ns"])
+
+    numeric_cols = [
+        col for col in merged.columns
+        if col not in {"lon", "lat", "time", "platform_id", "platform_type",
+                       "_val_time_ns", "_sar_time_ns", *group_cols}
+        and pd.api.types.is_numeric_dtype(merged[col])
+    ]
+
+    agg: Dict[str, Any] = {col: "mean" for col in numeric_cols}
+    if "lon" not in group_cols:
+        agg["lon"] = "mean"
+    if "lat" not in group_cols:
+        agg["lat"] = "mean"
+    if "platform_id" in merged.columns and "platform_id" not in group_cols:
+        agg["platform_id"] = "first"
+    if "platform_type" in merged.columns and "platform_type" not in group_cols:
+        agg["platform_type"] = "first"
+
+    grouped = merged.groupby(group_cols + ["_sar_time_ns"], as_index=False).agg(agg)
+    grouped["time"] = grouped["_sar_time_ns"]
+    return grouped.drop(columns=["_sar_time_ns"])
+
+
+def _merge_sibling_ssm_nodes(
+    buckets: Dict[str, Dict[str, Any]],
+    source_metadata: Dict[str, Dict[str, Any]],
+    layer_vs_layer_specs: dict,
+) -> None:
+    """
+    Collapse sibling per-file SSM satellite nodes sharing the same source
+    into a single logical node before any averaging or collocation runs.
+
+    Satellite SSM sources are stored as one datatree node per downloaded
+    file (e.g. ``validation/ascat_ssm/<stem1>``,
+    ``validation/ascat_ssm/<stem2>``, ... for multiple granules), each its
+    own ``val_name`` key in *buckets*. Without this step, an ascending and
+    a descending overpass delivered as two separate files would be
+    averaged independently by ``_average_within_sar_tolerance`` (called
+    per ``val_name``) rather than blended together, defeating the point
+    of blending overpasses within one ±time_tolerance window at all. This
+    mutates *buckets* and *source_metadata* in place: for every group of
+    >=2 sibling ``val_name``s sharing a ``source_type`` whose resolved
+    layer_type is in ``SSM_SATELLITE_LAYER_TYPES``, only one representative
+    ``val_name`` survives in ``buckets["layer_vs_layer"]``, with the raw
+    (pre-averaging) concatenation of every sibling's own
+    ``to_dataframe()`` stashed on ``source_metadata[representative]
+    ["_merged_raw_df"]`` for the val_dfs-building loop to pick up instead
+    of recomputing ``to_dataframe()`` from just the representative's own
+    single-file Dataset.
+
+    Grouped by ``source_type`` (the top-level validation-tree directory
+    name, e.g. ``"ascat_ssm"``), not by resolved layer_type, since that's
+    the "one physical source" key already used elsewhere in
+    ``run_collocation`` (e.g. for ``collocation_kwargs`` overrides).
+    """
+    sources = buckets.get("layer_vs_layer")
+    if not sources:
+        return
+
+    groups: Dict[str, List[str]] = {}
+    for val_name, val_ds in sources.items():
+        layer_type = _resolve_layer_type(val_ds, val_name, layer_vs_layer_specs)
+        if layer_type not in SSM_SATELLITE_LAYER_TYPES:
+            continue
+        source_type = source_metadata.get(val_name, {}).get("source_type", val_name)
+        groups.setdefault(source_type, []).append(val_name)
+
+    for val_names in groups.values():
+        if len(val_names) < 2:
+            continue
+        ordered = sorted(val_names)
+        representative = ordered[0]
+        merged_df = pd.concat(
+            [sources[name].to_dataframe().reset_index(drop=True) for name in ordered],
+            ignore_index=True,
+        )
+        source_metadata[representative]["_merged_raw_df"] = merged_df
+        for name in ordered[1:]:
+            del sources[name]
+            source_metadata.pop(name, None)
 
 
 def _distance_weights(
@@ -1320,14 +1516,111 @@ def run_collocation(
                         "colloc_kwargs": source_type_overrides.get(source_type, {}),
                     }
 
+    _merge_sibling_ssm_nodes(buckets, source_metadata, layer_vs_layer_specs)
+
     total_sources = sum(len(v) for v in buckets.values())
     if total_sources == 0:
         logger.warning("No validation nodes with 'point' dimension found — nothing to collocate.")
         return None
 
-    for sources in buckets.values():
+    # ``ds["time"]`` is a scalar coordinate for grid-mode (IW/EW/SM) scenes
+    # but a (point,)-dimensioned array of per-imagette times for WV-mode
+    # scenes -- np.atleast_1d normalises both to an iterable so every SAR
+    # acquisition time is collected regardless of scene mode. Scenes with
+    # no ``time`` coordinate at all, or individual NaT entries within one,
+    # are skipped here rather than raising -- the per-scene loop below
+    # already skips a no-time scene gracefully with a warning, and this
+    # must not short-circuit that with a crash first; a NaT entry would
+    # otherwise reach pd.merge_asof (inside _average_within_sar_tolerance)
+    # as a null merge key, which pandas rejects outright.
+    sar_scene_times: List[datetime] = [
+        pd.Timestamp(t).to_pydatetime()
+        for ds in sar_scenes.values()
+        if "time" in ds.coords
+        for t in np.atleast_1d(ds["time"].values)
+        if not pd.isna(t)
+    ]
+
+    for ctype, sources in buckets.items():
         for val_name, val_ds in sources.items():
-            val_dfs[val_name] = val_ds.to_dataframe().reset_index(drop=True)
+            merged_raw_df = source_metadata.get(val_name, {}).get("_merged_raw_df")
+            df = (
+                merged_raw_df if merged_raw_df is not None
+                else val_ds.to_dataframe().reset_index(drop=True)
+            )
+            source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
+
+            if ctype == "point_vs_layer" and source_label == "ismn":
+                # Average every ISMN reading within ±time_tolerance_minutes
+                # of each SAR scene into one station-day value, instead of
+                # picking the single nearest (always-nighttime, since S1
+                # SSM scenes are stamped at midnight) reading. See
+                # docs/design-choices.md §8.6.
+                per_source_kwargs = source_metadata.get(val_name, {}).get("colloc_kwargs", {})
+                merged_kwargs = _merge_collocation_kwargs(global_coll_kwargs, per_source_kwargs)
+                group_cols = ["platform_id"] if "platform_id" in df.columns else ["lon", "lat"]
+                df = _average_within_sar_tolerance(
+                    df, sar_scene_times, group_cols,
+                    merged_kwargs["time_tolerance_minutes"],
+                )
+            elif ctype == "layer_vs_layer":
+                layer_type = _resolve_layer_type(val_ds, val_name, layer_vs_layer_specs)
+                if layer_type in SSM_SATELLITE_LAYER_TYPES:
+                    # Blend every overpass (e.g. ascending + descending
+                    # passes) of the same grid cell within ±time_tolerance
+                    # into one day value -- same treatment as ISMN above.
+                    # This also shrinks soil-moisture's ~100k-point scale,
+                    # since multiple overpasses collapse into one row
+                    # before the per-row collocation loop runs. Km-based
+                    # sources (ASCAT/SMAP/SMOS/AMSR2-NSIDC-0451/AU_Land) are
+                    # snapped to the source's own aggregation_window_km
+                    # below; AMSR2's G-Portal format is stamped with a
+                    # native_grid_deg attribute at conversion time and
+                    # grouped by its raw (exact) lon/lat instead, since it's
+                    # already a fixed lattice that reports identical
+                    # coordinates for repeated readings of the same cell.
+                    # See docs/design-choices.md §8.7.
+                    spec = layer_vs_layer_specs.get(layer_type, {})
+                    time_tol = spec.get(
+                        "time_tolerance_minutes", global_coll_kwargs["time_tolerance_minutes"]
+                    )
+                    native_grid_deg = val_ds.attrs.get("native_grid_deg")
+                    if native_grid_deg is not None:
+                        # A genuinely degree-native fixed grid (e.g. AMSR2
+                        # G-Portal's 0.1x0.1 EQR grid) reports IDENTICAL
+                        # lon/lat for repeated readings of the same cell --
+                        # no snapping needed, group on the raw coordinates
+                        # directly. Rounding this grid's cell centres
+                        # (which sit at exact half-step offsets, e.g.
+                        # 9.05/9.15/9.25/...) to a 0.1deg step would put
+                        # every centre exactly on a tie, and NumPy's
+                        # round-half-to-even resolves ties inconsistently,
+                        # silently merging ~1 in 5 pairs of genuinely
+                        # adjacent native cells.
+                        df = _average_within_sar_tolerance(
+                            df, sar_scene_times, ["lon", "lat"], time_tol,
+                        )
+                    else:
+                        # Km-based (roughly equal-area) grids: a degree of
+                        # longitude covers less physical distance than a
+                        # degree of latitude away from the equator, by a
+                        # factor of cos(latitude) -- widen the longitude
+                        # step accordingly so the snap footprint is
+                        # isotropic in physical km at any latitude.
+                        lon_vals = df["lon"].to_numpy(dtype=float)
+                        lat_vals = df["lat"].to_numpy(dtype=float)
+                        agg_km = spec.get("aggregation_window_km", 25.0)
+                        lat_step = agg_km / 111.0
+                        mean_lat = float(np.nanmean(lat_vals)) if lat_vals.size else 0.0
+                        lon_step = agg_km / (111.0 * max(np.cos(np.radians(mean_lat)), 1e-6))
+                        df["_snap_lon"] = _snap_to_grid(lon_vals, lon_step)
+                        df["_snap_lat"] = _snap_to_grid(lat_vals, lat_step)
+                        df = _average_within_sar_tolerance(
+                            df, sar_scene_times, ["_snap_lon", "_snap_lat"], time_tol,
+                        )
+                        df = df.drop(columns=["_snap_lon", "_snap_lat"], errors="ignore")
+
+            val_dfs[val_name] = df
 
     for ctype, sources in buckets.items():
         if sources:
@@ -1478,20 +1771,6 @@ def run_collocation(
 
                         # Add layer-vs-layer collocation method
                         merged_kwargs["method"] = layer_vs_layer_collocation_method
-
-                    if ctype == "point_vs_layer" and source_label == "ismn":
-                        # ISMN reports far more densely (hourly) than the SAR
-                        # revisit time, and needs a wide time_tolerance_minutes
-                        # to tolerate reporting gaps — without deduping, every
-                        # in-tolerance hourly reading becomes its own
-                        # collocation, multiplying one station into dozens of
-                        # near-duplicate matches against the same SAR
-                        # overpass. Other point_vs_layer sources (moorings,
-                        # buoys) keep the historical one-match-per-reading
-                        # behaviour, where repeated readings at a location are
-                        # genuinely distinct passes worth comparing
-                        # independently.
-                        merged_kwargs["dedup_nearest_in_time"] = True
 
                     colloc = _COLLOC_CLASSES[ctype](**merged_kwargs)
 

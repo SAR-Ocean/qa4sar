@@ -26,21 +26,19 @@ Step 2 — Convert to xarray.DataTree
           │  filter to recipe geographic/temporal bounds +/- tolerances
           │  handle different grids / resolutions
           ▼
-Step 3 — Collocation
+Step 3 — Collocation + store collocated pairs
           │  point vs. point    (mooring / buoy / drifter / ferrybox / tidal gauge vs. SAR wave parameter)
           │  point vs. layer    (mooring / buoy / drifter / ferrybox / tidal gauge vs. SAR)
           │  layer vs. layer    (scatterometer / altimeter / radiometer / HF-radar vs. SAR)
           |  create a collocation diagnostics plot
-          ▼
-Step 4 — Store collocated pairs
           │  keep only overlapping data
           │  store spatial/temporal offset metadata
           ▼
-Step 5a — Compute statistics
+Step 4 — Compute statistics
           │  bias, RMSE, correlation, scatter index
           │  per platform/source
           ▼
-Step 5b — Generate visualisation & report
+Step 5 — Generate visualisation & report
           │  scatter plots, geographic maps
           │  statistics charts, residuals
           │  PDF validation report
@@ -61,8 +59,8 @@ sar_validation/
 │   ├── orchestrator.py     # Orchestrates step 1 (download all sources)
 │   ├── datatree_converter.py  # Step 2: convert to xarray.DataTree
 │   ├── collocation.py      # Step 3: collocation algorithms
-│   ├── statistics.py       # Step 5a: compute bias, RMSE, correlation, scatter index
-│   ├── visualization.py    # Step 5b: scatter plots, geographic maps, statistics charts, residuals
+│   ├── statistics.py       # Step 4: compute bias, RMSE, correlation, scatter index
+│   ├── visualization.py    # Step 5: scatter plots, geographic maps, statistics charts, residuals
 │   ├── _variable_map.py    # Variable mapping (wind/currents/waves)
 │   └── __init__.py         # Package exports
 └── downloaders/
@@ -74,6 +72,9 @@ sar_validation/
     ├── altimeter_downloader.py      # Along-track SWH/wind via Copernicus Marine
     ├── radiometer_downloader.py     # RSS radiometer ocean winds (AMSR2 NetCDF + GMI/SSMIS/WindSat bytemaps)
     ├── soil_moisture_downloader.py   # Sentinel-1 CLMS Surface Soil Moisture via Copernicus Dataspace (CDSE)
+    ├── ascat_soil_moisture_downloader.py  # ASCAT scatterometer soil moisture (SOMO12) via EUMETSAT EUMDAC
+    ├── earthdata_soil_moisture_downloader.py  # AMSR-E/2 and SMAP soil moisture via NASA Earthdata
+    ├── smos_downloader.py            # SMOS L3 soil moisture via ESA SMOS FTPS
     ├── ismn_downloader.py            # ISMN local-archive station selector (no download API)
     └── _rss_bytemap.py              # Decoder for RSS binary bytemap (.gz) radiometer products
 ```
@@ -131,7 +132,7 @@ converter = DataTreeConverter()
 ds_sar    = converter.from_sar_l2_ocn(xr.open_dataset("data/.../S1_L2_OCN/product.nc"))
 ds_insitu = converter.from_insitu_csv("data/.../copernicus_insitu_data/obs.csv", source_type="buoy")
 
-# --- Step 3: collocate ---
+# --- Step 3: collocate and store as DataFrame ---
 colloc = PointLayerCollocation(spatial_tolerance_km=50, time_tolerance_minutes=60)
 results = colloc.collocate(
     sar_data={"wind_speed": sar_ws_array},
@@ -139,12 +140,12 @@ results = colloc.collocate(
     val_data=df_insitu,
     val_source="buoy",
 )
-
-# --- Step 4: store as DataFrame ---
 df = DataTreeConverter.to_dataframe(results)
 df.to_csv("data/.../collocations_wind_buoy.csv", index=False)
 
-# --- Step 5a/5b: analyse / visualize ---
+# --- Step 4: calculate statistics ---
+
+# --- Step 5: visualize and create PDF report ---
 import matplotlib.pyplot as plt
 plt.scatter(df["val_wind_speed"], df["sar_wind_speed"])
 plt.xlabel("Buoy wind speed (m/s)")
@@ -164,6 +165,10 @@ plt.show()
 | ASCAT (MetOp-B/C) | wind | `scatterometer_downloader` | EUMETSAT EUMDAC |
 | Radiometer — AMSR2 (NetCDF); GMI, SSMIS F16/F17/F18, WindSat (binary bytemaps) | wind (+ direction from WindSat) | `radiometer_downloader` | RSS `data.remss.com` (public HTTPS) |
 | Sentinel-1 CLMS Surface Soil Moisture | soil moisture | `soil_moisture_downloader` | Copernicus Dataspace (CDSE) |
+| ASCAT Soil Moisture (SOMO12) | soil moisture | `ascat_soil_moisture_downloader` | EUMETSAT EUMDAC |
+| AMSR-E/AMSR2 (NSIDC-0451) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata |
+| SMAP (SPL2SMP_E) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata |
+| SMOS (L3 SM DQR) | soil moisture | `smos_downloader` | ESA SMOS FTPS |
 | ISMN (International Soil Moisture Network) | soil moisture | `ismn_downloader` | Manual portal download (no API) |
 
 > **Note:** The Sentinel-1 CLMS Surface Soil Moisture downloader's CDSE query
@@ -217,6 +222,55 @@ chmod 600 ~/.eumdac/credentials
 Or use environment variables: `EUMDAC_USERNAME` / `EUMDAC_PASSWORD`.
 
 Register at: https://eoportal.eumetsat.int
+
+### Earthdata (AMSR-E/2, SMAP) — for satellite soil moisture downloads
+
+```bash
+export EARTHDATA_USERNAME=your_username
+export EARTHDATA_PASSWORD=your_password
+```
+
+Or create a `~/.netrc` file:
+
+```
+machine urs.earthdata.nasa.gov
+login your_username
+password your_password
+```
+
+```bash
+chmod 600 ~/.netrc
+```
+
+Register at: https://urs.earthdata.nasa.gov
+
+The `earthdata_soil_moisture_downloader` uses these credentials to download AMSR-E/2 and SMAP
+soil moisture products from the NASA Earthdata archive.
+
+### ESA SMOS FTPS — for SMOS soil moisture downloads
+
+```bash
+export SMOS_FTP_USERNAME=your_username
+export SMOS_FTP_PASSWORD=your_password
+```
+
+Or create a `~/.esa_smos_credentials` file (JSON format):
+
+```json
+{
+  "username": "your_username",
+  "password": "your_password"
+}
+```
+
+```bash
+chmod 600 ~/.esa_smos_credentials
+```
+
+Register at: https://smos.argans.co.uk
+
+The `smos_downloader` uses these credentials to download SMOS L3 soil moisture products
+from the ESA SMOS FTPS archive.
 
 ### ISMN — for soil moisture in-situ validation
 

@@ -2,11 +2,27 @@
 
 from __future__ import annotations
 
+import zipfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 
 from sar_validation.downloaders.ismn_downloader import ISMNDownloader
+
+
+@pytest.fixture(autouse=True)
+def mock_ismn_shared_cache(monkeypatch, tmp_path):
+    """Mock the shared ISMN archive cache and station-index cache to
+    prevent tests from accidentally using the real cache directory.
+    Tests that explicitly want to test either cache's real behavior
+    override this fixture's monkeypatch locally with their own tmp_path."""
+    import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+    # Set both caches to non-existent temp paths
+    monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", tmp_path / "mock_shared_cache")
+    monkeypatch.setattr(ismn_mod, "_STATION_INDEX_CACHE_DIR", tmp_path / "mock_station_index")
 
 
 class TestISMNDownloaderNoArchive:
@@ -96,7 +112,8 @@ class TestISMNDownloaderFiltering:
 
     def test_writes_one_csv_per_sensor_in_bbox(self, tmp_path):
         archive = tmp_path / "archive.zip"
-        archive.write_bytes(b"")
+        with zipfile.ZipFile(archive, "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
         out_dir = tmp_path / "out"
         dl = ISMNDownloader(output_dir=out_dir)
 
@@ -126,7 +143,8 @@ class TestISMNDownloaderFiltering:
 
     def test_station_outside_bbox_is_excluded(self, tmp_path):
         archive = tmp_path / "archive.zip"
-        archive.write_bytes(b"")
+        with zipfile.ZipFile(archive, "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
         dl = ISMNDownloader(output_dir=tmp_path / "out")
 
         reader = self._fake_reader()
@@ -149,7 +167,8 @@ class TestISMNDownloaderFiltering:
 
     def test_dry_run_writes_nothing(self, tmp_path):
         archive = tmp_path / "archive.zip"
-        archive.write_bytes(b"")
+        with zipfile.ZipFile(archive, "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
         out_dir = tmp_path / "out"
         dl = ISMNDownloader(output_dir=out_dir, dry_run=True)
 
@@ -165,6 +184,32 @@ class TestISMNDownloaderFiltering:
 
         assert written == []
         assert not out_dir.exists()
+        # dry_run must bail out before ever constructing ISMN_Interface --
+        # that call triggers ismn's own full sensor-level metadata scan
+        # (slow, and floods the terminal with a per-station tqdm progress
+        # bar on first run for a given archive+bbox), which defeats the
+        # entire point of --dry-run being quick.
+        fake_interface.ISMN_Interface.assert_not_called()
+
+    def test_dry_run_with_real_station_index_skips_ISMN_Interface(self, tmp_path, capsys):
+        archive = tmp_path / "synthetic.zip"
+        _write_synthetic_ismn_archive(archive, [
+            ("NETA", "InBbox", 45.0, 10.0, 0),
+            ("NETB", "OutBbox", -30.0, 150.0, 0),
+        ])
+        dl = ISMNDownloader(output_dir=tmp_path / "out", dry_run=True)
+
+        fake_interface = MagicMock()
+        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
+            written = dl.download(
+                min_lon=5.0, max_lon=15.0, min_lat=40.0, max_lat=50.0,
+                start="2020-01-01", end="2020-01-02",
+                archive_path=str(archive),
+            )
+
+        assert written == []
+        fake_interface.ISMN_Interface.assert_not_called()
+        assert "1 station" in capsys.readouterr().out
 
 
 class TestISMNDownloaderAutoDetectArchive:
@@ -192,7 +237,8 @@ class TestISMNDownloaderAutoDetectArchive:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         zip_path = out_dir / "Data_separate_files_20240703.zip"
-        zip_path.write_bytes(b"")
+        with zipfile.ZipFile(zip_path, "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
         dl = ISMNDownloader(output_dir=out_dir)
 
         fake_interface = MagicMock()
@@ -230,9 +276,11 @@ class TestISMNDownloaderAutoDetectArchive:
         out_dir.mkdir()
         older = out_dir / "older.zip"
         newer = out_dir / "newer.zip"
-        older.write_bytes(b"")
+        with zipfile.ZipFile(older, "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
         time.sleep(0.01)
-        newer.write_bytes(b"")
+        with zipfile.ZipFile(newer, "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
         now = time.time()
         os.utime(older, (now - 100, now - 100))
         os.utime(newer, (now, now))
@@ -254,9 +302,11 @@ class TestISMNDownloaderAutoDetectArchive:
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         decoy = out_dir / "decoy.zip"
-        decoy.write_bytes(b"")
+        with zipfile.ZipFile(decoy, "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
         explicit = tmp_path / "explicit_archive.zip"
-        explicit.write_bytes(b"")
+        with zipfile.ZipFile(explicit, "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
         dl = ISMNDownloader(output_dir=out_dir)
 
         fake_interface = MagicMock()
@@ -295,7 +345,8 @@ class TestISMNDownloaderSingleReadingArchive:
 
     def test_all_files_unparseable_raises_actionable_error(self, tmp_path):
         archive = tmp_path / "archive.zip"
-        archive.write_bytes(b"")
+        with zipfile.ZipFile(archive, "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
         dl = ISMNDownloader(output_dir=tmp_path / "out")
 
         fake_interface = MagicMock()
@@ -312,3 +363,477 @@ class TestISMNDownloaderSingleReadingArchive:
             except ValueError as exc:
                 assert "single reading" in str(exc) or "date range" in str(exc)
                 assert "dataviewer" in str(exc)
+
+
+class TestISMNDownloaderSharedCacheFallback:
+    """When no explicit archive_path is given and no zip sits in this
+    run's own output_dir, fall back to the shared complete-archive cache
+    at data/_archive_cache/ismn/ before giving up and printing manual
+    portal instructions."""
+
+    def _fake_reader(self):
+        meta_df = pd.DataFrame(
+            {("longitude", "val"): [10.0], ("latitude", "val"): [45.0]},
+            index=[0],
+        )
+        reader = MagicMock()
+        reader.metadata = meta_df
+        reader.get_dataset_ids.return_value = [0]
+        ts = pd.DataFrame(
+            {"soil_moisture": [0.20]},
+            index=pd.to_datetime(["2026-01-01T00:00:00"]),
+        )
+        meta = _real_shaped_sensor_meta("station_in_bbox", 10.0, 45.0, 0.0, 0.05)
+        reader.read.return_value = (ts, meta)
+        return reader
+
+    def test_falls_back_to_shared_cache_when_no_local_zip(self, tmp_path, monkeypatch):
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        shared_cache = tmp_path / "shared_cache"
+        shared_cache.mkdir()
+        shared_zip = shared_cache / "ISMN_archive_20260724.zip"
+        with zipfile.ZipFile(shared_zip, "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
+        monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", shared_cache)
+
+        out_dir = tmp_path / "out"  # empty -- no recipe-local zip
+        dl = ISMNDownloader(output_dir=out_dir)
+
+        fake_interface = MagicMock()
+        fake_interface.ISMN_Interface.return_value = self._fake_reader()
+
+        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
+            written = dl.download(
+                min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
+                start="2026-01-01", end="2026-01-02",
+                min_depth=0.0, max_depth=0.05,
+                archive_path=None,
+            )
+
+        assert len(written) == 1
+        assert fake_interface.ISMN_Interface.call_args.args[0] == shared_zip
+
+    def test_local_zip_takes_priority_over_shared_cache(self, tmp_path, monkeypatch):
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        shared_cache = tmp_path / "shared_cache"
+        shared_cache.mkdir()
+        with zipfile.ZipFile(shared_cache / "ISMN_archive_20260724.zip", "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
+        monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", shared_cache)
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        local_zip = out_dir / "Data_separate_files_20260101.zip"
+        with zipfile.ZipFile(local_zip, "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
+        dl = ISMNDownloader(output_dir=out_dir)
+
+        fake_interface = MagicMock()
+        fake_interface.ISMN_Interface.return_value = self._fake_reader()
+
+        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
+            dl.download(
+                min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
+                start="2026-01-01", end="2026-01-02",
+                archive_path=None,
+            )
+
+        assert fake_interface.ISMN_Interface.call_args.args[0] == local_zip
+
+    def test_missing_shared_cache_dir_still_prints_instructions(self, tmp_path, monkeypatch, capsys):
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", tmp_path / "does_not_exist")
+
+        dl = ISMNDownloader(output_dir=tmp_path / "out")
+        result = dl.download(
+            min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
+            start="2026-01-01", end="2026-01-02",
+            archive_path=None,
+        )
+
+        assert result == []
+        assert "ismn.earth" in capsys.readouterr().out
+
+    def test_warns_when_shared_cache_archive_older_than_90_days(self, tmp_path, monkeypatch, caplog):
+        import logging
+        import os
+        import time
+
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        shared_cache = tmp_path / "shared_cache"
+        shared_cache.mkdir()
+        old_zip = shared_cache / "ISMN_archive_old.zip"
+        with zipfile.ZipFile(old_zip, "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
+        old_time = time.time() - (95 * 86400)
+        os.utime(old_zip, (old_time, old_time))
+        monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", shared_cache)
+
+        dl = ISMNDownloader(output_dir=tmp_path / "out")
+
+        fake_interface = MagicMock()
+        fake_interface.ISMN_Interface.return_value = self._fake_reader()
+
+        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
+            with caplog.at_level(logging.WARNING):
+                dl.download(
+                    min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
+                    start="2026-01-01", end="2026-01-02",
+                    archive_path=None,
+                )
+
+        assert any("days old" in r.message for r in caplog.records)
+
+    def test_no_warning_when_shared_cache_archive_is_recent(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        shared_cache = tmp_path / "shared_cache"
+        shared_cache.mkdir()
+        with zipfile.ZipFile(shared_cache / "ISMN_archive_recent.zip", "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
+        monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", shared_cache)
+
+        dl = ISMNDownloader(output_dir=tmp_path / "out")
+
+        fake_interface = MagicMock()
+        fake_interface.ISMN_Interface.return_value = self._fake_reader()
+
+        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
+            with caplog.at_level(logging.WARNING):
+                dl.download(
+                    min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
+                    start="2026-01-01", end="2026-01-02",
+                    archive_path=None,
+                )
+
+        assert not any("days old" in r.message for r in caplog.records)
+
+
+def _write_synthetic_ismn_archive(archive_path, stations):
+    """stations: list of (network, station, lat_or_None, lon_or_None,
+    extra_stm_count). lat/lon=None writes a deliberately malformed
+    first line instead of a real CEOP header, to test the fail-safe
+    path. extra_stm_count adds N additional .stm files under the same
+    station directory (different sensor/depth), all sharing the same
+    header line, to prove one row per STATION not per FILE."""
+    with zipfile.ZipFile(archive_path, "w") as zf:
+        for network, station, lat, lon, extra_stm_count in stations:
+            if lat is None or lon is None:
+                header = "this is not a valid CEOP header line\n"
+            else:
+                header = f"{network} {network} {station} {lat} {lon} 100.0 0.0000 0.0500 'Test-Sensor'\n"
+            body = header + "2020/01/01 00:00 0.20 G M\n2020/01/02 00:00 0.21 G M\n"
+            base = f"{network}/{station}/{network}_{network}_{station}"
+            zf.writestr(f"{base}_sm_0.000000_0.050000_Test-Sensor_1_1_19500101_20260101.stm", body)
+            for i in range(extra_stm_count):
+                zf.writestr(f"{base}_ts_{i}_0.000000_0.050000_Test-Sensor_1_1_19500101_20260101.stm", body)
+
+
+class TestBuildStationIndex:
+    def test_one_row_per_station_directory_not_per_file(self, tmp_path):
+        from sar_validation.downloaders.ismn_downloader import _build_station_index
+
+        archive = tmp_path / "synthetic.zip"
+        _write_synthetic_ismn_archive(archive, [("NETA", "Station1", 45.0, 10.0, 3)])
+
+        index_df = _build_station_index(archive)
+
+        assert len(index_df) == 1
+        row = index_df.iloc[0]
+        assert row["network"] == "NETA"
+        assert row["station"] == "Station1"
+        assert row["lat"] == pytest.approx(45.0)
+        assert row["lon"] == pytest.approx(10.0)
+        assert row["dir_prefix"] == "NETA/Station1/"
+
+    def test_multiple_stations_all_indexed(self, tmp_path):
+        from sar_validation.downloaders.ismn_downloader import _build_station_index
+
+        archive = tmp_path / "synthetic.zip"
+        _write_synthetic_ismn_archive(archive, [
+            ("NETA", "Station1", 45.0, 10.0, 0),
+            ("NETB", "Station2", -30.0, 150.0, 0),
+        ])
+
+        index_df = _build_station_index(archive)
+
+        assert len(index_df) == 2
+        assert set(index_df["dir_prefix"]) == {"NETA/Station1/", "NETB/Station2/"}
+
+    def test_malformed_first_line_kept_with_nan_coords(self, tmp_path):
+        from sar_validation.downloaders.ismn_downloader import _build_station_index
+
+        archive = tmp_path / "synthetic.zip"
+        _write_synthetic_ismn_archive(archive, [("BADNET", "BadStation", None, None, 0)])
+
+        index_df = _build_station_index(archive)
+
+        assert len(index_df) == 1
+        assert index_df.iloc[0]["dir_prefix"] == "BADNET/BadStation/"
+        assert pd.isna(index_df.iloc[0]["lat"])
+        assert pd.isna(index_df.iloc[0]["lon"])
+
+
+class TestLoadOrBuildStationIndex:
+    def test_builds_and_caches_on_first_call(self, tmp_path, monkeypatch):
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        cache_dir = tmp_path / "index_cache"
+        monkeypatch.setattr(ismn_mod, "_STATION_INDEX_CACHE_DIR", cache_dir)
+
+        archive = tmp_path / "synthetic.zip"
+        _write_synthetic_ismn_archive(archive, [("NETA", "Station1", 45.0, 10.0, 0)])
+
+        index_df = ismn_mod._load_or_build_station_index(archive)
+
+        assert len(index_df) == 1
+        # Cache filename includes the archive's size/mtime fingerprint (not
+        # just its stem) so a replaced archive with the same name gets a
+        # fresh cache entry instead of silently reusing a stale one.
+        expected_path = ismn_mod._station_index_path(archive)
+        assert expected_path.exists()
+        assert expected_path.name != f"station_index_{archive.stem}.csv"
+
+    def test_second_call_loads_from_cache_without_reopening_zip(self, tmp_path, monkeypatch):
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        cache_dir = tmp_path / "index_cache"
+        monkeypatch.setattr(ismn_mod, "_STATION_INDEX_CACHE_DIR", cache_dir)
+
+        archive = tmp_path / "synthetic.zip"
+        _write_synthetic_ismn_archive(archive, [("NETA", "Station1", 45.0, 10.0, 0)])
+        ismn_mod._load_or_build_station_index(archive)  # first call builds + caches
+
+        with patch("zipfile.ZipFile") as mock_zip_cls:
+            index_df = ismn_mod._load_or_build_station_index(archive)
+
+        mock_zip_cls.assert_not_called()
+        assert len(index_df) == 1
+        assert index_df.iloc[0]["dir_prefix"] == "NETA/Station1/"
+
+
+class TestExtractMatchingStations:
+    def test_extracts_only_matching_station_files(self, tmp_path):
+        from sar_validation.downloaders.ismn_downloader import _extract_matching_stations
+
+        archive = tmp_path / "synthetic.zip"
+        _write_synthetic_ismn_archive(archive, [
+            ("NETA", "Station1", 45.0, 10.0, 0),
+            ("NETB", "Station2", -30.0, 150.0, 0),
+        ])
+        out_dir = tmp_path / "subset"
+
+        _extract_matching_stations(archive, {"NETA/Station1/"}, out_dir)
+
+        assert (out_dir / "NETA" / "Station1").exists()
+        assert list((out_dir / "NETA" / "Station1").glob("*.stm"))
+        assert not (out_dir / "NETB").exists()
+
+    def test_global_reference_files_always_copied_if_present(self, tmp_path):
+        from sar_validation.downloaders.ismn_downloader import _extract_matching_stations
+
+        archive = tmp_path / "synthetic.zip"
+        _write_synthetic_ismn_archive(archive, [("NETA", "Station1", 45.0, 10.0, 0)])
+        with zipfile.ZipFile(archive, "a") as zf:
+            zf.writestr("ISMN_sensor_list.csv", "sensor_name;measured_variable\n5TE;soil moisture\n")
+
+        out_dir = tmp_path / "subset"
+        _extract_matching_stations(archive, {"NETA/Station1/"}, out_dir)
+
+        assert (out_dir / "ISMN_sensor_list.csv").exists()
+
+
+class TestISMNDownloaderBboxPreFilterWiring:
+    def test_download_passes_extracted_subset_not_raw_archive_to_ISMN_Interface(
+        self, tmp_path, monkeypatch,
+    ):
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        cache_dir = tmp_path / "index_cache"
+        monkeypatch.setattr(ismn_mod, "_STATION_INDEX_CACHE_DIR", cache_dir)
+
+        archive = tmp_path / "synthetic.zip"
+        _write_synthetic_ismn_archive(archive, [
+            ("NETA", "InBbox", 45.0, 10.0, 0),
+            ("NETB", "OutBbox", -30.0, 150.0, 0),
+        ])
+
+        out_dir = tmp_path / "out"
+        dl = ISMNDownloader(output_dir=out_dir)
+
+        captured = {}
+        fake_reader = MagicMock()
+        fake_reader.metadata = pd.DataFrame(
+            columns=pd.MultiIndex.from_tuples([("longitude", "val"), ("latitude", "val")]),
+        )
+        fake_reader.get_dataset_ids.return_value = []
+
+        def capture_and_return_reader(path, **kwargs):
+            # Called while subset_dir still exists (before download() returns
+            # and cleans it up) -- this is the only point at which the
+            # extracted subset's contents can be observed from a test.
+            captured["path"] = Path(path)
+            captured["neta_exists"] = (Path(path) / "NETA" / "InBbox").exists()
+            captured["netb_exists"] = (Path(path) / "NETB").exists()
+            return fake_reader
+
+        fake_interface = MagicMock()
+        fake_interface.ISMN_Interface.side_effect = capture_and_return_reader
+
+        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
+            dl.download(
+                min_lon=5.0, max_lon=15.0, min_lat=40.0, max_lat=50.0,
+                start="2020-01-01", end="2020-01-02",
+                archive_path=str(archive),
+            )
+
+        assert captured["path"] != archive
+        assert captured["neta_exists"] is True
+        assert captured["netb_exists"] is False
+        # The extracted subset is a PERSISTENT cache now, not a scratch
+        # temp dir -- it must still exist after download() returns, so a
+        # second call (e.g. a --dry-run immediately followed by the real
+        # run) can reuse it instead of re-extracting from scratch. The
+        # completion marker specifically (not just the directory) is
+        # what a real second call checks for before reusing it.
+        assert captured["path"].exists()
+        assert (captured["path"] / ismn_mod._EXTRACTION_COMPLETE_MARKER).exists()
+
+    def test_second_call_with_same_archive_and_bbox_reuses_extracted_subset(
+        self, tmp_path, monkeypatch,
+    ):
+        """Regression test: ismn's own internal metadata cache lives
+        INSIDE the extracted subset directory -- if that directory were
+        recreated fresh on every call (e.g. a random tempfile.mkdtemp()
+        target, the original design), ismn would rebuild its metadata
+        from scratch every time, even for two calls with the identical
+        archive and bbox (e.g. a --dry-run immediately followed by the
+        real run). Proves the second call reuses the same directory
+        rather than extracting again."""
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        cache_dir = tmp_path / "index_cache"
+        monkeypatch.setattr(ismn_mod, "_STATION_INDEX_CACHE_DIR", cache_dir)
+
+        archive = tmp_path / "synthetic.zip"
+        _write_synthetic_ismn_archive(archive, [("NETA", "InBbox", 45.0, 10.0, 0)])
+
+        dl = ISMNDownloader(output_dir=tmp_path / "out")
+
+        fake_reader = MagicMock()
+        fake_reader.metadata = pd.DataFrame(
+            columns=pd.MultiIndex.from_tuples([("longitude", "val"), ("latitude", "val")]),
+        )
+        fake_reader.get_dataset_ids.return_value = []
+        fake_interface = MagicMock()
+        fake_interface.ISMN_Interface.return_value = fake_reader
+
+        kwargs = dict(
+            min_lon=5.0, max_lon=15.0, min_lat=40.0, max_lat=50.0,
+            start="2020-01-01", end="2020-01-02", archive_path=str(archive),
+        )
+
+        def fake_extract(archive_path, dir_prefixes, out_dir):
+            # Real _extract_matching_stations creates out_dir (via
+            # zf.extractall) and then writes the completion marker --
+            # replicate both so download()'s reuse check (which looks
+            # for the marker, not just directory existence, to guard
+            # against reusing an interrupted extraction) behaves like
+            # it would for a real extraction.
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / ismn_mod._EXTRACTION_COMPLETE_MARKER).touch()
+
+        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}), \
+             patch(
+                 "sar_validation.downloaders.ismn_downloader._extract_matching_stations",
+                 side_effect=fake_extract,
+             ) as mock_extract:
+            dl.download(**kwargs)
+            first_call_path = fake_interface.ISMN_Interface.call_args.args[0]
+            assert mock_extract.call_count == 1
+
+            dl.download(**kwargs)
+            second_call_path = fake_interface.ISMN_Interface.call_args.args[0]
+            # Must NOT extract again -- that's what lets ismn's own
+            # internal metadata cache (written inside this directory)
+            # survive between the two calls.
+            assert mock_extract.call_count == 1
+
+        assert first_call_path == second_call_path
+
+    def test_interrupted_extraction_without_completion_marker_is_redone(
+        self, tmp_path, monkeypatch,
+    ):
+        """Regression test: an extraction directory that exists but was
+        never completed (e.g. the process was killed mid-extractall,
+        plausible given the real archive is multi-GB) must be
+        re-extracted, not silently reused as if it were a valid,
+        complete station subset."""
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        cache_dir = tmp_path / "index_cache"
+        monkeypatch.setattr(ismn_mod, "_STATION_INDEX_CACHE_DIR", cache_dir)
+
+        archive = tmp_path / "synthetic.zip"
+        _write_synthetic_ismn_archive(archive, [("NETA", "InBbox", 45.0, 10.0, 0)])
+
+        dl = ISMNDownloader(output_dir=tmp_path / "out")
+
+        # Pre-create the deterministic subset directory WITHOUT the
+        # completion marker -- simulates a prior extraction that was
+        # interrupted partway through.
+        subset_dir = ismn_mod._extracted_subset_dir(archive, 5.0, 15.0, 40.0, 50.0)
+        subset_dir.mkdir(parents=True)
+        (subset_dir / "partial_leftover.txt").write_text("incomplete")
+        assert not (subset_dir / ismn_mod._EXTRACTION_COMPLETE_MARKER).exists()
+
+        fake_reader = MagicMock()
+        fake_reader.metadata = pd.DataFrame(
+            columns=pd.MultiIndex.from_tuples([("longitude", "val"), ("latitude", "val")]),
+        )
+        fake_reader.get_dataset_ids.return_value = []
+        fake_interface = MagicMock()
+        fake_interface.ISMN_Interface.return_value = fake_reader
+
+        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
+            dl.download(
+                min_lon=5.0, max_lon=15.0, min_lat=40.0, max_lat=50.0,
+                start="2020-01-01", end="2020-01-02",
+                archive_path=str(archive),
+            )
+
+        # Real extraction ran (not skipped) -- the in-bbox station's
+        # real files are now present, proving _extract_matching_stations
+        # was actually invoked rather than trusting the stale directory.
+        assert (subset_dir / "NETA" / "InBbox").exists()
+        assert (subset_dir / ismn_mod._EXTRACTION_COMPLETE_MARKER).exists()
+
+    def test_no_stations_in_bbox_returns_empty_without_calling_ISMN_Interface(
+        self, tmp_path, monkeypatch,
+    ):
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        cache_dir = tmp_path / "index_cache"
+        monkeypatch.setattr(ismn_mod, "_STATION_INDEX_CACHE_DIR", cache_dir)
+
+        archive = tmp_path / "synthetic.zip"
+        _write_synthetic_ismn_archive(archive, [("NETA", "FarAway", -80.0, 179.0, 0)])
+
+        dl = ISMNDownloader(output_dir=tmp_path / "out")
+
+        fake_interface = MagicMock()
+        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
+            result = dl.download(
+                min_lon=5.0, max_lon=15.0, min_lat=40.0, max_lat=50.0,
+                start="2020-01-01", end="2020-01-02",
+                archive_path=str(archive),
+            )
+
+        assert result == []
+        fake_interface.ISMN_Interface.assert_not_called()

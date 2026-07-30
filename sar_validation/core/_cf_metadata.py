@@ -36,11 +36,13 @@ PRODUCT_REFERENCES: Dict[str, str] = {
         "https://osi-saf.eumetsat.int/products/osi-104-b; "
         "https://osi-saf.eumetsat.int/products/osi-104-c"
     ),
+    "scatterometer_ssm": "https://user.eumetsat.int/s3/eup-strapi-media/pdf_ten_0343_eps_ascatl2_pfs_f509981295.pdf",
     "altimeter": (
         "https://data.marine.copernicus.eu/product/"
         "WAVE_GLO_PHY_SWH_L3_NRT_014_001/services"
     ),
     "radiometer": "https://www.remss.com/missions/amsr/",
+    "radiometer_ssm": "https://nsidc.org/data/nsidc-0451; https://nsidc.org/data/spl2smp_e",
     "hf_radar": "https://hfradar.ioos.us/",
     "sar": "https://s1.pages.eopf.copernicus.eu/s1-l12-rp/main/pfs/index.html",
     "insitu": (
@@ -199,27 +201,89 @@ def annotate_collocation_ds(result_ds: xr.Dataset, datatree: xr.DataTree) -> xr.
     """
     Copy CF metadata from datatree nodes onto a collocation Dataset in place.
 
-    Every ``sar_<var>``/``val_<var>`` column inherits the descriptive attrs
-    of the first datatree variable named ``<var>`` (they were produced from
-    those variables, so units/standard_name carry over). Geometry and
-    provenance columns get fixed attrs from
+    ``sar_<var>`` columns inherit the descriptive attrs of the first
+    datatree variable named ``<var>`` (a recipe run has exactly one SAR
+    product, so there's no ambiguity). ``val_<var>`` columns pool every
+    validation source's rows together, distinguished only by the
+    per-point ``val_source`` value -- when every source present shares the
+    same units for that variable (the common case), the column gets one
+    shared attrs value, same as before. When sources genuinely differ
+    (e.g. soil moisture: ASCAT's "%" alongside ISMN/SMAP/SMOS's "m3 m-3"),
+    a single column-level ``units`` string can't represent every row
+    correctly, so this adds per-point ``val_units``/``val_long_name``
+    companion variables instead of guessing -- the previous behavior
+    (silently keeping whichever source's attrs were encountered first
+    while walking ``datatree.subtree``) mislabeled every other source's
+    rows. Geometry and provenance columns get fixed attrs from
     :data:`_COLLOCATION_GEOMETRY_ATTRS`.
+
+    Platform-based resolution keys off each datatree node's ``platform_type``
+    *attribute*, matched against each collocation row's ``val_source``
+    *value*. For most converters those are the same string. The combined
+    in-situ CSV converter (``from_insitu_csv``) is an exception: its node-level
+    ``platform_type`` attr is a generic value (e.g. ``"insitu"``), while
+    ``collocation.py`` derives each row's ``val_source`` from a *per-point*
+    ``platform_type`` data variable with mapped values (``"mooring"``,
+    ``"buoy"``, ``"drifter"``, ...). Those never match
+    ``source_attrs_by_platform``, so ``known_attrs`` comes back empty for
+    every source present. When that happens -- i.e. platform-based
+    resolution found *nothing* for *any* source in this column -- fall back
+    to the var-name-keyed lookup (``source_attrs``) used by the ``sar_``
+    branch below. This is deliberately narrower than the var-name fallback
+    that predates platform-based resolution: it only fires when
+    ``known_attrs`` is completely empty, so it cannot mask a genuine
+    mixed-units case where *some* sources resolved via platform_type and
+    others didn't -- that scenario still falls through to the
+    ``val_units``/``val_long_name`` branch below.
     """
     source_attrs: Dict[str, Dict[str, Any]] = {}
+    source_attrs_by_platform: Dict[tuple, Dict[str, Any]] = {}
     for node in datatree.subtree:
-        for raw_name, var in node.to_dataset().variables.items():
+        node_ds = node.to_dataset()
+        platform_type = node_ds.attrs.get("platform_type")
+        for raw_name, var in node_ds.variables.items():
             name = str(raw_name)
-            if var.attrs and name not in source_attrs:
+            if not var.attrs:
+                continue
+            if name not in source_attrs:
                 source_attrs[name] = sanitize_raw_attrs(var.attrs)
+            if platform_type:
+                source_attrs_by_platform[(platform_type, name)] = sanitize_raw_attrs(var.attrs)
 
     for name in map(str, result_ds.variables):
         if name in _COLLOCATION_GEOMETRY_ATTRS:
             result_ds[name].attrs.update(_COLLOCATION_GEOMETRY_ATTRS[name])
             continue
-        for prefix in ("sar_", "val_"):
-            if name.startswith(prefix) and name[len(prefix):] in source_attrs:
-                result_ds[name].attrs.update(source_attrs[name[len(prefix):]])
-                break
+
+        if name.startswith("val_") and "val_source" in result_ds:
+            var_name = name[len("val_"):]
+            platform_types_present = sorted(set(str(v) for v in result_ds["val_source"].values))
+            attrs_per_platform = {
+                pt: source_attrs_by_platform.get((pt, var_name)) for pt in platform_types_present
+            }
+            known_attrs = [a for a in attrs_per_platform.values() if a]
+            distinct_units = {a.get("units") for a in known_attrs}
+
+            if not known_attrs and var_name in source_attrs:
+                result_ds[name].attrs.update(source_attrs[var_name])
+            elif len(distinct_units) <= 1 and known_attrs:
+                result_ds[name].attrs.update(known_attrs[0])
+            elif known_attrs:
+                val_source_values = result_ds["val_source"].values
+                result_ds["val_units"] = (
+                    "collocation",
+                    [(attrs_per_platform.get(str(pt)) or {}).get("units", "") for pt in val_source_values],
+                )
+                result_ds["val_long_name"] = (
+                    "collocation",
+                    [(attrs_per_platform.get(str(pt)) or {}).get("long_name", "") for pt in val_source_values],
+                )
+                result_ds[name].attrs["units"] = "mixed — see val_units"
+                result_ds[name].attrs.pop("long_name", None)
+            continue
+
+        if name.startswith("sar_") and name[len("sar_"):] in source_attrs:
+            result_ds[name].attrs.update(source_attrs[name[len("sar_"):]])
 
     result_ds.attrs["Conventions"] = "CF-1.8"
     return result_ds

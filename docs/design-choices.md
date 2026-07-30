@@ -16,14 +16,14 @@ For the *mechanics* of each step see the companion docs:
 
 ## 1. What the toolbox is
 
-A standalone Python package that validates Sentinel-1 **L2_OCN** (Level-2
+A standalone Python package that validates L2 SAR data, such as Sentinel-1 **L2_OCN** (Level-2
 Ocean) products against independent observations. One YAML **recipe**
 (variable + region + time window + validation sources) drives the entire
 pipeline:
 
 | Step | What happens | Output |
 |---|---|---|
-| 1 — Download | SAR L2_OCN scenes + all validation sources for the recipe domain | `data/<run>/...` |
+| 1 — Download | SAR scenes + all validation sources for the recipe domain | `data/<run>/...` |
 | 2 — Convert | Every source is standardised into one hierarchical `xarray.DataTree` | `datatree.nc` |
 | 3 — Collocate | SAR cells are matched to validation observations within spatial/temporal tolerances | `collocation_results.nc` |
 | 4 — Statistics | Bias, RMSE, correlation, scatter index per platform type | `validation_statistics_*.nc/.csv` |
@@ -31,10 +31,10 @@ pipeline:
 
 Four validated quantities are supported — **wind** (speed + direction,
 OWI grids), **currents** (RVL radial velocity), **waves** (significant wave
-height, OSW/WV imagettes), **soil moisture** (Sentinel-1 CLMS SSM 1 km
+height, OSW/WV vignettes), **soil moisture** (Sentinel-1 CLMS SSM 1 km
 Europe rasters) — against in-situ platforms (moorings, buoys, drifters,
-ferryboxes, tidal gauges), ASCAT scatterometer, satellite altimeters, RSS
-radiometers (AMSR2), HF radar, and ISMN soil-moisture stations.
+ferryboxes, tidal gauges, ISMN soil moisture stations), scatterometers, altimeters,
+radiometers, and HF radars.
 
 > Code: `sar_validation/cli.py` (pipeline driver), `core/recipe.py`
 > (recipe schema), `core/orchestrator.py` (step 1).
@@ -108,9 +108,8 @@ CMEMS along-track altimetry comes at 1 Hz (~7 km along-track spacing, carries
 distinct layer types** (`altimeter_1hz` / `altimeter_5hz`) because the
 collocation aggregation window must match the sensor's footprint spacing —
 a single window would be wrong for at least one of them (§5.2). The frequency
-is detected from the file content (5 Hz files carry `VAVH_UNCERTAINTY`
-instead of `WIND_SPEED`). Wind recipes download only 1 Hz (5 Hz has no wind
-and 5× the point density for no benefit); wave recipes download both.
+is detected from the file content (5 Hz files do not carry `WIND_SPEED`). 
+Wind recipes download only 1 Hz (as 5 Hz has no wind); wave recipes download both.
 
 ### 3.4 Radiometer products are pre-gridded to 0.25° bins
 
@@ -248,7 +247,7 @@ Different validation geometries call for different anchoring:
 | `point_vs_layer` | validation observation | observation (× SAR time) | moorings, buoys, drifters, … vs IW/EW grid |
 | `layer_vs_layer`, `cell-averaging` (default) | validation cell | scatterometer/altimeter point | pre-gridded swaths vs IW/EW grid |
 | `layer_vs_layer`, `individual` | SAR pixel | SAR pixel | sensitivity studies; many matches, validation points reused |
-| WV mode (`point_vs_point` / `point_vs_layer`) | SAR imagette | imagette | sparse OSW point measurements |
+| WV mode (`point_vs_point` / `point_vs_layer`) | SAR vignette | vignette | sparse OSW point measurements |
 
 **Why observation-anchored by default:** the observation is the scarce,
 independent quantity; anchoring on it yields one statistically independent
@@ -275,10 +274,11 @@ The window size is matched to the validation sensor:
 |---|---|---|
 | in-situ (default) | 5.0 | small neighbourhood around a point sensor |
 | scatterometer | 12.5 | ASCAT wind-vector-cell size |
+| scatterometer | 25 | OceanSat3 & HY-2B/C wind-vector-cell size |
 | altimeter 1 Hz | 7.0 | 1 Hz along-track spacing |
 | altimeter 5 Hz | 1.4 | 5 Hz along-track spacing |
 | radiometer (AMSR2, …) | 25.0 | RSS 0.25° grid-cell size |
-| HF radar | 5.0 | typical radial grid spacing |
+| HF radar | 6.0 | typical radial grid spacing |
 
 These built-in defaults apply even when a recipe declares no
 `layer_vs_layer` section; a recipe's own `layer_type_specs` override them
@@ -295,8 +295,11 @@ per key.
   following the 3-hour match window used for Sentinel-1/scatterometer
   validation in hal-04202202; the 12.5 km spatial scale is the ASCAT cell
   size from the same reference.
-- **HF radar: ±20 min** — surface currents decorrelate quickly; HF radar
-  fields are typically 10–30 min composites.
+- **HF radar: ±30 min** — surface currents decorrelate quickly; HF radar
+  fields are typically 10–30 min composites. Note: Finnmark radar only has a
+  temporal resolution of 60 min --> needs a longer temporal tolerance
+- **soil moisture: ±12 hours** — Sentinel 1 Surface Soil Moisture product
+  is a daily file (time stamp at midnight).
 
 ### 5.4 Distance weighting
 
@@ -310,19 +313,19 @@ Weighting kernels available: `gaussian`, `inverse_distance`, `linear`,
   average over a regular cell, so every SAR pixel inside that cell
   contributes the same.
 
-### 5.5 The area around WV/OSW imagette points
+### 5.5 The area around WV/OSW vignette points
 
-Sentinel-1 WV mode produces isolated **~20 × 20 km imagettes ~200 km
+Sentinel-1 WV mode produces isolated **~20 × 20 km vignettes ~200 km
 apart**, each stored as a single point (e.g. `oswHs`). Requiring validation
-data within a few km of the imagette *centre* (as the grid matchers would if
+data within a few km of the vignette *centre* (as the grid matchers would if
 the point were faked into a 1×1 grid) would discard almost everything.
 
-**Choice: anchor on the imagette and gather every validation observation
+**Choice: anchor on the vignette and gather every validation observation
 within `sar_footprint_radius_km` = 14 km** — approximately the
 centre-to-corner half-diagonal of the 20 × 20 km footprint
 (½·√(20² + 20²) ≈ 14.1 km), i.e. the radius that fully covers the footprint.
 Observations inside the footprint are aggregated into one match per
-imagette:
+vignette:
 
 - **in-situ** observations are plain-averaged (`equal` weights) — labelled
   `point_vs_point`;
@@ -342,7 +345,7 @@ height** of all wave systems combined. Validation compares against the in-situ
 `oswHs`.
 
 Taking a single `oswHs` partition (previously partition 0) picks one wave
-system, which is not the total sea state; in a real imagette the partitions were
+system, which is not the total sea state; in a real vignette the partitions were
 `[0.65, 0.78, 0.54, …]` m while `oswTotalHs` was 2.85 m. Note `oswTotalHs` is
 **not** the root-sum-square of the partitions either — it is integrated from the
 full spectrum, so it cannot be reconstructed from `oswHs`.
@@ -564,36 +567,438 @@ Axis/colorbar labels also now append each variable's CF `units` attribute
 generically (`_labeled_var` in `visualization.py`) — a side benefit for
 every existing variable pair (e.g. `"WSPD (m s-1)"`), not just soil moisture.
 
-### 8.6 ISMN stations deduped to their nearest-in-time reading per SAR scene
+### 8.6 ISMN stations averaged over ±12h per SAR scene, not deduped to nearest
 
-ISMN's recommended recipe tolerance (`time_tolerance_minutes: 720`, ±12h) is
-deliberately wide, to tolerate ISMN's own reporting gaps. But ISMN reports
-hourly — far more densely than one daily SAR overpass — so without any
-further change, every hourly reading within that ±12h window became its own
-separate collocation. Confirmed against a real 118-station recipe run: one
-station alone produced ~25 matches against a single SAR scene (all sharing
-the same `sar_y_idx`/`sar_x_idx`, differing only in which hourly ISMN
-reading they carried), inflating a real run from a sane station-count to
-1517 total collocations.
+ISMN's recommended recipe tolerance (`time_tolerance_minutes: 720`, ±12h)
+is deliberately wide, to tolerate ISMN's own reporting gaps. But ISMN
+reports hourly — far more densely than one daily SAR overpass — so without
+any further change, every hourly reading within that ±12h window became
+its own separate collocation. Confirmed against a real 118-station recipe
+run: one station alone produced ~25 matches against a single SAR scene
+(all sharing the same `sar_y_idx`/`sar_x_idx`, differing only in which
+hourly ISMN reading they carried), inflating a real run from a sane
+station-count to 1517 total collocations.
 
-The obvious fix — "only keep the closest-in-time validation reading" —
-can't apply unconditionally to `PointLayerCollocation.collocate()`, which is
-shared by every point-type source (moorings, buoys, ISMN). Two pre-existing
-tests (`test_no_temporal_averaging_uses_raw_value`,
-`test_each_point_matched_independently`) document a deliberate, opposite
-choice for scatterometer/buoy/mooring sources: repeated readings at one
-location, different times, are genuinely distinct satellite passes/looks,
-and are each kept as an independent collocation on purpose. ISMN's case is
-different — its hourly readings aren't distinct "looks", just dense
-oversampling of one slowly-evolving quantity relative to the SAR revisit
-time.
+The original fix — "only keep the closest-in-time validation reading" —
+worked for the inflation problem, but introduced a real bias: since S1 SSM
+scenes are always stamped at exactly midnight UTC, the "closest" reading
+is *always* a nighttime one. Soil moisture has a strong diurnal cycle, so
+comparing S1 SSM (representing the whole day) against only ISMN's
+nighttime value systematically misrepresents the comparison.
 
-So the dedup is opt-in: `PointLayerCollocation(dedup_nearest_in_time=False)`
-by default (unchanged behaviour for every existing source), and
-`collocate()` only groups-and-keeps-nearest (by `val_id` when present, else
-by the validation point's own `(lon, lat)`, per SAR acquisition) when the
-flag is set. `run_collocation` sets it automatically, only for sources
-whose `platform_type` attr is `"ismn"` — every other point_vs_layer source
-is completely unaffected. Confirmed against the same real recipe: 1517 →
-61 collocations (54 unique stations, most matched against one of 3 SAR
-scenes, a few against more).
+**Current behaviour: average, don't pick.** `run_collocation` now
+pre-aggregates each ISMN station's raw hourly readings — grouped by
+`platform_id` (falling back to `(lon, lat)` when no `platform_id` column
+exists) and matched to its nearest SAR scene time via
+`pd.merge_asof(direction="nearest", tolerance=...)` — into a single
+station-day mean *before* `PointLayerCollocation.collocate()` ever runs
+(`_average_within_sar_tolerance` in `core/collocation.py`). Every reading
+within `time_tolerance_minutes` of a SAR scene contributes to that scene's
+average; readings outside every scene's tolerance window are dropped, same
+as before. This applies only to sources whose `platform_type` attr is
+`"ismn"` — every other point_vs_layer source (moorings, buoys) keeps every
+in-tolerance reading as its own independent collocation, unchanged
+(`test_no_temporal_averaging_uses_raw_value`,
+`test_each_point_matched_independently`, `test_mooring_source_unaffected_keeps_every_reading`
+document this).
+
+`dedup_nearest_in_time` (the mechanism this superseded for ISMN) remains
+available on `PointLayerCollocation`/`LayerLayerCollocation` and is still
+used by `hf_radar_grid` — it was never ISMN-specific machinery, just no
+longer ISMN's chosen behaviour.
+
+### 8.7 Satellite soil-moisture sources (ASCAT/AMSR-E-2/SMAP)
+
+These three sources are gridded satellite products (like scatterometer/
+radiometer wind), so they plug into `layer_vs_layer` collocation, not
+`point_vs_layer`. They reuse the ISMN's own `SOIL_MOISTURE` canonical code
+(§2) rather than getting their own — same reasoning as `WSPD` unifying
+wind sources: one shared code means one report section, not four separate
+ones each showing the others as "no data".
+
+**Time tolerance: 720 minutes (±12h), not the 180 minutes inherited from
+wind/wave scatterometer defaults.** Soil moisture is a slowly-evolving
+quantity relative to a satellite's one-or-so daily overpass — the same
+reasoning already applied to ISMN's own ±12h tolerance (§8.3) — whereas
+180 minutes reflects wind/waves' much faster decorrelation time. Applying
+the wind-derived 180-minute default here would under-match a genuinely
+slow-changing quantity for no benefit.
+
+**Overpasses within that ±12h window are averaged together, including
+ascending and descending passes.** Like ISMN (§8.6), these sources are now
+pre-aggregated before collocation runs, but the grouping key depends on
+the source's format:
+
+- **Km-based sources** — ASCAT (WARP5 grid), SMAP (EASE grid), SMOS (EASE
+  grid), AMSR2's NSIDC-0451 (25 km EASE grid), and AMSR2's AU_Land
+  half-orbit swath (lon/lat vary continuously, not a fixed grid) — are
+  grouped by `(lon, lat)` spatially snapped via `_snap_to_grid`, using
+  each source's own `aggregation_window_km` converted to a degree step
+  with a cos(latitude) correction on the longitude step (a degree of
+  longitude covers less physical distance than a degree of latitude away
+  from the equator). This correctly merges nearby-but-not-identical
+  pixels for AU_Land, and is effectively a no-op for the other, already-
+  gridded km-based sources.
+- **AMSR2's G-Portal format specifically** is stamped with a
+  `native_grid_deg` attribute (0.1°) at conversion time
+  (`_from_amsr_ssm_gportal_l3_grid`) and is grouped by its raw, exact
+  `(lon, lat)` instead of being snapped at all — it's already a fixed
+  equirectangular lattice, so repeated readings of the same cell report
+  IDENTICAL coordinates and snapping buys nothing. (An earlier version of
+  this code snapped G-Portal too, rounding its cell centres — which sit
+  at exact half-step offsets like 9.05°/9.15°/9.25°/... — to a 0.1°
+  step; every centre landed exactly on a rounding tie, and NumPy's
+  round-half-to-even resolved those ties inconsistently, silently merging
+  roughly 1 in 5 pairs of genuinely adjacent native cells. Grouping on
+  the raw coordinates avoids the rounding step entirely.)
+
+Either way, groups are then matched to the nearest SAR scene time and
+averaged, exactly as ISMN readings are. **This means an ascending (e.g.
+early-morning) and a descending (e.g. evening) overpass of the same cell
+on the same day are blended into a single value**
+if both fall within the ±12h window — a deliberate methodological choice,
+consistent with the ISMN treatment, not an incidental side effect. It also
+shrinks the point count for these sources, which without any collapsing
+could otherwise approach ~100,000 collocations for a large domain/date
+range, since multiple overpasses per cell no longer each produce their own
+row before the per-row collocation loop runs.
+
+**A real, not just cosmetic, limitation of pytesmo's CDF-matching (§8.1)
+for these sources:** `pytesmo.scaling.scale(method="cdf_match")` rescales
+by rank/percentile, so it is blind to *why* two series differ. For SAR vs.
+ISMN today, that gap is "SAR's saturation-like index vs. ISMN's volumetric
+m³/m³" — one cause, cleanly corrected. For SAR vs. these four new sources,
+the CDF-match will *also* silently absorb at least three more, physically
+distinct gaps at once:
+
+1. **Retrieval units** — ASCAT reports % saturation (same domain as SAR);
+   AMSR-E/2, SMAP, SMOS, and SAR CLMS all report volumetric m³/m³, but S1 SAR's
+   own SSM product is itself a % saturation index, so every one of these
+   comparisons still crosses the same unit boundary § 8.1 already crosses
+   for ISMN.
+2. **Sensing depth / band** — C-band SAR and ASCAT (~0-5 cm), X/Ka-band
+   AMSR-E/2 (~0-1 cm skin depth), and L-band SMAP/SMOS (~0-5 cm, but a
+   different retrieval physics) do not sense the same soil layer. No
+   depth-adjustment model is implemented (would require external soil
+   dielectric/texture data, out of scope) — depths are only *documented*,
+   per source, via each converter's `long_name` and surfaced in the
+   validation report cover page (§ new `plot_...` cover-page text, listing
+   each present source's representative depth/band) so a reader isn't misled
+   about what's being compared.
+3. **Native footprint/resolution** — 9-50 km depending on source, vs. SAR's
+   1 km CLMS grid.
+
+Because CDF-matching corrects only the *marginal distribution*, a good
+post-rescale statistical fit (low RMSE/high correlation in the rescaled
+domain) does **not** certify that two sources are physically equivalent,
+and comparing fit quality *across* validation sources (e.g. "SAR agrees
+better with SMAP than with ASCAT") is not a like-for-like measure of
+retrieval accuracy — each pair is scored in its own bespoke rescaled
+domain, shaped by whichever mix of the three gaps above that pair happens
+to have. This is an inherited limitation of the existing ISMN pipeline
+(§8.1), not a new one introduced by these sources — but it compounds
+across more, and more varied, gaps than the single ISMN case did, which is
+why it's worth stating explicitly rather than leaving implicit.
+
+**Mitigation: a second, unit-native comparison, for pairs where it's
+actually possible.** Since gap 1 (units) only exists for *some* pairs — SAR's
+`%` matches ASCAT's `%` exactly, and a future L-band SAR source (e.g. NISAR)
+would match ISMN/AMSR/SMAP/SMOS's `m³/m³` exactly — those same-unit pairs
+don't need CDF-matching's rank-based workaround at all, and can be compared
+directly in physical units instead. **Choice: whenever `sar_var`'s and
+`val_var`'s `units` attrs fall in the same unit family** (`%` vs `%`, or any
+of `m3 m-3`/`cm3 cm-3`/`1` — all volumetric — vs each other), **compute a
+second statistics table using the plain, generic `compute_statistics` path**
+(the same bias/RMSE/correlation/SI/ubrmsd machinery every other recipe
+variable already uses, with no rescaling) **alongside** the existing
+CDF-matched one — not instead of it, since CDF-matching still covers the
+pairs that don't share units. This second table only ever contains the
+subset of platform types whose units genuinely match SAR's; e.g. for
+Sentinel-1 (`%`), that's `ascat_ssm` only, while ISMN/AMSR/SMAP/SMOS stay
+CDF-matched-only. A future NISAR (`m3 m-3`) recipe would instead see
+ISMN/AMSR/SMAP/SMOS in the native-units table and ASCAT CDF-matched-only —
+the same mechanism handles both without a per-source-type allow-list, since
+it's driven by the `units` attrs already set at conversion (§ new converters'
+step 3), not a hardcoded list of "which sources are volumetric."
+
+**Mechanism detail: units are resolved per `val_source`, not read off the
+pooled collocation column.** `collocation_results.nc`'s `val_SOIL_MOISTURE`
+column pools every validation source's raw values into one column,
+distinguished only by the `val_source` group label (e.g. `"ismn"`,
+`"ascat_ssm"`) — a single `units` attribute on that column cannot represent
+per-row units once sources with genuinely different units (ASCAT's `%`
+alongside ISMN's `m3 m-3`) are pooled together. So the native-units gate
+uses a small explicit lookup, keyed by `val_source` (the same platform-type
+label already used for per-group statistics), not by reading `units` off
+the pooled `val_<var>` column:
+```python
+_VAL_SOURCE_UNITS_FAMILY = {
+    "ismn": "volumetric", "ascat_ssm": "percent_saturation",
+    "amsr_ssm": "volumetric", "smap_ssm": "volumetric", "smos_ssm": "volumetric",
+}
+```
+The **SAR** side has no such ambiguity — one recipe run has exactly one SAR
+product, so its `sar_<var>` column's `units` attr is read directly and
+normalized (`"%"` → `"percent_saturation"`; `"m3 m-3"`/`"cm3 cm-3"`/`"1"` →
+`"volumetric"`) to get the family to match against.
+
+Output: a second file per soil-moisture run,
+`validation_statistics_<sar_var>_vs_<val_var>_native_units.nc` (parallel to
+the existing `..._individual` suffix convention for the alternate
+collocation method), written only when at least one same-unit platform type
+is present. `validation_report` gains a parallel scatter/residual/geographic
+plot section for these same-unit pairs, titled distinctly (e.g. "— native
+units") so it's never confused with the CDF-matched plots (§8.5) covering
+the full source set.
+
+> Code: `core/datatree_converter.py` (`from_ascat_ssm`, `from_amsr_ssm`,
+> `from_smap_ssm`, `from_smos_ssm`),
+> `core/statistics.py` (`run_statistics_native_units`, `add_rescaled_sar_column`,
+> `fit_sar_to_val_transform`, `_VAL_SOURCE_UNITS_FAMILY`),
+> `downloaders/ascat_soil_moisture_downloader.py`,
+> `downloaders/earthdata_soil_moisture_downloader.py`,
+> `downloaders/smos_downloader.py` (`SMOSDownloader`, `authenticate_smos_ftp`).
+
+### 8.8 SMOS: OADS's real HTML/data formats, confirmed against live runs
+
+`SMOSDownloader` and `from_smos_ssm` were originally written and shipped
+without ever running against ESA's live OADS portal or a real downloaded
+product (no credentials were available at the time) — both the login flow
+and the NetCDF converter were later found to make several wrong,
+unconfirmed assumptions once a real user ran them, all fixed and now
+CONFIRMED live. Recorded here since each one is easy to silently
+reintroduce by "cleaning up" the code without a real account to test
+against.
+
+**FTPS was replaced with the OADS HTTP portal, not merely retried.**
+`smos-diss.eo.esa.int`'s FTP/FTPS control channel completes its TCP
+handshake but never sends the welcome banner — confirmed hung
+indefinitely from this toolbox's environment, and not a general
+FTP-blocking issue (other public FTP servers responded normally from the
+same environment). ESA's OADS web portal serves the same NRT product over
+plain HTTPS and responds normally, so `SMOSDownloader` browses/logs in/
+downloads via OADS instead of FTP entirely.
+
+**OADS's SAML2/WSO2 SSO login HTML mixes single- and double-quoted
+attributes unpredictably — never assume one quote style.** Confirmed
+across three separate parsing bugs, each only caught by a real login
+attempt: the login form's `sessionDataKey` hidden input is single-quoted
+(`value='...'`) while the surrounding form uses double quotes; the login
+form's own `action` is a *relative* URL (`action="../samlsso"`), resolved
+via `urllib.parse.urljoin(resp.url, action_url)` against the actual
+post-redirect page URL, not posted as-is; and the IdP's ACS auto-submit
+response form uses single quotes for **both** `name=` and `value=` on its
+`SAMLResponse`/`RelayState` inputs, a different style again from the
+login form. `SMOSDownloader._login`'s regexes now match every quoted
+attribute (`name=`, `value=`, `action=`) as `["\']` rather than assuming
+`"`.
+
+**OADS's product-listing link format also depends on session state, and
+carries an unexpected extra attribute.** An authenticated session's
+"Download Product" link is a direct download URL
+(`/oads/data/NRT_Open/<filename>`), not the login-gated redirect
+(`/oads/access/login?r=...&d=...`) an unauthenticated fetch shows — and
+the `<a>` tag carries an extra `target="_blank"` attribute between `href`
+and the closing `>`, which the original regex's exact
+`href="...">Download Product</a>` assumption didn't allow for and
+silently matched zero products against. `_list_products_for_day`'s regex
+now allows arbitrary attributes (`[^>]*`) after `href`'s closing quote,
+and both href shapes are covered by tests.
+
+**`from_smos_ssm`'s real NetCDF field names/time convention, confirmed
+against real downloaded products:** fields are lowercase
+(`soil_moisture`/`longitude`/`latitude`), not the capitalised names
+originally guessed; there is no single `time` variable — per-point
+acquisition time is split across `days_since_01-01-2000` (int, days since
+the SMOS epoch 2000-01-01T00:00:00) and `seconds_since_midnight` (int,
+seconds within that day), combined as
+`pd.Timestamp("2000-01-01") + pd.to_timedelta(days, unit="D") +
+pd.to_timedelta(seconds, unit="s")` — verified against a real file's own
+filename-encoded acquisition window. Real `soil_moisture` data showed no
+`-999.0`-style fill sentinel (a full granule's min/max were both clean
+physical values, no NaN), so validity now relies primarily on
+`~np.isnan` (whatever `xr.open_dataset`'s default `mask_and_scale=True`
+already decoded), keeping the `-999.0` check only as cheap, harmless
+insurance rather than the load-bearing check it was before.
+
+> Code: `downloaders/smos_downloader.py` (`SMOSDownloader._login`,
+> `_list_products_for_day`, `download`),
+> `core/datatree_converter.py` (`from_smos_ssm`).
+
+### 8.9 CDF-matched section: ASCAT converted into ISMN's volumetric domain
+
+ASCAT reports `%` saturation — the same domain as Sentinel-1 SSM's own raw
+retrieval (§8.7) — while ISMN/SMAP/SMOS report `m3 m-3` volumetric
+fraction. Pooling both domains onto one shared scatter axis or geographic
+colorbar (the original CDF-matched report section's behavior) squashed the
+volumetric sources near the origin/one end of the color scale and made the
+pooled N/bias/RMSE/r annotation physically meaningless.
+
+**Fix: convert ASCAT into ISMN's volumetric domain, reusing the transform
+already fit for the ISMN group.** Since SAR's own raw retrieval shares
+ASCAT's `%` domain, the CDF-match transform fit from SAR-vs-ISMN
+collocated pairs (`SAR raw % → ISMN raw m3 m-3`) is equally valid applied
+to ASCAT's own raw values — this avoids needing to collocate ASCAT against
+ISMN directly (they are never paired with each other, only each with SAR),
+and reuses the same out-of-sample-application pattern
+`fit_sar_to_val_transform` already used for painting a full SAR scene.
+`_harmonize_percent_domain_sources` (`core/statistics.py`) implements this,
+called by `add_rescaled_sar_column`, `compute_statistics_soil_moisture`,
+and `fit_sar_to_val_transform` — so the CDF-matched scatterplot,
+geographic plot, and statistics table all agree, and no downstream
+plotting code needs its own domain-splitting logic.
+
+**Mechanism: detection via existing `_VAL_SOURCE_UNITS_FAMILY` lookup, not
+per-row inspection.** Which sources need converting is determined by checking
+whether each source's units family (via the existing `_VAL_SOURCE_UNITS_FAMILY`
+dictionary, the same lookup already used by `run_statistics_native_units` in
+§8.7) matches SAR's own units family — correct for today's Sentinel-1 (`%`)
+case. This function is a true no-op for every non-soil-moisture recipe and
+every soil-moisture recipe whose val_source labels aren't in that dictionary,
+so the overhead is negligible.
+
+**Fit details: RAW input paired with HARMONIZED target.** Two separate
+CDF-matching fits are involved, and the pre-fix bug came from conflating
+them. `_harmonize_percent_domain_sources` fits its own internal SAR→ISMN
+transform (from raw SAR-vs-ISMN pairs; this fit itself was never buggy) and
+uses it to convert ASCAT's raw `sar_col` *and* raw `val_col` into ISMN's
+volumetric domain. `fit_sar_to_val_transform` then runs its own, separate
+pooled fit on top of that harmonized dataset, producing the callable applied
+later to an entire raw SAR scene raster (`plot_geographic`'s background
+layer) — not to ASCAT's values specifically. Pre-fix, that second fit's `df`
+took *both* its x (`sar_col`) and y (`val_col`) columns from the harmonized
+dataset: for ASCAT rows `sar_col` had already been converted to volumetric,
+while for ISMN rows — never touched by the harmonize step, since ISMN is the
+reference — `sar_col` stayed raw percent. The pooled x-input was therefore
+domain-inconsistent (ISMN rows in percent, ASCAT rows in volumetric), which
+skewed the percentile binning used by CDF-matching; it was not a case of "no
+harmonization." The fix keeps `sar_col` raw for every row (read straight
+from `collocation_ds`, which the harmonize step never touches) and pairs it
+with `val_col` from the harmonized dataset — volumetric for ASCAT via the
+conversion above, and volumetric for ISMN because it was already volumetric.
+The pooled fit's x-input is now consistently raw-percent across every row,
+and its y-target is consistently volumetric across every row.
+
+**Fallback:** if ISMN has too few (or zero) collocated points to fit that
+transform for a given run, ASCAT is dropped from the CDF-matched section
+for that run (logged) — it still appears in the native-units section
+(§8.7), which compares ASCAT against SAR directly in `%` and doesn't
+depend on ISMN at all. The native-units section remains the *only* place
+`%`-domain values appear in the report; the CDF-matched section is always
+volumetric once any conversion happens.
+
+**Missing colorbar (unrelated bug, fixed alongside).** Soil moisture's
+geographic plot uses a dedicated two-column-by-scene layout
+(`_build_scene_pair_figure`, added 2026-07-24) that never called
+`fig.colorbar()` at all — structurally absent, not an intermittent
+failure from the domain-mixing bug above. Fixed by adding the same
+shared/two-colorbar logic `_build_figure` (every other variable's
+geographic layout) already had.
+
+**Scope limitation.** This hardcodes ISMN as the volumetric reference and
+detects "needs converting" as "shares SAR's own raw units family" — correct
+for today's Sentinel-1 (`%`) case. A future non-percent SAR product (e.g. a
+hypothetical NISAR, `m3 m-3`) would need this reference choice revisited,
+since ASCAT would then be the odd one out with no analogous "percent
+reference source" to convert onto.
+
+> Code: `core/statistics.py` (`_harmonize_percent_domain_sources`,
+> `_soil_moisture_metrics`, `add_rescaled_sar_column`,
+> `compute_statistics_soil_moisture`, `fit_sar_to_val_transform`),
+> `core/visualization.py` (`_build_scene_pair_figure`).
+
+### 8.10 CDF-matched scatter forces a per-source split once harmonization ran
+
+`plot_scatter` already splits into one small-multiples subplot per
+`val_source` when a single source holds >70% of the points
+(`split_when_imbalanced`, §9.2) — but a harmonized soil-moisture pair (§8.9)
+can stay visually busy even when no source is that dominant: real data with
+ASCAT (~7400), SMAP (~7400), ISMN (~30) and SMOS (~1600) points all sharing
+one now-common volumetric domain and one shared axes produced an unreadable
+overlapping mess at ASCAT's ~45% share, well under the 70% trigger.
+
+**Fix: `plot_scatter(..., force_split=True)`.** `validation_report` sets
+this whenever `_harmonize_percent_domain_sources` actually converted a
+source for the current pair (non-empty `converted_sources`) — i.e. whenever
+the CDF-matched section's sources no longer share their original native
+domain — regardless of `dominant_share`. Applies to both the main
+CDF-matched scatter and its "colored by temporal offset" twin (same
+`force_split` value passed to both calls). A true no-op for every
+non-soil-moisture recipe, since harmonization itself never runs for them.
+
+> Code: `core/visualization.py` (`plot_scatter`'s `force_split` param,
+> `validation_report`'s `harmonized_sources` check).
+
+## 9. Visualization / report choices
+
+### 9.1 Adaptive geographic marker sizing
+
+The geographic plot overlays validation points on the SAR background field
+at a fixed marker size (`s=`); too large and dense validation coverage
+tiles edge-to-edge and hides the SAR field underneath it entirely, too
+small and sparse in-situ points (e.g. a handful of ISMN stations) become
+hard to see at all. One fixed size per variable can't serve both cases.
+
+**Wind and soil moisture: density-based, per `collocation_type`.** For each
+`collocation_type` present (`point_vs_layer`, `layer_vs_layer`), `avg =
+(collocation_type == ctype).sum() / len(matched_scenes)`; `>~300` uses a
+smaller marker (`5`) for that type, otherwise `15`. `plot_geographic`'s
+`point_size` accordingly accepts either a plain `int` (uniform) or a
+`dict[collocation_type, int]` (per-type). Originally wind-only, pooled
+across the whole pair rather than per-type (adaptive scatterometer
+sizing); soil moisture reused the check rather than its own flat
+`point_size=10`, but pooling one average across both types let ASCAT/
+SMAP/SMOS's thousands of `layer_vs_layer` points dominate the average and
+made ISMN's sparse `point_vs_layer` points too small too — split per-type
+once a mixed-density soil-moisture fixture caught it.
+
+**Currents: always `15`.** HF radar (currents' only layer-type source)
+forms a near-continuous coverage grid that tiles edge-to-edge at the
+default size regardless of density, so it doesn't need — and doesn't
+benefit from — the adaptive check.
+
+**Everything else: default `40`.**
+
+`pair_ds.sizes["collocation"]`, not `len(pair_ds)`: an `xr.Dataset`'s
+`len()` counts its *data variables* (`sar_<var>`, `val_<var>`,
+`val_source`, …), not its collocation-row count — using it here silently
+undercounted every real dataset (typically 5-10 variables vs. hundreds to
+thousands of rows), so the `>300` branch could never actually fire; fixed
+alongside soil moisture's adoption of this check once a realistic-scale
+test caught it.
+
+> Code: `core/visualization.py` (`validation_report`'s `geo_point_size`
+> block, `plot_geographic`'s `_resolve_point_size`).
+
+### 9.2 Scatter plots split into per-source small multiples when imbalanced
+
+A single shared scatter axes with one source holding the vast majority of
+points (e.g. ASCAT's thousands vs. SMOS's dozens) visually buries every
+other source under the dominant one's overplotting.
+
+**`plot_scatter` renders one subplot per `val_source` instead** whenever a
+single source holds `>70%` of the deduplicated points *and* at least 2
+sources are present (`split_when_imbalanced`, default on) — matching
+`plot_residuals`' existing by-source small-multiples layout — or whenever
+the caller explicitly requests it regardless of share via `force_split`
+(soil moisture's harmonized-domain case, §8.10). Each subplot keeps its own
+1:1 reference line, scaled to that source's own data range, and — when
+`color_by="temporal_offset"` — its own per-point coloring, sharing one
+color scale/colorbar across every subplot.
+
+> Code: `core/visualization.py` (`plot_scatter`, `_plot_scatter_small_multiples`).
+
+### 9.3 Report page order: geographic before scatter
+
+Every pair's plots used to lead with the scatter comparison, then the
+geographic overview. Reordered so geographic comes first — a reader sees
+*where* the matches are and how dense they are before the more abstract
+point-cloud comparison, which is easier to interpret once that spatial
+context is established. Applies to every recipe type (the loop generating
+these sections is shared across wind/currents/waves/soil_moisture), not
+just soil moisture — and to soil moisture's separate native-units section
+(§8.7) too, which follows the same geographic-then-scatter-then-residuals
+order as the CDF-matched section above it.
+
+> Code: `core/visualization.py` (`validation_report`'s per-pair loop and
+> native-units block).

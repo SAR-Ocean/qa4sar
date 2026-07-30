@@ -5,6 +5,8 @@ Provides:
 - CopernicusODataClient  — CDSE OData REST client (used for SAR downloads)
 - authenticate_cdse      — Read CDSE credentials from file / env
 - authenticate_eumdac    — Read EUMDAC credentials from file / env
+- authenticate_osi_saf_ftp — Read OSI-SAF wind FTP credentials from file / env
+- authenticate_smos_ftp  — Read SMOS Online Dissemination FTPS credentials from file / env
 - normalize_datetime     — ISO datetime normalisation helper
 - format_dir_datetime    — Directory-name-safe datetime string
 - build_output_dir       — Canonical output directory path
@@ -26,6 +28,8 @@ __all__ = [
     "authenticate_cdse",
     "authenticate_eumdac",
     "authenticate_osi_saf_ftp",
+    "authenticate_gportal",
+    "authenticate_smos_ftp",
     "normalize_datetime",
     "is_date_recent",
     "build_output_dir",
@@ -141,8 +145,12 @@ class CopernicusODataClient:
                 f"att:att/Name eq 'productType' and "
                 f"att/OData.CSC.StringAttribute/Value eq '{product_type}')"
             ),
-            f"ContentDate/Start gt {start_date}",
-            f"ContentDate/Start lt {end_date}",
+            # ge/le, not gt/lt: a daily product's ContentDate/Start commonly
+            # lands exactly on a requested window boundary (e.g. a recipe's
+            # start date normalizes to an exact midnight timestamp) -- a
+            # strict gt/lt silently drops that boundary-matching product.
+            f"ContentDate/Start ge {start_date}",
+            f"ContentDate/Start le {end_date}",
             f"OData.CSC.Intersects(area=geography'SRID=4326;{polygon}')",
         ]
         params = {
@@ -204,8 +212,9 @@ class CopernicusODataClient:
                 f"att:att/Name eq 'datasetIdentifier' and "
                 f"att/OData.CSC.StringAttribute/Value eq '{dataset_identifier}')"
             ),
-            f"ContentDate/Start gt {start_date}",
-            f"ContentDate/Start lt {end_date}",
+            # ge/le, not gt/lt -- see the identical comment in query_products.
+            f"ContentDate/Start ge {start_date}",
+            f"ContentDate/Start le {end_date}",
             f"OData.CSC.Intersects(area=geography'SRID=4326;{polygon}')",
         ]
         params = {
@@ -410,6 +419,119 @@ def authenticate_osi_saf_ftp(
         "  2. Set OSI_SAF_FTP_USERNAME / OSI_SAF_FTP_PASSWORD environment variables\n"
         "  3. Pass --username / --password on the command line\n"
         "Register at: https://osi-saf.eumetsat.int/register"
+    )
+
+def authenticate_gportal(
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    allow_prompt: bool = True,
+) -> Tuple[str, str]:
+    """
+    Resolve JAXA G-Portal SFTP (ftp.gportal.jaxa.jp:2051) credentials.
+
+    Priority order:
+      1. Explicit arguments
+      2. Environment variables  GPORTAL_USERNAME / GPORTAL_PASSWORD
+      3. ~/.jaxa_gportal_credentials  (JSON: {"username": ..., "password": ...})
+      4. Interactive terminal prompt (username via input(), password via
+         getpass.getpass()) -- deliberately NOT persisted to disk, unlike
+         every step above. This is the only authenticate_* helper in this
+         module that prompts instead of raising when nothing resolves;
+         that is intentional and specific to G-Portal, not a convention
+         to retrofit onto the others. Only reached when *allow_prompt* is
+         True (the default, for direct/CLI use of the downloader).
+
+    G-Portal has no SSH-key registration option for this account (per the
+    G-Portal user manual, "public key cryptography is available to
+    specific users only") -- account+password is the only auth method
+    available here.
+
+    Parameters
+    ----------
+    allow_prompt : bool
+        When False, step 4 is skipped -- raises RuntimeError instead of
+        prompting if nothing resolved from steps 1-3. Automated/orchestrated
+        callers (e.g. the AMSR2 G-Portal fallback in orchestrator.py, which
+        reaches this on every amsr_ssm recipe run past the Earthdata
+        coverage cutoff) must never block an unattended pipeline run on an
+        interactive password prompt nobody expected to be asked for.
+    """
+    if username and password:
+        return username, password
+
+    username = username or os.environ.get("GPORTAL_USERNAME")
+    password = password or os.environ.get("GPORTAL_PASSWORD")
+    if username and password:
+        return username, password
+
+    cred_file = Path.home() / ".jaxa_gportal_credentials"
+    if cred_file.exists():
+        with open(cred_file) as f:
+            creds = json.load(f)
+        username = username or creds.get("username")
+        password = password or creds.get("password")
+        if username and password:
+            return username, password
+
+    if not allow_prompt:
+        raise RuntimeError(
+            "G-Portal credentials not found.\n"
+            "Options:\n"
+            "  1. Store in ~/.jaxa_gportal_credentials as "
+            "'{\"username\": \"...\", \"password\": \"...\"}'\n"
+            "  2. Set GPORTAL_USERNAME / GPORTAL_PASSWORD environment variables\n"
+            "  3. Pass --username / --password on the command line\n"
+            "Register at: https://gportal.jaxa.jp"
+        )
+
+    import getpass
+
+    if not username:
+        username = input("G-Portal username: ")
+    if not password:
+        password = getpass.getpass("G-Portal password: ")
+    return username, password
+
+
+def authenticate_smos_ftp(
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+) -> Tuple[str, str]:
+    """
+    Resolve SMOS Online Dissemination FTPS (smos-diss.eo.esa.int) credentials.
+
+    Priority order:
+      1. Explicit arguments
+      2. Environment variables  SMOS_FTP_USERNAME / SMOS_FTP_PASSWORD
+      3. ~/.esa_smos_credentials  (JSON: {"username": ..., "password": ...})
+
+    Raises RuntimeError if no credentials are found.
+    """
+    if username and password:
+        return username, password
+
+    username = username or os.environ.get("SMOS_FTP_USERNAME")
+    password = password or os.environ.get("SMOS_FTP_PASSWORD")
+    if username and password:
+        return username, password
+
+    cred_file = Path.home() / ".esa_smos_credentials"
+    if cred_file.exists():
+        with open(cred_file) as f:
+            creds = json.load(f)
+        username = username or creds.get("username")
+        password = password or creds.get("password")
+        if username and password:
+            return username, password
+
+    raise RuntimeError(
+        "SMOS FTPS credentials not found.\n"
+        "Options:\n"
+        "  1. Store in ~/.esa_smos_credentials as "
+        "'{\"username\": \"...\", \"password\": \"...\"}'\n"
+        "  2. Set SMOS_FTP_USERNAME / SMOS_FTP_PASSWORD environment variables\n"
+        "  3. Pass --username / --password on the command line\n"
+        "Register at: https://smos-diss.eo.esa.int"
     )
 
 

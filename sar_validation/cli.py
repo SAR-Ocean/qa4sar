@@ -151,12 +151,12 @@ Examples:
     parser.add_argument(
         "--stats",
         action="store_true",
-        help="Compute validation statistics (step 5a — bias, RMSE, correlation); implies --collocate",
+        help="Compute validation statistics (step 4 — bias, RMSE, correlation); implies --collocate",
     )
     parser.add_argument(
         "--plot",
         action="store_true",
-        help="Generate validation plots (step 5b — scatter, geographic, statistics, residuals); implies --stats",
+        help="Generate validation plots (step 5 — scatter, geographic, statistics, residuals); implies --stats",
     )
     parser.add_argument(
         "--output-dir",
@@ -460,6 +460,14 @@ def _build_soil_moisture_config(limit: Optional[int] = None):
             # sensing depth; a future NISAR (L-band) recipe would instead
             # use a deeper window (~0-0.25 m), set the same way.
             ValidationDataSource(source_type="ismn", min_depth=0.0, max_depth=0.05),
+            # Satellite soil-moisture sources -- ASCAT (scatterometer),
+            # AMSR2/SMAP/SMOS (radiometer) -- default on alongside ISMN
+            # rather than requiring a separate recipe, matching
+            # recipes/soil_moisture_satellite_example.yaml's source list.
+            ValidationDataSource(source_type="ascat_ssm"),
+            ValidationDataSource(source_type="amsr_ssm"),
+            ValidationDataSource(source_type="smap_ssm"),
+            ValidationDataSource(source_type="smos_ssm"),
         ],
         collocation=CollocationType(
             # Pixel-scale tolerances, not the ocean buoy-footprint defaults:
@@ -678,7 +686,7 @@ def _execute_recipe(
             )
 
     # Reprint any warnings/notices at the very end of the run: they may
-    # have fired during Step 1 (download), long before Steps 2/3/5a/5b's
+    # have fired during Step 1 (download), long before Steps 2/3/4/5's
     # own console output scrolled them out of view.
     warnings = _load_download_warnings(orchestrator.base_dir)
     if warnings:
@@ -763,12 +771,16 @@ def _collocate_data(
     # there are zero collocated pairs, in which case every validation point
     # shows up as unmatched.
     try:
-        diag_path = plot_collocation_diagnostics(
+        diag_result = plot_collocation_diagnostics(
             tree, collocation_ds, recipe, base_dir,
             filename_suffix=filename_suffix,
             layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
         )
-        if diag_path:
+        # soil_moisture recipes with multiple SAR files return one Path per
+        # file (see plot_collocation_diagnostics); every other case returns
+        # a single Path or None.
+        diag_paths = diag_result if isinstance(diag_result, list) else ([diag_result] if diag_result else [])
+        for diag_path in diag_paths:
             print(f"  Generated diagnostic plot: {diag_path.relative_to(base_dir.parent)}")
     except Exception as exc:
         print(f"  Could not generate diagnostic plot: {exc}")
@@ -776,17 +788,17 @@ def _collocate_data(
 
 
 def _compute_stats(recipe, base_dir: Path, filename_suffix: str = "") -> None:
-    """Run step 5a: compute validation statistics from collocation_results<suffix>.nc."""
+    """Run step 4: compute validation statistics from collocation_results<suffix>.nc."""
     import xarray as xr
 
-    from .core.statistics import run_statistics
+    from .core.statistics import run_statistics, run_statistics_native_units
 
     coll_path = base_dir / f"collocation_results{filename_suffix}.nc"
     if not coll_path.exists():
         print(f"  collocation_results{filename_suffix}.nc not found — statistics skipped.")
         return
 
-    print("\nStep 5a: Computing validation statistics…")
+    print("\nStep 4: Computing validation statistics…")
     collocation_ds = xr.open_dataset(str(coll_path))
     results = run_statistics(collocation_ds, recipe, base_dir, filename_suffix=filename_suffix)
     if not results:
@@ -795,10 +807,15 @@ def _compute_stats(recipe, base_dir: Path, filename_suffix: str = "") -> None:
         for key in results:
             print(f"  Statistics saved: validation_statistics_{key}{filename_suffix}.nc/.csv")
 
+    if recipe.config.variable == "soil_moisture":
+        native_results = run_statistics_native_units(collocation_ds, recipe, base_dir, filename_suffix=filename_suffix)
+        for key in native_results:
+            print(f"  Native-units statistics saved: validation_statistics_{key}_native_units{filename_suffix}.nc/.csv")
+
 
 def _load_precomputed_stats(recipe, collocation_ds, base_dir: Path, filename_suffix: str = "") -> dict:
     """Load ``validation_statistics_<sar_var>_vs_<val_var><suffix>.nc`` files already
-    saved by step 5a, keyed the same way ``run_statistics`` names them.
+    saved by step 4, keyed the same way ``run_statistics`` names them.
 
     Extracted from ``_generate_plots`` so the file-matching logic is
     unit-testable independent of the CLI's plotting/PDF side effects. Uses
@@ -828,7 +845,7 @@ def _generate_plots(
     recipe, base_dir: Path, filename_suffix: str = "",
     layer_vs_layer_collocation_method: str = "cell-averaging",
 ) -> None:
-    """Run step 5b: generate validation plots and save PDF to <base_dir>/, PNG to <base_dir>/plots/."""
+    """Run step 5: generate validation plots and save PDF to <base_dir>/, PNG to <base_dir>/plots/."""
     import xarray as xr
 
     from .core.visualization import validation_report
@@ -843,19 +860,33 @@ def _generate_plots(
         print("  datatree.nc not found — plotting skipped.")
         return
 
-    print("\nStep 5b: Generating validation plots…")
-    collocation_ds = xr.open_dataset(str(coll_path))
-    datatree = xr.open_datatree(str(datatree_path), engine="netcdf4")
+    print("\nStep 5: Generating validation plots and validation report")
+    # .load() eagerly reads both files into memory once instead of leaving
+    # them backed by lazy netCDF4 handles: report generation re-reads the
+    # same collocation columns and SAR scenes from many different sections
+    # (scatter, geographic, residuals, stats table), and repeated on-disk
+    # reads of small-enough-to-fit-in-memory files (collocation_results.nc,
+    # datatree.nc are tens of MB here) were a measured contributor to slow
+    # report generation on multi-source (soil moisture) recipes.
+    collocation_ds = xr.open_dataset(str(coll_path)).load()
+    datatree = xr.open_datatree(str(datatree_path), engine="netcdf4").load()
 
     stats_ds_map = _load_precomputed_stats(recipe, collocation_ds, base_dir, filename_suffix)
     download_warnings = _load_download_warnings(base_dir)
+
+    native_units_stats_ds_map = None
+    if recipe.config.variable == "soil_moisture":
+        native_units_stats_ds_map = _load_precomputed_stats(
+            recipe, collocation_ds, base_dir, filename_suffix=f"_native_units{filename_suffix}",
+        )
 
     validation_report(collocation_ds, datatree, recipe,
                       stats_ds_map=stats_ds_map or None,
                       out_dir=base_dir,
                       filename_suffix=filename_suffix,
                       download_warnings=download_warnings,
-                      layer_vs_layer_collocation_method=layer_vs_layer_collocation_method)
+                      layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
+                      native_units_stats_ds_map=native_units_stats_ds_map or None)
     pdf_path = base_dir / f"validation_report{filename_suffix}.pdf"
     if pdf_path.exists():
         print(f"  PDF report saved to {pdf_path}")

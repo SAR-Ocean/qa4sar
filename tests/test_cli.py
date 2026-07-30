@@ -70,6 +70,36 @@ class TestLoadPrecomputedStats:
         assert set(result.keys()) == {"oswTotalHs_vs_VAVH"}
 
 
+class TestComputeStatsWritesNativeUnitsForSoilMoisture:
+    def test_compute_stats_writes_native_units_for_soil_moisture(self, tmp_path, capsys):
+        import numpy as np
+
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
+
+        cfg = RecipeConfig(
+            name="test_native_units_cli", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        )
+        recipe = Recipe(config=cfg)
+
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": ("collocation", np.array([20.0, 30.0, 40.0, 50.0]), {"units": "%"}),
+                "val_SOIL_MOISTURE": ("collocation", np.array([25.0, 35.0, 0.15, 0.20])),
+                "val_source": ("collocation", np.array(["ascat_ssm", "ascat_ssm", "ismn", "ismn"])),
+            },
+        )
+        collocation_ds.to_netcdf(tmp_path / "collocation_results.nc")
+
+        cli._compute_stats(recipe, tmp_path)
+
+        assert (tmp_path / "validation_statistics_sarSSM_vs_SOIL_MOISTURE.nc").exists()
+        assert (tmp_path / "validation_statistics_sarSSM_vs_SOIL_MOISTURE_native_units.nc").exists()
+        out = capsys.readouterr().out
+        assert "Native-units statistics saved" in out
+
+
 class TestExecuteRecipeContinuesPastDownloadFailure:
     def test_does_not_exit_when_download_all_returns_false(self, tmp_path, capsys):
         from unittest.mock import patch
@@ -272,12 +302,15 @@ class TestBuildSoilMoistureConfig:
         assert cfg.variable == "soil_moisture"
         assert cfg.sar_data.satellite == "Sentinel-1"
         assert cfg.sar_data.product_level == "L3_SSM"
-        assert len(cfg.validation_sources) == 1
-        source = cfg.validation_sources[0]
-        assert source.source_type == "ismn"
-        assert source.min_depth == 0.0
-        assert source.max_depth == 0.05
-        assert source.download_kwargs == {}
+        assert len(cfg.validation_sources) == 5
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert source_types == ["ismn", "ascat_ssm", "amsr_ssm", "smap_ssm", "smos_ssm"]
+        ismn_source = cfg.validation_sources[0]
+        assert ismn_source.min_depth == 0.0
+        assert ismn_source.max_depth == 0.05
+        assert ismn_source.download_kwargs == {}
+        for satellite_source in cfg.validation_sources[1:]:
+            assert satellite_source.download_kwargs == {}
 
     def test_default_geographic_bounds(self):
         from sar_validation.cli import _build_soil_moisture_config
