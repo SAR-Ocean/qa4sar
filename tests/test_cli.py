@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import xarray as xr
 
 from sar_validation import cli
@@ -399,3 +400,56 @@ class TestBuildSoilMoistureConfig:
 
         recipe_path = tmp_path / "recipes" / "soil_moisture_validation.yaml"
         assert recipe_path.exists()
+
+
+class TestSetCredentialCli:
+    """--set-credential prompts for username/password and stores them in
+    the OS keyring via sar_validation.downloaders.base.set_credential."""
+
+    def test_prompts_and_stores_via_set_credential(self, monkeypatch, capsys):
+        from sar_validation import cli
+
+        monkeypatch.setattr("builtins.input", lambda prompt: "alice")
+        monkeypatch.setattr("getpass.getpass", lambda prompt: "secret")
+
+        calls = []
+        monkeypatch.setattr(
+            "sar_validation.downloaders.base.set_credential",
+            lambda name, username, password: calls.append((name, username, password)),
+        )
+
+        cli._set_credential("eumdac")
+
+        assert calls == [("eumdac", "alice", "secret")]
+        assert "eumdac" in capsys.readouterr().out.lower()
+
+    def test_reports_failure_and_exits_nonzero_when_keyring_unavailable(
+        self, monkeypatch, capsys
+    ):
+        import keyring.errors
+
+        from sar_validation import cli
+
+        monkeypatch.setattr("builtins.input", lambda prompt: "alice")
+        monkeypatch.setattr("getpass.getpass", lambda prompt: "secret")
+
+        def _raise(name, username, password):
+            raise keyring.errors.NoKeyringError("no backend")
+
+        monkeypatch.setattr("sar_validation.downloaders.base.set_credential", _raise)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli._set_credential("eumdac")
+
+        assert exc_info.value.code != 0
+        assert "no backend" in capsys.readouterr().out.lower()
+
+    def test_main_wires_set_credential_flag(self, monkeypatch):
+        from sar_validation import cli
+
+        called = []
+        monkeypatch.setattr(cli, "_set_credential", lambda name: called.append(name))
+
+        cli.main(["--set-credential", "smos"])
+
+        assert called == ["smos"]

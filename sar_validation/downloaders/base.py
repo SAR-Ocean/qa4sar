@@ -4,9 +4,12 @@ Shared base utilities for all downloaders.
 Provides:
 - CopernicusODataClient  — CDSE OData REST client (used for SAR downloads)
 - authenticate_cdse      — Read CDSE credentials from file / env
-- authenticate_eumdac    — Read EUMDAC credentials from file / env
-- authenticate_osi_saf_ftp — Read OSI-SAF wind FTP credentials from file / env
-- authenticate_smos_ftp  — Read SMOS Online Dissemination FTPS credentials from file / env
+- authenticate_eumdac    — Read EUMDAC credentials from env / OS keyring
+- authenticate_osi_saf_ftp — Read OSI-SAF wind FTP credentials from env / OS keyring
+- authenticate_gportal   — Read JAXA G-Portal credentials from env / OS keyring / prompt
+- authenticate_smos_ftp  — Read SMOS Online Dissemination FTPS credentials from env / OS keyring
+- set_credential         — Store a username/password pair in the OS keyring
+  (used by ``sar-validate --set-credential``)
 - normalize_datetime     — ISO datetime normalisation helper
 - format_dir_datetime    — Directory-name-safe datetime string
 - build_output_dir       — Canonical output directory path
@@ -16,12 +19,17 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
+import keyring
+import keyring.errors
 import requests
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "CopernicusODataClient",
@@ -30,12 +38,136 @@ __all__ = [
     "authenticate_osi_saf_ftp",
     "authenticate_gportal",
     "authenticate_smos_ftp",
+    "set_credential",
     "normalize_datetime",
     "is_date_recent",
     "build_output_dir",
     "split_antimeridian_bbox",
     "copernicus_marine_download_kwargs",
 ]
+
+# ---------------------------------------------------------------------------
+# OS keyring service names — one per migrated credential set. Each service
+# stores two entries: "username" and "password" (via keyring.set_password /
+# keyring.get_password).
+# ---------------------------------------------------------------------------
+_KEYRING_SERVICES = {
+    "eumdac": "sar-validation-eumdac",
+    "osi_saf": "sar-validation-osi-saf",
+    "gportal": "sar-validation-gportal",
+    "smos": "sar-validation-smos",
+}
+
+
+def _keyring_get(service: str) -> Tuple[Optional[str], Optional[str]]:
+    """Read (username, password) from the OS keyring for *service*.
+
+    Treats "no OS keyring backend available" (e.g. headless CI runners,
+    which raise keyring.errors.NoKeyringError or similar) identically to
+    "nothing stored" -- callers fall through to the next credential source
+    rather than crashing.
+    """
+    try:
+        username = keyring.get_password(service, "username")
+        password = keyring.get_password(service, "password")
+    except keyring.errors.KeyringError:
+        return None, None
+    return username, password
+
+
+def _keyring_set_quiet(service: str, username: str, password: str) -> None:
+    """Best-effort store of (username, password) into the OS keyring.
+
+    Used for the automatic legacy-file migration path, where a missing
+    keyring backend must not turn a successful credential read into a
+    crash -- it just means the migration silently doesn't happen this run.
+    """
+    try:
+        keyring.set_password(service, "username", username)
+        keyring.set_password(service, "password", password)
+    except keyring.errors.KeyringError:
+        pass
+
+
+def _resolve_from_keyring_or_legacy_file(
+    name: str,
+    cred_file: Path,
+    parse_legacy_file: Callable[[str], Tuple[Optional[str], Optional[str]]],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve (username, password) from the OS keyring, migrating from a
+    legacy plaintext credentials file into the keyring on first use.
+
+    Priority: keyring first; if the keyring has nothing stored for
+    *name* AND the legacy *cred_file* still exists on disk, read it,
+    write its contents into the keyring (one-time migration), print a
+    console notice, and return those values. The legacy file itself is
+    never deleted -- that's left to the user.
+    """
+    service = _KEYRING_SERVICES[name]
+    username, password = _keyring_get(service)
+    if username and password:
+        return username, password
+
+    if cred_file.exists():
+        file_username, file_password = parse_legacy_file(cred_file.read_text())
+        if file_username and file_password:
+            _keyring_set_quiet(service, file_username, file_password)
+            logger.warning(
+                "Migrated %s credentials from %s to the OS keyring "
+                "(service=%r). You can now safely delete %s.",
+                name, cred_file, service, cred_file,
+            )
+            return file_username, file_password
+
+    return username, password
+
+
+def _parse_comma_separated_legacy_file(content: str) -> Tuple[Optional[str], Optional[str]]:
+    """Parse the EUMDAC legacy file format: 'username,password'."""
+    parts = content.strip().split(",")
+    if len(parts) >= 2:
+        return parts[0].strip(), parts[1].strip()
+    return None, None
+
+
+def _parse_json_legacy_file(content: str) -> Tuple[Optional[str], Optional[str]]:
+    """Parse the OSI-SAF/G-Portal/SMOS legacy file format:
+    '{"username": ..., "password": ...}'."""
+    creds = json.loads(content)
+    return creds.get("username"), creds.get("password")
+
+
+def set_credential(name: str, username: str, password: str) -> None:
+    """Store *username*/*password* in the OS keyring for a credential set.
+
+    Used by ``sar-validate --set-credential {eumdac,osi_saf,gportal,smos}``.
+
+    Parameters
+    ----------
+    name : str
+        One of "eumdac", "osi_saf", "gportal", "smos".
+    username, password : str
+        Values to store.
+
+    Raises
+    ------
+    ValueError
+        If *name* is not one of the recognised credential sets.
+    keyring.errors.KeyringError
+        If no OS keyring backend is available. Unlike the internal
+        migration helper, this is intentionally NOT swallowed here: this
+        function backs an explicit user action, so the caller (the CLI)
+        needs a real error to report rather than a silent no-op.
+    """
+    try:
+        service = _KEYRING_SERVICES[name]
+    except KeyError:
+        raise ValueError(
+            f"Unknown credential set {name!r}. Choose one of: "
+            f"{', '.join(sorted(_KEYRING_SERVICES))}"
+        ) from None
+    keyring.set_password(service, "username", username)
+    keyring.set_password(service, "password", password)
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +471,11 @@ def authenticate_eumdac(
     Priority order:
       1. Explicit arguments
       2. Environment variables  EUMDAC_USERNAME / EUMDAC_PASSWORD
-      3. ~/.eumdac/credentials  (comma-separated: username,password)
+      3. OS keyring (service "sar-validation-eumdac"; see set_credential /
+         ``sar-validate --set-credential eumdac``). If nothing is stored
+         there yet but the legacy ~/.eumdac/credentials file
+         (comma-separated: username,password) still exists, it is read
+         once, migrated into the keyring, and a console notice is printed.
 
     Requires the ``eumdac`` package to be installed.
     Raises RuntimeError if no credentials are found.
@@ -357,19 +493,20 @@ def authenticate_eumdac(
     if not password:
         password = os.environ.get("EUMDAC_PASSWORD")
 
-    cred_file = Path.home() / ".eumdac" / "credentials"
-    if (not username or not password) and cred_file.exists():
-        content = cred_file.read_text().strip()
-        parts = content.split(",")
-        if len(parts) >= 2:
-            username = username or parts[0].strip()
-            password = password or parts[1].strip()
+    if not username or not password:
+        cred_file = Path.home() / ".eumdac" / "credentials"
+        kr_username, kr_password = _resolve_from_keyring_or_legacy_file(
+            "eumdac", cred_file, _parse_comma_separated_legacy_file
+        )
+        username = username or kr_username
+        password = password or kr_password
 
     if not username or not password:
         raise RuntimeError(
             "EUMDAC credentials not found.\n"
             "Options:\n"
-            "  1. Store in ~/.eumdac/credentials as 'username,password'\n"
+            "  1. Run `sar-validate --set-credential eumdac` to store credentials "
+            "in your OS keyring\n"
             "  2. Set EUMDAC_USERNAME / EUMDAC_PASSWORD environment variables\n"
             "Register at: https://eoportal.eumetsat.int"
         )
@@ -390,7 +527,12 @@ def authenticate_osi_saf_ftp(
     Priority order:
       1. Explicit arguments
       2. Environment variables  OSI_SAF_FTP_USERNAME / OSI_SAF_FTP_PASSWORD
-      3. ~/.eumetsat_osi_saf_wind_credentials  (JSON: {"username": ..., "password": ...})
+      3. OS keyring (service "sar-validation-osi-saf"; see set_credential /
+         ``sar-validate --set-credential osi_saf``). If nothing is stored
+         there yet but the legacy ~/.eumetsat_osi_saf_wind_credentials
+         file (JSON: {"username": ..., "password": ...}) still exists, it
+         is read once, migrated into the keyring, and a console notice is
+         printed.
 
     Raises RuntimeError if no credentials are found.
     """
@@ -403,19 +545,19 @@ def authenticate_osi_saf_ftp(
         return username, password
 
     cred_file = Path.home() / ".eumetsat_osi_saf_wind_credentials"
-    if cred_file.exists():
-        with open(cred_file) as f:
-            creds = json.load(f)
-        username = username or creds.get("username")
-        password = password or creds.get("password")
-        if username and password:
-            return username, password
+    kr_username, kr_password = _resolve_from_keyring_or_legacy_file(
+        "osi_saf", cred_file, _parse_json_legacy_file
+    )
+    username = username or kr_username
+    password = password or kr_password
+    if username and password:
+        return username, password
 
     raise RuntimeError(
         "OSI-SAF FTP credentials not found.\n"
         "Options:\n"
-        "  1. Store in ~/.eumetsat_osi_saf_wind_credentials as "
-        "'{\"username\": \"...\", \"password\": \"...\"}'\n"
+        "  1. Run `sar-validate --set-credential osi_saf` to store credentials "
+        "in your OS keyring\n"
         "  2. Set OSI_SAF_FTP_USERNAME / OSI_SAF_FTP_PASSWORD environment variables\n"
         "  3. Pass --username / --password on the command line\n"
         "Register at: https://osi-saf.eumetsat.int/register"
@@ -432,7 +574,11 @@ def authenticate_gportal(
     Priority order:
       1. Explicit arguments
       2. Environment variables  GPORTAL_USERNAME / GPORTAL_PASSWORD
-      3. ~/.jaxa_gportal_credentials  (JSON: {"username": ..., "password": ...})
+      3. OS keyring (service "sar-validation-gportal"; see set_credential /
+         ``sar-validate --set-credential gportal``). If nothing is stored
+         there yet but the legacy ~/.jaxa_gportal_credentials file (JSON:
+         {"username": ..., "password": ...}) still exists, it is read
+         once, migrated into the keyring, and a console notice is printed.
       4. Interactive terminal prompt (username via input(), password via
          getpass.getpass()) -- deliberately NOT persisted to disk, unlike
          every step above. This is the only authenticate_* helper in this
@@ -465,20 +611,20 @@ def authenticate_gportal(
         return username, password
 
     cred_file = Path.home() / ".jaxa_gportal_credentials"
-    if cred_file.exists():
-        with open(cred_file) as f:
-            creds = json.load(f)
-        username = username or creds.get("username")
-        password = password or creds.get("password")
-        if username and password:
-            return username, password
+    kr_username, kr_password = _resolve_from_keyring_or_legacy_file(
+        "gportal", cred_file, _parse_json_legacy_file
+    )
+    username = username or kr_username
+    password = password or kr_password
+    if username and password:
+        return username, password
 
     if not allow_prompt:
         raise RuntimeError(
             "G-Portal credentials not found.\n"
             "Options:\n"
-            "  1. Store in ~/.jaxa_gportal_credentials as "
-            "'{\"username\": \"...\", \"password\": \"...\"}'\n"
+            "  1. Run `sar-validate --set-credential gportal` to store credentials "
+            "in your OS keyring\n"
             "  2. Set GPORTAL_USERNAME / GPORTAL_PASSWORD environment variables\n"
             "  3. Pass --username / --password on the command line\n"
             "Register at: https://gportal.jaxa.jp"
@@ -503,7 +649,11 @@ def authenticate_smos_ftp(
     Priority order:
       1. Explicit arguments
       2. Environment variables  SMOS_FTP_USERNAME / SMOS_FTP_PASSWORD
-      3. ~/.esa_smos_credentials  (JSON: {"username": ..., "password": ...})
+      3. OS keyring (service "sar-validation-smos"; see set_credential /
+         ``sar-validate --set-credential smos``). If nothing is stored
+         there yet but the legacy ~/.esa_smos_credentials file (JSON:
+         {"username": ..., "password": ...}) still exists, it is read
+         once, migrated into the keyring, and a console notice is printed.
 
     Raises RuntimeError if no credentials are found.
     """
@@ -516,19 +666,19 @@ def authenticate_smos_ftp(
         return username, password
 
     cred_file = Path.home() / ".esa_smos_credentials"
-    if cred_file.exists():
-        with open(cred_file) as f:
-            creds = json.load(f)
-        username = username or creds.get("username")
-        password = password or creds.get("password")
-        if username and password:
-            return username, password
+    kr_username, kr_password = _resolve_from_keyring_or_legacy_file(
+        "smos", cred_file, _parse_json_legacy_file
+    )
+    username = username or kr_username
+    password = password or kr_password
+    if username and password:
+        return username, password
 
     raise RuntimeError(
         "SMOS FTPS credentials not found.\n"
         "Options:\n"
-        "  1. Store in ~/.esa_smos_credentials as "
-        "'{\"username\": \"...\", \"password\": \"...\"}'\n"
+        "  1. Run `sar-validate --set-credential smos` to store credentials "
+        "in your OS keyring\n"
         "  2. Set SMOS_FTP_USERNAME / SMOS_FTP_PASSWORD environment variables\n"
         "  3. Pass --username / --password on the command line\n"
         "Register at: https://smos-diss.eo.esa.int"

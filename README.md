@@ -213,24 +213,62 @@ copernicusmarine login
 
 ### EUMETSAT EUMDAC — for ASCAT scatterometer downloads
 
+Store credentials in your OS keyring (GNOME Keyring/libsecret on Linux):
+
 ```bash
-mkdir -p ~/.eumdac
-echo "username,password" > ~/.eumdac/credentials
-chmod 600 ~/.eumdac/credentials
+sar-validate --set-credential eumdac
 ```
 
-Or use environment variables: `EUMDAC_USERNAME` / `EUMDAC_PASSWORD`.
+You'll be prompted for a username and password; nothing is written to disk
+in plaintext. Or use environment variables: `EUMDAC_USERNAME` /
+`EUMDAC_PASSWORD`.
+
+If you have an existing `~/.eumdac/credentials` file from before this
+change, it's picked up automatically and migrated into the OS keyring the
+first time it's needed — a one-time console notice confirms the migration
+and tells you it's then safe to delete the old file yourself (it is never
+deleted automatically).
 
 Register at: https://eoportal.eumetsat.int
 
-### Earthdata (AMSR-E/2, SMAP) — for satellite soil moisture downloads
+### EUMETSAT OSI-SAF wind FTP — for OSI-SAF wind downloads
+
+Store credentials in your OS keyring:
 
 ```bash
-export EARTHDATA_USERNAME=your_username
-export EARTHDATA_PASSWORD=your_password
+sar-validate --set-credential osi_saf
 ```
 
-Or create a `~/.netrc` file:
+Or use environment variables: `OSI_SAF_FTP_USERNAME` / `OSI_SAF_FTP_PASSWORD`.
+
+An existing `~/.eumetsat_osi_saf_wind_credentials` file is migrated into
+the OS keyring automatically on first use (with a one-time console notice);
+you can delete the old file afterwards.
+
+Register at: https://osi-saf.eumetsat.int/register
+
+### JAXA G-Portal — for AMSR2 soil moisture downloads (SFTP fallback)
+
+Store credentials in your OS keyring:
+
+```bash
+sar-validate --set-credential gportal
+```
+
+Or use environment variables: `GPORTAL_USERNAME` / `GPORTAL_PASSWORD`. If
+none of these resolve, the downloader falls back to an interactive
+terminal prompt (deliberately not persisted anywhere).
+
+An existing `~/.jaxa_gportal_credentials` file is migrated into the OS
+keyring automatically on first use (with a one-time console notice); you
+can delete the old file afterwards.
+
+Register at: https://gportal.jaxa.jp
+
+### Earthdata (AMSR-E/2, SMAP) — for satellite soil moisture downloads
+
+Earthdata credentials are handled by the `earthaccess` library using its own
+native convention — a `~/.netrc` file — **not** a bespoke credentials file:
 
 ```
 machine urs.earthdata.nasa.gov
@@ -242,6 +280,8 @@ password your_password
 chmod 600 ~/.netrc
 ```
 
+Or use environment variables: `EARTHDATA_USERNAME` / `EARTHDATA_PASSWORD`.
+
 Register at: https://urs.earthdata.nasa.gov
 
 The `earthdata_soil_moisture_downloader` uses these credentials to download AMSR-E/2 and SMAP
@@ -249,23 +289,17 @@ soil moisture products from the NASA Earthdata archive.
 
 ### ESA SMOS FTPS — for SMOS soil moisture downloads
 
-```bash
-export SMOS_FTP_USERNAME=your_username
-export SMOS_FTP_PASSWORD=your_password
-```
-
-Or create a `~/.esa_smos_credentials` file (JSON format):
-
-```json
-{
-  "username": "your_username",
-  "password": "your_password"
-}
-```
+Store credentials in your OS keyring:
 
 ```bash
-chmod 600 ~/.esa_smos_credentials
+sar-validate --set-credential smos
 ```
+
+Or use environment variables: `SMOS_FTP_USERNAME` / `SMOS_FTP_PASSWORD`.
+
+An existing `~/.esa_smos_credentials` file is migrated into the OS keyring
+automatically on first use (with a one-time console notice); you can
+delete the old file afterwards.
 
 Register at: https://smos.argans.co.uk
 

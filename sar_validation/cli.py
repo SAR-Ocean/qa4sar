@@ -12,6 +12,9 @@ Usage
   # Create a recipe template (wind | currents | waves | soil_moisture)
   sar-validate --create-recipe wind
 
+  # Store credentials in the OS keyring (eumdac | osi_saf | gportal | smos)
+  sar-validate --set-credential eumdac
+
   # Dry-run (see what would be downloaded)
   sar-validate --recipe recipes/wind_validation.yaml --dry-run
 
@@ -50,6 +53,7 @@ def main(argv=None) -> None:
 Examples:
   sar-validate --list-recipes
   sar-validate --create-recipe wind
+  sar-validate --set-credential eumdac
   sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65
   sar-validate --create-recipe wind --start 2026-03-01 --end 2026-03-31
   sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65 \\
@@ -83,6 +87,13 @@ Examples:
         "--create-recipe",
         metavar="NAME",
         help="Create a recipe template: wind | currents | waves | soil_moisture",
+    )
+    parser.add_argument(
+        "--set-credential",
+        metavar="SERVICE",
+        choices=["eumdac", "osi_saf", "gportal", "smos"],
+        help="Prompt for a username/password and store them in the OS keyring "
+             "for SERVICE (eumdac | osi_saf | gportal | smos)",
     )
     parser.add_argument(
         "--limit",
@@ -200,6 +211,8 @@ Examples:
 
     if args.list_recipes:
         _list_recipes()
+    elif args.set_credential:
+        _set_credential(args.set_credential)
     elif args.create_recipe:
         _create_recipe(
             args.create_recipe,
@@ -233,6 +246,25 @@ Examples:
 # ---------------------------------------------------------------------------
 # Sub-commands
 # ---------------------------------------------------------------------------
+
+def _set_credential(name: str) -> None:
+    """Prompt for a username/password and store them in the OS keyring.
+
+    Backs ``sar-validate --set-credential {eumdac,osi_saf,gportal,smos}``.
+    """
+    import getpass
+
+    from .downloaders import base
+
+    username = input(f"Username for '{name}': ")
+    password = getpass.getpass(f"Password for '{name}': ")
+    try:
+        base.set_credential(name, username, password)
+    except Exception as exc:
+        print(f"Failed to store '{name}' credentials in the OS keyring: {exc}")
+        sys.exit(1)
+    print(f"Stored '{name}' credentials in the OS keyring.")
+
 
 def _list_recipes() -> None:
     examples_dir = Path(__file__).parent.parent / "examples"

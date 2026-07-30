@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import keyring
+import keyring.errors
 import pytest
 
 from sar_validation.downloaders.base import (
@@ -14,6 +16,7 @@ from sar_validation.downloaders.base import (
     copernicus_marine_download_kwargs,
     is_date_recent,
     normalize_datetime,
+    set_credential,
     split_antimeridian_bbox,
 )
 from sar_validation.downloaders.insitu_downloader import (
@@ -281,11 +284,142 @@ class TestCopernicusMarineDownloadKwargs:
 
 
 # ---------------------------------------------------------------------------
+# Fake keyring backend — tests must never touch a real OS keyring
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fake_keyring(monkeypatch):
+    """Replace keyring.get_password/set_password with an in-memory dict.
+
+    Every authenticate_*/set_credential test that could reach the keyring
+    layer uses this fixture so the suite passes identically whether or not
+    a real OS keyring backend (GNOME Keyring/libsecret, etc.) is present --
+    critical for headless CI runners.
+    """
+    store: dict[tuple[str, str], str] = {}
+
+    def _get_password(service, key):
+        return store.get((service, key))
+
+    def _set_password(service, key, value):
+        store[(service, key)] = value
+
+    monkeypatch.setattr(keyring, "get_password", _get_password)
+    monkeypatch.setattr(keyring, "set_password", _set_password)
+    return store
+
+
+@pytest.fixture
+def broken_keyring(monkeypatch):
+    """Simulate "no OS keyring backend available" (e.g. headless CI):
+    keyring.get_password/set_password both raise NoKeyringError."""
+
+    def _raise(*args, **kwargs):
+        raise keyring.errors.NoKeyringError("no recommended backend available")
+
+    monkeypatch.setattr(keyring, "get_password", _raise)
+    monkeypatch.setattr(keyring, "set_password", _raise)
+
+
+# ---------------------------------------------------------------------------
+# Tests for authenticate_eumdac()
+# ---------------------------------------------------------------------------
+
+class TestAuthenticateEumdac:
+    def _fake_eumdac_module(self):
+        fake_eumdac = MagicMock()
+        fake_eumdac.AccessToken.side_effect = lambda creds: creds
+        return fake_eumdac
+
+    def test_explicit_args_win_over_everything(self, monkeypatch, tmp_path, fake_keyring):
+        from sar_validation.downloaders.base import authenticate_eumdac
+
+        monkeypatch.setenv("EUMDAC_USERNAME", "env_user")
+        monkeypatch.setenv("EUMDAC_PASSWORD", "env_pass")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        fake_keyring[("sar-validation-eumdac", "username")] = "kr_user"
+        fake_keyring[("sar-validation-eumdac", "password")] = "kr_pass"
+
+        with patch.dict("sys.modules", {"eumdac": self._fake_eumdac_module()}):
+            token = authenticate_eumdac("explicit_user", "explicit_pass")
+        assert token == ("explicit_user", "explicit_pass")
+
+    def test_env_vars_used_when_args_absent(self, monkeypatch, tmp_path, fake_keyring):
+        from sar_validation.downloaders.base import authenticate_eumdac
+
+        monkeypatch.setenv("EUMDAC_USERNAME", "env_user")
+        monkeypatch.setenv("EUMDAC_PASSWORD", "env_pass")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        fake_keyring[("sar-validation-eumdac", "username")] = "kr_user"
+        fake_keyring[("sar-validation-eumdac", "password")] = "kr_pass"
+
+        with patch.dict("sys.modules", {"eumdac": self._fake_eumdac_module()}):
+            token = authenticate_eumdac()
+        assert token == ("env_user", "env_pass")
+
+    def test_uses_keyring_when_no_args_or_env(self, monkeypatch, tmp_path, fake_keyring):
+        from sar_validation.downloaders.base import authenticate_eumdac
+
+        monkeypatch.delenv("EUMDAC_USERNAME", raising=False)
+        monkeypatch.delenv("EUMDAC_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        fake_keyring[("sar-validation-eumdac", "username")] = "kr_user"
+        fake_keyring[("sar-validation-eumdac", "password")] = "kr_pass"
+
+        with patch.dict("sys.modules", {"eumdac": self._fake_eumdac_module()}):
+            token = authenticate_eumdac()
+        assert token == ("kr_user", "kr_pass")
+
+    def test_falls_back_to_legacy_file_and_migrates_to_keyring(
+        self, monkeypatch, tmp_path, fake_keyring
+    ):
+        monkeypatch.delenv("EUMDAC_USERNAME", raising=False)
+        monkeypatch.delenv("EUMDAC_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        cred_dir = tmp_path / ".eumdac"
+        cred_dir.mkdir()
+        (cred_dir / "credentials").write_text("file_user,file_pass")
+
+        from sar_validation.downloaders.base import authenticate_eumdac
+
+        with patch.dict("sys.modules", {"eumdac": self._fake_eumdac_module()}):
+            token = authenticate_eumdac()
+        assert token == ("file_user", "file_pass")
+        # One-time migration: the legacy values are now stored in the keyring.
+        assert fake_keyring[("sar-validation-eumdac", "username")] == "file_user"
+        assert fake_keyring[("sar-validation-eumdac", "password")] == "file_pass"
+
+    def test_no_keyring_backend_falls_through_to_runtime_error(
+        self, monkeypatch, tmp_path, broken_keyring
+    ):
+        from sar_validation.downloaders.base import authenticate_eumdac
+
+        monkeypatch.delenv("EUMDAC_USERNAME", raising=False)
+        monkeypatch.delenv("EUMDAC_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        with patch.dict("sys.modules", {"eumdac": self._fake_eumdac_module()}):
+            with pytest.raises(RuntimeError, match="EUMDAC credentials not found"):
+                authenticate_eumdac()
+
+    def test_runtime_error_mentions_set_credential(self, monkeypatch, tmp_path, fake_keyring):
+        from sar_validation.downloaders.base import authenticate_eumdac
+
+        monkeypatch.delenv("EUMDAC_USERNAME", raising=False)
+        monkeypatch.delenv("EUMDAC_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        with patch.dict("sys.modules", {"eumdac": self._fake_eumdac_module()}):
+            with pytest.raises(RuntimeError, match="sar-validate --set-credential eumdac"):
+                authenticate_eumdac()
+
+
+# ---------------------------------------------------------------------------
 # Tests for authenticate_osi_saf_ftp()
 # ---------------------------------------------------------------------------
 
 class TestAuthenticateOsiSafFtp:
-    def test_explicit_args_win_over_everything(self, monkeypatch, tmp_path):
+    def test_explicit_args_win_over_everything(self, monkeypatch, tmp_path, fake_keyring):
         monkeypatch.setenv("OSI_SAF_FTP_USERNAME", "env_user")
         monkeypatch.setenv("OSI_SAF_FTP_PASSWORD", "env_pass")
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -293,7 +427,7 @@ class TestAuthenticateOsiSafFtp:
         username, password = authenticate_osi_saf_ftp("explicit_user", "explicit_pass")
         assert (username, password) == ("explicit_user", "explicit_pass")
 
-    def test_env_vars_used_when_args_absent(self, monkeypatch, tmp_path):
+    def test_env_vars_used_when_args_absent(self, monkeypatch, tmp_path, fake_keyring):
         monkeypatch.setenv("OSI_SAF_FTP_USERNAME", "env_user")
         monkeypatch.setenv("OSI_SAF_FTP_PASSWORD", "env_pass")
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -301,7 +435,19 @@ class TestAuthenticateOsiSafFtp:
         username, password = authenticate_osi_saf_ftp()
         assert (username, password) == ("env_user", "env_pass")
 
-    def test_falls_back_to_credentials_file(self, monkeypatch, tmp_path):
+    def test_uses_keyring_when_no_args_or_env(self, monkeypatch, tmp_path, fake_keyring):
+        monkeypatch.delenv("OSI_SAF_FTP_USERNAME", raising=False)
+        monkeypatch.delenv("OSI_SAF_FTP_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        fake_keyring[("sar-validation-osi-saf", "username")] = "kr_user"
+        fake_keyring[("sar-validation-osi-saf", "password")] = "kr_pass"
+
+        username, password = authenticate_osi_saf_ftp()
+        assert (username, password) == ("kr_user", "kr_pass")
+
+    def test_falls_back_to_legacy_file_and_migrates_to_keyring(
+        self, monkeypatch, tmp_path, fake_keyring
+    ):
         import json
 
         monkeypatch.delenv("OSI_SAF_FTP_USERNAME", raising=False)
@@ -312,13 +458,33 @@ class TestAuthenticateOsiSafFtp:
 
         username, password = authenticate_osi_saf_ftp()
         assert (username, password) == ("file_user", "file_pass")
+        assert fake_keyring[("sar-validation-osi-saf", "username")] == "file_user"
+        assert fake_keyring[("sar-validation-osi-saf", "password")] == "file_pass"
 
-    def test_raises_runtime_error_when_nothing_resolves(self, monkeypatch, tmp_path):
+    def test_no_keyring_backend_falls_through_to_runtime_error(
+        self, monkeypatch, tmp_path, broken_keyring
+    ):
         monkeypatch.delenv("OSI_SAF_FTP_USERNAME", raising=False)
         monkeypatch.delenv("OSI_SAF_FTP_PASSWORD", raising=False)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         with pytest.raises(RuntimeError, match="OSI-SAF FTP credentials not found"):
+            authenticate_osi_saf_ftp()
+
+    def test_raises_runtime_error_when_nothing_resolves(self, monkeypatch, tmp_path, fake_keyring):
+        monkeypatch.delenv("OSI_SAF_FTP_USERNAME", raising=False)
+        monkeypatch.delenv("OSI_SAF_FTP_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        with pytest.raises(RuntimeError, match="OSI-SAF FTP credentials not found"):
+            authenticate_osi_saf_ftp()
+
+    def test_runtime_error_mentions_set_credential(self, monkeypatch, tmp_path, fake_keyring):
+        monkeypatch.delenv("OSI_SAF_FTP_USERNAME", raising=False)
+        monkeypatch.delenv("OSI_SAF_FTP_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        with pytest.raises(RuntimeError, match="sar-validate --set-credential osi_saf"):
             authenticate_osi_saf_ftp()
 
 
@@ -328,7 +494,7 @@ class TestAuthenticateOsiSafFtp:
 # ---------------------------------------------------------------------------
 
 class TestAuthenticateGportal:
-    def test_explicit_args_take_priority(self, monkeypatch, tmp_path):
+    def test_explicit_args_take_priority(self, monkeypatch, tmp_path, fake_keyring):
         from sar_validation.downloaders.base import authenticate_gportal
 
         monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
@@ -338,7 +504,7 @@ class TestAuthenticateGportal:
         user, pwd = authenticate_gportal(username="alice", password="secret")
         assert (user, pwd) == ("alice", "secret")
 
-    def test_env_vars_used_when_no_explicit_args(self, monkeypatch, tmp_path):
+    def test_env_vars_used_when_no_explicit_args(self, monkeypatch, tmp_path, fake_keyring):
         from sar_validation.downloaders.base import authenticate_gportal
 
         monkeypatch.setenv("GPORTAL_USERNAME", "bob")
@@ -348,7 +514,21 @@ class TestAuthenticateGportal:
         user, pwd = authenticate_gportal()
         assert (user, pwd) == ("bob", "hunter2")
 
-    def test_falls_back_to_credentials_file(self, monkeypatch, tmp_path):
+    def test_uses_keyring_when_no_args_or_env(self, monkeypatch, tmp_path, fake_keyring):
+        from sar_validation.downloaders.base import authenticate_gportal
+
+        monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
+        monkeypatch.delenv("GPORTAL_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        fake_keyring[("sar-validation-gportal", "username")] = "kr_user"
+        fake_keyring[("sar-validation-gportal", "password")] = "kr_pass"
+
+        user, pwd = authenticate_gportal()
+        assert (user, pwd) == ("kr_user", "kr_pass")
+
+    def test_falls_back_to_legacy_file_and_migrates_to_keyring(
+        self, monkeypatch, tmp_path, fake_keyring
+    ):
         import json
 
         from sar_validation.downloaders.base import authenticate_gportal
@@ -361,8 +541,27 @@ class TestAuthenticateGportal:
 
         user, pwd = authenticate_gportal()
         assert (user, pwd) == ("file_user", "file_pass")
+        assert fake_keyring[("sar-validation-gportal", "username")] == "file_user"
+        assert fake_keyring[("sar-validation-gportal", "password")] == "file_pass"
 
-    def test_prompts_interactively_when_nothing_else_resolves(self, monkeypatch, tmp_path):
+    def test_no_keyring_backend_falls_through_to_prompt(
+        self, monkeypatch, tmp_path, broken_keyring
+    ):
+        """No keyring backend + no legacy file must behave exactly like
+        "nothing resolved" -- i.e. still reach the interactive prompt for
+        G-Portal, not raise."""
+        from sar_validation.downloaders.base import authenticate_gportal
+
+        monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
+        monkeypatch.delenv("GPORTAL_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr("builtins.input", lambda prompt: "prompted_user")
+        monkeypatch.setattr("getpass.getpass", lambda prompt: "prompted_pass")
+
+        user, pwd = authenticate_gportal()
+        assert (user, pwd) == ("prompted_user", "prompted_pass")
+
+    def test_prompts_interactively_when_nothing_else_resolves(self, monkeypatch, tmp_path, fake_keyring):
         from sar_validation.downloaders.base import authenticate_gportal
 
         monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
@@ -415,7 +614,7 @@ class TestAuthenticateGportal:
 # ---------------------------------------------------------------------------
 
 class TestAuthenticateSmosFtp:
-    def test_explicit_args_take_priority(self, monkeypatch, tmp_path):
+    def test_explicit_args_take_priority(self, monkeypatch, tmp_path, fake_keyring):
         from sar_validation.downloaders.base import authenticate_smos_ftp
 
         monkeypatch.delenv("SMOS_FTP_USERNAME", raising=False)
@@ -425,7 +624,7 @@ class TestAuthenticateSmosFtp:
         user, pwd = authenticate_smos_ftp(username="alice", password="secret")
         assert (user, pwd) == ("alice", "secret")
 
-    def test_env_vars_used_when_no_explicit_args(self, monkeypatch, tmp_path):
+    def test_env_vars_used_when_no_explicit_args(self, monkeypatch, tmp_path, fake_keyring):
         from sar_validation.downloaders.base import authenticate_smos_ftp
 
         monkeypatch.setenv("SMOS_FTP_USERNAME", "bob")
@@ -435,7 +634,21 @@ class TestAuthenticateSmosFtp:
         user, pwd = authenticate_smos_ftp()
         assert (user, pwd) == ("bob", "hunter2")
 
-    def test_falls_back_to_credentials_file(self, monkeypatch, tmp_path):
+    def test_uses_keyring_when_no_args_or_env(self, monkeypatch, tmp_path, fake_keyring):
+        from sar_validation.downloaders.base import authenticate_smos_ftp
+
+        monkeypatch.delenv("SMOS_FTP_USERNAME", raising=False)
+        monkeypatch.delenv("SMOS_FTP_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        fake_keyring[("sar-validation-smos", "username")] = "kr_user"
+        fake_keyring[("sar-validation-smos", "password")] = "kr_pass"
+
+        user, pwd = authenticate_smos_ftp()
+        assert (user, pwd) == ("kr_user", "kr_pass")
+
+    def test_falls_back_to_legacy_file_and_migrates_to_keyring(
+        self, monkeypatch, tmp_path, fake_keyring
+    ):
         import json
 
         from sar_validation.downloaders.base import authenticate_smos_ftp
@@ -448,8 +661,12 @@ class TestAuthenticateSmosFtp:
 
         user, pwd = authenticate_smos_ftp()
         assert (user, pwd) == ("file_user", "file_pass")
+        assert fake_keyring[("sar-validation-smos", "username")] == "file_user"
+        assert fake_keyring[("sar-validation-smos", "password")] == "file_pass"
 
-    def test_raises_when_nothing_configured(self, monkeypatch, tmp_path):
+    def test_no_keyring_backend_falls_through_to_runtime_error(
+        self, monkeypatch, tmp_path, broken_keyring
+    ):
         from sar_validation.downloaders.base import authenticate_smos_ftp
 
         monkeypatch.delenv("SMOS_FTP_USERNAME", raising=False)
@@ -458,6 +675,64 @@ class TestAuthenticateSmosFtp:
 
         with pytest.raises(RuntimeError, match="SMOS"):
             authenticate_smos_ftp()
+
+    def test_raises_when_nothing_configured(self, monkeypatch, tmp_path, fake_keyring):
+        from sar_validation.downloaders.base import authenticate_smos_ftp
+
+        monkeypatch.delenv("SMOS_FTP_USERNAME", raising=False)
+        monkeypatch.delenv("SMOS_FTP_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        with pytest.raises(RuntimeError, match="SMOS"):
+            authenticate_smos_ftp()
+
+    def test_runtime_error_mentions_set_credential(self, monkeypatch, tmp_path, fake_keyring):
+        from sar_validation.downloaders.base import authenticate_smos_ftp
+
+        monkeypatch.delenv("SMOS_FTP_USERNAME", raising=False)
+        monkeypatch.delenv("SMOS_FTP_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        with pytest.raises(RuntimeError, match="sar-validate --set-credential smos"):
+            authenticate_smos_ftp()
+
+
+# ---------------------------------------------------------------------------
+# Tests for set_credential()
+# ---------------------------------------------------------------------------
+
+class TestSetCredential:
+    def test_stores_username_and_password_in_keyring(self, fake_keyring):
+        set_credential("eumdac", "alice", "secret")
+        assert fake_keyring[("sar-validation-eumdac", "username")] == "alice"
+        assert fake_keyring[("sar-validation-eumdac", "password")] == "secret"
+
+    @pytest.mark.parametrize(
+        "name,service",
+        [
+            ("eumdac", "sar-validation-eumdac"),
+            ("osi_saf", "sar-validation-osi-saf"),
+            ("gportal", "sar-validation-gportal"),
+            ("smos", "sar-validation-smos"),
+        ],
+    )
+    def test_uses_the_expected_service_name_per_credential_set(
+        self, fake_keyring, name, service
+    ):
+        set_credential(name, "user", "pass")
+        assert fake_keyring[(service, "username")] == "user"
+        assert fake_keyring[(service, "password")] == "pass"
+
+    def test_unknown_name_raises_value_error(self, fake_keyring):
+        with pytest.raises(ValueError, match="Unknown credential"):
+            set_credential("not_a_real_service", "user", "pass")
+
+    def test_propagates_keyring_errors_to_the_caller(self, broken_keyring):
+        """--set-credential is an explicit user action -- if the OS keyring
+        backend is unavailable, the CLI needs a real exception to report,
+        not a silent no-op."""
+        with pytest.raises(keyring.errors.KeyringError):
+            set_credential("eumdac", "user", "pass")
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ dependencies = [
     "netCDF4",         # xarray netcdf4 engine — datatree read/write in cli.py
     "pyyaml",
     "requests",
+    "keyring",         # OS keyring credential storage — authenticate_* helpers in downloaders/base.py
     "copernicusmarine>=2.0",
     "rioxarray",       # GeoTIFF ingestion — Sentinel-1 CLMS Surface Soil Moisture
     "rasterio",        # rioxarray's raster I/O backend
