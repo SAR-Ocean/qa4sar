@@ -293,6 +293,59 @@ class TestExecuteRecipePassesForceDownloadToOrchestrator:
         assert mock_cls.call_args.kwargs["force_download"] is True
 
 
+class TestExecuteRecipeSkipsStatsWhenAlreadyComputed:
+    """Step 4 (compute statistics) should be resumable just like steps 1-3:
+    if validation_statistics_*.nc files for every pair already exist on
+    disk, --stats/--plot must not recompute them from scratch."""
+
+    def _write_recipe_with_collocation(self, tmp_path):
+        import json
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "download_metadata.json").write_text(json.dumps({"errors": []}))
+
+        collocation_ds = xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", [7.0, 8.0]),
+            "val_WSPD":         ("collocation", [7.2, 7.9]),
+        })
+        collocation_ds.to_netcdf(run_dir / "collocation_results.nc")
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-stats-resume", variable="wind", output_dir=str(run_dir),
+        )).to_yaml(recipe_path)
+        return recipe_path, run_dir
+
+    def test_does_not_recompute_stats_when_files_already_exist(self, tmp_path, capsys):
+        from unittest.mock import patch
+
+        recipe_path, run_dir = self._write_recipe_with_collocation(tmp_path)
+
+        stats_ds = xr.Dataset({"bias": ("source", [0.1])}, coords={"source": ["scatterometer"]})
+        stats_ds.to_netcdf(run_dir / "validation_statistics_owiWindSpeed_vs_WSPD.nc")
+
+        with patch("sar_validation.cli._compute_stats") as mock_compute_stats:
+            cli._execute_recipe(str(recipe_path), stats=True)
+
+        mock_compute_stats.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Step 4 skipped" in out
+
+    def test_still_computes_stats_when_files_missing(self, tmp_path):
+        from unittest.mock import patch
+
+        recipe_path, run_dir = self._write_recipe_with_collocation(tmp_path)
+        # No pre-existing validation_statistics_*.nc file this time.
+
+        with patch("sar_validation.cli._compute_stats") as mock_compute_stats:
+            cli._execute_recipe(str(recipe_path), stats=True)
+
+        mock_compute_stats.assert_called_once()
+
+
 class TestBuildSoilMoistureConfig:
     def test_recipe_shape(self):
         from sar_validation.cli import _build_soil_moisture_config

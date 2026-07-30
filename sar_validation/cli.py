@@ -677,7 +677,10 @@ def _execute_recipe(
                 print(f"Step 3 skipped — collocation_results{suffix}.nc already exists")
 
         if stats or plot:
-            _compute_stats(recipe, orchestrator.base_dir, filename_suffix=suffix)
+            if _stats_already_computed(recipe, orchestrator.base_dir, filename_suffix=suffix):
+                print("Step 4 skipped — validation_statistics files already exist")
+            else:
+                _compute_stats(recipe, orchestrator.base_dir, filename_suffix=suffix)
 
         if plot:
             _generate_plots(
@@ -811,6 +814,51 @@ def _compute_stats(recipe, base_dir: Path, filename_suffix: str = "") -> None:
         native_results = run_statistics_native_units(collocation_ds, recipe, base_dir, filename_suffix=filename_suffix)
         for key in native_results:
             print(f"  Native-units statistics saved: validation_statistics_{key}_native_units{filename_suffix}.nc/.csv")
+
+
+def _stats_already_computed(recipe, base_dir: Path, filename_suffix: str = "") -> bool:
+    """Return True if every ``validation_statistics_*<suffix>.nc`` file Step 4
+    would produce already exists on disk, so ``_execute_recipe`` can skip
+    recomputation the same way Steps 1-3 skip their own already-done work.
+
+    Opens ``collocation_results<suffix>.nc`` (Step 3's output) and applies
+    the same dataset-aware ``filter_variable_pairs`` selection ``run_statistics``
+    uses to decide *which* files it writes — reusing ``_load_precomputed_stats``
+    for the lookup so the pair-matching logic isn't duplicated. Also requires
+    the ``_native_units`` companion file for soil_moisture recipes, since
+    ``_compute_stats`` writes those too.
+
+    Returns False (i.e. "recompute") whenever the collocation results are
+    missing, no variable pairs apply, or anything is still absent — a safe
+    default that falls through to the normal Step 4 behaviour.
+    """
+    import xarray as xr
+
+    from .core._variable_map import filter_variable_pairs
+
+    coll_path = base_dir / f"collocation_results{filename_suffix}.nc"
+    if not coll_path.exists():
+        return False
+
+    collocation_ds = xr.open_dataset(str(coll_path))
+    try:
+        pairs = filter_variable_pairs(recipe, collocation_ds)
+    except KeyError:
+        return False
+    if not pairs:
+        return False
+
+    precomputed = _load_precomputed_stats(recipe, collocation_ds, base_dir, filename_suffix=filename_suffix)
+    if set(precomputed) != {f"{sar_var}_vs_{val_var}" for sar_var, val_var in pairs}:
+        return False
+
+    if recipe.config.variable == "soil_moisture":
+        for sar_var, val_var in pairs:
+            native_path = base_dir / f"validation_statistics_{sar_var}_vs_{val_var}_native_units{filename_suffix}.nc"
+            if not native_path.exists():
+                return False
+
+    return True
 
 
 def _load_precomputed_stats(recipe, collocation_ds, base_dir: Path, filename_suffix: str = "") -> dict:
