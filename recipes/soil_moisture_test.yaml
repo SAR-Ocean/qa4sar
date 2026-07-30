@@ -1,0 +1,41 @@
+name: soil_moisture_test
+description: 'Validate Sentinel-1 CLMS Surface Soil Moisture (1 km, Europe,
+
+  daily) against ISMN in-situ stations.'
+version: '1.0'
+variable: soil_moisture
+variable_specs:
+  components:
+  - soil_moisture
+geographic_bounds:
+  min_lon: -10.0
+  max_lon: 30.0
+  min_lat: 35.0
+  max_lat: 60.0
+temporal_bounds:
+  start: '2024-01-01'
+  end: '2024-01-05'
+sar_data:
+  satellite: Sentinel-1
+  product_level: L3_SSM
+  swath_mode:
+  - IW
+  - EW
+  max_downloads: null
+validation_sources:
+- source_type: ismn
+  min_depth: 0.0
+  max_depth: 0.05
+  download_kwargs: {'ismn_archive_path': '/home/chvan0015/git/sar-l2-validation-toolbox/.claude/worktrees/soil-moisture-validation/data/2024-01-01-000000-2024-01-05-000000_-10.00_30.00_35.00_60.00/ISMN/Data_separate_files_20240101_20240105_13757_1vqs_20260722.zip'}
+  collocation_kwargs: {}
+collocation:
+  point_vs_layer:
+    time_tolerance_minutes: 720
+    spatial_tolerance_km: 2.0
+    interpolation_method: nearest
+    aggregation_window_km: 1.0
+    validation_temporal_averaging_minutes: 30
+    distance_weighting: equal
+    gaussian_sigma_km: 2.0
+  sar_footprint_radius_km: 14.0
+output_dir: null

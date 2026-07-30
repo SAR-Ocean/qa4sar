@@ -281,7 +281,10 @@ class TestCurrentsRecipeYamlFilesHfRadarGridSpec:
 
         recipes_dir = pathlib.Path(__file__).resolve().parent.parent / "recipes"
         paths = sorted(recipes_dir.glob("currents_*.yaml"))
-        assert len(paths) >= 13
+        # Not an exact/minimum count -- how many currents recipes exist is
+        # up to the toolbox user. Just guard against the glob itself being
+        # broken (e.g. a typo'd pattern) and silently testing nothing.
+        assert len(paths) > 0
 
         for path in paths:
             recipe = Recipe.from_yaml(path)

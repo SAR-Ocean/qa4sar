@@ -1,0 +1,98 @@
+name: wind_antimeridian
+description: 'Validate Sentinel-1 IW/EW mode wind speed and direction
+
+  against moorings, buoys, ASCAT scatterometer, 1 Hz altimeter,
+
+  and RSS radiometer (AMSR2) ocean winds.'
+version: '1.0'
+variable: wind
+variable_specs:
+  components:
+  - speed
+  - direction
+geographic_bounds:
+  min_lon: 120.0
+  max_lon: -170.0
+  min_lat: -15.0
+  max_lat: 15.0
+temporal_bounds:
+  start: '2026-07-18 19:00:00'
+  end: '2026-07-18 22:00:00'
+sar_data:
+  satellite: Sentinel-1
+  product_level: L2_OCN
+  swath_mode:
+  - IW
+  - EW
+  max_downloads: null
+validation_sources:
+- source_type: mooring
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: buoy
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: ferrybox
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: drifter
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: tidal_gauge
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: scatterometer
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: altimeter
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: radiometer
+  download_kwargs: {}
+  collocation_kwargs: {}
+collocation:
+  point_vs_layer:
+    time_tolerance_minutes: 30
+    spatial_tolerance_km: 25
+    interpolation_method: nearest
+    aggregation_window_km: 5.0
+    validation_temporal_averaging_minutes: 30
+    distance_weighting: gaussian
+    gaussian_sigma_km: 2.0
+  sar_footprint_radius_km: 14.0
+  layer_vs_layer:
+    layer_type_specs:
+      scatterometer:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 12.5
+        distance_weighting: equal
+      altimeter_1hz:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 7.0
+        distance_weighting: equal
+      radiometer_amsr2:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      radiometer_gmi:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      radiometer_ssmis_f16:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      radiometer_ssmis_f17:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      radiometer_ssmis_f18:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      radiometer_windsat:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+    method: cell-averaging
+output_dir: null
