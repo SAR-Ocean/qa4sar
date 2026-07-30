@@ -46,6 +46,9 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# outdated documentation
+docs/older_docs/    
+
 # Superpowers documentation
 superpowers/
 AGENTS.md
