@@ -3578,6 +3578,120 @@ class TestPlotCollocationDiagnosticsSoilMoistureTransparency:
         assert path is not None
 
 
+class TestPlotCollocationDiagnosticsDensePointSubsampling:
+    """Regression test: the Tier 3/4 matched-point subsampling cap
+    (_subsample_matched_points, max 1000 points) was added for soil
+    moisture's routinely-dense ASCAT/SMAP/SMOS footprints but was applied
+    unconditionally to every variable, silently dropping matched
+    radiometer/scatterometer points for wind recipes down to a random
+    1000-point subsample even though the legend count showed the true
+    total. It must only kick in for soil_moisture."""
+
+    @staticmethod
+    def _dense_radiometer_scene(n, value_var="WSPD", sar_var="owiWindSpeed"):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        y, x = 4, 5
+        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+        sar_ds = xr.Dataset(
+            {sar_var: (("y", "x"), np.full((y, x), 8.0))},
+            coords={
+                "lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                "time": pd.Timestamp("2026-07-10T19:00:00"),
+            },
+        )
+        rng = np.random.default_rng(0)
+        radiometer_ds = xr.Dataset(
+            {value_var: ("point", rng.uniform(5.0, 12.0, n))},
+            coords={
+                "lon": ("point", rng.uniform(-9.9, -8.1, n)),
+                "lat": ("point", rng.uniform(50.1, 51.9, n)),
+                "time": ("point", pd.date_range("2026-07-10T19:05", periods=n, freq="1s")),
+            },
+            attrs={"data_type": "radiometer"},
+        )
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds, "validation/radiometer": radiometer_ds,
+        })
+        collocation_ds = xr.Dataset({
+            f"sar_{sar_var}":     ("collocation", rng.uniform(5.0, 12.0, n)),
+            f"val_{value_var}":   ("collocation", radiometer_ds[value_var].values),
+            "val_source":       ("collocation", np.array(["radiometer"] * n)),
+            "sar_scene_name":   ("collocation", np.array(["sceneA"] * n)),
+            "val_lon":          ("collocation", radiometer_ds["lon"].values),
+            "val_lat":          ("collocation", radiometer_ds["lat"].values),
+            "val_id":           ("collocation", [f"r{i}" for i in range(n)]),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-10T19:05", periods=n, freq="1s")),
+        )
+        return datatree, collocation_ds
+
+    def test_wind_recipe_plots_every_matched_radiometer_point(self, tmp_path, monkeypatch):
+        import matplotlib.axes
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        n = 1500
+        datatree, collocation_ds = self._dense_radiometer_scene(n)
+        recipe = Recipe(config=RecipeConfig(
+            name="test_wind_dense", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, -8.0, 50.0, 52.0),
+        ))
+
+        recorded = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded.append((args, kwargs))
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        out_path = plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
+        plt.close("all")
+
+        assert out_path is not None
+        layer_calls = [args for args, kwargs in recorded if kwargs.get("zorder") == 5]
+        assert layer_calls
+        plotted = sum(len(np.atleast_1d(args[0])) for args in layer_calls)
+        assert plotted == n, f"expected all {n} matched wind points plotted, got {plotted}"
+
+    def test_soil_moisture_recipe_still_subsamples_dense_matches(self, tmp_path, monkeypatch):
+        import matplotlib.axes
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        n = 1500
+        datatree, collocation_ds = self._dense_radiometer_scene(
+            n, value_var="SOIL_MOISTURE", sar_var="sarSSM",
+        )
+        recipe = Recipe(config=RecipeConfig(
+            name="test_soil_moisture_dense", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, -8.0, 50.0, 52.0),
+        ))
+
+        recorded = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded.append((args, kwargs))
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        out_path = plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
+        plt.close("all")
+
+        assert out_path is not None
+        layer_calls = [args for args, kwargs in recorded if kwargs.get("zorder") == 5]
+        assert layer_calls
+        plotted = sum(len(np.atleast_1d(args[0])) for args in layer_calls)
+        assert plotted <= 1000, f"expected soil_moisture to stay subsampled to <=1000, got {plotted}"
+
+
 class TestPlotCollocationDiagnosticsTicks:
     def test_overview_plot_gets_degree_formatted_ticks(
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path

@@ -1363,6 +1363,60 @@ class TestInSituDownloaderAntimeridian:
         assert paths[0].name == fname
 
 
+class TestInSituDownloaderDatasetPartFallbackErrorMessage:
+    """When a requested date predates the CMEMS in-situ dataset's coverage,
+    both the auto-selected dataset_part and its fallback fail. Raising the
+    fallback's bare exception is misleading: for an old date (e.g. 2019),
+    the initial attempt is 'monthly' (whose own error correctly reports
+    that part's ~2020-onwards coverage), then the retry against 'latest'
+    fails too, but with 'latest's own ~30-day rolling-window bounds --
+    those are the only bounds a caller ever sees if just e2 is raised,
+    making the dataset look far more limited than it actually is. The
+    combined message must surface both parts' own reported bounds."""
+
+    def test_error_includes_both_dataset_parts_coverage_messages(self, tmp_path):
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        dl = InSituDownloader(output_dir=tmp_path, dry_run=False, force_download=True)
+        fake_module = MagicMock()
+
+        def fake_subset(**kwargs):
+            part = kwargs["dataset_part"]
+            if part == "monthly":
+                raise ValueError(
+                    "Some of your subset selection [2019-02-01T16:30:00, "
+                    "2019-02-01T19:30:00] for the time dimension exceed the "
+                    "dataset coordinates [2020-01-01T00:00:00, 2026-07-01T02:45:00]"
+                )
+            raise ValueError(
+                "Some of your subset selection [2019-02-01T16:30:00, "
+                "2019-02-01T19:30:00] for the time dimension exceed the "
+                "dataset coordinates [2026-06-30T00:00:00, 2026-07-30T08:27:00]"
+            )
+
+        fake_module.subset.side_effect = fake_subset
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            with pytest.raises(RuntimeError) as exc_info:
+                dl.download(
+                    min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+                    start="2019-02-01T16:30:00", end="2019-02-01T19:30:00",
+                )
+
+        assert fake_module.subset.call_count == 2
+        msg = str(exc_info.value)
+        assert "monthly" in msg
+        assert "latest" in msg
+        assert "2020-01-01T00:00:00" in msg, (
+            f"expected the monthly part's own reported lower bound in the "
+            f"combined error, got: {msg}"
+        )
+        assert "2026-06-30T00:00:00" in msg, (
+            f"expected the latest part's own reported lower bound in the "
+            f"combined error, got: {msg}"
+        )
+
+
 class TestInSituDownloaderForceDownload:
     def test_skips_download_when_file_already_exists(self, tmp_path):
         from unittest.mock import patch

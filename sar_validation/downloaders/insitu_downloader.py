@@ -265,8 +265,18 @@ class InSituDownloader:
                     )
                     resolved_part = alt_dataset_part
                 except Exception as e2:
-                    # Both failed, raise the second error
-                    raise e2
+                    # Both dataset_parts failed. Raising e2 alone is
+                    # misleading: it only carries whichever part's coverage
+                    # was tried *second*, e.g. the "latest" part's rolling
+                    # ~30-day window, which makes the dataset look far more
+                    # limited than it is. Surface both parts' own
+                    # (dynamically reported) coverage messages together.
+                    raise RuntimeError(
+                        f"In-situ data unavailable for [{start_dt}, {end_dt}] in either "
+                        f"CMEMS dataset_part of {DATASET_ID}:\n"
+                        f"  '{resolved_part}': {error_msg}\n"
+                        f"  '{alt_dataset_part}': {e2}"
+                    ) from e2
             else:
                 # Not a data availability error, re-raise original
                 raise

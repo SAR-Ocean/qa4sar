@@ -1979,7 +1979,7 @@ def _downsampled_valid_pixel_coords(
 
 
 def _subsample_matched_points(
-    lon: np.ndarray, lat: np.ndarray, max_points: int = 1000, seed: int = 0,
+    lon: np.ndarray, lat: np.ndarray, max_points: Optional[int] = 1000, seed: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Randomly subsample a matched-point tier to at most *max_points* points
@@ -1991,8 +1991,11 @@ def _subsample_matched_points(
     thinning the plotted points (while callers keep using the *original*
     array length for legend counts) keeps individual markers distinguishable
     without misrepresenting how many matches actually occurred. Returns
-    *lon*/*lat* unchanged when already at or below *max_points*.
+    *lon*/*lat* unchanged when already at or below *max_points*, or when
+    *max_points* is None (subsampling disabled for this variable).
     """
+    if max_points is None:
+        return lon, lat
     n = len(lon)
     if n <= max_points:
         return lon, lat
@@ -2000,11 +2003,15 @@ def _subsample_matched_points(
     return lon[idx], lat[idx]
 
 
-def _matched_point_alpha(base_alpha: float, n_points: int, max_points: int = 1000) -> float:
+def _matched_point_alpha(
+    base_alpha: float, n_points: int, max_points: Optional[int] = 1000,
+) -> float:
     """Cap alpha lower for a matched-point tier once it's dense enough to be
     subsampled (see :func:`_subsample_matched_points`) — the overlapping
     points that remain after thinning still need enough transparency to
-    stay distinguishable from each other."""
+    stay distinguishable from each other. No-op when *max_points* is None."""
+    if max_points is None:
+        return base_alpha
     return min(base_alpha, 0.35) if n_points > max_points else base_alpha
 
 def plot_collocation_diagnostics(
@@ -2141,6 +2148,11 @@ def _plot_collocation_diagnostics_impl(
     except ImportError:
         logger.debug("cartopy not installed — collocation_diagnostics plot unavailable.")
         return None
+
+    # Dense matched-point subsampling (see _subsample_matched_points) only
+    # applies to soil_moisture's typically saturated ASCAT/SMAP/SMOS point
+    # clouds; every other variable plots every matched point it has.
+    density_subsample_max = 1000 if recipe.config.variable == "soil_moisture" else None
 
     # ── Extract SAR scene bounds ────────────────────────────────────────
     sar_node = datatree.get("sar")
@@ -2578,11 +2590,11 @@ def _plot_collocation_diagnostics_impl(
         if n_matched == 0:
             continue
         color, marker = source_style_map.get(str(cat["label"]), ("#2ca02c", "o"))
-        plot_lon, plot_lat = _subsample_matched_points(m_lon, m_lat)
+        plot_lon, plot_lat = _subsample_matched_points(m_lon, m_lat, max_points=density_subsample_max)
         ax.scatter(
             plot_lon, plot_lat,
             s=matched_marker_size, c=color, marker=marker,
-            alpha=_matched_point_alpha(matched_layer_alpha, n_matched),
+            alpha=_matched_point_alpha(matched_layer_alpha, n_matched, max_points=density_subsample_max),
             edgecolors=matched_edgecolors, linewidths=matched_linewidths,
             transform=transform, zorder=5, label=f"{cat['label']} matched ({n_matched})",
         )
@@ -2612,11 +2624,13 @@ def _plot_collocation_diagnostics_impl(
                     mask = m_src == source
                     count = int(np.sum(mask))
                     color, marker = source_style_map.get(str(source), ("#ff7f0e", "o"))
-                    plot_lon, plot_lat = _subsample_matched_points(m_lon[mask], m_lat[mask])
+                    plot_lon, plot_lat = _subsample_matched_points(
+                        m_lon[mask], m_lat[mask], max_points=density_subsample_max
+                    )
                     ax.scatter(
                         plot_lon, plot_lat,
                         s=matched_marker_size, c=color, marker=marker,
-                        alpha=_matched_point_alpha(1.0, count),
+                        alpha=_matched_point_alpha(1.0, count, max_points=density_subsample_max),
                         edgecolors=matched_edgecolors, linewidths=matched_linewidths,
                         transform=transform, zorder=6,
                         label=f"In-situ matched: {source} ({count})",
@@ -2624,11 +2638,11 @@ def _plot_collocation_diagnostics_impl(
             else:
                 # Fallback if no source info available
                 n_matched = len(m_lon)
-                plot_lon, plot_lat = _subsample_matched_points(m_lon, m_lat)
+                plot_lon, plot_lat = _subsample_matched_points(m_lon, m_lat, max_points=density_subsample_max)
                 ax.scatter(
                     plot_lon, plot_lat,
                     s=matched_marker_size, c="#ff7f0e", marker="o",
-                    alpha=_matched_point_alpha(1.0, n_matched),
+                    alpha=_matched_point_alpha(1.0, n_matched, max_points=density_subsample_max),
                     edgecolors=matched_edgecolors, linewidths=matched_linewidths,
                     transform=transform, zorder=6,
                     label=f"In-situ matched ({n_matched})",
