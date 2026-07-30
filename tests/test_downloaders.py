@@ -587,7 +587,7 @@ class TestAuthenticateGportal:
         authenticate_gportal()
         assert not (tmp_path / ".jaxa_gportal_credentials").exists()
 
-    def test_allow_prompt_false_raises_instead_of_prompting(self, monkeypatch, tmp_path):
+    def test_allow_prompt_false_raises_instead_of_prompting(self, monkeypatch, tmp_path, fake_keyring):
         """allow_prompt=False (used by the orchestrator's automatic G-Portal
         AMSR2 fallback) must raise RuntimeError instead of reaching the
         interactive input()/getpass.getpass() prompt when nothing resolves
