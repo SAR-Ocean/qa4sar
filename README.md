@@ -301,7 +301,7 @@ An existing `~/.esa_smos_credentials` file is migrated into the OS keyring
 automatically on first use (with a one-time console notice); you can
 delete the old file afterwards.
 
-Register at: https://smos.argans.co.uk
+Register at: https://eoiam-idp.eo.esa.int/ 
 
 The `smos_downloader` uses these credentials to download SMOS L3 soil moisture products
 from the ESA SMOS FTPS archive.

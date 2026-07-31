@@ -22,6 +22,9 @@ data/
 # Handy notebooks
 handy_notebooks/
 
+# Relevant previous code
+relevant_code_for_toolbox/
+
 # Created recipes
 #*.yaml
 #!recipes/currents_*.yaml
