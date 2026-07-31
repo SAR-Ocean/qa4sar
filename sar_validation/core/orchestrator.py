@@ -477,6 +477,7 @@ class DataOrchestrator:
             "hf_radar":      self._download_hf_radar,
             "hf_radar_noaa": self._download_noaa_hfradar,
             "hf_radar_historical": self._download_hf_radar_historical,
+            "hf_radar_us":   self._download_hf_radar_us,
             "adcp_historical": self._download_adcp_historical,
             "argo_historical": self._download_argo_historical,
             "drifter_historical": self._download_drifter_historical,
@@ -841,6 +842,46 @@ class DataOrchestrator:
             logger.error(msg)
             self.metadata["errors"].append(msg)
             self.metadata["downloads"]["hf_radar_historical"] = {"status": "failed", "error": msg}
+            return False
+
+    def _download_hf_radar_us(self, source) -> bool:
+        from ..downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+        from ..downloaders.noaa_hfradar_downloader import DEFAULT_RESOLUTION_KM
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, "hf_radar_grid")
+        # Resolution is an optional per-source override, forwarded via the
+        # established ValidationDataSource.download_kwargs channel. It only
+        # takes effect if the request resolves to the NOAA backend; ignored
+        # on the Copernicus fallback path.
+        resolution_km = int(source.download_kwargs.get("resolution_km", DEFAULT_RESOLUTION_KM))
+
+        try:
+            dl = HFRadarUSDownloader(
+                output_dir=self.base_dir,
+                dry_run=self.dry_run,
+                resolution_km=resolution_km,
+                force_download=self.force_download,
+            )
+            downloaded = dl.download(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=pad_start, end=pad_end,
+            ) or []
+            for subdir in ("hfr_noaa", "hf_radar", "hf_radar_historical"):
+                self._cleanup_if_empty(self.base_dir / subdir)
+            self.metadata["downloads"]["hf_radar_us"] = {
+                "status": "dry_run" if self.dry_run else "success",
+                "file_count": len(downloaded),
+                "backend": dl.resolved_backend,
+            }
+            return True
+        except Exception as exc:
+            msg = f"US HF-radar download failed: {exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"]["hf_radar_us"] = {"status": "failed", "error": msg}
             return False
 
     def _download_currents_historical(self, source, instrument: str) -> bool:

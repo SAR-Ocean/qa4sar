@@ -308,11 +308,6 @@ def _build_currents_config(limit: Optional[int] = None):
         validation_sources=[
             ValidationDataSource(source_type="hf_radar"),
             ValidationDataSource(source_type="hf_radar_historical"),
-            ValidationDataSource(
-                source_type="hf_radar_noaa",
-                min_depth=-2.0, max_depth=2.0,
-                download_kwargs={"resolution_km": 6},
-            ),
             ValidationDataSource(source_type="drifter"),
             ValidationDataSource(source_type="ferrybox"),
             ValidationDataSource(source_type="mooring"),

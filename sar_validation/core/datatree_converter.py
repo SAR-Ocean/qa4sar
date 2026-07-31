@@ -1528,15 +1528,18 @@ class DataTreeConverter:
         The regular grid is flattened to a ``point`` dimension (one point per
         cell per time) so it collocates through the ``layer_vs_layer`` path,
         exactly like the scatterometer converter. Ancillary uncertainty/QC
-        fields are *retained but not used* (design §3.7): NOAA's
-        ``DOPx``/``DOPy`` are combined into ``hfr_gdop``, its radial/site
-        counts are kept as ``hfr_n_radials``/``hfr_n_sites``; Copernicus's
-        ``GDOP`` is copied to ``hfr_gdop`` directly, ``EWCS``/``NSCS`` (the
-        per-cell eastward/northward current standard deviations) to
-        ``hfr_ewcs``/``hfr_nscs``, the overall ``QCflag`` to ``hfr_qc``, and
-        each per-parameter QC flag (``CSPD_QC``, ``DDNS_QC``, ``GDOP_QC``,
-        ``VART_QC``, ``POSITION_QC``) to its own ``hfr_qc_<param>`` field —
-        so the deferred correction/QC phase can filter on them later.
+        fields are retained for reference: NOAA's ``DOPx``/``DOPy`` are
+        combined into ``hfr_gdop``, its radial/site counts are kept as
+        ``hfr_n_radials``/``hfr_n_sites``; Copernicus's ``GDOP`` is copied to
+        ``hfr_gdop`` directly, ``EWCS``/``NSCS`` (the per-cell
+        eastward/northward current standard deviations) to
+        ``hfr_ewcs``/``hfr_nscs``, and each per-parameter QC flag
+        (``CSPD_QC``, ``DDNS_QC``, ``GDOP_QC``, ``VART_QC``,
+        ``POSITION_QC``) to its own ``hfr_qc_<param>`` field — these remain
+        retained but unused. The overall ``QCflag`` is copied to ``hfr_qc``
+        AND used to drop cells where it equals 4 ("bad"); NOAA's product has
+        no equivalent flag (it filters upstream before publishing), so this
+        has no effect on NOAA-sourced files.
 
         Returns
         -------
@@ -1626,11 +1629,13 @@ class DataTreeConverter:
                 "long_name": "northward current component std error", "units": "m s-1",
                 "comment": "Retained for a future HF-radar QC/uncertainty filter.",
             }
+        qc_flat = None
         if "QCflag" in raw:
-            data_vars["hfr_qc"] = ("point", _flat("QCflag"))
+            qc_flat = _flat("QCflag")
+            data_vars["hfr_qc"] = ("point", qc_flat)
             var_attrs["hfr_qc"] = {
                 "long_name": "HF-radar overall QC flag",
-                "comment": "Retained for a future HF-radar QC filter (design §3.7).",
+                "comment": "Cells where this equals 4 (\"bad\") are excluded below.",
             }
         # Per-parameter QC flags (Copernicus radar-total product): each one
         # is retained under its own field rather than folded into hfr_qc, so
@@ -1648,10 +1653,14 @@ class DataTreeConverter:
                     "comment": "Retained for a future HF-radar QC filter (design §3.7).",
                 }
 
-        # Drop points where both current components are NaN (masked land/gaps).
+        # Drop points where both current components are NaN (masked
+        # land/gaps), or where the overall QCflag marks the cell "bad" (4).
+        # Per-parameter QC flags (CSPD_QC etc.) remain retained but unused.
         valid = np.isfinite(ewct) | np.isfinite(nsct)
+        if qc_flat is not None:
+            valid &= qc_flat != 4
         if not np.any(valid):
-            logger.warning("from_hf_radar_grid: all cells NaN in %s.", nc_path.name)
+            logger.warning("from_hf_radar_grid: all cells NaN or QC-bad in %s.", nc_path.name)
             raw.close()
             return None
 

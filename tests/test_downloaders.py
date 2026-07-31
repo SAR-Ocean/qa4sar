@@ -2324,6 +2324,82 @@ class TestOrchestratorHFRadarNOAAWiring:
         assert kwargs["resolution_km"] == 1
 
 
+class TestOrchestratorHFRadarUSWiring:
+    def test_dispatch_source_registers_hf_radar_us_handler(self):
+        import inspect
+
+        from sar_validation.core.orchestrator import DataOrchestrator
+
+        src = inspect.getsource(DataOrchestrator._dispatch_source)
+        assert '"hf_radar_us"' in src
+        assert "_download_hf_radar_us" in src
+        assert hasattr(DataOrchestrator, "_download_hf_radar_us")
+
+    def test_download_hf_radar_us_dry_run_sets_metadata_and_makes_no_network_call(
+        self, tmp_path
+    ):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+
+        recipe = Recipe(RecipeConfig(
+            name="test-hf-radar-us",
+            variable="currents",
+            output_dir=str(tmp_path),
+            # US_WEST bbox, recent date -> resolves to NOAA internally.
+            geographic_bounds=GeographicBounds(-125.0, -119.0, 33.0, 38.0),
+            temporal_bounds=TemporalBounds(_RECENT_START, _RECENT_END),
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        source = ValidationDataSource(source_type="hf_radar_us")
+
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+        ) as m:
+            result = orchestrator._download_hf_radar_us(source)
+
+        assert result is True
+        assert orchestrator.metadata["downloads"]["hf_radar_us"]["status"] == "dry_run"
+        assert orchestrator.metadata["downloads"]["hf_radar_us"]["backend"] == "noaa"
+        m.assert_not_called()
+
+    def test_download_hf_radar_us_honours_resolution_km_override(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+
+        recipe = Recipe(RecipeConfig(
+            name="test-hf-radar-us-res",
+            variable="currents",
+            output_dir=str(tmp_path),
+            geographic_bounds=GeographicBounds(-125.0, -119.0, 33.0, 38.0),
+            temporal_bounds=TemporalBounds(_RECENT_START, _RECENT_END),
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        source = ValidationDataSource(
+            source_type="hf_radar_us",
+            download_kwargs={"resolution_km": 1},
+        )
+
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_noaa:
+            m_noaa.return_value.download.return_value = []
+            orchestrator._download_hf_radar_us(source)
+
+        assert m_noaa.call_args.kwargs["resolution_km"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Tests for DataOrchestrator depth resolution (optional min_depth/max_depth)
 # ---------------------------------------------------------------------------
@@ -3716,3 +3792,151 @@ class TestEarthdataSoilMoistureDownloader:
             temporal=("2026-07-01T00:00:00", "2026-07-02T00:00:00"),
         )
         fake_earthaccess.download.assert_not_called()
+
+# ---------------------------------------------------------------------------
+# HFRadarUSDownloader
+# ---------------------------------------------------------------------------
+
+class TestResolveHfRadarUsBackend:
+    def test_us_west_recent_date_resolves_to_noaa(self):
+        from sar_validation.downloaders.hf_radar_us_downloader import (
+            resolve_hf_radar_us_backend,
+        )
+
+        recent = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
+        assert resolve_hf_radar_us_backend(-125, -119, 33, 38, recent) == "noaa"
+
+    def test_us_west_old_date_resolves_to_copernicus(self):
+        from sar_validation.downloaders.hf_radar_us_downloader import (
+            resolve_hf_radar_us_backend,
+        )
+
+        old = (datetime.now(timezone.utc) - timedelta(days=200)).strftime("%Y-%m-%d")
+        assert resolve_hf_radar_us_backend(-125, -119, 33, 38, old) == "copernicus"
+
+    def test_non_us_bbox_resolves_to_copernicus_regardless_of_date(self):
+        from sar_validation.downloaders.hf_radar_us_downloader import (
+            resolve_hf_radar_us_backend,
+        )
+
+        recent = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
+        # German Bight -- not a NOAA-supported region (US West/East-Gulf only).
+        assert resolve_hf_radar_us_backend(2.0, 8.0, 53.0, 55.0, recent) == "copernicus"
+
+
+class TestHFRadarUSDownloaderDelegation:
+    def test_recent_us_west_delegates_to_noaa_only(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        recent = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
+        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
+
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_noaa, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_noaa.return_value.download.return_value = []
+            dl.download(-125, -119, 33, 38, recent, recent)
+
+        m_noaa.assert_called_once()
+        assert m_noaa.call_args.kwargs["output_dir"] == tmp_path / "hfr_noaa"
+        m_cop.assert_not_called()
+        m_cop_hist.assert_not_called()
+
+    def test_old_us_west_delegates_to_copernicus_only(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        old = (datetime.now(timezone.utc) - timedelta(days=200)).strftime("%Y-%m-%d")
+        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
+
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_noaa, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_cop.return_value.download.return_value = []
+            m_cop_hist.return_value.download.return_value = []
+            dl.download(-125, -119, 33, 38, old, old)
+
+        m_noaa.assert_not_called()
+        m_cop.assert_called_once()
+        assert m_cop.call_args.kwargs["output_dir"] == tmp_path / "hf_radar"
+        m_cop_hist.assert_called_once()
+        assert m_cop_hist.call_args.kwargs["output_dir"] == tmp_path / "hf_radar_historical"
+
+    def test_old_us_west_skips_nrt_when_historical_has_data(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        old = (datetime.now(timezone.utc) - timedelta(days=200)).strftime("%Y-%m-%d")
+        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
+
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_noaa, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_cop_hist.return_value.download.return_value = [
+                tmp_path / "hf_radar_historical" / "archive.nc"
+            ]
+            result = dl.download(-125, -119, 33, 38, old, old)
+
+        m_noaa.assert_not_called()
+        m_cop_hist.assert_called_once()
+        m_cop.assert_not_called()
+        assert result == [tmp_path / "hf_radar_historical" / "archive.nc"]
+
+    def test_resolved_backend_attribute_set_after_download(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        recent = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
+        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
+        assert dl.resolved_backend is None
+
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_noaa:
+            m_noaa.return_value.download.return_value = []
+            dl.download(-125, -119, 33, 38, recent, recent)
+
+        assert dl.resolved_backend == "noaa"
+
+    def test_warns_when_stale_other_backend_output_exists(self, tmp_path, caplog):
+        import logging as _logging
+
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        recent = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
+        stale_dir = tmp_path / "hf_radar"
+        stale_dir.mkdir(parents=True)
+        (stale_dir / "stale.nc").write_bytes(b"")
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
+
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_noaa, caplog.at_level(_logging.WARNING):
+            m_noaa.return_value.download.return_value = []
+            dl.download(-125, -119, 33, 38, recent, recent)
+
+        assert any("already contains cached" in rec.message for rec in caplog.records)
+
+    def test_resolution_km_forwarded_to_noaa_only(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        recent = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
+        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True, resolution_km=1)
+
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_noaa:
+            m_noaa.return_value.download.return_value = []
+            dl.download(-125, -119, 33, 38, recent, recent)
+
+        assert m_noaa.call_args.kwargs["resolution_km"] == 1

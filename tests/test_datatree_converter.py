@@ -2204,3 +2204,56 @@ class TestConvertDownloadedDataAscatSidecarFiles:
         assert str(nat_path) in str(fake_ascat_module.AscatL2File.call_args)
         assert not any("format unknown" in record.message for record in caplog.records)
         assert tree is not None
+
+
+class TestFromHfRadarGridQCFlagFilter:
+    def test_drops_qcflag_bad_cells(self, tmp_path):
+        times = pd.date_range("2026-06-01", periods=1, freq="1h")
+        lats = np.array([10.0, 11.0, 12.0, 13.0])
+        lons = np.array([20.0, 21.0])
+        ewct = np.array([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]])
+        nsct = np.array([[[0.1, 0.2], [0.3, 0.4], [0.5, 0.6], [0.7, 0.8]]])
+        # Flattened order is (time, lat, lon) row-major: [1,4,4,1,1,1,4,4]
+        qcflag = np.array([[[1.0, 4.0], [4.0, 1.0], [1.0, 1.0], [4.0, 4.0]]])
+        ds = xr.Dataset(
+            {
+                "EWCT": (("time", "latitude", "longitude"), ewct),
+                "NSCT": (("time", "latitude", "longitude"), nsct),
+                "QCflag": (("time", "latitude", "longitude"), qcflag),
+            },
+            coords={"time": times, "latitude": lats, "longitude": lons},
+        )
+        path = tmp_path / "cop_qc_test.nc"
+        ds.to_netcdf(path)
+
+        result = DataTreeConverter.from_hf_radar_grid(path, u_var="EWCT", v_var="NSCT")
+
+        assert result is not None
+        # 8 cells total; QCflag==4 marks 4 of them "bad" (indices 1,2,6,7 of
+        # the flattened [1,4,4,1,1,1,4,4] QCflag array) -- those must be
+        # dropped, leaving the 4 cells at indices 0,3,4,5 (EWCT 1,4,5,6).
+        assert result.sizes["point"] == 4
+        assert sorted(np.round(result["EWCT"].values, 1).tolist()) == [1.0, 4.0, 5.0, 6.0]
+        assert all(q != 4 for q in result["hfr_qc"].values)
+
+    def test_noaa_style_file_without_qcflag_is_unaffected(self, tmp_path):
+        times = pd.date_range("2026-06-01", periods=1, freq="1h")
+        lats = np.array([10.0, 11.0])
+        lons = np.array([20.0, 21.0])
+        water_u = np.array([[[1.0, 2.0], [3.0, np.nan]]])
+        water_v = np.array([[[0.1, 0.2], [0.3, np.nan]]])
+        ds = xr.Dataset(
+            {
+                "water_u": (("time", "latitude", "longitude"), water_u),
+                "water_v": (("time", "latitude", "longitude"), water_v),
+            },
+            coords={"time": times, "latitude": lats, "longitude": lons},
+        )
+        path = tmp_path / "noaa_style_test.nc"
+        ds.to_netcdf(path)
+
+        result = DataTreeConverter.from_hf_radar_grid(path)
+
+        assert result is not None
+        # Only the NaN cell is dropped; no QCflag variable exists to filter on.
+        assert result.sizes["point"] == 3

@@ -35,6 +35,7 @@ __all__ = [
     "build_erddap_subset_url",
     "select_backend",
     "clamp_to_region_bbox",
+    "match_region",
 ]
 
 # ERDDAP griddap host serving the UCSD HFRnet RTV datasets.
@@ -63,7 +64,7 @@ def _bbox_center(min_lon, max_lon, min_lat, max_lat):
     return (min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0
 
 
-def _match_region(min_lon, max_lon, min_lat, max_lat) -> tuple[str, Dict]:
+def match_region(min_lon, max_lon, min_lat, max_lat) -> tuple[str, Dict]:
     """Find the ``_REGIONS`` entry whose bbox contains the request's center point.
 
     Raises ``ValueError`` if no configured region contains it.
@@ -86,7 +87,7 @@ def select_erddap_dataset(min_lon, max_lon, min_lat, max_lat, resolution_km: int
     Raises ``ValueError`` if the region is outside the supported CONUS coasts
     or the requested resolution is unavailable for that region.
     """
-    name, cfg = _match_region(min_lon, max_lon, min_lat, max_lat)
+    name, cfg = match_region(min_lon, max_lon, min_lat, max_lat)
     datasets = cfg["datasets"]
     if resolution_km not in datasets:
         raise ValueError(
@@ -105,7 +106,7 @@ def clamp_to_region_bbox(min_lon, max_lon, min_lat, max_lat) -> tuple[float, flo
     past its southern edge) must be clamped here before the URL is built, not
     left for the server to reject outright.
     """
-    _, cfg = _match_region(min_lon, max_lon, min_lat, max_lat)
+    _, cfg = match_region(min_lon, max_lon, min_lat, max_lat)
     lo, hi, la, ha = cfg["bbox"]
     return (
         max(min_lon, lo), min(max_lon, hi),

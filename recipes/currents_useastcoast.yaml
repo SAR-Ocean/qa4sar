@@ -26,17 +26,8 @@ sar_data:
   - SM
   max_downloads: null
 validation_sources:
-- source_type: hf_radar
+- source_type: hf_radar_us
   download_kwargs: {}
-  collocation_kwargs: {}
-- source_type: hf_radar_historical
-  download_kwargs: {}
-  collocation_kwargs: {}
-- source_type: hf_radar_noaa
-  min_depth: -2.0
-  max_depth: 2.0
-  download_kwargs:
-    resolution_km: 6
   collocation_kwargs: {}
 - source_type: drifter
   download_kwargs: {}

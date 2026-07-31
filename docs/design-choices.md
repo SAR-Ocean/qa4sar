@@ -172,6 +172,38 @@ Design choices:
 > `core/orchestrator.py` (`_ALTIMETER_FREQUENCIES_BY_VARIABLE`,
 > depth-window merge in `download_all`).
 
+### 3.6 HF-radar: NOAA primary for US regions, Copernicus fallback, QCflag filtering
+
+Copernicus Marine's US-region HF-radar-total product (`US-WestCoast`,
+`US-EastGulfCoast`) is sourced from the same U.S. IOOS/HFRNet national
+network NOAA distributes directly via ERDDAP — but a live comparison for an
+identical bbox/date/resolution found Copernicus's re-ingestion has ~5.8x-17x
+fewer valid grid cells than NOAA's own distribution (173,116 vs 26,227 raw,
+or vs 10,001 restricted to Copernicus cells flagged "good"). NOAA has no
+per-cell quality flag at all — it filters upstream before publishing, so
+whatever it serves has already passed QC; Copernicus ships an explicit
+`QCflag` (1=good, 4=bad) but includes flagged-bad cells anyway.
+
+**Why:** US recipes therefore use a `hf_radar_us` source that automatically
+prefers NOAA (denser real coverage) whenever the request's region and date
+fall inside NOAA's ~90-day rolling ERDDAP window, falling back to
+Copernicus (NRT + delayed-mode, historical-first to avoid double-counting
+the same stations twice) only when NOAA can't serve the request — an older
+date, or a non-US region. NOAA's own THREDDS/OPeNDAP archive, which would
+extend its coverage to older dates directly, isn't implemented yet. This
+supersedes an earlier, same-day decision to retire NOAA everywhere in favor
+of Copernicus alone (the network-identity argument was correct, but ignored
+Copernicus's incomplete re-ingestion of it) — see `docs/superpowers/specs/`
+for that reasoning's full history. Separately, and independent of which
+backend is used, all Copernicus HF-radar data (US or not) now drops cells
+where the overall `QCflag == 4` ("bad") — Copernicus ships them unfiltered,
+and this toolbox previously retained them uncritically; per-parameter flags
+(`CSPD_QC` etc.) remain retained but unused.
+
+> Code: `downloaders/hf_radar_us_downloader.py` (`resolve_hf_radar_us_backend`,
+> `HFRadarUSDownloader`), `core/orchestrator.py` (`_download_hf_radar_us`),
+> `core/datatree_converter.py` (`from_hf_radar_grid`'s `QCflag` filter).
+
 ---
 
 ## 4. datatree.nc content choices

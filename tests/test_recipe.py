@@ -210,19 +210,18 @@ class TestFromDict:
 # ---------------------------------------------------------------------------
 
 class TestCurrentsTemplate:
-    def test_includes_noaa_hf_radar_source(self):
+    def test_does_not_include_noaa_hf_radar_source(self):
+        """NOAA HF-radar is retired from active recipe use (2026-07-30):
+        Copernicus's US-region HF-radar-total product is sourced from the
+        same IOOS/HFRNet network NOAA distributes directly, so stacking both
+        double-counts the same stations. The downloader itself is kept,
+        untouched, for a future revert — it's just no longer in the default
+        template."""
         from sar_validation import cli
 
         recipe = cli._build_currents_config(limit=None)
         source_types = {s.source_type for s in recipe.validation_sources}
-        assert "hf_radar_noaa" in source_types
-
-        noaa_src = next(
-            s for s in recipe.validation_sources if s.source_type == "hf_radar_noaa"
-        )
-        assert noaa_src.min_depth == -2.0
-        assert noaa_src.max_depth == 2.0
-        assert noaa_src.download_kwargs == {"resolution_km": 6}
+        assert "hf_radar_noaa" not in source_types
 
     def test_includes_hf_radar_grid_layer_spec(self):
         from sar_validation import cli
@@ -250,7 +249,7 @@ class TestCurrentsTemplate:
         recipe = cli._build_currents_config(limit=7)
         source_types = [s.source_type for s in recipe.validation_sources]
         assert source_types == [
-            "hf_radar", "hf_radar_historical", "hf_radar_noaa",
+            "hf_radar", "hf_radar_historical",
             "drifter", "ferrybox", "mooring",
             "adcp_historical", "argo_historical", "drifter_historical", "glider_historical",
         ]
