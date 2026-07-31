@@ -17,8 +17,7 @@ temporal_bounds:
   start: '2018-03-05'
   end: '2018-03-07'
 sar_data:
-  satellite: Sentinel-1
-  product_level: L2_OCN
+  source: sentinel1_l2_ocn
   swath_mode:
   - WV
   - IW

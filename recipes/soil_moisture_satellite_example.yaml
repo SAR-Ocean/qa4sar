@@ -15,8 +15,7 @@ temporal_bounds:
   start: '2025-07-02 23:59:59'
   end: '2025-07-04 00:00:00'
 sar_data:
-  satellite: Sentinel-1
-  product_level: L3_SSM
+  source: sentinel1_clms_ssm
   swath_mode:
   - IW
   - EW

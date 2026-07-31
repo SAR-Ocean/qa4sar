@@ -43,6 +43,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# The ismn package's own file-collection logger (a plain 'ismn_meta_collector'
+# name, not a dotted child of 'ismn' -- see its own const.py/filecollection.py)
+# logs one INFO line per station file it reads while building ISMN_Interface's
+# metadata -- hundreds of lines for a real archive. Pinned to WARNING
+# unconditionally (not just outside --verbose, matching the "matplotlib" cap
+# below) since this per-file trace has no debugging value for this toolbox.
+logging.getLogger("ismn_meta_collector").setLevel(logging.WARNING)
+
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
@@ -91,9 +99,9 @@ Examples:
     parser.add_argument(
         "--set-credential",
         metavar="SERVICE",
-        choices=["eumdac", "osi_saf", "gportal", "smos"],
+        choices=["eumdac", "osi_saf", "gportal", "smos", "earthdata"],
         help="Prompt for a username/password and store them in the OS keyring "
-             "for SERVICE (eumdac | osi_saf | gportal | smos)",
+             "for SERVICE (eumdac | osi_saf | gportal | smos | earthdata)",
     )
     parser.add_argument(
         "--limit",
@@ -143,6 +151,14 @@ Examples:
         "--recipe-name",
         metavar="LABEL",
         help="Custom name for the recipe (sets the 'name' field and output filename)",
+    )
+    parser.add_argument(
+        "--sar-source",
+        metavar="KEY",
+        default=None,
+        help="Which SAR source to validate against (used with --create-recipe); "
+             "defaults to the category's existing source if omitted. "
+             "See sar_validation.core.sar_sources.SAR_SOURCES for valid keys.",
     )
     parser.add_argument(
         "--dry-run",
@@ -224,6 +240,7 @@ Examples:
             start=args.start,
             end=args.end,
             recipe_name=args.recipe_name,
+            sar_source=args.sar_source,
         )
     elif args.recipe:
         _execute_recipe(
@@ -250,7 +267,7 @@ Examples:
 def _set_credential(name: str) -> None:
     """Prompt for a username/password and store them in the OS keyring.
 
-    Backs ``sar-validate --set-credential {eumdac,osi_saf,gportal,smos}``.
+    Backs ``sar-validate --set-credential {eumdac,osi_saf,gportal,smos,earthdata}``.
     """
     import getpass
 
@@ -279,12 +296,29 @@ def _list_recipes() -> None:
         print(f"  {f.name}")
 
 
-def _build_currents_config(limit: Optional[int] = None):
+def _validate_sar_source(sar_source: str, variable: str) -> None:
+    from .core.sar_sources import SAR_SOURCES
+
+    if sar_source not in SAR_SOURCES:
+        raise ValueError(
+            f"Unknown SAR source {sar_source!r}. Choose one of: "
+            f"{', '.join(sorted(SAR_SOURCES))}"
+        )
+    spec = SAR_SOURCES[sar_source]
+    if variable not in spec.variables:
+        raise ValueError(
+            f"SAR source {sar_source!r} is only valid for: "
+            f"{', '.join(sorted(spec.variables))} (got variable={variable!r})"
+        )
+
+
+def _build_currents_config(limit: Optional[int] = None, sar_source: str = "sentinel1_l2_ocn"):
     """Build the 'currents' recipe template's RecipeConfig.
 
     Extracted from ``_create_recipe`` so the template content is
     unit-testable independent of the CLI's file-writing side effects.
     """
+    _validate_sar_source(sar_source, "currents")
     from .core.recipe import (
         CollocationType,
         GeographicBounds,
@@ -304,7 +338,7 @@ def _build_currents_config(limit: Optional[int] = None):
         variable="currents",
         variable_specs={"components": ["zonal", "meridional"]},
         geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
-        sar_data=SARDataSpec(swath_mode=["WV","IW","EW","SM"], max_downloads=limit),
+        sar_data=SARDataSpec(source=sar_source, swath_mode=["WV","IW","EW","SM"], max_downloads=limit),
         validation_sources=[
             ValidationDataSource(source_type="hf_radar"),
             ValidationDataSource(source_type="hf_radar_historical"),
@@ -335,13 +369,14 @@ def _build_currents_config(limit: Optional[int] = None):
     )
 
 
-def _build_wind_config(limit: Optional[int] = None):
+def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1_l2_ocn"):
     """Build the 'wind' recipe template's RecipeConfig.
 
     Extracted from ``_create_recipe`` so the template content is
     unit-testable independent of the CLI's file-writing side effects,
     mirroring ``_build_currents_config``.
     """
+    _validate_sar_source(sar_source, "wind")
     from .core.recipe import (
         CollocationType,
         GeographicBounds,
@@ -363,7 +398,7 @@ def _build_wind_config(limit: Optional[int] = None):
         variable="wind",
         variable_specs={"components": ["speed", "direction"]},
         geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
-        sar_data=SARDataSpec(swath_mode=["IW", "EW"], max_downloads=limit),
+        sar_data=SARDataSpec(source=sar_source, swath_mode=["IW", "EW"], max_downloads=limit),
         validation_sources=[
             ValidationDataSource(source_type="mooring"),
             ValidationDataSource(source_type="buoy"),
@@ -452,16 +487,18 @@ def _build_wind_config(limit: Optional[int] = None):
     )
 
 
-def _build_soil_moisture_config(limit: Optional[int] = None):
-    """Build the 'soil_moisture' recipe template's RecipeConfig.
+def _build_waves_config(limit: Optional[int] = None, sar_source: str = "sentinel1_l2_ocn"):
+    """Build the 'waves' recipe template's RecipeConfig.
 
     Extracted from ``_create_recipe`` so the template content is
     unit-testable independent of the CLI's file-writing side effects,
     mirroring ``_build_wind_config``/``_build_currents_config``.
     """
+    _validate_sar_source(sar_source, "waves")
     from .core.recipe import (
         CollocationType,
         GeographicBounds,
+        LayerVsLayerCollocation,
         PointVsLayerCollocation,
         RecipeConfig,
         SARDataSpec,
@@ -469,45 +506,132 @@ def _build_soil_moisture_config(limit: Optional[int] = None):
     )
 
     return RecipeConfig(
-        name="Soil Moisture Validation",
+        name="Wave Height Validation",
         description=(
+            "Validate Sentinel-1 significant wave height\n"
+            "against moorings, tidal gauges, drifters, and altimeter."
+        ),
+        variable="waves",
+        variable_specs={"components": ["significant_wave_height"]},
+        geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+        sar_data=SARDataSpec(source=sar_source, swath_mode=["WV","SM"], max_downloads=limit),
+        validation_sources=[
+            ValidationDataSource(source_type="mooring"),
+            ValidationDataSource(source_type="tidal_gauge"),
+            ValidationDataSource(source_type="drifter"),
+            ValidationDataSource(source_type="altimeter"),
+        ],
+        collocation=CollocationType(
+            point_vs_layer=PointVsLayerCollocation(),
+            layer_vs_layer=LayerVsLayerCollocation(
+                layer_type_specs={
+                    "altimeter_1hz": {
+                        "time_tolerance_minutes": 180,
+                        "aggregation_window_km": 7.0,
+                        "distance_weighting": "equal",
+                    },
+                    "altimeter_5hz": {
+                        "time_tolerance_minutes": 180,
+                        "aggregation_window_km": 1.4,
+                        "distance_weighting": "equal",
+                    },
+                }
+            ),
+        ),
+    )
+
+
+def _build_soil_moisture_config(limit: Optional[int] = None, sar_source: str = "sentinel1_clms_ssm"):
+    """Build the 'soil_moisture' recipe template's RecipeConfig.
+
+    Extracted from ``_create_recipe`` so the template content is
+    unit-testable independent of the CLI's file-writing side effects,
+    mirroring ``_build_wind_config``/``_build_currents_config``. Depth and
+    collocation-tolerance defaults are read from the resolved
+    ``SARSourceSpec`` (``sar_sources.SAR_SOURCES``), so a NISAR SME2
+    recipe automatically gets its own template values instead of
+    Sentinel-1 CLMS SSM's.
+    """
+    _validate_sar_source(sar_source, "soil_moisture")
+    from .core.recipe import (
+        CollocationType,
+        GeographicBounds,
+        LayerVsLayerCollocation,
+        PointVsLayerCollocation,
+        RecipeConfig,
+        SARDataSpec,
+        ValidationDataSource,
+    )
+    from .core.sar_sources import SAR_SOURCES
+
+    spec = SAR_SOURCES[sar_source]
+    # SARSourceSpec's default_* fields are Optional[...] because sources
+    # outside the "soil_moisture" variable set (e.g. sentinel1_l2_ocn)
+    # leave them unset; _validate_sar_source above already restricted
+    # sar_source to a "soil_moisture" entry, both of which (today:
+    # sentinel1_clms_ssm, nisar_sme2) populate every default_* field, so
+    # narrow the Optional types for mypy here.
+    assert spec.default_time_tolerance_minutes is not None
+    assert spec.default_aggregation_window_km is not None
+    assert spec.default_spatial_tolerance_km is not None
+    time_tol = spec.default_time_tolerance_minutes
+    agg_km = spec.default_aggregation_window_km
+    spatial_km = spec.default_spatial_tolerance_km
+
+    layer_vs_layer = None
+    if sar_source != "sentinel1_clms_ssm":
+        # Sentinel-1 CLMS SSM's ±12h default already matches
+        # DEFAULT_LAYER_TYPE_SPECS's own fallback (recipe.py) -- no
+        # per-recipe override needed. Any other source (e.g. NISAR's ±6h)
+        # must set an explicit layer_type_specs override, since the global
+        # fallback stays 720 for every recipe that doesn't override it.
+        layer_vs_layer = LayerVsLayerCollocation(
+            layer_type_specs={
+                key: {"time_tolerance_minutes": time_tol}
+                for key in (
+                    "scatterometer_ssm", "radiometer_ssm",
+                    "amsr_ssm", "smap_ssm", "smos_ssm",
+                )
+            }
+        )
+
+    # Select description based on sar_source
+    if sar_source == "nisar_sme2":
+        description = (
+            "Validate NISAR SME2 (beta) L-band Surface Soil Moisture\n"
+            "against ISMN in-situ stations, ASCAT, AMSR2, SMAP, and SMOS."
+        )
+    else:
+        description = (
             "Validate Sentinel-1 CLMS Surface Soil Moisture (1 km, Europe,\n"
             "daily) against ISMN in-situ stations."
-        ),
+        )
+
+    return RecipeConfig(
+        name="Soil Moisture Validation",
+        description=description,
         variable="soil_moisture",
         variable_specs={"components": ["soil_moisture"]},
-        # Narrower than the ocean templates' Europe default — matches the
-        # CLMS SSM 1km product's documented extent more tightly.
         geographic_bounds=GeographicBounds(-10.0, 30.0, 35.0, 60.0),
-        sar_data=SARDataSpec(satellite="Sentinel-1", product_level="L3_SSM", max_downloads=limit),
+        sar_data=SARDataSpec(source=sar_source, max_downloads=limit),
         validation_sources=[
-            # download_kwargs left empty on purpose — first run prints ISMN
-            # portal instructions rather than needing a placeholder path.
-            # min_depth/max_depth here (~0-5 cm) match C-band Sentinel-1's
-            # sensing depth; a future NISAR (L-band) recipe would instead
-            # use a deeper window (~0-0.25 m), set the same way.
-            ValidationDataSource(source_type="ismn", min_depth=0.0, max_depth=0.05),
-            # Satellite soil-moisture sources -- ASCAT (scatterometer),
-            # AMSR2/SMAP/SMOS (radiometer) -- default on alongside ISMN
-            # rather than requiring a separate recipe, matching
-            # recipes/soil_moisture_satellite_example.yaml's source list.
+            ValidationDataSource(
+                source_type="ismn", min_depth=spec.default_min_depth, max_depth=spec.default_max_depth,
+            ),
             ValidationDataSource(source_type="ascat_ssm"),
             ValidationDataSource(source_type="amsr_ssm"),
             ValidationDataSource(source_type="smap_ssm"),
             ValidationDataSource(source_type="smos_ssm"),
         ],
         collocation=CollocationType(
-            # Pixel-scale tolerances, not the ocean buoy-footprint defaults:
-            # a 1 km SAR pixel and a point ISMN station don't need a 25 km
-            # buoy-scale aggregation window, and the product is daily (not
-            # 30-minutes-tolerance) — only a calendar-day match matters.
             point_vs_layer=PointVsLayerCollocation(
-                spatial_tolerance_km=2.0,
-                aggregation_window_km=1.0,
+                spatial_tolerance_km=spatial_km,
+                aggregation_window_km=agg_km,
                 distance_weighting="equal",
                 interpolation_method="nearest",
-                time_tolerance_minutes=720,
+                time_tolerance_minutes=time_tol,
             ),
+            layer_vs_layer=layer_vs_layer,
         ),
     )
 
@@ -522,61 +646,40 @@ def _create_recipe(
     start: Optional[str] = None,
     end: Optional[str] = None,
     recipe_name: Optional[str] = None,
+    sar_source: Optional[str] = None,
 ) -> None:
     from .core.recipe import (
-        CollocationType,
         GeographicBounds,
-        LayerVsLayerCollocation,
-        PointVsLayerCollocation,
         Recipe,
-        RecipeConfig,
-        SARDataSpec,
         TemporalBounds,
-        ValidationDataSource,
     )
 
-    templates = {
-        "wind": _build_wind_config(limit),
-        "currents": _build_currents_config(limit),
-        "soil_moisture": _build_soil_moisture_config(limit),
-        "waves": RecipeConfig(
-            name="Wave Height Validation",
-            description=(
-                "Validate Sentinel-1 significant wave height\n"
-                "against moorings, tidal gauges, drifters, and altimeter."
-            ),
-            variable="waves",
-            variable_specs={"components": ["significant_wave_height"]},
-            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
-            sar_data=SARDataSpec(swath_mode=["WV","SM"], max_downloads=limit),
-            validation_sources=[
-                ValidationDataSource(source_type="mooring"),
-                ValidationDataSource(source_type="tidal_gauge"),
-                ValidationDataSource(source_type="drifter"),
-                ValidationDataSource(source_type="altimeter"),
-            ],
-            collocation=CollocationType(
-                point_vs_layer=PointVsLayerCollocation(),
-                layer_vs_layer=LayerVsLayerCollocation(
-                    layer_type_specs={
-                        # 1 Hz (~7km) and 5 Hz (~1.4km along-track) altimeter
-                        # data need different aggregation windows — see
-                        # DEFAULT_LAYER_TYPE_SPECS in recipe.py.
-                        "altimeter_1hz": {
-                            "time_tolerance_minutes": 180,
-                            "aggregation_window_km": 7.0,
-                            "distance_weighting": "equal",
-                        },
-                        "altimeter_5hz": {
-                            "time_tolerance_minutes": 180,
-                            "aggregation_window_km": 1.4,
-                            "distance_weighting": "equal",
-                        },
-                    }
-                ),
-            ),
-        ),
+    defaults = {
+        "wind": "sentinel1_l2_ocn", "currents": "sentinel1_l2_ocn",
+        "waves": "sentinel1_l2_ocn", "soil_moisture": "sentinel1_clms_ssm",
     }
+    resolved_sar_source = sar_source if sar_source is not None else defaults.get(name, "sentinel1_l2_ocn")
+
+    # All four templates are built eagerly (existing behaviour predating this
+    # flag — see the `if name not in templates` check below), but an explicit
+    # --sar-source only applies to the *requested* category: e.g.
+    # `--create-recipe soil_moisture --sar-source sentinel1_clms_ssm` must
+    # not also try (and fail) to build the "wind" template with a source
+    # that's only valid for soil_moisture. Every other, unrequested category
+    # keeps building with its own default source.
+    def _source_for(category: str) -> str:
+        return resolved_sar_source if category == name else defaults[category]
+
+    try:
+        templates = {
+            "wind": _build_wind_config(limit, _source_for("wind")),
+            "currents": _build_currents_config(limit, _source_for("currents")),
+            "soil_moisture": _build_soil_moisture_config(limit, _source_for("soil_moisture")),
+            "waves": _build_waves_config(limit, _source_for("waves")),
+        }
+    except ValueError as exc:
+        print(str(exc))
+        sys.exit(1)
 
     if name not in templates:
         print(f"Unknown recipe type '{name}'. Choose from: {', '.join(templates)}")

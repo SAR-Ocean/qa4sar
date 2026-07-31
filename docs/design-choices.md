@@ -961,6 +961,166 @@ non-soil-moisture recipe, since harmonization itself never runs for them.
 > Code: `core/visualization.py` (`plot_scatter`'s `force_split` param,
 > `validation_report`'s `harmonized_sources` check).
 
+### 8.11 NISAR SME2 (beta): a second SAR source, selected per recipe
+
+`soil_moisture` is the first recipe category to offer more than one real
+SAR-side product: Sentinel-1 CLMS Surface Soil Moisture (`%`, C-band,
+once-daily merged raster, `source: sentinel1_clms_ssm`) or NISAR SME2
+(`m3 m-3`, L-band, twice-daily per-overpass granules,
+`source: nisar_sme2`). `sar_validation/core/sar_sources.py`'s `SAR_SOURCES`
+registry is the single place mapping this key to its downloader, output
+subdirectory, converter, and per-source recipe-template defaults (depth,
+collocation tolerances) — the same registry also carries `wind`/`waves`/
+`currents`' existing `sentinel1_l2_ocn` entry, so the same `sar_data.source`
+mechanism is available to every category, even though only `soil_moisture`
+has a second real choice today.
+
+**Units require no `statistics.py` changes.** `_harmonize_percent_domain_sources`
+and `run_statistics_native_units` already key off the SAR variable's actual
+`units` attribute at runtime, not a hardcoded "Sentinel-1 = %" assumption —
+confirmed by tracing both functions directly. A NISAR (`m3 m-3`) recipe
+automatically classifies ISMN/AMSR/SMAP/SMOS as the "native units" group
+and ASCAT as the CDF-matched-only outlier, the reverse of today's
+Sentinel-1 case, with zero code changes.
+
+**Time-averaging requires no `collocation.py` changes either.**
+`_average_within_sar_tolerance` (§8.6/§8.7) matches validation readings to
+whichever real `sar_scene_times` it's given — Sentinel-1 CLMS SSM's scenes
+happen to always sit at midnight UTC, but NISAR SME2's twice-daily granules
+each carry their own real overpass timestamp, so the NISAR recipe template
+simply uses a tighter `time_tolerance_minutes=360` (±6h) instead of 720
+(±12h) — a template default, not a code change.
+
+**Depth window (0–0.05 m) and spatial tolerances (`aggregation_window_km=0.2`,
+`spatial_tolerance_km=2.0`) are documented assumptions**, not confirmed
+NISAR SME2 product-documentation values — 0–0.05 m matches the same window
+already used for Sentinel-1 CLMS SSM and (implicitly) SMAP's own documented
+L-band near-surface retrieval depth in this codebase; 200 m resolution
+(hence `aggregation_window_km=0.2`) was recorded from an earlier deferred
+spec, not independently re-verified. `spatial_tolerance_km` is kept equal
+to Sentinel-1's, by explicit choice, rather than deriving a separate
+resolution-scaled value. All are trivially overridable per-recipe.
+
+**CMR identifiers and HDF5 layout both confirmed 2026-07-31 against real
+data — Task 9 complete.** `sar_sources.py`'s `NISAR_SME2_SHORT_NAME`/
+`NISAR_SME2_VERSION` were originally a guess (`"NISAR_L3_PR_SME2_BETA"`/
+`None`) and returned zero results against the real CMR — the actual
+collection is `NISAR_L3_SME2_BETA_V1` (version `"1"`, concept id
+`C2850265000-ASF`, "NISAR Beta Soil Moisture (Version 1)"), confirmed
+directly against NASA's live CMR catalog (13,881 granules total as of the
+check date; granule ids do start with `NISAR_L3_PR_SME2_` and are `.h5`,
+matching this source's `file_glob`). A separate, more granule-dense
+`NISAR_L3_SME2_PROVISIONAL_V1` collection (`C2854344945-ASF`) also exists —
+not used here, since BETA matches the maturity level this source's
+docs/attrs were written for; switching would be a deliberate
+product-choice decision.
+
+`datatree_converter.py`'s `from_nisar_sme2` was then verified against a
+real downloaded granule (`NISAR_L3_PR_SME2_003_005_A_014_..._001.h5`,
+inspected directly with `h5py`) and every placeholder assumption turned
+out wrong: `soilMoisture`/`longitude`/`latitude` live directly under
+`science/LSAR/SME2/grids`, not a `frequencyA` subgroup (a
+`grids/radarData/frequencyA` subgroup does exist, but holds only
+backscatter/sigma0 fields, no soil moisture); `longitude`/`latitude` are
+1-D EASE-grid axis arrays, not a 2-D meshgrid (now meshed via
+`np.meshgrid`, the same way `from_sar_l3_ssm_geotiff` meshes its GeoTIFF
+axes); the fill value is `soilMoisture`'s own `_FillValue` dataset
+attribute, not a group-level attribute; the acquisition time is a scalar
+string dataset at `science/LSAR/identification/zeroDopplerStartTime`, not
+a root file attribute. `retrievalQualityFlag` (sibling to `soilMoisture`)
+was checked and flags exactly the same cells `soilMoisture`'s own fill
+value already does, so no separate quality-flag masking was added. Fixed
+and re-verified end-to-end: `--sar-source nisar_sme2` now correctly finds,
+downloads, converts (325,109 valid soil-moisture cells confirmed on one
+real granule), and collocates real NISAR SME2 data (5,480 collocated
+pairs against a real recipe run). The synthetic test fixture in
+`TestFromNisarSme2` was updated in lockstep to match this real layout.
+
+**Known gap: `_harmonize_percent_domain_sources` cannot harmonize ASCAT
+for a NISAR recipe.** `_harmonize_percent_domain_sources` (in
+`core/statistics.py`) converts a validation source sharing SAR's own raw
+units family (e.g. ASCAT's `%`) into the reference source's domain, by
+reusing the already-fitted SAR-vs-reference CDF transform. This only works
+when SAR's raw domain matches the source needing conversion — true for
+Sentinel-1 CLMS SSM, whose raw domain is `%`, the same as ASCAT's. For
+NISAR SME2, whose raw domain is volumetric (`m3 m-3`), the same as the
+ISMN reference already, the function's `to_convert` set is always empty by
+construction: a source can't simultaneously equal `sar_family` and differ
+from `reference_family` when `sar_family == reference_family`. So for a
+NISAR recipe, ASCAT's raw `%` values are never harmonized into the shared
+volumetric domain, unlike the Sentinel-1 case. Concretely, this means
+`fit_sar_to_val_transform` (used for `plot_geographic`'s background-raster
+color scale) and the CDF-matched-scatter `force_split` decision in
+`visualization.py` may pool ASCAT's un-harmonized raw percent values with
+volumetric values from ISMN/AMSR/SMAP/SMOS for a NISAR recipe — the exact
+"pooling raw percent and raw volumetric pairs with no harmonization"
+scenario that `fit_sar_to_val_transform`'s own docstring calls
+"nonsensical." This is a known, currently-unaddressed gap for
+`nisar_sme2` recipes with ASCAT enabled. It is left unresolved here
+deliberately (fixing it is a design task, not a documentation one) and is
+deferred to be resolved as part of the real-data verification pass
+(Task 9), once NISAR SME2 data can actually be run end-to-end and this
+path can be exercised and tested for real.
+
+**NISAR SME2's underlying CMR collection changed mid-mission, with a real
+~5-month gap in between — `EarthdataSoilMoistureDownloader` now queries
+multiple candidates and merges results.** Confirmed 2026-07-31 directly
+against NASA's live CMR catalog, cross-checked against a real
+user-reported coverage gap that was itself independently cross-checked
+against ASF Vertex: `NISAR_L3_SME2_BETA_V1`'s real granules run
+2025-10-01 through 2026-01-20, then nothing (not even in Vertex) until
+`NISAR_L3_SME2_PROVISIONAL_V1`'s real granules pick up on 2026-06-17 — a
+hard product-maturity transition (beta → provisional) with zero temporal
+overlap between the two collections. Hardcoding a single short_name (as
+originally shipped) or a date-based cutoff to pick between the two (the
+pattern already used for AMSR2's NSIDC-0451/AU_Land switch in
+`orchestrator.py`) would both be guesses about exactly when NASA's
+processing pipeline transitioned — and this codebase already has one
+example of that kind of guess turning out wrong (`AU_Land_NRT_R02`, see
+below). Instead, `EarthdataSoilMoistureDownloader.__init__`'s `dataset`
+parameter now accepts either a single short_name (backward compatible,
+used unchanged by AMSR2/SMAP) or a list of `(short_name, version)`
+candidates; `download()` queries every candidate and merges the results,
+letting CMR itself be the source of truth for which collection actually
+has data in the requested window. `sar_sources.py`'s
+`NISAR_SME2_CANDIDATES` wires both `NISAR_L3_SME2_BETA_V1` and
+`NISAR_L3_SME2_PROVISIONAL_V1` in for `nisar_sme2`.
+
+**Diagnostics-plot per-scene splitting and auto-zoom are now
+registry-driven / data-driven instead of hardcoded for soil_moisture in
+general.** `plot_collocation_diagnostics` used to split into one PNG per
+SAR scene for *any* soil_moisture recipe with multiple scenes — correct
+for Sentinel-1 CLMS SSM (daily, mutually-overlapping, continent-wide
+mosaics, where overlaying more than one makes individual days
+indistinguishable) but wrong for NISAR SME2 (small, non-overlapping
+per-orbit granules that coexist fine on one map, where splitting just
+produces many near-empty PNGs instead of one useful overview). Fixed via
+a new `SARSourceSpec.diagnostics_split_by_scene` flag (`True` only for
+`sentinel1_clms_ssm`). Separately, the plot always set its extent to the
+recipe's full requested bbox, which is fine when SAR coverage roughly
+fills that bbox (Sentinel-1) but leaves a tiny, hard-to-read data cluster
+in an otherwise-empty map when it doesn't (NISAR granules against a
+continent-scale bbox). Fixed by computing the actual combined extent of
+every SAR scene/footprint/coverage-pixel and validation point the plot
+already draws, padding it, and clamping the result to never exceed the
+recipe's own bounds (so it only ever zooms *in*, never out) — a no-op for
+Sentinel-1-scale coverage, a clear improvement for NISAR-scale coverage.
+Dateline-crossing recipes keep the original always-full-bounds behavior
+(combining that longitude-shifting logic with a data-driven zoom safely
+was out of scope for this fix).
+
+> Code: `core/sar_sources.py` (`SARSourceSpec`, `SAR_SOURCES`,
+> `NISAR_SME2_CANDIDATES`), `core/recipe.py` (`SARDataSpec.source`,
+> `_build_sar_data_spec`), `core/orchestrator.py` (`_download_sar`),
+> `core/datatree_converter.py` (`convert_downloaded_data`'s SAR-scanning
+> block, `from_nisar_sme2`), `cli.py` (`--sar-source`,
+> `_build_soil_moisture_config`), `downloaders/base.py`
+> (`authenticate_earthdata`), `downloaders/earthdata_soil_moisture_downloader.py`
+> (multi-candidate `EarthdataSoilMoistureDownloader`), `core/statistics.py`
+> (`_harmonize_percent_domain_sources`, `fit_sar_to_val_transform`),
+> `core/visualization.py` (`plot_collocation_diagnostics`,
+> `_diagnostics_zoom_extent`).
+
 ## 9. Visualization / report choices
 
 ### 9.1 Adaptive geographic marker sizing

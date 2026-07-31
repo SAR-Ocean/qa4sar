@@ -7,10 +7,11 @@ Radiometer Half-Orbit 9 km EASE-Grid Soil Moisture") with one class,
 parameterized by dataset short_name — both are searchable through the
 same ``earthaccess.search_data()``/``earthaccess.download()`` calls.
 
-Credentials: ``earthaccess.login()`` resolves NASA Earthdata Login
-credentials via its own standard convention (``EARTHDATA_USERNAME``/
-``EARTHDATA_PASSWORD`` env vars, then ``~/.netrc``) — no bespoke
-credentials file for this toolbox.
+Credentials: ``base.authenticate_earthdata()`` resolves NASA Earthdata
+Login credentials (explicit args > ``EARTHDATA_USERNAME``/
+``EARTHDATA_PASSWORD`` env vars > OS keyring, migrating a legacy
+``~/.netrc`` entry into the keyring on first use) before calling
+``earthaccess.login()`` — see ``sar-validate --set-credential earthdata``.
 
 Library usage::
 
@@ -34,11 +35,28 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Sequence, Tuple, Union
 
 from .base import build_output_dir, normalize_datetime
 
 __all__ = ["EarthdataSoilMoistureDownloader"]
+
+
+def _describe_granule(granule: object) -> str:
+    """One-line ``name  (size)`` summary of an ``earthaccess.DataGranule``
+    for dry-run/found-granule listings. Falls back to ``str(granule)`` for
+    anything that doesn't expose ``data_links()``/``size()`` (e.g. a plain
+    string used as a test double)."""
+    try:
+        links = granule.data_links()  # type: ignore[attr-defined]
+        name = links[0].rsplit("/", 1)[-1] if links else str(granule)
+    except AttributeError:
+        name = str(granule)
+    try:
+        size_str = f"{granule.size():.1f} MB"  # type: ignore[attr-defined]
+    except AttributeError:
+        size_str = "size unknown"
+    return f"{name}  ({size_str})"
 
 
 class EarthdataSoilMoistureDownloader:
@@ -47,26 +65,39 @@ class EarthdataSoilMoistureDownloader:
 
     Parameters
     ----------
-    dataset : str
-        Earthdata ``short_name`` (e.g. ``"NSIDC-0451"`` or ``"SPL2SMP_E"``).
+    dataset : str or sequence of (short_name, version) tuples
+        A single Earthdata ``short_name`` (e.g. ``"NSIDC-0451"`` or
+        ``"SPL2SMP_E"``), paired with *version* below -- or a list of
+        ``(short_name, version)`` candidate pairs to search and merge
+        results from. The latter is for a mission whose data has moved
+        between CMR collections over time with no temporal overlap (e.g.
+        NISAR SME2's beta -> provisional product-maturity transition) --
+        a single requested time window might need either collection, or
+        even straddle both, and CMR has no "try these short_names in
+        order" query of its own.
     output_dir : Path
         Directory to save downloaded files.
     version : str, optional
         Dataset version filter (recommended when multiple versions are
         public — avoids returning every version's granules at once).
+        Ignored when *dataset* is a list of ``(short_name, version)``
+        pairs (each pair carries its own version).
     dry_run : bool
-        If True, print what would be searched without actually downloading.
+        If True, still search (so the found granules can be listed) but
+        skip the actual download.
     """
 
     def __init__(
         self,
-        dataset: str,
+        dataset: Union[str, Sequence[Tuple[str, Optional[str]]]],
         output_dir: Path,
         version: Optional[str] = None,
         dry_run: bool = False,
     ) -> None:
-        self.dataset = dataset
-        self.version = version
+        if isinstance(dataset, str):
+            self._candidates: List[Tuple[str, Optional[str]]] = [(dataset, version)]
+        else:
+            self._candidates = list(dataset)
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
 
@@ -80,7 +111,9 @@ class EarthdataSoilMoistureDownloader:
         end: str,
     ) -> list[Path]:
         """
-        Search and download granules intersecting the given region/time window.
+        Search and download granules intersecting the given region/time
+        window, across every ``(short_name, version)`` candidate, merging
+        the results into one combined list.
 
         Returns
         -------
@@ -90,33 +123,36 @@ class EarthdataSoilMoistureDownloader:
         start_dt = normalize_datetime(start)
         end_dt   = normalize_datetime(end)
 
-        if self.dry_run:
-            print(
-                f"[DRY RUN] Would search earthaccess for {self.dataset} "
-                f"(version={self.version})\n"
-                f"  Region: lon [{min_lon},{max_lon}] lat [{min_lat},{max_lat}]\n"
-                f"  Time:   {start_dt} -> {end_dt}\n"
-                f"  Output: {self.output_dir}"
-            )
-            return []
-
         import earthaccess
 
-        earthaccess.login()
-        results = earthaccess.search_data(
-            short_name=self.dataset,
-            version=self.version,
-            bounding_box=(min_lon, min_lat, max_lon, max_lat),
-            temporal=(start_dt, end_dt),
-        )
-        print(f"Found {len(results)} {self.dataset} granule(s).")
-        if not results:
+        from .base import authenticate_earthdata
+
+        authenticate_earthdata()
+
+        all_results = []
+        for short_name, version in self._candidates:
+            results = earthaccess.search_data(
+                short_name=short_name,
+                version=version,
+                bounding_box=(min_lon, min_lat, max_lon, max_lat),
+                temporal=(start_dt, end_dt),
+            )
+            print(f"Found {len(results)} {short_name} granule(s).")
+            for granule in results:
+                print(f"  {_describe_granule(granule)}")
+            all_results.extend(results)
+
+        if self.dry_run:
+            print(f"[DRY RUN] Would download {len(all_results)} granule(s) to {self.output_dir}")
+            return []
+
+        if not all_results:
             return []
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        downloaded = earthaccess.download(results, str(self.output_dir))
+        downloaded = earthaccess.download(all_results, str(self.output_dir))
         paths = [Path(p) for p in downloaded]
-        print(f"Downloaded {len(paths)} {self.dataset} file(s).")
+        print(f"Downloaded {len(paths)} file(s).")
         return paths
 
 

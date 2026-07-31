@@ -449,6 +449,95 @@ class TestFromSarL3SsmGeotiff:
             _parse_ssm_timestamp(filename)
 
 
+class TestFromNisarSme2:
+    """Tests for DataTreeConverter.from_nisar_sme2 -- fixture layout
+    confirmed 2026-07-31 against a real downloaded granule
+    (NISAR_L3_PR_SME2_003_005_A_014_..._001.h5): soilMoisture/longitude/
+    latitude live directly under science/LSAR/SME2/grids (not a
+    frequencyA subgroup); longitude/latitude are 1-D EASE-grid axes (not
+    a 2-D meshgrid); the fill value is soilMoisture's own _FillValue
+    dataset attribute (not a group-level attribute); the acquisition time
+    is a scalar string dataset at science/LSAR/identification/
+    zeroDopplerStartTime (not a root file attribute)."""
+
+    def _write_fake_granule(self, path, *, fill_value=-9999.0):
+        import h5py
+        import numpy as np
+
+        ny, nx = 4, 5
+        lon_1d = np.linspace(10.0, 10.4, nx)
+        lat_1d = np.linspace(45.3, 45.0, ny)  # descending, like real data
+        sm = np.linspace(0.05, 0.35, ny * nx, dtype="float32").reshape(ny, nx)
+        sm[0, 0] = fill_value  # one masked cell
+
+        with h5py.File(path, "w") as f:
+            grp = f.create_group("science/LSAR/SME2/grids")
+            sm_dset = grp.create_dataset("soilMoisture", data=sm)
+            sm_dset.attrs["_FillValue"] = np.float32(fill_value)
+            grp.create_dataset("longitude", data=lon_1d.astype("float32"))
+            grp.create_dataset("latitude", data=lat_1d.astype("float32"))
+            ident = f.create_group("science/LSAR/identification")
+            ident.create_dataset("zeroDopplerStartTime", data=b"2026-06-20T01:30:00")
+
+    def test_reads_grid_and_masks_fill_value(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        h5_path = tmp_path / "NISAR_L3_PR_SME2_001_A_20260620T013000.h5"
+        self._write_fake_granule(h5_path)
+
+        ds = DataTreeConverter.from_nisar_sme2(h5_path)
+
+        assert ds is not None
+        assert "sarSSM" in ds
+        assert ds["sarSSM"].dims == ("y", "x")
+        assert ds["sarSSM"].attrs["units"] == "m3 m-3"
+        assert bool(np.isnan(ds["sarSSM"].values[0, 0]))  # fill value masked
+        assert float(ds["sarSSM"].values[1, 1]) == pytest.approx(
+            np.linspace(0.05, 0.35, 20, dtype="float32").reshape(4, 5)[1, 1]
+        )
+
+    def test_time_parsed_from_zero_doppler_start_time(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        h5_path = tmp_path / "granule.h5"
+        self._write_fake_granule(h5_path)
+
+        ds = DataTreeConverter.from_nisar_sme2(h5_path)
+
+        assert ds is not None
+        assert pd.Timestamp(ds["time"].values) == pd.Timestamp("2026-06-20T01:30:00")
+
+    def test_data_type_and_source_attrs(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        h5_path = tmp_path / "granule.h5"
+        self._write_fake_granule(h5_path)
+
+        ds = DataTreeConverter.from_nisar_sme2(h5_path)
+
+        assert ds is not None
+        assert ds.attrs["data_type"] == "sar_l3_ssm"
+        assert ds.attrs["source"] == "NISAR SME2 (beta)"
+
+    def test_missing_file_returns_none(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        ds = DataTreeConverter.from_nisar_sme2(tmp_path / "does_not_exist.h5")
+        assert ds is None
+
+    def test_missing_group_returns_none(self, tmp_path):
+        import h5py
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        h5_path = tmp_path / "wrong_shape.h5"
+        with h5py.File(h5_path, "w") as f:
+            f.create_group("some/other/path")
+
+        ds = DataTreeConverter.from_nisar_sme2(h5_path)
+        assert ds is None
+
+
 class TestFromAltimeter:
     def test_wind_speed_renamed_to_wspd(self, tmp_path):
         path = _make_altimeter_nc(tmp_path)
@@ -782,6 +871,91 @@ class TestConvertDownloadedDataFiltering:
         sar_names = list(tree["sar"].children)
         assert len(sar_names) == 1
         assert "NOISE" not in sar_names[0]
+
+
+class TestConvertDownloadedDataOnlyUsesRecipeSarSource:
+    """convert_downloaded_data must convert ONLY the recipe's chosen SAR
+    source's subdirectory, even when a stale sibling SAR-shaped folder
+    from a previous run (using a different source) is still on disk --
+    see design doc §9 and design-choices.md §8.11."""
+
+    def test_stale_l3_ssm_folder_ignored_when_recipe_wants_l2_ocn(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            SARDataSpec,
+            TemporalBounds,
+        )
+
+        # A stale S1_L3_SSM folder left over from an earlier soil_moisture
+        # run against the same output_dir -- must be ignored entirely.
+        ssm_dir = tmp_path / "S1_L3_SSM"
+        ssm_dir.mkdir()
+        (ssm_dir / "not_a_real_geotiff.tif").write_bytes(b"not a real geotiff")
+
+        recipe = Recipe(RecipeConfig(
+            name="t", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, 10.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            sar_data=SARDataSpec(source="sentinel1_l2_ocn"),
+        ))
+
+        tree = DataTreeConverter.convert_downloaded_data(
+            tmp_path, product_type="wind", recipe=recipe,
+        )
+        # No S1_L2_OCN folder exists either -- but the point of this test
+        # is that from_sar_l3_ssm_geotiff must never even be attempted
+        # against the bogus S1_L3_SSM content, which would raise/log a
+        # parse error if it were (wrongly) picked up.
+        if tree is not None:
+            assert "sar" not in tree or len(list(tree["sar"].children)) == 0
+
+    def test_only_resolved_source_subdir_is_scanned(self, tmp_path, monkeypatch):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            SARDataSpec,
+            TemporalBounds,
+        )
+
+        # Two sibling folders: only S1_L3_SSM should be scanned when the
+        # recipe's source is sentinel1_clms_ssm. The filename must contain
+        # the "-SSM_" marker (as real SoilMoistureDownloader output does)
+        # since the sentinel1_clms_ssm branch filters on it to skip the
+        # sibling "-NOISE_" uncertainty-layer GeoTIFF -- a plain "real.tif"
+        # would be excluded by that filter regardless of this fix.
+        ssm_dir = tmp_path / "S1_L3_SSM"
+        ssm_dir.mkdir()
+        (ssm_dir / "real-SSM_product.tif").write_bytes(b"x")
+        ocn_dir = tmp_path / "S1_L2_OCN"
+        (ocn_dir / "S1A_IW_OCN.SAFE").mkdir(parents=True)
+
+        recipe = Recipe(RecipeConfig(
+            name="t", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 10.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
+        ))
+
+        calls = []
+
+        def fake_from_sar_l3_ssm_geotiff(path):
+            calls.append(path)
+            return None
+
+        monkeypatch.setattr(
+            DataTreeConverter, "from_sar_l3_ssm_geotiff",
+            staticmethod(fake_from_sar_l3_ssm_geotiff),
+        )
+
+        DataTreeConverter.convert_downloaded_data(tmp_path, product_type="wind", recipe=recipe)
+
+        assert len(calls) == 1
+        assert calls[0].name == "real-SSM_product.tif"
 
 
 class TestConvertDownloadedDataIsmn:

@@ -8,6 +8,8 @@ Provides:
 - authenticate_osi_saf_ftp — Read OSI-SAF wind FTP credentials from env / OS keyring
 - authenticate_gportal   — Read JAXA G-Portal credentials from env / OS keyring / prompt
 - authenticate_smos_ftp  — Read SMOS Online Dissemination FTPS credentials from env / OS keyring
+- authenticate_earthdata — Resolve NASA Earthdata Login credentials from env /
+  OS keyring / ~/.netrc and log in via earthaccess
 - set_credential         — Store a username/password pair in the OS keyring
   (used by ``sar-validate --set-credential``)
 - normalize_datetime     — ISO datetime normalisation helper
@@ -38,6 +40,7 @@ __all__ = [
     "authenticate_osi_saf_ftp",
     "authenticate_gportal",
     "authenticate_smos_ftp",
+    "authenticate_earthdata",
     "set_credential",
     "normalize_datetime",
     "is_date_recent",
@@ -56,6 +59,7 @@ _KEYRING_SERVICES = {
     "osi_saf": "sar-validation-osi-saf",
     "gportal": "sar-validation-gportal",
     "smos": "sar-validation-smos",
+    "earthdata": "sar-validation-earthdata",
 }
 
 
@@ -112,11 +116,24 @@ def _resolve_from_keyring_or_legacy_file(
         file_username, file_password = parse_legacy_file(cred_file.read_text())
         if file_username and file_password:
             _keyring_set_quiet(service, file_username, file_password)
-            logger.warning(
-                "Migrated %s credentials from %s to the OS keyring "
-                "(service=%r). You can now safely delete %s.",
-                name, cred_file, service, cred_file,
-            )
+            if cred_file.name == ".netrc":
+                # ~/.netrc is a shared OS-standard file used by many tools
+                # (curl, wget, earthaccess itself, other NASA clients) and
+                # may hold other machines' unrelated credentials -- unlike
+                # the bespoke single-purpose legacy files below, it is not
+                # safe to suggest deleting it.
+                logger.warning(
+                    "Migrated %s credentials from %s to the OS keyring "
+                    "(service=%r). %s is left in place since it's a "
+                    "shared file other tools may still use.",
+                    name, cred_file, service, cred_file,
+                )
+            else:
+                logger.warning(
+                    "Migrated %s credentials from %s to the OS keyring "
+                    "(service=%r). You can now safely delete %s.",
+                    name, cred_file, service, cred_file,
+                )
             return file_username, file_password
 
     return username, password
@@ -137,15 +154,42 @@ def _parse_json_legacy_file(content: str) -> Tuple[Optional[str], Optional[str]]
     return creds.get("username"), creds.get("password")
 
 
+def _parse_netrc_legacy_file(content: str) -> Tuple[Optional[str], Optional[str]]:
+    """Parse a ~/.netrc file's urs.earthdata.nasa.gov machine entry
+    (login/password), using the stdlib netrc module."""
+    import netrc as netrc_module
+    import os
+    import tempfile
+
+    # netrc.netrc() only accepts a file path, not a string -- write the
+    # content to a throwaway temp file so the stdlib parser can be reused
+    # instead of hand-rolling a parser for netrc's format.
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".netrc", delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+    try:
+        parsed = netrc_module.netrc(tmp_path)
+    except (netrc_module.NetrcParseError, OSError):
+        return None, None
+    finally:
+        os.unlink(tmp_path)
+
+    entry = parsed.authenticators("urs.earthdata.nasa.gov")
+    if entry is None:
+        return None, None
+    login, _account, password = entry
+    return login, password
+
+
 def set_credential(name: str, username: str, password: str) -> None:
     """Store *username*/*password* in the OS keyring for a credential set.
 
-    Used by ``sar-validate --set-credential {eumdac,osi_saf,gportal,smos}``.
+    Used by ``sar-validate --set-credential {eumdac,osi_saf,gportal,smos,earthdata}``.
 
     Parameters
     ----------
     name : str
-        One of "eumdac", "osi_saf", "gportal", "smos".
+        One of "eumdac", "osi_saf", "gportal", "smos", "earthdata".
     username, password : str
         Values to store.
 
@@ -515,6 +559,54 @@ def authenticate_eumdac(
 
     token = eumdac.AccessToken((username, password))
     return token
+
+
+def authenticate_earthdata(
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+) -> None:
+    """
+    Resolve NASA Earthdata Login credentials and log in via ``earthaccess``.
+
+    Priority order:
+      1. Explicit arguments
+      2. Environment variables  EARTHDATA_USERNAME / EARTHDATA_PASSWORD
+      3. OS keyring (service "sar-validation-earthdata"; see set_credential /
+         ``sar-validate --set-credential earthdata``). If nothing is stored
+         there yet but ~/.netrc has a urs.earthdata.nasa.gov entry, it is
+         read once, migrated into the keyring, and a console notice is
+         printed.
+
+    Unlike the other ``authenticate_*`` helpers, this performs the actual
+    login (there is no separate credential-carrying return value to hand
+    back to the caller) -- ``earthaccess.login()`` is the toolbox's whole
+    NASA Earthdata client. If nothing resolves from any of the above, falls
+    back to a bare ``earthaccess.login()``, preserving its own netrc/
+    interactive-prompt resolution rather than raising.
+    """
+    import os
+
+    import earthaccess
+
+    if not username:
+        username = os.environ.get("EARTHDATA_USERNAME")
+    if not password:
+        password = os.environ.get("EARTHDATA_PASSWORD")
+
+    if not username or not password:
+        cred_file = Path.home() / ".netrc"
+        kr_username, kr_password = _resolve_from_keyring_or_legacy_file(
+            "earthdata", cred_file, _parse_netrc_legacy_file,
+        )
+        username = username or kr_username
+        password = password or kr_password
+
+    if username and password:
+        os.environ["EARTHDATA_USERNAME"] = username
+        os.environ["EARTHDATA_PASSWORD"] = password
+        earthaccess.login(strategy="environment")
+    else:
+        earthaccess.login()
 
 
 def authenticate_osi_saf_ftp(

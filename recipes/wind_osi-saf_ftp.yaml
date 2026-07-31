@@ -19,8 +19,7 @@ temporal_bounds:
   start: '2026-07-20 10:30:00'
   end: '2026-07-20 17:00:00'
 sar_data:
-  satellite: Sentinel-1
-  product_level: L2_OCN
+  source: sentinel1_l2_ocn
   swath_mode:
   - IW
   - EW

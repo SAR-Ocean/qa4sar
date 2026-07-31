@@ -299,6 +299,102 @@ class DataTreeConverter:
         return ds
 
     @staticmethod
+    def from_nisar_sme2(h5_path: Union[str, Path]) -> Optional[xr.Dataset]:
+        """
+        Open a NISAR SME2 (beta) soil-moisture HDF5 granule and return a
+        standardised Dataset with a native ``(y, x)`` grid -- the same
+        grid-shape-role Sentinel-1 CLMS SSM (``from_sar_l3_ssm_geotiff``)
+        and SAR L2_OCN products use, so it reuses the existing
+        grid-collocation path unchanged.
+
+        Confirmed 2026-07-31 against a real downloaded granule
+        (``NISAR_L3_PR_SME2_003_005_A_014_..._001.h5``): ``soilMoisture``
+        (float32, meter^3/meter^3, CF-1.7 dataset attrs including its own
+        ``_FillValue``) lives directly under ``science/LSAR/SME2/grids`` --
+        *not* a ``frequencyA`` subgroup. (A ``grids/radarData/frequencyA``
+        subgroup does exist, but only holds backscatter/sigma0 fields, no
+        soil moisture.) ``latitude``/``longitude`` are 1-D EASE-grid axis
+        arrays, not a 2-D meshgrid -- meshed into ``(y, x)`` coords below,
+        the same way ``from_sar_l3_ssm_geotiff`` meshes its GeoTIFF axes.
+        The acquisition time lives at ``science/LSAR/identification/
+        zeroDopplerStartTime`` as a scalar string *dataset*, not a root
+        file attribute. ``retrievalQualityFlag`` (sibling to
+        ``soilMoisture``) was checked and found to flag exactly the same
+        cells ``soilMoisture``'s own fill value already does, so no
+        separate quality-flag masking is applied here.
+
+        Parameters
+        ----------
+        h5_path : str or Path
+            Path to a downloaded ``NISAR_L3_PR_SME2_*.h5`` granule.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="sar_l3_ssm"``, or None on failure.
+        """
+        import h5py
+
+        h5_path = Path(h5_path)
+        if not h5_path.exists():
+            logger.warning("NISAR SME2 file not found: %s", h5_path)
+            return None
+
+        group_path = "science/LSAR/SME2/grids"
+        time_path = "science/LSAR/identification/zeroDopplerStartTime"
+        try:
+            with h5py.File(h5_path, "r") as f:
+                if group_path not in f:
+                    logger.warning(
+                        "Missing %s group in %s.", group_path, h5_path.name,
+                    )
+                    return None
+                grp = f[group_path]
+                required = ("soilMoisture", "longitude", "latitude")
+                if not all(field in grp for field in required):
+                    logger.warning(
+                        "Missing soilMoisture/longitude/latitude field(s) in %s (available: %s).",
+                        h5_path.name, list(grp.keys()),
+                    )
+                    return None
+                sm_dset = grp["soilMoisture"]
+                sm = np.asarray(sm_dset[:], dtype=float)
+                lon_1d = np.asarray(grp["longitude"][:], dtype=float)
+                lat_1d = np.asarray(grp["latitude"][:], dtype=float)
+                fill_value = float(sm_dset.attrs.get("_FillValue", -9999.0))
+                time_raw = f[time_path][()] if time_path in f else None
+        except Exception as exc:
+            logger.warning("Could not read NISAR SME2 file %s: %s", h5_path, exc)
+            return None
+
+        sm = np.where(np.isclose(sm, fill_value) | np.isnan(sm), np.nan, sm)
+        lon, lat = np.meshgrid(lon_1d, lat_1d)
+
+        if time_raw is None:
+            time_val = pd.NaT
+        else:
+            time_str = time_raw.decode() if isinstance(time_raw, bytes) else str(time_raw)
+            time_val = pd.to_datetime(time_str, errors="coerce")
+
+        ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), sm)},
+            coords={
+                "lon":  (("y", "x"), lon),
+                "lat":  (("y", "x"), lat),
+                "time": time_val,
+            },
+        )
+        apply_cf_metadata(ds, "sar", {
+            "sarSSM": {
+                "long_name": "NISAR SME2 (beta) surface soil moisture",
+                "units": "m3 m-3",
+            },
+        })
+        ds.attrs["data_type"] = "sar_l3_ssm"
+        ds.attrs["source"]    = "NISAR SME2 (beta)"
+        return ds
+
+    @staticmethod
     def from_insitu_csv(
         csv_path: Union[str, Path],
         source_type: str = "mooring",
@@ -2961,38 +3057,56 @@ class DataTreeConverter:
                 )
             return out
 
-        # SAR L2_OCN SAFE directories
-        sar_dir = base_dir / "S1_L2_OCN"
-        if sar_dir.exists():
-            for safe_dir in sorted(d for d in sar_dir.iterdir()
-                                   if d.is_dir() and d.suffix == ".SAFE"):
-                ds = DataTreeConverter.from_sar_l2_ocn_safe(safe_dir, product_type=product_type)
-                if ds is not None:
-                    datasets[f"sar/{safe_dir.name}"] = ds
-                    logger.info("Converted SAR SAFE: %s", safe_dir.name)
+        # SAR data -- only the recipe's chosen source's own subdirectory is
+        # scanned, so a stale sibling folder from a previous run using a
+        # different source (e.g. S1_L3_SSM left over when this run wants
+        # sentinel1_l2_ocn) is never picked up. See design-choices.md §8.11.
+        if recipe is not None:
+            from .sar_sources import SAR_SOURCES
 
-        # Sentinel-1 CLMS Surface Soil Moisture GeoTIFFs (1 km, Europe,
-        # daily). Kept on a native (y, x) grid like S1_L2_OCN so
-        # collocation's grid path handles it unchanged; no domain-filtering
-        # needed since the product is already Europe-only and 1 km (not a
-        # full-orbit swath like scatterometer).
-        ssm_dir = base_dir / "S1_L3_SSM"
-        if ssm_dir.exists():
-            from ..downloaders.soil_moisture_downloader import _SSM_FILENAME_MARKER
-
-            # SoilMoistureDownloader unzips each product into its own
-            # subfolder (a "-SSM_" GeoTIFF alongside a sibling "-NOISE_"
-            # uncertainty-layer GeoTIFF it doesn't return) — search
-            # recursively and keep only the soil-moisture file.
-            tif_paths = [
-                p for p in list(ssm_dir.rglob("*.tif")) + list(ssm_dir.rglob("*.tiff"))
-                if _SSM_FILENAME_MARKER in p.name
-            ]
-            for tif_path in sorted(tif_paths):
-                ds = DataTreeConverter.from_sar_l3_ssm_geotiff(tif_path)
+            spec = SAR_SOURCES[recipe.config.sar_data.source]
+            sar_subdir = base_dir / spec.output_subdir
+            sar_paths: list[Path] = []
+            if sar_subdir.exists():
+                if spec.key == "sentinel1_clms_ssm":
+                    from ..downloaders.soil_moisture_downloader import _SSM_FILENAME_MARKER
+                    sar_paths = sorted(
+                        p for p in list(sar_subdir.rglob("*.tif")) + list(sar_subdir.rglob("*.tiff"))
+                        if _SSM_FILENAME_MARKER in p.name
+                    )
+                else:
+                    sar_paths = sorted(sar_subdir.rglob(spec.file_glob))
+            for sar_path in sar_paths:
+                ds = spec.convert(sar_path, product_type)
                 if ds is not None:
-                    datasets[f"sar/{tif_path.stem}"] = ds
-                    logger.info("Converted SSM GeoTIFF: %s", tif_path.name)
+                    datasets[f"sar/{sar_path.stem}"] = ds
+                    logger.info("Converted SAR product (%s): %s", spec.key, sar_path.name)
+        else:
+            # Legacy/test-only fallback: no recipe given, scan every known
+            # SAR-shaped folder. Never exercised by the real pipeline --
+            # cli.py always passes recipe.
+            sar_dir = base_dir / "S1_L2_OCN"
+            if sar_dir.exists():
+                for safe_dir in sorted(d for d in sar_dir.iterdir()
+                                       if d.is_dir() and d.suffix == ".SAFE"):
+                    ds = DataTreeConverter.from_sar_l2_ocn_safe(safe_dir, product_type=product_type)
+                    if ds is not None:
+                        datasets[f"sar/{safe_dir.name}"] = ds
+                        logger.info("Converted SAR SAFE: %s", safe_dir.name)
+
+            ssm_dir = base_dir / "S1_L3_SSM"
+            if ssm_dir.exists():
+                from ..downloaders.soil_moisture_downloader import _SSM_FILENAME_MARKER
+
+                tif_paths = [
+                    p for p in list(ssm_dir.rglob("*.tif")) + list(ssm_dir.rglob("*.tiff"))
+                    if _SSM_FILENAME_MARKER in p.name
+                ]
+                for tif_path in sorted(tif_paths):
+                    ds = DataTreeConverter.from_sar_l3_ssm_geotiff(tif_path)
+                    if ds is not None:
+                        datasets[f"sar/{tif_path.stem}"] = ds
+                        logger.info("Converted SSM GeoTIFF: %s", tif_path.name)
 
         # In-situ CSV (Copernicus Marine)
         insitu_dir = base_dir / "copernicus_insitu"

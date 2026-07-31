@@ -58,15 +58,24 @@ _CURRENTS_INSTRUMENT_TYPES = (
 )
 
 #: AMSR-E/2's combined coverage across NSIDC-0451 (ends 2023-12-31) and its
-#: replacement AU_Land_NRT_R02/AU_Land (both frozen 2025-09-01, per NSIDC's
-#: "AMSR2 SIPS stopped processing AMSR Unified data sets" notice) — the
-#: later of the two, since _download_amsr_ssm switches datasets at
-#: 2023-12-31 (see Task 7). ISO date string, compared against the
-#: recipe's temporal_bounds.end.
+#: replacement AU_Land (frozen 2025-09-01, per NSIDC's "AMSR2 SIPS stopped
+#: processing AMSR Unified data sets" notice; confirmed 2026-07-31 against
+#: NASA's live CMR catalog -- AU_Land's newest real granule is dated
+#: 2025-08-31T23:19) -- the later of the two, since _download_amsr_ssm
+#: switches datasets at 2023-12-31 (see Task 7). ISO date string, compared
+#: against the recipe's temporal_bounds.end.
+#:
+#: NOTE: "AU_Land_NRT_R02" (a differently-versioned, near-real-time variant
+#: of this collection) was used here until 2026-07-31 -- confirmed against
+#: CMR to hold only 3 granules total, all dated 2020-10-19 (an abandoned
+#: test batch), so every real recipe request against it silently returned
+#: 0 files and fell through to the G-Portal SFTP fallback. "AU_Land" (no
+#: suffix) is the real, actively-populated 237k+-granule archival
+#: collection and is what's actually queried now.
 _AMSR_COVERAGE_CUTOFF = "2025-09-01"
 
-#: NSIDC-0451's own coverage ends here; AU_Land_NRT_R02 picks up from
-#: roughly this point through _AMSR_COVERAGE_CUTOFF.
+#: NSIDC-0451's own coverage ends here; AU_Land picks up from roughly this
+#: point through _AMSR_COVERAGE_CUTOFF.
 _NSIDC_0451_CUTOFF = "2023-12-31"
 
 # ASCAT's collocation spec lives under its data_type tag "scatterometer_ssm"
@@ -339,54 +348,21 @@ class DataOrchestrator:
     # ------------------------------------------------------------------
 
     def _download_sar(self) -> bool:
+        from .sar_sources import SAR_SOURCES
+
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
         temp   = cfg.temporal_bounds
-
-        if cfg.sar_data.product_level == "L3_SSM":
-            from ..downloaders.soil_moisture_downloader import SoilMoistureDownloader
-
-            out_dir = self.base_dir / "S1_L3_SSM"
-            try:
-                ssm_dl = SoilMoistureDownloader(
-                    output_dir=out_dir,
-                    dry_run=self.dry_run,
-                    force_download=self.force_download,
-                )
-                paths = ssm_dl.download(
-                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
-                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                    start=temp.start,      end=temp.end,
-                )
-                self._cleanup_if_empty(out_dir)
-                self.metadata["downloads"]["sar"] = {
-                    "status": "dry_run" if self.dry_run else "success",
-                    "files":  [str(p) for p in paths],
-                }
-                return True
-            except Exception as exc:
-                msg = f"SAR (CLMS SSM) download failed: {exc}"
-                logger.error(msg)
-                self.metadata["errors"].append(msg)
-                self.metadata["downloads"]["sar"] = {"status": "failed", "error": msg}
-                return False
-
-        from ..downloaders.sar_downloader import SARDownloader
-
-        out_dir = self.base_dir / "S1_L2_OCN"
+        spec   = SAR_SOURCES[cfg.sar_data.source]
+        out_dir = self.base_dir / spec.output_subdir
 
         try:
-            dl = SARDownloader(
-                output_dir=out_dir,
-                dry_run=self.dry_run,
-                force_download=self.force_download,
-            )
+            dl = spec.build_downloader(out_dir, self.dry_run, self.force_download)
             paths = dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=temp.start,      end=temp.end,
-                modes=cfg.sar_data.swath_mode or None,
-                limit=cfg.sar_data.max_downloads,
+                **spec.extra_download_kwargs(cfg.sar_data),
             )
             self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["sar"] = {
@@ -395,7 +371,7 @@ class DataOrchestrator:
             }
             return True
         except Exception as exc:
-            msg = f"SAR download failed: {exc}"
+            msg = f"SAR ({cfg.sar_data.source}) download failed: {exc}"
             logger.error(msg)
             self.metadata["errors"].append(msg)
             self.metadata["downloads"]["sar"] = {"status": "failed", "error": msg}
@@ -589,7 +565,7 @@ class DataOrchestrator:
             if not paths and coverage_cutoff and temp.end > coverage_cutoff:
                 # Use human-readable name for AMSR datasets for clarity
                 display_name = (
-                    "AMSR-E/2" if dataset in ("NSIDC-0451", "AU_Land_NRT_R02", "AU_Land") else dataset
+                    "AMSR-E/2" if dataset in ("NSIDC-0451", "AU_Land") else dataset
                 )
                 self.metadata["notices"].append(
                     f"{display_name}: requested range ends {temp.end}, after this "
@@ -613,7 +589,7 @@ class DataOrchestrator:
         if temp.end <= _NSIDC_0451_CUTOFF:
             dataset = "NSIDC-0451"
         else:
-            dataset = "AU_Land_NRT_R02"
+            dataset = "AU_Land"
         ok = self._download_earthdata_ssm(
             source, dataset=dataset, version=None, out_subdir="amsr_ssm",
             coverage_cutoff=_AMSR_COVERAGE_CUTOFF,

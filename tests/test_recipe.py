@@ -50,6 +50,59 @@ class TestRecipeConfigDefaults:
 
 
 # ---------------------------------------------------------------------------
+# SARDataSpec.source
+# ---------------------------------------------------------------------------
+
+class TestSARDataSpecSource:
+    def test_default_source_is_sentinel1_l2_ocn(self):
+        spec = SARDataSpec()
+        assert spec.source == "sentinel1_l2_ocn"
+
+    def test_to_dict_has_source_not_satellite_or_product_level(self):
+        spec = SARDataSpec(source="sentinel1_clms_ssm")
+        d = spec.to_dict()
+        assert d["source"] == "sentinel1_clms_ssm"
+        assert "satellite" not in d
+        assert "product_level" not in d
+
+    def test_download_kwargs_default_empty_dict(self):
+        spec = SARDataSpec()
+        assert spec.download_kwargs == {}
+
+    def test_from_yaml_reads_source_field(self, tmp_path):
+        yaml_path = tmp_path / "r.yaml"
+        yaml_path.write_text(
+            "name: t\nvariable: soil_moisture\n"
+            "sar_data:\n  source: sentinel1_clms_ssm\n  max_downloads: 3\n"
+        )
+        recipe = Recipe.from_yaml(yaml_path)
+        assert recipe.config.sar_data.source == "sentinel1_clms_ssm"
+        assert recipe.config.sar_data.max_downloads == 3
+
+    def test_from_yaml_missing_source_defaults_to_sentinel1_l2_ocn(self, tmp_path):
+        yaml_path = tmp_path / "r.yaml"
+        yaml_path.write_text("name: t\nvariable: wind\n")
+        recipe = Recipe.from_yaml(yaml_path)
+        assert recipe.config.sar_data.source == "sentinel1_l2_ocn"
+
+    def test_unknown_source_raises_value_error(self, tmp_path):
+        yaml_path = tmp_path / "r.yaml"
+        yaml_path.write_text(
+            "name: t\nvariable: wind\nsar_data:\n  source: not_a_real_source\n"
+        )
+        with pytest.raises(ValueError, match="Unknown SAR source 'not_a_real_source'"):
+            Recipe.from_yaml(yaml_path)
+
+    def test_source_not_valid_for_this_variable_raises_value_error(self, tmp_path):
+        yaml_path = tmp_path / "r.yaml"
+        yaml_path.write_text(
+            "name: t\nvariable: wind\nsar_data:\n  source: sentinel1_clms_ssm\n"
+        )
+        with pytest.raises(ValueError, match="only valid for"):
+            Recipe.from_yaml(yaml_path)
+
+
+# ---------------------------------------------------------------------------
 # YAML roundtrip
 # ---------------------------------------------------------------------------
 

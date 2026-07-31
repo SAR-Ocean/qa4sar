@@ -2977,6 +2977,178 @@ class TestPlotCollocationDiagnostics:
         assert len(set(matched_markers)) >= 2
 
 
+def _small_soil_moisture_scene(lon_center, lat_center, time):
+    y, x = 3, 3
+    lon2d, lat2d = np.meshgrid(
+        np.linspace(lon_center - 0.2, lon_center + 0.2, x),
+        np.linspace(lat_center - 0.2, lat_center + 0.2, y),
+    )
+    sm = np.linspace(0.1, 0.3, y * x).reshape(y, x)
+    return xr.Dataset(
+        {"sarSSM": (("y", "x"), sm)},
+        coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d), "time": pd.Timestamp(time)},
+    )
+
+
+@pytest.fixture
+def two_scene_soil_moisture_datatree():
+    """Two small, non-overlapping NISAR-like SAR scenes, each tiny
+    relative to a continent-scale recipe bbox, plus one ISMN point near
+    the first scene -- used to test the registry-driven per-scene-split
+    decision and the diagnostics-plot auto-zoom."""
+    from sar_validation.core.datatree_converter import DataTreeConverter
+
+    # sceneB sits a couple of degrees from sceneA -- like adjacent
+    # NISAR orbit segments from the same pass, not scattered edge-to-edge
+    # across the whole (60-degree-wide) recipe bbox, so the auto-zoom
+    # test below has something meaningful to zoom in past.
+    scene_a = _small_soil_moisture_scene(-120.0, 45.0, "2026-06-17T12:00:00")
+    scene_b = _small_soil_moisture_scene(-118.0, 44.0, "2026-06-17T13:00:00")
+    ismn_ds = xr.Dataset(
+        {"SOIL_MOISTURE": ("point", np.array([0.15, 0.18]))},
+        coords={
+            "lon": ("point", np.array([-120.05, -119.95])),
+            "lat": ("point", np.array([44.95, 45.05])),
+            "time": ("point", pd.date_range("2026-06-17T12:05", periods=2, freq="5min")),
+        },
+        attrs={"platform_type": "ismn"},
+    )
+    datatree = DataTreeConverter.to_datatree({
+        "sar/sceneA": scene_a,
+        "sar/sceneB": scene_b,
+        "validation/ismn": ismn_ds,
+    })
+    collocation_ds = xr.Dataset({
+        "sar_sarSSM":        ("collocation", np.array([0.14, 0.19])),
+        "val_SOIL_MOISTURE": ("collocation", np.array([0.15, 0.18])),
+        "val_source":        ("collocation", ["ismn", "ismn"]),
+        "sar_scene_name":    ("collocation", ["sceneA", "sceneA"]),
+        "val_lon":           ("collocation", np.array([-120.05, -119.95])),
+        "val_lat":           ("collocation", np.array([44.95, 45.05])),
+        "val_id":            ("collocation", ["i0", "i1"]),
+    })
+    collocation_ds = collocation_ds.assign_coords(
+        val_time=("collocation", pd.date_range("2026-06-17T12:05", periods=2, freq="5min")),
+    )
+    return datatree, collocation_ds
+
+
+def _soil_moisture_recipe(source):
+    from sar_validation.core.recipe import (
+        GeographicBounds,
+        Recipe,
+        RecipeConfig,
+        SARDataSpec,
+        ValidationDataSource,
+    )
+    config = RecipeConfig(
+        name="test_recipe",
+        variable="soil_moisture",
+        geographic_bounds=GeographicBounds(min_lon=-125.0, max_lon=-65.0, min_lat=25.0, max_lat=50.0),
+        validation_sources=[ValidationDataSource(source_type="ismn")],
+        sar_data=SARDataSpec(source=source),
+    )
+    return Recipe(config=config)
+
+
+class TestPlotCollocationDiagnosticsSplitByScenePerSource:
+    def test_sentinel1_clms_ssm_splits_into_one_plot_per_scene(
+        self, two_scene_soil_moisture_datatree, tmp_path
+    ):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = two_scene_soil_moisture_datatree
+        recipe = _soil_moisture_recipe("sentinel1_clms_ssm")
+
+        result = plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
+        plt.close("all")
+
+        assert isinstance(result, list)
+        assert len(result) == 2
+
+    def test_nisar_sme2_keeps_one_combined_plot(
+        self, two_scene_soil_moisture_datatree, tmp_path
+    ):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = two_scene_soil_moisture_datatree
+        recipe = _soil_moisture_recipe("nisar_sme2")
+
+        result = plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
+        plt.close("all")
+
+        assert not isinstance(result, list)
+        assert result is not None
+
+
+class TestPlotCollocationDiagnosticsAutoZoom:
+    def test_small_scene_zooms_in_past_the_full_recipe_bbox(
+        self, two_scene_soil_moisture_datatree, tmp_path, monkeypatch
+    ):
+        """The recipe bbox spans 60 degrees of longitude; each SAR scene
+        is <1 degree wide. The plotted extent must be far tighter than
+        the full bbox, not always the full bbox."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = two_scene_soil_moisture_datatree
+        recipe = _soil_moisture_recipe("nisar_sme2")
+
+        captured_extents = []
+        import cartopy.mpl.geoaxes
+
+        original_set_extent = cartopy.mpl.geoaxes.GeoAxes.set_extent
+
+        def recording_set_extent(self, extent, *args, **kwargs):
+            captured_extents.append(extent)
+            return original_set_extent(self, extent, *args, **kwargs)
+
+        monkeypatch.setattr(cartopy.mpl.geoaxes.GeoAxes, "set_extent", recording_set_extent)
+        plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
+        plt.close("all")
+
+        assert captured_extents, "expected at least one set_extent call"
+        lon0, lon1, _lat0, _lat1 = captured_extents[0]
+        assert (lon1 - lon0) < 20.0, (
+            f"expected a zoomed-in extent (<20 degrees wide), got {lon1 - lon0}"
+        )
+
+    def test_zoom_never_exceeds_the_recipe_bounds(
+        self, two_scene_soil_moisture_datatree, tmp_path, monkeypatch
+    ):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds = two_scene_soil_moisture_datatree
+        recipe = _soil_moisture_recipe("nisar_sme2")
+
+        captured_extents = []
+        import cartopy.mpl.geoaxes
+
+        original_set_extent = cartopy.mpl.geoaxes.GeoAxes.set_extent
+
+        def recording_set_extent(self, extent, *args, **kwargs):
+            captured_extents.append(extent)
+            return original_set_extent(self, extent, *args, **kwargs)
+
+        monkeypatch.setattr(cartopy.mpl.geoaxes.GeoAxes, "set_extent", recording_set_extent)
+        plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
+        plt.close("all")
+
+        bounds = recipe.config.geographic_bounds
+        lon0, lon1, lat0, lat1 = captured_extents[0]
+        assert lon0 >= bounds.min_lon - 1e-6
+        assert lon1 <= bounds.max_lon + 1e-6
+        assert lat0 >= bounds.min_lat - 1e-6
+        assert lat1 <= bounds.max_lat + 1e-6
+
+
 class TestPlotCollocationDiagnosticsNoValidationDataAtAll:
     """A validation source that collected zero files (e.g. ISMN awaiting a
     manually-downloaded archive) means the DataTree has SAR data but no
@@ -4213,7 +4385,12 @@ class TestValidationReportSoilMoistureGeographicSizing:
     full native extent (e.g. CLMS SSM's all-of-mainland-Europe grid)
     instead of the recipe's requested bounding box. Fixed per Lotte's
     feedback: validation_report passes the recipe's geographic_bounds
-    through so plot_geographic clamps each scene panel to it.
+    through so plot_geographic clamps each scene panel to it -- but only
+    for sources whose SARSourceSpec.geographic_plot_clamp_to_bounds opts
+    in (sentinel1_clms_ssm); a source like nisar_sme2, whose own native
+    grid is already tight around real data, must NOT be clamped to a much
+    larger recipe bbox, or its real scene shrinks into a small corner of
+    an otherwise-empty panel (see the two tests immediately below).
 
     Point sizing itself was originally a flat point_size=10, but that made
     sparse in-situ ISMN points too small and dense scatterometer/radiometer
@@ -4392,13 +4569,17 @@ class TestValidationReportSoilMoistureGeographicSizing:
 
         assert captured.get("point_size") == {"layer_vs_layer": 5, "point_vs_layer": 25}
 
-    def test_soil_moisture_recipe_passes_recipe_geographic_bounds(self, tmp_path, monkeypatch):
+    def test_sentinel1_clms_ssm_recipe_passes_recipe_geographic_bounds(self, tmp_path, monkeypatch):
+        """sentinel1_clms_ssm's raw grid covers all of mainland Europe
+        regardless of what was requested (mostly NaN outside that day's
+        real swath) -- clamping to the recipe's own bbox is required, or
+        every scene panel would show far more than was asked for."""
         import warnings
 
         import matplotlib.pyplot as plt
 
         import sar_validation.core.visualization as viz
-        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, SARDataSpec
 
         datatree, coll = self._soil_moisture_datatree_and_collocation()
 
@@ -4413,6 +4594,7 @@ class TestValidationReportSoilMoistureGeographicSizing:
         bounds = GeographicBounds(min_lon=-10.0, max_lon=30.0, min_lat=35.0, max_lat=60.0)
         recipe = Recipe(config=RecipeConfig(
             name="soil_moisture_test", variable="soil_moisture", geographic_bounds=bounds,
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
         ))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
@@ -4420,6 +4602,40 @@ class TestValidationReportSoilMoistureGeographicSizing:
         plt.close("all")
 
         assert captured.get("geographic_bounds") is bounds
+
+    def test_nisar_sme2_recipe_does_not_clamp_to_geographic_bounds(self, tmp_path, monkeypatch):
+        """nisar_sme2's own native grid is already tight around real data
+        -- clamping to a much larger recipe bbox would shrink the actual
+        scene into a small corner of an otherwise-empty panel instead of
+        showing it at a legible scale."""
+        import warnings
+
+        import matplotlib.pyplot as plt
+
+        import sar_validation.core.visualization as viz
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, SARDataSpec
+
+        datatree, coll = self._soil_moisture_datatree_and_collocation()
+
+        captured = {}
+        original = viz.plot_geographic
+
+        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
+            captured["geographic_bounds"] = kwargs.get("geographic_bounds")
+            return original(datatree_, coll_, sar_var, val_var, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_geographic", spy)
+        bounds = GeographicBounds(min_lon=-10.0, max_lon=30.0, min_lat=35.0, max_lat=60.0)
+        recipe = Recipe(config=RecipeConfig(
+            name="soil_moisture_test", variable="soil_moisture", geographic_bounds=bounds,
+            sar_data=SARDataSpec(source="nisar_sme2"),
+        ))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
+
+        assert captured.get("geographic_bounds") is None
 
     def test_other_variables_do_not_get_geographic_bounds(self, geo_datatree_and_collocation, tmp_path, monkeypatch):
         """Scoped deliberately to soil_moisture only — wind/currents/waves

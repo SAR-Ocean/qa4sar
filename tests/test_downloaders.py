@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -698,6 +699,97 @@ class TestAuthenticateSmosFtp:
 
 
 # ---------------------------------------------------------------------------
+# Tests for authenticate_earthdata()
+# ---------------------------------------------------------------------------
+
+class TestAuthenticateEarthdata:
+    def _fake_earthaccess_module(self):
+        return MagicMock()
+
+    def test_explicit_args_win_over_everything(self, monkeypatch, tmp_path, fake_keyring):
+        from sar_validation.downloaders.base import authenticate_earthdata
+
+        monkeypatch.setenv("EARTHDATA_USERNAME", "env_user")
+        monkeypatch.setenv("EARTHDATA_PASSWORD", "env_pass")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        fake_keyring[("sar-validation-earthdata", "username")] = "kr_user"
+        fake_keyring[("sar-validation-earthdata", "password")] = "kr_pass"
+        fake_earthaccess = self._fake_earthaccess_module()
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            authenticate_earthdata("explicit_user", "explicit_pass")
+
+        assert os.environ["EARTHDATA_USERNAME"] == "explicit_user"
+        assert os.environ["EARTHDATA_PASSWORD"] == "explicit_pass"
+        fake_earthaccess.login.assert_called_once_with(strategy="environment")
+
+    def test_env_vars_used_when_args_absent(self, monkeypatch, tmp_path, fake_keyring):
+        from sar_validation.downloaders.base import authenticate_earthdata
+
+        monkeypatch.setenv("EARTHDATA_USERNAME", "env_user")
+        monkeypatch.setenv("EARTHDATA_PASSWORD", "env_pass")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        fake_earthaccess = self._fake_earthaccess_module()
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            authenticate_earthdata()
+
+        fake_earthaccess.login.assert_called_once_with(strategy="environment")
+
+    def test_uses_keyring_when_no_args_or_env(self, monkeypatch, tmp_path, fake_keyring):
+        from sar_validation.downloaders.base import authenticate_earthdata
+
+        monkeypatch.delenv("EARTHDATA_USERNAME", raising=False)
+        monkeypatch.delenv("EARTHDATA_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        fake_keyring[("sar-validation-earthdata", "username")] = "kr_user"
+        fake_keyring[("sar-validation-earthdata", "password")] = "kr_pass"
+        fake_earthaccess = self._fake_earthaccess_module()
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            authenticate_earthdata()
+
+        assert os.environ["EARTHDATA_USERNAME"] == "kr_user"
+        assert os.environ["EARTHDATA_PASSWORD"] == "kr_pass"
+        fake_earthaccess.login.assert_called_once_with(strategy="environment")
+
+    def test_falls_back_to_legacy_netrc_and_migrates_to_keyring(self, monkeypatch, tmp_path, fake_keyring):
+        from sar_validation.downloaders.base import authenticate_earthdata
+
+        monkeypatch.delenv("EARTHDATA_USERNAME", raising=False)
+        monkeypatch.delenv("EARTHDATA_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        (tmp_path / ".netrc").write_text(
+            "machine urs.earthdata.nasa.gov\nlogin file_user\npassword file_pass\n"
+        )
+        fake_earthaccess = self._fake_earthaccess_module()
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            authenticate_earthdata()
+
+        assert os.environ["EARTHDATA_USERNAME"] == "file_user"
+        assert os.environ["EARTHDATA_PASSWORD"] == "file_pass"
+        assert fake_keyring[("sar-validation-earthdata", "username")] == "file_user"
+        assert fake_keyring[("sar-validation-earthdata", "password")] == "file_pass"
+
+    def test_nothing_resolves_falls_back_to_bare_earthaccess_login(self, monkeypatch, tmp_path, fake_keyring):
+        """No explicit args, no env vars, no keyring, no ~/.netrc -- must
+        not raise; falls back to earthaccess's own login() (netrc/
+        interactive-prompt resolution), preserving today's behaviour."""
+        from sar_validation.downloaders.base import authenticate_earthdata
+
+        monkeypatch.delenv("EARTHDATA_USERNAME", raising=False)
+        monkeypatch.delenv("EARTHDATA_PASSWORD", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        fake_earthaccess = self._fake_earthaccess_module()
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            authenticate_earthdata()
+
+        fake_earthaccess.login.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
 # Tests for set_credential()
 # ---------------------------------------------------------------------------
 
@@ -714,6 +806,7 @@ class TestSetCredential:
             ("osi_saf", "sar-validation-osi-saf"),
             ("gportal", "sar-validation-gportal"),
             ("smos", "sar-validation-smos"),
+            ("earthdata", "sar-validation-earthdata"),
         ],
     )
     def test_uses_the_expected_service_name_per_credential_set(
@@ -3717,7 +3810,50 @@ class TestOrchestratorForceDownloadWiring:
 # ---------------------------------------------------------------------------
 
 class TestEarthdataSoilMoistureDownloader:
-    def test_dry_run_prints_params_without_network(self, tmp_path, capsys):
+    def test_dry_run_lists_found_granules_and_does_not_download(self, tmp_path, monkeypatch, capsys):
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
+            EarthdataSoilMoistureDownloader,
+        )
+
+        dl = EarthdataSoilMoistureDownloader(
+            dataset="NISAR_L3_PR_SME2_BETA", output_dir=tmp_path, dry_run=True,
+        )
+        monkeypatch.setenv("EARTHDATA_USERNAME", "test_user")
+        monkeypatch.setenv("EARTHDATA_PASSWORD", "test_pass")
+
+        granule = MagicMock()
+        granule.data_links.return_value = ["https://example.com/NISAR_L3_PR_SME2_20260301.h5"]
+        granule.size.return_value = 42.5
+
+        fake_earthaccess = MagicMock()
+        fake_earthaccess.search_data.return_value = [granule]
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            out = dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        assert out == []
+        fake_earthaccess.login.assert_called_once()
+        fake_earthaccess.search_data.assert_called_once_with(
+            short_name="NISAR_L3_PR_SME2_BETA",
+            version=None,
+            bounding_box=(-10.0, 40.0, 10.0, 55.0),
+            temporal=("2026-07-01T00:00:00", "2026-07-02T00:00:00"),
+        )
+        fake_earthaccess.download.assert_not_called()
+        captured = capsys.readouterr().out
+        assert "Found 1 NISAR_L3_PR_SME2_BETA granule(s)" in captured
+        assert "NISAR_L3_PR_SME2_20260301.h5" in captured
+        assert "42.5 MB" in captured
+        assert "DRY RUN" in captured
+
+    def test_dry_run_reports_zero_granules_found(self, tmp_path, monkeypatch, capsys):
+        from unittest.mock import patch
+
         from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
             EarthdataSoilMoistureDownloader,
         )
@@ -3725,16 +3861,143 @@ class TestEarthdataSoilMoistureDownloader:
         dl = EarthdataSoilMoistureDownloader(
             dataset="NSIDC-0451", output_dir=tmp_path, dry_run=True,
         )
-        out = dl.download(
-            min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
-            start="2026-07-01", end="2026-07-02",
-        )
-        assert out == []
-        captured = capsys.readouterr().out
-        assert "NSIDC-0451" in captured
-        assert "DRY RUN" in captured
+        monkeypatch.setenv("EARTHDATA_USERNAME", "test_user")
+        monkeypatch.setenv("EARTHDATA_PASSWORD", "test_pass")
 
-    def test_search_and_download_amsr(self, tmp_path):
+        fake_earthaccess = MagicMock()
+        fake_earthaccess.search_data.return_value = []
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            out = dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        assert out == []
+        fake_earthaccess.download.assert_not_called()
+        captured = capsys.readouterr().out
+        assert "Found 0 NSIDC-0451 granule(s)" in captured
+
+    def test_multiple_candidates_query_and_merge_all(self, tmp_path, monkeypatch, capsys):
+        """A list of (short_name, version) candidates -- e.g. NISAR SME2's
+        beta/provisional product-maturity transition, where the underlying
+        collection changed partway through the mission with no temporal
+        overlap -- must all be queried and their granules merged into one
+        combined result, not just the first candidate."""
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
+            EarthdataSoilMoistureDownloader,
+        )
+
+        dl = EarthdataSoilMoistureDownloader(
+            dataset=[("NISAR_L3_SME2_BETA_V1", "1"), ("NISAR_L3_SME2_PROVISIONAL_V1", "1")],
+            output_dir=tmp_path,
+        )
+        monkeypatch.setenv("EARTHDATA_USERNAME", "test_user")
+        monkeypatch.setenv("EARTHDATA_PASSWORD", "test_pass")
+
+        fake_earthaccess = MagicMock()
+
+        def fake_search_data(short_name, **kwargs):
+            return {"NISAR_L3_SME2_BETA_V1": [], "NISAR_L3_SME2_PROVISIONAL_V1": ["granuleA", "granuleB"]}[short_name]
+
+        fake_earthaccess.search_data.side_effect = fake_search_data
+        fake_earthaccess.download.return_value = [
+            str(tmp_path / "fileA.h5"), str(tmp_path / "fileB.h5"),
+        ]
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            result = dl.download(
+                min_lon=0.0, max_lon=30.0, min_lat=55.0, max_lat=70.0,
+                start="2026-06-17", end="2026-06-18",
+            )
+
+        assert fake_earthaccess.search_data.call_count == 2
+        fake_earthaccess.search_data.assert_any_call(
+            short_name="NISAR_L3_SME2_BETA_V1", version="1",
+            bounding_box=(0.0, 55.0, 30.0, 70.0),
+            temporal=("2026-06-17T00:00:00", "2026-06-18T00:00:00"),
+        )
+        fake_earthaccess.search_data.assert_any_call(
+            short_name="NISAR_L3_SME2_PROVISIONAL_V1", version="1",
+            bounding_box=(0.0, 55.0, 30.0, 70.0),
+            temporal=("2026-06-17T00:00:00", "2026-06-18T00:00:00"),
+        )
+        # earthaccess.download() must be called with the MERGED granule
+        # list from both candidates, not just one.
+        fake_earthaccess.download.assert_called_once_with(
+            ["granuleA", "granuleB"], str(tmp_path),
+        )
+        assert result == [tmp_path / "fileA.h5", tmp_path / "fileB.h5"]
+        captured = capsys.readouterr().out
+        assert "Found 0 NISAR_L3_SME2_BETA_V1 granule(s)" in captured
+        assert "Found 2 NISAR_L3_SME2_PROVISIONAL_V1 granule(s)" in captured
+
+    def test_multiple_candidates_dry_run_lists_all_without_downloading(self, tmp_path, monkeypatch, capsys):
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
+            EarthdataSoilMoistureDownloader,
+        )
+
+        dl = EarthdataSoilMoistureDownloader(
+            dataset=[("NISAR_L3_SME2_BETA_V1", "1"), ("NISAR_L3_SME2_PROVISIONAL_V1", "1")],
+            output_dir=tmp_path, dry_run=True,
+        )
+        monkeypatch.setenv("EARTHDATA_USERNAME", "test_user")
+        monkeypatch.setenv("EARTHDATA_PASSWORD", "test_pass")
+
+        fake_earthaccess = MagicMock()
+
+        def fake_search_data(short_name, **kwargs):
+            return {"NISAR_L3_SME2_BETA_V1": [], "NISAR_L3_SME2_PROVISIONAL_V1": ["granuleA"]}[short_name]
+
+        fake_earthaccess.search_data.side_effect = fake_search_data
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            result = dl.download(
+                min_lon=0.0, max_lon=30.0, min_lat=55.0, max_lat=70.0,
+                start="2026-06-17", end="2026-06-18",
+            )
+
+        assert result == []
+        fake_earthaccess.download.assert_not_called()
+        captured = capsys.readouterr().out
+        assert "Found 0 NISAR_L3_SME2_BETA_V1 granule(s)" in captured
+        assert "Found 1 NISAR_L3_SME2_PROVISIONAL_V1 granule(s)" in captured
+        assert "[DRY RUN] Would download 1 granule(s)" in captured
+
+    def test_single_dataset_string_still_works_unchanged(self, tmp_path, monkeypatch):
+        """Backward compatibility: a plain string `dataset` (used by
+        AMSR2/SMAP) is equivalent to a single-candidate list."""
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
+            EarthdataSoilMoistureDownloader,
+        )
+
+        dl = EarthdataSoilMoistureDownloader(dataset="SPL2SMP_E", version="006", output_dir=tmp_path)
+        monkeypatch.setenv("EARTHDATA_USERNAME", "test_user")
+        monkeypatch.setenv("EARTHDATA_PASSWORD", "test_pass")
+
+        fake_earthaccess = MagicMock()
+        fake_earthaccess.search_data.return_value = []
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            result = dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        assert result == []
+        fake_earthaccess.search_data.assert_called_once_with(
+            short_name="SPL2SMP_E", version="006",
+            bounding_box=(-10.0, 40.0, 10.0, 55.0),
+            temporal=("2026-07-01T00:00:00", "2026-07-02T00:00:00"),
+        )
+
+    def test_search_and_download_amsr(self, tmp_path, monkeypatch):
         from unittest.mock import patch
 
         from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
@@ -3742,6 +4005,8 @@ class TestEarthdataSoilMoistureDownloader:
         )
 
         dl = EarthdataSoilMoistureDownloader(dataset="NSIDC-0451", output_dir=tmp_path)
+        monkeypatch.setenv("EARTHDATA_USERNAME", "test_user")
+        monkeypatch.setenv("EARTHDATA_PASSWORD", "test_pass")
 
         fake_earthaccess = MagicMock()
         fake_earthaccess.search_data.return_value = ["granule1", "granule2"]
@@ -3764,7 +4029,7 @@ class TestEarthdataSoilMoistureDownloader:
         )
         assert result == [tmp_path / "file1.h5", tmp_path / "file2.h5"]
 
-    def test_search_with_version_for_smap(self, tmp_path):
+    def test_search_with_version_for_smap(self, tmp_path, monkeypatch):
         from unittest.mock import patch
 
         from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
@@ -3774,6 +4039,8 @@ class TestEarthdataSoilMoistureDownloader:
         dl = EarthdataSoilMoistureDownloader(
             dataset="SPL2SMP_E", version="006", output_dir=tmp_path,
         )
+        monkeypatch.setenv("EARTHDATA_USERNAME", "test_user")
+        monkeypatch.setenv("EARTHDATA_PASSWORD", "test_pass")
 
         fake_earthaccess = MagicMock()
         fake_earthaccess.search_data.return_value = []

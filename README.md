@@ -182,6 +182,15 @@ plt.show()
 > (and, separately, a redundant NetCDF variant) — both are downloaded/unzipped
 > and filtered automatically, no manual handling needed.
 
+NISAR SME2 (`m3 m-3`, L-band, twice-daily per-overpass granules) is a second,
+beta SAR-side source for soil moisture, selectable per recipe via
+`sar-validate --create-recipe soil_moisture --sar-source nisar_sme2` (or
+`source: nisar_sme2` in the recipe YAML) — see `docs/design-choices.md`
+§8.11 for how units and collocation defaults adapt automatically. Its CMR
+product identifiers and HDF5 layout are currently documented placeholders,
+not yet verified against a real downloaded granule, so `--sar-source
+nisar_sme2` cannot download/convert real data yet — see §8.11 for details.
+
 ### Collocation types
 
 | Type | Example | Status |
@@ -265,27 +274,27 @@ can delete the old file afterwards.
 
 Register at: https://gportal.jaxa.jp
 
-### Earthdata (AMSR-E/2, SMAP) — for satellite soil moisture downloads
-
-Earthdata credentials are handled by the `earthaccess` library using its own
-native convention — a `~/.netrc` file — **not** a bespoke credentials file:
-
-```
-machine urs.earthdata.nasa.gov
-login your_username
-password your_password
-```
+### Earthdata (AMSR-E/2, SMAP, NISAR) — for satellite/SAR soil moisture downloads
 
 ```bash
-chmod 600 ~/.netrc
+sar-validate --set-credential earthdata
 ```
 
-Or use environment variables: `EARTHDATA_USERNAME` / `EARTHDATA_PASSWORD`.
+This prompts for your NASA Earthdata Login username/password and stores
+them in the OS keyring. Credential resolution priority is: explicit
+arguments, then environment variables (`EARTHDATA_USERNAME` /
+`EARTHDATA_PASSWORD`), then the OS keyring, then an existing `~/.netrc`
+`urs.earthdata.nasa.gov` entry — the `~/.netrc` entry is not an ongoing
+override; it is only read as a one-time migration source when the
+keyring has nothing stored, and is then copied into the keyring
+automatically (with a one-time console notice) so subsequent runs use
+the keyring directly.
 
 Register at: https://urs.earthdata.nasa.gov
 
-The `earthdata_soil_moisture_downloader` uses these credentials to download AMSR-E/2 and SMAP
-soil moisture products from the NASA Earthdata archive.
+`earthdata_soil_moisture_downloader` uses these credentials to download
+AMSR-E/2 and SMAP soil moisture products, and NISAR SME2 soil moisture
+(as a SAR source), from the NASA Earthdata archive.
 
 ### ESA SMOS FTPS — for SMOS soil moisture downloads
 

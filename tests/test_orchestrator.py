@@ -16,20 +16,20 @@ from sar_validation.core.recipe import (
 )
 
 
-def _recipe(product_level: str) -> Recipe:
+def _recipe(source: str) -> Recipe:
     cfg = RecipeConfig(
         name="test",
-        variable="soil_moisture" if product_level == "L3_SSM" else "wind",
+        variable="soil_moisture" if source == "sentinel1_clms_ssm" else "wind",
         geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
         temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
-        sar_data=SARDataSpec(product_level=product_level),
+        sar_data=SARDataSpec(source=source),
     )
     return Recipe(cfg)
 
 
 class TestCleanupIfEmpty:
     def test_removes_dir_with_no_files_including_nested_empty_subdirs(self, tmp_path):
-        recipe = _recipe("L2_OCN")
+        recipe = _recipe("sentinel1_l2_ocn")
         orchestrator = DataOrchestrator(recipe, dry_run=True)
         empty_dir = tmp_path / "empty"
         (empty_dir / "nested").mkdir(parents=True)
@@ -39,7 +39,7 @@ class TestCleanupIfEmpty:
         assert not empty_dir.exists()
 
     def test_keeps_dir_containing_a_file(self, tmp_path):
-        recipe = _recipe("L2_OCN")
+        recipe = _recipe("sentinel1_l2_ocn")
         orchestrator = DataOrchestrator(recipe, dry_run=True)
         populated_dir = tmp_path / "populated"
         populated_dir.mkdir()
@@ -51,7 +51,7 @@ class TestCleanupIfEmpty:
         assert (populated_dir / "data.nc").exists()
 
     def test_noop_when_dir_does_not_exist(self, tmp_path):
-        recipe = _recipe("L2_OCN")
+        recipe = _recipe("sentinel1_l2_ocn")
         orchestrator = DataOrchestrator(recipe, dry_run=True)
         missing_dir = tmp_path / "missing"
 
@@ -60,9 +60,9 @@ class TestCleanupIfEmpty:
         assert not missing_dir.exists()
 
 
-class TestDownloadSarProductLevelBranch:
+class TestDownloadSarSourceBranch:
     def test_l3_ssm_uses_soil_moisture_downloader(self, tmp_path):
-        recipe = _recipe("L3_SSM")
+        recipe = _recipe("sentinel1_clms_ssm")
         orchestrator = DataOrchestrator(recipe, dry_run=True)
         orchestrator.base_dir = tmp_path
 
@@ -80,7 +80,7 @@ class TestDownloadSarProductLevelBranch:
         assert mock_cls.call_args.kwargs["output_dir"] == tmp_path / "S1_L3_SSM"
 
     def test_l2_ocn_uses_sar_downloader(self, tmp_path):
-        recipe = _recipe("L2_OCN")
+        recipe = _recipe("sentinel1_l2_ocn")
         orchestrator = DataOrchestrator(recipe, dry_run=True)
         orchestrator.base_dir = tmp_path
 
@@ -98,7 +98,7 @@ class TestDownloadSarProductLevelBranch:
         assert mock_cls.call_args.kwargs["output_dir"] == tmp_path / "S1_L2_OCN"
 
     def test_l3_ssm_failure_is_recorded_in_metadata(self, tmp_path):
-        recipe = _recipe("L3_SSM")
+        recipe = _recipe("sentinel1_clms_ssm")
         orchestrator = DataOrchestrator(recipe, dry_run=True)
         orchestrator.base_dir = tmp_path
 
@@ -265,7 +265,7 @@ class TestDownloadTemporalPadding:
             name="test", variable="soil_moisture",
             geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
             temporal_bounds=TemporalBounds("2026-02-01", "2026-02-03"),
-            sar_data=SARDataSpec(product_level="L3_SSM"),
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
             validation_sources=[
                 ValidationDataSource(source_type="ascat_ssm"),
                 ValidationDataSource(source_type="ismn"),
@@ -433,7 +433,7 @@ class TestIsmnDownloadStatusReporting:
 
 class TestScatterometerHandlerCleansUpEmptyOutputDir:
     def test_removes_output_dir_when_downloader_produced_no_files(self, tmp_path):
-        recipe = _recipe("L2_OCN")
+        recipe = _recipe("sentinel1_l2_ocn")
         orchestrator = DataOrchestrator(recipe, dry_run=False)
         orchestrator.base_dir = tmp_path
 
@@ -458,7 +458,7 @@ class TestScatterometerHandlerCleansUpEmptyOutputDir:
         assert not (tmp_path / "osi_saf_winds").exists()
 
     def test_keeps_output_dir_when_downloader_produced_a_file(self, tmp_path):
-        recipe = _recipe("L2_OCN")
+        recipe = _recipe("sentinel1_l2_ocn")
         orchestrator = DataOrchestrator(recipe, dry_run=False)
         orchestrator.base_dir = tmp_path
 
@@ -760,7 +760,7 @@ class TestAmsrCoverageCutoffNotice:
 
         assert orchestrator.metadata["notices"] == []
 
-    def test_selects_au_land_nrt_for_post_2023_dates(self, tmp_path):
+    def test_selects_au_land_for_post_2023_dates(self, tmp_path):
         recipe = self._recipe_with_amsr("2025-07-04")
         orchestrator = DataOrchestrator(recipe, dry_run=False)
         orchestrator.base_dir = tmp_path
@@ -777,7 +777,7 @@ class TestAmsrCoverageCutoffNotice:
 
             orchestrator._download_amsr_ssm(recipe.config.validation_sources[0])
 
-        assert mock_cls.call_args.kwargs["dataset"] == "AU_Land_NRT_R02"
+        assert mock_cls.call_args.kwargs["dataset"] == "AU_Land"
 
     def test_notice_added_when_gportal_fallback_also_finds_nothing(self, tmp_path):
         """Within AMSR's known coverage window (no coverage-cutoff notice),

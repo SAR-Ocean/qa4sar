@@ -40,6 +40,7 @@ from scipy import ndimage
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from matplotlib.backends.backend_pdf import PdfPages
     from matplotlib.figure import Figure
 
     from .recipe import GeographicBounds
@@ -2014,6 +2015,47 @@ def _matched_point_alpha(
         return base_alpha
     return min(base_alpha, 0.35) if n_points > max_points else base_alpha
 
+
+def _diagnostics_zoom_extent(
+    scene_bounds: List[Dict[str, float]],
+    footprint_points: List[Tuple[float, float]],
+    coverage_points: List[Tuple[float, float]],
+    categories: List[dict],
+) -> Optional[Tuple[float, float, float, float]]:
+    """Bounding box ``(lon_min, lon_max, lat_min, lat_max)`` of everything
+    :func:`_plot_collocation_diagnostics_impl` actually draws — SAR scene
+    boxes/footprints/coverage plus every validation point shown, matched or
+    unmatched — or ``None`` if there's nothing to bound.
+
+    Used so the plot can zoom to where the data actually is instead of
+    always the recipe's full requested bbox: a big win for a source whose
+    individual scenes are small relative to that bbox (e.g. NISAR SME2's
+    per-orbit granules against a continent-scale recipe), and a no-op for a
+    source whose scenes already span close to the full bbox (e.g.
+    Sentinel-1 CLMS SSM's daily Europe-wide mosaics), since the caller
+    clamps the padded result back to the recipe's own bounds.
+    """
+    lons: List[float] = []
+    lats: List[float] = []
+    for b in scene_bounds:
+        lons.extend((b["lon_min"], b["lon_max"]))
+        lats.extend((b["lat_min"], b["lat_max"]))
+    for lon, lat in footprint_points:
+        lons.append(lon)
+        lats.append(lat)
+    for lon, lat in coverage_points:
+        lons.append(lon)
+        lats.append(lat)
+    for cat in categories:
+        lons.extend(np.asarray(cat["matched_lon"]).tolist())
+        lons.extend(np.asarray(cat["unmatched_lon"]).tolist())
+        lats.extend(np.asarray(cat["matched_lat"]).tolist())
+        lats.extend(np.asarray(cat["unmatched_lat"]).tolist())
+    if not lons:
+        return None
+    return min(lons), max(lons), min(lats), max(lats)
+
+
 def plot_collocation_diagnostics(
     datatree,
     collocation_ds,
@@ -2024,22 +2066,32 @@ def plot_collocation_diagnostics(
 ) -> Union[Path, List[Path], None]:
     """
     Plot collocation diagnostics, dispatching to one plot per SAR file for
-    soil_moisture recipes with multiple scenes.
+    soil_moisture recipes whose SAR source wants it (see
+    ``sar_sources.SARSourceSpec.diagnostics_split_by_scene``) and have
+    multiple scenes.
 
-    soil_moisture's SAR "scenes" are CLMS Surface Soil Moisture overpass
-    mosaics — one per day. Overlaying every day's coverage and matches onto a
-    single map makes individual passes visually indistinguishable, so each
-    scene gets its own diagnostics PNG instead (returned as a list of Path).
-    Every other variable, and soil_moisture recipes with only one scene,
-    keep the original single-plot behaviour (returned as one Path, or None).
+    Sentinel-1 CLMS SSM's SAR "scenes" are daily, mutually-overlapping,
+    continent-wide overpass mosaics -- overlaying every day's coverage and
+    matches onto a single map makes individual passes visually
+    indistinguishable, so each scene gets its own diagnostics PNG instead
+    (returned as a list of Path). Every other source's scenes (e.g. NISAR
+    SME2's small, non-overlapping per-orbit granules) don't have that
+    problem and keep the original single combined-map behaviour (returned
+    as one Path, or None) -- as does any soil_moisture recipe with only one
+    scene, and every non-soil_moisture variable.
 
     See :func:`_plot_collocation_diagnostics_impl` for the actual plotting
     logic and full parameter documentation.
     """
+    from .sar_sources import SAR_SOURCES
+
     sar_node = datatree.get("sar")
     scene_names = list(sar_node.children.keys()) if sar_node is not None else []
 
-    if recipe.config.variable == "soil_moisture" and len(scene_names) > 1:
+    sar_spec = SAR_SOURCES.get(recipe.config.sar_data.source)
+    split_by_scene = sar_spec is not None and sar_spec.diagnostics_split_by_scene
+
+    if recipe.config.variable == "soil_moisture" and split_by_scene and len(scene_names) > 1:
         paths: List[Path] = []
         for scene_name in scene_names:
             scene_tree = datatree.copy()
@@ -2451,7 +2503,8 @@ def _plot_collocation_diagnostics_impl(
     ax.add_feature(coastline, linewidth=0.5, zorder=0)
     gl = ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
 
-    # ── Set plot extent to the recipe's geographic bounds ────────────────
+    # ── Set plot extent, zoomed to the actual data when that's tighter
+    # than the recipe's full requested bbox ──────────────────────────────
     # In the central_longitude=180 axes frame, true longitude L maps to
     # (L % 360) - 180, which turns the wrapped [min_lon, 180] +
     # [-180, max_lon] range into one contiguous span with no wraparound.
@@ -2459,13 +2512,27 @@ def _plot_collocation_diagnostics_impl(
         return (lon % 360) - 180
 
     if crosses_dateline:
+        # Combining the dateline's own longitude-shifting with a
+        # data-driven zoom needs more care than this fix's scope covers —
+        # keep the always-full-bounds behaviour here.
         ax.set_extent(
             [_shift(bounds.min_lon), _shift(bounds.max_lon), bounds.min_lat, bounds.max_lat],
             crs=proj,
         )
     else:
-        ax.set_extent([bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat],
-                      crs=transform)
+        lon0, lon1, lat0, lat1 = bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat
+        data_extent = _diagnostics_zoom_extent(scene_bounds, footprint_points, coverage_points, categories)
+        if data_extent is not None:
+            d_lon_min, d_lon_max, d_lat_min, d_lat_max = data_extent
+            lon_pad = max((d_lon_max - d_lon_min) * 0.2, 0.2)
+            lat_pad = max((d_lat_max - d_lat_min) * 0.2, 0.2)
+            # Never zoom OUT past what was actually requested — only ever
+            # in, closer than the full recipe bbox.
+            lon0 = max(d_lon_min - lon_pad, bounds.min_lon)
+            lon1 = min(d_lon_max + lon_pad, bounds.max_lon)
+            lat0 = max(d_lat_min - lat_pad, bounds.min_lat)
+            lat1 = min(d_lat_max + lat_pad, bounds.max_lat)
+        ax.set_extent([lon0, lon1, lat0, lat1], crs=transform)
     _set_lonlat_ticks(ax, gl)
 
     # Scene-box/footprint longitudes above are pre-shifted into the axes'
@@ -3130,6 +3197,21 @@ def validation_report(
         base_dir = Path(out_dir)
 
     variable = recipe.config.variable
+    # Whether each soil_moisture geographic scene panel should clamp its
+    # extent to the recipe's full requested bbox (needed for
+    # sentinel1_clms_ssm, whose raw grid covers all of mainland Europe
+    # regardless of what was requested) or auto-zoom to its own actual
+    # data (correct for sources like nisar_sme2, whose native grid is
+    # already tight around real data) -- see
+    # SARSourceSpec.geographic_plot_clamp_to_bounds.
+    from .sar_sources import SAR_SOURCES
+
+    _geo_sar_spec = SAR_SOURCES.get(recipe.config.sar_data.source)
+    geo_clamp_bounds = (
+        variable == "soil_moisture"
+        and _geo_sar_spec is not None
+        and _geo_sar_spec.geographic_plot_clamp_to_bounds
+    )
     try:
         pairs = filter_variable_pairs(recipe, collocation_ds)
     except KeyError as exc:
@@ -3137,7 +3219,6 @@ def validation_report(
         return {}
 
     all_figures: Dict[str, list] = {}
-    pdf_pages: list = []   # (title, Figure) pairs fed into the PDF
 
     # Union across all pairs of SAR scenes that matched at least one
     # validation point — used to drop scenes with no matches from the
@@ -3147,6 +3228,108 @@ def validation_report(
         sorted(set(str(s) for s in collocation_ds["sar_scene_name"].values))
         if "sar_scene_name" in collocation_ds else None
     )
+
+    # PDF writer: opens lazily on the first page actually written (so, as
+    # before, no file is created at all if nothing ever gets added) and
+    # writes+closes each page's Figure immediately. Previously every
+    # lightweight page Figure (built by _finalize_figure_for_report /
+    # _image_page_figure) was accumulated in a list for the whole report
+    # and only closed in one final loop -- with several (sar_var, val_var)
+    # pairs that left 20+ figures open simultaneously, which crashed
+    # VSCode during real-data testing.
+    pdf_path = base_dir / f"validation_report{filename_suffix}.pdf" if base_dir is not None else None
+    pdf_cm: Optional["PdfPages"] = None
+    pdf_writer: Optional["PdfPages"] = None
+
+    def _open_pdf():
+        nonlocal pdf_cm, pdf_writer
+        import datetime as _dt  # noqa: PLC0415
+
+        from matplotlib.backends.backend_pdf import PdfPages  # noqa: PLC0415
+
+        pdf_cm = PdfPages(pdf_path)
+        pdf_writer = pdf_cm.__enter__()
+
+        cover = plt.figure(figsize=(11, 8.5))
+        cover.text(
+            0.5, 0.60,
+            f"SAR L2 Validation Report\n{recipe.config.name}",
+            ha="center", va="center", fontsize=20, fontweight="bold",
+        )
+        cover.text(
+            0.5, 0.44,
+            f"Variable: {recipe.config.variable}\n"
+            f"Generated: {_dt.date.today().isoformat()}",
+            ha="center", va="center", fontsize=12,
+        )
+        if variable == "soil_moisture":
+            depth_lines = _collect_sensing_depths(datatree, recipe)
+            if depth_lines:
+                cover.text(
+                    0.5, 0.34,
+                    "Sensing depths: " + " · ".join(depth_lines),
+                    ha="center", va="center", fontsize=8, wrap=True,
+                )
+        if download_warnings:
+            cover.text(
+                0.5, 0.26,
+                "⚠ " + "; ".join(download_warnings),
+                ha="center", va="center", fontsize=9, color="firebrick", wrap=True,
+            )
+        pdf_writer.savefig(cover, bbox_inches="tight")
+        plt.close(cover)
+        return pdf_writer
+
+    def _write_page(_title, fig):
+        writer = pdf_writer if pdf_writer is not None else _open_pdf()
+        writer.savefig(fig, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+    # Collocation diagnostics plot — generated once per recipe, written
+    # first (right after the cover page) so a reader sees the spatial/
+    # matching overview before the per-pair detail sections below.
+    if base_dir is not None:
+        try:
+            diag_result = plot_collocation_diagnostics(
+                datatree, collocation_ds, recipe, base_dir,
+                filename_suffix=filename_suffix,
+                layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
+            )
+            # soil_moisture recipes with multiple SAR files return one Path
+            # per file (see plot_collocation_diagnostics); every other case
+            # returns a single Path or None.
+            diag_paths = (
+                diag_result if isinstance(diag_result, list)
+                else ([diag_result] if diag_result is not None else [])
+            )
+            for diag_path in diag_paths:
+                logger.info("Collocation diagnostics plot saved to %s", diag_path)
+                diag_img = plt.imread(str(diag_path))
+                title = (
+                    f"Collocation diagnostics — {recipe.config.name}"
+                    if len(diag_paths) == 1
+                    else f"Collocation diagnostics — {recipe.config.name} [{diag_path.stem}]"
+                )
+                # plot_collocation_diagnostics() closes its own figure(s)
+                # internally (it's also called standalone from cli.py), so
+                # the only way to embed them here is to reload the
+                # rendered images.
+                _write_page(title, _image_page_figure(diag_img))
+        except Exception as exc:
+            logger.warning("plot_collocation_diagnostics failed: %s", exc)
+
+    # RVL land-contamination QA page — currents recipes only, and only when
+    # at least one scene actually has land-flagged cells (plot_rvl_land_qa
+    # returns None otherwise, so no empty page is added). Written right
+    # after the diagnostics page(s) rather than appended at the end, per
+    # the design spec.
+    if base_dir is not None and variable == "currents":
+        try:
+            fig_land_qa = plot_rvl_land_qa(datatree)
+            if fig_land_qa is not None:
+                _write_page("RVL land-contamination QA", _finalize_figure_for_report(fig_land_qa, None))
+        except Exception as exc:
+            logger.warning("plot_rvl_land_qa failed: %s", exc)
 
     for sar_var, val_var in pairs:
         key = f"{sar_var}_vs_{val_var}"
@@ -3252,7 +3435,7 @@ def validation_report(
                 datatree, geo_pair_ds, sar_var, val_var, scenes=matched_scenes,
                 point_size=geo_point_size,
                 geographic_bounds=(
-                    recipe.config.geographic_bounds if variable == "soil_moisture" else None
+                    recipe.config.geographic_bounds if geo_clamp_bounds else None
                 ),
                 two_column_by_type=(variable == "soil_moisture"),
             )
@@ -3264,18 +3447,14 @@ def validation_report(
                         figs.append(fig_geo)
                         title = f"{sar_var} vs {val_var} — geographic [{group}]{cdf_matched_suffix}"
                         if base_dir is not None:
-                            pdf_pages.append((title, _finalize_figure_for_report(fig_geo, None)))
-                        else:
-                            pdf_pages.append((title, fig_geo))
+                            _write_page(title, _finalize_figure_for_report(fig_geo, None))
             elif geo_result is not None:
                 if cdf_matched_suffix:
                     geo_result = _mark_cdf_matched(geo_result)
                 figs.append(geo_result)
                 title = f"{sar_var} vs {val_var} — geographic{cdf_matched_suffix}"
                 if base_dir is not None:
-                    pdf_pages.append((title, _finalize_figure_for_report(geo_result, None)))
-                else:
-                    pdf_pages.append((title, geo_result))
+                    _write_page(title, _finalize_figure_for_report(geo_result, None))
         except Exception as exc:
             logger.warning("plot_geographic failed for %s: %s", sar_var, exc, exc_info=True)
 
@@ -3294,9 +3473,7 @@ def validation_report(
             figs.append(fig_scatter)
             title = f"{sar_var} vs {val_var} — scatter{cdf_matched_suffix}"
             if base_dir is not None:
-                pdf_pages.append((title, _finalize_figure_for_report(fig_scatter, None)))
-            else:
-                pdf_pages.append((title, fig_scatter))
+                _write_page(title, _finalize_figure_for_report(fig_scatter, None))
 
         # Summary table (immediately before the statistics bar charts, so
         # a reader has the exact numbers before the visual comparison —
@@ -3308,9 +3485,7 @@ def validation_report(
                 figs.append(fig_table)
                 title = f"{sar_var} vs {val_var} — summary table"
                 if base_dir is not None:
-                    pdf_pages.append((title, _finalize_figure_for_report(fig_table, None)))
-                else:
-                    pdf_pages.append((title, fig_table))
+                    _write_page(title, _finalize_figure_for_report(fig_table, None))
 
         # Statistics
         if stats_ds_map and key in stats_ds_map:
@@ -3319,9 +3494,7 @@ def validation_report(
                 figs.append(fig_stats)
                 title = f"{sar_var} vs {val_var} — statistics"
                 if base_dir is not None:
-                    pdf_pages.append((title, _finalize_figure_for_report(fig_stats, None)))
-                else:
-                    pdf_pages.append((title, fig_stats))
+                    _write_page(title, _finalize_figure_for_report(fig_stats, None))
 
         # Residuals
         fig_res = plot_residuals(
@@ -3337,9 +3510,7 @@ def validation_report(
             figs.append(fig_res)
             title = f"{sar_var} vs {val_var} — residuals{cdf_matched_suffix}"
             if base_dir is not None:
-                pdf_pages.append((title, _finalize_figure_for_report(fig_res, None)))
-            else:
-                pdf_pages.append((title, fig_res))
+                _write_page(title, _finalize_figure_for_report(fig_res, None))
 
         # Scatter colored by temporal offset, and temporal offset vs.
         # residual magnitude — both meaningless for soil_moisture, whose
@@ -3359,9 +3530,7 @@ def validation_report(
                 figs.append(fig_scatter_offset)
                 title = f"{sar_var} vs {val_var} — scatter (colored by temporal offset)"
                 if base_dir is not None:
-                    pdf_pages.append((title, _finalize_figure_for_report(fig_scatter_offset, None)))
-                else:
-                    pdf_pages.append((title, fig_scatter_offset))
+                    _write_page(title, _finalize_figure_for_report(fig_scatter_offset, None))
 
             # Temporal offset vs. residual magnitude
             fig_offset = plot_temporal_offset(pair_ds, sar_var, val_var)
@@ -3369,9 +3538,7 @@ def validation_report(
                 figs.append(fig_offset)
                 title = f"{sar_var} vs {val_var} — residual vs. temporal offset"
                 if base_dir is not None:
-                    pdf_pages.append((title, _finalize_figure_for_report(fig_offset, None)))
-                else:
-                    pdf_pages.append((title, fig_offset))
+                    _write_page(title, _finalize_figure_for_report(fig_offset, None))
 
         # Native-units section: same plot functions, applied to the raw
         # (non-rescaled) geo_pair_ds restricted to val_source groups whose
@@ -3390,7 +3557,9 @@ def validation_report(
                 fig_nu_geo_result = plot_geographic(
                     datatree, nu_pair_ds, sar_var, val_var, scenes=matched_scenes,
                     point_size=geo_point_size,
-                    geographic_bounds=recipe.config.geographic_bounds,
+                    geographic_bounds=(
+                        recipe.config.geographic_bounds if geo_clamp_bounds else None
+                    ),
                     # nu_pair_ds is already row-filtered to val_source
                     # groups sharing SAR's own units family (see
                     # matching_sources above) -- every source present is
@@ -3412,17 +3581,13 @@ def validation_report(
                             figs.append(fig_nu_geo)
                             title = f"{sar_var} vs {val_var} — native units — geographic [{group}]"
                             if base_dir is not None:
-                                pdf_pages.append((title, _finalize_figure_for_report(fig_nu_geo, None)))
-                            else:
-                                pdf_pages.append((title, fig_nu_geo))
+                                _write_page(title, _finalize_figure_for_report(fig_nu_geo, None))
                 elif fig_nu_geo_result is not None:
                     fig_nu_geo_result = _mark_native_units(fig_nu_geo_result)
                     figs.append(fig_nu_geo_result)
                     title = f"{sar_var} vs {val_var} — native units — geographic"
                     if base_dir is not None:
-                        pdf_pages.append((title, _finalize_figure_for_report(fig_nu_geo_result, None)))
-                    else:
-                        pdf_pages.append((title, fig_nu_geo_result))
+                        _write_page(title, _finalize_figure_for_report(fig_nu_geo_result, None))
             except Exception as exc:
                 logger.warning("plot_geographic failed for native-units %s: %s", sar_var, exc)
 
@@ -3432,9 +3597,7 @@ def validation_report(
                 figs.append(fig_nu_scatter)
                 title = f"{sar_var} vs {val_var} — native units — scatter"
                 if base_dir is not None:
-                    pdf_pages.append((title, _finalize_figure_for_report(fig_nu_scatter, None)))
-                else:
-                    pdf_pages.append((title, fig_nu_scatter))
+                    _write_page(title, _finalize_figure_for_report(fig_nu_scatter, None))
 
             fig_nu_residuals = plot_residuals(nu_pair_ds, sar_var, val_var)
             if fig_nu_residuals is not None:
@@ -3442,9 +3605,7 @@ def validation_report(
                 figs.append(fig_nu_residuals)
                 title = f"{sar_var} vs {val_var} — native units — residuals"
                 if base_dir is not None:
-                    pdf_pages.append((title, _finalize_figure_for_report(fig_nu_residuals, None)))
-                else:
-                    pdf_pages.append((title, fig_nu_residuals))
+                    _write_page(title, _finalize_figure_for_report(fig_nu_residuals, None))
 
             fig_nu_stats = plot_statistics(nu_stats)
             if fig_nu_stats is not None:
@@ -3452,122 +3613,27 @@ def validation_report(
                 figs.append(fig_nu_stats)
                 title = f"{sar_var} vs {val_var} — native units — statistics"
                 if base_dir is not None:
-                    pdf_pages.append((title, _finalize_figure_for_report(fig_nu_stats, None)))
-                else:
-                    pdf_pages.append((title, fig_nu_stats))
+                    _write_page(title, _finalize_figure_for_report(fig_nu_stats, None))
 
         all_figures[key] = figs
 
         # When base_dir is not None, each fig here was already closed inside
-        # _finalize_figure_for_report. pdf_pages holds separate lightweight
-        # image-page figures, not these same objects — so this loop is a safe,
-        # idempotent no-op double-close. Closing here deregisters them from
-        # pyplot's global figure manager to avoid accumulating figures across
-        # pairs and across the two collocation-method passes triggered by
+        # _finalize_figure_for_report. _write_page's page Figures are separate
+        # lightweight image-page objects, not these same objects — so this
+        # loop is a safe, idempotent no-op double-close. Closing here
+        # deregisters them from pyplot's global figure manager to avoid
+        # accumulating figures across pairs and across the two
+        # collocation-method passes triggered by
         # --layer-vs-layer-collocation-method both.
         if base_dir is not None:
             for fig in figs:
                 plt.close(fig)
 
-    # Collocation diagnostics plot — generated once per recipe
-    diagnostics_inserted = False
-    if base_dir is not None:
-        try:
-            diag_result = plot_collocation_diagnostics(
-                datatree, collocation_ds, recipe, base_dir,
-                filename_suffix=filename_suffix,
-                layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
-            )
-            # soil_moisture recipes with multiple SAR files return one Path
-            # per file (see plot_collocation_diagnostics); every other case
-            # returns a single Path or None.
-            diag_paths = (
-                diag_result if isinstance(diag_result, list)
-                else ([diag_result] if diag_result is not None else [])
-            )
-            if diag_paths:
-                # Embed each saved PNG as a page in the combined PDF report —
-                # plot_collocation_diagnostics() closes its own figure(s)
-                # internally (it's also called standalone from cli.py), so
-                # the only way to include them in pdf_pages is to reload the
-                # rendered images.
-                diag_pages = []
-                for diag_path in diag_paths:
-                    logger.info("Collocation diagnostics plot saved to %s", diag_path)
-                    diag_img = plt.imread(str(diag_path))
-                    title = (
-                        f"Collocation diagnostics — {recipe.config.name}"
-                        if len(diag_paths) == 1
-                        else f"Collocation diagnostics — {recipe.config.name} [{diag_path.stem}]"
-                    )
-                    diag_pages.append((title, _image_page_figure(diag_img)))
-                # Lead the report body with the diagnostics overview(s) (the
-                # cover page is written separately, so index 0 here becomes
-                # the first page after the cover).
-                pdf_pages[0:0] = diag_pages
-                diagnostics_inserted = True
-        except Exception as exc:
-            logger.warning("plot_collocation_diagnostics failed: %s", exc)
-
-    # RVL land-contamination QA page — currents recipes only, and only when
-    # at least one scene actually has land-flagged cells (plot_rvl_land_qa
-    # returns None otherwise, so no empty page is added). Inserted right
-    # after the diagnostics page (index 1 if that page exists, else index 0
-    # so it becomes the first content page) rather than appended at the end,
-    # per the design spec.
-    if base_dir is not None and variable == "currents":
-        try:
-            fig_land_qa = plot_rvl_land_qa(datatree)
-            if fig_land_qa is not None:
-                pdf_pages.insert(
-                    1 if diagnostics_inserted else 0,
-                    ("RVL land-contamination QA", _finalize_figure_for_report(fig_land_qa, None)),
-                )
-        except Exception as exc:
-            logger.warning("plot_rvl_land_qa failed: %s", exc)
-
-    # Combined PDF — saved alongside the validation_statistics_*.nc files
-    if base_dir is not None and pdf_pages:
-        import datetime as _dt  # noqa: PLC0415
-
-        from matplotlib.backends.backend_pdf import PdfPages  # noqa: PLC0415
-
-        pdf_path = base_dir / f"validation_report{filename_suffix}.pdf"
-        with PdfPages(pdf_path) as pdf:
-            # Cover page
-            cover = plt.figure(figsize=(11, 8.5))
-            cover.text(
-                0.5, 0.60,
-                f"SAR L2 Validation Report\n{recipe.config.name}",
-                ha="center", va="center", fontsize=20, fontweight="bold",
-            )
-            cover.text(
-                0.5, 0.44,
-                f"Variable: {recipe.config.variable}\n"
-                f"Generated: {_dt.date.today().isoformat()}",
-                ha="center", va="center", fontsize=12,
-            )
-            if variable == "soil_moisture":
-                depth_lines = _collect_sensing_depths(datatree, recipe)
-                if depth_lines:
-                    cover.text(
-                        0.5, 0.34,
-                        "Sensing depths: " + " · ".join(depth_lines),
-                        ha="center", va="center", fontsize=8, wrap=True,
-                    )
-            if download_warnings:
-                cover.text(
-                    0.5, 0.26,
-                    "⚠ " + "; ".join(download_warnings),
-                    ha="center", va="center", fontsize=9, color="firebrick", wrap=True,
-                )
-            pdf.savefig(cover, bbox_inches="tight")
-            plt.close(cover)
-
-            for _title, fig in pdf_pages:
-                pdf.savefig(fig, dpi=150, bbox_inches="tight")
-                plt.close(fig)
-
+    # Combined PDF — saved alongside the validation_statistics_*.nc files.
+    # Only opened (via _open_pdf, above) if at least one page was actually
+    # written, matching the previous "no file unless there's content" behavior.
+    if pdf_cm is not None:
+        pdf_cm.__exit__(None, None, None)
         logger.info("PDF report saved to %s", pdf_path)
 
     return all_figures

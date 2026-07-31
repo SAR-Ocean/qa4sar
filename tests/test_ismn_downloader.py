@@ -514,6 +514,87 @@ class TestISMNDownloaderSharedCacheFallback:
 
         assert not any("days old" in r.message for r in caplog.records)
 
+    def test_prints_age_from_filename_date_not_mtime(self, tmp_path, monkeypatch, capsys):
+        """A shared-cache archive named ISMN_archive_YYYYMMDD.zip must
+        report its age from that embedded date, not the file's own mtime
+        -- mtime resets on any copy/checkout/sync of the shared cache
+        directory (observed in practice: a real cache file's mtime read
+        "0 days old" even though its filename said it was over a week
+        old), so it's an unreliable proxy whenever a name-embedded date
+        is available."""
+        import datetime
+        import os
+        import re
+        import time
+
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        shared_cache = tmp_path / "shared_cache"
+        shared_cache.mkdir()
+        archive_date = datetime.date.today() - datetime.timedelta(days=7)
+        dated_zip = shared_cache / f"ISMN_archive_{archive_date:%Y%m%d}.zip"
+        with zipfile.ZipFile(dated_zip, "w"):
+            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
+        # mtime deliberately set to "just now" -- if the code used mtime
+        # instead of the filename date, it would report ~0 days old.
+        now = time.time()
+        os.utime(dated_zip, (now, now))
+        monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", shared_cache)
+
+        dl = ISMNDownloader(output_dir=tmp_path / "out")
+
+        fake_interface = MagicMock()
+        fake_interface.ISMN_Interface.return_value = self._fake_reader()
+
+        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
+            dl.download(
+                min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
+                start="2026-01-01", end="2026-01-02",
+                archive_path=None,
+            )
+
+        captured = capsys.readouterr().out
+        # Not "0 days old" (mtime-based, wrong) -- 7 or 8, depending on
+        # exactly where "now" falls relative to the archive date's own
+        # midnight (day-boundary rounding), which proves the filename
+        # date was used, not the mtime set to "just now" above.
+        match = re.search(r"\((\d+) days old\)", captured)
+        assert match is not None
+        assert 7 <= int(match.group(1)) <= 8
+
+    def test_falls_back_to_mtime_when_filename_has_no_date(self, tmp_path, monkeypatch, capsys):
+        """A filename with no _YYYYMMDD suffix keeps today's mtime-based
+        behavior unchanged (e.g. ISMN_archive_recent.zip, ISMN_archive_old.zip
+        as used by the tests above)."""
+        import os
+        import time
+
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        shared_cache = tmp_path / "shared_cache"
+        shared_cache.mkdir()
+        undated_zip = shared_cache / "ISMN_archive_recent.zip"
+        with zipfile.ZipFile(undated_zip, "w"):
+            pass
+        old_time = time.time() - (3 * 86400)
+        os.utime(undated_zip, (old_time, old_time))
+        monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", shared_cache)
+
+        dl = ISMNDownloader(output_dir=tmp_path / "out")
+
+        fake_interface = MagicMock()
+        fake_interface.ISMN_Interface.return_value = self._fake_reader()
+
+        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
+            dl.download(
+                min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
+                start="2026-01-01", end="2026-01-02",
+                archive_path=None,
+            )
+
+        captured = capsys.readouterr().out
+        assert "(3 days old)" in captured
+
 
 def _write_synthetic_ismn_archive(archive_path, stations):
     """stations: list of (network, station, lat_or_None, lon_or_None,

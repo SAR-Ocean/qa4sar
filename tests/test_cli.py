@@ -354,8 +354,7 @@ class TestBuildSoilMoistureConfig:
         cfg = _build_soil_moisture_config()
 
         assert cfg.variable == "soil_moisture"
-        assert cfg.sar_data.satellite == "Sentinel-1"
-        assert cfg.sar_data.product_level == "L3_SSM"
+        assert cfg.sar_data.source == "sentinel1_clms_ssm"
         assert len(cfg.validation_sources) == 5
         source_types = [s.source_type for s in cfg.validation_sources]
         assert source_types == ["ismn", "ascat_ssm", "amsr_ssm", "smap_ssm", "smos_ssm"]
@@ -400,6 +399,94 @@ class TestBuildSoilMoistureConfig:
 
         recipe_path = tmp_path / "recipes" / "soil_moisture_validation.yaml"
         assert recipe_path.exists()
+
+
+class TestSarSourceCliOption:
+    def test_soil_moisture_default_sar_source(self):
+        from sar_validation.cli import _build_soil_moisture_config
+
+        cfg = _build_soil_moisture_config()
+        assert cfg.sar_data.source == "sentinel1_clms_ssm"
+
+    def test_wind_rejects_soil_moisture_only_source(self):
+        from sar_validation.cli import _build_wind_config
+
+        with pytest.raises(ValueError, match="only valid for"):
+            _build_wind_config(sar_source="sentinel1_clms_ssm")
+
+    def test_wind_accepts_its_own_default_source_explicitly(self):
+        from sar_validation.cli import _build_wind_config
+
+        cfg = _build_wind_config(sar_source="sentinel1_l2_ocn")
+        assert cfg.sar_data.source == "sentinel1_l2_ocn"
+
+    def test_waves_config_extracted_and_matches_prior_shape(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config()
+        assert cfg.variable == "waves"
+        assert cfg.sar_data.swath_mode == ["WV", "SM"]
+        assert cfg.sar_data.source == "sentinel1_l2_ocn"
+
+    def test_cli_sar_source_flag_rejects_invalid_key(self, tmp_path, monkeypatch, capsys):
+        from sar_validation.cli import main
+
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit):
+            main(["--create-recipe", "wind", "--sar-source", "sentinel1_clms_ssm"])
+        captured = capsys.readouterr()
+        assert "only valid for" in captured.out or "only valid for" in captured.err
+
+    def test_cli_sar_source_flag_writes_to_recipe(self, tmp_path, monkeypatch):
+        from sar_validation.cli import main
+        from sar_validation.core.recipe import Recipe
+
+        monkeypatch.chdir(tmp_path)
+        main(["--create-recipe", "soil_moisture", "--sar-source", "sentinel1_clms_ssm"])
+        recipe = Recipe.from_yaml(tmp_path / "recipes" / "soil_moisture_validation.yaml")
+        assert recipe.config.sar_data.source == "sentinel1_clms_ssm"
+
+
+class TestBuildSoilMoistureConfigNisarSme2:
+    def test_nisar_source_recorded(self):
+        from sar_validation.cli import _build_soil_moisture_config
+
+        cfg = _build_soil_moisture_config(sar_source="nisar_sme2")
+        assert cfg.sar_data.source == "nisar_sme2"
+
+    def test_ismn_depth_window_uses_registry_defaults(self):
+        from sar_validation.cli import _build_soil_moisture_config
+
+        cfg = _build_soil_moisture_config(sar_source="nisar_sme2")
+        ismn = next(s for s in cfg.validation_sources if s.source_type == "ismn")
+        assert ismn.min_depth == 0.0
+        assert ismn.max_depth == 0.05
+
+    def test_point_vs_layer_tolerances_use_registry_defaults(self):
+        from sar_validation.cli import _build_soil_moisture_config
+
+        cfg = _build_soil_moisture_config(sar_source="nisar_sme2")
+        pvl = cfg.collocation.point_vs_layer
+        assert pvl.time_tolerance_minutes == 360
+        assert pvl.aggregation_window_km == 0.2
+        assert pvl.spatial_tolerance_km == 2.0
+
+    def test_satellite_ssm_sources_get_360_minute_layer_type_spec_override(self):
+        from sar_validation.cli import _build_soil_moisture_config
+
+        cfg = _build_soil_moisture_config(sar_source="nisar_sme2")
+        specs = cfg.collocation.layer_vs_layer.layer_type_specs
+        for key in ("scatterometer_ssm", "radiometer_ssm", "amsr_ssm", "smap_ssm", "smos_ssm"):
+            assert specs[key]["time_tolerance_minutes"] == 360
+
+    def test_sentinel1_clms_ssm_source_unaffected_no_layer_type_specs(self):
+        from sar_validation.cli import _build_soil_moisture_config
+
+        cfg = _build_soil_moisture_config(sar_source="sentinel1_clms_ssm")
+        assert cfg.collocation.layer_vs_layer is None
+        pvl = cfg.collocation.point_vs_layer
+        assert pvl.time_tolerance_minutes == 720
+        assert pvl.aggregation_window_km == 1.0
 
 
 class TestSetCredentialCli:
@@ -453,3 +540,18 @@ class TestSetCredentialCli:
         cli.main(["--set-credential", "smos"])
 
         assert called == ["smos"]
+
+
+class TestIsmnMetaCollectorLoggerSuppressed:
+    """The ismn package's own file-collection logger ('ismn_meta_collector',
+    not a dotted child of 'ismn') logs one INFO line per station file it
+    reads while building ISMN_Interface's metadata -- hundreds of lines for
+    a real archive. cli.py pins it to WARNING at import time, unconditionally
+    (not just outside --verbose)."""
+
+    def test_pinned_to_warning(self):
+        import logging
+
+        import sar_validation.cli  # noqa: F401 -- import triggers the pin
+
+        assert logging.getLogger("ismn_meta_collector").level == logging.WARNING

@@ -111,18 +111,21 @@ class ValidationDataSource:
 
 @dataclass
 class SARDataSpec:
-    """Specification for the SAR product to validate."""
-    satellite: str = "Sentinel-1"
-    product_level: str = "L2_OCN"
+    """Specification for the SAR product to validate.
+
+    ``source`` is a key into ``sar_sources.SAR_SOURCES`` -- the single
+    registry mapping a source to its downloader, output subdirectory,
+    converter, and per-source recipe-template defaults. See
+    docs/superpowers/specs/2026-07-30-nisar-soil-moisture-and-sar-source-selection-design.md
     """
-    ``"L2_OCN"`` (wind/currents/waves, via ``SARDownloader``) or
-    ``"L3_SSM"`` (soil moisture, via ``SoilMoistureDownloader``).
-    """
+    source: str = "sentinel1_l2_ocn"
     swath_mode: List[str] = field(default_factory=lambda: ["IW", "EW"])
-    """SAR beam mode(s), e.g. ``["IW", "EW"]`` or ``["WV"]``. Unused for
-    ``product_level="L3_SSM"`` (no WV/IW/EW mode concept for a daily
-    merged raster)."""
+    """SAR beam mode(s), e.g. ``["IW", "EW"]`` or ``["WV"]``. Only
+    meaningful for ``source="sentinel1_l2_ocn"`` -- ignored (harmless
+    no-op) by every other source."""
     max_downloads: Optional[int] = None   # None → download all found products
+    download_kwargs: Dict[str, Any] = field(default_factory=dict)
+    """Extra keyword arguments forwarded to the registry's downloader."""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -329,6 +332,33 @@ class RecipeConfig:
 # Recipe loader / writer
 # ---------------------------------------------------------------------------
 
+def _build_sar_data_spec(sar: Dict[str, Any], variable: str) -> SARDataSpec:
+    """Build and validate a SARDataSpec from a recipe dict's ``sar_data``
+    block. Raises ValueError for an unknown source key, or a known key
+    that isn't valid for *variable* -- catches a recipe whose ``variable``
+    was changed without updating ``sar_data.source`` to match."""
+    from .sar_sources import SAR_SOURCES
+
+    source = sar.get("source", "sentinel1_l2_ocn")
+    if source not in SAR_SOURCES:
+        raise ValueError(
+            f"Unknown SAR source {source!r}. Choose one of: "
+            f"{', '.join(sorted(SAR_SOURCES))}"
+        )
+    spec = SAR_SOURCES[source]
+    if variable and variable not in spec.variables:
+        raise ValueError(
+            f"SAR source {source!r} is only valid for: "
+            f"{', '.join(sorted(spec.variables))} (recipe variable is {variable!r})"
+        )
+    return SARDataSpec(
+        source=source,
+        swath_mode=sar.get("swath_mode", sar.get("swath_modes", ["IW", "EW"])),
+        max_downloads=sar.get("max_downloads"),
+        download_kwargs=sar.get("download_kwargs", {}),
+    )
+
+
 class Recipe:
     """Load, save, and manage a RecipeConfig."""
 
@@ -409,12 +439,7 @@ class Recipe:
                 start=temporal.get("start", "2026-01-01"),
                 end=temporal.get("end",   "2026-01-02"),
             ),
-            sar_data=SARDataSpec(
-                satellite=sar.get("satellite", "Sentinel-1"),
-                product_level=sar.get("product_level", "L2_OCN"),
-                swath_mode=sar.get("swath_mode", sar.get("swath_modes", ["IW", "EW"])),
-                max_downloads=sar.get("max_downloads"),
-            ),
+            sar_data=_build_sar_data_spec(sar, data.get("variable", "")),
             validation_sources=[
                 ValidationDataSource(
                     source_type=src["source_type"],

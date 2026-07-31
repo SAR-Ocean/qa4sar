@@ -36,8 +36,10 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import time
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -78,6 +80,30 @@ _GLOBAL_REFERENCE_FILENAMES = ("ISMN_sensor_list.csv", "ISMN_network_flags_descr
 #: extraction genuinely finishes -- see _extract_matching_stations and
 #: the reuse check in ISMNDownloader.download().
 _EXTRACTION_COMPLETE_MARKER = ".extraction_complete"
+
+
+def _archive_age_days(path: Path) -> float:
+    """
+    Age of *path* in days, preferring a trailing ``_YYYYMMDD`` date
+    embedded in the filename (e.g. ``ISMN_archive_20260724.zip``, the
+    convention this project's shared-cache archives have settled on) over
+    the file's own mtime.
+
+    mtime resets on any copy/checkout/sync of the shared cache directory
+    (observed in practice: a real cache file's mtime read "0 days old"
+    even though its filename said it was over a week old), so it's an
+    unreliable proxy for how stale the underlying ISMN data actually is
+    whenever a name-embedded date is available. Falls back to mtime for
+    any filename without a recognizable trailing date.
+    """
+    match = re.search(r"_(\d{8})$", path.stem)
+    if match:
+        try:
+            archive_date = datetime.strptime(match.group(1), "%Y%m%d")
+            return (datetime.now() - archive_date).total_seconds() / 86400
+        except ValueError:
+            pass
+    return (time.time() - path.stat().st_mtime) / 86400
 
 
 def _auto_detect_archive(output_dir: Path) -> Optional[Path]:
@@ -352,7 +378,7 @@ class ISMNDownloader:
             return []
 
         if resolved_archive_path.parent == _SHARED_ARCHIVE_CACHE_DIR:
-            age_days = (time.time() - resolved_archive_path.stat().st_mtime) / 86400
+            age_days = _archive_age_days(resolved_archive_path)
             print(f"  Using shared ISMN archive cache: {resolved_archive_path} ({age_days:.0f} days old)")
             if age_days > _SHARED_ARCHIVE_STALE_DAYS:
                 logger.warning(
