@@ -1202,7 +1202,7 @@ class TestSARDownloaderAntimeridian:
         }
 
     def test_query_splits_crossing_bbox_into_two_windows(self, tmp_path):
-        from sar_validation.downloaders.sar_downloader import SARDownloader
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
 
         dl = SARDownloader(output_dir=tmp_path)
         fake_client = MagicMock()
@@ -1224,7 +1224,7 @@ class TestSARDownloaderAntimeridian:
         assert sorted(df["Id"]) == ["a", "b"]
 
     def test_query_dedupes_product_returned_by_both_windows(self, tmp_path):
-        from sar_validation.downloaders.sar_downloader import SARDownloader
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
 
         dl = SARDownloader(output_dir=tmp_path)
         fake_client = MagicMock()
@@ -1239,7 +1239,7 @@ class TestSARDownloaderAntimeridian:
         assert len(df) == 1
 
     def test_query_non_crossing_bbox_calls_once(self, tmp_path):
-        from sar_validation.downloaders.sar_downloader import SARDownloader
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
 
         dl = SARDownloader(output_dir=tmp_path)
         fake_client = MagicMock()
@@ -1269,7 +1269,7 @@ class TestSARDownloaderForceDownload:
         }
 
     def test_skips_product_whose_directory_already_exists(self, tmp_path, capsys):
-        from sar_validation.downloaders.sar_downloader import SARDownloader
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
 
         dl = SARDownloader(output_dir=tmp_path, dry_run=False)
         fake_client = MagicMock()
@@ -1286,7 +1286,7 @@ class TestSARDownloaderForceDownload:
         assert "Already downloaded" in capsys.readouterr().out
 
     def test_force_download_redownloads_existing_product(self, tmp_path):
-        from sar_validation.downloaders.sar_downloader import SARDownloader
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
 
         dl = SARDownloader(output_dir=tmp_path, dry_run=False, force_download=True)
         fake_client = MagicMock()
@@ -2726,7 +2726,7 @@ class TestOrchestratorDepthResolution:
         with patch(
             "sar_validation.downloaders.insitu_downloader.InSituDownloader"
         ) as mock_cls, patch(
-            "sar_validation.downloaders.sar_downloader.SARDownloader"
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
         ) as mock_sar_cls:
             mock_cls.return_value.download.return_value = None
             mock_sar_cls.return_value.download.return_value = []
@@ -2754,7 +2754,7 @@ class TestOrchestratorDepthResolution:
         with patch(
             "sar_validation.downloaders.insitu_downloader.InSituDownloader"
         ) as mock_cls, patch(
-            "sar_validation.downloaders.sar_downloader.SARDownloader"
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
         ) as mock_sar_cls:
             mock_cls.return_value.download.return_value = None
             mock_sar_cls.return_value.download.return_value = []
@@ -3580,7 +3580,7 @@ class TestOrchestratorHistoricalFirstDedup:
         orchestrator = DataOrchestrator(recipe, dry_run=True)
 
         with patch(
-            "sar_validation.downloaders.sar_downloader.SARDownloader"
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
         ) as mock_sar_cls, patch(
             "sar_validation.downloaders.hf_radar_historical_downloader.HFRadarHistoricalDownloader"
         ) as mock_hist_cls, patch(
@@ -3615,7 +3615,7 @@ class TestOrchestratorHistoricalFirstDedup:
         orchestrator = DataOrchestrator(recipe, dry_run=True)
 
         with patch(
-            "sar_validation.downloaders.sar_downloader.SARDownloader"
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
         ) as mock_sar_cls, patch(
             "sar_validation.downloaders.hf_radar_historical_downloader.HFRadarHistoricalDownloader"
         ) as mock_hist_cls, patch(
@@ -3644,7 +3644,7 @@ class TestOrchestratorHistoricalFirstDedup:
         orchestrator = DataOrchestrator(recipe, dry_run=True)
 
         with patch(
-            "sar_validation.downloaders.sar_downloader.SARDownloader"
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
         ) as mock_sar_cls, patch(
             "sar_validation.downloaders.hf_radar_downloader.HFRadarDownloader"
         ) as mock_nrt_cls:
@@ -3673,7 +3673,7 @@ class TestOrchestratorHistoricalFirstDedup:
         orchestrator = DataOrchestrator(recipe, dry_run=True)
 
         with patch(
-            "sar_validation.downloaders.sar_downloader.SARDownloader"
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
         ) as mock_sar_cls, patch(
             "sar_validation.downloaders.insitu_currents_historical_downloader."
             "InSituCurrentsHistoricalDownloader"
@@ -3705,7 +3705,7 @@ class TestOrchestratorHistoricalFirstDedup:
         orchestrator = DataOrchestrator(recipe, dry_run=True)
 
         with patch(
-            "sar_validation.downloaders.sar_downloader.SARDownloader"
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
         ) as mock_sar_cls, patch(
             "sar_validation.downloaders.insitu_currents_historical_downloader."
             "InSituCurrentsHistoricalDownloader"
@@ -3739,7 +3739,7 @@ class TestOrchestratorHistoricalFirstDedup:
         orchestrator = DataOrchestrator(recipe, dry_run=True)
 
         with patch(
-            "sar_validation.downloaders.sar_downloader.SARDownloader"
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
         ) as mock_sar_cls, patch(
             "sar_validation.downloaders.insitu_currents_historical_downloader."
             "InSituCurrentsHistoricalDownloader"
@@ -3771,7 +3771,7 @@ class TestOrchestratorHistoricalFirstDedup:
         orchestrator = DataOrchestrator(recipe, dry_run=True)
 
         with patch(
-            "sar_validation.downloaders.sar_downloader.SARDownloader"
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
         ) as mock_sar_cls, patch(
             "sar_validation.downloaders.insitu_currents_historical_downloader."
             "InSituCurrentsHistoricalDownloader"
@@ -3826,7 +3826,7 @@ class TestOrchestratorAntimeridianDryRun:
         orchestrator = DataOrchestrator(recipe, dry_run=True)
 
         with patch(
-            "sar_validation.downloaders.sar_downloader.SARDownloader"
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
         ) as mock_sar_cls, patch(
             "sar_validation.downloaders.insitu_downloader.InSituDownloader"
         ) as mock_insitu_cls, patch(
@@ -3875,7 +3875,7 @@ class TestOrchestratorForceDownloadWiring:
         from unittest.mock import patch
 
         orchestrator = self._make_orchestrator(tmp_path, force_download=True)
-        with patch("sar_validation.downloaders.sar_downloader.SARDownloader") as mock_cls:
+        with patch("sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader") as mock_cls:
             mock_cls.return_value.download.return_value = []
             orchestrator._download_sar()
         assert mock_cls.call_args.kwargs["force_download"] is True
@@ -3987,7 +3987,7 @@ class TestOrchestratorForceDownloadWiring:
         from unittest.mock import patch
 
         orchestrator = self._make_orchestrator(tmp_path, force_download=False)
-        with patch("sar_validation.downloaders.sar_downloader.SARDownloader") as mock_cls:
+        with patch("sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader") as mock_cls:
             mock_cls.return_value.download.return_value = []
             orchestrator._download_sar()
         assert mock_cls.call_args.kwargs["force_download"] is False

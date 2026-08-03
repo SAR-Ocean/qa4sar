@@ -6,12 +6,17 @@ import warnings
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pandas as pd
 import pytest
 import xarray as xr
 
 from sar_validation.core._variable_map import filter_variable_pairs, infer_variable_pairs
 from sar_validation.core.recipe import Recipe, RecipeConfig, SARDataSpec
 from sar_validation.core.statistics import (
+    _assemble_stats_dataset,
+    _core_metrics,
+    _group_by_columns,
+    _missing_columns,
     add_rescaled_sar_column,
     compute_statistics,
     run_statistics,
@@ -1181,3 +1186,47 @@ def test_val_source_units_family_includes_smos_ssm():
     from sar_validation.core.statistics import _VAL_SOURCE_UNITS_FAMILY
 
     assert _VAL_SOURCE_UNITS_FAMILY["smos_ssm"] == "volumetric"
+
+
+# ---------------------------------------------------------------------------
+# Tests for extracted helper functions
+# ---------------------------------------------------------------------------
+
+
+def test_missing_columns_reports_absent_columns():
+    ds = xr.Dataset({"sar_x": ("collocation", [1.0])})
+    assert _missing_columns(ds, "sar_x", "val_x") == ["val_x"]
+
+
+def test_missing_columns_empty_when_all_present():
+    ds = xr.Dataset({"sar_x": ("collocation", [1.0]), "val_x": ("collocation", [2.0])})
+    assert _missing_columns(ds, "sar_x", "val_x") == []
+
+
+def test_group_by_columns_single_column():
+    df = pd.DataFrame({"a": ["x", "x", "y"], "v": [1, 2, 3]})
+    groups = _group_by_columns(df, ["a"])
+    assert sorted(groups.groups.keys()) == ["x", "y"]
+
+
+def test_group_by_columns_composite_key():
+    df = pd.DataFrame({"a": ["x", "x"], "b": ["1", "2"], "v": [1, 2]})
+    groups = _group_by_columns(df, ["a", "b"])
+    assert sorted(groups.groups.keys()) == ["x | 1", "x | 2"]
+
+
+def test_core_metrics_basic():
+    sar = np.array([1.0, 2.0, 3.0])
+    val = np.array([1.0, 2.0, 4.0])
+    record = _core_metrics(sar, val)
+    assert record["N"] == 3
+    assert record["bias"] == pytest.approx(np.mean(sar - val))
+    assert set(record.keys()) == {"N", "bias", "std", "rmse", "correlation", "scatter_index"}
+
+
+def test_assemble_stats_dataset_shape():
+    records = [{"N": 3, "bias": 0.1, "std": 0.2, "rmse": 0.3, "correlation": 0.9, "scatter_index": 0.05}]
+    ds = _assemble_stats_dataset(records, ["buoy"], "wind_speed", "WSPD", ["val_source"])
+    assert list(ds["source"].values) == ["buoy"]
+    assert ds.attrs["group_by"] == "val_source"
+    assert float(ds["bias"].values[0]) == pytest.approx(0.1)

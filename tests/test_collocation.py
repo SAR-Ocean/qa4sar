@@ -18,6 +18,7 @@ from sar_validation.core.collocation import (
     _haversine_distance,
     _inverse_distance_weights,
     _linear_weights,
+    _normalize_weights,
     _project_currents_to_radial,
     _to_datetime_array,
 )
@@ -61,6 +62,16 @@ class TestToDatetimeArray:
         dt = datetime(2026, 6, 1)
         arr = _to_datetime_array(dt)
         assert arr[0] == dt
+
+
+def test_normalize_weights_sums_to_one():
+    weights = _normalize_weights(np.array([1.0, 2.0, 3.0]))
+    assert weights.sum() == pytest.approx(1.0)
+
+
+def test_normalize_weights_zero_sum_returns_unchanged():
+    weights = _normalize_weights(np.array([0.0, 0.0]))
+    assert list(weights) == [0.0, 0.0]
 
 
 # ---------------------------------------------------------------------------

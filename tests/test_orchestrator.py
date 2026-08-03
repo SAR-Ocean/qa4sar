@@ -60,6 +60,78 @@ class TestCleanupIfEmpty:
         assert not missing_dir.exists()
 
 
+class TestRunDownload:
+    def test_success_records_files_and_status(self, tmp_path):
+        orch = DataOrchestrator(_recipe("sentinel1_l2_ocn"), dry_run=True)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "f.nc").touch()
+
+        class FakeDl:
+            def download(self, **kwargs):
+                return [out_dir / "f.nc"]
+
+        ok = orch._run_download(
+            "test_key", out_dir, lambda: FakeDl(), lambda: {}, "Test",
+        )
+        assert ok is True
+        assert orch.metadata["downloads"]["test_key"]["status"] == "dry_run"
+        assert orch.metadata["downloads"]["test_key"]["files"] == [str(out_dir / "f.nc")]
+
+    def test_failure_records_error(self, tmp_path):
+        orch = DataOrchestrator(_recipe("sentinel1_l2_ocn"), dry_run=True)
+        out_dir = tmp_path / "out"
+
+        class FailingDl:
+            def download(self, **kwargs):
+                raise RuntimeError("boom")
+
+        ok = orch._run_download(
+            "test_key", out_dir, lambda: FailingDl(), lambda: {}, "Test",
+        )
+        assert ok is False
+        assert orch.metadata["downloads"]["test_key"]["status"] == "failed"
+        assert "Test download failed: boom" in orch.metadata["downloads"]["test_key"]["error"]
+
+    def test_result_to_metadata_override(self, tmp_path):
+        orch = DataOrchestrator(_recipe("sentinel1_l2_ocn"), dry_run=True)
+        out_dir = tmp_path / "out"
+
+        class FakeDl:
+            def download(self, **kwargs):
+                return [1, 2, 3]
+
+        ok = orch._run_download(
+            "test_key", out_dir, lambda: FakeDl(), lambda: {}, "Test",
+            result_to_metadata=lambda result, dl: {"file_count": len(result)},
+        )
+        assert ok is True
+        assert orch.metadata["downloads"]["test_key"]["file_count"] == 3
+        assert "files" not in orch.metadata["downloads"]["test_key"]
+
+    def test_build_kwargs_exception_records_failure_not_raised(self, tmp_path):
+        """A bad recipe (e.g. download_kwargs isn't actually a dict) can make
+        kwargs construction itself raise. That must be caught the same as a
+        downloader/.download() failure -- recorded as a per-source failure --
+        rather than propagating uncaught through _dispatch_source."""
+        orch = DataOrchestrator(_recipe("sentinel1_l2_ocn"), dry_run=True)
+        out_dir = tmp_path / "out"
+
+        class FakeDl:
+            def download(self, **kwargs):
+                return []
+
+        def build_kwargs():
+            raise ValueError("bad kwargs")
+
+        ok = orch._run_download(
+            "test_key", out_dir, lambda: FakeDl(), build_kwargs, "Test",
+        )
+        assert ok is False
+        assert orch.metadata["downloads"]["test_key"]["status"] == "failed"
+        assert "Test download failed: bad kwargs" in orch.metadata["downloads"]["test_key"]["error"]
+
+
 class TestDownloadSarSourceBranch:
     def test_l3_ssm_uses_soil_moisture_downloader(self, tmp_path):
         recipe = _recipe("sentinel1_clms_ssm")
@@ -67,7 +139,7 @@ class TestDownloadSarSourceBranch:
         orchestrator.base_dir = tmp_path
 
         with patch(
-            "sar_validation.downloaders.soil_moisture_downloader.SoilMoistureDownloader"
+            "sar_validation.downloaders.sentinel1_soil_moisture_downloader.SoilMoistureDownloader"
         ) as mock_cls:
             mock_instance = MagicMock()
             mock_instance.download.return_value = []
@@ -85,7 +157,7 @@ class TestDownloadSarSourceBranch:
         orchestrator.base_dir = tmp_path
 
         with patch(
-            "sar_validation.downloaders.sar_downloader.SARDownloader"
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
         ) as mock_cls:
             mock_instance = MagicMock()
             mock_instance.download.return_value = []
@@ -103,7 +175,7 @@ class TestDownloadSarSourceBranch:
         orchestrator.base_dir = tmp_path
 
         with patch(
-            "sar_validation.downloaders.soil_moisture_downloader.SoilMoistureDownloader"
+            "sar_validation.downloaders.sentinel1_soil_moisture_downloader.SoilMoistureDownloader"
         ) as mock_cls:
             mock_cls.side_effect = RuntimeError("boom")
             ok = orchestrator._download_sar()
@@ -350,7 +422,7 @@ class TestDownloadTemporalPadding:
         orchestrator.base_dir = tmp_path
 
         with patch(
-            "sar_validation.downloaders.soil_moisture_downloader.SoilMoistureDownloader"
+            "sar_validation.downloaders.sentinel1_soil_moisture_downloader.SoilMoistureDownloader"
         ) as mock_cls:
             mock_instance = MagicMock()
             mock_instance.download.return_value = []

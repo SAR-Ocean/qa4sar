@@ -79,7 +79,7 @@ class SARSourceSpec:
 # ---------------------------------------------------------------------------
 
 def _build_sentinel1_l2_ocn_downloader(output_dir: Path, dry_run: bool, force_download: bool) -> Any:
-    from ..downloaders.sar_downloader import SARDownloader
+    from ..downloaders.sentinel1_l2_ocn_downloader import SARDownloader
     return SARDownloader(output_dir=output_dir, dry_run=dry_run, force_download=force_download)
 
 
@@ -97,7 +97,7 @@ def _convert_sentinel1_l2_ocn(path: Path, product_type: str) -> Optional["xr.Dat
 # ---------------------------------------------------------------------------
 
 def _build_sentinel1_clms_ssm_downloader(output_dir: Path, dry_run: bool, force_download: bool) -> Any:
-    from ..downloaders.soil_moisture_downloader import SoilMoistureDownloader
+    from ..downloaders.sentinel1_soil_moisture_downloader import SoilMoistureDownloader
     return SoilMoistureDownloader(output_dir=output_dir, dry_run=dry_run, force_download=force_download)
 
 

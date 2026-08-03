@@ -204,32 +204,6 @@ class DataTreeConverter:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def from_sar_l2_ocn(
-        sar_data: Union[xr.Dataset, Dict],
-    ) -> xr.Dataset:
-        """
-        Wrap SAR L2_OCN data in a standardised Dataset.
-
-        Parameters
-        ----------
-        sar_data : xr.Dataset or dict
-            SAR data as an xarray Dataset or a plain dict of arrays.
-
-        Returns
-        -------
-        xr.Dataset
-            Dataset with ``data_type`` attribute set to ``"sar_l2_ocn"``.
-        """
-        if isinstance(sar_data, xr.Dataset):
-            ds = sar_data.copy()
-        else:
-            ds = xr.Dataset(sar_data)
-
-        ds.attrs.setdefault("data_type", "sar_l2_ocn")
-        ds.attrs.setdefault("source", "Sentinel-1")
-        return ds
-
-    @staticmethod
     def from_sar_l3_ssm_geotiff(tif_path: Union[str, Path]) -> Optional[xr.Dataset]:
         """
         Open a Sentinel-1 CLMS Surface Soil Moisture GeoTIFF and return a
@@ -999,6 +973,38 @@ class DataTreeConverter:
         return ds
 
     @staticmethod
+    def _build_ssm_point_dataset(
+        sm: np.ndarray, lon: np.ndarray, lat: np.ndarray, time_vals: np.ndarray,
+        *, data_type: str, var_attrs: dict, platform_type: str, source: str,
+        sensing_depth_cm: str, band: str, filename: str,
+        sensor: Optional[str] = None, native_grid_deg: Optional[float] = None,
+    ) -> xr.Dataset:
+        """Build the flat-point SOIL_MOISTURE Dataset + attrs shared by every
+        ``from_*_ssm`` parser. Caller is responsible for pre-filtering
+        *sm*/*lon*/*lat*/*time_vals* down to valid cells."""
+        ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", sm)},
+            coords={
+                "lon":  ("point", lon),
+                "lat":  ("point", lat),
+                "time": ("point", time_vals),
+            },
+        )
+        apply_cf_metadata(ds, data_type, var_attrs)
+
+        ds.attrs["data_type"]        = data_type
+        ds.attrs["platform_type"]    = platform_type
+        if sensor is not None:
+            ds.attrs["sensor"] = sensor
+        ds.attrs["source"]           = source
+        ds.attrs["sensing_depth_cm"] = sensing_depth_cm
+        ds.attrs["band"]             = band
+        ds.attrs["filename"]         = filename
+        if native_grid_deg is not None:
+            ds.attrs["native_grid_deg"] = native_grid_deg
+        return ds
+
+    @staticmethod
     def from_ascat_ssm(path: Union[str, Path]) -> Optional[xr.Dataset]:
         """
         Open an ASCAT Soil Moisture (SOMO12) product via the TU Wien
@@ -1067,24 +1073,13 @@ class DataTreeConverter:
                 "long_name": "ASCAT surface soil moisture (~0-5cm, C-band)",
             }
         }
-        ds = xr.Dataset(
-            {"SOIL_MOISTURE": ("point", sm[valid])},
-            coords={
-                "lon":  ("point", lon[valid]),
-                "lat":  ("point", lat[valid]),
-                "time": ("point", time_vals.values[valid]),
-            },
+        return DataTreeConverter._build_ssm_point_dataset(
+            sm[valid], lon[valid], lat[valid], time_vals.values[valid],
+            data_type="scatterometer_ssm", var_attrs=var_attrs,
+            platform_type="ascat_ssm",
+            source="ASCAT Soil Moisture 12.5km Swath Grid (EO:EUM:DAT:METOP:SOMO12)",
+            sensing_depth_cm="0-5", band="C", filename=path.name,
         )
-        apply_cf_metadata(ds, "scatterometer_ssm", var_attrs)
-
-        ds.attrs["data_type"]        = "scatterometer_ssm"
-        ds.attrs["platform_type"]    = "ascat_ssm"
-        ds.attrs["source"]           = "ASCAT Soil Moisture 12.5km Swath Grid (EO:EUM:DAT:METOP:SOMO12)"
-        ds.attrs["sensing_depth_cm"] = "0-5"
-        ds.attrs["band"]             = "C"
-        ds.attrs["filename"]         = path.name
-
-        return ds
 
     @staticmethod
     def from_amsr_ssm(path: Union[str, Path]) -> Optional[xr.Dataset]:
@@ -1186,25 +1181,13 @@ class DataTreeConverter:
                 "long_name": "AMSR-E/2 surface soil moisture (~0-1cm, X/Ka-band)",
             }
         }
-        ds = xr.Dataset(
-            {"SOIL_MOISTURE": ("point", sm[valid])},
-            coords={
-                "lon":  ("point", lon[valid]),
-                "lat":  ("point", lat[valid]),
-                "time": ("point", time_arr),
-            },
+        return DataTreeConverter._build_ssm_point_dataset(
+            sm[valid], lon[valid], lat[valid], time_arr,
+            data_type="radiometer_ssm", var_attrs=var_attrs,
+            platform_type="amsr_ssm", sensor="amsr",
+            source="AMSR-E/AMSR2 Daily Global Land Parameters (NSIDC-0451)",
+            sensing_depth_cm="0-1", band="X/Ka", filename=path.name,
         )
-        apply_cf_metadata(ds, "radiometer_ssm", var_attrs)
-
-        ds.attrs["data_type"]        = "radiometer_ssm"
-        ds.attrs["platform_type"]    = "amsr_ssm"
-        ds.attrs["sensor"]           = "amsr"
-        ds.attrs["source"]           = "AMSR-E/AMSR2 Daily Global Land Parameters (NSIDC-0451)"
-        ds.attrs["sensing_depth_cm"] = "0-1"
-        ds.attrs["band"]             = "X/Ka"
-        ds.attrs["filename"]         = path.name
-
-        return ds
 
     @staticmethod
     def _from_amsr_ssm_au_land_swath(f: Any, path: Path) -> Optional[xr.Dataset]:
@@ -1255,25 +1238,13 @@ class DataTreeConverter:
                 "long_name": "AMSR-E/2 surface soil moisture (~0-1cm, X/Ka-band)",
             }
         }
-        ds = xr.Dataset(
-            {"SOIL_MOISTURE": ("point", sm[valid].astype(float))},
-            coords={
-                "lon":  ("point", lon[valid].astype(float)),
-                "lat":  ("point", lat[valid].astype(float)),
-                "time": ("point", time_vals.values),
-            },
+        return DataTreeConverter._build_ssm_point_dataset(
+            sm[valid].astype(float), lon[valid].astype(float), lat[valid].astype(float), time_vals.values,
+            data_type="radiometer_ssm", var_attrs=var_attrs,
+            platform_type="amsr_ssm", sensor="amsr",
+            source="AMSR-E/AMSR2 Unified L2B Half-Orbit SSM (AU_Land/AU_Land_NRT_R02)",
+            sensing_depth_cm="0-1", band="X/Ka", filename=path.name,
         )
-        apply_cf_metadata(ds, "radiometer_ssm", var_attrs)
-
-        ds.attrs["data_type"]        = "radiometer_ssm"
-        ds.attrs["platform_type"]    = "amsr_ssm"
-        ds.attrs["sensor"]           = "amsr"
-        ds.attrs["source"]           = "AMSR-E/AMSR2 Unified L2B Half-Orbit SSM (AU_Land/AU_Land_NRT_R02)"
-        ds.attrs["sensing_depth_cm"] = "0-1"
-        ds.attrs["band"]             = "X/Ka"
-        ds.attrs["filename"]         = path.name
-
-        return ds
 
     @staticmethod
     def _from_amsr_ssm_gportal_l3_grid(f: Any, path: Path) -> Optional[xr.Dataset]:
@@ -1350,26 +1321,14 @@ class DataTreeConverter:
                 "long_name": "AMSR-E/2 surface soil moisture (~0-1cm, X/Ka-band)",
             }
         }
-        ds = xr.Dataset(
-            {"SOIL_MOISTURE": ("point", sm)},
-            coords={
-                "lon":  ("point", lon2d[valid]),
-                "lat":  ("point", lat2d[valid]),
-                "time": ("point", time_vals),
-            },
+        return DataTreeConverter._build_ssm_point_dataset(
+            sm, lon2d[valid], lat2d[valid], time_vals,
+            data_type="radiometer_ssm", var_attrs=var_attrs,
+            platform_type="amsr_ssm", sensor="amsr",
+            source="AMSR2 L3 Daily 0.1-degree Global Soil Moisture (JAXA G-Portal L3SGSMC)",
+            sensing_depth_cm="0-1", band="X/Ka", filename=path.name,
+            native_grid_deg=0.1,
         )
-        apply_cf_metadata(ds, "radiometer_ssm", var_attrs)
-
-        ds.attrs["data_type"]        = "radiometer_ssm"
-        ds.attrs["platform_type"]    = "amsr_ssm"
-        ds.attrs["sensor"]           = "amsr"
-        ds.attrs["source"]           = "AMSR2 L3 Daily 0.1-degree Global Soil Moisture (JAXA G-Portal L3SGSMC)"
-        ds.attrs["sensing_depth_cm"] = "0-1"
-        ds.attrs["band"]             = "X/Ka"
-        ds.attrs["filename"]         = path.name
-        ds.attrs["native_grid_deg"] = 0.1
-
-        return ds
 
     @staticmethod
     def from_smap_ssm(path: Union[str, Path]) -> Optional[xr.Dataset]:
@@ -1475,25 +1434,13 @@ class DataTreeConverter:
                 "long_name": "SMAP surface soil moisture (~0-5cm, L-band)",
             }
         }
-        ds = xr.Dataset(
-            {"SOIL_MOISTURE": ("point", sm)},
-            coords={
-                "lon":  ("point", lon),
-                "lat":  ("point", lat),
-                "time": ("point", time_arr),
-            },
+        return DataTreeConverter._build_ssm_point_dataset(
+            sm, lon, lat, time_arr,
+            data_type="radiometer_ssm", var_attrs=var_attrs,
+            platform_type="smap_ssm", sensor="smap",
+            source="SMAP Enhanced L2 Radiometer Soil Moisture (SPL2SMP_E)",
+            sensing_depth_cm="0-5", band="L", filename=path.name,
         )
-        apply_cf_metadata(ds, "radiometer_ssm", var_attrs)
-
-        ds.attrs["data_type"]        = "radiometer_ssm"
-        ds.attrs["platform_type"]    = "smap_ssm"
-        ds.attrs["sensor"]           = "smap"
-        ds.attrs["source"]           = "SMAP Enhanced L2 Radiometer Soil Moisture (SPL2SMP_E)"
-        ds.attrs["sensing_depth_cm"] = "0-5"
-        ds.attrs["band"]             = "L"
-        ds.attrs["filename"]         = path.name
-
-        return ds
 
     @staticmethod
     def from_smos_ssm(path: Union[str, Path]) -> Optional[xr.Dataset]:
@@ -1583,24 +1530,13 @@ class DataTreeConverter:
                 "long_name": "SMOS surface soil moisture (~0-5cm, L-band)",
             }
         }
-        ds = xr.Dataset(
-            {"SOIL_MOISTURE": ("point", sm[valid])},
-            coords={
-                "lon":  ("point", lon[valid]),
-                "lat":  ("point", lat[valid]),
-                "time": ("point", time_arr.values[valid]),
-            },
+        ds = DataTreeConverter._build_ssm_point_dataset(
+            sm[valid], lon[valid], lat[valid], time_arr.values[valid],
+            data_type="radiometer_ssm", var_attrs=var_attrs,
+            platform_type="smos_ssm", sensor="smos",
+            source="SMOS Soil Moisture (ESA Online Dissemination, SM_OPER_MIR_SMUDP2)",
+            sensing_depth_cm="0-5", band="L", filename=path.name,
         )
-        apply_cf_metadata(ds, "radiometer_ssm", var_attrs)
-
-        ds.attrs["data_type"]        = "radiometer_ssm"
-        ds.attrs["platform_type"]    = "smos_ssm"
-        ds.attrs["sensor"]           = "smos"
-        ds.attrs["source"]           = "SMOS Soil Moisture (ESA Online Dissemination, SM_OPER_MIR_SMUDP2)"
-        ds.attrs["sensing_depth_cm"] = "0-5"
-        ds.attrs["band"]             = "L"
-        ds.attrs["filename"]         = path.name
-
         raw.close()
         return ds
 
@@ -3089,7 +3025,7 @@ class DataTreeConverter:
             sar_paths: list[Path] = []
             if sar_subdir.exists():
                 if spec.key == "sentinel1_clms_ssm":
-                    from ..downloaders.soil_moisture_downloader import _SSM_FILENAME_MARKER
+                    from ..downloaders.sentinel1_soil_moisture_downloader import _SSM_FILENAME_MARKER
                     sar_paths = sorted(
                         p for p in list(sar_subdir.rglob("*.tif")) + list(sar_subdir.rglob("*.tiff"))
                         if _SSM_FILENAME_MARKER in p.name
@@ -3116,7 +3052,7 @@ class DataTreeConverter:
 
             ssm_dir = base_dir / "S1_L3_SSM"
             if ssm_dir.exists():
-                from ..downloaders.soil_moisture_downloader import _SSM_FILENAME_MARKER
+                from ..downloaders.sentinel1_soil_moisture_downloader import _SSM_FILENAME_MARKER
 
                 tif_paths = [
                     p for p in list(ssm_dir.rglob("*.tif")) + list(ssm_dir.rglob("*.tiff"))

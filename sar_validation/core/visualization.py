@@ -39,6 +39,52 @@ from scipy import ndimage
 
 logger = logging.getLogger(__name__)
 
+
+def _pad_degenerate_range(vmin: float, vmax: float) -> Tuple[float, float]:
+    """Pad an all-identical (vmin == vmax) value range to a non-degenerate
+    one so set_xlim/set_ylim don't warn about singular limits."""
+    if vmin == vmax:
+        pad = max(0.5, abs(vmin) * 0.05)
+        return vmin - pad, vmax + pad
+    return vmin, vmax
+
+
+def _source_marker_handles(items, *, markersize: float = 6, markeredgecolor: str = "black") -> list:
+    """Build one legend Line2D per (label, marker) pair in *items*."""
+    import matplotlib.lines as mlines  # noqa: PLC0415
+
+    return [
+        mlines.Line2D([], [], marker=marker, linestyle="None",
+                      markerfacecolor="lightgray", markeredgecolor=markeredgecolor,
+                      markersize=markersize, label=label)
+        for label, marker in items
+    ]
+
+
+def _draw_colorbar(
+    fig, right_margin: float, sar_sm, val_sm, single_colorbar: bool,
+    collocation_ds, sar_var: str, val_var: Optional[str], sar_field_transform,
+) -> None:
+    """Compute SAR/validation axis labels and draw the shared or two-colorbar
+    layout shared by plot_geographic's per-scene and grouped figure builders."""
+    sar_label = (
+        _labeled_var(collocation_ds, f"val_{val_var}", sar_var)
+        if sar_field_transform is not None
+        else _labeled_var(collocation_ds, f"sar_{sar_var}", sar_var)
+    )
+    val_label = _labeled_var(collocation_ds, f"val_{val_var}", val_var) if val_var else None
+
+    fig.subplots_adjust(right=right_margin)
+    cbar_ax = fig.add_axes((right_margin + 0.01, 0.15, 0.015, 0.70))
+    if single_colorbar:
+        fig.colorbar(sar_sm, cax=cbar_ax, label=f"{sar_label} / {val_label}")
+    else:
+        fig.colorbar(sar_sm, cax=cbar_ax, label=f"SAR {sar_label}")
+        if val_sm is not None:
+            val_cbar_ax = fig.add_axes((right_margin + 0.055, 0.15, 0.015, 0.70))
+            fig.colorbar(val_sm, cax=val_cbar_ax, label=f"In-situ {val_label}")
+
+
 if TYPE_CHECKING:
     from matplotlib.backends.backend_pdf import PdfPages
     from matplotlib.figure import Figure
@@ -553,7 +599,6 @@ def plot_scatter(
                         name="1:1", showlegend=True)
         return fig
 
-    import matplotlib.lines as mlines  # noqa: PLC0415
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
     if ax is None:
@@ -585,13 +630,7 @@ def plot_scatter(
                        color=style[src][0], marker=marker, label=label, rasterized=True)
 
     all_vals = np.concatenate([df[val_col].values, df[sar_col].values])
-    vmin, vmax = float(np.nanmin(all_vals)), float(np.nanmax(all_vals))
-    if vmin == vmax:
-        # All values identical — pad to a non-degenerate range so
-        # set_xlim/set_ylim don't warn about singular limits.
-        pad = max(0.5, abs(vmin) * 0.05)
-        vmin -= pad
-        vmax += pad
+    vmin, vmax = _pad_degenerate_range(float(np.nanmin(all_vals)), float(np.nanmax(all_vals)))
     line11 = ax.plot([vmin, vmax], [vmin, vmax], "k--", linewidth=1, label="1:1")[0]
 
     if color_by_offset and offset_sm is not None:
@@ -630,12 +669,9 @@ def plot_scatter(
 
     if color_by_offset:
         if by_source:
-            handles = [
-                mlines.Line2D([], [], marker=style[src][1], linestyle="None",
-                              markerfacecolor="lightgray", markeredgecolor="black",
-                              markersize=6, label=src)
-                for src in sorted(sources)
-            ]
+            handles = _source_marker_handles(
+                ((src, style[src][1]) for src in sorted(sources)), markersize=6,
+            )
             handles.append(line11)
             ax.legend(handles=handles, fontsize=7, framealpha=0.7)
     elif by_source:
@@ -694,11 +730,7 @@ def _plot_scatter_small_multiples(
         sub_ax.grid(True, linewidth=0.4)
 
         sub_vals = np.concatenate([sub[val_col].values, sub[sar_col].values])
-        sub_vmin, sub_vmax = float(np.nanmin(sub_vals)), float(np.nanmax(sub_vals))
-        if sub_vmin == sub_vmax:
-            pad = max(0.5, abs(sub_vmin) * 0.05)
-            sub_vmin -= pad
-            sub_vmax += pad
+        sub_vmin, sub_vmax = _pad_degenerate_range(float(np.nanmin(sub_vals)), float(np.nanmax(sub_vals)))
         sub_ax.plot([sub_vmin, sub_vmax], [sub_vmin, sub_vmax], "k--", linewidth=1, label="1:1")
 
     visible_axes = [axes[idx // ncols][idx % ncols] for idx in range(len(sources))]
@@ -1275,12 +1307,10 @@ def plot_geographic(
                     # reaches this function at all -- point_collocation_ds
                     # above already excludes it, rows and all.
                     present = set(valid_pts["val_source"].astype(str))
-                    handles += [
-                        mlines.Line2D([], [], marker=mkr, linestyle="None",
-                                      markerfacecolor="lightgray", markeredgecolor="black",
-                                      markersize=5, label=s)
-                        for s, (_, mkr) in source_style.items() if s in present
-                    ]
+                    handles += _source_marker_handles(
+                        ((s, mkr) for s, (_, mkr) in source_style.items() if s in present),
+                        markersize=5,
+                    )
                 if len(nan_pts):
                     handles.append(
                         mlines.Line2D([], [], marker="o", linestyle="None",
@@ -1387,21 +1417,10 @@ def plot_geographic(
         # all -- structurally absent, not intermittent. Add it now, reusing
         # the exact same shared/two-colorbar objects _build_figure already
         # computes once for the whole plot_geographic call.
-        fig.subplots_adjust(right=right_margin)
-        cbar_ax = fig.add_axes((right_margin + 0.01, 0.15, 0.015, 0.70))
-        sar_label = (
-            _labeled_var(collocation_ds, f"val_{val_var}", sar_var)
-            if sar_field_transform is not None
-            else _labeled_var(collocation_ds, f"sar_{sar_var}", sar_var)
+        _draw_colorbar(
+            fig, right_margin, sar_sm, val_sm, single_colorbar,
+            collocation_ds, sar_var, val_var, sar_field_transform,
         )
-        val_label = _labeled_var(collocation_ds, f"val_{val_var}", val_var) if val_var else None
-        if single_colorbar:
-            fig.colorbar(sar_sm, cax=cbar_ax, label=f"{sar_label} / {val_label}")
-        else:
-            fig.colorbar(sar_sm, cax=cbar_ax, label=f"SAR {sar_label}")
-            if val_sm is not None:
-                val_cbar_ax = fig.add_axes((right_margin + 0.055, 0.15, 0.015, 0.70))
-                fig.colorbar(val_sm, cax=val_cbar_ax, label=f"In-situ {val_label}")
 
         return fig
 
@@ -1433,22 +1452,10 @@ def plot_geographic(
         # Once the field has been converted into the validation domain,
         # label it with the validation column's units, not the SAR
         # column's original ones — matching what's actually displayed.
-        sar_label = (
-            _labeled_var(collocation_ds, f"val_{val_var}", sar_var)
-            if sar_field_transform is not None
-            else _labeled_var(collocation_ds, f"sar_{sar_var}", sar_var)
+        _draw_colorbar(
+            fig, right_margin, sar_sm, val_sm, single_colorbar,
+            collocation_ds, sar_var, val_var, sar_field_transform,
         )
-        val_label = _labeled_var(collocation_ds, f"val_{val_var}", val_var) if val_var else None
-
-        fig.subplots_adjust(right=right_margin)
-        cbar_ax = fig.add_axes((right_margin + 0.01, 0.15, 0.015, 0.70))
-        if single_colorbar:
-            fig.colorbar(sar_sm, cax=cbar_ax, label=f"{sar_label} / {val_label}")
-        else:
-            fig.colorbar(sar_sm, cax=cbar_ax, label=f"SAR {sar_label}")
-            if val_sm is not None:
-                val_cbar_ax = fig.add_axes((right_margin + 0.055, 0.15, 0.015, 0.70))
-                fig.colorbar(val_sm, cax=val_cbar_ax, label=f"In-situ {val_label}")
 
         title = f"SAR {sar_var}"
         if val_var:

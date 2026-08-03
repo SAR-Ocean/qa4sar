@@ -180,6 +180,14 @@ def _to_datetime_array(time_array) -> np.ndarray:
 # Distance-weighting functions for SAR aggregation
 # ---------------------------------------------------------------------------
 
+def _normalize_weights(weights: np.ndarray) -> np.ndarray:
+    """Normalize *weights* to sum to 1.0; unchanged if the sum is 0."""
+    weight_sum = np.sum(weights)
+    if weight_sum > 0:
+        weights = weights / weight_sum
+    return weights
+
+
 def _gaussian_weights(distances: np.ndarray, sigma_km: float) -> np.ndarray:
     """
     Compute normalized Gaussian distance weights.
@@ -199,10 +207,7 @@ def _gaussian_weights(distances: np.ndarray, sigma_km: float) -> np.ndarray:
         Normalized weights, same shape as distances.
     """
     weights = np.exp(-(distances ** 2) / (2 * sigma_km ** 2))
-    weight_sum = np.sum(weights)
-    if weight_sum > 0:
-        weights = weights / weight_sum
-    return weights
+    return _normalize_weights(weights)
 
 
 def _inverse_distance_weights(distances: np.ndarray, power: float = 2.0) -> np.ndarray:
@@ -226,10 +231,7 @@ def _inverse_distance_weights(distances: np.ndarray, power: float = 2.0) -> np.n
     # Avoid division by zero
     safe_distances = np.maximum(distances, 1e-6)
     weights = 1.0 / (safe_distances ** power)
-    weight_sum = np.sum(weights)
-    if weight_sum > 0:
-        weights = weights / weight_sum
-    return weights
+    return _normalize_weights(weights)
 
 
 def _linear_weights(distances: np.ndarray, max_distance_km: float) -> np.ndarray:
@@ -251,10 +253,7 @@ def _linear_weights(distances: np.ndarray, max_distance_km: float) -> np.ndarray
         Normalized weights, same shape as distances.
     """
     weights = np.maximum(0.0, 1.0 - distances / max_distance_km)
-    weight_sum = np.sum(weights)
-    if weight_sum > 0:
-        weights = weights / weight_sum
-    return weights
+    return _normalize_weights(weights)
 
 
 def _equal_weights(distances: np.ndarray) -> np.ndarray:

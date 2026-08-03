@@ -70,6 +70,66 @@ def _circular_corrcoef_deg(a_deg: np.ndarray, b_deg: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Extracted helpers for deduplication
+# ---------------------------------------------------------------------------
+
+
+def _missing_columns(collocation_ds: xr.Dataset, *cols: str) -> List[str]:
+    """Names in *cols* absent from *collocation_ds*, in order."""
+    return [c for c in cols if c not in collocation_ds]
+
+
+def _group_by_columns(df, group_by: List[str]):
+    """Group *df* by a single column, or by a synthetic ``_group`` column
+    joining all of *group_by* with ``" | "`` when there's more than one."""
+    if len(group_by) == 1:
+        return df.groupby(group_by[0])
+    df["_group"] = df[group_by].astype(str).agg(" | ".join, axis=1)
+    return df.groupby("_group")
+
+
+def _core_metrics(sar_vals: np.ndarray, val_vals: np.ndarray) -> dict:
+    """bias/std/rmse/correlation/scatter_index for a non-circular
+    (sar_vals, val_vals) pair. Shared by :func:`compute_statistics`'s
+    non-circular branch and :func:`_soil_moisture_metrics` (which adds
+    ubrmsd on top)."""
+    diff = sar_vals - val_vals
+    n = len(sar_vals)
+    bias = float(np.mean(diff))
+    std = float(np.std(diff, ddof=1)) if n > 1 else float("nan")
+    rmse = float(np.sqrt(np.mean(diff ** 2)))
+    mean_val = float(np.mean(val_vals))
+    si = rmse / abs(mean_val) if abs(mean_val) > 1e-10 else float("nan")
+    if n > 1 and np.std(sar_vals) > 0 and np.std(val_vals) > 0:
+        corr = float(np.corrcoef(sar_vals, val_vals)[0, 1])
+    else:
+        corr = float("nan")
+    return {"N": n, "bias": bias, "std": std, "rmse": rmse, "correlation": corr, "scatter_index": si}
+
+
+def _assemble_stats_dataset(records, source_labels, sar_var: str, val_var: str, group_by: List[str]) -> xr.Dataset:
+    """Build the per-source stats xr.Dataset shared by
+    :func:`compute_statistics` and :func:`compute_statistics_soil_moisture`."""
+    metrics = list(records[0].keys())
+    return xr.Dataset(
+        {
+            metric: xr.DataArray(
+                [r[metric] for r in records],
+                dims=["source"],
+                attrs={"sar_var": sar_var, "val_var": val_var},
+            )
+            for metric in metrics
+        },
+        coords={"source": source_labels},
+        attrs={
+            "sar_var":  sar_var,
+            "val_var":  val_var,
+            "group_by": ",".join(group_by),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Core computation
 # ---------------------------------------------------------------------------
 
@@ -125,7 +185,7 @@ def compute_statistics(
     sar_col = f"sar_{sar_var}"
     val_col = f"val_{val_var}"
 
-    missing = [c for c in (sar_col, val_col) if c not in collocation_ds]
+    missing = _missing_columns(collocation_ds, sar_col, val_col)
     if missing:
         logger.warning(
             "compute_statistics: variable(s) %s not found in collocation dataset — skipping.",
@@ -142,11 +202,7 @@ def compute_statistics(
         return None
 
     # Build group label by joining all group_by columns
-    if len(group_by) == 1:
-        groups = df.groupby(group_by[0])
-    else:
-        df["_group"] = df[group_by].astype(str).agg(" | ".join, axis=1)
-        groups = df.groupby("_group")
+    groups = _group_by_columns(df, group_by)
 
     is_circular = val_var in CIRCULAR_VAL_VARS
 
@@ -176,48 +232,21 @@ def compute_statistics(
             mean_val = _circular_mean_deg(val_vals)
             si = rmse / abs(mean_val) if abs(mean_val) > 1e-10 else float("nan")
             corr = _circular_corrcoef_deg(sar_vals, val_vals) if n > 1 else float("nan")
+            record = {
+                "N":             n,
+                "bias":          bias,
+                "std":           std,
+                "rmse":          rmse,
+                "correlation":   corr,
+                "scatter_index": si,
+            }
         else:
-            diff = sar_vals - val_vals
-            bias = float(np.mean(diff))
-            std = float(np.std(diff, ddof=1)) if n > 1 else float("nan")
-            rmse = float(np.sqrt(np.mean(diff ** 2)))
-            mean_val = float(np.mean(val_vals))
-            si = rmse / abs(mean_val) if abs(mean_val) > 1e-10 else float("nan")
+            record = _core_metrics(sar_vals, val_vals)
 
-            if n > 1 and np.std(sar_vals) > 0 and np.std(val_vals) > 0:
-                corr_mat = np.corrcoef(sar_vals, val_vals)
-                corr = float(corr_mat[0, 1])
-            else:
-                corr = float("nan")
-
-        records.append({
-            "N":             n,
-            "bias":          bias,
-            "std":           std,
-            "rmse":          rmse,
-            "correlation":   corr,
-            "scatter_index": si,
-        })
+        records.append(record)
         source_labels.append(str(label))
 
-    metrics = list(records[0].keys())
-    stats_ds = xr.Dataset(
-        {
-            metric: xr.DataArray(
-                [r[metric] for r in records],
-                dims=["source"],
-                attrs={"sar_var": sar_var, "val_var": val_var},
-            )
-            for metric in metrics
-        },
-        coords={"source": source_labels},
-        attrs={
-            "sar_var":  sar_var,
-            "val_var":  val_var,
-            "group_by": ",".join(group_by),
-        },
-    )
-    return stats_ds
+    return _assemble_stats_dataset(records, source_labels, sar_var, val_var, group_by)
 
 
 def _cdf_match_sar_series(
@@ -283,25 +312,9 @@ def _soil_moisture_metrics(sar_rescaled: np.ndarray, val_vals: np.ndarray) -> di
     """
     from pytesmo.metrics import ubrmsd
 
-    diff = sar_rescaled - val_vals
-    n = len(sar_rescaled)
-    bias = float(np.mean(diff))
-    std = float(np.std(diff, ddof=1)) if n > 1 else float("nan")
-    rmse = float(np.sqrt(np.mean(diff ** 2)))
-    mean_val = float(np.mean(val_vals))
-    si = rmse / abs(mean_val) if abs(mean_val) > 1e-10 else float("nan")
-
-    if n > 1 and np.std(sar_rescaled) > 0 and np.std(val_vals) > 0:
-        corr = float(np.corrcoef(sar_rescaled, val_vals)[0, 1])
-    else:
-        corr = float("nan")
-
-    ubrmsd_val = float(ubrmsd(sar_rescaled, val_vals)) if n > 1 else float("nan")
-
-    return {
-        "N": n, "bias": bias, "std": std, "rmse": rmse,
-        "correlation": corr, "scatter_index": si, "ubrmsd": ubrmsd_val,
-    }
+    record = _core_metrics(sar_rescaled, val_vals)
+    record["ubrmsd"] = float(ubrmsd(sar_rescaled, val_vals)) if record["N"] > 1 else float("nan")
+    return record
 
 
 def _rescale_and_compute_soil_moisture_stats(
@@ -354,7 +367,7 @@ def compute_statistics_soil_moisture(
     sar_col = f"sar_{sar_var}"
     val_col = f"val_{val_var}"
 
-    missing = [c for c in (sar_col, val_col) if c not in collocation_ds]
+    missing = _missing_columns(collocation_ds, sar_col, val_col)
     if missing:
         logger.warning(
             "compute_statistics_soil_moisture: variable(s) %s not found in collocation dataset — skipping.",
@@ -371,11 +384,7 @@ def compute_statistics_soil_moisture(
         logger.warning("compute_statistics_soil_moisture: no valid pairs for %s vs %s.", sar_col, val_col)
         return None
 
-    if len(group_by) == 1:
-        groups = df.groupby(group_by[0])
-    else:
-        df["_group"] = df[group_by].astype(str).agg(" | ".join, axis=1)
-        groups = df.groupby("_group")
+    groups = _group_by_columns(df, group_by)
 
     records = []
     source_labels = []
@@ -403,24 +412,7 @@ def compute_statistics_soil_moisture(
     if not records:
         return None
 
-    metrics = list(records[0].keys())
-    stats_ds = xr.Dataset(
-        {
-            metric: xr.DataArray(
-                [r[metric] for r in records],
-                dims=["source"],
-                attrs={"sar_var": sar_var, "val_var": val_var},
-            )
-            for metric in metrics
-        },
-        coords={"source": source_labels},
-        attrs={
-            "sar_var":  sar_var,
-            "val_var":  val_var,
-            "group_by": ",".join(group_by),
-        },
-    )
-    return stats_ds
+    return _assemble_stats_dataset(records, source_labels, sar_var, val_var, group_by)
 
 
 def add_rescaled_sar_column(
@@ -482,10 +474,11 @@ def add_rescaled_sar_column(
     sar_col = f"sar_{sar_var}"
     val_col = f"val_{val_var}"
 
-    if sar_col not in collocation_ds or val_col not in collocation_ds:
+    missing = _missing_columns(collocation_ds, sar_col, val_col)
+    if missing:
         logger.warning(
             "add_rescaled_sar_column: variable(s) %s not found — returning unchanged.",
-            [c for c in (sar_col, val_col) if c not in collocation_ds],
+            missing,
         )
         return collocation_ds.copy(deep=True)
 
@@ -500,11 +493,7 @@ def add_rescaled_sar_column(
 
     df = out[[sar_col, val_col, *group_by]].to_dataframe()
 
-    if len(group_by) == 1:
-        groups = df.groupby(group_by[0])
-    else:
-        df["_group"] = df[group_by].astype(str).agg(" | ".join, axis=1)
-        groups = df.groupby("_group")
+    groups = _group_by_columns(df, group_by)
 
     for label, grp in groups:
         if str(label) in converted_sources:

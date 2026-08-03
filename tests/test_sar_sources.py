@@ -46,7 +46,7 @@ class TestSentinel1L2OcnDownloaderWiring:
         from sar_validation.core.sar_sources import SAR_SOURCES
 
         spec = SAR_SOURCES["sentinel1_l2_ocn"]
-        with patch("sar_validation.downloaders.sar_downloader.SARDownloader") as mock_cls:
+        with patch("sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader") as mock_cls:
             mock_cls.return_value = MagicMock()
             dl = spec.build_downloader(tmp_path, False, True)
         mock_cls.assert_called_once_with(output_dir=tmp_path, dry_run=False, force_download=True)
@@ -78,7 +78,7 @@ class TestSentinel1ClmsSsmDownloaderWiring:
 
         spec = SAR_SOURCES["sentinel1_clms_ssm"]
         with patch(
-            "sar_validation.downloaders.soil_moisture_downloader.SoilMoistureDownloader"
+            "sar_validation.downloaders.sentinel1_soil_moisture_downloader.SoilMoistureDownloader"
         ) as mock_cls:
             mock_cls.return_value = MagicMock()
             dl = spec.build_downloader(tmp_path, True, False)

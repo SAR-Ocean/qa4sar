@@ -9,10 +9,36 @@ import xarray as xr
 
 from sar_validation.core.statistics import compute_statistics
 from sar_validation.core.visualization import (
+    _pad_degenerate_range,
+    _source_marker_handles,
     plot_residuals,
     plot_scatter,
     plot_statistics,
 )
+
+
+def test_pad_degenerate_range_returns_unchanged_when_not_degenerate():
+    assert _pad_degenerate_range(1.0, 5.0) == (1.0, 5.0)
+
+
+def test_pad_degenerate_range_pads_when_equal():
+    vmin, vmax = _pad_degenerate_range(3.0, 3.0)
+    assert vmin < 3.0 < vmax
+    assert vmax - 3.0 == pytest.approx(max(0.5, abs(3.0) * 0.05))
+
+
+def test_pad_degenerate_range_pads_zero_with_floor():
+    vmin, vmax = _pad_degenerate_range(0.0, 0.0)
+    assert vmax == pytest.approx(0.5)
+    assert vmin == pytest.approx(-0.5)
+
+
+def test_source_marker_handles_builds_one_line2d_per_item():
+    handles = _source_marker_handles([("buoy", "o"), ("mooring", "^")], markersize=6)
+    assert [h.get_label() for h in handles] == ["buoy", "mooring"]
+    assert [h.get_marker() for h in handles] == ["o", "^"]
+    assert all(h.get_markersize() == 6 for h in handles)
+
 
 # ---------------------------------------------------------------------------
 # Fixtures

@@ -162,29 +162,6 @@ def _make_collocations(n: int = 3) -> list[CollocatedPoint]:
 
 
 # ---------------------------------------------------------------------------
-# from_sar_l2_ocn
-# ---------------------------------------------------------------------------
-
-class TestFromSarL2Ocn:
-    def test_accepts_dataset(self):
-        ds_in = xr.Dataset({"wind_speed": ("x", [5.0, 6.0, 7.0])})
-        ds = DataTreeConverter.from_sar_l2_ocn(ds_in)
-        assert isinstance(ds, xr.Dataset)
-        assert ds.attrs["data_type"] == "sar_l2_ocn"
-
-    def test_accepts_dict(self):
-        data = {"wind_speed": np.array([5.0, 6.0]), "lat": np.array([50.0, 51.0])}
-        ds = DataTreeConverter.from_sar_l2_ocn(data)
-        assert "wind_speed" in ds
-
-    def test_preserves_existing_attrs(self):
-        ds_in = xr.Dataset({"v": ("x", [1.0])}, attrs={"source": "custom"})
-        ds = DataTreeConverter.from_sar_l2_ocn(ds_in)
-        assert ds.attrs["source"] == "custom"
-        assert ds.attrs["data_type"] == "sar_l2_ocn"
-
-
-# ---------------------------------------------------------------------------
 # from_insitu_csv
 # ---------------------------------------------------------------------------
 
@@ -1890,6 +1867,43 @@ class TestBuildDatatreeCurrentsHistorical:
         # TestBuildDatatreeHfRadarHistorical convention — DataTree node
         # paths carry a leading "/" this key doesn't include.
         assert any(f"validation/{instrument}/{csv_path.stem}" in p for p in node_paths)
+
+
+def test_build_ssm_point_dataset_sets_attrs_and_data():
+    ds = DataTreeConverter._build_ssm_point_dataset(
+        np.array([0.1, 0.2]), np.array([10.0, 11.0]), np.array([50.0, 51.0]),
+        np.array(["2026-01-01", "2026-01-02"], dtype="datetime64[ns]"),
+        data_type="scatterometer_ssm",
+        var_attrs={"SOIL_MOISTURE": {"units": "%"}},
+        platform_type="ascat_ssm",
+        source="Test Source",
+        sensing_depth_cm="0-5",
+        band="C",
+        filename="test.nc",
+    )
+    assert list(ds["SOIL_MOISTURE"].values) == [0.1, 0.2]
+    assert ds.attrs["data_type"] == "scatterometer_ssm"
+    assert ds.attrs["platform_type"] == "ascat_ssm"
+    assert "sensor" not in ds.attrs
+    assert ds.attrs["filename"] == "test.nc"
+
+
+def test_build_ssm_point_dataset_optional_sensor_and_grid():
+    ds = DataTreeConverter._build_ssm_point_dataset(
+        np.array([0.1]), np.array([10.0]), np.array([50.0]),
+        np.array(["2026-01-01"], dtype="datetime64[ns]"),
+        data_type="radiometer_ssm",
+        var_attrs={"SOIL_MOISTURE": {"units": "m3 m-3"}},
+        platform_type="amsr_ssm",
+        source="Test Source",
+        sensing_depth_cm="0-1",
+        band="X/Ka",
+        filename="test.h5",
+        sensor="amsr",
+        native_grid_deg=0.1,
+    )
+    assert ds.attrs["sensor"] == "amsr"
+    assert ds.attrs["native_grid_deg"] == 0.1
 
 
 class TestFromASCATSsm:

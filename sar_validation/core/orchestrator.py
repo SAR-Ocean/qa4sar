@@ -210,6 +210,39 @@ class DataOrchestrator:
         if out_dir.exists() and not any(p.is_file() for p in out_dir.rglob("*")):
             shutil.rmtree(out_dir)
 
+    def _run_download(
+        self, key: str, out_dir: Path, build_dl, build_kwargs, error_label: str,
+        *, result_to_metadata=None,
+    ) -> bool:
+        """Shared skeleton for the simple ``_download_*`` handlers: build the
+        downloader, call ``.download()``, clean up an empty output dir, and
+        record success/failure metadata under *key*.
+
+        *build_dl* is a zero-arg callable returning the constructed
+        downloader. *build_kwargs* is a zero-arg callable returning the
+        ``download()`` keyword-argument dict. *result_to_metadata*, if
+        given, maps ``(download_result, downloader) -> dict`` merged into
+        the success entry; default is ``{"files": [str(p) for p in result]}``.
+        """
+        try:
+            dl = build_dl()
+            download_kwargs = build_kwargs()
+            result = dl.download(**download_kwargs)
+            self._cleanup_if_empty(out_dir)
+            entry: Dict[str, Any] = {"status": "dry_run" if self.dry_run else "success"}
+            if result_to_metadata is not None:
+                entry.update(result_to_metadata(result, dl))
+            else:
+                entry["files"] = [str(p) for p in (result or [])]
+            self.metadata["downloads"][key] = entry
+            return True
+        except Exception as exc:
+            msg = f"{error_label} download failed: {exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"][key] = {"status": "failed", "error": msg}
+            return False
+
     def _load_previous_downloads(self) -> Dict[str, Any]:
         """Read the ``downloads`` section of a prior run's
         ``download_metadata.json`` in ``self.base_dir``, if present.
@@ -359,26 +392,17 @@ class DataOrchestrator:
         spec   = SAR_SOURCES[cfg.sar_data.source]
         out_dir = self.base_dir / spec.output_subdir
 
-        try:
-            dl = spec.build_downloader(out_dir, self.dry_run, self.force_download)
-            paths = dl.download(
+        return self._run_download(
+            "sar", out_dir,
+            lambda: spec.build_downloader(out_dir, self.dry_run, self.force_download),
+            lambda: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=temp.start,      end=temp.end,
                 **spec.extra_download_kwargs(cfg.sar_data),
-            )
-            self._cleanup_if_empty(out_dir)
-            self.metadata["downloads"]["sar"] = {
-                "status": "dry_run" if self.dry_run else "success",
-                "files":  [str(p) for p in paths],
-            }
-            return True
-        except Exception as exc:
-            msg = f"SAR ({cfg.sar_data.source}) download failed: {exc}"
-            logger.error(msg)
-            self.metadata["errors"].append(msg)
-            self.metadata["downloads"]["sar"] = {"status": "failed", "error": msg}
-            return False
+            ),
+            f"SAR ({cfg.sar_data.source})",
+        )
 
     def _download_insitu(
         self,
@@ -529,28 +553,19 @@ class DataOrchestrator:
         pad_start, pad_end = _padded_temporal_bounds(cfg, "scatterometer")
         out_dir = self.base_dir / "osi_saf_winds"
 
-        try:
-            dl = ScatterometerDownloader(
+        return self._run_download(
+            "scatterometer", out_dir,
+            lambda: ScatterometerDownloader(
                 output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
-            )
-            dl.download(
+            ),
+            lambda: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=pad_start, end=pad_end,
-            )
-            self._cleanup_if_empty(out_dir)
-            self.metadata["downloads"]["scatterometer"] = {
-                "status": "dry_run" if self.dry_run else "success",
-            }
-            return True
-        except Exception as exc:
-            msg = f"Scatterometer download failed: {exc}"
-            logger.error(msg)
-            self.metadata["errors"].append(msg)
-            self.metadata["downloads"]["scatterometer"] = {
-                "status": "failed", "error": msg
-            }
-            return False
+            ),
+            "Scatterometer",
+            result_to_metadata=lambda result, dl: {},
+        )
 
     def _download_ascat_ssm(self, source) -> bool:
         from ..downloaders.ascat_soil_moisture_downloader import ASCATSoilMoistureDownloader
@@ -560,29 +575,18 @@ class DataOrchestrator:
         pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
         out_dir = self.base_dir / "ascat_ssm"
 
-        try:
-            dl = ASCATSoilMoistureDownloader(
+        return self._run_download(
+            "ascat_ssm", out_dir,
+            lambda: ASCATSoilMoistureDownloader(
                 output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
-            )
-            paths = dl.download(
+            ),
+            lambda: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=pad_start, end=pad_end,
-            )
-            self._cleanup_if_empty(out_dir)
-            self.metadata["downloads"]["ascat_ssm"] = {
-                "status": "dry_run" if self.dry_run else "success",
-                "files":  [str(p) for p in paths],
-            }
-            return True
-        except Exception as exc:
-            msg = f"ASCAT SSM download failed: {exc}"
-            logger.error(msg)
-            self.metadata["errors"].append(msg)
-            self.metadata["downloads"]["ascat_ssm"] = {
-                "status": "failed", "error": msg
-            }
-            return False
+            ),
+            "ASCAT SSM",
+        )
 
     def _download_earthdata_ssm(
         self, source, dataset: str, version: Optional[str], out_subdir: str,
@@ -702,25 +706,16 @@ class DataOrchestrator:
         pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
         out_dir = self.base_dir / "smos_ssm"
 
-        try:
-            dl = SMOSDownloader(output_dir=out_dir, dry_run=self.dry_run)
-            paths = dl.download(
+        return self._run_download(
+            "smos_ssm", out_dir,
+            lambda: SMOSDownloader(output_dir=out_dir, dry_run=self.dry_run),
+            lambda: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=pad_start, end=pad_end,
-            )
-            self._cleanup_if_empty(out_dir)
-            self.metadata["downloads"]["smos_ssm"] = {
-                "status": "dry_run" if self.dry_run else "success",
-                "files":  [str(p) for p in paths],
-            }
-            return True
-        except Exception as exc:
-            msg = f"SMOS SSM download failed: {exc}"
-            logger.error(msg)
-            self.metadata["errors"].append(msg)
-            self.metadata["downloads"]["smos_ssm"] = {"status": "failed", "error": msg}
-            return False
+            ),
+            "SMOS SSM",
+        )
 
     def _download_scatterometer_ftp(self, source, satellite: str) -> bool:
         from ..downloaders.scatterometer_ftp_downloader import ScatterometerFTPDownloader
@@ -730,29 +725,20 @@ class DataOrchestrator:
         pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
         out_dir = self.base_dir / f"scatterometer_{satellite}"
 
-        try:
-            dl = ScatterometerFTPDownloader(
+        return self._run_download(
+            f"scatterometer_{satellite}", out_dir,
+            lambda: ScatterometerFTPDownloader(
                 satellite=satellite,
                 output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
-            )
-            dl.download(
+            ),
+            lambda: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=pad_start, end=pad_end,
-            )
-            self._cleanup_if_empty(out_dir)
-            self.metadata["downloads"][f"scatterometer_{satellite}"] = {
-                "status": "dry_run" if self.dry_run else "success",
-            }
-            return True
-        except Exception as exc:
-            msg = f"{satellite} FTP scatterometer download failed: {exc}"
-            logger.error(msg)
-            self.metadata["errors"].append(msg)
-            self.metadata["downloads"][f"scatterometer_{satellite}"] = {
-                "status": "failed", "error": msg
-            }
-            return False
+            ),
+            f"{satellite} FTP scatterometer",
+            result_to_metadata=lambda result, dl: {},
+        )
 
     def _download_scatterometer_hy2b(self, source) -> bool:
         return self._download_scatterometer_ftp(source, "hy2b")
@@ -771,31 +757,23 @@ class DataOrchestrator:
         pad_start, pad_end = _padded_temporal_bounds(cfg, "hf_radar_grid")
         out_dir = self.base_dir / "hf_radar"
 
-        try:
-            dl = HFRadarDownloader(
+        return self._run_download(
+            "hf_radar", out_dir,
+            lambda: HFRadarDownloader(
                 output_dir=out_dir,
                 dry_run=self.dry_run,
                 min_depth=source.resolved_min_depth,
                 max_depth=source.resolved_max_depth,
                 force_download=self.force_download,
-            )
-            downloaded = dl.download(
+            ),
+            lambda: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=pad_start, end=pad_end,
-            ) or []
-            self._cleanup_if_empty(out_dir)
-            self.metadata["downloads"]["hf_radar"] = {
-                "status": "dry_run" if self.dry_run else "success",
-                "file_count": len(downloaded),
-            }
-            return True
-        except Exception as exc:
-            msg = f"HF radar download failed: {exc}"
-            logger.error(msg)
-            self.metadata["errors"].append(msg)
-            self.metadata["downloads"]["hf_radar"] = {"status": "failed", "error": msg}
-            return False
+            ),
+            "HF radar",
+            result_to_metadata=lambda result, dl: {"file_count": len(result or [])},
+        )
 
     def _download_noaa_hfradar(self, source) -> bool:
         from ..downloaders.noaa_hfradar_downloader import (
@@ -811,29 +789,20 @@ class DataOrchestrator:
         # established ValidationDataSource.download_kwargs channel.
         resolution_km = int(source.download_kwargs.get("resolution_km", DEFAULT_RESOLUTION_KM))
 
-        try:
-            dl = NOAAHFRadarDownloader(
-                output_dir=out_dir,
-                dry_run=self.dry_run,
-                resolution_km=resolution_km,
-                force_download=self.force_download,
-            )
-            dl.download(
+        return self._run_download(
+            "hf_radar_noaa", out_dir,
+            lambda: NOAAHFRadarDownloader(
+                output_dir=out_dir, dry_run=self.dry_run,
+                resolution_km=resolution_km, force_download=self.force_download,
+            ),
+            lambda: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=pad_start, end=pad_end,
-            )
-            self._cleanup_if_empty(out_dir)
-            self.metadata["downloads"]["hf_radar_noaa"] = {
-                "status": "dry_run" if self.dry_run else "success",
-            }
-            return True
-        except Exception as exc:
-            msg = f"NOAA HF-radar download failed: {exc}"
-            logger.error(msg)
-            self.metadata["errors"].append(msg)
-            self.metadata["downloads"]["hf_radar_noaa"] = {"status": "failed", "error": msg}
-            return False
+            ),
+            "NOAA HF-radar",
+            result_to_metadata=lambda result, dl: {},
+        )
 
     def _download_hf_radar_historical(self, source) -> bool:
         from ..downloaders.hf_radar_historical_downloader import HFRadarHistoricalDownloader
@@ -843,27 +812,19 @@ class DataOrchestrator:
         pad_start, pad_end = _padded_temporal_bounds(cfg, "hf_radar_grid")
         out_dir = self.base_dir / "hf_radar_historical"
 
-        try:
-            dl = HFRadarHistoricalDownloader(
+        return self._run_download(
+            "hf_radar_historical", out_dir,
+            lambda: HFRadarHistoricalDownloader(
                 output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
-            )
-            downloaded = dl.download(
+            ),
+            lambda: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=pad_start, end=pad_end,
-            ) or []
-            self._cleanup_if_empty(out_dir)
-            self.metadata["downloads"]["hf_radar_historical"] = {
-                "status": "dry_run" if self.dry_run else "success",
-                "file_count": len(downloaded),
-            }
-            return True
-        except Exception as exc:
-            msg = f"HF radar historical download failed: {exc}"
-            logger.error(msg)
-            self.metadata["errors"].append(msg)
-            self.metadata["downloads"]["hf_radar_historical"] = {"status": "failed", "error": msg}
-            return False
+            ),
+            "HF radar historical",
+            result_to_metadata=lambda result, dl: {"file_count": len(result or [])},
+        )
 
     def _download_hf_radar_us(self, source) -> bool:
         from ..downloaders.hf_radar_us_downloader import HFRadarUSDownloader
@@ -916,34 +877,24 @@ class DataOrchestrator:
         pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
         out_dir = self.base_dir / f"{instrument}_historical"
 
-        try:
-            dl = InSituCurrentsHistoricalDownloader(
+        return self._run_download(
+            f"{instrument}_historical", out_dir,
+            lambda: InSituCurrentsHistoricalDownloader(
                 instrument=instrument,
                 output_dir=out_dir,
                 dry_run=self.dry_run,
                 min_depth=source.resolved_min_depth,
                 max_depth=source.resolved_max_depth,
                 force_download=self.force_download,
-            )
-            downloaded = dl.download(
+            ),
+            lambda: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=pad_start, end=pad_end,
-            ) or []
-            self._cleanup_if_empty(out_dir)
-            self.metadata["downloads"][f"{instrument}_historical"] = {
-                "status": "dry_run" if self.dry_run else "success",
-                "file_count": len(downloaded),
-            }
-            return True
-        except Exception as exc:
-            msg = f"{instrument} delayed-mode currents download failed: {exc}"
-            logger.error(msg)
-            self.metadata["errors"].append(msg)
-            self.metadata["downloads"][f"{instrument}_historical"] = {
-                "status": "failed", "error": msg
-            }
-            return False
+            ),
+            f"{instrument} delayed-mode currents",
+            result_to_metadata=lambda result, dl: {"file_count": len(result or [])},
+        )
 
     def _download_adcp_historical(self, source) -> bool:
         return self._download_currents_historical(source, "adcp")
@@ -977,35 +928,26 @@ class DataOrchestrator:
         # recipe's variable actually requests.
         pad_start, pad_end = _padded_temporal_bounds(cfg, "altimeter_1hz", "altimeter_5hz")
         out_dir = self.base_dir / "altimeter"
+        kwargs = {
+            "frequencies": self._ALTIMETER_FREQUENCIES_BY_VARIABLE.get(
+                cfg.variable, ["1hz", "5hz"]
+            ),
+        }
+        kwargs.update(source.download_kwargs)   # recipe-level override wins
 
-        try:
-            dl = AltimeterDownloader(
+        return self._run_download(
+            "altimeter", out_dir,
+            lambda: AltimeterDownloader(
                 output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
-            )
-            kwargs = {
-                "frequencies": self._ALTIMETER_FREQUENCIES_BY_VARIABLE.get(
-                    cfg.variable, ["1hz", "5hz"]
-                ),
-            }
-            kwargs.update(source.download_kwargs)   # recipe-level override wins
-            paths = dl.download(
+            ),
+            lambda: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=pad_start, end=pad_end,
                 **kwargs,
-            )
-            self._cleanup_if_empty(out_dir)
-            self.metadata["downloads"]["altimeter"] = {
-                "status": "dry_run" if self.dry_run else "success",
-                "files":  [str(p) for p in paths],
-            }
-            return True
-        except Exception as exc:
-            msg = f"Altimeter download failed: {exc}"
-            logger.error(msg)
-            self.metadata["errors"].append(msg)
-            self.metadata["downloads"]["altimeter"] = {"status": "failed", "error": msg}
-            return False
+            ),
+            "Altimeter",
+        )
 
     def _download_radiometer(self, source) -> bool:
         from ..downloaders.radiometer_downloader import RadiometerDownloader
@@ -1014,28 +956,19 @@ class DataOrchestrator:
         bounds = cfg.geographic_bounds
         pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
         out_dir = self.base_dir / "radiometer"
+        kwargs = dict(source.download_kwargs)   # e.g. {"sensors": ["amsr2"]}
 
-        try:
-            dl = RadiometerDownloader(output_dir=out_dir, dry_run=self.dry_run)
-            kwargs = dict(source.download_kwargs)   # e.g. {"sensors": ["amsr2"]}
-            paths = dl.download(
+        return self._run_download(
+            "radiometer", out_dir,
+            lambda: RadiometerDownloader(output_dir=out_dir, dry_run=self.dry_run),
+            lambda: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=pad_start, end=pad_end,
                 **kwargs,
-            )
-            self._cleanup_if_empty(out_dir)
-            self.metadata["downloads"]["radiometer"] = {
-                "status": "dry_run" if self.dry_run else "success",
-                "files":  [str(p) for p in paths],
-            }
-            return True
-        except Exception as exc:
-            msg = f"Radiometer download failed: {exc}"
-            logger.error(msg)
-            self.metadata["errors"].append(msg)
-            self.metadata["downloads"]["radiometer"] = {"status": "failed", "error": msg}
-            return False
+            ),
+            "Radiometer",
+        )
 
     def _download_ismn(self, source) -> bool:
         from ..downloaders.ismn_downloader import ISMNDownloader

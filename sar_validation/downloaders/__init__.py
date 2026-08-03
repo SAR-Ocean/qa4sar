@@ -3,8 +3,8 @@
 from .hf_radar_downloader import HFRadarDownloader
 from .insitu_downloader import InSituDownloader
 from .radiometer_downloader import RadiometerDownloader
-from .sar_downloader import SARDownloader
 from .scatterometer_downloader import ScatterometerDownloader
+from .sentinel1_l2_ocn_downloader import SARDownloader
 
 __all__ = [
     "SARDownloader",

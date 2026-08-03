@@ -64,19 +64,28 @@ sar_validation/
 │   ├── _variable_map.py    # Variable mapping (wind/currents/waves)
 │   └── __init__.py         # Package exports
 └── downloaders/
-    ├── base.py             # Shared credential handling & helpers
-    ├── sar_downloader.py   # Sentinel-1 L2_OCN via Copernicus Dataspace
-    ├── insitu_downloader.py   # Moorings/buoys/ferrybox via Copernicus Marine
-    ├── hf_radar_downloader.py # HF radar via Copernicus Marine
-    ├── scatterometer_downloader.py  # ASCAT (MetOp) via EUMETSAT EUMDAC
-    ├── altimeter_downloader.py      # Along-track SWH/wind via Copernicus Marine
-    ├── radiometer_downloader.py     # RSS radiometer ocean winds (AMSR2 NetCDF + GMI/SSMIS/WindSat bytemaps)
-    ├── soil_moisture_downloader.py   # Sentinel-1 CLMS Surface Soil Moisture via Copernicus Dataspace (CDSE)
-    ├── ascat_soil_moisture_downloader.py  # ASCAT scatterometer soil moisture (SOMO12) via EUMETSAT EUMDAC
-    ├── earthdata_soil_moisture_downloader.py  # AMSR-E/2 and SMAP soil moisture via NASA Earthdata
-    ├── smos_downloader.py            # SMOS L3 soil moisture via ESA SMOS FTPS
-    ├── ismn_downloader.py            # ISMN local-archive station selector (no download API)
-    └── _rss_bytemap.py              # Decoder for RSS binary bytemap (.gz) radiometer products
+    ├── base.py                                  # Shared credential handling & helpers
+    ├── _hf_radar_regions.py                     # Copernicus Marine HF-radar region bbox/flag table (shared, not a downloader)
+    ├── _noaa_hfr_regions.py                     # NOAA HF-radar region bbox/dataset-id table (shared, not a downloader)
+    ├── _rss_bytemap.py                          # Decoder for RSS binary bytemap (.gz) radiometer products
+    ├── altimeter_downloader.py                  # Along-track SWH/wind altimetry via Copernicus Marine
+    ├── ascat_soil_moisture_downloader.py        # ASCAT (MetOp) soil moisture (SOMO12) via EUMETSAT EUMDAC
+    ├── earthdata_soil_moisture_downloader.py    # AMSR-E/2, SMAP, and NISAR SME2 soil moisture via NASA Earthdata
+    ├── gportal_downloader.py                    # AMSR2 soil moisture via JAXA G-Portal (SFTP)
+    ├── hf_radar_downloader.py                   # Near-real-time HF-radar surface currents via Copernicus Marine
+    ├── hf_radar_historical_downloader.py        # Delayed-mode/historical HF-radar currents via Copernicus Marine
+    ├── hf_radar_us_downloader.py                # US HF-radar waterfall selector: NOAA ERDDAP → NOAA THREDDS → Copernicus Marine
+    ├── insitu_currents_historical_downloader.py # Delayed-mode in-situ currents (ADCP/Argo/drifter/glider) via Copernicus Marine
+    ├── insitu_downloader.py                      # Moorings/buoys/ferrybox via Copernicus Marine
+    ├── ismn_downloader.py                        # ISMN local-archive soil-moisture station selector (no download API)
+    ├── noaa_hfradar_downloader.py                # NOAA HFRnet gridded surface currents via ERDDAP (rolling ~90-day window)
+    ├── noaa_hfradar_thredds_downloader.py        # NOAA HFRnet gridded surface currents via NCEI THREDDS archive (2006-present)
+    ├── radiometer_downloader.py                  # RSS radiometer ocean winds (AMSR2 NetCDF + GMI/SSMIS/WindSat bytemaps)
+    ├── scatterometer_downloader.py               # ASCAT (MetOp) wind via EUMETSAT EUMDAC
+    ├── scatterometer_ftp_downloader.py           # HY-2B/HY-2C/Oceansat-3 scatterometer wind via OSI-SAF FTP
+    ├── sentinel1_l2_ocn_downloader.py            # Sentinel-1 L2_OCN (wind/currents/waves) via Copernicus Dataspace (CDSE)
+    ├── sentinel1_soil_moisture_downloader.py     # Sentinel-1 CLMS Surface Soil Moisture via Copernicus Dataspace (CDSE)
+    └── smos_downloader.py                        # SMOS L3 soil moisture via ESA SMOS FTPS
 ```
 
 ---
@@ -129,7 +138,7 @@ import pandas as pd
 
 # --- Step 2: convert ---
 converter = DataTreeConverter()
-ds_sar    = converter.from_sar_l2_ocn(xr.open_dataset("data/.../S1_L2_OCN/product.nc"))
+ds_sar    = converter.from_sar_l2_ocn_safe("data/.../S1_L2_OCN/S1A_IW_OCN_...SAFE", product_type="wind")
 ds_insitu = converter.from_insitu_csv("data/.../copernicus_insitu_data/obs.csv", source_type="buoy")
 
 # --- Step 3: collocate and store as DataFrame ---
@@ -159,21 +168,29 @@ plt.show()
 
 | Source | Variable | Downloader | Service |
 |--------|----------|------------|---------|
-| Sentinel-1 L2_OCN | wind / currents / waves | `sar_downloader` | Copernicus Dataspace (CDSE) |
+| Sentinel-1 L2_OCN | wind / currents / waves | `sentinel1_l2_ocn_downloader` | Copernicus Dataspace (CDSE) |
 | Moorings / Buoys / Ferryboxes | wind / currents / waves | `insitu_downloader` | Copernicus Marine |
-| HF Radar | ocean currents | `hf_radar_downloader` | Copernicus Marine |
+| Delayed-mode in-situ currents (ADCP / Argo / drifter / glider) | ocean currents | `insitu_currents_historical_downloader` | Copernicus Marine |
+| HF Radar (near-real-time) | ocean currents | `hf_radar_downloader` | Copernicus Marine |
+| HF Radar (delayed-mode/historical) | ocean currents | `hf_radar_historical_downloader` | Copernicus Marine |
+| HF Radar (US regions) | ocean currents | `hf_radar_us_downloader` | NOAA ERDDAP → NOAA THREDDS → Copernicus Marine (waterfall) |
+| HF Radar (NOAA HFRnet, rolling window) | ocean currents | `noaa_hfradar_downloader` | NOAA ERDDAP |
+| HF Radar (NOAA HFRnet, full archive) | ocean currents | `noaa_hfradar_thredds_downloader` | NOAA NCEI THREDDS |
 | ASCAT (MetOp-B/C) | wind | `scatterometer_downloader` | EUMETSAT EUMDAC |
+| HY-2B / HY-2C / Oceansat-3 | wind | `scatterometer_ftp_downloader` | OSI-SAF FTP |
 | Radiometer — AMSR2 (NetCDF); GMI, SSMIS F16/F17/F18, WindSat (binary bytemaps) | wind (+ direction from WindSat) | `radiometer_downloader` | RSS `data.remss.com` (public HTTPS) |
-| Sentinel-1 CLMS Surface Soil Moisture | soil moisture | `soil_moisture_downloader` | Copernicus Dataspace (CDSE) |
+| Sentinel-1 CLMS Surface Soil Moisture | soil moisture | `sentinel1_soil_moisture_downloader` | Copernicus Dataspace (CDSE) |
 | ASCAT Soil Moisture (SOMO12) | soil moisture | `ascat_soil_moisture_downloader` | EUMETSAT EUMDAC |
-| AMSR-E/AMSR2 (NSIDC-0451) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata |
+| AMSR-E/AMSR2 (NSIDC-0451 / AU_Land) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata |
 | SMAP (SPL2SMP_E) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata |
+| NISAR SME2 (beta) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata |
+| AMSR2 (JAXA G-Portal) | soil moisture | `gportal_downloader` | JAXA G-Portal (SFTP) |
 | SMOS (L3 SM DQR) | soil moisture | `smos_downloader` | ESA SMOS FTPS |
 | ISMN (International Soil Moisture Network) | soil moisture | `ismn_downloader` | Manual portal download (no API) |
 
 > **Note:** The Sentinel-1 CLMS Surface Soil Moisture downloader's CDSE query
 > parameters (`DATASET_IDENTIFIER`, `PRODUCT_EXTENT` in
-> `sar_validation/downloaders/soil_moisture_downloader.py`) and GeoTIFF value
+> `sar_validation/downloaders/sentinel1_soil_moisture_downloader.py`) and GeoTIFF value
 > decoding (`from_sar_l3_ssm_geotiff` in `sar_validation/core/datatree_converter.py`)
 > have been confirmed against a real downloaded CEURO product (embedded
 > `scale_factor`/`add_offset`/`flag_values`/geospatial-extent GDAL tags) and a

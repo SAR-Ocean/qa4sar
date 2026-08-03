@@ -5,7 +5,7 @@ from __future__ import annotations
 import zipfile
 from unittest.mock import MagicMock
 
-from sar_validation.downloaders.soil_moisture_downloader import (
+from sar_validation.downloaders.sentinel1_soil_moisture_downloader import (
     DATASET_IDENTIFIER,
     SoilMoistureDownloader,
 )

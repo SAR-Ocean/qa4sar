@@ -3,14 +3,14 @@ Download Sentinel-1 L2_OCN products from Copernicus Dataspace (CDSE).
 
 Can be used as a library::
 
-    from sar_validation.downloaders.sar_downloader import SARDownloader
+    from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
     dl = SARDownloader(output_dir=Path("data/run1/S1_L2_OCN"))
     dl.download(min_lon=-20, max_lon=0, min_lat=35, max_lat=60,
                 start="2026-01-01", end="2026-01-02")
 
 Or from the command line::
 
-    python -m sar_validation.downloaders.sar_downloader \\
+    python -m sar_validation.downloaders.sentinel1_l2_ocn_downloader \\
         --min-lon -20 --max-lon 0 --min-lat 35 --max-lat 60 \\
         --start 2026-01-01 --end 2026-01-02 --download-indices all
 """
@@ -221,11 +221,11 @@ def _parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m sar_validation.downloaders.sar_downloader \\
+  python -m sar_validation.downloaders.sentinel1_l2_ocn_downloader \\
       --min-lon -20 --max-lon 0 --min-lat 35 --max-lat 60 \\
       --start 2026-01-01 --end 2026-01-02 --download-indices all
 
-  python -m sar_validation.downloaders.sar_downloader \\
+  python -m sar_validation.downloaders.sentinel1_l2_ocn_downloader \\
       --params-file params.json --mode IW,EW --limit 5
         """,
     )

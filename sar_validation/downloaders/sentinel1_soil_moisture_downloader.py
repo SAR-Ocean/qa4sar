@@ -4,7 +4,7 @@ rasters from Copernicus Dataspace (CDSE).
 
 Library usage::
 
-    from sar_validation.downloaders.soil_moisture_downloader import SoilMoistureDownloader
+    from sar_validation.downloaders.sentinel1_soil_moisture_downloader import SoilMoistureDownloader
     dl = SoilMoistureDownloader(output_dir=Path("data/run1/S1_L3_SSM"))
     dl.download(min_lon=-10, max_lon=20, min_lat=40, max_lat=55,
                 start="2026-01-01", end="2026-01-02")
