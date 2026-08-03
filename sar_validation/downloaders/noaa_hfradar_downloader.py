@@ -1,8 +1,10 @@
 """
 Download NOAA HFRnet gridded surface currents (Real-Time Velocities, RTV).
 
-Backend for Phase 3a: ERDDAP griddap NetCDF subset (recent ~3-month window).
-The THREDDS/OPeNDAP archive backend (2012–present) is Phase 3b.
+Backend for the recent ~90-day ERDDAP griddap window. Dates older than that
+are served by the THREDDS archive backend
+(noaa_hfradar_thredds_downloader.py); hf_radar_us_downloader.py's waterfall
+tries this module first, then THREDDS, then Copernicus.
 
 Data source: NOAA/UCSD HFRnet Regional/National RTV, distributed via ERDDAP
 griddap on coastwatch.pfeg.noaa.gov. Variables ``water_u``/``water_v`` carry CF
@@ -25,9 +27,10 @@ import sys
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
-from .base import normalize_datetime, split_antimeridian_bbox
+from ._noaa_hfr_regions import _resolution_token, match_noaa_hfr_region
+from .base import normalize_datetime, prefer_ipv4_dns, split_antimeridian_bbox
 
 __all__ = [
     "NOAAHFRadarDownloader",
@@ -35,64 +38,34 @@ __all__ = [
     "build_erddap_subset_url",
     "select_backend",
     "clamp_to_region_bbox",
-    "match_region",
 ]
 
 # ERDDAP griddap host serving the UCSD HFRnet RTV datasets.
 ERDDAP_BASE = "https://coastwatch.pfeg.noaa.gov/erddap/griddap"
-# ERDDAP keeps a rolling ~3-month window; older dates need the THREDDS archive
-# (Phase 3b).
+# ERDDAP keeps a rolling ~3-month window; older dates need the THREDDS archive.
 ERDDAP_WINDOW_DAYS = 90
 DEFAULT_RESOLUTION_KM = 6
 
-# Region bounding boxes (lon_min, lon_max, lat_min, lat_max) and their
-# resolution → ERDDAP dataset-id maps. Non-CONUS regions (Hawaii, Alaska,
-# PR/USVI, Great Lakes) are deferred (design §6) and raise a clear error.
-_REGIONS = {
-    "US_WEST": {
-        "bbox": (-130.36, -115.8056, 30.25, 49.99204),
-        "datasets": {1: "ucsdHfrW1", 2: "ucsdHfrW2", 6: "ucsdHfrW6"},
-    },
-    "US_EAST_GULF": {
-        "bbox": (-97.88385, -60.0, 22.0, 46.0),
-        "datasets": {1: "ucsdHfrE1", 6: "ucsdHfrE6"},
-    },
-}
 
-
-def _bbox_center(min_lon, max_lon, min_lat, max_lat):
-    return (min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0
-
-
-def match_region(min_lon, max_lon, min_lat, max_lat) -> tuple[str, Dict]:
-    """Find the ``_REGIONS`` entry whose bbox contains the request's center point.
-
-    Raises ``ValueError`` if no configured region contains it.
-    """
-    clon, clat = _bbox_center(min_lon, max_lon, min_lat, max_lat)
-    for name, cfg in _REGIONS.items():
-        lo, hi, la, ha = cfg["bbox"]
-        if lo <= clon <= hi and la <= clat <= ha:
-            return name, cfg
-    raise ValueError(
-        "No ERDDAP HF-radar dataset for bbox center "
-        f"({clon:.2f}, {clat:.2f}). Phase 3a supports US West and US "
-        "East/Gulf coasts; other regions arrive in later phases."
-    )
-
-
-def select_erddap_dataset(min_lon, max_lon, min_lat, max_lat, resolution_km: int) -> str:
+def select_erddap_dataset(min_lon, max_lon, min_lat, max_lat, resolution_km: float) -> str:
     """Choose the ERDDAP RTV dataset id from the request bbox and resolution.
 
-    Raises ``ValueError`` if the region is outside the supported CONUS coasts
-    or the requested resolution is unavailable for that region.
+    Raises ``ValueError`` if the region is outside NOAA's coverage, has no
+    ERDDAP dataset at all (Great Lakes/Gulf of Alaska), or doesn't offer
+    the requested resolution.
     """
-    name, cfg = match_region(min_lon, max_lon, min_lat, max_lat)
-    datasets = cfg["datasets"]
-    if resolution_km not in datasets:
+    name, region = match_noaa_hfr_region(min_lon, max_lon, min_lat, max_lat)
+    datasets = region["erddap_datasets"]
+    if datasets is None:
         raise ValueError(
-            f"resolution {resolution_km} km not available for region "
-            f"{name}; available: {sorted(datasets)} km"
+            f"region {name} has no ERDDAP dataset at all (THREDDS-only region); "
+            "use the THREDDS backend instead."
+        )
+    if resolution_km not in datasets:
+        available = ", ".join(_resolution_token(r) for r in sorted(datasets))
+        raise ValueError(
+            f"resolution {_resolution_token(resolution_km)} not available for region "
+            f"{name}; available: {available}"
         )
     return datasets[resolution_km]
 
@@ -106,8 +79,8 @@ def clamp_to_region_bbox(min_lon, max_lon, min_lat, max_lat) -> tuple[float, flo
     past its southern edge) must be clamped here before the URL is built, not
     left for the server to reject outright.
     """
-    _, cfg = match_region(min_lon, max_lon, min_lat, max_lat)
-    lo, hi, la, ha = cfg["bbox"]
+    _, region = match_noaa_hfr_region(min_lon, max_lon, min_lat, max_lat)
+    lo, hi, la, ha = region["bbox"]
     return (
         max(min_lon, lo), min(max_lon, hi),
         max(min_lat, la), min(max_lat, ha),
@@ -141,9 +114,9 @@ def build_erddap_subset_url(
 def select_backend(end: str) -> str:
     """Pick the download backend from the requested end date.
 
-    Phase 3a implements only the ERDDAP griddap backend (recent window). Dates
-    older than ``ERDDAP_WINDOW_DAYS`` require the THREDDS archive backend, which
-    is delivered in Phase 3b.
+    Dates within ERDDAP_WINDOW_DAYS use ERDDAP; older dates require the
+    THREDDS archive backend (noaa_hfradar_thredds_downloader.py), which
+    hf_radar_us_downloader.py's waterfall tries next.
     """
     end_dt = datetime.fromisoformat(normalize_datetime(end))
     now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -151,7 +124,7 @@ def select_backend(end: str) -> str:
     if age_days > ERDDAP_WINDOW_DAYS:
         raise NotImplementedError(
             f"end date {end} is older than the ERDDAP ~{ERDDAP_WINDOW_DAYS}-day "
-            "window; the THREDDS/OPeNDAP archive backend is Phase 3b."
+            "window; use the THREDDS archive backend."
         )
     return "erddap"
 
@@ -165,12 +138,13 @@ class NOAAHFRadarDownloader:
         Directory to save the downloaded NetCDF.
     dry_run : bool
         If True, print the subset URL and return None without fetching.
-    resolution_km : int
-        Grid resolution (1/2/6 km); default 6 km for robust coverage.
+    resolution_km : float
+        Grid resolution (0.5/1/2/6 km, region-dependent); default 6 km for
+        robust coverage.
     """
 
     def __init__(self, output_dir: Path, dry_run: bool = False,
-                 resolution_km: int = DEFAULT_RESOLUTION_KM,
+                 resolution_km: float = DEFAULT_RESOLUTION_KM,
                  force_download: bool = False) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
@@ -205,7 +179,7 @@ class NOAAHFRadarDownloader:
     def _download_window(
         self, min_lon, max_lon, min_lat, max_lat, start: str, end: str, filename_suffix: str,
     ) -> Optional[Path]:
-        backend = select_backend(end)  # raises if archive (Phase 3b) needed
+        backend = select_backend(end)  # raises if the THREDDS archive backend is needed
         dataset_id = select_erddap_dataset(
             min_lon, max_lon, min_lat, max_lat, self.resolution_km
         )
@@ -215,7 +189,8 @@ class NOAAHFRadarDownloader:
         start_d = normalize_datetime(start).split("T")[0]
         end_d = normalize_datetime(end).split("T")[0]
         date_str = start_d if start_d == end_d else f"{start_d}_{end_d}"
-        out_path = self.output_dir / f"{dataset_id}_{self.resolution_km}km_{date_str}{filename_suffix}.nc"
+        res_token = _resolution_token(self.resolution_km)
+        out_path = self.output_dir / f"{dataset_id}_{res_token}_{date_str}{filename_suffix}.nc"
         url = build_erddap_subset_url(
             dataset_id, min_lon, max_lon, min_lat, max_lat, start, end
         )
@@ -229,7 +204,8 @@ class NOAAHFRadarDownloader:
             return out_path
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        urllib.request.urlretrieve(url, str(out_path))
+        with prefer_ipv4_dns(), urllib.request.urlopen(url, timeout=15) as resp:
+            out_path.write_bytes(resp.read())
         return out_path
 
 
@@ -241,8 +217,8 @@ def _parse_args(argv=None):
     p.add_argument("--max-lat", type=float, required=True)
     p.add_argument("--start", required=True)
     p.add_argument("--end", required=True)
-    p.add_argument("--resolution", type=int, default=DEFAULT_RESOLUTION_KM,
-                   choices=[1, 2, 6])
+    p.add_argument("--resolution", type=float, default=DEFAULT_RESOLUTION_KM,
+                   choices=[0.5, 1, 2, 6])
     p.add_argument("--output-dir", default="data/hfr_noaa")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args(argv)

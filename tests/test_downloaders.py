@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -17,6 +18,7 @@ from sar_validation.downloaders.base import (
     copernicus_marine_download_kwargs,
     is_date_recent,
     normalize_datetime,
+    prefer_ipv4_dns,
     set_credential,
     split_antimeridian_bbox,
 )
@@ -266,6 +268,60 @@ class TestSplitAntimeridianBbox:
         windows = split_antimeridian_bbox(170.0, -170.0)
         for lo, hi in windows:
             assert lo <= hi
+
+
+# ---------------------------------------------------------------------------
+# Tests for prefer_ipv4_dns()
+# ---------------------------------------------------------------------------
+
+class TestPreferIpv4Dns:
+    """Regression coverage for the IPv6-black-hole fix: some hosts (observed
+    live for www.ncei.noaa.gov) have IPv6 addresses that silently never
+    connect while their IPv4 addresses connect in ~0.1-0.2s.
+    socket.create_connection() tries getaddrinfo() results in the order
+    returned (IPv6-first by default on this system), wasting up to
+    ``6 * timeout`` seconds per request. prefer_ipv4_dns() reorders results
+    IPv4-first for the duration of a ``with`` block."""
+
+    def test_reorders_ipv4_before_ipv6_preserving_relative_order(self, monkeypatch):
+        fake_results = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 443, 0, 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::2", 443, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::3", 443, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.2", 443)),
+        ]
+
+        def fake_getaddrinfo(*args, **kwargs):
+            return fake_results
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+        with prefer_ipv4_dns():
+            result = socket.getaddrinfo("example.com", 443)
+
+        families = [r[0] for r in result]
+        assert families == [
+            socket.AF_INET, socket.AF_INET,
+            socket.AF_INET6, socket.AF_INET6, socket.AF_INET6,
+        ]
+        ipv4_addrs = [r[4][0] for r in result if r[0] == socket.AF_INET]
+        assert ipv4_addrs == ["192.0.2.1", "192.0.2.2"]  # relative order preserved
+        ipv6_addrs = [r[4][0] for r in result if r[0] == socket.AF_INET6]
+        assert ipv6_addrs == ["2001:db8::1", "2001:db8::2", "2001:db8::3"]  # ditto
+
+    def test_restores_original_getaddrinfo_after_normal_exit(self):
+        original_getaddrinfo = socket.getaddrinfo
+        with prefer_ipv4_dns():
+            assert socket.getaddrinfo is not original_getaddrinfo
+        assert socket.getaddrinfo is original_getaddrinfo
+
+    def test_restores_original_getaddrinfo_after_exception(self):
+        original_getaddrinfo = socket.getaddrinfo
+        with pytest.raises(RuntimeError):
+            with prefer_ipv4_dns():
+                raise RuntimeError("boom")
+        assert socket.getaddrinfo is original_getaddrinfo
 
 
 # ---------------------------------------------------------------------------
@@ -2121,12 +2177,18 @@ class TestSelectErddapDataset:
         assert select_erddap_dataset(-80, -70, 35, 42, 6) == "ucsdHfrE6"
 
     def test_unsupported_region_raises(self):
-        with pytest.raises(ValueError, match="No ERDDAP HF-radar dataset"):
-            select_erddap_dataset(2.0, 8.0, 53.0, 55.0, 6)  # German Bight → Phase 3c
+        # German Bight isn't in NOAA_HFR_REGIONS at all (Task 1's shared
+        # table is US-only), so match_noaa_hfr_region's own "no region"
+        # message surfaces here rather than an ERDDAP-specific one.
+        with pytest.raises(ValueError, match="No NOAA HF-radar region"):
+            select_erddap_dataset(2.0, 8.0, 53.0, 55.0, 6)
 
     def test_unsupported_resolution_raises(self):
         with pytest.raises(ValueError, match="resolution"):
-            select_erddap_dataset(-80, -70, 35, 42, 2)  # US-East has no 2 km
+            # US-East/Gulf's shared-table entry has no 3 km dataset (only
+            # 1/2/6 km); this used to test 2 km, but Task 1's shared table
+            # added 2 km support for US-East/Gulf, so 2 km is valid now.
+            select_erddap_dataset(-80, -70, 35, 42, 3)
 
 
 class TestClampToRegionBbox:
@@ -2184,7 +2246,7 @@ class TestSelectBackend:
         assert select_backend(recent) == "erddap"
 
     def test_old_date_not_yet_supported(self):
-        with pytest.raises(NotImplementedError, match="Phase 3b"):
+        with pytest.raises(NotImplementedError, match="THREDDS archive backend"):
             select_backend("2015-01-01")
 
 
@@ -2204,11 +2266,19 @@ _RECENT_START = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m
 _RECENT_END = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%dT06:00:00")
 
 
+def _configure_fake_download_response(mock_urlopen, data: bytes = b"fake-netcdf-bytes"):
+    """Configure a patched urllib.request.urlopen mock to behave as the
+    context manager the real downloaders use:
+    `with urllib.request.urlopen(url, timeout=...) as resp: dest.write_bytes(resp.read())`.
+    """
+    mock_urlopen.return_value.__enter__.return_value.read.return_value = data
+
+
 class TestNOAAHFRadarDownload:
     def test_dry_run_returns_empty_list_and_no_fetch(self, tmp_path, capsys):
         dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=True, resolution_km=6)
         with patch(
-            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
         ) as m:
             out = dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
         assert out == []
@@ -2218,16 +2288,52 @@ class TestNOAAHFRadarDownload:
     def test_download_fetches_url_to_expected_path(self, tmp_path):
         dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
         with patch(
-            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
         ) as m:
+            _configure_fake_download_response(m)
             out = dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
         assert len(out) == 1
         assert out[0].parent == tmp_path
         assert out[0].suffix == ".nc"
         m.assert_called_once()
-        called_url, called_path = m.call_args[0][0], m.call_args[0][1]
+        called_url = m.call_args[0][0]
         assert "ucsdHfrW6.nc?" in called_url
-        assert str(out[0]) == str(called_path)
+        assert out[0].read_bytes() == b"fake-netcdf-bytes"
+
+    def test_download_uses_a_bounded_timeout(self, tmp_path):
+        """Regression test: urlretrieve (the original implementation) has no
+        timeout parameter at all, and a stalled connection would hang the
+        download indefinitely (observed live: a TCP socket stuck in
+        SYN-SENT for many minutes). The fix moved to urlopen(..., timeout=...)
+        specifically so a hung connection is bounded. Lowered from 60 to 15
+        (Task 9b): combined with prefer_ipv4_dns(), a genuinely broken IPv6
+        path now fails fast per address instead of eating up to 6 * timeout
+        seconds before ever reaching a working IPv4 address."""
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            _configure_fake_download_response(m)
+            dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+        m.assert_called_once()
+        assert m.call_args.kwargs["timeout"] == 15
+
+    def test_download_wraps_network_call_in_prefer_ipv4_dns(self, tmp_path):
+        """Wiring test: the ERDDAP file-download call site must actually use
+        prefer_ipv4_dns(), not just have it importable."""
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.prefer_ipv4_dns"
+        ) as mock_prefer:
+            mock_prefer.return_value.__exit__.return_value = False
+            with patch(
+                "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+            ) as m:
+                _configure_fake_download_response(m)
+                dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+        mock_prefer.assert_called_once_with()
+        mock_prefer.return_value.__enter__.assert_called_once()
+        mock_prefer.return_value.__exit__.assert_called_once()
 
     def test_download_clamps_bbox_extending_past_region_edge(self, tmp_path):
         """A bbox reaching past a region's real grid edge must be clamped in
@@ -2235,8 +2341,9 @@ class TestNOAAHFRadarDownload:
         reported HTTP 404 'axis minimum' error)."""
         dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
         with patch(
-            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
         ) as m:
+            _configure_fake_download_response(m)
             dl.download(-80, -60, 20.0, 40.0, _RECENT_START, _RECENT_END)
         called_url = m.call_args[0][0]
         assert "[(22.0):(40.0)]" in called_url
@@ -2248,13 +2355,63 @@ class TestNOAAHFRadarDownload:
         straight through and 404 at the server."""
         dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
         with patch(
-            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
         ) as m:
+            _configure_fake_download_response(m)
             dl.download(-126.0, -115.0, 30.0, 48.0, _RECENT_START, _RECENT_END)
         called_url = m.call_args[0][0]
         assert "[(30.25):(48.0)]" in called_url
         assert "[(30.0)" not in called_url
         assert "[(-126.0):(-115.8056)]" in called_url
+
+
+class TestNOAAHFRadarDownload500m:
+    def test_select_erddap_dataset_accepts_500m_for_us_west(self):
+        from sar_validation.downloaders.noaa_hfradar_downloader import select_erddap_dataset
+
+        assert select_erddap_dataset(-125, -119, 33, 38, 0.5) == "ucsdHfrW500"
+
+    def test_500m_not_available_for_us_east_gulf(self):
+        from sar_validation.downloaders.noaa_hfradar_downloader import select_erddap_dataset
+
+        with pytest.raises(ValueError, match="500m"):
+            select_erddap_dataset(-80, -70, 35, 42, 0.5)
+
+    def test_download_500m_builds_500m_filename_not_500km(self, tmp_path):
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=0.5)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            _configure_fake_download_response(m)
+            out = dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+        assert len(out) == 1
+        assert "500m" in out[0].name
+        assert "500km" not in out[0].name
+        m.assert_called_once()
+        called_url = m.call_args[0][0]
+        assert "ucsdHfrW500.nc?" in called_url
+
+    def test_existing_6km_filename_unaffected_by_resolution_token_change(self, tmp_path):
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            _configure_fake_download_response(m)
+            out = dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+        assert "6km" in out[0].name
+
+
+class TestNoaaHfradarDownloaderUsesSharedRegionTable:
+    def test_erddap_dataset_error_names_available_resolutions(self):
+        from sar_validation.downloaders.noaa_hfradar_downloader import select_erddap_dataset
+
+        with pytest.raises(ValueError, match=r"1\.0|2\.0|6\.0|0\.5|1km|2km|6km|500m"):
+            select_erddap_dataset(-125, -119, 33, 38, 3)
+
+    def test_match_region_removed(self):
+        import sar_validation.downloaders.noaa_hfradar_downloader as mod
+
+        assert not hasattr(mod, "match_region")
 
 
 class TestNOAAHFRadarDownloaderAntimeridian:
@@ -2271,9 +2428,9 @@ class TestNOAAHFRadarDownloaderAntimeridian:
         # pre-fix.
         dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=True, resolution_km=6)
         with patch(
-            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
         ) as m:
-            with pytest.raises(ValueError, match="No ERDDAP HF-radar dataset"):
+            with pytest.raises(ValueError, match="No NOAA HF-radar region"):
                 dl.download(135.0, -120.0, -15.0, 30.0, _RECENT_START, _RECENT_END)
         m.assert_not_called()
 
@@ -2287,8 +2444,9 @@ class TestNOAAHFRadarDownloaderAntimeridian:
         # (56.5, 36.5), matches nothing — that's what makes this fail today.
         dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
         with patch(
-            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
         ) as m:
+            _configure_fake_download_response(m)
             out = dl.download(179.0, -66.0, 35.0, 38.0, _RECENT_START, _RECENT_END)
         assert len(out) == 1
         m.assert_called_once()
@@ -2311,7 +2469,7 @@ class TestNOAAHFRadarDownloaderForceDownload:
         out_path.write_bytes(b"")
 
         with patch(
-            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
         ) as m:
             out = dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
 
@@ -2334,8 +2492,9 @@ class TestNOAAHFRadarDownloaderForceDownload:
         out_path.write_bytes(b"stale")
 
         with patch(
-            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
         ) as m:
+            _configure_fake_download_response(m)
             dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
 
         m.assert_called_once()
@@ -2384,7 +2543,7 @@ class TestOrchestratorHFRadarNOAAWiring:
         source = ValidationDataSource(source_type="hf_radar_noaa")
 
         with patch(
-            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
         ) as m:
             result = orchestrator._download_noaa_hfradar(source)
 
@@ -2452,13 +2611,20 @@ class TestOrchestratorHFRadarUSWiring:
         source = ValidationDataSource(source_type="hf_radar_us")
 
         with patch(
-            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlretrieve"
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
         ) as m:
             result = orchestrator._download_hf_radar_us(source)
 
         assert result is True
         assert orchestrator.metadata["downloads"]["hf_radar_us"]["status"] == "dry_run"
-        assert orchestrator.metadata["downloads"]["hf_radar_us"]["backend"] == "noaa"
+        # Under dry_run, every backend's own dry-run contract is "print
+        # intent, return []" (no exception, no files) -- so the waterfall
+        # still cascades all the way through ERDDAP and THREDDS for
+        # attempted_backends completeness, but resolved_backend reports the
+        # FIRST backend that structurally applies (doesn't raise), not
+        # whichever was tried last. For this US_WEST/recent-date bbox,
+        # ERDDAP is the first (and only) backend that applies.
+        assert orchestrator.metadata["downloads"]["hf_radar_us"]["backend"] == "erddap"
         m.assert_not_called()
 
     def test_download_hf_radar_us_honours_resolution_km_override(self, tmp_path):
@@ -2598,6 +2764,27 @@ class TestOrchestratorDepthResolution:
         # most permissive window across resolved depths: min(-5,-20)=-20, max(5,20)=20
         assert kwargs["min_depth"] == -20.0
         assert kwargs["max_depth"] == 20.0
+
+
+class TestDownloadHfRadarTracksFileCount:
+    def test_metadata_records_file_count(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(
+            name="test-hf-radar-file-count", variable="currents", output_dir=str(tmp_path),
+        ))
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        source = ValidationDataSource(source_type="hf_radar")
+
+        with patch(
+            "sar_validation.downloaders.hf_radar_downloader.HFRadarDownloader"
+        ) as mock_cls:
+            mock_cls.return_value.download.return_value = [tmp_path / "hf_radar" / "a.nc"]
+            orchestrator._download_hf_radar(source)
+
+        assert orchestrator.metadata["downloads"]["hf_radar"]["file_count"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -4064,146 +4251,214 @@ class TestEarthdataSoilMoistureDownloader:
 # HFRadarUSDownloader
 # ---------------------------------------------------------------------------
 
-class TestResolveHfRadarUsBackend:
-    def test_us_west_recent_date_resolves_to_noaa(self):
-        from sar_validation.downloaders.hf_radar_us_downloader import (
-            resolve_hf_radar_us_backend,
-        )
-
-        recent = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
-        assert resolve_hf_radar_us_backend(-125, -119, 33, 38, recent) == "noaa"
-
-    def test_us_west_old_date_resolves_to_copernicus(self):
-        from sar_validation.downloaders.hf_radar_us_downloader import (
-            resolve_hf_radar_us_backend,
-        )
-
-        old = (datetime.now(timezone.utc) - timedelta(days=200)).strftime("%Y-%m-%d")
-        assert resolve_hf_radar_us_backend(-125, -119, 33, 38, old) == "copernicus"
-
-    def test_non_us_bbox_resolves_to_copernicus_regardless_of_date(self):
-        from sar_validation.downloaders.hf_radar_us_downloader import (
-            resolve_hf_radar_us_backend,
-        )
-
-        recent = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
-        # German Bight -- not a NOAA-supported region (US West/East-Gulf only).
-        assert resolve_hf_radar_us_backend(2.0, 8.0, 53.0, 55.0, recent) == "copernicus"
-
-
-class TestHFRadarUSDownloaderDelegation:
-    def test_recent_us_west_delegates_to_noaa_only(self, tmp_path):
+class TestHFRadarUSDownloaderWaterfall:
+    def test_erddap_success_short_circuits_thredds_and_copernicus(self, tmp_path):
         from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
 
-        recent = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
         dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
-
         with patch(
             "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
-        ) as m_noaa, patch(
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
             "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
         ) as m_cop, patch(
             "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
         ) as m_cop_hist:
-            m_noaa.return_value.download.return_value = []
-            dl.download(-125, -119, 33, 38, recent, recent)
+            m_erddap.return_value.download.return_value = [tmp_path / "a.nc"]
+            result = dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
 
-        m_noaa.assert_called_once()
-        assert m_noaa.call_args.kwargs["output_dir"] == tmp_path / "hfr_noaa"
+        assert result == [tmp_path / "a.nc"]
+        assert dl.resolved_backend == "erddap"
+        assert dl.attempted_backends == ["erddap"]
+        m_thredds.assert_not_called()
         m_cop.assert_not_called()
         m_cop_hist.assert_not_called()
 
-    def test_old_us_west_delegates_to_copernicus_only(self, tmp_path):
+    def test_erddap_not_implemented_falls_through_to_thredds(self, tmp_path):
         from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
 
         old = (datetime.now(timezone.utc) - timedelta(days=200)).strftime("%Y-%m-%d")
         dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
-
         with patch(
             "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
-        ) as m_noaa, patch(
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
             "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
         ) as m_cop, patch(
             "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
         ) as m_cop_hist:
-            m_cop.return_value.download.return_value = []
-            m_cop_hist.return_value.download.return_value = []
-            dl.download(-125, -119, 33, 38, old, old)
-
-        m_noaa.assert_not_called()
-        m_cop.assert_called_once()
-        assert m_cop.call_args.kwargs["output_dir"] == tmp_path / "hf_radar"
-        m_cop_hist.assert_called_once()
-        assert m_cop_hist.call_args.kwargs["output_dir"] == tmp_path / "hf_radar_historical"
-
-    def test_old_us_west_skips_nrt_when_historical_has_data(self, tmp_path):
-        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
-
-        old = (datetime.now(timezone.utc) - timedelta(days=200)).strftime("%Y-%m-%d")
-        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
-
-        with patch(
-            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
-        ) as m_noaa, patch(
-            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
-        ) as m_cop, patch(
-            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
-        ) as m_cop_hist:
-            m_cop_hist.return_value.download.return_value = [
-                tmp_path / "hf_radar_historical" / "archive.nc"
-            ]
+            m_erddap.return_value.download.side_effect = NotImplementedError("too old")
+            m_thredds.return_value.download.return_value = [tmp_path / "b.nc"]
             result = dl.download(-125, -119, 33, 38, old, old)
 
-        m_noaa.assert_not_called()
-        m_cop_hist.assert_called_once()
+        assert result == [tmp_path / "b.nc"]
+        assert dl.resolved_backend == "thredds"
+        assert dl.attempted_backends == ["erddap", "thredds"]
         m_cop.assert_not_called()
-        assert result == [tmp_path / "hf_radar_historical" / "archive.nc"]
+        m_cop_hist.assert_not_called()
 
-    def test_resolved_backend_attribute_set_after_download(self, tmp_path):
+    def test_erddap_and_thredds_empty_falls_through_to_copernicus(self, tmp_path):
         from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
 
-        recent = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
-        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
-        assert dl.resolved_backend is None
-
+        # dry_run=False here (unlike the rest of this class): this scenario
+        # simulates a REAL run where ERDDAP/THREDDS genuinely found no data
+        # and Copernicus genuinely did, not a dry-run preview -- under
+        # dry_run=True, resolved_backend would report "erddap" (the first
+        # backend that structurally applies) rather than reflecting which
+        # backend actually produced files.
+        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=False)
         with patch(
             "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
-        ) as m_noaa:
-            m_noaa.return_value.download.return_value = []
-            dl.download(-125, -119, 33, 38, recent, recent)
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_erddap.return_value.download.return_value = []
+            m_thredds.return_value.download.return_value = []
+            m_cop_hist.return_value.download.return_value = []
+            m_cop.return_value.download.return_value = [tmp_path / "c.nc"]
+            result = dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
 
-        assert dl.resolved_backend == "noaa"
+        assert result == [tmp_path / "c.nc"]
+        assert dl.resolved_backend == "copernicus"
+        assert dl.attempted_backends == ["erddap", "thredds", "copernicus"]
+
+    def test_great_lakes_region_skips_erddap_entirely(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds:
+            m_thredds.return_value.download.return_value = [tmp_path / "d.nc"]
+            # US_GREAT_LAKES bbox center: lon ~-84.8, lat ~45.8
+            result = dl.download(-85.3, -84.2, 45.6, 46.05, "2024-01-31", "2024-01-31")
+
+        assert result == [tmp_path / "d.nc"]
+        m_erddap.assert_not_called()
+        assert dl.attempted_backends == ["thredds"]
+
+    def test_dry_run_thredds_only_region_reports_thredds_not_copernicus(self, tmp_path):
+        """US_GREAT_LAKES has no ERDDAP dataset at all, so under a dry run
+        THREDDS is the first (and only NOAA) backend that structurally
+        applies -- resolved_backend must report "thredds", not fall through
+        to the terminal "copernicus" default the way it did before this
+        fix (Task: final-review Fix 5)."""
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_thredds.return_value.download.return_value = []  # dry-run contract: [] always
+            m_cop_hist.return_value.download.return_value = []
+            m_cop.return_value.download.return_value = []
+            # US_GREAT_LAKES bbox center: lon ~-84.8, lat ~45.8
+            dl.download(-85.3, -84.2, 45.6, 46.05, "2024-01-31", "2024-01-31")
+
+        m_erddap.assert_not_called()
+        assert dl.resolved_backend == "thredds"
+        assert dl.attempted_backends == ["thredds", "copernicus"]
+
+    def test_non_us_bbox_skips_erddap_and_thredds_entirely(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_cop_hist.return_value.download.return_value = []
+            m_cop.return_value.download.return_value = []
+            dl.download(2.0, 8.0, 53.0, 55.0, _RECENT_START, _RECENT_END)
+
+        m_erddap.assert_not_called()
+        m_thredds.assert_not_called()
+        assert dl.attempted_backends == ["copernicus"]
+
+    def test_unexpected_exception_from_erddap_is_not_caught(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap:
+            m_erddap.return_value.download.side_effect = RuntimeError("network exploded")
+            with pytest.raises(RuntimeError, match="network exploded"):
+                dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+    def test_resolution_km_forwarded_to_erddap_and_thredds(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True, resolution_km=1)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds:
+            m_erddap.return_value.download.return_value = []
+            m_thredds.return_value.download.return_value = [tmp_path / "e.nc"]
+            dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert m_erddap.call_args.kwargs["resolution_km"] == 1
+        assert m_thredds.call_args.kwargs["resolution_km"] == 1
+
+    def test_finest_resolves_per_region(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True, resolution_km="finest")
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap:
+            m_erddap.return_value.download.return_value = [tmp_path / "f.nc"]
+            dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)  # US_WEST -> finest 0.5
+
+        assert m_erddap.call_args.kwargs["resolution_km"] == 0.5
+
+    def test_no_override_uses_region_default(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap:
+            m_erddap.return_value.download.return_value = [tmp_path / "g.nc"]
+            dl.download(-159.0, -154.0, 19.0, 22.0, _RECENT_START, _RECENT_END)  # US_HAWAII -> 1
+
+        assert m_erddap.call_args.kwargs["resolution_km"] == 1
 
     def test_warns_when_stale_other_backend_output_exists(self, tmp_path, caplog):
         import logging as _logging
 
         from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
 
-        recent = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
         stale_dir = tmp_path / "hf_radar"
         stale_dir.mkdir(parents=True)
         (stale_dir / "stale.nc").write_bytes(b"")
 
         dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)
-
         with patch(
             "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
-        ) as m_noaa, caplog.at_level(_logging.WARNING):
-            m_noaa.return_value.download.return_value = []
-            dl.download(-125, -119, 33, 38, recent, recent)
+        ) as m_erddap, caplog.at_level(_logging.WARNING):
+            m_erddap.return_value.download.return_value = [tmp_path / "h.nc"]
+            dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
 
         assert any("already contains cached" in rec.message for rec in caplog.records)
-
-    def test_resolution_km_forwarded_to_noaa_only(self, tmp_path):
-        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
-
-        recent = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
-        dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True, resolution_km=1)
-
-        with patch(
-            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
-        ) as m_noaa:
-            m_noaa.return_value.download.return_value = []
-            dl.download(-125, -119, 33, 38, recent, recent)
-
-        assert m_noaa.call_args.kwargs["resolution_km"] == 1

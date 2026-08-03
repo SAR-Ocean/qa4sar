@@ -282,9 +282,13 @@ class TestCurrentsTemplate:
         recipe = cli._build_currents_config(limit=None)
         specs = recipe.collocation.layer_vs_layer.layer_type_specs
         assert "hf_radar_grid" in specs
+        # aggregation_window_km is deliberately absent: it's now derived at
+        # collocation time from the grid's own hfr_resolution_km attribute
+        # (stamped by from_hf_radar_grid), not hardcoded here -- a fixed
+        # 6.0 km window was wrong for higher-resolution NOAA grids (500m/
+        # 1km/2km) once hf_radar_us made those reachable.
         assert specs["hf_radar_grid"] == {
             "time_tolerance_minutes": 30,
-            "aggregation_window_km": 6.0,
             "distance_weighting": "equal",
             "dedup_nearest_in_time": True,
         }

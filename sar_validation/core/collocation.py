@@ -995,6 +995,25 @@ def _resolve_layer_type(val_ds: "xr.Dataset", val_name: str, layer_vs_layer_spec
     return layer_type
 
 
+def _apply_hf_radar_resolution_override(
+    layer_type: str, val_ds: "xr.Dataset", merged_kwargs: dict, recipe_layer_type_specs: dict,
+) -> None:
+    """Override merged_kwargs["aggregation_window_km"] with the node's own
+    hfr_resolution_km (stamped by from_hf_radar_grid from the file's actual
+    lat/lon spacing) -- unless the recipe explicitly set
+    aggregation_window_km for this layer_type itself, which always wins.
+    A no-op for any layer_type other than "hf_radar_grid", or when the
+    node has no hfr_resolution_km attr (e.g. it wasn't computable)."""
+    if layer_type != "hf_radar_grid":
+        return
+    hfr_resolution_km = val_ds.attrs.get("hfr_resolution_km")
+    if hfr_resolution_km is None:
+        return
+    if "aggregation_window_km" in recipe_layer_type_specs.get(layer_type, {}):
+        return
+    merged_kwargs["aggregation_window_km"] = hfr_resolution_km
+
+
 #: layer_vs_layer types that receive pre-collocation ±time_tolerance
 #: temporal averaging (soil-moisture satellite sources) instead of the
 #: default "keep every reading" behaviour -- see run_collocation and
@@ -1472,6 +1491,10 @@ def run_collocation(
     if coll_cfg.layer_vs_layer is not None:
         layer_vs_layer_specs.update(coll_cfg.layer_vs_layer.layer_type_specs)
 
+    recipe_layer_type_specs = (
+        coll_cfg.layer_vs_layer.layer_type_specs if coll_cfg.layer_vs_layer is not None else {}
+    )
+
     # Collect SAR nodes (one Dataset per SAR scene)
     sar_scenes: Dict[str, Any] = {}
     if "sar" in datatree.children:
@@ -1687,6 +1710,9 @@ def run_collocation(
                         layer_type = _resolve_layer_type(val_ds, val_name, layer_vs_layer_specs)
                         if layer_type in layer_vs_layer_specs:
                             merged_kwargs.update(layer_vs_layer_specs[layer_type])
+                        _apply_hf_radar_resolution_override(
+                            layer_type, val_ds, merged_kwargs, recipe_layer_type_specs,
+                        )
                         collocation_type = "point_vs_layer"
                         distance_weighting = merged_kwargs.get("distance_weighting", "equal")
                     else:
@@ -1768,6 +1794,9 @@ def run_collocation(
                                 "Applying layer_vs_layer specs for '%s': %s",
                                 layer_type, layer_vs_layer_specs[layer_type],
                             )
+                        _apply_hf_radar_resolution_override(
+                            layer_type, val_ds, merged_kwargs, recipe_layer_type_specs,
+                        )
 
                         # Add layer-vs-layer collocation method
                         merged_kwargs["method"] = layer_vs_layer_collocation_method

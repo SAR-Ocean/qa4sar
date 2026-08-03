@@ -339,6 +339,9 @@ class DataOrchestrator:
             if not self._dispatch_source(source):
                 ok = False
 
+        self._report_combined_hf_radar_us_status()
+        self._report_combined_hf_radar_status()
+
         if not self.dry_run:
             self._save_metadata()
         return ok
@@ -443,6 +446,47 @@ class DataOrchestrator:
             msg = f"No delayed-mode in-situ current data found ({names}) for this window."
             logger.warning(msg)
             self.metadata["notices"].append(msg)
+
+    def _report_combined_hf_radar_us_status(self) -> None:
+        """Log one combined 'no data' notice for hf_radar_us, naming which
+        backends were tried, instead of the silent zero-message outcome
+        today's per-source status recording produces for an empty result."""
+        if self.dry_run:
+            return
+        entry = self.metadata["downloads"].get("hf_radar_us")
+        if entry is None or entry.get("status") == "failed":
+            return
+        if entry.get("file_count", 0) > 0:
+            return
+        backends = entry.get("attempted_backends") or []
+        msg = f"No US HF-radar data found (tried {', '.join(backends)}) for this window."
+        logger.warning(msg)
+        self.metadata["notices"].append(msg)
+
+    def _report_combined_hf_radar_status(self) -> None:
+        """Log one combined 'no data' notice for the non-US hf_radar /
+        hf_radar_historical pair, mirroring _report_combined_currents_status."""
+        if self.dry_run:
+            return
+        attempted = [
+            t for t in ("hf_radar", "hf_radar_historical")
+            if any(s.source_type == t for s in self.recipe.config.validation_sources)
+        ]
+        if not attempted:
+            return
+        total_files = 0
+        any_non_failed = False
+        for t in attempted:
+            entry = self.metadata["downloads"].get(t, {})
+            if entry.get("status") == "failed":
+                continue
+            any_non_failed = True
+            total_files += entry.get("file_count", 0)
+        if not any_non_failed or total_files > 0:
+            return
+        msg = "No HF-radar data found (hf_radar/hf_radar_historical) for this window."
+        logger.warning(msg)
+        self.metadata["notices"].append(msg)
 
     def _dispatch_source(self, source) -> bool:
         handlers = {
@@ -735,14 +779,15 @@ class DataOrchestrator:
                 max_depth=source.resolved_max_depth,
                 force_download=self.force_download,
             )
-            dl.download(
+            downloaded = dl.download(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
                 start=pad_start, end=pad_end,
-            )
+            ) or []
             self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["hf_radar"] = {
                 "status": "dry_run" if self.dry_run else "success",
+                "file_count": len(downloaded),
             }
             return True
         except Exception as exc:
@@ -822,16 +867,16 @@ class DataOrchestrator:
 
     def _download_hf_radar_us(self, source) -> bool:
         from ..downloaders.hf_radar_us_downloader import HFRadarUSDownloader
-        from ..downloaders.noaa_hfradar_downloader import DEFAULT_RESOLUTION_KM
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
         pad_start, pad_end = _padded_temporal_bounds(cfg, "hf_radar_grid")
         # Resolution is an optional per-source override, forwarded via the
-        # established ValidationDataSource.download_kwargs channel. It only
-        # takes effect if the request resolves to the NOAA backend; ignored
-        # on the Copernicus fallback path.
-        resolution_km = int(source.download_kwargs.get("resolution_km", DEFAULT_RESOLUTION_KM))
+        # established ValidationDataSource.download_kwargs channel. None
+        # (the recipe didn't set it) lets HFRadarUSDownloader auto-pick the
+        # matched region's own default; "finest" and explicit floats are
+        # also forwarded as-is. Ignored on the Copernicus fallback path.
+        resolution_km = source.download_kwargs.get("resolution_km")
 
         try:
             dl = HFRadarUSDownloader(
@@ -851,6 +896,7 @@ class DataOrchestrator:
                 "status": "dry_run" if self.dry_run else "success",
                 "file_count": len(downloaded),
                 "backend": dl.resolved_backend,
+                "attempted_backends": dl.attempted_backends,
             }
             return True
         except Exception as exc:

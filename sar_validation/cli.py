@@ -161,6 +161,14 @@ Examples:
              "See sar_validation.core.sar_sources.SAR_SOURCES for valid keys.",
     )
     parser.add_argument(
+        "--hfradar-resolution",
+        choices=["finest", "1km", "2km", "6km"],
+        default=None,
+        help="NOAA HF-radar grid resolution for --create-recipe currents "
+             "(only valid with that template). 'finest' uses the best "
+             "resolution available for the recipe's region.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what will be downloaded without actually downloading",
@@ -220,6 +228,9 @@ Examples:
 
     args = parser.parse_args(argv)
 
+    if args.hfradar_resolution is not None and args.create_recipe != "currents":
+        parser.error("--hfradar-resolution is only valid with --create-recipe currents")
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
@@ -241,6 +252,7 @@ Examples:
             end=args.end,
             recipe_name=args.recipe_name,
             sar_source=args.sar_source,
+            hfradar_resolution=args.hfradar_resolution,
         )
     elif args.recipe:
         _execute_recipe(
@@ -312,11 +324,23 @@ def _validate_sar_source(sar_source: str, variable: str) -> None:
         )
 
 
-def _build_currents_config(limit: Optional[int] = None, sar_source: str = "sentinel1_l2_ocn"):
+def _build_currents_config(
+    limit: Optional[int] = None,
+    sar_source: str = "sentinel1_l2_ocn",
+    hfradar_resolution: Optional[str] = None,
+    min_lon: Optional[float] = None,
+    max_lon: Optional[float] = None,
+    min_lat: Optional[float] = None,
+    max_lat: Optional[float] = None,
+):
     """Build the 'currents' recipe template's RecipeConfig.
 
     Extracted from ``_create_recipe`` so the template content is
     unit-testable independent of the CLI's file-writing side effects.
+    Resolves geographic_bounds from the bbox overrides (or the template's
+    own default) *inside* this function -- unlike the other templates --
+    because the HF-radar source choice below depends on knowing the final
+    bbox before validation_sources is built.
     """
     _validate_sar_source(sar_source, "currents")
     from .core.recipe import (
@@ -328,6 +352,56 @@ def _build_currents_config(limit: Optional[int] = None, sar_source: str = "senti
         SARDataSpec,
         ValidationDataSource,
     )
+    from .downloaders._noaa_hfr_regions import NOAA_HFR_REGIONS, region_bbox_overlaps
+
+    default_bounds = GeographicBounds(-20.0, 0.0, 35.0, 60.0)
+    bounds = GeographicBounds(
+        min_lon=min_lon if min_lon is not None else default_bounds.min_lon,
+        max_lon=max_lon if max_lon is not None else default_bounds.max_lon,
+        min_lat=min_lat if min_lat is not None else default_bounds.min_lat,
+        max_lat=max_lat if max_lat is not None else default_bounds.max_lat,
+    )
+
+    overlapping = [
+        (name, region) for name, region in NOAA_HFR_REGIONS.items()
+        if region_bbox_overlaps(region, bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat)
+    ]
+
+    _RESOLUTION_VALUES = {"1km": 1.0, "2km": 2.0, "6km": 6.0}
+
+    if overlapping:
+        download_kwargs: dict = {}
+        if hfradar_resolution is not None:
+            if hfradar_resolution == "finest":
+                download_kwargs["resolution_km"] = "finest"
+            else:
+                requested_km = _RESOLUTION_VALUES[hfradar_resolution]
+                download_kwargs["resolution_km"] = requested_km
+                if len(overlapping) == 1:
+                    _, region = overlapping[0]
+                    available = set(region["thredds_resolutions_km"])
+                    if region["erddap_datasets"] is not None:
+                        available |= set(region["erddap_datasets"])
+                    if requested_km not in available:
+                        from .downloaders._noaa_hfr_regions import _resolution_token
+                        names = ", ".join(sorted(_resolution_token(r) for r in available))
+                        raise ValueError(
+                            f"resolution {hfradar_resolution} not available for "
+                            f"{overlapping[0][0]}; available: {names}"
+                        )
+        hf_radar_sources = [
+            ValidationDataSource(source_type="hf_radar_us", download_kwargs=download_kwargs),
+        ]
+    else:
+        if hfradar_resolution is not None:
+            logger.warning(
+                "--hfradar-resolution has no effect: the recipe's bounds don't "
+                "overlap any NOAA HF-radar region."
+            )
+        hf_radar_sources = [
+            ValidationDataSource(source_type="hf_radar"),
+            ValidationDataSource(source_type="hf_radar_historical"),
+        ]
 
     return RecipeConfig(
         name="Ocean Currents Validation",
@@ -337,11 +411,10 @@ def _build_currents_config(limit: Optional[int] = None, sar_source: str = "senti
         ),
         variable="currents",
         variable_specs={"components": ["zonal", "meridional"]},
-        geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+        geographic_bounds=bounds,
         sar_data=SARDataSpec(source=sar_source, swath_mode=["WV","IW","EW","SM"], max_downloads=limit),
         validation_sources=[
-            ValidationDataSource(source_type="hf_radar"),
-            ValidationDataSource(source_type="hf_radar_historical"),
+            *hf_radar_sources,
             ValidationDataSource(source_type="drifter"),
             ValidationDataSource(source_type="ferrybox"),
             ValidationDataSource(source_type="mooring"),
@@ -359,7 +432,6 @@ def _build_currents_config(limit: Optional[int] = None, sar_source: str = "senti
                 layer_type_specs={
                     "hf_radar_grid": {
                         "time_tolerance_minutes": 30,
-                        "aggregation_window_km": 6.0,
                         "distance_weighting": "equal",
                         "dedup_nearest_in_time": True,
                     },
@@ -647,6 +719,7 @@ def _create_recipe(
     end: Optional[str] = None,
     recipe_name: Optional[str] = None,
     sar_source: Optional[str] = None,
+    hfradar_resolution: Optional[str] = None,
 ) -> None:
     from .core.recipe import (
         GeographicBounds,
@@ -673,7 +746,10 @@ def _create_recipe(
     try:
         templates = {
             "wind": _build_wind_config(limit, _source_for("wind")),
-            "currents": _build_currents_config(limit, _source_for("currents")),
+            "currents": _build_currents_config(
+                limit, _source_for("currents"), hfradar_resolution,
+                min_lon, max_lon, min_lat, max_lat,
+            ),
             "soil_moisture": _build_soil_moisture_config(limit, _source_for("soil_moisture")),
             "waves": _build_waves_config(limit, _source_for("waves")),
         }

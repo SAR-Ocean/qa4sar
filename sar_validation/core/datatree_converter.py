@@ -1666,6 +1666,23 @@ class DataTreeConverter:
 
         lats = np.asarray(raw[lat_name].values, dtype=float)
         lons = np.asarray(raw[lon_name].values, dtype=float)
+
+        # Native grid resolution, derived from the file's own lat/lon
+        # coordinate spacing (not assumed from a filename or hardcoded
+        # constant) -- read downstream by collocation.py to set
+        # aggregation_window_km per-node instead of a fixed 6.0. Same
+        # degrees-to-km approximation collocation.py already uses
+        # (km ~= deg * 111 * cos(latitude)), reversed.
+        hfr_resolution_km: Optional[float] = None
+        if len(lats) > 1 and len(lons) > 1:
+            lat_spacing_deg = float(np.median(np.abs(np.diff(lats))))
+            lon_spacing_deg = float(np.median(np.abs(np.diff(lons))))
+            mean_lat = float(np.nanmean(lats))
+            lat_spacing_km = lat_spacing_deg * 111.0
+            lon_spacing_km = lon_spacing_deg * 111.0 * max(np.cos(np.radians(mean_lat)), 1e-6)
+            if lat_spacing_km > 0 and lon_spacing_km > 0:
+                hfr_resolution_km = (lat_spacing_km + lon_spacing_km) / 2.0
+
         if time_name is not None:
             times = pd.to_datetime(raw[time_name].values)
         else:
@@ -1777,6 +1794,9 @@ class DataTreeConverter:
         ds.attrs["platform_type"] = "radar"
         ds.attrs["source"]        = source_label
         ds.attrs["filename"]      = nc_path.name
+
+        if hfr_resolution_km is not None:
+            ds.attrs["hfr_resolution_km"] = hfr_resolution_km
 
         raw.close()
         return ds

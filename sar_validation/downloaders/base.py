@@ -15,6 +15,8 @@ Provides:
 - normalize_datetime     — ISO datetime normalisation helper
 - format_dir_datetime    — Directory-name-safe datetime string
 - build_output_dir       — Canonical output directory path
+- prefer_ipv4_dns        — Context manager that reorders socket.getaddrinfo()
+  results IPv4-first, to avoid wasting time on hosts with black-holed IPv6
 """
 
 from __future__ import annotations
@@ -23,9 +25,11 @@ import base64
 import json
 import logging
 import os
+import socket
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, Iterator, Optional, Tuple
 
 import keyring
 import keyring.errors
@@ -47,6 +51,7 @@ __all__ = [
     "build_output_dir",
     "split_antimeridian_bbox",
     "copernicus_marine_download_kwargs",
+    "prefer_ipv4_dns",
 ]
 
 # ---------------------------------------------------------------------------
@@ -881,6 +886,57 @@ def split_antimeridian_bbox(min_lon: float, max_lon: float) -> list[tuple[float,
     if min_lon <= max_lon:
         return [(min_lon, max_lon)]
     return [(min_lon, 180.0), (-180.0, max_lon)]
+
+
+# ---------------------------------------------------------------------------
+# Network helpers
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def prefer_ipv4_dns() -> Iterator[None]:
+    """Temporarily reorder ``socket.getaddrinfo()`` results so IPv4
+    addresses (``socket.AF_INET``) come before IPv6 addresses
+    (``socket.AF_INET6``), for the duration of the ``with`` block.
+
+    Some hosts (observed live for www.ncei.noaa.gov: all 6 of its IPv6
+    addresses are silently unreachable / black-holed, while all 6 of its
+    IPv4 addresses connect in ~0.1-0.2s) have broken IPv6 reachability that
+    a plain DNS/connect timeout doesn't protect against.
+    ``socket.create_connection`` -- used internally by
+    ``urllib.request.urlopen``/``http.client`` -- iterates
+    ``getaddrinfo(AF_UNSPEC)`` results in the order returned, which is
+    IPv6-before-IPv4 by default on many systems. Every request to such a
+    host therefore wastes up to ``len(ipv6_addresses) * timeout`` seconds
+    cycling through dead candidates before ever reaching a working IPv4
+    one. This doesn't filter out IPv6 (it's still tried, just last) --
+    combined with a shorter per-address timeout, it just makes the common
+    case fast instead of catastrophically slow.
+
+    Uses a stable sort (``key=lambda r: r[0] != socket.AF_INET``) so each
+    family's original relative order is preserved -- only the IPv4-vs-IPv6
+    grouping changes.
+
+    Restores the original ``socket.getaddrinfo`` afterward, even if an
+    exception is raised inside the ``with`` block.
+
+    This codebase's downloaders run sequentially, single-threaded (no
+    ThreadPoolExecutor/threading/multiprocessing anywhere in
+    ``core/orchestrator.py`` or ``downloaders/*.py``), so a temporary
+    global monkeypatch of ``socket.getaddrinfo`` is safe here -- but callers
+    should still scope the ``with`` block as narrowly as possible (only
+    around the actual network call) as good practice regardless.
+    """
+    original_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_first_getaddrinfo(*args, **kwargs):
+        results = original_getaddrinfo(*args, **kwargs)
+        return sorted(results, key=lambda r: r[0] != socket.AF_INET)
+
+    socket.getaddrinfo = _ipv4_first_getaddrinfo
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
 
 
 def copernicus_marine_download_kwargs(force_download: bool) -> dict:

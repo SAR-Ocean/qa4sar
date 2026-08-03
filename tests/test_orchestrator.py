@@ -588,6 +588,149 @@ class TestCombinedCurrentsHistoricalStatusMessage:
         )
 
 
+class TestCombinedHfRadarUsStatusMessage:
+    def _recipe(self) -> Recipe:
+        cfg = RecipeConfig(
+            name="test", variable="currents",
+            geographic_bounds=GeographicBounds(-125.0, -119.0, 33.0, 38.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[ValidationDataSource(source_type="hf_radar_us")],
+        )
+        return Recipe(cfg)
+
+    def test_all_backends_empty_logs_and_records_one_notice(self, caplog):
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.metadata["downloads"]["hf_radar_us"] = {
+            "status": "success", "file_count": 0,
+            "attempted_backends": ["erddap", "thredds", "copernicus"],
+        }
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_hf_radar_us_status()
+
+        combined = [r for r in caplog.records if "No US HF-radar data found" in r.message]
+        assert len(combined) == 1
+        assert "erddap" in combined[0].message
+        assert "thredds" in combined[0].message
+        assert "copernicus" in combined[0].message
+        assert len(orchestrator.metadata["notices"]) == 1
+        assert orchestrator.metadata["errors"] == []
+
+    def test_nonempty_result_suppresses_notice(self, caplog):
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.metadata["downloads"]["hf_radar_us"] = {
+            "status": "success", "file_count": 3,
+            "attempted_backends": ["erddap"],
+        }
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_hf_radar_us_status()
+
+        assert not any("No US HF-radar data found" in r.message for r in caplog.records)
+        assert orchestrator.metadata["notices"] == []
+
+    def test_failed_status_suppresses_notice(self, caplog):
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.metadata["downloads"]["hf_radar_us"] = {
+            "status": "failed", "error": "boom",
+        }
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_hf_radar_us_status()
+
+        assert not any("No US HF-radar data found" in r.message for r in caplog.records)
+
+    def test_no_entry_at_all_is_a_no_op(self, caplog):
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_hf_radar_us_status()
+
+        assert orchestrator.metadata["notices"] == []
+
+    def test_dry_run_never_logs(self, caplog):
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.metadata["downloads"]["hf_radar_us"] = {
+            "status": "dry_run", "file_count": 0, "attempted_backends": ["erddap"],
+        }
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_hf_radar_us_status()
+
+        assert not any("No US HF-radar data found" in r.message for r in caplog.records)
+
+
+class TestCombinedHfRadarStatusMessage:
+    def _recipe_with(self, *source_types: str) -> Recipe:
+        cfg = RecipeConfig(
+            name="test", variable="currents",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2020-01-01", "2020-01-02"),
+            validation_sources=[ValidationDataSource(source_type=st) for st in source_types],
+        )
+        return Recipe(cfg)
+
+    def test_both_empty_logs_one_combined_notice(self, caplog):
+        recipe = self._recipe_with("hf_radar", "hf_radar_historical")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.metadata["downloads"]["hf_radar_historical"] = {"status": "success", "file_count": 0}
+        orchestrator.metadata["downloads"]["hf_radar"] = {"status": "success", "file_count": 0}
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_hf_radar_status()
+
+        combined = [r for r in caplog.records if "No HF-radar data found" in r.message]
+        assert len(combined) == 1
+        assert len(orchestrator.metadata["notices"]) == 1
+
+    def test_hf_radar_skipped_but_historical_had_data_suppresses_notice(self, caplog):
+        recipe = self._recipe_with("hf_radar", "hf_radar_historical")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.metadata["downloads"]["hf_radar_historical"] = {"status": "success", "file_count": 4}
+        orchestrator.metadata["downloads"]["hf_radar"] = {
+            "status": "skipped", "reason": "covered by hf_radar_historical"
+        }
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_hf_radar_status()
+
+        assert not any("No HF-radar data found" in r.message for r in caplog.records)
+
+    def test_only_hf_radar_in_recipe_and_empty_still_logs(self, caplog):
+        recipe = self._recipe_with("hf_radar")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.metadata["downloads"]["hf_radar"] = {"status": "success", "file_count": 0}
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_hf_radar_status()
+
+        assert any("No HF-radar data found" in r.message for r in caplog.records)
+
+    def test_neither_source_in_recipe_is_a_no_op(self, caplog):
+        recipe = self._recipe_with("adcp_historical")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_hf_radar_status()
+
+        assert orchestrator.metadata["notices"] == []
+
+    def test_failed_source_does_not_double_report(self, caplog):
+        recipe = self._recipe_with("hf_radar")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.metadata["downloads"]["hf_radar"] = {"status": "failed", "error": "boom"}
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_hf_radar_status()
+
+        assert not any("No HF-radar data found" in r.message for r in caplog.records)
+
+
 def test_dispatch_source_routes_amsr_ssm(tmp_path):
     from unittest.mock import MagicMock
 

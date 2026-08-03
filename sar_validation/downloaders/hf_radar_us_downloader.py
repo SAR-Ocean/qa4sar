@@ -1,22 +1,25 @@
 """
-Pick NOAA ERDDAP or Copernicus Marine for a US HF-radar current-grid request.
+Pick NOAA (ERDDAP, then THREDDS archive) or Copernicus Marine for a US
+HF-radar current-grid request.
 
-NOAA's ERDDAP griddap distribution of the U.S. IOOS/HFRNet national HF-radar
-network has substantially denser real-world coverage than Copernicus's
-re-ingestion of the same network for US-WestCoast/US-EastGulfCoast (confirmed
-2026-07-30: ~5.8x-17x more valid grid cells for an identical bbox/date/
-resolution — see
-docs/superpowers/specs/2026-07-30-hf-radar-us-source-noaa-primary-copernicus-fallback-design.md).
-This downloader therefore prefers NOAA whenever the request's region and
-date are within NOAA's ERDDAP coverage (~90 rolling days), and falls back to
-Copernicus (NRT + delayed-mode) otherwise — for regions NOAA doesn't cover,
-or dates older than its window (NOAA's THREDDS/OPeNDAP archive backend,
-which would cover those dates directly from NOAA, is not implemented).
+Tries, in order, the first to return at least one file wins:
+  1. ERDDAP griddap (rolling ~90-day window) -- noaa_hfradar_downloader.py.
+  2. THREDDS archive (2006-present, published a few weeks behind
+     real-time) -- noaa_hfradar_thredds_downloader.py.
+  3. Copernicus Marine (historical then NRT) -- hf_radar_downloader.py /
+     hf_radar_historical_downloader.py. Only ever reached when NOAA (both
+     of its own backends) produced nothing for the exact window -- this
+     structurally avoids the double-counting risk of using NOAA and
+     Copernicus for the same stations in the same run.
 
-Both backends write to the same folder names the rest of the toolbox
-already discovers (``hfr_noaa/``, ``hf_radar/``, ``hf_radar_historical/``),
-so no converter or collocation changes are needed to consume either path's
-output.
+Applies uniformly across all 6 regions in NOAA_HFR_REGIONS. A bbox that
+doesn't match any of the 6 (non-US networks, or Copernicus-only regions)
+skips straight to step 3.
+
+All backends write to the same folder names the rest of the toolbox
+already discovers (``hfr_noaa/`` for ERDDAP+THREDDS, ``hf_radar/`` +
+``hf_radar_historical/`` for Copernicus), so no converter or collocation
+changes are needed to consume any path's output.
 
 CLI usage::
 
@@ -31,113 +34,132 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
+from ._noaa_hfr_regions import finest_resolution_km, match_noaa_hfr_region
 from .hf_radar_downloader import HFRadarDownloader
 from .hf_radar_historical_downloader import HFRadarHistoricalDownloader
-from .noaa_hfradar_downloader import (
-    DEFAULT_RESOLUTION_KM,
-    NOAAHFRadarDownloader,
-    match_region,
-    select_backend,
-)
+from .noaa_hfradar_downloader import DEFAULT_RESOLUTION_KM, NOAAHFRadarDownloader
+from .noaa_hfradar_thredds_downloader import NOAATHREDDSHFRadarDownloader
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["HFRadarUSDownloader", "resolve_hf_radar_us_backend"]
-
-
-def resolve_hf_radar_us_backend(min_lon, max_lon, min_lat, max_lat, end: str) -> str:
-    """Return ``"noaa"`` if NOAA's ERDDAP covers this bbox/date, else ``"copernicus"``.
-
-    NOAA covers a bbox if it resolves to one of its configured US regions
-    (``match_region``) AND the request's end date is within its rolling
-    ERDDAP window (``select_backend``). Either condition failing (a region
-    mismatch, or a date outside the window) means Copernicus is used
-    instead. A malformed ``end`` date string still propagates its
-    ``ValueError`` from ``select_backend``'s date parsing — this function
-    only absorbs the two conditions above, not input validation.
-    """
-    try:
-        match_region(min_lon, max_lon, min_lat, max_lat)
-    except ValueError:
-        return "copernicus"
-    try:
-        select_backend(end)
-    except NotImplementedError:
-        return "copernicus"
-    return "noaa"
+__all__ = ["HFRadarUSDownloader"]
 
 
 class HFRadarUSDownloader:
-    """Download a US HF-radar current grid, preferring NOAA over Copernicus.
+    """Download a US HF-radar current grid via the ERDDAP->THREDDS->Copernicus waterfall.
 
     Parameters
     ----------
     output_dir : Path
         The recipe run's base download directory (NOT a per-source
-        subfolder) — the NOAA path writes into ``<output_dir>/hfr_noaa``,
-        the Copernicus path writes into ``<output_dir>/hf_radar`` and
-        ``<output_dir>/hf_radar_historical``, matching the folder names the
-        plain ``hf_radar_noaa``/``hf_radar``/``hf_radar_historical`` sources
-        already use.
+        subfolder) — ERDDAP and THREDDS both write into
+        ``<output_dir>/hfr_noaa``, Copernicus writes into
+        ``<output_dir>/hf_radar`` and ``<output_dir>/hf_radar_historical``.
     dry_run : bool
-        Forwarded to whichever backend is selected.
-    resolution_km : int
-        Forwarded to ``NOAAHFRadarDownloader`` only; ignored on the
-        Copernicus fallback path (Copernicus publishes one fixed-resolution
-        grid per region, no resolution parameter to pass).
+        Forwarded to whichever backend is tried.
+    resolution_km : float, "finest", or None
+        None (default) auto-picks the matched region's
+        ``default_resolution_km``. ``"finest"`` picks
+        ``finest_resolution_km(region)``. A float is used as-is. Ignored on
+        the Copernicus fallback path (Copernicus publishes one
+        fixed-resolution grid per region). Not applied at all for a bbox
+        that matches no NOAA region.
     force_download : bool
-        Forwarded to whichever backend is selected.
+        Forwarded to whichever backend is tried.
     """
 
     def __init__(
         self,
         output_dir: Path,
         dry_run: bool = False,
-        resolution_km: int = DEFAULT_RESOLUTION_KM,
+        resolution_km: Optional[Union[float, str]] = None,
         force_download: bool = False,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
         self.resolution_km = resolution_km
         self.force_download = force_download
-        #: Set by download() to "noaa" or "copernicus" once resolved, so
-        #: callers (the orchestrator) can record which backend actually ran
-        #: without re-deriving it or inspecting the output folder layout.
+        #: Set by download() to "erddap"/"thredds"/"copernicus" once
+        #: resolved, so callers (the orchestrator) can record which backend
+        #: actually produced the run's data.
         self.resolved_backend: Optional[str] = None
+        #: Full ordered list of backends actually tried this call, even if
+        #: every one came back empty -- used to build the combined
+        #: "no data found" notice's wording.
+        self.attempted_backends: list[str] = []
 
     def download(
         self, min_lon: float, max_lon: float, min_lat: float, max_lat: float,
         start: str, end: str,
     ) -> list[Path]:
-        backend = resolve_hf_radar_us_backend(min_lon, max_lon, min_lat, max_lat, end)
-        self.resolved_backend = backend
-        logger.info(
-            "hf_radar_us: resolved to %s backend for bbox=[%s, %s, %s, %s] window=[%s, %s]",
-            backend, min_lon, max_lon, min_lat, max_lat, start, end,
-        )
+        self.attempted_backends = []
+        self.resolved_backend = None
+        try:
+            region_name, region = match_noaa_hfr_region(min_lon, max_lon, min_lat, max_lat)
+        except ValueError:
+            region_name, region = None, None
 
-        if backend == "noaa":
+        resolution_km: float
+        if self.resolution_km == "finest":
+            resolution_km = finest_resolution_km(region) if region is not None else DEFAULT_RESOLUTION_KM
+        elif isinstance(self.resolution_km, (int, float)):
+            resolution_km = self.resolution_km
+        else:
+            resolution_km = region["default_resolution_km"] if region is not None else DEFAULT_RESOLUTION_KM
+
+        if region is not None:
+            if region["erddap_datasets"] is not None:
+                self.attempted_backends.append("erddap")
+                self._warn_if_stale_output("hf_radar", "Copernicus NRT")
+                self._warn_if_stale_output("hf_radar_historical", "Copernicus delayed-mode")
+                try:
+                    erddap_dl = NOAAHFRadarDownloader(
+                        output_dir=self.output_dir / "hfr_noaa",
+                        dry_run=self.dry_run,
+                        resolution_km=resolution_km,
+                        force_download=self.force_download,
+                    )
+                    files = erddap_dl.download(min_lon, max_lon, min_lat, max_lat, start, end)
+                    if files:
+                        self.resolved_backend = "erddap"
+                        return files
+                    elif self.dry_run:
+                        self.resolved_backend = "erddap"
+                except (ValueError, NotImplementedError) as exc:
+                    logger.info(
+                        "hf_radar_us: ERDDAP not applicable for %s (%s), trying THREDDS",
+                        region_name, exc,
+                    )
+
+            self.attempted_backends.append("thredds")
             self._warn_if_stale_output("hf_radar", "Copernicus NRT")
             self._warn_if_stale_output("hf_radar_historical", "Copernicus delayed-mode")
-            dl = NOAAHFRadarDownloader(
-                output_dir=self.output_dir / "hfr_noaa",
-                dry_run=self.dry_run,
-                resolution_km=self.resolution_km,
-                force_download=self.force_download,
-            )
-            return dl.download(min_lon, max_lon, min_lat, max_lat, start, end)
+            try:
+                thredds_dl = NOAATHREDDSHFRadarDownloader(
+                    output_dir=self.output_dir / "hfr_noaa",
+                    dry_run=self.dry_run,
+                    resolution_km=resolution_km,
+                    force_download=self.force_download,
+                )
+                files = thredds_dl.download(min_lon, max_lon, min_lat, max_lat, start, end)
+                if files:
+                    self.resolved_backend = "thredds"
+                    return files
+                elif self.dry_run and self.resolved_backend is None:
+                    self.resolved_backend = "thredds"
+            except ValueError as exc:
+                logger.info(
+                    "hf_radar_us: THREDDS not applicable for %s (%s), trying Copernicus",
+                    region_name, exc,
+                )
 
+        self.attempted_backends.append("copernicus")
         self._warn_if_stale_output("hfr_noaa", "NOAA")
 
         # Historical-first, mirroring the orchestrator's _HISTORICAL_FIRST_PAIRS
-        # gate for plain hf_radar/hf_radar_historical sources: the delayed-mode
-        # archive is checked first, and the NRT grid is only fetched if the
-        # archive produced nothing for this window. Calling both
-        # unconditionally would double-count the same HFRNet stations via two
-        # differently-processed grids of the same network -- exactly the
-        # failure mode this downloader exists to eliminate.
+        # gate for plain hf_radar/hf_radar_historical sources.
         historical = HFRadarHistoricalDownloader(
             output_dir=self.output_dir / "hf_radar_historical",
             dry_run=self.dry_run,
@@ -146,6 +168,8 @@ class HFRadarUSDownloader:
         downloaded: list[Path] = list(
             historical.download(min_lon, max_lon, min_lat, max_lat, start, end)
         )
+        if self.resolved_backend is None:
+            self.resolved_backend = "copernicus"
         if downloaded:
             return downloaded
 
@@ -162,13 +186,13 @@ class HFRadarUSDownloader:
         run where a DIFFERENT backend was selected than this run's. Folder
         discovery in convert_downloaded_data is unconditional (checks only
         whether the folder exists), so leftover data from a prior run using
-        the other backend would get collocated alongside this run's
-        selected backend, double-counting the same stations."""
+        the other backend would get discovered and collocated alongside
+        this run's, double-counting the same stations."""
         d = self.output_dir / subdir
         if d.exists() and any(d.glob("*.nc")):
             logger.warning(
                 "hf_radar_us: %s already contains cached %s data from a prior "
-                "run, but this run resolved to a different backend -- both "
+                "run, but this run may resolve to a different backend -- both "
                 "will be discovered and collocated, double-counting the same "
                 "stations. Delete %s if you only want this run's backend used.",
                 d, backend_label, d,
@@ -177,7 +201,7 @@ class HFRadarUSDownloader:
 
 def _parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Download a US HF-radar current grid (NOAA primary, Copernicus fallback).",
+        description="Download a US HF-radar current grid (ERDDAP -> THREDDS -> Copernicus).",
     )
     p.add_argument("--min-lon", type=float, required=True)
     p.add_argument("--max-lon", type=float, required=True)
@@ -185,7 +209,7 @@ def _parse_args(argv=None):
     p.add_argument("--max-lat", type=float, required=True)
     p.add_argument("--start", required=True)
     p.add_argument("--end", required=True)
-    p.add_argument("--resolution", type=int, default=DEFAULT_RESOLUTION_KM, choices=[1, 2, 6])
+    p.add_argument("--resolution", type=float, default=None, choices=[0.5, 1, 2, 6])
     p.add_argument("--output-dir", default="data/hf_radar_us")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args(argv)

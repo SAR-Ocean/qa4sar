@@ -690,6 +690,60 @@ class TestResolveLayerTypeScatterometerVariants:
         assert _resolve_layer_type(ds_smos, "validation/smos_ssm/f1", DEFAULT_LAYER_TYPE_SPECS) == "smos_ssm"
 
 
+class TestApplyHfRadarResolutionOverride:
+    def test_overrides_when_no_recipe_override_and_attr_present(self):
+        import xarray as xr
+
+        from sar_validation.core.collocation import _apply_hf_radar_resolution_override
+
+        val_ds = xr.Dataset(attrs={"hfr_resolution_km": 1.2})
+        merged_kwargs = {"aggregation_window_km": 6.0, "time_tolerance_minutes": 30}
+        _apply_hf_radar_resolution_override("hf_radar_grid", val_ds, merged_kwargs, {})
+        assert merged_kwargs["aggregation_window_km"] == 1.2
+
+    def test_recipe_explicit_override_wins(self):
+        import xarray as xr
+
+        from sar_validation.core.collocation import _apply_hf_radar_resolution_override
+
+        val_ds = xr.Dataset(attrs={"hfr_resolution_km": 1.2})
+        merged_kwargs = {"aggregation_window_km": 6.0}
+        recipe_specs = {"hf_radar_grid": {"aggregation_window_km": 10.0}}
+        _apply_hf_radar_resolution_override("hf_radar_grid", val_ds, merged_kwargs, recipe_specs)
+        assert merged_kwargs["aggregation_window_km"] == 6.0  # unchanged -- recipe pinned it
+
+    def test_recipe_partial_override_without_aggregation_window_km_still_derives(self):
+        import xarray as xr
+
+        from sar_validation.core.collocation import _apply_hf_radar_resolution_override
+
+        val_ds = xr.Dataset(attrs={"hfr_resolution_km": 2.5})
+        merged_kwargs = {"aggregation_window_km": 6.0}
+        recipe_specs = {"hf_radar_grid": {"time_tolerance_minutes": 45}}  # no aggregation_window_km
+        _apply_hf_radar_resolution_override("hf_radar_grid", val_ds, merged_kwargs, recipe_specs)
+        assert merged_kwargs["aggregation_window_km"] == 2.5
+
+    def test_missing_attr_leaves_merged_kwargs_untouched(self):
+        import xarray as xr
+
+        from sar_validation.core.collocation import _apply_hf_radar_resolution_override
+
+        val_ds = xr.Dataset(attrs={})
+        merged_kwargs = {"aggregation_window_km": 6.0}
+        _apply_hf_radar_resolution_override("hf_radar_grid", val_ds, merged_kwargs, {})
+        assert merged_kwargs["aggregation_window_km"] == 6.0
+
+    def test_non_hf_radar_grid_layer_type_untouched(self):
+        import xarray as xr
+
+        from sar_validation.core.collocation import _apply_hf_radar_resolution_override
+
+        val_ds = xr.Dataset(attrs={"hfr_resolution_km": 1.2})
+        merged_kwargs = {"aggregation_window_km": 12.5}
+        _apply_hf_radar_resolution_override("scatterometer", val_ds, merged_kwargs, {})
+        assert merged_kwargs["aggregation_window_km"] == 12.5
+
+
 class TestScatterometerVariantDefaultSpecs:
     @pytest.mark.parametrize("key", [
         "scatterometer_hy2b", "scatterometer_hy2c", "scatterometer_oceansat3",

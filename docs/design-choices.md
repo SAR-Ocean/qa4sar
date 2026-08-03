@@ -184,25 +184,45 @@ per-cell quality flag at all — it filters upstream before publishing, so
 whatever it serves has already passed QC; Copernicus ships an explicit
 `QCflag` (1=good, 4=bad) but includes flagged-bad cells anyway.
 
-**Why:** US recipes therefore use a `hf_radar_us` source that automatically
-prefers NOAA (denser real coverage) whenever the request's region and date
-fall inside NOAA's ~90-day rolling ERDDAP window, falling back to
-Copernicus (NRT + delayed-mode, historical-first to avoid double-counting
-the same stations twice) only when NOAA can't serve the request — an older
-date, or a non-US region. NOAA's own THREDDS/OPeNDAP archive, which would
-extend its coverage to older dates directly, isn't implemented yet. This
+**Why:** US recipes therefore use a `hf_radar_us` source that tries three
+backends in order, first to return at least one file wins:
+
+1. **ERDDAP griddap** (`noaa_hfradar_downloader.py`) — NOAA's rolling
+   ~90-day real-time window, the densest and freshest coverage.
+2. **THREDDS archive** (`noaa_hfradar_thredds_downloader.py`) — NOAA's
+   NCEI-hosted archive, 2006-present but published a few weeks behind
+   real-time, so it picks up the gap ERDDAP's rolling window leaves behind:
+   older, historical dates. It cannot cover very recent/near-real-time
+   dates -- those aren't published to THREDDS yet and remain ERDDAP's
+   domain. THREDDS serves whole-region grids with no server-side bbox
+   subsetting (unlike ERDDAP), so the downloader trims the merged output to
+   the requested bbox client-side after download.
+3. **Copernicus Marine** (`hf_radar_downloader.py` /
+   `hf_radar_historical_downloader.py`, historical-first to avoid
+   double-counting the same stations twice) — only ever reached when
+   neither NOAA backend produced anything for the exact window: an even
+   older date than THREDDS covers, or a non-US region.
+
+`HFRadarUSDownloader.download()` (`hf_radar_us_downloader.py`) implements
+this waterfall directly — there is no separate date-threshold picker
+function; each backend's own `download()` is simply tried in turn inside
+one method, and the first non-empty result short-circuits the rest. This
 supersedes an earlier, same-day decision to retire NOAA everywhere in favor
 of Copernicus alone (the network-identity argument was correct, but ignored
-Copernicus's incomplete re-ingestion of it) — see `docs/superpowers/specs/`
-for that reasoning's full history. Separately, and independent of which
-backend is used, all Copernicus HF-radar data (US or not) now drops cells
-where the overall `QCflag == 4` ("bad") — Copernicus ships them unfiltered,
-and this toolbox previously retained them uncritically; per-parameter flags
+Copernicus's incomplete re-ingestion of it), and a later, separate decision
+that stopped at ERDDAP-only NOAA coverage (superseded once the THREDDS
+archive backend was added) — see `docs/superpowers/specs/` for that
+reasoning's full history. Separately, and independent of which backend is
+used, all Copernicus HF-radar data (US or not) now drops cells where the
+overall `QCflag == 4` ("bad") — Copernicus ships them unfiltered, and this
+toolbox previously retained them uncritically; per-parameter flags
 (`CSPD_QC` etc.) remain retained but unused.
 
-> Code: `downloaders/hf_radar_us_downloader.py` (`resolve_hf_radar_us_backend`,
-> `HFRadarUSDownloader`), `core/orchestrator.py` (`_download_hf_radar_us`),
-> `core/datatree_converter.py` (`from_hf_radar_grid`'s `QCflag` filter).
+> Code: `downloaders/hf_radar_us_downloader.py` (`HFRadarUSDownloader.download()`),
+> `downloaders/noaa_hfradar_thredds_downloader.py`
+> (`NOAATHREDDSHFRadarDownloader`), `core/orchestrator.py`
+> (`_download_hf_radar_us`), `core/datatree_converter.py`
+> (`from_hf_radar_grid`'s `QCflag` filter).
 
 ---
 

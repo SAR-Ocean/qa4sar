@@ -17,6 +17,155 @@ def _waves_recipe(swath_mode):
     ))
 
 
+class TestBuildCurrentsConfig:
+    def test_default_bbox_uses_copernicus_pair(self):
+        from sar_validation.cli import _build_currents_config
+
+        cfg = _build_currents_config()
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "hf_radar" in source_types
+        assert "hf_radar_historical" in source_types
+        assert "hf_radar_us" not in source_types
+
+    def test_no_hfradar_resolution_warning_for_non_us_bbox(self, caplog):
+        import logging
+
+        from sar_validation.cli import _build_currents_config
+
+        with caplog.at_level(logging.WARNING):
+            _build_currents_config()
+        assert not any("has no effect" in r.message for r in caplog.records)
+
+    def test_us_west_bbox_selects_hf_radar_us(self):
+        from sar_validation.cli import _build_currents_config
+
+        cfg = _build_currents_config(min_lon=-130.0, max_lon=-117.0, min_lat=32.0, max_lat=42.0)
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert source_types.count("hf_radar_us") == 1
+        assert "hf_radar" not in source_types
+        assert "hf_radar_historical" not in source_types
+        hf_source = next(s for s in cfg.validation_sources if s.source_type == "hf_radar_us")
+        assert hf_source.download_kwargs == {}
+
+    def test_us_west_bbox_with_1km_sets_download_kwargs(self):
+        from sar_validation.cli import _build_currents_config
+
+        cfg = _build_currents_config(
+            min_lon=-130.0, max_lon=-117.0, min_lat=32.0, max_lat=42.0,
+            hfradar_resolution="1km",
+        )
+        hf_source = next(s for s in cfg.validation_sources if s.source_type == "hf_radar_us")
+        assert hf_source.download_kwargs == {"resolution_km": 1.0}
+
+    def test_us_west_bbox_with_finest_passes_sentinel_through(self):
+        from sar_validation.cli import _build_currents_config
+
+        cfg = _build_currents_config(
+            min_lon=-130.0, max_lon=-117.0, min_lat=32.0, max_lat=42.0,
+            hfradar_resolution="finest",
+        )
+        hf_source = next(s for s in cfg.validation_sources if s.source_type == "hf_radar_us")
+        assert hf_source.download_kwargs == {"resolution_km": "finest"}
+
+    def test_prvi_only_bbox_with_1km_raises_value_error(self):
+        # US_PRVI's combined ERDDAP union THREDDS resolutions are {2, 6} --
+        # 1km is available on neither backend for this region, unlike
+        # Hawaii (see next test) where THREDDS covers what ERDDAP lacks.
+        from sar_validation.cli import _build_currents_config
+
+        with pytest.raises(ValueError, match="1km"):
+            _build_currents_config(
+                min_lon=-68.0, max_lon=-64.0, min_lat=16.0, max_lat=20.0,
+                hfradar_resolution="1km",
+            )
+
+    def test_prvi_only_bbox_with_2km_succeeds(self):
+        from sar_validation.cli import _build_currents_config
+
+        cfg = _build_currents_config(
+            min_lon=-68.0, max_lon=-64.0, min_lat=16.0, max_lat=20.0,
+            hfradar_resolution="2km",
+        )
+        hf_source = next(s for s in cfg.validation_sources if s.source_type == "hf_radar_us")
+        assert hf_source.download_kwargs == {"resolution_km": 2.0}
+
+    def test_hawaii_only_bbox_with_6km_succeeds_via_thredds_even_though_erddap_lacks_it(self):
+        # ERDDAP only ever publishes 1km for Hawaii, but THREDDS has
+        # 1/2/6km -- the early creation-time check must consider both
+        # backends' union, not just ERDDAP's, or this would wrongly reject
+        # a request the waterfall could actually satisfy at run time.
+        from sar_validation.cli import _build_currents_config
+
+        cfg = _build_currents_config(
+            min_lon=-159.0, max_lon=-154.0, min_lat=19.0, max_lat=22.0,
+            hfradar_resolution="6km",
+        )
+        hf_source = next(s for s in cfg.validation_sources if s.source_type == "hf_radar_us")
+        assert hf_source.download_kwargs == {"resolution_km": 6.0}
+
+    def test_hawaii_only_bbox_with_1km_succeeds(self):
+        from sar_validation.cli import _build_currents_config
+
+        cfg = _build_currents_config(
+            min_lon=-159.0, max_lon=-154.0, min_lat=19.0, max_lat=22.0,
+            hfradar_resolution="1km",
+        )
+        hf_source = next(s for s in cfg.validation_sources if s.source_type == "hf_radar_us")
+        assert hf_source.download_kwargs == {"resolution_km": 1.0}
+
+    def test_non_us_bbox_with_hfradar_resolution_warns_and_keeps_copernicus(self, caplog):
+        import logging
+
+        from sar_validation.cli import _build_currents_config
+
+        with caplog.at_level(logging.WARNING):
+            cfg = _build_currents_config(
+                min_lon=-10.0, max_lon=5.0, min_lat=50.0, max_lat=65.0,
+                hfradar_resolution="1km",
+            )
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "hf_radar" in source_types
+        assert "hf_radar_us" not in source_types
+        assert any("has no effect" in r.message for r in caplog.records)
+
+    def test_hf_radar_grid_layer_type_specs_has_no_aggregation_window_km(self):
+        from sar_validation.cli import _build_currents_config
+
+        cfg = _build_currents_config()
+        specs = cfg.collocation.layer_vs_layer.layer_type_specs["hf_radar_grid"]
+        assert "aggregation_window_km" not in specs
+        assert specs["time_tolerance_minutes"] == 30
+        assert specs["distance_weighting"] == "equal"
+        assert specs["dedup_nearest_in_time"] is True
+
+
+class TestHfradarResolutionCliFlag:
+    def test_rejected_for_non_currents_template(self, tmp_path, monkeypatch, capsys):
+        from sar_validation.cli import main
+
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit):
+            main(["--create-recipe", "wind", "--hfradar-resolution", "1km"])
+        captured = capsys.readouterr()
+        assert "currents" in (captured.out + captured.err)
+
+    def test_accepted_for_currents_template(self, tmp_path, monkeypatch):
+        from sar_validation.cli import main
+        from sar_validation.core.recipe import Recipe
+
+        monkeypatch.chdir(tmp_path)
+        main([
+            "--create-recipe", "currents", "--hfradar-resolution", "finest",
+            "--min-lon", "-130.0", "--max-lon", "-117.0",
+            "--min-lat", "32.0", "--max-lat", "42.0",
+        ])
+        recipe = Recipe.from_yaml(tmp_path / "recipes" / "currents_validation.yaml")
+        hf_source = next(
+            s for s in recipe.config.validation_sources if s.source_type == "hf_radar_us"
+        )
+        assert hf_source.download_kwargs == {"resolution_km": "finest"}
+
+
 class TestLoadPrecomputedStats:
     def test_finds_files_saved_under_filter_variable_pairs_keys(self, tmp_path):
         """Regression test: run_statistics saves files keyed by

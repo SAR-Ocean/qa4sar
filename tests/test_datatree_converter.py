@@ -1664,6 +1664,88 @@ class TestFromHfRadarGrid:
         assert DataTreeConverter.from_hf_radar_grid(tmp_path / "nope.nc") is None
 
 
+class TestFromHfRadarGridResolutionDerivation:
+    def test_derives_approximately_6km_spacing(self, tmp_path):
+        # lats span 33.0..38.0 over 3 points -> 2.5 deg spacing -> ~278km;
+        # this fixture isn't a real 6km product, so just assert the
+        # derivation runs and lands in a sane physical range, not an exact
+        # 6.0 -- the precise-spacing case is covered by the next test.
+        ds = DataTreeConverter.from_hf_radar_grid(_make_hfr_grid_nc(tmp_path))
+        assert ds is not None
+        assert "hfr_resolution_km" in ds.attrs
+        assert ds.attrs["hfr_resolution_km"] > 0
+
+    def test_derives_known_1km_spacing_precisely(self, tmp_path):
+        import numpy as np
+        import xarray as xr
+
+        # ~1km spacing: 0.009 deg lat (~1.0km), lon widened by /cos(lat) at
+        # this latitude is handled by the derivation itself.
+        n_lat, n_lon = 5, 5
+        lat0 = 36.0
+        lats = lat0 + np.arange(n_lat) * (1.0 / 111.0)
+        lons = -122.0 + np.arange(n_lon) * (1.0 / (111.0 * np.cos(np.radians(lat0))))
+        shape = (1, n_lat, n_lon)
+        raw = xr.Dataset(
+            {
+                "water_u": (("time", "lat", "lon"), np.zeros(shape),
+                            {"standard_name": "surface_eastward_sea_water_velocity"}),
+                "water_v": (("time", "lat", "lon"), np.zeros(shape),
+                            {"standard_name": "surface_northward_sea_water_velocity"}),
+            },
+            coords={"time": [np.datetime64("2024-05-01")], "lat": lats, "lon": lons},
+        )
+        path = tmp_path / "synthetic_1km.nc"
+        raw.to_netcdf(path)
+
+        ds = DataTreeConverter.from_hf_radar_grid(path)
+        assert ds is not None
+        assert ds.attrs["hfr_resolution_km"] == pytest.approx(1.0, rel=0.05)
+
+    def test_copernicus_shaped_input_also_gets_a_value(self, tmp_path):
+        import numpy as np
+        import xarray as xr
+
+        n_lat, n_lon = 5, 5
+        lats = 40.0 + np.arange(n_lat) * 0.05  # Copernicus HF-radar-total's own native spacing
+        lons = -1.0 + np.arange(n_lon) * 0.05
+        shape = (1, n_lat, n_lon)
+        raw = xr.Dataset(
+            {
+                "EWCT": (("time", "lat", "lon"), np.zeros(shape)),
+                "NSCT": (("time", "lat", "lon"), np.zeros(shape)),
+            },
+            coords={"time": [np.datetime64("2024-05-01")], "lat": lats, "lon": lons},
+        )
+        path = tmp_path / "synthetic_copernicus.nc"
+        raw.to_netcdf(path)
+
+        ds = DataTreeConverter.from_hf_radar_grid(path, u_var="EWCT", v_var="NSCT")
+        assert ds is not None
+        assert ds.attrs["hfr_resolution_km"] > 0
+        assert ds.attrs["hfr_resolution_km"] != 6.0  # not a hardcoded constant
+
+    def test_single_lat_or_lon_omits_attribute_rather_than_erroring(self, tmp_path):
+        import numpy as np
+        import xarray as xr
+
+        raw = xr.Dataset(
+            {
+                "water_u": (("time", "lat", "lon"), np.zeros((1, 1, 3)),
+                            {"standard_name": "surface_eastward_sea_water_velocity"}),
+                "water_v": (("time", "lat", "lon"), np.zeros((1, 1, 3)),
+                            {"standard_name": "surface_northward_sea_water_velocity"}),
+            },
+            coords={"time": [np.datetime64("2024-05-01")], "lat": [40.0], "lon": [-1.0, -0.9, -0.8]},
+        )
+        path = tmp_path / "single_lat.nc"
+        raw.to_netcdf(path)
+
+        ds = DataTreeConverter.from_hf_radar_grid(path)
+        assert ds is not None
+        assert "hfr_resolution_km" not in ds.attrs
+
+
 def _make_copernicus_hfr_grid_nc(tmp_path, n_time=2, n_lat=3, n_lon=4):
     """Write a minimal Copernicus radar-total-shaped gridded NetCDF."""
     rng = np.random.default_rng(11)
