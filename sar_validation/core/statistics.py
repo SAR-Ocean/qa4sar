@@ -36,6 +36,7 @@ __all__ = [
     "save_statistics",
     "run_statistics",
     "run_statistics_native_units",
+    "run_statistics_cds_ssm",
 ]
 
 
@@ -857,15 +858,25 @@ def run_statistics(
     for sar_var, val_var in pairs:
         logger.info("Computing statistics: %s vs %s …", sar_var, val_var)
 
+        # Exclude C3S CDS SSM rows: they are handled by run_statistics_cds_ssm
+        # (a separate, non-CDF-matched pass) and must not enter the CDF-matched
+        # section where their native units (%/m³m⁻³) would be treated as if
+        # they were ISMN-equivalent volumetric fractions.
+        if "val_source" in collocation_ds:
+            cds_mask = collocation_ds["val_source"] != "cds_ssm"
+            ds_for_stats = collocation_ds.isel(collocation=cds_mask.values)
+        else:
+            ds_for_stats = collocation_ds
+
         # Group by platform type (val_source, e.g. "mooring", "buoy",
         # "drifter", "scatterometer") rather than per-station (val_id), so
         # categories stay coarse and every platform type — including
         # scatterometer — gets its own row.
         if recipe.config.variable == "soil_moisture":
-            stats_ds = compute_statistics_soil_moisture(collocation_ds, sar_var, val_var,
+            stats_ds = compute_statistics_soil_moisture(ds_for_stats, sar_var, val_var,
                                                          group_by=["val_source"])
         else:
-            stats_ds = compute_statistics(collocation_ds, sar_var, val_var,
+            stats_ds = compute_statistics(ds_for_stats, sar_var, val_var,
                                           group_by=["val_source"])
         if stats_ds is None:
             continue
@@ -879,6 +890,61 @@ def run_statistics(
     return results
 
 
+# ---------------------------------------------------------------------------
+# C3S CDS SSM statistics pass
+# ---------------------------------------------------------------------------
+
+def run_statistics_cds_ssm(
+    collocation_ds: xr.Dataset,
+    recipe,
+    base_dir: Union[str, Path],
+    filename_suffix: str = "",
+) -> dict[str, xr.Dataset]:
+    """
+    Dedicated, non-CDF-matched statistics pass for C3S CDS satellite soil
+    moisture (``val_source == "cds_ssm"``).
+
+    Keeps only the rows whose ``val_source`` is ``"cds_ssm"``, then runs
+    plain :func:`compute_statistics` (no CDF matching, no unit conversion)
+    for each ``(sar_var, val_var)`` pair inferred from *recipe*.  Output is
+    written to
+    ``<base_dir>/validation_statistics_<sar_var>_vs_<val_var>_cds_ssm<filename_suffix>.nc/.csv``.
+
+    No-op (returns ``{}``) when:
+    - ``recipe.config.variable`` is not ``"soil_moisture"``
+    - no ``"val_source"`` coordinate exists in *collocation_ds*
+    - no rows with ``val_source == "cds_ssm"`` are present
+    """
+    base_dir = Path(base_dir)
+    if recipe.config.variable != "soil_moisture":
+        return {}
+    if "val_source" not in collocation_ds:
+        return {}
+
+    cds_mask = collocation_ds["val_source"] == "cds_ssm"
+    if not cds_mask.values.any():
+        return {}
+
+    cds_ds = collocation_ds.isel(collocation=cds_mask.values)
+
+    try:
+        pairs = filter_variable_pairs(recipe, cds_ds)
+    except KeyError as exc:
+        logger.error("run_statistics_cds_ssm: %s", exc)
+        return {}
+
+    results: dict[str, xr.Dataset] = {}
+    for sar_var, val_var in pairs:
+        logger.info("Computing C3S CDS SSM statistics: %s vs %s …", sar_var, val_var)
+        stats_ds = compute_statistics(cds_ds, sar_var, val_var, group_by=["val_source"])
+        if stats_ds is None:
+            continue
+        key = f"{sar_var}_vs_{val_var}"
+        out_path = base_dir / f"validation_statistics_{key}_cds_ssm{filename_suffix}.nc"
+        save_statistics(stats_ds, out_path)
+        results[key] = stats_ds
+
+    return results
 # ---------------------------------------------------------------------------
 # Native-units statistics pass (soil moisture only)
 # ---------------------------------------------------------------------------
@@ -946,7 +1012,17 @@ def run_statistics_native_units(
             continue
         sar_family = _normalize_units_family(collocation_ds[sar_col].attrs.get("units", ""))
 
-        stats_ds = compute_statistics(collocation_ds, sar_var, val_var, group_by=["val_source"])
+        # Exclude cds_ssm from native-units pass: cds_ssm is handled by
+        # run_statistics_cds_ssm.  It is not in _VAL_SOURCE_UNITS_FAMILY so
+        # the matching-family filter below would drop it anyway, but an
+        # explicit exclusion here prevents it appearing in intermediate stats.
+        if "val_source" in collocation_ds:
+            cds_mask = collocation_ds["val_source"] != "cds_ssm"
+            ds_for_native = collocation_ds.isel(collocation=cds_mask.values)
+        else:
+            ds_for_native = collocation_ds
+
+        stats_ds = compute_statistics(ds_for_native, sar_var, val_var, group_by=["val_source"])
         if stats_ds is None:
             continue
 

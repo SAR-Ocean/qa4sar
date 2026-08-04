@@ -2527,3 +2527,121 @@ class TestFromHfRadarGridQCFlagFilter:
         assert result is not None
         # Only the NaN cell is dropped; no QCflag variable exists to filter on.
         assert result.sizes["point"] == 3
+
+
+class TestFromC3sSsm:
+    """Tests for DataTreeConverter.from_c3s_ssm."""
+
+    def test_returns_none_for_missing_file(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        result = DataTreeConverter.from_c3s_ssm(tmp_path / "does_not_exist.nc", "active")
+        assert result is None
+
+    def test_returns_none_for_unknown_product_type(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        path = tmp_path / "fake.nc"
+        path.write_bytes(b"")
+        result = DataTreeConverter.from_c3s_ssm(path, "invalid_type")
+        assert result is None
+
+    def test_converts_active_product(self, tmp_path):
+        """Active product → units='%', data_type='cds_ssm', source contains ACTIVE."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        lat = np.array([50.0, 50.25])
+        lon = np.array([10.0, 10.25])
+        sm_vals = np.array([[35.0, np.nan], [42.0, 10.0]], dtype=float)
+
+        time_dim = np.array(["2026-01-01"], dtype="datetime64[ns]")
+        ds = xr.Dataset(
+            {"sm": (("time", "lat", "lon"), sm_vals[np.newaxis, :, :])},
+            coords={"time": time_dim, "lat": lat, "lon": lon},
+        )
+        nc_path = tmp_path / "c3s_ssm_active_20260101.nc"
+        ds.to_netcdf(nc_path)
+
+        result = DataTreeConverter.from_c3s_ssm(nc_path, "active")
+
+        assert result is not None
+        assert "SOIL_MOISTURE" in result
+        assert result["SOIL_MOISTURE"].attrs["units"] == "%"
+        assert result.attrs["data_type"] == "cds_ssm"
+        assert result.attrs["platform_type"] == "cds_ssm"
+        assert "ACTIVE" in result.attrs["source"]
+        # NaN filtered: 3 valid out of 4
+        assert result.sizes["point"] == 3
+
+    def test_converts_passive_product(self, tmp_path):
+        """Passive product → units='m3 m-3', source contains PASSIVE."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        lat = np.array([50.0])
+        lon = np.array([10.0, 10.25])
+        sm_vals = np.array([[0.3, 0.25]], dtype=float)
+
+        time_dim = np.array(["2026-01-01"], dtype="datetime64[ns]")
+        ds = xr.Dataset(
+            {"sm": (("time", "lat", "lon"), sm_vals[np.newaxis, :, :])},
+            coords={"time": time_dim, "lat": lat, "lon": lon},
+        )
+        nc_path = tmp_path / "c3s_ssm_passive_20260101.nc"
+        ds.to_netcdf(nc_path)
+
+        result = DataTreeConverter.from_c3s_ssm(nc_path, "passive")
+
+        assert result is not None
+        assert result["SOIL_MOISTURE"].attrs["units"] == "m3 m-3"
+        assert "PASSIVE" in result.attrs["source"]
+
+    def test_fill_value_masked_to_nan(self, tmp_path):
+        """Cells equal to _FillValue must be masked (dropped as NaN)."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        lat = np.array([50.0])
+        lon = np.array([10.0, 10.25, 10.5])
+        FILL = -9999.0
+        sm_vals = np.array([[30.0, FILL, 45.0]], dtype=float)
+
+        time_dim = np.array(["2026-01-01"], dtype="datetime64[ns]")
+        da = xr.DataArray(
+            sm_vals[np.newaxis, :, :],
+            dims=("time", "lat", "lon"),
+            coords={"time": time_dim, "lat": lat, "lon": lon},
+            attrs={"_FillValue": FILL},
+        )
+        ds = xr.Dataset({"sm": da})
+        nc_path = tmp_path / "c3s_ssm_active_20260101.nc"
+        ds.to_netcdf(nc_path)
+
+        result = DataTreeConverter.from_c3s_ssm(nc_path, "active")
+
+        assert result is not None
+        assert result.sizes["point"] == 2
+
+    def test_returns_none_when_sm_variable_missing(self, tmp_path):
+        """A file without 'sm' variable must return None without raising."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        ds = xr.Dataset(
+            {"other_var": (("lat", "lon"), np.ones((2, 2)))},
+            coords={"lat": [50.0, 50.25], "lon": [10.0, 10.25]},
+        )
+        nc_path = tmp_path / "c3s_ssm_active_20260101.nc"
+        ds.to_netcdf(nc_path)
+
+        result = DataTreeConverter.from_c3s_ssm(nc_path, "active")
+        assert result is None

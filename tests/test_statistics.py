@@ -1184,3 +1184,107 @@ def test_assemble_stats_dataset_shape():
     assert list(ds["source"].values) == ["buoy"]
     assert ds.attrs["group_by"] == "val_source"
     assert float(ds["bias"].values[0]) == pytest.approx(0.1)
+
+
+# ---------------------------------------------------------------------------
+# Tests for CDS SSM statistics exclusion / run_statistics_cds_ssm
+# ---------------------------------------------------------------------------
+
+def _make_sm_collocation_ds(n_per_source: int = 20) -> "xr.Dataset":
+    """Synthetic soil-moisture collocation_ds with three val_source values:
+    'ismn', 'ascat_ssm', and 'cds_ssm'. Used by several CDS stats tests."""
+    rng = np.random.default_rng(7)
+    sources = ["ismn"] * n_per_source + ["ascat_ssm"] * n_per_source + ["cds_ssm"] * n_per_source
+    n = len(sources)
+    sar_vals = rng.uniform(20.0, 80.0, n)
+    val_vals = sar_vals + rng.normal(0, 5, n)
+    return xr.Dataset(
+        {
+            "sar_sarSSM": ("collocation", sar_vals, {"units": "%"}),
+            "val_SOIL_MOISTURE": ("collocation", val_vals, {"units": "mixed"}),
+            "val_source": ("collocation", np.array(sources, dtype="U20")),
+        },
+        coords={"collocation": np.arange(n)},
+    )
+
+
+class TestRunStatisticsCdsSsmExclusion:
+    """run_statistics must not include cds_ssm rows in CDF-matched output."""
+
+    def test_cds_ssm_absent_from_cdf_matched_results(self, tmp_path):
+        from sar_validation.core.statistics import run_statistics
+
+        recipe = Recipe(RecipeConfig(
+            name="test", variable="soil_moisture",
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
+        ))
+        ds = _make_sm_collocation_ds(20)
+        results = run_statistics(ds, recipe, tmp_path)
+        assert results, "expected at least one stats pair"
+        for stats_ds in results.values():
+            sources = [str(s) for s in stats_ds["source"].values]
+            assert "cds_ssm" not in sources, (
+                f"cds_ssm should be excluded from CDF-matched stats, but found in: {sources}"
+            )
+
+    def test_cds_ssm_absent_from_native_units_results(self, tmp_path):
+        from sar_validation.core.statistics import run_statistics_native_units
+
+        recipe = Recipe(RecipeConfig(
+            name="test", variable="soil_moisture",
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
+        ))
+        ds = _make_sm_collocation_ds(20)
+        results = run_statistics_native_units(ds, recipe, tmp_path)
+        for stats_ds in results.values():
+            sources = [str(s) for s in stats_ds["source"].values]
+            assert "cds_ssm" not in sources, (
+                f"cds_ssm should be excluded from native-units stats, but found in: {sources}"
+            )
+
+
+class TestRunStatisticsCdsSsm:
+    """run_statistics_cds_ssm produces stats only for cds_ssm rows."""
+
+    def test_returns_empty_for_non_soil_moisture_recipe(self, tmp_path):
+        from sar_validation.core.statistics import run_statistics_cds_ssm
+
+        recipe = Recipe(RecipeConfig(name="test", variable="wind"))
+        ds = _make_sm_collocation_ds(20)
+        results = run_statistics_cds_ssm(ds, recipe, tmp_path)
+        assert results == {}
+
+    def test_returns_empty_when_no_cds_ssm_rows(self, tmp_path):
+        from sar_validation.core.statistics import run_statistics_cds_ssm
+
+        recipe = Recipe(RecipeConfig(
+            name="test", variable="soil_moisture",
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
+        ))
+        rng = np.random.default_rng(0)
+        ds = xr.Dataset(
+            {
+                "sar_sarSSM": ("collocation", rng.uniform(20, 80, 10), {"units": "%"}),
+                "val_SOIL_MOISTURE": ("collocation", rng.uniform(20, 80, 10)),
+                "val_source": ("collocation", np.array(["ismn"] * 10, dtype="U20")),
+            },
+        )
+        results = run_statistics_cds_ssm(ds, recipe, tmp_path)
+        assert results == {}
+
+    def test_produces_stats_only_for_cds_ssm(self, tmp_path):
+        from sar_validation.core.statistics import run_statistics_cds_ssm
+
+        recipe = Recipe(RecipeConfig(
+            name="test", variable="soil_moisture",
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
+        ))
+        ds = _make_sm_collocation_ds(20)
+        results = run_statistics_cds_ssm(ds, recipe, tmp_path)
+        assert results, "expected at least one stats pair"
+        for stats_ds in results.values():
+            sources = [str(s) for s in stats_ds["source"].values]
+            assert sources == ["cds_ssm"]
+            # Verify the .nc file was written
+        key = "sarSSM_vs_SOIL_MOISTURE"
+        assert (tmp_path / f"validation_statistics_{key}_cds_ssm.nc").exists()

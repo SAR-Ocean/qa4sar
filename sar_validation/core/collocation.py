@@ -288,12 +288,13 @@ def _equal_weights(distances: np.ndarray) -> np.ndarray:
 LAYER_DATA_TYPES = {
     "scatterometer", "altimeter", "hf_radar", "hf_radar_grid", "radiometer",
     "scatterometer_ssm", "radiometer_ssm",
+    "cds_ssm",
 }
 # path-fragment fallbacks when attributes are absent
 LAYER_SOURCE_PATHS = {
     "osi_saf_winds", "scatterometer", "altimeter", "hf_radar",
     "hf_radar_grid", "hfr_noaa", "radiometer", "ascat_ssm", "amsr_ssm", "smap_ssm",
-    "smos_ssm",
+    "smos_ssm", "cds_ssm",
 }
 
 
@@ -1019,6 +1020,7 @@ def _apply_hf_radar_resolution_override(
 #: _average_within_sar_tolerance below.
 SSM_SATELLITE_LAYER_TYPES = {
     "scatterometer_ssm", "radiometer_ssm", "amsr_ssm", "smap_ssm", "smos_ssm",
+    "cds_ssm",
 }
 
 

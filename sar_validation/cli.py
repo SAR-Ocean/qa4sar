@@ -662,21 +662,26 @@ def _build_soil_moisture_config(limit: Optional[int] = None, sar_source: str = "
                 key: {"time_tolerance_minutes": time_tol}
                 for key in (
                     "scatterometer_ssm", "radiometer_ssm",
-                    "amsr_ssm", "smap_ssm", "smos_ssm",
+                    "amsr_ssm", "smap_ssm", "smos_ssm", "cds_ssm",
                 )
             }
         )
 
-    # Select description based on sar_source
+    # C3S CDS product type: active (%) pairs with Sentinel-1 CLMS (%);
+    # passive (m3 m-3) pairs with NISAR SME2.
+    cds_product_type = "passive" if sar_source == "nisar_sme2" else "active"
+
     if sar_source == "nisar_sme2":
         description = (
             "Validate NISAR SME2 (beta) L-band Surface Soil Moisture\n"
-            "against ISMN in-situ stations, ASCAT, AMSR2, SMAP, and SMOS."
+            "against ISMN in-situ stations, ASCAT, AMSR2, SMAP, SMOS,\n"
+            "and C3S CDS Passive SSM (multi-radiometer composite, 0.25°)."
         )
     else:
         description = (
             "Validate Sentinel-1 CLMS Surface Soil Moisture (1 km, Europe,\n"
-            "daily) against ISMN in-situ stations."
+            "daily) against ISMN in-situ stations and C3S CDS Active SSM\n"
+            "(multi-ASCAT composite, 0.25°)."
         )
 
     return RecipeConfig(
@@ -694,6 +699,10 @@ def _build_soil_moisture_config(limit: Optional[int] = None, sar_source: str = "
             ValidationDataSource(source_type="amsr_ssm"),
             ValidationDataSource(source_type="smap_ssm"),
             ValidationDataSource(source_type="smos_ssm"),
+            ValidationDataSource(
+                source_type="cds_ssm",
+                download_kwargs={"product_type": cds_product_type},
+            ),
         ],
         collocation=CollocationType(
             point_vs_layer=PointVsLayerCollocation(
@@ -1000,7 +1009,7 @@ def _compute_stats(recipe, base_dir: Path, filename_suffix: str = "") -> None:
     """Run step 4: compute validation statistics from collocation_results<suffix>.nc."""
     import xarray as xr
 
-    from .core.statistics import run_statistics, run_statistics_native_units
+    from .core.statistics import run_statistics, run_statistics_cds_ssm, run_statistics_native_units
 
     coll_path = base_dir / f"collocation_results{filename_suffix}.nc"
     if not coll_path.exists():
@@ -1020,6 +1029,9 @@ def _compute_stats(recipe, base_dir: Path, filename_suffix: str = "") -> None:
         native_results = run_statistics_native_units(collocation_ds, recipe, base_dir, filename_suffix=filename_suffix)
         for key in native_results:
             print(f"  Native-units statistics saved: validation_statistics_{key}_native_units{filename_suffix}.nc/.csv")
+        cds_results = run_statistics_cds_ssm(collocation_ds, recipe, base_dir, filename_suffix=filename_suffix)
+        for key in cds_results:
+            print(f"  C3S CDS SSM statistics saved: validation_statistics_{key}_cds_ssm{filename_suffix}.nc/.csv")
 
 
 def _stats_already_computed(recipe, base_dir: Path, filename_suffix: str = "") -> bool:
@@ -1128,11 +1140,15 @@ def _generate_plots(
     stats_ds_map = _load_precomputed_stats(recipe, collocation_ds, base_dir, filename_suffix)
     download_warnings = _load_download_warnings(base_dir)
 
-    native_units_stats_ds_map = None
     if recipe.config.variable == "soil_moisture":
         native_units_stats_ds_map = _load_precomputed_stats(
             recipe, collocation_ds, base_dir, filename_suffix=f"_native_units{filename_suffix}",
         )
+        cds_ssm_stats_ds_map: Optional[dict] = _load_precomputed_stats(
+            recipe, collocation_ds, base_dir, filename_suffix=f"_cds_ssm{filename_suffix}",
+        ) or None
+    else:
+        cds_ssm_stats_ds_map = None
 
     validation_report(collocation_ds, datatree, recipe,
                       stats_ds_map=stats_ds_map or None,
@@ -1140,7 +1156,8 @@ def _generate_plots(
                       filename_suffix=filename_suffix,
                       download_warnings=download_warnings,
                       layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
-                      native_units_stats_ds_map=native_units_stats_ds_map or None)
+                      native_units_stats_ds_map=native_units_stats_ds_map or None,
+                      cds_ssm_stats_ds_map=cds_ssm_stats_ds_map)
     pdf_path = base_dir / f"validation_report{filename_suffix}.pdf"
     if pdf_path.exists():
         print(f"  PDF report saved to {pdf_path}")

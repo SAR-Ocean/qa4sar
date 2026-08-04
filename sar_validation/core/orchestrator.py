@@ -533,6 +533,7 @@ class DataOrchestrator:
             "amsr_ssm":      self._download_amsr_ssm,
             "smap_ssm":      self._download_smap_ssm,
             "smos_ssm":      self._download_smos_ssm,
+            "cds_ssm":       self._download_cds_ssm,
         }
         handler = handlers.get(source.source_type)
         if handler is None:
@@ -715,6 +716,29 @@ class DataOrchestrator:
                 start=pad_start, end=pad_end,
             ),
             "SMOS SSM",
+        )
+
+    def _download_cds_ssm(self, source) -> bool:
+        from ..downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        out_dir = self.base_dir / "cds_ssm"
+        product_type = source.download_kwargs.get("product_type", "active")
+
+        return self._run_download(
+            "cds_ssm", out_dir,
+            lambda: CDSSoilMoistureDownloader(
+                product_type=product_type,
+                output_dir=out_dir, dry_run=self.dry_run,
+            ),
+            lambda: dict(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=pad_start, end=pad_end,
+            ),
+            f"C3S CDS SSM ({product_type})",
         )
 
     def _download_scatterometer_ftp(self, source, satellite: str) -> bool:

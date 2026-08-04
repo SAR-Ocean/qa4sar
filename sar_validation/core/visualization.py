@@ -128,13 +128,14 @@ _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#17becf",
     "#f032e6", "#e6194b", "#000080", "#ffff00",
+    "#00ff00",
 ]
 
 # Marker shapes paired 1:1 with _SOURCE_COLORS by index, used wherever
 # validation sources need to stay identifiable independently of color (e.g.
 # when color is taken by a continuous value like wind speed or temporal
 # offset instead of by source).
-_SOURCE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<"]
+_SOURCE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<", ">"]
 
 
 # ---------------------------------------------------------------------------
@@ -2948,6 +2949,13 @@ def _mark_native_units(fig: "Figure") -> "Figure":
     return _stamp_banner(fig, "— native units —", "darkred")
 
 
+def _mark_cds_section(fig: "Figure") -> "Figure":
+    """Stamp a "— C3S CDS SSM —" banner across the top of *fig* to
+    distinguish the C3S CDS comparison section from the CDF-matched and
+    native-units sections."""
+    return _stamp_banner(fig, "— C3S CDS SSM —", "darkorange")
+
+
 def _mark_cdf_matched(fig: "Figure") -> "Figure":
     """Stamp a "(CDF-matched)" banner across the top of *fig* so
     soil-moisture's main-section scatter/geographic/residuals pages
@@ -3144,6 +3152,7 @@ def validation_report(
     download_warnings: Optional[list[str]] = None,
     layer_vs_layer_collocation_method: str = "cell-averaging",
     native_units_stats_ds_map: Optional[Dict[str, "xr.Dataset"]] = None,
+    cds_ssm_stats_ds_map: Optional[Dict[str, "xr.Dataset"]] = None,
 ) -> Dict[str, list]:
     """
     Run all four plot functions for every (sar_var, val_var) pair inferred
@@ -3621,6 +3630,66 @@ def validation_report(
                 title = f"{sar_var} vs {val_var} — native units — statistics"
                 if base_dir is not None:
                     _write_page(title, _finalize_figure_for_report(fig_nu_stats, None))
+
+        all_figures[key] = figs
+
+        # C3S CDS SSM section: plain (non-CDF-matched) comparison between
+        # SAR and the C3S CDS composite (ACTIVE or PASSIVE) collocated rows.
+        # Only present for soil_moisture recipes when cds_ssm rows exist.
+        if variable == "soil_moisture" and cds_ssm_stats_ds_map and key in cds_ssm_stats_ds_map:
+            cds_stats = cds_ssm_stats_ds_map[key]
+            cds_mask = geo_pair_ds["val_source"] == "cds_ssm"
+            cds_pair_ds = geo_pair_ds.where(cds_mask, drop=True)
+
+            try:
+                fig_cds_geo_result = plot_geographic(
+                    datatree, cds_pair_ds, sar_var, val_var, scenes=matched_scenes,
+                    point_size=geo_point_size,
+                    geographic_bounds=(
+                        recipe.config.geographic_bounds if geo_clamp_bounds else None
+                    ),
+                    skip_domain_harmonization=True,
+                )
+                if isinstance(fig_cds_geo_result, dict):
+                    for group, fig_cds_geo in fig_cds_geo_result.items():
+                        if fig_cds_geo is not None:
+                            fig_cds_geo = _mark_cds_section(fig_cds_geo)
+                            figs.append(fig_cds_geo)
+                            title = f"{sar_var} vs {val_var} — C3S CDS SSM — geographic [{group}]"
+                            if base_dir is not None:
+                                _write_page(title, _finalize_figure_for_report(fig_cds_geo, None))
+                elif fig_cds_geo_result is not None:
+                    fig_cds_geo_result = _mark_cds_section(fig_cds_geo_result)
+                    figs.append(fig_cds_geo_result)
+                    title = f"{sar_var} vs {val_var} — C3S CDS SSM — geographic"
+                    if base_dir is not None:
+                        _write_page(title, _finalize_figure_for_report(fig_cds_geo_result, None))
+            except Exception as exc:
+                logger.warning("plot_geographic failed for C3S CDS SSM %s: %s", sar_var, exc)
+
+            fig_cds_scatter = plot_scatter(cds_pair_ds, sar_var, val_var)
+            if fig_cds_scatter is not None:
+                fig_cds_scatter = _mark_cds_section(fig_cds_scatter)
+                figs.append(fig_cds_scatter)
+                title = f"{sar_var} vs {val_var} — C3S CDS SSM — scatter"
+                if base_dir is not None:
+                    _write_page(title, _finalize_figure_for_report(fig_cds_scatter, None))
+
+            fig_cds_residuals = plot_residuals(cds_pair_ds, sar_var, val_var)
+            if fig_cds_residuals is not None:
+                fig_cds_residuals = _mark_cds_section(fig_cds_residuals)
+                figs.append(fig_cds_residuals)
+                title = f"{sar_var} vs {val_var} — C3S CDS SSM — residuals"
+                if base_dir is not None:
+                    _write_page(title, _finalize_figure_for_report(fig_cds_residuals, None))
+
+            fig_cds_stats = plot_statistics(cds_stats)
+            if fig_cds_stats is not None:
+                fig_cds_stats = _mark_cds_section(fig_cds_stats)
+                figs.append(fig_cds_stats)
+                title = f"{sar_var} vs {val_var} — C3S CDS SSM — statistics"
+                if base_dir is not None:
+                    _write_page(title, _finalize_figure_for_report(fig_cds_stats, None))
 
         all_figures[key] = figs
 

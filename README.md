@@ -89,6 +89,7 @@ sar_validation/
     ├── scatterometer_ftp_downloader.py           # HY-2B/HY-2C/Oceansat-3 scatterometer wind via OSI-SAF FTP (only last 3 days)
     ├── sentinel1_l2_ocn_downloader.py            # Sentinel-1 L2_OCN (wind/currents/waves) via Copernicus Dataspace (CDSE)
     ├── sentinel1_soil_moisture_downloader.py     # Sentinel-1 CLMS Surface Soil Moisture via Copernicus Dataspace (CDSE)
+    ├── cds_soil_moisture_downloader.py           # C3S CDS satellite soil moisture (ACTIVE/PASSIVE/COMBINED, 0.25°) via cdsapi
     └── smos_downloader.py                        # SMOS L2 soil moisture via ESA SMOS FTPS
 ```
 
@@ -190,6 +191,7 @@ plt.show()
 | SMAP (SPL2SMP_E) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata | 2015 - present |
 | NISAR SME2 (beta & provisional) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata | 2025-10-01 - present |
 | SMOS (SM_OPER_MIR_SMUDP2) | soil moisture | `smos_downloader` | ESA SMOS FTPS | 2010 - present |
+| C3S CDS Soil Moisture (ACTIVE / PASSIVE / COMBINED) | soil moisture | `cds_soil_moisture_downloader` | Copernicus CDS | 1991 - present (ICDR: ~10-day latency) |
 | ISMN (International Soil Moisture Network) | soil moisture | `ismn_downloader` | Manual portal download (no API) | Varies by station |
 
 NISAR SME2 (`m3 m-3`, L-band, twice-daily per-overpass granules) is a second,
@@ -321,6 +323,22 @@ Register at: https://eoiam-idp.eo.esa.int/
 
 The `smos_downloader` uses these credentials to download SMOS L2 soil moisture products
 from the ESA SMOS FTPS archive.
+
+### Copernicus CDS — for C3S satellite soil moisture downloads
+
+`cds_soil_moisture_downloader` downloads via the
+[`cdsapi`](https://cds.climate.copernicus.eu/how-to-api) library, which reads
+credentials automatically from `~/.cdsapirc`. Create that file after registering:
+
+```ini
+url: https://cds.climate.copernicus.eu/api
+key: <your-personal-access-token>
+```
+
+Register and generate a token at: https://cds.climate.copernicus.eu
+
+Note: no `sar-validate --set-credential` command is needed; `cdsapi` reads
+`~/.cdsapirc` natively.
 
 ### ISMN — for soil moisture in-situ validation
 

@@ -504,15 +504,19 @@ class TestBuildSoilMoistureConfig:
 
         assert cfg.variable == "soil_moisture"
         assert cfg.sar_data.source == "sentinel1_clms_ssm"
-        assert len(cfg.validation_sources) == 5
+        assert len(cfg.validation_sources) == 6
         source_types = [s.source_type for s in cfg.validation_sources]
-        assert source_types == ["ismn", "ascat_ssm", "amsr_ssm", "smap_ssm", "smos_ssm"]
+        assert source_types == ["ismn", "ascat_ssm", "amsr_ssm", "smap_ssm", "smos_ssm", "cds_ssm"]
         ismn_source = cfg.validation_sources[0]
         assert ismn_source.min_depth == 0.0
         assert ismn_source.max_depth == 0.05
         assert ismn_source.download_kwargs == {}
-        for satellite_source in cfg.validation_sources[1:]:
-            assert satellite_source.download_kwargs == {}
+        for satellite_source in cfg.validation_sources[1:6]:
+            assert satellite_source.download_kwargs == {} or satellite_source.source_type == "cds_ssm"
+        # cds_ssm has product_type in download_kwargs
+        cds_ssm_source = cfg.validation_sources[5]
+        assert cds_ssm_source.source_type == "cds_ssm"
+        assert cds_ssm_source.download_kwargs == {"product_type": "active"}
 
     def test_default_geographic_bounds(self):
         from sar_validation.cli import _build_soil_moisture_config
