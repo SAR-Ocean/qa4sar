@@ -1,9 +1,13 @@
 # SAR L2 Ocean Data Validation Toolbox
 
-A standalone Python package for validating Sentinel-1 L2_OCN (Level 2 Ocean) products
-against multi-source in-situ and satellite observations.
+A standalone Python package for validating Level 2 SAR products against multi-source in-situ and satellite observations.
 
 Supports validation of **wind** (speed + direction), **ocean currents**, **significant wave height**, and **soil moisture**.
+
+Supported SAR products:
+- Sentinel-1 L2_OCN (Level 2 Ocean): wind/waves/currents
+- Sentinel1 clms ssm (Surface Soil Moisture; Europe; daily): soil moisture
+- NISAR SME2 (beta & provisional): soil_moisture 
 
 ---
 
@@ -20,9 +24,10 @@ Step 0 — Create recipe (.yaml)
 Step 1 — Download data
           │  download SAR L2_OCN + all validation sources
           │  for the recipe region and time window
+          |  --dry-run available to check product availibility
           ▼
 Step 2 — Convert to xarray.DataTree
-          │  standardize all formats
+          │  standardize all formats + attach CF-convention metadata 
           │  filter to recipe geographic/temporal bounds +/- tolerances
           │  handle different grids / resolutions
           ▼
@@ -31,8 +36,7 @@ Step 3 — Collocation + store collocated pairs
           │  point vs. layer    (mooring / buoy / drifter / ferrybox / tidal gauge vs. SAR)
           │  layer vs. layer    (scatterometer / altimeter / radiometer / HF-radar vs. SAR)
           |  create a collocation diagnostics plot
-          │  keep only overlapping data
-          │  store spatial/temporal offset metadata
+          │  store collocated data + spatial/temporal offset metadata
           ▼
 Step 4 — Compute statistics
           │  bias, RMSE, correlation, scatter index
@@ -69,7 +73,7 @@ sar_validation/
     ├── _noaa_hfr_regions.py                     # NOAA HF-radar region bbox/dataset-id table (shared, not a downloader)
     ├── _rss_bytemap.py                          # Decoder for RSS binary bytemap (.gz) radiometer products
     ├── altimeter_downloader.py                  # Along-track SWH/wind altimetry via Copernicus Marine
-    ├── ascat_soil_moisture_downloader.py        # ASCAT (MetOp) soil moisture (SOMO12) via EUMETSAT EUMDAC
+    ├── ascat_soil_moisture_downloader.py        # ASCAT (MetOp) soil moisture (SOMO12) via EUMETSAT EUMDAC (discontinued after 2025-07-15)
     ├── earthdata_soil_moisture_downloader.py    # AMSR-E/2, SMAP, and NISAR SME2 soil moisture via NASA Earthdata
     ├── gportal_downloader.py                    # AMSR2 soil moisture via JAXA G-Portal (SFTP)
     ├── hf_radar_downloader.py                   # Near-real-time HF-radar surface currents via Copernicus Marine
@@ -82,10 +86,10 @@ sar_validation/
     ├── noaa_hfradar_thredds_downloader.py        # NOAA HFRnet gridded surface currents via NCEI THREDDS archive (2006-present)
     ├── radiometer_downloader.py                  # RSS radiometer ocean winds (AMSR2 NetCDF + GMI/SSMIS/WindSat bytemaps)
     ├── scatterometer_downloader.py               # ASCAT (MetOp) wind via EUMETSAT EUMDAC
-    ├── scatterometer_ftp_downloader.py           # HY-2B/HY-2C/Oceansat-3 scatterometer wind via OSI-SAF FTP
+    ├── scatterometer_ftp_downloader.py           # HY-2B/HY-2C/Oceansat-3 scatterometer wind via OSI-SAF FTP (only last 3 days)
     ├── sentinel1_l2_ocn_downloader.py            # Sentinel-1 L2_OCN (wind/currents/waves) via Copernicus Dataspace (CDSE)
     ├── sentinel1_soil_moisture_downloader.py     # Sentinel-1 CLMS Surface Soil Moisture via Copernicus Dataspace (CDSE)
-    └── smos_downloader.py                        # SMOS L3 soil moisture via ESA SMOS FTPS
+    └── smos_downloader.py                        # SMOS L2 soil moisture via ESA SMOS FTPS
 ```
 
 ---
@@ -166,47 +170,33 @@ plt.show()
 
 ## Supported Data Sources
 
-| Source | Variable | Downloader | Service |
-|--------|----------|------------|---------|
-| Sentinel-1 L2_OCN | wind / currents / waves | `sentinel1_l2_ocn_downloader` | Copernicus Dataspace (CDSE) |
-| Moorings / Buoys / Ferryboxes | wind / currents / waves | `insitu_downloader` | Copernicus Marine |
-| Delayed-mode in-situ currents (ADCP / Argo / drifter / glider) | ocean currents | `insitu_currents_historical_downloader` | Copernicus Marine |
-| HF Radar (near-real-time) | ocean currents | `hf_radar_downloader` | Copernicus Marine |
-| HF Radar (delayed-mode/historical) | ocean currents | `hf_radar_historical_downloader` | Copernicus Marine |
-| HF Radar (US regions) | ocean currents | `hf_radar_us_downloader` | NOAA ERDDAP → NOAA THREDDS → Copernicus Marine (waterfall) |
-| HF Radar (NOAA HFRnet, rolling window) | ocean currents | `noaa_hfradar_downloader` | NOAA ERDDAP |
-| HF Radar (NOAA HFRnet, full archive) | ocean currents | `noaa_hfradar_thredds_downloader` | NOAA NCEI THREDDS |
-| ASCAT (MetOp-B/C) | wind | `scatterometer_downloader` | EUMETSAT EUMDAC |
-| HY-2B / HY-2C / Oceansat-3 | wind | `scatterometer_ftp_downloader` | OSI-SAF FTP |
-| Radiometer — AMSR2 (NetCDF); GMI, SSMIS F16/F17/F18, WindSat (binary bytemaps) | wind (+ direction from WindSat) | `radiometer_downloader` | RSS `data.remss.com` (public HTTPS) |
-| Sentinel-1 CLMS Surface Soil Moisture | soil moisture | `sentinel1_soil_moisture_downloader` | Copernicus Dataspace (CDSE) |
-| ASCAT Soil Moisture (SOMO12) | soil moisture | `ascat_soil_moisture_downloader` | EUMETSAT EUMDAC |
-| AMSR-E/AMSR2 (NSIDC-0451 / AU_Land) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata |
-| SMAP (SPL2SMP_E) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata |
-| NISAR SME2 (beta) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata |
-| AMSR2 (JAXA G-Portal) | soil moisture | `gportal_downloader` | JAXA G-Portal (SFTP) |
-| SMOS (L3 SM DQR) | soil moisture | `smos_downloader` | ESA SMOS FTPS |
-| ISMN (International Soil Moisture Network) | soil moisture | `ismn_downloader` | Manual portal download (no API) |
-
-> **Note:** The Sentinel-1 CLMS Surface Soil Moisture downloader's CDSE query
-> parameters (`DATASET_IDENTIFIER`, `PRODUCT_EXTENT` in
-> `sar_validation/downloaders/sentinel1_soil_moisture_downloader.py`) and GeoTIFF value
-> decoding (`from_sar_l3_ssm_geotiff` in `sar_validation/core/datatree_converter.py`)
-> have been confirmed against a real downloaded CEURO product (embedded
-> `scale_factor`/`add_offset`/`flag_values`/geospatial-extent GDAL tags) and a
-> successful end-to-end recipe run. Each CDSE product is served as a zip
-> containing a soil-moisture GeoTIFF plus a sibling uncertainty-layer GeoTIFF
-> (and, separately, a redundant NetCDF variant) — both are downloaded/unzipped
-> and filtered automatically, no manual handling needed.
+| Source | Variable | Downloader | Service | Temporal coverage |
+|--------|----------|------------|---------| ----------------- |
+| Sentinel-1 L2_OCN | wind / currents / waves | `sentinel1_l2_ocn_downloader` | Copernicus Dataspace (CDSE) | 2014-10-03 - present |
+| Moorings / Buoys / Ferryboxes | wind / currents / waves | `insitu_downloader` | Copernicus Marine | varies by platform; max 2020-01-01 - present |
+| Delayed-mode in-situ currents (ADCP / Argo / drifter / glider) | ocean currents |   `insitu_currents_historical_downloader` | Copernicus Marine | varies by platform (6 - 24 months delay) |
+| HF Radar (near-real-time) | ocean currents | `hf_radar_downloader` | Copernicus Marine | varies by radar; max 2020-01-01 - present |
+| HF Radar (delayed-mode/historical) | ocean currents | `hf_radar_historical_downloader` | Copernicus Marine | varies by platform |
+| HF Radar (US regions) | ocean currents | `hf_radar_us_downloader` | NOAA ERDDAP → NOAA THREDDS → Copernicus Marine (waterfall) | see HF Rader (NOAA HFRnet) |
+| HF Radar (NOAA HFRnet, rolling window) | ocean currents | `noaa_hfradar_downloader` | NOAA ERDDAP | 90 days rolling window |
+| HF Radar (NOAA HFRnet, full archive) | ocean currents | `noaa_hfradar_thredds_downloader` | NOAA NCEI THREDDS | 2006 - present (~1 month delay) |
+| ASCAT (MetOp-B/C) | wind | `scatterometer_downloader` | EUMETSAT EUMDAC | MetOp-B/C: 2012/2019 - present |
+| HY-2B / HY-2C / Oceansat-3 | wind | `scatterometer_ftp_downloader` | OSI-SAF FTP | last 3 days |
+| Radiometer — AMSR2 (NetCDF); GMI, SSMIS F16/F17/F18, WindSat (binary bytemaps) | wind (+ direction from WindSat) | `radiometer_downloader` | RSS `data.remss.com` (public HTTPS) | AMSR2/GMI/SSMIS F16/F17/F18: 2012-07-02/2014-03-04/2003-10-26/2006-11-04/2009-10-18 - present |
+| Sentinel-1 CLMS Surface Soil Moisture | soil moisture | `sentinel1_soil_moisture_downloader` | Copernicus Dataspace (CDSE) | 2014 - present (Europe only) |
+| ASCAT Soil Moisture (SOMO12) | soil moisture | `ascat_soil_moisture_downloader` | EUMETSAT EUMDAC | 2007 - 2025-07-15 (⚠️ discontinued) |
+| AMSR-E/AMSR2 (NSIDC-0451 / AU_Land) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata | AMSR-E: 2002 - 2011; AMSR2: 2012 - 2025-09-01 ⚠️ frozen |
+| AMSR2 (JAXA G-Portal) | soil moisture | `gportal_downloader` | JAXA G-Portal (SFTP) | 2012 - present |
+| SMAP (SPL2SMP_E) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata | 2015 - present |
+| NISAR SME2 (beta & provisional) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata | 2025-10-01 - present |
+| SMOS (SM_OPER_MIR_SMUDP2) | soil moisture | `smos_downloader` | ESA SMOS FTPS | 2010 - present |
+| ISMN (International Soil Moisture Network) | soil moisture | `ismn_downloader` | Manual portal download (no API) | Varies by station |
 
 NISAR SME2 (`m3 m-3`, L-band, twice-daily per-overpass granules) is a second,
-beta SAR-side source for soil moisture, selectable per recipe via
+beta/provisional SAR-side source for soil moisture, selectable per recipe via
 `sar-validate --create-recipe soil_moisture --sar-source nisar_sme2` (or
 `source: nisar_sme2` in the recipe YAML) — see `docs/design-choices.md`
-§8.11 for how units and collocation defaults adapt automatically. Its CMR
-product identifiers and HDF5 layout are currently documented placeholders,
-not yet verified against a real downloaded granule, so `--sar-source
-nisar_sme2` cannot download/convert real data yet — see §8.11 for details.
+§8.11 for how units and collocation defaults adapt automatically.
 
 ### Collocation types
 
@@ -329,7 +319,7 @@ delete the old file afterwards.
 
 Register at: https://eoiam-idp.eo.esa.int/ 
 
-The `smos_downloader` uses these credentials to download SMOS L3 soil moisture products
+The `smos_downloader` uses these credentials to download SMOS L2 soil moisture products
 from the ESA SMOS FTPS archive.
 
 ### ISMN — for soil moisture in-situ validation
@@ -368,6 +358,3 @@ python -m mypy -p sar_validation
 ## Documentation
 
 - [Design choices](docs/design-choices.md) — toolbox overview and the rationale behind conventions: wind-direction rotation, collocation aggregation windows and tolerances, WV footprint handling, circular statistics, datatree filtering and CF metadata
-- [Creating recipes](docs/creating-recipes.md) — recipe options and CLI flags
-- [Collocation](docs/collocation.md) — matching algorithm mechanics and parameters
-- [Statistics & plots](docs/cli-statistics-and-plots.md) — steps 4–5 outputs and CLI usage

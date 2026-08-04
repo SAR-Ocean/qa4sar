@@ -25,10 +25,16 @@ handy_notebooks/
 # Relevant previous code
 relevant_code_for_toolbox/
 
-# Created recipes
-#*.yaml
-#!recipes/currents_*.yaml
-#!recipes/soil_moisture_satellite_example.yaml
+# Created recipes - keep only selected examples
+recipes/*.yaml
+!recipes/wind_example.yaml
+!recipes/wind_antimeridian.yaml
+!recipes/currents_uswestcoast.yaml
+!recipes/currents_useastcoast.yaml
+!recipes/waves_pacific.yaml
+!recipes/waves_atlantic.yaml
+!recipes/soil_moisture_nisar_norway.yaml
+!recipes/soil_moisture_example.yaml
 
 # Jupyter notebooks checkpoints
 .ipynb_checkpoints/
