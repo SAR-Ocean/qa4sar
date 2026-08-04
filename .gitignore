@@ -56,10 +56,11 @@ htmlcov/
 Thumbs.db
 
 # outdated documentation
-docs/older_docs/    
+docs/*
+!docs/design-choices.md
+!docs/rvlHeading_considerations.md   
 
 # Superpowers documentation
-superpowers/
 AGENTS.md
 
 # Credentials (never commit these)
