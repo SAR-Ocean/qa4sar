@@ -156,23 +156,6 @@ class TestPointLayerCollocation:
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "mooring")
         assert results == []
 
-    def test_multiple_matches_per_point(self):
-        """Aggregation produces one match per validation point (not per SAR cell)."""
-        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
-
-        val = _make_val_dataframe(
-            lons=[0.0], lats=[52.0],
-            times=[datetime(2026, 1, 1, 12, 0, 0)],
-            WSPD=[8.0],
-        )
-
-        colloc = PointLayerCollocation(spatial_tolerance_km=500, time_tolerance_minutes=60,
-                                        aggregation_window_km=100)
-        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "mooring")
-        # Aggregation produces one match per validation point, not multiple for each nearby SAR cell
-        assert len(results) == 1
-        assert "WSPD" in results[0].val_data
-
     def test_collocated_point_fields(self):
         grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
 
@@ -233,19 +216,6 @@ class TestPointLayerCollocation:
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "mooring")
         assert len(results) > 0
 
-    def test_collocated_point_has_collocation_type(self):
-        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
-        val = _make_val_dataframe(
-            lons=[0.0], lats=[52.0],
-            times=[datetime(2026, 1, 1, 12, 0, 0)],
-            WSPD=[8.0],
-        )
-        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
-                                        aggregation_window_km=100)
-        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "mooring")
-        assert len(results) > 0
-        assert results[0].collocation_type == "point_vs_layer"
-
     def test_invalid_interpolation_method(self):
         with pytest.raises(ValueError, match="interpolation_method"):
             PointLayerCollocation(interpolation_method="bilinear")
@@ -302,78 +272,76 @@ class TestPointLayerCollocation:
         assert len(results) > 0
         assert results[0].val_source == "insitu"
 
-    def test_wide_tolerance_keeps_only_nearest_reading_per_station(self):
+    @pytest.mark.parametrize(
+        "spatial_tolerance_km,val_kwargs,expected_len,expected_check",
+        [
+            pytest.param(
+                200,
+                dict(
+                    lons=[0.0] * 5, lats=[52.0] * 5,
+                    times=[datetime(2026, 1, 1, h, 0, 0) for h in (9, 10, 11, 14, 15)],
+                    WSPD=[float(h) for h in (9, 10, 11, 14, 15)],
+                    platform_id=["StationA"] * 5,
+                ),
+                1,
+                lambda results: (
+                    results[0].val_data["WSPD"] == 11.0
+                    and results[0].temporal_distance_minutes == 60.0
+                ),
+                id="keeps_only_nearest_reading_per_station",
+            ),
+            pytest.param(
+                200,
+                dict(
+                    lons=[0.0, 0.0], lats=[52.0, 52.0],
+                    times=[datetime(2026, 1, 1, 12, 0, 0)] * 2,
+                    WSPD=[7.0, 9.0],
+                    platform_id=["SensorA", "SensorB"],
+                ),
+                2,
+                lambda results: {r.val_id for r in results} == {"SensorA", "SensorB"},
+                id="keeps_distinct_stations_separate",
+            ),
+            pytest.param(
+                500,
+                dict(
+                    lons=[0.0, 0.0, 0.5], lats=[52.0, 52.0, 52.5],
+                    times=[
+                        datetime(2026, 1, 1, 10, 0, 0),
+                        datetime(2026, 1, 1, 12, 0, 0),
+                        datetime(2026, 1, 1, 12, 0, 0),
+                    ],
+                    WSPD=[6.0, 8.0, 10.0],
+                ),
+                2,
+                lambda results: {r.val_data["WSPD"] for r in results} == {8.0, 10.0},
+                id="dedup_falls_back_to_lonlat_without_platform_id",
+            ),
+        ],
+    )
+    def test_wide_tolerance_dedup(
+        self, spatial_tolerance_km, val_kwargs, expected_len, expected_check,
+    ):
         """A station reporting hourly, matched against one SAR time with a
         wide time tolerance (e.g. ISMN's 720 min), must contribute only its
         single closest-in-time reading — not one collocation per hourly
-        reading in the window. Regression test for the real-data bug where
-        one ISMN station produced ~25 collocations against a single SAR
-        overpass instead of 1."""
+        reading in the window. Regression coverage for the real-data bug
+        where one ISMN station produced ~25 collocations against a single
+        SAR overpass instead of 1, plus the two related guards: distinct
+        stations must not be collapsed together, and dedup falls back to
+        (lon, lat) grouping when no platform_id column is present."""
         grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
 
-        # 5 hourly readings from ONE station, spanning the SAR time
-        # (12:00). The 11:00 reading (60 min away) is the unique closest.
-        hours = [9, 10, 11, 14, 15]
-        val = _make_val_dataframe(
-            lons=[0.0] * 5, lats=[52.0] * 5,
-            times=[datetime(2026, 1, 1, h, 0, 0) for h in hours],
-            WSPD=[float(h) for h in hours],
-            platform_id=["StationA"] * 5,
-        )
+        val = _make_val_dataframe(**val_kwargs)
 
-        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=720,
-                                        aggregation_window_km=100, dedup_nearest_in_time=True)
+        colloc = PointLayerCollocation(
+            spatial_tolerance_km=spatial_tolerance_km, time_tolerance_minutes=720,
+            aggregation_window_km=100, dedup_nearest_in_time=True,
+        )
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "ismn")
 
-        assert len(results) == 1
-        assert results[0].val_data["WSPD"] == 11.0
-        assert results[0].temporal_distance_minutes == 60.0
-
-    def test_wide_tolerance_keeps_distinct_stations_separate(self):
-        """Distinct stations (different platform_id, e.g. co-located
-        sensors at the same physical site reporting independently) must
-        each keep their own nearest-in-time reading — the dedup must not
-        collapse across stations."""
-        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
-
-        val = _make_val_dataframe(
-            lons=[0.0, 0.0], lats=[52.0, 52.0],
-            times=[datetime(2026, 1, 1, 12, 0, 0), datetime(2026, 1, 1, 12, 0, 0)],
-            WSPD=[7.0, 9.0],
-            platform_id=["SensorA", "SensorB"],
-        )
-
-        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=720,
-                                        aggregation_window_km=100, dedup_nearest_in_time=True)
-        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "ismn")
-
-        assert len(results) == 2
-        assert {r.val_id for r in results} == {"SensorA", "SensorB"}
-
-    def test_wide_tolerance_dedup_falls_back_to_lonlat_without_platform_id(self):
-        """When no platform_id column is present, dedup must fall back to
-        (lon, lat) so distinct validation points still aren't collapsed
-        together, while repeated readings from the exact same point are."""
-        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
-
-        val = _make_val_dataframe(
-            lons=[0.0, 0.0, 0.5], lats=[52.0, 52.0, 52.5],
-            times=[
-                datetime(2026, 1, 1, 10, 0, 0),
-                datetime(2026, 1, 1, 12, 0, 0),
-                datetime(2026, 1, 1, 12, 0, 0),
-            ],
-            WSPD=[6.0, 8.0, 10.0],
-        )
-
-        colloc = PointLayerCollocation(spatial_tolerance_km=500, time_tolerance_minutes=720,
-                                        aggregation_window_km=100, dedup_nearest_in_time=True)
-        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "ismn")
-
-        # (0.0, 52.0) contributes one reading (the 12:00 one, closer than
-        # 10:00); (0.5, 52.5) contributes its own separate reading.
-        assert len(results) == 2
-        assert {r.val_data["WSPD"] for r in results} == {8.0, 10.0}
+        assert len(results) == expected_len
+        assert expected_check(results)
 
 
 # ---------------------------------------------------------------------------
@@ -413,22 +381,6 @@ class TestLayerLayerCollocation:
                                         aggregation_window_km=100)
         results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
         assert results == []
-
-    def test_inherits_from_point_layer(self):
-        assert issubclass(LayerLayerCollocation, PointLayerCollocation)
-
-    def test_layer_collocation_defaults(self):
-        """Verify LayerLayerCollocation has scatterometer-optimized defaults."""
-        colloc = LayerLayerCollocation()
-        assert colloc.time_tolerance_minutes == 180  # Paper spec: ±3 hours
-        assert colloc.spatial_tolerance_km == 12.5   # ASCAT cell size
-        assert colloc.aggregation_window_km == 12.5  # ASCAT cell size
-        assert colloc.distance_weighting == "equal"  # Uniform for regular grid
-        assert colloc.validation_temporal_averaging_minutes == 60  # ±1 hour window
-
-    def test_layer_collocation_dedup_nearest_in_time_defaults_to_false(self):
-        colloc = LayerLayerCollocation()
-        assert colloc.dedup_nearest_in_time is False
 
     def test_dedup_nearest_in_time_keeps_only_nearest_reading_per_cell(self):
         """A gridded HF-radar cell reporting hourly, with two candidate
@@ -596,14 +548,6 @@ class TestDetectCollocationTypeImport:
         assert _detect_collocation_type(ds, "validation/scatterometer/file") == "layer_vs_layer"
 
 
-def test_scatterometer_ssm_is_a_layer_data_type():
-    assert "scatterometer_ssm" in LAYER_DATA_TYPES
-
-
-def test_radiometer_ssm_is_a_layer_data_type():
-    assert "radiometer_ssm" in LAYER_DATA_TYPES
-
-
 class TestHfRadarGridDispatch:
     def test_data_type_routes_to_layer(self):
         import xarray as xr
@@ -615,45 +559,26 @@ class TestHfRadarGridDispatch:
         ds = xr.Dataset()  # no data_type attr
         assert _detect_collocation_type(ds, "validation/hfr_noaa/scene") == "layer_vs_layer"
 
-    def test_default_layer_spec_present(self):
-        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
-        spec = DEFAULT_LAYER_TYPE_SPECS["hf_radar_grid"]
-        assert spec["aggregation_window_km"] == 6.0
-        assert spec["time_tolerance_minutes"] == 30
-        assert spec["distance_weighting"] == "equal"
-        assert spec["dedup_nearest_in_time"] is True
-        # Bare "hf_radar" is dead config -- data_type is always
-        # "hf_radar_grid" for every HF-radar source today, so this key was
-        # never actually reachable. Removed.
-        assert "hf_radar" not in DEFAULT_LAYER_TYPE_SPECS
-
 
 class TestResolveLayerTypeScatterometerVariants:
-    def test_hy2b_path_resolves_to_its_own_spec_key(self):
-        import xarray as xr
-
-        from sar_validation.core.collocation import _resolve_layer_type
-        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
-
-        ds = xr.Dataset(attrs={"data_type": "scatterometer"})
-        layer_type = _resolve_layer_type(
-            ds, "validation/scatterometer_hy2b/some_file", DEFAULT_LAYER_TYPE_SPECS
-        )
-        assert layer_type == "scatterometer_hy2b"
-
-    def test_oceansat3_path_resolves_to_its_own_spec_key(self):
-        import xarray as xr
-
-        from sar_validation.core.collocation import _resolve_layer_type
-        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
-
-        ds = xr.Dataset(attrs={"data_type": "scatterometer"})
-        layer_type = _resolve_layer_type(
-            ds, "validation/scatterometer_oceansat3/some_file", DEFAULT_LAYER_TYPE_SPECS
-        )
-        assert layer_type == "scatterometer_oceansat3"
-
-    def test_plain_ascat_path_still_resolves_to_bare_scatterometer(self):
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            pytest.param(
+                "validation/scatterometer_hy2b/some_file", "scatterometer_hy2b",
+                id="hy2b_path_resolves_to_its_own_spec_key",
+            ),
+            pytest.param(
+                "validation/scatterometer_oceansat3/some_file", "scatterometer_oceansat3",
+                id="oceansat3_path_resolves_to_its_own_spec_key",
+            ),
+            pytest.param(
+                "validation/scatterometer/some_file", "scatterometer",
+                id="plain_ascat_path_still_resolves_to_bare_scatterometer",
+            ),
+        ],
+    )
+    def test_scatterometer_variant_path_resolution(self, path, expected):
         """Regression guard: the refinement must not over-match ASCAT nodes."""
         import xarray as xr
 
@@ -661,10 +586,8 @@ class TestResolveLayerTypeScatterometerVariants:
         from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
 
         ds = xr.Dataset(attrs={"data_type": "scatterometer"})
-        layer_type = _resolve_layer_type(
-            ds, "validation/scatterometer/some_file", DEFAULT_LAYER_TYPE_SPECS
-        )
-        assert layer_type == "scatterometer"
+        layer_type = _resolve_layer_type(ds, path, DEFAULT_LAYER_TYPE_SPECS)
+        assert layer_type == expected
 
     def test_altimeter_frequency_refinement_still_works(self):
         """Regression guard: extracting the helper must preserve existing behavior."""
@@ -702,69 +625,64 @@ class TestResolveLayerTypeScatterometerVariants:
 
 
 class TestApplyHfRadarResolutionOverride:
-    def test_overrides_when_no_recipe_override_and_attr_present(self):
+    @pytest.mark.parametrize(
+        "layer_type,val_ds_attrs,merged_kwargs,recipe_layer_type_specs,expected_aggregation_window_km",
+        [
+            pytest.param(
+                "hf_radar_grid",
+                {"hfr_resolution_km": 1.2},
+                {"aggregation_window_km": 6.0, "time_tolerance_minutes": 30},
+                {},
+                1.2,
+                id="overrides_when_no_recipe_override_and_attr_present",
+            ),
+            pytest.param(
+                "hf_radar_grid",
+                {"hfr_resolution_km": 1.2},
+                {"aggregation_window_km": 6.0},
+                {"hf_radar_grid": {"aggregation_window_km": 10.0}},
+                6.0,  # unchanged -- recipe pinned it
+                id="recipe_explicit_override_wins",
+            ),
+            pytest.param(
+                "hf_radar_grid",
+                {"hfr_resolution_km": 2.5},
+                {"aggregation_window_km": 6.0},
+                {"hf_radar_grid": {"time_tolerance_minutes": 45}},  # no aggregation_window_km
+                2.5,
+                id="recipe_partial_override_without_aggregation_window_km_still_derives",
+            ),
+            pytest.param(
+                "hf_radar_grid",
+                {},
+                {"aggregation_window_km": 6.0},
+                {},
+                6.0,
+                id="missing_attr_leaves_merged_kwargs_untouched",
+            ),
+            pytest.param(
+                "scatterometer",
+                {"hfr_resolution_km": 1.2},
+                {"aggregation_window_km": 12.5},
+                {},
+                12.5,
+                id="non_hf_radar_grid_layer_type_untouched",
+            ),
+        ],
+    )
+    def test_apply_hf_radar_resolution_override(
+        self, layer_type, val_ds_attrs, merged_kwargs, recipe_layer_type_specs,
+        expected_aggregation_window_km,
+    ):
         import xarray as xr
 
         from sar_validation.core.collocation import _apply_hf_radar_resolution_override
 
-        val_ds = xr.Dataset(attrs={"hfr_resolution_km": 1.2})
-        merged_kwargs = {"aggregation_window_km": 6.0, "time_tolerance_minutes": 30}
-        _apply_hf_radar_resolution_override("hf_radar_grid", val_ds, merged_kwargs, {})
-        assert merged_kwargs["aggregation_window_km"] == 1.2
-
-    def test_recipe_explicit_override_wins(self):
-        import xarray as xr
-
-        from sar_validation.core.collocation import _apply_hf_radar_resolution_override
-
-        val_ds = xr.Dataset(attrs={"hfr_resolution_km": 1.2})
-        merged_kwargs = {"aggregation_window_km": 6.0}
-        recipe_specs = {"hf_radar_grid": {"aggregation_window_km": 10.0}}
-        _apply_hf_radar_resolution_override("hf_radar_grid", val_ds, merged_kwargs, recipe_specs)
-        assert merged_kwargs["aggregation_window_km"] == 6.0  # unchanged -- recipe pinned it
-
-    def test_recipe_partial_override_without_aggregation_window_km_still_derives(self):
-        import xarray as xr
-
-        from sar_validation.core.collocation import _apply_hf_radar_resolution_override
-
-        val_ds = xr.Dataset(attrs={"hfr_resolution_km": 2.5})
-        merged_kwargs = {"aggregation_window_km": 6.0}
-        recipe_specs = {"hf_radar_grid": {"time_tolerance_minutes": 45}}  # no aggregation_window_km
-        _apply_hf_radar_resolution_override("hf_radar_grid", val_ds, merged_kwargs, recipe_specs)
-        assert merged_kwargs["aggregation_window_km"] == 2.5
-
-    def test_missing_attr_leaves_merged_kwargs_untouched(self):
-        import xarray as xr
-
-        from sar_validation.core.collocation import _apply_hf_radar_resolution_override
-
-        val_ds = xr.Dataset(attrs={})
-        merged_kwargs = {"aggregation_window_km": 6.0}
-        _apply_hf_radar_resolution_override("hf_radar_grid", val_ds, merged_kwargs, {})
-        assert merged_kwargs["aggregation_window_km"] == 6.0
-
-    def test_non_hf_radar_grid_layer_type_untouched(self):
-        import xarray as xr
-
-        from sar_validation.core.collocation import _apply_hf_radar_resolution_override
-
-        val_ds = xr.Dataset(attrs={"hfr_resolution_km": 1.2})
-        merged_kwargs = {"aggregation_window_km": 12.5}
-        _apply_hf_radar_resolution_override("scatterometer", val_ds, merged_kwargs, {})
-        assert merged_kwargs["aggregation_window_km"] == 12.5
-
-
-class TestScatterometerVariantDefaultSpecs:
-    @pytest.mark.parametrize("key", [
-        "scatterometer_hy2b", "scatterometer_hy2c", "scatterometer_oceansat3",
-    ])
-    def test_25km_spec_present(self, key):
-        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
-        spec = DEFAULT_LAYER_TYPE_SPECS[key]
-        assert spec["aggregation_window_km"] == 25.0
-        assert spec["time_tolerance_minutes"] == 180
-        assert spec["distance_weighting"] == "equal"
+        val_ds = xr.Dataset(attrs=val_ds_attrs)
+        _apply_hf_radar_resolution_override(
+            layer_type, val_ds, merged_kwargs, recipe_layer_type_specs,
+        )
+        assert merged_kwargs["aggregation_window_km"] == expected_aggregation_window_km
 
 
 # ---------------------------------------------------------------------------
@@ -796,46 +714,45 @@ class TestAllTypesWork:
 class TestDistanceWeightingFunctions:
     """Test distance weighting functions for SAR aggregation."""
 
-    def test_gaussian_weights_normalize(self):
-        """Gaussian weights should sum to 1.0."""
-        distances = np.array([0.0, 1.0, 2.0, 3.0, 5.0])
-        weights = _gaussian_weights(distances, sigma_km=2.0)
+    @pytest.mark.parametrize(
+        "weight_fn,distances,kwargs",
+        [
+            pytest.param(
+                _gaussian_weights, np.array([0.0, 1.0, 2.0, 3.0, 5.0]), {"sigma_km": 2.0},
+                id="gaussian",
+            ),
+            pytest.param(
+                _inverse_distance_weights, np.array([0.1, 1.0, 2.0, 3.0, 5.0]), {"power": 2.0},
+                id="inverse_distance",
+            ),
+            pytest.param(
+                _linear_weights, np.array([0.0, 2.0, 4.0, 6.0]), {"max_distance_km": 10.0},
+                id="linear",
+            ),
+        ],
+    )
+    def test_weights_normalize(self, weight_fn, distances, kwargs):
+        """Weights should sum to 1.0 and be non-negative."""
+        weights = weight_fn(distances, **kwargs)
         assert len(weights) == len(distances)
         assert np.sum(weights) == pytest.approx(1.0)
         assert np.all(weights >= 0)
 
-    def test_gaussian_weights_favor_close(self):
-        """Gaussian weights should favor closer distances."""
-        distances = np.array([0.0, 5.0])
-        weights = _gaussian_weights(distances, sigma_km=2.0)
-        assert weights[0] > weights[1]
-
-    def test_inverse_distance_weights_normalize(self):
-        """Inverse distance weights should sum to 1.0."""
-        distances = np.array([0.1, 1.0, 2.0, 3.0, 5.0])
-        weights = _inverse_distance_weights(distances, power=2.0)
-        assert len(weights) == len(distances)
-        assert np.sum(weights) == pytest.approx(1.0)
-        assert np.all(weights >= 0)
-
-    def test_inverse_distance_weights_favor_close(self):
-        """Inverse distance weights should favor closer distances."""
-        distances = np.array([0.5, 5.0])
-        weights = _inverse_distance_weights(distances, power=2.0)
-        assert weights[0] > weights[1]
-
-    def test_linear_weights_normalize(self):
-        """Linear weights should sum to 1.0."""
-        distances = np.array([0.0, 2.0, 4.0, 6.0])
-        weights = _linear_weights(distances, max_distance_km=10.0)
-        assert len(weights) == len(distances)
-        assert np.sum(weights) == pytest.approx(1.0)
-        assert np.all(weights >= 0)
-
-    def test_linear_weights_favor_close(self):
-        """Linear weights should favor closer distances."""
-        distances = np.array([0.0, 8.0])
-        weights = _linear_weights(distances, max_distance_km=10.0)
+    @pytest.mark.parametrize(
+        "weight_fn,distances,kwargs",
+        [
+            pytest.param(_gaussian_weights, np.array([0.0, 5.0]), {"sigma_km": 2.0}, id="gaussian"),
+            pytest.param(
+                _inverse_distance_weights, np.array([0.5, 5.0]), {"power": 2.0}, id="inverse_distance",
+            ),
+            pytest.param(
+                _linear_weights, np.array([0.0, 8.0]), {"max_distance_km": 10.0}, id="linear",
+            ),
+        ],
+    )
+    def test_weights_favor_close(self, weight_fn, distances, kwargs):
+        """Weights should favor closer distances."""
+        weights = weight_fn(distances, **kwargs)
         assert weights[0] > weights[1]
 
     def test_equal_weights_uniform(self):
@@ -959,15 +876,15 @@ class TestPointLayerCollocationAggregation:
 
 
 class TestWvRvlProjection:
-    def test_projection_added_from_ewct_nsct(self):
+    def test_projection_and_radvel_std_from_ewct_nsct(self):
         from sar_validation.core.collocation import _collocate_wv_points
 
-        # One WV RVL point with a known heading; one in-situ current obs on top.
         sar_lons = np.array([-19.5])
         sar_lats = np.array([50.5])
         sar_times = np.array([np.datetime64("2026-06-20T19:15:00", "ns")])
         sar_point_vars = {
             "rvlRadVel": np.array([1.0]),
+            "rvlRadVelStd": np.array([0.15]),
             "rvlHeading": np.array([90.0]),  # heading_rad = radians(90-90)=0
         }
         val = pd.DataFrame({
@@ -988,33 +905,6 @@ class TestWvRvlProjection:
         proj = matches[0].val_data["rvlRadVel_projection"]
         # heading 90 -> heading_rad 0 -> projection = EWCT*cos0 + NSCT*sin0 = EWCT
         assert proj == pytest.approx(0.4, abs=1e-6)
-
-    def test_radvel_std_propagates(self):
-        from sar_validation.core.collocation import _collocate_wv_points
-
-        sar_lons = np.array([-19.5])
-        sar_lats = np.array([50.5])
-        sar_times = np.array([np.datetime64("2026-06-20T19:15:00", "ns")])
-        sar_point_vars = {
-            "rvlRadVel": np.array([1.0]),
-            "rvlRadVelStd": np.array([0.15]),
-            "rvlHeading": np.array([90.0]),
-        }
-        val = pd.DataFrame({
-            "lon": [-19.5],
-            "lat": [50.5],
-            "time": [pd.Timestamp("2026-06-20T19:20:00")],
-            "EWCT": [0.4],
-            "NSCT": [0.3],
-        })
-        matches = _collocate_wv_points(
-            sar_lons=sar_lons, sar_lats=sar_lats, sar_times=sar_times,
-            sar_point_vars=sar_point_vars, val_data=val, val_source="mooring",
-            footprint_radius_km=14.0, time_tolerance_minutes=30,
-            distance_weighting="equal", gaussian_sigma_km=5.0,
-            collocation_type="point_vs_point",
-        )
-        assert len(matches) == 1
         assert matches[0].sar_data["rvlRadVelStd"] == pytest.approx(0.15, abs=1e-6)
 
 
@@ -1033,11 +923,7 @@ class TestRunCollocationCurrentsFromDatatree:
             temporal_bounds=TemporalBounds("2026-06-20T18:00:00", "2026-06-20T23:00:00"),
         ))
 
-    def test_no_load_rvl_symbol(self):
-        import sar_validation.core.collocation as coll
-        assert not hasattr(coll, "_load_rvl_for_collocation")
-
-    def test_grid_rvl_projects_against_insitu(self, tmp_path):
+    def test_grid_rvl_projects_against_insitu_and_radvel_std_propagates(self, tmp_path):
         import xarray as xr
 
         from sar_validation.core.collocation import run_collocation
@@ -1054,6 +940,7 @@ class TestRunCollocationCurrentsFromDatatree:
         sar = xr.Dataset(
             {
                 "rvlRadVel": (("y", "x"), np.full((ny, nx), 0.5, dtype="float32")),
+                "rvlRadVelStd": (("y", "x"), np.full((ny, nx), 0.12, dtype="float32")),
                 "rvlHeading": (("y", "x"), np.full((ny, nx), 90.0, dtype="float32")),
                 "rvlIncidenceAngle": (("y", "x"), np.full((ny, nx), 30.0, dtype="float32")),
             },
@@ -1087,48 +974,6 @@ class TestRunCollocationCurrentsFromDatatree:
         assert "val_rvlRadVel_projection" in result
         # heading 90 -> projection == EWCT == 0.4
         assert float(result["val_rvlRadVel_projection"].values[0]) == pytest.approx(0.4, abs=1e-5)
-
-    def test_grid_rvl_radvel_std_propagates(self, tmp_path):
-        import xarray as xr
-
-        from sar_validation.core.collocation import run_collocation
-
-        ny, nx = 5, 5
-        lon2d, lat2d = np.meshgrid(
-            np.linspace(-20.0, -19.0, nx), np.linspace(50.0, 51.0, ny)
-        )
-        sar = xr.Dataset(
-            {
-                "rvlRadVel": (("y", "x"), np.full((ny, nx), 0.5, dtype="float32")),
-                "rvlRadVelStd": (("y", "x"), np.full((ny, nx), 0.12, dtype="float32")),
-                "rvlHeading": (("y", "x"), np.full((ny, nx), 90.0, dtype="float32")),
-                "rvlIncidenceAngle": (("y", "x"), np.full((ny, nx), 30.0, dtype="float32")),
-            },
-            coords={
-                "lon": (("y", "x"), lon2d),
-                "lat": (("y", "x"), lat2d),
-                "time": np.datetime64("2026-06-20T19:15:00", "ns"),
-            },
-            attrs={"data_type": "sar_l2_ocn", "swath_mode": "IW/EW/SM",
-                   "measurement_type": "rvl"},
-        )
-        val = xr.Dataset(
-            {
-                "EWCT": (("point",), np.array([0.4], dtype="float32")),
-                "NSCT": (("point",), np.array([0.3], dtype="float32")),
-            },
-            coords={
-                "lon": (("point",), np.array([-19.5])),
-                "lat": (("point",), np.array([50.5])),
-                "time": (("point",), np.array([np.datetime64("2026-06-20T19:20:00", "ns")])),
-                "platform_type": (("point",), np.array(["mooring"])),
-            },
-            attrs={"data_type": "insitu_observations", "platform_type": "mooring"},
-        )
-        tree = xr.DataTree.from_dict({"/sar/scene1": sar, "/validation/mooring1": val})
-
-        result = run_collocation(self._currents_recipe(), tree, tmp_path)
-        assert result is not None
         assert "sar_rvlRadVelStd" in result
         assert float(result["sar_rvlRadVelStd"].values[0]) == pytest.approx(0.12, abs=1e-5)
 

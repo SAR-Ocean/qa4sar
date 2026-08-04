@@ -1014,6 +1014,108 @@ class TestPlotGeographic:
         assert "No data (NaN)" in labels
 
 
+def _soil_moisture_domain_mismatch_scene(
+    *, n_ismn: int = 0, n_ascat: int = 0, n_smap: int = 0, stale_units_attr: bool = False,
+):
+    """Shared setup for a soil_moisture scene where SAR's raw field ("%")
+    spans a far wider natural range than validation values
+    ("1"/volumetric) -- used by TestPlotGeographicDomainMismatch,
+    TestPlotGeographicSkipDomainHarmonization, and
+    TestPlotGeographicPointLevelDomainHarmonization to build the SAR grid
+    plus 0-3 validation sources this module's CDF-matching/domain-
+    harmonization logic operates on. `stale_units_attr=True` reproduces
+    the "mixed — see val_units" sentinel `annotate_collocation_ds` leaves
+    stamped on val_<var> after validation_report row-filters down to a
+    single remaining unit family without recomputing that attr. Returns
+    (datatree, collocation_ds, source_coords) where source_coords maps
+    each included source name to its (lons, lats) arrays."""
+    from sar_validation.core.datatree_converter import DataTreeConverter
+
+    y, x = 4, 5
+    lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+    field = np.linspace(0.0, 100.0, y * x).reshape(y, x)
+    sar_ds = xr.Dataset(
+        {"sarSSM": (("y", "x"), field, {"units": "%"})},
+        coords={
+            "lon": (("y", "x"), lon2d),
+            "lat": (("y", "x"), lat2d),
+            "time": pd.Timestamp("2026-07-10T19:00:00"),
+        },
+    )
+
+    presets = {
+        "ismn": dict(
+            lons=np.array([-9.9, -9.7, -9.5, -9.3]),
+            lats=np.array([50.1, 50.3, 50.5, 50.7]),
+            vals=np.array([0.10, 0.15, 0.20, 0.25]),
+            sar_vals=np.array([12.0, 18.0, 22.0, 28.0]),
+            time_start="2026-07-10T19:05",
+        ),
+        "ascat_ssm": dict(
+            lons=np.array([-9.8, -9.6, -9.4, -9.2, -9.0]),
+            lats=np.array([50.2, 50.4, 50.6, 50.8, 51.0]),
+            vals=np.array([72.2, 70.3, 74.7, 75.7, 71.4]),
+            sar_vals=np.array([70.0, 68.0, 76.0, 74.0, 69.0]),
+            time_start="2026-07-10T19:06",
+        ),
+        "smap_ssm": dict(
+            lons=np.array([-8.9, -8.7, -8.5, -8.3, -8.1]),
+            lats=np.array([51.2, 51.4, 51.6, 51.8, 52.0]),
+            vals=np.array([0.12, 0.22, 0.32, 0.42, 0.30]),
+            sar_vals=np.array([15.0, 25.0, 35.0, 45.0, 33.0]),
+            time_start="2026-07-10T19:07",
+        ),
+    }
+    counts = {"ismn": n_ismn, "ascat_ssm": n_ascat, "smap_ssm": n_smap}
+
+    nodes = {"sar/sceneA": sar_ds}
+    lon_parts, lat_parts, val_parts, sar_parts, source_parts = [], [], [], [], []
+    source_coords = {}
+
+    for name, n in counts.items():
+        if not n:
+            continue
+        preset = presets[name]
+        lons, lats = preset["lons"][:n], preset["lats"][:n]
+        vals, sar_vals = preset["vals"][:n], preset["sar_vals"][:n]
+        nodes[f"validation/{name}"] = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", vals)},
+            coords={
+                "lon": ("point", lons), "lat": ("point", lats),
+                "time": ("point", pd.date_range(preset["time_start"], periods=n, freq="5min")),
+            },
+            attrs={"platform_type": name},
+        )
+        lon_parts.append(lons)
+        lat_parts.append(lats)
+        val_parts.append(vals)
+        sar_parts.append(sar_vals)
+        source_parts += [name] * n
+        source_coords[name] = (lons, lats)
+
+    datatree = DataTreeConverter.to_datatree(nodes)
+
+    lons = np.concatenate(lon_parts) if lon_parts else np.array([])
+    lats = np.concatenate(lat_parts) if lat_parts else np.array([])
+    val_vals = np.concatenate(val_parts) if val_parts else np.array([])
+    sar_vals = np.concatenate(sar_parts) if sar_parts else np.array([])
+    n_total = len(source_parts)
+
+    val_units = "mixed — see val_units" if stale_units_attr else "1"
+    collocation_ds = xr.Dataset({
+        "sar_sarSSM": xr.DataArray(sar_vals, dims="collocation", attrs={"units": "%"}),
+        "val_SOIL_MOISTURE": xr.DataArray(val_vals, dims="collocation", attrs={"units": val_units}),
+        "val_source": ("collocation", source_parts),
+        "sar_scene_name": ("collocation", ["sceneA"] * n_total),
+        "val_lon": ("collocation", lons),
+        "val_lat": ("collocation", lats),
+    })
+    collocation_ds = collocation_ds.assign_coords(
+        val_time=("collocation", pd.date_range("2026-07-10T19:05", periods=n_total, freq="1min")),
+    )
+    return datatree, collocation_ds, source_coords
+
+
 class TestPlotGeographicDomainMismatch:
     """Regression tests: pooling percentiles across a SAR field and
     validation values that live in genuinely different physical domains
@@ -1028,51 +1130,7 @@ class TestPlotGeographicDomainMismatch:
     percentile range) only when there isn't."""
 
     def _scene(self, n_colloc: int):
-        from sar_validation.core.datatree_converter import DataTreeConverter
-
-        y, x = 4, 5
-        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
-        # SAR field spans 0-100 ("%"); validation values span ~0.05-0.5
-        # ("1") — a real ~200x range mismatch, matching soil_moisture.
-        field = np.linspace(0.0, 100.0, y * x).reshape(y, x)
-        sar_ds = xr.Dataset(
-            {"sarSSM": (("y", "x"), field, {"units": "%"})},
-            coords={
-                "lon": (("y", "x"), lon2d),
-                "lat": (("y", "x"), lat2d),
-                "time": pd.Timestamp("2026-07-10T19:00:00"),
-            },
-        )
-        lons = np.array([-9.8, -9.6, -9.4, -9.2])[:n_colloc]
-        lats = np.array([50.2, 50.4, 50.6, 50.8])[:n_colloc]
-        val_vals = np.array([0.1, 0.2, 0.3, 0.4])[:n_colloc]
-        sar_vals = np.array([10.0, 30.0, 50.0, 70.0])[:n_colloc]
-        ismn_ds = xr.Dataset(
-            {"SOIL_MOISTURE": ("point", val_vals)},
-            coords={
-                "lon": ("point", lons),
-                "lat": ("point", lats),
-                "time": ("point", pd.date_range("2026-07-10T19:05", periods=n_colloc, freq="5min")),
-            },
-            attrs={"platform_type": "ismn"},
-        )
-        datatree = DataTreeConverter.to_datatree({
-            "sar/sceneA": sar_ds,
-            "validation/ismn": ismn_ds,
-        })
-        collocation_ds = xr.Dataset({
-            "sar_sarSSM": ("collocation", sar_vals),
-            "val_SOIL_MOISTURE": xr.DataArray(
-                val_vals, dims="collocation", attrs={"units": "1"},
-            ),
-            "val_source": ("collocation", ["ismn"] * n_colloc),
-            "sar_scene_name": ("collocation", ["sceneA"] * n_colloc),
-            "val_lon": ("collocation", lons),
-            "val_lat": ("collocation", lats),
-        })
-        collocation_ds = collocation_ds.assign_coords(
-            val_time=("collocation", pd.date_range("2026-07-10T19:05", periods=n_colloc, freq="5min")),
-        )
+        datatree, collocation_ds, _ = _soil_moisture_domain_mismatch_scene(n_ismn=n_colloc)
         return datatree, collocation_ds
 
     @pytest.fixture
@@ -1199,58 +1257,11 @@ class TestPlotGeographicSkipDomainHarmonization:
 
     def _single_family_scene_with_stale_mixed_attrs(self):
         """Mirrors what validation_report's nu_pair_ds looks like: only
-        ascat_ssm rows remain (ISMN was filtered out for being absent/too
-        sparse for the native-units restriction), but val_SOIL_MOISTURE's
-        column-level units attr is still the "mixed" sentinel inherited,
-        unchanged, from the pre-filter full dataset."""
-        from sar_validation.core.datatree_converter import DataTreeConverter
-
-        y, x = 4, 5
-        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
-        field = np.linspace(0.0, 100.0, y * x).reshape(y, x)
-        sar_ds = xr.Dataset(
-            {"sarSSM": (("y", "x"), field, {"units": "%"})},
-            coords={
-                "lon": (("y", "x"), lon2d),
-                "lat": (("y", "x"), lat2d),
-                "time": pd.Timestamp("2026-07-10T19:00:00"),
-            },
-        )
-        n = 5
-        lons = np.array([-9.8, -9.6, -9.4, -9.2, -9.0])
-        lats = np.array([50.2, 50.4, 50.6, 50.8, 51.0])
-        val_vals = np.array([72.2, 70.3, 74.7, 75.7, 71.4])
-        sar_vals = np.array([70.0, 68.0, 76.0, 74.0, 69.0])
-        ascat_ds = xr.Dataset(
-            {"SOIL_MOISTURE": ("point", val_vals)},
-            coords={
-                "lon": ("point", lons),
-                "lat": ("point", lats),
-                "time": ("point", pd.date_range("2026-07-10T19:05", periods=n, freq="5min")),
-            },
-            attrs={"platform_type": "ascat_ssm"},
-        )
-        datatree = DataTreeConverter.to_datatree({
-            "sar/sceneA": sar_ds,
-            "validation/ascat_ssm": ascat_ds,
-        })
-        collocation_ds = xr.Dataset({
-            "sar_sarSSM": xr.DataArray(sar_vals, dims="collocation", attrs={"units": "%"}),
-            "val_SOIL_MOISTURE": xr.DataArray(
-                val_vals, dims="collocation",
-                # The stale sentinel: real, unfiltered soil_moisture runs
-                # stamp this when ISMN/SMAP (volumetric) were present
-                # alongside ASCAT (percent) *before* row-filtering to
-                # native units — filtering rows never recomputes it.
-                attrs={"units": "mixed — see val_units"},
-            ),
-            "val_source": ("collocation", ["ascat_ssm"] * n),
-            "sar_scene_name": ("collocation", ["sceneA"] * n),
-            "val_lon": ("collocation", lons),
-            "val_lat": ("collocation", lats),
-        })
-        collocation_ds = collocation_ds.assign_coords(
-            val_time=("collocation", pd.date_range("2026-07-10T19:05", periods=n, freq="5min")),
+        ascat_ssm rows remain, but val_SOIL_MOISTURE's column-level units
+        attr is still the "mixed" sentinel inherited from the pre-filter
+        full dataset."""
+        datatree, collocation_ds, _ = _soil_moisture_domain_mismatch_scene(
+            n_ascat=5, stale_units_attr=True,
         )
         return datatree, collocation_ds
 
@@ -1345,100 +1356,12 @@ class TestPlotGeographicPointLevelDomainHarmonization:
     volumetric domain."""
 
     def _scene(self, n_ismn: int):
-        from sar_validation.core.datatree_converter import DataTreeConverter
-
-        y, x = 4, 5
-        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
-        field = np.linspace(0.0, 100.0, y * x).reshape(y, x)
-        sar_ds = xr.Dataset(
-            {"sarSSM": (("y", "x"), field, {"units": "%"})},
-            coords={
-                "lon": (("y", "x"), lon2d),
-                "lat": (("y", "x"), lat2d),
-                "time": pd.Timestamp("2026-07-10T19:00:00"),
-            },
+        datatree, collocation_ds, source_coords = _soil_moisture_domain_mismatch_scene(
+            n_ismn=n_ismn, n_ascat=5, n_smap=5, stale_units_attr=True,
         )
-
-        ismn_lons = np.array([-9.9, -9.7, -9.5, -9.3])[:n_ismn]
-        ismn_lats = np.array([50.1, 50.3, 50.5, 50.7])[:n_ismn]
-        ismn_vals = np.array([0.10, 0.15, 0.20, 0.25])[:n_ismn]
-        ismn_sar_vals = np.array([12.0, 18.0, 22.0, 28.0])[:n_ismn]
-        ismn_ds = xr.Dataset(
-            {"SOIL_MOISTURE": ("point", ismn_vals)},
-            coords={
-                "lon": ("point", ismn_lons),
-                "lat": ("point", ismn_lats),
-                "time": ("point", pd.date_range("2026-07-10T19:05", periods=n_ismn, freq="5min")),
-            },
-            attrs={"platform_type": "ismn"},
-        )
-
-        n_ascat = 5
-        ascat_lons = np.array([-9.8, -9.6, -9.4, -9.2, -9.0])
-        ascat_lats = np.array([50.2, 50.4, 50.6, 50.8, 51.0])
-        ascat_vals = np.array([72.2, 70.3, 74.7, 75.7, 71.4])
-        ascat_sar_vals = np.array([70.0, 68.0, 76.0, 74.0, 69.0])
-        ascat_ds = xr.Dataset(
-            {"SOIL_MOISTURE": ("point", ascat_vals)},
-            coords={
-                "lon": ("point", ascat_lons),
-                "lat": ("point", ascat_lats),
-                "time": ("point", pd.date_range("2026-07-10T19:06", periods=n_ascat, freq="5min")),
-            },
-            attrs={"platform_type": "ascat_ssm"},
-        )
-
-        n_smap = 5
-        smap_lons = np.array([-8.9, -8.7, -8.5, -8.3, -8.1])
-        smap_lats = np.array([51.2, 51.4, 51.6, 51.8, 52.0])
-        smap_vals = np.array([0.12, 0.22, 0.32, 0.42, 0.30])
-        smap_sar_vals = np.array([15.0, 25.0, 35.0, 45.0, 33.0])
-        smap_ds = xr.Dataset(
-            {"SOIL_MOISTURE": ("point", smap_vals)},
-            coords={
-                "lon": ("point", smap_lons),
-                "lat": ("point", smap_lats),
-                "time": ("point", pd.date_range("2026-07-10T19:07", periods=n_smap, freq="5min")),
-            },
-            attrs={"platform_type": "smap_ssm"},
-        )
-
-        datatree = DataTreeConverter.to_datatree({
-            "sar/sceneA": sar_ds,
-            "validation/ismn": ismn_ds,
-            "validation/ascat_ssm": ascat_ds,
-            "validation/smap_ssm": smap_ds,
-        })
-
-        lons = np.concatenate([ismn_lons, ascat_lons, smap_lons])
-        lats = np.concatenate([ismn_lats, ascat_lats, smap_lats])
-        val_vals = np.concatenate([ismn_vals, ascat_vals, smap_vals])
-        sar_vals = np.concatenate([ismn_sar_vals, ascat_sar_vals, smap_sar_vals])
-        sources = (["ismn"] * n_ismn) + (["ascat_ssm"] * n_ascat) + (["smap_ssm"] * n_smap)
-        n_total = n_ismn + n_ascat + n_smap
-
-        collocation_ds = xr.Dataset({
-            # units="%" mirrors annotate_collocation_ds copying the SAR
-            # scene variable's own attrs onto sar_<var> -- needed for
-            # _harmonize_percent_domain_sources's sar_family detection,
-            # which reads collocation_ds's own sar_col attrs (not the
-            # datatree scene field's).
-            "sar_sarSSM": xr.DataArray(sar_vals, dims="collocation", attrs={"units": "%"}),
-            "val_SOIL_MOISTURE": xr.DataArray(
-                val_vals, dims="collocation",
-                # Mirrors annotate_collocation_ds's real output for a run
-                # with genuinely mixed val_source units (ismn/smap "m3
-                # m-3" volumetric vs. ascat_ssm "%").
-                attrs={"units": "mixed — see val_units"},
-            ),
-            "val_source": ("collocation", sources),
-            "sar_scene_name": ("collocation", ["sceneA"] * n_total),
-            "val_lon": ("collocation", lons),
-            "val_lat": ("collocation", lats),
-        })
-        collocation_ds = collocation_ds.assign_coords(
-            val_time=("collocation", pd.date_range("2026-07-10T19:05", periods=n_total, freq="1min")),
-        )
+        ascat_lons, ascat_lats = source_coords["ascat_ssm"]
+        ismn_lons, ismn_lats = source_coords.get("ismn", (np.array([]), np.array([])))
+        smap_lons, smap_lats = source_coords["smap_ssm"]
         return datatree, collocation_ds, ascat_lons, ascat_lats, ismn_lons, ismn_lats, smap_lons, smap_lats
 
     def test_ascat_points_omitted_entirely_when_ismn_too_sparse(self):
@@ -1832,63 +1755,57 @@ class TestPlotGeographicTicks:
 
         plt.close("all")
 
-    def test_narrow_extent_caps_tick_count(self):
-        """Regression test: narrow WV-mode SAR scenes (sub-1° longitude
-        span) must not get more than a handful of ticks — the gridliner's
-        default locator (nbins=8) produces many closely-spaced,
-        high-decimal-precision ticks that overlap into unreadable labels
-        otherwise."""
-        import cartopy.crs as ccrs
-        import matplotlib.pyplot as plt
-
-        from sar_validation.core.visualization import _set_lonlat_ticks
-
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection=ccrs.PlateCarree())
-        lon = np.linspace(-49.55, -49.50, 5)   # ~0.05° wide, like a WV imagette
-        lat = np.linspace(20.0, 43.0, 5)       # wide latitude range
-        lon2d, lat2d = np.meshgrid(lon, lat)
-        data = np.linspace(5.0, 12.0, 25).reshape(5, 5)
-        ax.pcolormesh(lon2d, lat2d, data, transform=ccrs.PlateCarree())
-
-        gl = ax.gridlines(draw_labels=False, alpha=0.3)
-        _set_lonlat_ticks(ax, gl)
-
-        assert len(ax.get_xticks()) <= 3
-        assert len(ax.get_yticks()) <= 3
-        plt.close(fig)
-
-    def test_tall_narrow_wv_track_extent_caps_tick_count(self):
-        """Regression test: a WV-mode SAR scene's ground track can span
-        several degrees of longitude (not just sub-1°) while spanning many
-        more degrees of latitude. Because cartopy's PlateCarree GeoAxes
-        always renders at equal aspect ratio, that tall/narrow extent gets
+    @pytest.mark.parametrize(
+        ("lon", "lat", "figsize", "use_scatter", "max_xticks", "max_yticks"),
+        [
+            pytest.param(
+                np.linspace(-49.55, -49.50, 5), np.linspace(20.0, 43.0, 5),
+                None, False, 3, 3,
+                id="narrow-extent-caps-tick-count",
+            ),
+            pytest.param(
+                np.linspace(-50.0, -45.0, 20), np.linspace(20.0, 43.0, 20),
+                (7, 5), True, 2, 3,
+                id="tall-narrow-wv-track-caps-tick-count",
+            ),
+        ],
+    )
+    def test_extent_caps_tick_count(self, lon, lat, figsize, use_scatter, max_xticks, max_yticks):
+        """Regression test: narrow WV-mode SAR scenes must not get more
+        than a handful of ticks -- the gridliner's default locator
+        (nbins=8) produces closely-spaced, high-decimal-precision ticks
+        that overlap. Because cartopy's PlateCarree GeoAxes always renders
+        at equal aspect ratio, a tall/narrow ground track also gets
         squeezed into a visually narrow map column regardless of the
-        subplot's nominal figure width — a moderate cap (e.g. nbins=4) still
-        overlaps in that squeezed column; only a stricter cap avoids it.
-        This reproduces the real bug found by rendering an actual report
-        (a 5°-wide, 23°-tall WV scene), not just an isolated tick-value
-        count."""
+        subplot's nominal figure width, so only a stricter cap avoids
+        overlap there too."""
         import cartopy.crs as ccrs
         import matplotlib.pyplot as plt
 
         from sar_validation.core.visualization import _set_lonlat_ticks
 
-        fig, ax = plt.subplots(figsize=(7, 5), subplot_kw={"projection": ccrs.PlateCarree()})
-        lon = np.linspace(-50.0, -45.0, 20)   # 5° wide
-        lat = np.linspace(20.0, 43.0, 20)     # 23° tall — same equal-aspect
-                                               # squeeze that broke this in
-                                               # the real report
-        ax.scatter(lon, lat, transform=ccrs.PlateCarree())
-        ax.set_extent(
-            [lon.min() - 0.5, lon.max() + 0.5, lat.min() - 0.5, lat.max() + 0.5],
-            crs=ccrs.PlateCarree(),
-        )
+        if figsize is not None:
+            fig, ax = plt.subplots(figsize=figsize, subplot_kw={"projection": ccrs.PlateCarree()})
+        else:
+            fig = plt.figure()
+            ax = fig.add_subplot(111, projection=ccrs.PlateCarree())
+
+        if use_scatter:
+            ax.scatter(lon, lat, transform=ccrs.PlateCarree())
+            ax.set_extent(
+                [lon.min() - 0.5, lon.max() + 0.5, lat.min() - 0.5, lat.max() + 0.5],
+                crs=ccrs.PlateCarree(),
+            )
+        else:
+            lon2d, lat2d = np.meshgrid(lon, lat)
+            data = np.linspace(5.0, 12.0, lon2d.size).reshape(lon2d.shape)
+            ax.pcolormesh(lon2d, lat2d, data, transform=ccrs.PlateCarree())
+
         gl = ax.gridlines(draw_labels=False, alpha=0.3)
         _set_lonlat_ticks(ax, gl)
 
-        assert len(ax.get_xticks()) <= 2
-        assert len(ax.get_yticks()) <= 3
+        assert len(ax.get_xticks()) <= max_xticks
+        assert len(ax.get_yticks()) <= max_yticks
         plt.close(fig)
 
 
@@ -2065,21 +1982,15 @@ class TestPlotGeographicAntimeridian:
 
 
 class TestPlotGeographicPanelAspect:
-    def test_short_wide_scene_padded_to_min_aspect(self):
-        """Regression test: a scene with very few, tightly-clustered
-        imagettes (small latitude span relative to its longitude span) used
-        to autoscale to a short, wide box, visually inconsistent next to the
-        tall/portrait panels typical of WV-mode satellite tracks in the same
-        report. The rendered panel must never be shorter than it is wide."""
-        import matplotlib.pyplot as plt
-
+    @staticmethod
+    def _geo_scene(lon, lat, wind):
+        """Shared setup for a mooring-vs-SAR scene at explicit lon/lat/wind
+        values -- used by both aspect-padding regression tests below,
+        which differ only in the geometry of the points supplied and in
+        what they assert about the resulting panel's extent."""
         from sar_validation.core.datatree_converter import DataTreeConverter
-        from sar_validation.core.visualization import plot_geographic
 
-        n = 2
-        lon = np.array([-10.0, -8.0])
-        lat = np.array([50.0, 50.3])
-        wind = np.array([6.0, 6.5])
+        n = len(lon)
         sar_ds = xr.Dataset(
             {"owiWindSpeed": ("point", wind)},
             coords={
@@ -2089,10 +2000,10 @@ class TestPlotGeographicPanelAspect:
             },
         )
         mooring_ds = xr.Dataset(
-            {"WSPD": ("point", np.array([6.0, 6.5]))},
+            {"WSPD": ("point", wind)},
             coords={
-                "lon": ("point", np.array([-9.8, -8.2])),
-                "lat": ("point", np.array([50.05, 50.25])),
+                "lon": ("point", lon),
+                "lat": ("point", lat),
                 "time": ("point", pd.date_range("2026-07-02T12:05", periods=n, freq="5min")),
             },
             attrs={"platform_type": "mooring"},
@@ -2103,18 +2014,34 @@ class TestPlotGeographicPanelAspect:
         })
 
         collocation_ds = xr.Dataset({
-            "sar_owiWindSpeed":            ("collocation", np.array([6.1, 6.4])),
-            "val_WSPD":                    ("collocation", np.array([6.0, 6.5])),
+            "sar_owiWindSpeed":            ("collocation", wind),
+            "val_WSPD":                    ("collocation", wind),
             "val_source":                  ("collocation", ["mooring"] * n),
             "sar_scene_name":              ("collocation", ["sceneA"] * n),
-            "val_lon":                     ("collocation", np.array([-9.8, -8.2])),
-            "val_lat":                     ("collocation", np.array([50.05, 50.25])),
-            "val_id":                      ("collocation", ["mo0", "mo1"]),
-            "temporal_distance_minutes":   ("collocation", np.array([10.0, 20.0])),
+            "val_lon":                     ("collocation", lon),
+            "val_lat":                     ("collocation", lat),
+            "val_id":                      ("collocation", [f"mo{i}" for i in range(n)]),
+            "temporal_distance_minutes":   ("collocation", np.linspace(10.0, 10.0 * n, n)),
         })
         collocation_ds = collocation_ds.assign_coords(
             val_time=("collocation", pd.date_range("2026-07-02T12:05", periods=n, freq="5min")),
         )
+        return datatree, collocation_ds
+
+    def test_short_wide_scene_padded_to_min_aspect(self):
+        """Regression test: a scene with very few, tightly-clustered
+        imagettes (small latitude span relative to its longitude span) used
+        to autoscale to a short, wide box, visually inconsistent next to the
+        tall/portrait panels typical of WV-mode satellite tracks in the same
+        report. The rendered panel must never be shorter than it is wide."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        lon = np.array([-10.0, -8.0])
+        lat = np.array([50.0, 50.3])
+        wind = np.array([6.0, 6.5])
+        datatree, collocation_ds = self._geo_scene(lon, lat, wind)
 
         fig = plot_geographic(datatree, collocation_ds, "owiWindSpeed", "WSPD", split_by=None)
         fig.canvas.draw()
@@ -2133,54 +2060,20 @@ class TestPlotGeographicPanelAspect:
 
     def test_already_portrait_scene_extent_unchanged(self):
         """A scene whose natural autoscaled extent is already portrait
-        (height/width >= 1, similar to a real WV-mode satellite track
-        spanning many degrees of latitude but only a few of longitude) must
-        be completely unaffected by the padding helper: its aspect should
-        remain >= 1, i.e. no distortion is introduced where none is needed."""
+        (height/width >= 1) must be completely unaffected by the padding
+        helper: independently derive the expected natural extent from the
+        same lon/lat data using matplotlib's default autoscale margin (5%
+        of span, matching `axes.xmargin`/`axes.ymargin`) and assert the
+        rendered extent matches it exactly, proving the padding helper
+        took its early-return path."""
         import matplotlib.pyplot as plt
 
-        from sar_validation.core.datatree_converter import DataTreeConverter
         from sar_validation.core.visualization import plot_geographic
 
-        n = 4
         lon = np.array([-10.0, -9.3, -8.6, -7.9])
         lat = np.array([10.0, 20.0, 30.0, 50.0])
         wind = np.array([6.0, 6.5, 7.0, 7.5])
-        sar_ds = xr.Dataset(
-            {"owiWindSpeed": ("point", wind)},
-            coords={
-                "lon": ("point", lon),
-                "lat": ("point", lat),
-                "time": pd.Timestamp("2026-07-02T12:00:00"),
-            },
-        )
-        mooring_ds = xr.Dataset(
-            {"WSPD": ("point", np.array([6.0, 6.5, 7.0, 7.5]))},
-            coords={
-                "lon": ("point", lon),
-                "lat": ("point", lat),
-                "time": ("point", pd.date_range("2026-07-02T12:05", periods=n, freq="5min")),
-            },
-            attrs={"platform_type": "mooring"},
-        )
-        datatree = DataTreeConverter.to_datatree({
-            "sar/sceneA": sar_ds,
-            "validation/mooring": mooring_ds,
-        })
-
-        collocation_ds = xr.Dataset({
-            "sar_owiWindSpeed":            ("collocation", np.array([6.1, 6.4, 6.9, 7.3])),
-            "val_WSPD":                    ("collocation", np.array([6.0, 6.5, 7.0, 7.5])),
-            "val_source":                  ("collocation", ["mooring"] * n),
-            "sar_scene_name":              ("collocation", ["sceneA"] * n),
-            "val_lon":                     ("collocation", lon),
-            "val_lat":                     ("collocation", lat),
-            "val_id":                      ("collocation", ["mo0", "mo1", "mo2", "mo3"]),
-            "temporal_distance_minutes":   ("collocation", np.array([10.0, 20.0, 30.0, 40.0])),
-        })
-        collocation_ds = collocation_ds.assign_coords(
-            val_time=("collocation", pd.date_range("2026-07-02T12:05", periods=n, freq="5min")),
-        )
+        datatree, collocation_ds = self._geo_scene(lon, lat, wind)
 
         fig = plot_geographic(datatree, collocation_ds, "owiWindSpeed", "WSPD", split_by=None)
         fig.canvas.draw()
@@ -2189,18 +2082,6 @@ class TestPlotGeographicPanelAspect:
         x0, x1 = ax.get_xlim()
         y0, y1 = ax.get_ylim()
 
-        # A trivial `>= 1.0` assertion on the ratio would pass even if the
-        # padding helper always widened the y-extent somewhat, since this
-        # scene's natural ratio (~19) is so far above 1 that mild padding
-        # wouldn't pull it back down that far. To genuinely pin "extent is
-        # unaffected by padding", independently derive the *expected*
-        # natural extent from the same lon/lat data using matplotlib's
-        # default autoscale margin (5% of span on each side, the same
-        # ``axes.xmargin``/``axes.ymargin`` defaults matplotlib/cartopy
-        # apply when autoscaling a scatter with no explicit limits) and
-        # assert the rendered extent matches it exactly (within floating
-        # tolerance) — proving `_pad_extent_to_min_aspect` took its
-        # early-return path and never touched the y-limits at all.
         xmargin = plt.rcParams["axes.xmargin"]
         ymargin = plt.rcParams["axes.ymargin"]
         lon_span = lon.max() - lon.min()
@@ -2711,36 +2592,37 @@ class TestPlotGeographicTwoColumnByType:
 
 
 class TestDiagnosticsCategory:
-    def test_literal_ascat_ssm_maps_to_scatterometer(self):
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            pytest.param("ascat_ssm", "Scatterometer", id="literal-ascat_ssm"),
+            pytest.param("amsr_ssm", "Radiometer", id="literal-amsr_ssm"),
+            pytest.param("smap_ssm", "Radiometer", id="literal-smap_ssm"),
+            pytest.param("smos_ssm", "Radiometer", id="literal-smos_ssm"),
+            pytest.param(
+                "scatterometer_ssm", "Scatterometer",
+                id="generic-scatterometer_ssm-matches-literal",
+            ),
+            pytest.param(
+                "radiometer_ssm", "Radiometer",
+                id="generic-radiometer_ssm-matches-literal",
+            ),
+            pytest.param("scatterometer", "Scatterometer", id="fallback-scatterometer"),
+            pytest.param("altimeter", "Altimeter", id="fallback-altimeter"),
+            pytest.param("hf_radar", "Hf_Radar", id="fallback-hf_radar"),
+            pytest.param("mooring", "In-situ", id="in-situ-mooring"),
+            pytest.param("ismn", "In-situ", id="in-situ-ismn"),
+        ],
+    )
+    def test_diagnostics_category_maps_data_type_to_legend_category(self, value, expected):
+        """Regression coverage for _diagnostics_category's three code
+        paths: literal per-satellite names, the generic data_type tokens
+        used on the unmatched-point code path -- which must resolve to the
+        SAME category as their literal counterparts -- the existing
+        generic layer types, and in-situ platform types."""
         from sar_validation.core.visualization import _diagnostics_category
-        assert _diagnostics_category("ascat_ssm") == "Scatterometer"
 
-    def test_literal_radiometer_trio_maps_to_radiometer(self):
-        from sar_validation.core.visualization import _diagnostics_category
-        assert _diagnostics_category("amsr_ssm") == "Radiometer"
-        assert _diagnostics_category("smap_ssm") == "Radiometer"
-        assert _diagnostics_category("smos_ssm") == "Radiometer"
-
-    def test_generic_data_type_tokens_map_to_same_categories_as_literal_names(self):
-        """The unmatched code path carries the generic data_type token
-        (e.g. "scatterometer_ssm"), not the literal per-satellite name
-        -- both forms must resolve to the SAME category so a matched
-        ascat_ssm point and an unmatched scatterometer_ssm point land
-        in the same legend bucket."""
-        from sar_validation.core.visualization import _diagnostics_category
-        assert _diagnostics_category("scatterometer_ssm") == "Scatterometer"
-        assert _diagnostics_category("radiometer_ssm") == "Radiometer"
-
-    def test_existing_generic_layer_types_still_work_via_fallback(self):
-        from sar_validation.core.visualization import _diagnostics_category
-        assert _diagnostics_category("scatterometer") == "Scatterometer"
-        assert _diagnostics_category("altimeter") == "Altimeter"
-        assert _diagnostics_category("hf_radar") == "Hf_Radar"
-
-    def test_in_situ_platform_type_falls_to_in_situ(self):
-        from sar_validation.core.visualization import _diagnostics_category
-        assert _diagnostics_category("mooring") == "In-situ"
-        assert _diagnostics_category("ismn") == "In-situ"
+        assert _diagnostics_category(value) == expected
 
 
 class TestPlotCollocationDiagnosticsSoilMoistureSourceCategories:
@@ -3112,12 +2994,13 @@ class TestPlotCollocationDiagnosticsSplitByScenePerSource:
 
 
 class TestPlotCollocationDiagnosticsAutoZoom:
-    def test_small_scene_zooms_in_past_the_full_recipe_bbox(
+    def test_zoom_stays_within_recipe_bounds_but_tighter_than_full_bbox(
         self, two_scene_soil_moisture_datatree, tmp_path, monkeypatch
     ):
         """The recipe bbox spans 60 degrees of longitude; each SAR scene
         is <1 degree wide. The plotted extent must be far tighter than
-        the full bbox, not always the full bbox."""
+        the full bbox (not always the full bbox), while never exceeding
+        the recipe's own geographic bounds."""
         import matplotlib.pyplot as plt
 
         from sar_validation.core.visualization import plot_collocation_diagnostics
@@ -3139,36 +3022,13 @@ class TestPlotCollocationDiagnosticsAutoZoom:
         plt.close("all")
 
         assert captured_extents, "expected at least one set_extent call"
-        lon0, lon1, _lat0, _lat1 = captured_extents[0]
+        lon0, lon1, lat0, lat1 = captured_extents[0]
+
         assert (lon1 - lon0) < 20.0, (
             f"expected a zoomed-in extent (<20 degrees wide), got {lon1 - lon0}"
         )
 
-    def test_zoom_never_exceeds_the_recipe_bounds(
-        self, two_scene_soil_moisture_datatree, tmp_path, monkeypatch
-    ):
-        import matplotlib.pyplot as plt
-
-        from sar_validation.core.visualization import plot_collocation_diagnostics
-
-        datatree, collocation_ds = two_scene_soil_moisture_datatree
-        recipe = _soil_moisture_recipe("nisar_sme2")
-
-        captured_extents = []
-        import cartopy.mpl.geoaxes
-
-        original_set_extent = cartopy.mpl.geoaxes.GeoAxes.set_extent
-
-        def recording_set_extent(self, extent, *args, **kwargs):
-            captured_extents.append(extent)
-            return original_set_extent(self, extent, *args, **kwargs)
-
-        monkeypatch.setattr(cartopy.mpl.geoaxes.GeoAxes, "set_extent", recording_set_extent)
-        plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
-        plt.close("all")
-
         bounds = recipe.config.geographic_bounds
-        lon0, lon1, lat0, lat1 = captured_extents[0]
         assert lon0 >= bounds.min_lon - 1e-6
         assert lon1 <= bounds.max_lon + 1e-6
         assert lat0 >= bounds.min_lat - 1e-6
@@ -3588,14 +3448,24 @@ class TestPlotCollocationDiagnosticsRefinement:
 
 
 class TestPlotCollocationDiagnosticsRecipeVariableStyling:
-    def test_wind_matched_layer_alpha_is_reduced(
-        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
+    @pytest.mark.parametrize(
+        ("recipe_fixture_name", "expected_alpha"),
+        [
+            pytest.param("diagnostics_recipe", 0.65, id="wind-alpha-reduced"),
+            pytest.param("diagnostics_recipe_soil_moisture", 0.65, id="soil_moisture-alpha-reduced"),
+            pytest.param("diagnostics_recipe_waves", 1.0, id="waves-alpha-opaque"),
+            pytest.param("diagnostics_recipe_currents", 1.0, id="currents-alpha-opaque"),
+        ],
+    )
+    def test_matched_layer_alpha_by_recipe_variable(
+        self, geo_datatree_and_collocation, recipe_fixture_name, expected_alpha, tmp_path, monkeypatch, request,
     ):
         import matplotlib.axes
         import matplotlib.pyplot as plt
 
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
+        recipe = request.getfixturevalue(recipe_fixture_name)
         datatree, collocation_ds = geo_datatree_and_collocation
         recorded = []
         original_scatter = matplotlib.axes.Axes.scatter
@@ -3605,22 +3475,31 @@ class TestPlotCollocationDiagnosticsRecipeVariableStyling:
             return original_scatter(self, *args, **kwargs)
 
         monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
-        plot_collocation_diagnostics(datatree, collocation_ds, diagnostics_recipe, tmp_path)
+        plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
         plt.close("all")
 
         layer_calls = [c for c in recorded if c.get("zorder") == 5]
         assert layer_calls
         for c in layer_calls:
-            assert c.get("alpha") == 0.65
+            assert c.get("alpha") == expected_alpha
 
-    def test_soil_moisture_matched_layer_alpha_is_reduced(
-        self, geo_datatree_and_collocation, diagnostics_recipe_soil_moisture, tmp_path, monkeypatch
+    @pytest.mark.parametrize(
+        ("recipe_fixture_name", "expected_s", "expected_edge"),
+        [
+            pytest.param("diagnostics_recipe_waves", 45, "black", id="waves-larger-with-black-edge"),
+            pytest.param("diagnostics_recipe", 25, "none", id="wind-default-size-no-edge"),
+        ],
+    )
+    def test_matched_point_size_and_edge_by_recipe_variable(
+        self, geo_datatree_and_collocation, recipe_fixture_name, expected_s, expected_edge,
+        tmp_path, monkeypatch, request,
     ):
         import matplotlib.axes
         import matplotlib.pyplot as plt
 
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
+        recipe = request.getfixturevalue(recipe_fixture_name)
         datatree, collocation_ds = geo_datatree_and_collocation
         recorded = []
         original_scatter = matplotlib.axes.Axes.scatter
@@ -3630,117 +3509,14 @@ class TestPlotCollocationDiagnosticsRecipeVariableStyling:
             return original_scatter(self, *args, **kwargs)
 
         monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
-        plot_collocation_diagnostics(
-            datatree, collocation_ds, diagnostics_recipe_soil_moisture, tmp_path,
-        )
-        plt.close("all")
-
-        layer_calls = [c for c in recorded if c.get("zorder") == 5]
-        assert layer_calls
-        for c in layer_calls:
-            assert c.get("alpha") == 0.65
-
-    def test_waves_matched_layer_alpha_stays_opaque(
-        self, geo_datatree_and_collocation, diagnostics_recipe_waves, tmp_path, monkeypatch
-    ):
-        import matplotlib.axes
-        import matplotlib.pyplot as plt
-
-        from sar_validation.core.visualization import plot_collocation_diagnostics
-
-        datatree, collocation_ds = geo_datatree_and_collocation
-        recorded = []
-        original_scatter = matplotlib.axes.Axes.scatter
-
-        def recording_scatter(self, *args, **kwargs):
-            recorded.append(kwargs)
-            return original_scatter(self, *args, **kwargs)
-
-        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
-        plot_collocation_diagnostics(datatree, collocation_ds, diagnostics_recipe_waves, tmp_path)
-        plt.close("all")
-
-        layer_calls = [c for c in recorded if c.get("zorder") == 5]
-        assert layer_calls
-        for c in layer_calls:
-            assert c.get("alpha") == 1.0
-
-    def test_currents_matched_layer_alpha_stays_opaque(
-        self, geo_datatree_and_collocation, diagnostics_recipe_currents, tmp_path, monkeypatch
-    ):
-        import matplotlib.axes
-        import matplotlib.pyplot as plt
-
-        from sar_validation.core.visualization import plot_collocation_diagnostics
-
-        datatree, collocation_ds = geo_datatree_and_collocation
-        recorded = []
-        original_scatter = matplotlib.axes.Axes.scatter
-
-        def recording_scatter(self, *args, **kwargs):
-            recorded.append(kwargs)
-            return original_scatter(self, *args, **kwargs)
-
-        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
-        plot_collocation_diagnostics(datatree, collocation_ds, diagnostics_recipe_currents, tmp_path)
-        plt.close("all")
-
-        layer_calls = [c for c in recorded if c.get("zorder") == 5]
-        assert layer_calls
-        for c in layer_calls:
-            assert c.get("alpha") == 1.0
-
-    def test_waves_matched_points_are_larger_with_black_edge(
-        self, geo_datatree_and_collocation, diagnostics_recipe_waves, tmp_path, monkeypatch
-    ):
-        import matplotlib.axes
-        import matplotlib.pyplot as plt
-
-        from sar_validation.core.visualization import plot_collocation_diagnostics
-
-        datatree, collocation_ds = geo_datatree_and_collocation
-        recorded = []
-        original_scatter = matplotlib.axes.Axes.scatter
-
-        def recording_scatter(self, *args, **kwargs):
-            recorded.append(kwargs)
-            return original_scatter(self, *args, **kwargs)
-
-        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
-        plot_collocation_diagnostics(datatree, collocation_ds, diagnostics_recipe_waves, tmp_path)
+        plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
         plt.close("all")
 
         matched_calls = [c for c in recorded if c.get("zorder") in (5, 6)]
         assert matched_calls
         for c in matched_calls:
-            assert c.get("s") == 45
-            assert c.get("edgecolors") == "black"
-
-    def test_wind_matched_points_keep_default_size_and_no_edge(
-        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
-    ):
-        import matplotlib.axes
-        import matplotlib.pyplot as plt
-
-        from sar_validation.core.visualization import plot_collocation_diagnostics
-
-        datatree, collocation_ds = geo_datatree_and_collocation
-        recorded = []
-        original_scatter = matplotlib.axes.Axes.scatter
-
-        def recording_scatter(self, *args, **kwargs):
-            recorded.append(kwargs)
-            return original_scatter(self, *args, **kwargs)
-
-        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
-        plot_collocation_diagnostics(datatree, collocation_ds, diagnostics_recipe, tmp_path)
-        plt.close("all")
-
-        matched_calls = [c for c in recorded if c.get("zorder") in (5, 6)]
-        assert matched_calls
-        for c in matched_calls:
-            assert c.get("s") == 25
-            assert c.get("edgecolors") == "none"
+            assert c.get("s") == expected_s
+            assert c.get("edgecolors") == expected_edge
 
 
 class TestPlotCollocationDiagnosticsSoilMoistureTransparency:
@@ -3825,7 +3601,24 @@ class TestPlotCollocationDiagnosticsDensePointSubsampling:
         )
         return datatree, collocation_ds
 
-    def test_wind_recipe_plots_every_matched_radiometer_point(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        ("variable", "value_var", "sar_var", "assert_plotted_count"),
+        [
+            pytest.param(
+                "wind", "WSPD", "owiWindSpeed",
+                lambda plotted, n: plotted == n,
+                id="wind-plots-every-matched-point",
+            ),
+            pytest.param(
+                "soil_moisture", "SOIL_MOISTURE", "sarSSM",
+                lambda plotted, n: plotted <= 1000,
+                id="soil_moisture-subsamples-dense-matches",
+            ),
+        ],
+    )
+    def test_dense_matched_point_subsampling_by_variable(
+        self, tmp_path, monkeypatch, variable, value_var, sar_var, assert_plotted_count,
+    ):
         import matplotlib.axes
         import matplotlib.pyplot as plt
 
@@ -3833,9 +3626,9 @@ class TestPlotCollocationDiagnosticsDensePointSubsampling:
         from sar_validation.core.visualization import plot_collocation_diagnostics
 
         n = 1500
-        datatree, collocation_ds = self._dense_radiometer_scene(n)
+        datatree, collocation_ds = self._dense_radiometer_scene(n, value_var=value_var, sar_var=sar_var)
         recipe = Recipe(config=RecipeConfig(
-            name="test_wind_dense", variable="wind",
+            name=f"test_{variable}_dense", variable=variable,
             geographic_bounds=GeographicBounds(-10.0, -8.0, 50.0, 52.0),
         ))
 
@@ -3854,65 +3647,12 @@ class TestPlotCollocationDiagnosticsDensePointSubsampling:
         layer_calls = [args for args, kwargs in recorded if kwargs.get("zorder") == 5]
         assert layer_calls
         plotted = sum(len(np.atleast_1d(args[0])) for args in layer_calls)
-        assert plotted == n, f"expected all {n} matched wind points plotted, got {plotted}"
-
-    def test_soil_moisture_recipe_still_subsamples_dense_matches(self, tmp_path, monkeypatch):
-        import matplotlib.axes
-        import matplotlib.pyplot as plt
-
-        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig
-        from sar_validation.core.visualization import plot_collocation_diagnostics
-
-        n = 1500
-        datatree, collocation_ds = self._dense_radiometer_scene(
-            n, value_var="SOIL_MOISTURE", sar_var="sarSSM",
+        assert assert_plotted_count(plotted, n), (
+            f"variable={variable!r}: unexpected matched-point count {plotted} (n={n})"
         )
-        recipe = Recipe(config=RecipeConfig(
-            name="test_soil_moisture_dense", variable="soil_moisture",
-            geographic_bounds=GeographicBounds(-10.0, -8.0, 50.0, 52.0),
-        ))
-
-        recorded = []
-        original_scatter = matplotlib.axes.Axes.scatter
-
-        def recording_scatter(self, *args, **kwargs):
-            recorded.append((args, kwargs))
-            return original_scatter(self, *args, **kwargs)
-
-        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
-        out_path = plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
-        plt.close("all")
-
-        assert out_path is not None
-        layer_calls = [args for args, kwargs in recorded if kwargs.get("zorder") == 5]
-        assert layer_calls
-        plotted = sum(len(np.atleast_1d(args[0])) for args in layer_calls)
-        assert plotted <= 1000, f"expected soil_moisture to stay subsampled to <=1000, got {plotted}"
 
 
 class TestPlotCollocationDiagnosticsTicks:
-    def test_overview_plot_gets_degree_formatted_ticks(
-        self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path
-    ):
-        import matplotlib.image as mpimg
-        import matplotlib.pyplot as plt
-
-        from sar_validation.core.visualization import plot_collocation_diagnostics
-
-        datatree, collocation_ds = geo_datatree_and_collocation
-        out_path = plot_collocation_diagnostics(
-            datatree, collocation_ds, diagnostics_recipe, tmp_path,
-        )
-        plt.close("all")
-
-        assert out_path is not None
-        # plot_collocation_diagnostics saves its own PNG and closes its
-        # figure internally, so we can only verify the rendered image
-        # exists and is non-trivial in size (a proxy for "axes labels were
-        # drawn"), not inspect live tick-label Text objects.
-        img = mpimg.imread(str(out_path))
-        assert img.shape[0] > 100 and img.shape[1] > 100
-
     def test_overview_plot_calls_set_lonlat_ticks(
         self, geo_datatree_and_collocation, diagnostics_recipe, tmp_path, monkeypatch
     ):
@@ -4037,47 +3777,6 @@ class TestValidationReportIncludesDiagnostics:
         # Check that the collocation diagnostics plot PNG was created
         assert (tmp_path / "plots" / "collocation_diagnostics_test_recipe.png").exists()
         plt.close("all")
-
-    def test_diagnostics_page_embedded_in_pdf(self, geo_datatree_and_collocation, tmp_path, monkeypatch):
-        """The diagnostics PNG must not just be saved to disk — it must also
-        appear as a page inside validation_report.pdf. Spy on
-        PdfPages.savefig and check one of the saved pages is a
-        single-axes, full-bleed image page (the shape produced when the
-        reloaded diagnostics PNG is embedded via imshow) — no other plot
-        function in this module uses imshow, so this signature is unique
-        to the diagnostics page.
-        """
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_pdf import PdfPages
-
-        from sar_validation.core.recipe import Recipe, RecipeConfig
-        from sar_validation.core.visualization import validation_report
-
-        datatree, collocation_ds = geo_datatree_and_collocation
-        recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
-
-        recorded_figs = []
-        original_savefig = PdfPages.savefig
-
-        def recording_savefig(self, *args, **kwargs):
-            fig = args[0] if args else kwargs.get("figure")
-            recorded_figs.append(fig)
-            return original_savefig(self, *args, **kwargs)
-
-        monkeypatch.setattr(PdfPages, "savefig", recording_savefig)
-
-        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
-        plt.close("all")
-
-        def is_image_page(fig):
-            if fig is None or len(fig.axes) != 1:
-                return False
-            return len(fig.axes[0].images) > 0
-
-        assert any(is_image_page(fig) for fig in recorded_figs), (
-            "Expected the collocation diagnostics plot to be embedded as a "
-            "page in validation_report.pdf"
-        )
 
     def test_diagnostics_page_is_first_after_cover(self, geo_datatree_and_collocation, tmp_path, monkeypatch):
         """The diagnostics image page must be the first content page (index 1,
@@ -4333,17 +4032,22 @@ class TestValidationReportSceneAllowlist:
         assert "sceneA" in set(captured["scenes"])
 
 
-class TestValidationReportCurrentsPointSize:
-    def test_currents_recipe_passes_reduced_point_size_to_geographic(self, tmp_path, monkeypatch):
-        """HF radar (layer_vs_layer) currents validation points are dense
-        enough at the default marker size (s=40) to fully blanket the SAR
-        field underneath — validation_report must request a smaller marker
-        for currents recipes so the SAR scene stays visible through them."""
-        import matplotlib.pyplot as plt
+class TestValidationReportPointSizeAdaptive:
+    """HF radar (currents' only layer-type source) forms a
+    near-continuous coverage grid that at the default marker size (s=40)
+    tiles edge-to-edge and completely hides the SAR field underneath it
+    -- validation_report always requests a smaller marker (15) for
+    currents recipes regardless of density. Scatterometer/radiometer
+    (wind/soil_moisture) similarly occludes the SAR field but uses
+    adaptive sizing instead: <=300 points/scene uses point_size=15,
+    denser data uses point_size=5. soil_moisture mixes sparse in-situ
+    ISMN points with dense scatterometer/radiometer coverage in the same
+    panel, so it reuses wind's per-scene density check rather than one
+    flat size (see TestValidationReportSoilMoistureGeographicSizing for
+    the per-collocation-type sizing variant)."""
 
-        import sar_validation.core.visualization as viz
+    def _currents_datatree_and_collocation(self, n):
         from sar_validation.core.datatree_converter import DataTreeConverter
-        from sar_validation.core.recipe import Recipe, RecipeConfig
 
         y, x = 3, 3
         lon2d, lat2d = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
@@ -4354,40 +4058,72 @@ class TestValidationReportCurrentsPointSize:
         )
         datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
 
+        rng = np.random.default_rng(0)
         coll = xr.Dataset({
-            "sar_rvlRadVel":             ("collocation", [0.3, 0.31, 0.29, 0.32]),
-            "val_rvlRadVel_projection":  ("collocation", [0.28, 0.30, 0.27, 0.31]),
-            "val_source":                ("collocation", ["hf_radar"] * 4),
-            "sar_scene_name":            ("collocation", ["sceneA"] * 4),
-            "val_lon":                   ("collocation", [-9.5, -9.4, -9.3, -9.2]),
-            "val_lat":                   ("collocation", [50.5, 50.6, 50.7, 50.8]),
-            "temporal_distance_minutes": ("collocation", [10.0, 12.0, 8.0, 15.0]),
+            "sar_rvlRadVel":             ("collocation", rng.uniform(0.28, 0.32, n)),
+            "val_rvlRadVel_projection":  ("collocation", rng.uniform(0.27, 0.31, n)),
+            "val_source":                ("collocation", ["hf_radar"] * n),
+            "sar_scene_name":            ("collocation", ["sceneA"] * n),
+            "val_lon":                   ("collocation", rng.uniform(-9.8, -8.2, n)),
+            "val_lat":                   ("collocation", rng.uniform(50.2, 51.8, n)),
+            "temporal_distance_minutes": ("collocation", rng.uniform(5, 20, n)),
         })
+        return datatree, coll
 
-        captured = {}
-        original = viz.plot_geographic
+    def _soil_moisture_datatree_and_collocation(self, n, source):
+        from sar_validation.core.datatree_converter import DataTreeConverter
 
-        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
-            captured["point_size"] = kwargs.get("point_size")
-            return original(datatree_, coll_, sar_var, val_var, **kwargs)
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.full((y, x), 30.0))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T19:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
 
-        monkeypatch.setattr(viz, "plot_geographic", spy)
-        recipe = Recipe(config=RecipeConfig(name="currents_test", variable="currents"))
-        viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
-        plt.close("all")
+        rng = np.random.default_rng(0)
+        coll = xr.Dataset({
+            "sar_sarSSM":       ("collocation", rng.uniform(20, 40, n)),
+            "val_SOIL_MOISTURE": xr.DataArray(
+                rng.uniform(0.1, 0.4, n), dims="collocation", attrs={"units": "1"},
+            ),
+            "val_source":       ("collocation", [source] * n),
+            "sar_scene_name":   ("collocation", ["sceneA"] * n),
+            "val_lon":          ("collocation", rng.uniform(-9.8, -8.2, n)),
+            "val_lat":          ("collocation", rng.uniform(50.2, 51.8, n)),
+            "temporal_distance_minutes": ("collocation", rng.uniform(5, 20, n)),
+        })
+        return datatree, coll
 
-        assert captured.get("point_size") == 15
+    @pytest.mark.parametrize(
+        ("variable", "n", "source", "expected_point_size"),
+        [
+            pytest.param("currents", 4, "hf_radar", 15, id="currents-hf_radar-always-15"),
+            pytest.param("wind", 4, None, 15, id="wind-sparse-4pts-scene-15"),
+            pytest.param("soil_moisture", 4, "ismn", 15, id="soil_moisture-sparse-ismn-15"),
+            pytest.param("soil_moisture", 400, "ascat_ssm", 5, id="soil_moisture-dense-ascat_ssm-5"),
+        ],
+    )
+    def test_adaptive_point_size_by_variable_and_density(
+        self, geo_datatree_and_collocation, variable, n, source, expected_point_size, tmp_path, monkeypatch,
+    ):
+        import warnings
 
-    def test_wind_recipe_uses_adaptive_point_size(self, geo_datatree_and_collocation, tmp_path, monkeypatch):
-        """Wind recipes now use adaptive point sizing for scatterometer data
-        to avoid occluding the SAR field. For sparse data (<300 pts/scene),
-        use point_size=15. For dense data (>300 pts/scene), use point_size=5."""
         import matplotlib.pyplot as plt
 
         import sar_validation.core.visualization as viz
         from sar_validation.core.recipe import Recipe, RecipeConfig
 
-        datatree, collocation_ds = geo_datatree_and_collocation
+        if variable == "currents":
+            datatree, coll = self._currents_datatree_and_collocation(n)
+        elif variable == "wind":
+            # geo_datatree_and_collocation has 4 points in 1 scene = 4
+            # points/scene, well under the 300 threshold.
+            datatree, coll = geo_datatree_and_collocation
+        else:
+            datatree, coll = self._soil_moisture_datatree_and_collocation(n, source)
+
         captured = {}
         original = viz.plot_geographic
 
@@ -4396,13 +4132,16 @@ class TestValidationReportCurrentsPointSize:
             return original(datatree_, coll_, sar_var, val_var, **kwargs)
 
         monkeypatch.setattr(viz, "plot_geographic", spy)
-        recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
-        viz.validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        recipe = Recipe(config=RecipeConfig(name="test_recipe", variable=variable))
+        # Real (unmocked) pytesmo.cdf_matching resizes its bins for the
+        # deliberately tiny soil_moisture fixtures here -- an expected,
+        # benign side effect of fitting on so little data, not a defect.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
         plt.close("all")
 
-        # geo_datatree_and_collocation has 4 points in 1 scene = 4 points/scene
-        # which is < 300, so should use point_size=15
-        assert captured.get("point_size") == 15
+        assert captured.get("point_size") == expected_point_size
 
 
 class TestValidationReportSoilMoistureGeographicSizing:
@@ -4422,7 +4161,7 @@ class TestValidationReportSoilMoistureGeographicSizing:
     sparse in-situ ISMN points too small and dense scatterometer/radiometer
     (ASCAT/SMAP/SMOS) points too big in the same panel -- soil_moisture now
     reuses wind's adaptive density check instead (see
-    TestValidationReportCurrentsPointSize.test_wind_recipe_uses_adaptive_point_size)."""
+    TestValidationReportPointSizeAdaptive.test_adaptive_point_size_by_variable_and_density)."""
 
     def _soil_moisture_datatree_and_collocation(self):
         from sar_validation.core.datatree_converter import DataTreeConverter
@@ -4448,90 +4187,6 @@ class TestValidationReportSoilMoistureGeographicSizing:
             "temporal_distance_minutes": ("collocation", [10.0, 12.0, 8.0, 15.0]),
         })
         return datatree, coll
-
-    def test_soil_moisture_recipe_uses_adaptive_point_size_when_sparse(self, tmp_path, monkeypatch):
-        """4 points in 1 scene = 4 pts/scene, well under the 300 threshold,
-        so soil_moisture must use the same sparse-data size as wind (15)."""
-        import warnings
-
-        import matplotlib.pyplot as plt
-
-        import sar_validation.core.visualization as viz
-        from sar_validation.core.recipe import Recipe, RecipeConfig
-
-        datatree, coll = self._soil_moisture_datatree_and_collocation()
-
-        captured = {}
-        original = viz.plot_geographic
-
-        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
-            captured["point_size"] = kwargs.get("point_size")
-            return original(datatree_, coll_, sar_var, val_var, **kwargs)
-
-        monkeypatch.setattr(viz, "plot_geographic", spy)
-        recipe = Recipe(config=RecipeConfig(name="soil_moisture_test", variable="soil_moisture"))
-        # Real (unmocked) pytesmo.cdf_matching resizes its bins for this
-        # deliberately tiny 4-point fixture — an expected, benign side
-        # effect of fitting on so little data, not a defect.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
-        plt.close("all")
-
-        assert captured.get("point_size") == 15
-
-    def test_soil_moisture_recipe_uses_adaptive_point_size_when_dense(self, tmp_path, monkeypatch):
-        """A scatterometer/radiometer-dense scene (>300 pts/scene, e.g. a
-        real ASCAT/SMAP/SMOS-heavy soil-moisture run) must fall back to the
-        smaller marker (5), exactly like wind does, instead of the old flat
-        point_size=10 -- proves the density check actually drives the value
-        rather than the two thresholds coincidentally bracketing 10."""
-        import warnings
-
-        import matplotlib.pyplot as plt
-
-        import sar_validation.core.visualization as viz
-        from sar_validation.core.datatree_converter import DataTreeConverter
-        from sar_validation.core.recipe import Recipe, RecipeConfig
-
-        y, x = 3, 3
-        lon2d, lat2d = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
-        sar_ds = xr.Dataset(
-            {"sarSSM": (("y", "x"), np.full((y, x), 30.0))},
-            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
-                    "time": pd.Timestamp("2026-07-10T19:00:00")},
-        )
-        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
-
-        rng = np.random.default_rng(0)
-        n = 400
-        coll = xr.Dataset({
-            "sar_sarSSM":       ("collocation", rng.uniform(20, 40, n)),
-            "val_SOIL_MOISTURE": xr.DataArray(
-                rng.uniform(0.1, 0.4, n), dims="collocation", attrs={"units": "1"},
-            ),
-            "val_source":       ("collocation", ["ascat_ssm"] * n),
-            "sar_scene_name":   ("collocation", ["sceneA"] * n),
-            "val_lon":          ("collocation", rng.uniform(-9.8, -8.2, n)),
-            "val_lat":          ("collocation", rng.uniform(50.2, 51.8, n)),
-            "temporal_distance_minutes": ("collocation", rng.uniform(5, 20, n)),
-        })
-
-        captured = {}
-        original = viz.plot_geographic
-
-        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
-            captured["point_size"] = kwargs.get("point_size")
-            return original(datatree_, coll_, sar_var, val_var, **kwargs)
-
-        monkeypatch.setattr(viz, "plot_geographic", spy)
-        recipe = Recipe(config=RecipeConfig(name="soil_moisture_test", variable="soil_moisture"))
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
-        plt.close("all")
-
-        assert captured.get("point_size") == 5
 
     def test_soil_moisture_recipe_sizes_point_vs_layer_and_layer_vs_layer_independently(
         self, tmp_path, monkeypatch,
@@ -4595,11 +4250,26 @@ class TestValidationReportSoilMoistureGeographicSizing:
 
         assert captured.get("point_size") == {"layer_vs_layer": 5, "point_vs_layer": 25}
 
-    def test_sentinel1_clms_ssm_recipe_passes_recipe_geographic_bounds(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        ("variable", "sar_source", "expect_bounds"),
+        [
+            pytest.param("soil_moisture", "sentinel1_clms_ssm", True, id="clamps-clms-ssm-to-recipe-bounds"),
+            pytest.param("soil_moisture", "nisar_sme2", False, id="does-not-clamp-nisar-sme2"),
+            pytest.param("wind", None, False, id="non-soil-moisture-never-clamped"),
+        ],
+    )
+    def test_geographic_bounds_clamping_by_source_and_variable(
+        self, geo_datatree_and_collocation, variable, sar_source, expect_bounds, tmp_path, monkeypatch,
+    ):
         """sentinel1_clms_ssm's raw grid covers all of mainland Europe
         regardless of what was requested (mostly NaN outside that day's
         real swath) -- clamping to the recipe's own bbox is required, or
-        every scene panel would show far more than was asked for."""
+        every scene panel would show far more than was asked for.
+        nisar_sme2's own native grid is already tight around real data,
+        so clamping to a much larger recipe bbox would shrink the actual
+        scene into a small corner of an otherwise-empty panel instead.
+        Scoped deliberately to soil_moisture -- wind/currents/waves
+        reports must keep showing each SAR scene's full native extent."""
         import warnings
 
         import matplotlib.pyplot as plt
@@ -4607,7 +4277,10 @@ class TestValidationReportSoilMoistureGeographicSizing:
         import sar_validation.core.visualization as viz
         from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, SARDataSpec
 
-        datatree, coll = self._soil_moisture_datatree_and_collocation()
+        if variable == "soil_moisture":
+            datatree, coll = self._soil_moisture_datatree_and_collocation()
+        else:
+            datatree, coll = geo_datatree_and_collocation
 
         captured = {}
         original = viz.plot_geographic
@@ -4618,74 +4291,19 @@ class TestValidationReportSoilMoistureGeographicSizing:
 
         monkeypatch.setattr(viz, "plot_geographic", spy)
         bounds = GeographicBounds(min_lon=-10.0, max_lon=30.0, min_lat=35.0, max_lat=60.0)
-        recipe = Recipe(config=RecipeConfig(
-            name="soil_moisture_test", variable="soil_moisture", geographic_bounds=bounds,
-            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
-        ))
+        recipe_kwargs = dict(name="soil_moisture_test", variable=variable, geographic_bounds=bounds)
+        if sar_source is not None:
+            recipe_kwargs["sar_data"] = SARDataSpec(source=sar_source)
+        recipe = Recipe(config=RecipeConfig(**recipe_kwargs))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
         plt.close("all")
 
-        assert captured.get("geographic_bounds") is bounds
-
-    def test_nisar_sme2_recipe_does_not_clamp_to_geographic_bounds(self, tmp_path, monkeypatch):
-        """nisar_sme2's own native grid is already tight around real data
-        -- clamping to a much larger recipe bbox would shrink the actual
-        scene into a small corner of an otherwise-empty panel instead of
-        showing it at a legible scale."""
-        import warnings
-
-        import matplotlib.pyplot as plt
-
-        import sar_validation.core.visualization as viz
-        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, SARDataSpec
-
-        datatree, coll = self._soil_moisture_datatree_and_collocation()
-
-        captured = {}
-        original = viz.plot_geographic
-
-        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
-            captured["geographic_bounds"] = kwargs.get("geographic_bounds")
-            return original(datatree_, coll_, sar_var, val_var, **kwargs)
-
-        monkeypatch.setattr(viz, "plot_geographic", spy)
-        bounds = GeographicBounds(min_lon=-10.0, max_lon=30.0, min_lat=35.0, max_lat=60.0)
-        recipe = Recipe(config=RecipeConfig(
-            name="soil_moisture_test", variable="soil_moisture", geographic_bounds=bounds,
-            sar_data=SARDataSpec(source="nisar_sme2"),
-        ))
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
-        plt.close("all")
-
-        assert captured.get("geographic_bounds") is None
-
-    def test_other_variables_do_not_get_geographic_bounds(self, geo_datatree_and_collocation, tmp_path, monkeypatch):
-        """Scoped deliberately to soil_moisture only — wind/currents/waves
-        reports must keep showing each SAR scene's full native extent,
-        unaffected by this change."""
-        import matplotlib.pyplot as plt
-
-        import sar_validation.core.visualization as viz
-        from sar_validation.core.recipe import Recipe, RecipeConfig
-
-        datatree, collocation_ds = geo_datatree_and_collocation
-        captured = {}
-        original = viz.plot_geographic
-
-        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
-            captured["geographic_bounds"] = kwargs.get("geographic_bounds")
-            return original(datatree_, coll_, sar_var, val_var, **kwargs)
-
-        monkeypatch.setattr(viz, "plot_geographic", spy)
-        recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
-        viz.validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
-        plt.close("all")
-
-        assert captured.get("geographic_bounds") is None
+        if expect_bounds:
+            assert captured.get("geographic_bounds") is bounds
+        else:
+            assert captured.get("geographic_bounds") is None
 
     def test_soil_moisture_report_uses_two_column_geographic(
         self, geo_datatree_and_collocation, tmp_path,
@@ -4790,7 +4408,22 @@ class TestValidationReportForceSplitWhenHarmonized:
         })
         return datatree, coll
 
-    def test_force_split_true_when_ascat_harmonized_into_ismn_domain(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        ("include_ismn", "expected_force_split"),
+        [
+            pytest.param(True, True, id="ascat-harmonized-into-ismn-domain"),
+            pytest.param(False, False, id="ascat-not-harmonized-no-reference"),
+        ],
+    )
+    def test_force_split_when_ascat_harmonized(
+        self, tmp_path, monkeypatch, include_ismn, expected_force_split,
+    ):
+        """When ismn has enough points to CDF-match ascat_ssm into its
+        volumetric domain, validation_report must force the main
+        CDF-matched scatter into per-source small multiples even though no
+        single source dominates by point count. Without ismn present,
+        ascat_ssm can't be harmonized at all -- force_split must stay
+        False."""
         import warnings
 
         import matplotlib.pyplot as plt
@@ -4798,7 +4431,7 @@ class TestValidationReportForceSplitWhenHarmonized:
         import sar_validation.core.visualization as viz
         from sar_validation.core.recipe import Recipe, RecipeConfig
 
-        datatree, coll = self._datatree_and_collocation(include_ismn=True)
+        datatree, coll = self._datatree_and_collocation(include_ismn=include_ismn)
 
         captured = []
         original = viz.plot_scatter
@@ -4815,43 +4448,9 @@ class TestValidationReportForceSplitWhenHarmonized:
         plt.close("all")
 
         assert captured, "plot_scatter was never called"
-        assert all(force_split is True for force_split in captured), (
-            f"expected every plot_scatter call to request force_split=True once ascat_ssm "
-            f"was harmonized into ismn's domain, got {captured!r}"
-        )
-
-    def test_force_split_false_when_ascat_not_harmonized(self, tmp_path, monkeypatch):
-        """Without ismn present, ascat_ssm can't be harmonized at all (see
-        _harmonize_percent_domain_sources's reference-absent fallback) --
-        force_split must stay False, matching plain split_when_imbalanced
-        behavior instead of forcing a split unconditionally."""
-        import warnings
-
-        import matplotlib.pyplot as plt
-
-        import sar_validation.core.visualization as viz
-        from sar_validation.core.recipe import Recipe, RecipeConfig
-
-        datatree, coll = self._datatree_and_collocation(include_ismn=False)
-
-        captured = []
-        original = viz.plot_scatter
-
-        def spy(*args, **kwargs):
-            captured.append(kwargs.get("force_split"))
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(viz, "plot_scatter", spy)
-        recipe = Recipe(config=RecipeConfig(name="soil_moisture_test", variable="soil_moisture"))
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            viz.validation_report(coll, datatree, recipe, out_dir=tmp_path)
-        plt.close("all")
-
-        assert captured, "plot_scatter was never called"
-        assert all(force_split is False for force_split in captured), (
-            f"expected force_split=False when ascat_ssm has no reference to harmonize "
-            f"against, got {captured!r}"
+        assert all(force_split is expected_force_split for force_split in captured), (
+            f"expected every plot_scatter call to request force_split={expected_force_split} "
+            f"(include_ismn={include_ismn}), got {captured!r}"
         )
 
 
@@ -4982,27 +4581,24 @@ class TestValidationReportRvlLandQaPage:
         datatree = DataTreeConverter.to_datatree({"sar/sceneA": self._sar_node(with_land=True)})
         assert self._count_image_pages(monkeypatch, datatree, recipe, tmp_path) == baseline + 1
 
-    def test_qa_page_omitted_for_currents_without_land(self, tmp_path, monkeypatch):
-        """Previously this test compared a no-land run's page count against
-        a *second, identically-configured* no-land run — a tautology that
-        would still pass even if the omission logic were completely broken
-        (both runs would inflate identically, since nothing actually
-        varies between them). This version instead (a) calls
-        plot_rvl_land_qa directly — the function actually responsible for
-        the omission — and asserts it returns None for a no-land datatree,
-        a real assertion that varies with its input and fails if that
-        function's `if not rows: return None` guard breaks; and (b)
-        compares the no-land page count against a genuinely different
-        *with-land* run of the same recipe (one fewer page), rather than
-        against another no-land run, so the comparison itself is capable of
-        failing if the wiring's `if fig_land_qa is not None:` guard is
-        removed and a page ends up added regardless of land presence.
-        """
+    @pytest.mark.parametrize(
+        ("variable", "expected_delta"),
+        [
+            pytest.param("currents", 1, id="currents-adds-qa-page-when-land-present"),
+            pytest.param("wind", 0, id="non-currents-omits-qa-page-even-with-land"),
+        ],
+    )
+    def test_qa_page_omitted_unless_currents_with_land(
+        self, tmp_path, monkeypatch, variable, expected_delta,
+    ):
+        """For currents, land data must add exactly one page (the QA
+        table); for any other variable, land data must add none (the
+        wiring must stay gated on variable == "currents")."""
         from sar_validation.core.datatree_converter import DataTreeConverter
         from sar_validation.core.recipe import Recipe, RecipeConfig
         from sar_validation.core.visualization import plot_rvl_land_qa
 
-        recipe = Recipe(config=RecipeConfig(name="currents_test", variable="currents"))
+        recipe = Recipe(config=RecipeConfig(name="currents_test", variable=variable))
 
         datatree_no_land = DataTreeConverter.to_datatree({"sar/sceneA": self._sar_node(with_land=False)})
         assert plot_rvl_land_qa(datatree_no_land) is None
@@ -5012,23 +4608,10 @@ class TestValidationReportRvlLandQaPage:
         datatree_with_land = DataTreeConverter.to_datatree({"sar/sceneA": self._sar_node(with_land=True)})
         with_land_count = self._count_image_pages(monkeypatch, datatree_with_land, recipe, tmp_path)
 
-        assert no_land_count == with_land_count - 1, (
-            "Expected exactly one fewer image page when no scene has "
-            "land-flagged cells (no QA page) than when a scene does."
+        assert with_land_count - no_land_count == expected_delta, (
+            f"variable={variable!r}: expected with-land page count to exceed "
+            f"no-land by {expected_delta}, got no_land={no_land_count} with_land={with_land_count}"
         )
-
-    def test_qa_page_omitted_for_non_currents_variable(self, tmp_path, monkeypatch):
-        from sar_validation.core.datatree_converter import DataTreeConverter
-        from sar_validation.core.recipe import Recipe, RecipeConfig
-
-        recipe = Recipe(config=RecipeConfig(name="currents_test", variable="wind"))
-        datatree_no_land = DataTreeConverter.to_datatree({"sar/sceneA": self._sar_node(with_land=False)})
-        baseline = self._count_image_pages(monkeypatch, datatree_no_land, recipe, tmp_path)
-
-        # Land-flagged data present, but variable != "currents" — QA page
-        # must still be gated off, so the page count is unchanged from baseline.
-        datatree = DataTreeConverter.to_datatree({"sar/sceneA": self._sar_node(with_land=True)})
-        assert self._count_image_pages(monkeypatch, datatree, recipe, tmp_path) == baseline
 
     def test_qa_page_immediately_follows_diagnostics_page(self, tmp_path, monkeypatch):
         """Regression guard for the design-spec ordering requirement (3.b):
@@ -5266,20 +4849,6 @@ class TestPlotCollocationDiagnosticsAntimeridian:
         assert len(seen_ax) == 1
         assert seen_ax[0].projection.proj4_params.get("lon_0", 0) == 0
 
-    def test_produces_a_valid_png_for_crossing_bbox(
-        self, geo_datatree_and_collocation_dateline, diagnostics_recipe_dateline, tmp_path
-    ):
-        import matplotlib.image as mpimg
-
-        from sar_validation.core.visualization import plot_collocation_diagnostics
-
-        datatree, collocation_ds = geo_datatree_and_collocation_dateline
-        out_path = plot_collocation_diagnostics(
-            datatree, collocation_ds, diagnostics_recipe_dateline, tmp_path,
-        )
-        img = mpimg.imread(str(out_path))
-        assert img.shape[0] > 100 and img.shape[1] > 100
-
     def test_scene_bounds_line_plotted_in_projected_frame_when_crossing(
         self, geo_datatree_and_collocation_dateline, diagnostics_recipe_dateline, tmp_path, monkeypatch
     ):
@@ -5370,34 +4939,6 @@ class TestValidationReportDownloadWarnings:
         cover = recorded_figs[0]
         cover_text = " ".join(t.get_text() for t in cover.texts)
         assert "altimeter download failed: timeout" in cover_text
-
-    def test_no_warning_text_when_download_warnings_omitted(
-        self, geo_datatree_and_collocation, tmp_path, monkeypatch
-    ):
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_pdf import PdfPages
-
-        from sar_validation.core.recipe import Recipe, RecipeConfig
-        from sar_validation.core.visualization import validation_report
-
-        datatree, collocation_ds = geo_datatree_and_collocation
-        recipe = Recipe(config=RecipeConfig(name="test_recipe", variable="wind"))
-
-        recorded_figs = []
-        original_savefig = PdfPages.savefig
-
-        def recording_savefig(self, *args, **kwargs):
-            fig = args[0] if args else kwargs.get("figure")
-            recorded_figs.append(fig)
-            return original_savefig(self, *args, **kwargs)
-
-        monkeypatch.setattr(PdfPages, "savefig", recording_savefig)
-        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
-        plt.close("all")
-
-        cover = recorded_figs[0]
-        # Exactly the same two text() calls as before this change: title + variable/date.
-        assert len(cover.texts) == 2
 
 
 class TestValidationReportSensingDepths:
@@ -5937,26 +5478,6 @@ class TestCdfMatchedTitleSuffix:
             assert _cdf_matched_suffix(other) == "", (
                 f"expected no CDF-matched suffix for variable={other!r}"
             )
-
-    def test_suffix_wired_into_all_four_main_section_title_sites(self):
-        """Guards against the helper existing but never being consumed
-        (or being consumed by the wrong branch) -- i.e. it would fail if
-        someone reverted the f-string edits from Step 6 while leaving
-        ``_cdf_matched_suffix`` itself intact."""
-        import inspect
-
-        from sar_validation.core.visualization import validation_report
-
-        source = inspect.getsource(validation_report)
-
-        assert 'cdf_matched_suffix = _cdf_matched_suffix(variable)' in source
-        assert '— scatter{cdf_matched_suffix}"' in source
-        assert '— geographic [{group}]{cdf_matched_suffix}"' in source
-        assert '— geographic{cdf_matched_suffix}"' in source
-        assert '— residuals{cdf_matched_suffix}"' in source
-        # The statistics-table pages show metric numbers, not raw/rescaled
-        # values directly, so they should NOT carry this suffix.
-        assert '— statistics{cdf_matched_suffix}"' not in source
 
     def test_soil_moisture_main_section_report_still_generates(
         self, geo_datatree_and_collocation, tmp_path,

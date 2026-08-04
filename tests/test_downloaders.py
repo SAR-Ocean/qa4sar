@@ -14,7 +14,6 @@ import keyring.errors
 import pytest
 
 from sar_validation.downloaders.base import (
-    authenticate_osi_saf_ftp,
     copernicus_marine_download_kwargs,
     is_date_recent,
     normalize_datetime,
@@ -23,8 +22,6 @@ from sar_validation.downloaders.base import (
     split_antimeridian_bbox,
 )
 from sar_validation.downloaders.insitu_downloader import (
-    PLATFORM_CODE_TO_SOURCE_TYPE,
-    SOURCE_TYPE_TO_PLATFORM,
     _resolve_platform_codes,
 )
 
@@ -35,75 +32,25 @@ from sar_validation.downloaders.insitu_downloader import (
 class TestNormalizeDatetime:
     """Test datetime normalization with various input formats."""
 
-    def test_date_only(self):
-        """Date-only input should be normalized with T00:00:00."""
-        result = normalize_datetime("2026-01-01")
-        assert result == "2026-01-01T00:00:00"
-
-    def test_date_with_iso_time(self):
-        """ISO format with T separator should pass through (roughly)."""
-        result = normalize_datetime("2026-01-01T12:34:56")
-        assert result == "2026-01-01T12:34:56"
-
-    def test_date_with_space_separator(self):
-        """Space-separated datetime should convert space to T."""
-        result = normalize_datetime("2026-01-01 12:34:56")
-        assert result == "2026-01-01T12:34:56"
-
-    def test_hhmmss_format_no_colons(self):
-        """6-digit time without colons should be converted to HH:MM:SS."""
-        result = normalize_datetime("2026-06-24 000000")
-        assert result == "2026-06-24T00:00:00"
-
-    def test_hhmmss_format_midnight(self):
-        """HHMMSS midnight should convert correctly."""
-        result = normalize_datetime("2026-06-24 000000")
-        assert result == "2026-06-24T00:00:00"
-
-    def test_hhmmss_format_midday(self):
-        """HHMMSS midday should convert correctly."""
-        result = normalize_datetime("2026-06-24 120000")
-        assert result == "2026-06-24T12:00:00"
-
-    def test_hhmmss_format_near_end_of_day(self):
-        """HHMMSS near end of day should convert correctly."""
-        result = normalize_datetime("2026-06-24 235959")
-        assert result == "2026-06-24T23:59:59"
-
-    def test_hhmmss_with_three_hour_offset(self):
-        """HHMMSS from the original error case should work."""
-        result = normalize_datetime("2026-06-24 030000")
-        assert result == "2026-06-24T03:00:00"
-
-    def test_trailing_z_removed(self):
-        """Trailing Z should be stripped."""
-        result = normalize_datetime("2026-01-01T12:34:56Z")
-        assert result == "2026-01-01T12:34:56"
-
-    def test_milliseconds_removed(self):
-        """Milliseconds should be removed."""
-        result = normalize_datetime("2026-01-01T12:34:56.123Z")
-        assert result == "2026-01-01T12:34:56"
-
-    def test_whitespace_stripped(self):
-        """Leading/trailing whitespace should be stripped."""
-        result = normalize_datetime("  2026-01-01  ")
-        assert result == "2026-01-01T00:00:00"
-
-    def test_space_and_hhmmss(self):
-        """Space-separated HHMMSS should convert both."""
-        result = normalize_datetime("2026-01-01 120000")
-        assert result == "2026-01-01T12:00:00"
-
-    def test_iso_format_already_correct(self):
-        """Already-correct ISO format should pass through."""
-        result = normalize_datetime("2026-01-01T12:34:56")
-        assert result == "2026-01-01T12:34:56"
-
-    def test_iso_hhmmss_with_z(self):
-        """ISO format HHMMSS with Z should be handled."""
-        result = normalize_datetime("2026-01-01T120000Z")
-        assert result == "2026-01-01T12:00:00"
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            pytest.param("2026-01-01", "2026-01-01T00:00:00", id="date_only"),
+            pytest.param("2026-01-01T12:34:56", "2026-01-01T12:34:56", id="date_with_iso_time"),
+            pytest.param("2026-01-01 12:34:56", "2026-01-01T12:34:56", id="date_with_space_separator"),
+            pytest.param("2026-06-24 000000", "2026-06-24T00:00:00", id="hhmmss_format_no_colons"),
+            pytest.param("2026-06-24 120000", "2026-06-24T12:00:00", id="hhmmss_format_midday"),
+            pytest.param("2026-06-24 235959", "2026-06-24T23:59:59", id="hhmmss_format_near_end_of_day"),
+            pytest.param("2026-06-24 030000", "2026-06-24T03:00:00", id="hhmmss_with_three_hour_offset"),
+            pytest.param("2026-01-01T12:34:56Z", "2026-01-01T12:34:56", id="trailing_z_removed"),
+            pytest.param("2026-01-01T12:34:56.123Z", "2026-01-01T12:34:56", id="milliseconds_removed"),
+            pytest.param("  2026-01-01  ", "2026-01-01T00:00:00", id="whitespace_stripped"),
+            pytest.param("2026-01-01 120000", "2026-01-01T12:00:00", id="space_and_hhmmss"),
+            pytest.param("2026-01-01T120000Z", "2026-01-01T12:00:00", id="iso_hhmmss_with_z"),
+        ],
+    )
+    def test_normalizes_various_formats(self, raw, expected):
+        assert normalize_datetime(raw) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -113,55 +60,29 @@ class TestNormalizeDatetime:
 class TestIsDateRecent:
     """Test detection of recent dates."""
 
+    @pytest.mark.parametrize(
+        "raw_date,threshold_days,expected",
+        [
+            pytest.param("2026-07-02", 30, True, id="today_is_recent"),
+            pytest.param("2026-07-01", 30, True, id="yesterday_is_recent"),
+            pytest.param("2026-06-02", 30, True, id="30_days_ago_is_recent"),
+            pytest.param("2026-06-01", 30, False, id="31_days_ago_is_not_recent"),
+            pytest.param("2026-03-15", 30, False, id="old_date_is_not_recent"),
+            pytest.param("2026-05-03", 30, False, id="custom_threshold_30_days_not_recent"),
+            pytest.param("2026-05-03", 60, True, id="custom_threshold_60_days_recent"),
+        ],
+    )
     @patch("sar_validation.downloaders.base.datetime")
-    def test_today_is_recent(self, mock_datetime):
-        """Today should be considered recent (0 days ago)."""
+    def test_is_date_recent_relative_to_mocked_today(
+        self, mock_datetime, raw_date, threshold_days, expected
+    ):
+        """`datetime.now()` is mocked to a fixed "today" (2026-07-02); each
+        row exercises is_date_recent's day-difference-vs-threshold compare."""
         today = datetime(2026, 7, 2)
         mock_datetime.now.return_value = today
         mock_datetime.fromisoformat = datetime.fromisoformat
-        
-        result = is_date_recent("2026-07-02", threshold_days=30)
-        assert result is True
 
-    @patch("sar_validation.downloaders.base.datetime")
-    def test_yesterday_is_recent(self, mock_datetime):
-        """Yesterday should be considered recent (1 day ago)."""
-        today = datetime(2026, 7, 2)
-        mock_datetime.now.return_value = today
-        mock_datetime.fromisoformat = datetime.fromisoformat
-        
-        result = is_date_recent("2026-07-01", threshold_days=30)
-        assert result is True
-
-    @patch("sar_validation.downloaders.base.datetime")
-    def test_30_days_ago_is_recent(self, mock_datetime):
-        """30 days ago should be at the boundary of recent."""
-        today = datetime(2026, 7, 2)
-        mock_datetime.now.return_value = today
-        mock_datetime.fromisoformat = datetime.fromisoformat
-        
-        result = is_date_recent("2026-06-02", threshold_days=30)
-        assert result is True
-
-    @patch("sar_validation.downloaders.base.datetime")
-    def test_31_days_ago_is_not_recent(self, mock_datetime):
-        """31 days ago should exceed the 30-day threshold."""
-        today = datetime(2026, 7, 2)
-        mock_datetime.now.return_value = today
-        mock_datetime.fromisoformat = datetime.fromisoformat
-        
-        result = is_date_recent("2026-06-01", threshold_days=30)
-        assert result is False
-
-    @patch("sar_validation.downloaders.base.datetime")
-    def test_old_date_is_not_recent(self, mock_datetime):
-        """Date from several months ago should not be recent."""
-        today = datetime(2026, 7, 2)
-        mock_datetime.now.return_value = today
-        mock_datetime.fromisoformat = datetime.fromisoformat
-        
-        result = is_date_recent("2026-03-15", threshold_days=30)
-        assert result is False
+        assert is_date_recent(raw_date, threshold_days=threshold_days) is expected
 
     def test_with_hhmmss_format_parses_correctly(self):
         """HHMMSS format should parse correctly through normalize_datetime."""
@@ -169,21 +90,6 @@ class TestIsDateRecent:
         # not the date recency comparison (which requires mocking datetime.now)
         normalized = normalize_datetime("2026-07-02 120000")
         assert normalized == "2026-07-02T12:00:00"
-
-    @patch("sar_validation.downloaders.base.datetime")
-    def test_custom_threshold(self, mock_datetime):
-        """Custom threshold should be respected."""
-        today = datetime(2026, 7, 2)
-        mock_datetime.now.return_value = today
-        mock_datetime.fromisoformat = datetime.fromisoformat
-        
-        # Should NOT be recent with 30-day threshold
-        result = is_date_recent("2026-05-03", threshold_days=30)
-        assert result is False
-        
-        # But SHOULD be recent with 60-day threshold
-        result = is_date_recent("2026-05-03", threshold_days=60)
-        assert result is True
 
     def test_invalid_datetime_returns_false(self):
         """Invalid datetime should return False gracefully."""
@@ -382,253 +288,217 @@ def broken_keyring(monkeypatch):
 # Tests for authenticate_eumdac()
 # ---------------------------------------------------------------------------
 
-class TestAuthenticateEumdac:
-    def _fake_eumdac_module(self):
-        fake_eumdac = MagicMock()
-        fake_eumdac.AccessToken.side_effect = lambda creds: creds
-        return fake_eumdac
+# ---------------------------------------------------------------------------
+# Tests for authenticate_eumdac() / authenticate_osi_saf_ftp() /
+# authenticate_gportal() / authenticate_smos_ftp() — shared resolution order
+# ---------------------------------------------------------------------------
 
-    def test_explicit_args_win_over_everything(self, monkeypatch, tmp_path, fake_keyring):
-        from sar_validation.downloaders.base import authenticate_eumdac
+def _call_eumdac(username=None, password=None, allow_prompt=True):
+    """authenticate_eumdac() needs a fake `eumdac` module patched into
+    sys.modules for the duration of the call; the returned "token" is just
+    the (username, password) tuple, per _fake_eumdac_module's side_effect."""
+    from sar_validation.downloaders.base import authenticate_eumdac
 
-        monkeypatch.setenv("EUMDAC_USERNAME", "env_user")
-        monkeypatch.setenv("EUMDAC_PASSWORD", "env_pass")
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        fake_keyring[("sar-validation-eumdac", "username")] = "kr_user"
-        fake_keyring[("sar-validation-eumdac", "password")] = "kr_pass"
+    fake_eumdac = MagicMock()
+    fake_eumdac.AccessToken.side_effect = lambda creds: creds
+    with patch.dict("sys.modules", {"eumdac": fake_eumdac}):
+        return authenticate_eumdac(username, password)
 
-        with patch.dict("sys.modules", {"eumdac": self._fake_eumdac_module()}):
-            token = authenticate_eumdac("explicit_user", "explicit_pass")
-        assert token == ("explicit_user", "explicit_pass")
 
-    def test_env_vars_used_when_args_absent(self, monkeypatch, tmp_path, fake_keyring):
-        from sar_validation.downloaders.base import authenticate_eumdac
+def _call_osi_saf_ftp(username=None, password=None, allow_prompt=True):
+    from sar_validation.downloaders.base import authenticate_osi_saf_ftp
 
-        monkeypatch.setenv("EUMDAC_USERNAME", "env_user")
-        monkeypatch.setenv("EUMDAC_PASSWORD", "env_pass")
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        fake_keyring[("sar-validation-eumdac", "username")] = "kr_user"
-        fake_keyring[("sar-validation-eumdac", "password")] = "kr_pass"
+    return authenticate_osi_saf_ftp(username, password)
 
-        with patch.dict("sys.modules", {"eumdac": self._fake_eumdac_module()}):
-            token = authenticate_eumdac()
-        assert token == ("env_user", "env_pass")
 
-    def test_uses_keyring_when_no_args_or_env(self, monkeypatch, tmp_path, fake_keyring):
-        from sar_validation.downloaders.base import authenticate_eumdac
+def _call_gportal(username=None, password=None, allow_prompt=True):
+    from sar_validation.downloaders.base import authenticate_gportal
 
-        monkeypatch.delenv("EUMDAC_USERNAME", raising=False)
-        monkeypatch.delenv("EUMDAC_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        fake_keyring[("sar-validation-eumdac", "username")] = "kr_user"
-        fake_keyring[("sar-validation-eumdac", "password")] = "kr_pass"
+    return authenticate_gportal(username, password, allow_prompt=allow_prompt)
 
-        with patch.dict("sys.modules", {"eumdac": self._fake_eumdac_module()}):
-            token = authenticate_eumdac()
-        assert token == ("kr_user", "kr_pass")
 
-    def test_falls_back_to_legacy_file_and_migrates_to_keyring(
-        self, monkeypatch, tmp_path, fake_keyring
+def _call_smos_ftp(username=None, password=None, allow_prompt=True):
+    from sar_validation.downloaders.base import authenticate_smos_ftp
+
+    return authenticate_smos_ftp(username, password)
+
+
+def _json_legacy_content(username, password):
+    import json
+
+    return json.dumps({"username": username, "password": password})
+
+
+def _comma_separated_legacy_content(username, password):
+    return f"{username},{password}"
+
+
+# (name, call, env_user_var, env_pass_var, keyring_service, legacy_relpath,
+#  legacy_content_fn, no_resolution_match, resolves_via_prompt)
+CREDENTIAL_RESOLUTION_CASES = [
+    pytest.param(
+        "eumdac", _call_eumdac,
+        "EUMDAC_USERNAME", "EUMDAC_PASSWORD", "sar-validation-eumdac",
+        ".eumdac/credentials", _comma_separated_legacy_content,
+        "EUMDAC credentials not found", False,
+        id="eumdac",
+    ),
+    pytest.param(
+        "osi_saf_ftp", _call_osi_saf_ftp,
+        "OSI_SAF_FTP_USERNAME", "OSI_SAF_FTP_PASSWORD", "sar-validation-osi-saf",
+        ".eumetsat_osi_saf_wind_credentials", _json_legacy_content,
+        "OSI-SAF FTP credentials not found", False,
+        id="osi_saf_ftp",
+    ),
+    pytest.param(
+        "gportal", _call_gportal,
+        "GPORTAL_USERNAME", "GPORTAL_PASSWORD", "sar-validation-gportal",
+        ".jaxa_gportal_credentials", _json_legacy_content,
+        "G-Portal credentials not found", True,
+        id="gportal",
+    ),
+    pytest.param(
+        "smos_ftp", _call_smos_ftp,
+        "SMOS_FTP_USERNAME", "SMOS_FTP_PASSWORD", "sar-validation-smos",
+        ".esa_smos_credentials", _json_legacy_content,
+        "SMOS", False,
+        id="smos_ftp",
+    ),
+]
+
+# Subset that also has a distinct "empty (working) keyring, no legacy file"
+# test alongside the "broken keyring backend" test below — eumdac only has
+# the broken-keyring variant.
+CREDENTIAL_RESOLUTION_CASES_WITH_EMPTY_KEYRING_VARIANT = [
+    c for c in CREDENTIAL_RESOLUTION_CASES if c.id != "eumdac"
+]
+
+_CREDENTIAL_RESOLUTION_PARAMS = (
+    "name,call,env_user_var,env_pass_var,keyring_service,legacy_relpath,"
+    "legacy_content_fn,no_resolution_match,resolves_via_prompt"
+)
+
+
+class TestAuthenticateCredentialResolution:
+    """Shared explicit-args / env / keyring / legacy-file / no-resolution
+    behavior for the four authenticate_* helpers (eumdac, osi_saf_ftp,
+    gportal, smos_ftp) that all share one resolution order. G-Portal's two
+    behaviors unique to it (prompting instead of raising, and never
+    persisting a prompted credential) are covered separately below."""
+
+    @pytest.mark.parametrize(_CREDENTIAL_RESOLUTION_PARAMS, CREDENTIAL_RESOLUTION_CASES)
+    def test_explicit_args_win_over_everything(
+        self, name, call, env_user_var, env_pass_var, keyring_service,
+        legacy_relpath, legacy_content_fn, no_resolution_match, resolves_via_prompt,
+        monkeypatch, tmp_path, fake_keyring,
     ):
-        monkeypatch.delenv("EUMDAC_USERNAME", raising=False)
-        monkeypatch.delenv("EUMDAC_PASSWORD", raising=False)
+        monkeypatch.setenv(env_user_var, "env_user")
+        monkeypatch.setenv(env_pass_var, "env_pass")
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        cred_dir = tmp_path / ".eumdac"
-        cred_dir.mkdir()
-        (cred_dir / "credentials").write_text("file_user,file_pass")
+        fake_keyring[(keyring_service, "username")] = "kr_user"
+        fake_keyring[(keyring_service, "password")] = "kr_pass"
 
-        from sar_validation.downloaders.base import authenticate_eumdac
+        result = call(username="explicit_user", password="explicit_pass")
+        assert result == ("explicit_user", "explicit_pass")
 
-        with patch.dict("sys.modules", {"eumdac": self._fake_eumdac_module()}):
-            token = authenticate_eumdac()
-        assert token == ("file_user", "file_pass")
+    @pytest.mark.parametrize(_CREDENTIAL_RESOLUTION_PARAMS, CREDENTIAL_RESOLUTION_CASES)
+    def test_env_vars_used_when_args_absent(
+        self, name, call, env_user_var, env_pass_var, keyring_service,
+        legacy_relpath, legacy_content_fn, no_resolution_match, resolves_via_prompt,
+        monkeypatch, tmp_path, fake_keyring,
+    ):
+        monkeypatch.setenv(env_user_var, "env_user")
+        monkeypatch.setenv(env_pass_var, "env_pass")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        fake_keyring[(keyring_service, "username")] = "kr_user"
+        fake_keyring[(keyring_service, "password")] = "kr_pass"
+
+        result = call()
+        assert result == ("env_user", "env_pass")
+
+    @pytest.mark.parametrize(_CREDENTIAL_RESOLUTION_PARAMS, CREDENTIAL_RESOLUTION_CASES)
+    def test_uses_keyring_when_no_args_or_env(
+        self, name, call, env_user_var, env_pass_var, keyring_service,
+        legacy_relpath, legacy_content_fn, no_resolution_match, resolves_via_prompt,
+        monkeypatch, tmp_path, fake_keyring,
+    ):
+        monkeypatch.delenv(env_user_var, raising=False)
+        monkeypatch.delenv(env_pass_var, raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        fake_keyring[(keyring_service, "username")] = "kr_user"
+        fake_keyring[(keyring_service, "password")] = "kr_pass"
+
+        result = call()
+        assert result == ("kr_user", "kr_pass")
+
+    @pytest.mark.parametrize(_CREDENTIAL_RESOLUTION_PARAMS, CREDENTIAL_RESOLUTION_CASES)
+    def test_falls_back_to_legacy_file_and_migrates_to_keyring(
+        self, name, call, env_user_var, env_pass_var, keyring_service,
+        legacy_relpath, legacy_content_fn, no_resolution_match, resolves_via_prompt,
+        monkeypatch, tmp_path, fake_keyring,
+    ):
+        monkeypatch.delenv(env_user_var, raising=False)
+        monkeypatch.delenv(env_pass_var, raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        cred_file = tmp_path / legacy_relpath
+        cred_file.parent.mkdir(parents=True, exist_ok=True)
+        cred_file.write_text(legacy_content_fn("file_user", "file_pass"))
+
+        result = call()
+        assert result == ("file_user", "file_pass")
         # One-time migration: the legacy values are now stored in the keyring.
-        assert fake_keyring[("sar-validation-eumdac", "username")] == "file_user"
-        assert fake_keyring[("sar-validation-eumdac", "password")] == "file_pass"
+        assert fake_keyring[(keyring_service, "username")] == "file_user"
+        assert fake_keyring[(keyring_service, "password")] == "file_pass"
 
-    def test_no_keyring_backend_falls_through_to_runtime_error(
-        self, monkeypatch, tmp_path, broken_keyring
+    @pytest.mark.parametrize(_CREDENTIAL_RESOLUTION_PARAMS, CREDENTIAL_RESOLUTION_CASES)
+    def test_no_keyring_backend_and_no_legacy_file(
+        self, name, call, env_user_var, env_pass_var, keyring_service,
+        legacy_relpath, legacy_content_fn, no_resolution_match, resolves_via_prompt,
+        monkeypatch, tmp_path, broken_keyring,
     ):
-        from sar_validation.downloaders.base import authenticate_eumdac
-
-        monkeypatch.delenv("EUMDAC_USERNAME", raising=False)
-        monkeypatch.delenv("EUMDAC_PASSWORD", raising=False)
+        monkeypatch.delenv(env_user_var, raising=False)
+        monkeypatch.delenv(env_pass_var, raising=False)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        with patch.dict("sys.modules", {"eumdac": self._fake_eumdac_module()}):
-            with pytest.raises(RuntimeError, match="EUMDAC credentials not found"):
-                authenticate_eumdac()
+        if resolves_via_prompt:
+            monkeypatch.setattr("builtins.input", lambda prompt: "prompted_user")
+            monkeypatch.setattr("getpass.getpass", lambda prompt: "prompted_pass")
+            result = call()
+            assert result == ("prompted_user", "prompted_pass")
+        else:
+            with pytest.raises(RuntimeError, match=no_resolution_match):
+                call()
 
-    def test_runtime_error_mentions_set_credential(self, monkeypatch, tmp_path, fake_keyring):
-        from sar_validation.downloaders.base import authenticate_eumdac
-
-        monkeypatch.delenv("EUMDAC_USERNAME", raising=False)
-        monkeypatch.delenv("EUMDAC_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        with patch.dict("sys.modules", {"eumdac": self._fake_eumdac_module()}):
-            with pytest.raises(RuntimeError, match="sar-validate --set-credential eumdac"):
-                authenticate_eumdac()
-
-
-# ---------------------------------------------------------------------------
-# Tests for authenticate_osi_saf_ftp()
-# ---------------------------------------------------------------------------
-
-class TestAuthenticateOsiSafFtp:
-    def test_explicit_args_win_over_everything(self, monkeypatch, tmp_path, fake_keyring):
-        monkeypatch.setenv("OSI_SAF_FTP_USERNAME", "env_user")
-        monkeypatch.setenv("OSI_SAF_FTP_PASSWORD", "env_pass")
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        username, password = authenticate_osi_saf_ftp("explicit_user", "explicit_pass")
-        assert (username, password) == ("explicit_user", "explicit_pass")
-
-    def test_env_vars_used_when_args_absent(self, monkeypatch, tmp_path, fake_keyring):
-        monkeypatch.setenv("OSI_SAF_FTP_USERNAME", "env_user")
-        monkeypatch.setenv("OSI_SAF_FTP_PASSWORD", "env_pass")
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        username, password = authenticate_osi_saf_ftp()
-        assert (username, password) == ("env_user", "env_pass")
-
-    def test_uses_keyring_when_no_args_or_env(self, monkeypatch, tmp_path, fake_keyring):
-        monkeypatch.delenv("OSI_SAF_FTP_USERNAME", raising=False)
-        monkeypatch.delenv("OSI_SAF_FTP_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        fake_keyring[("sar-validation-osi-saf", "username")] = "kr_user"
-        fake_keyring[("sar-validation-osi-saf", "password")] = "kr_pass"
-
-        username, password = authenticate_osi_saf_ftp()
-        assert (username, password) == ("kr_user", "kr_pass")
-
-    def test_falls_back_to_legacy_file_and_migrates_to_keyring(
-        self, monkeypatch, tmp_path, fake_keyring
+    @pytest.mark.parametrize(
+        _CREDENTIAL_RESOLUTION_PARAMS, CREDENTIAL_RESOLUTION_CASES_WITH_EMPTY_KEYRING_VARIANT,
+    )
+    def test_empty_working_keyring_and_no_legacy_file(
+        self, name, call, env_user_var, env_pass_var, keyring_service,
+        legacy_relpath, legacy_content_fn, no_resolution_match, resolves_via_prompt,
+        monkeypatch, tmp_path, fake_keyring,
     ):
-        import json
-
-        monkeypatch.delenv("OSI_SAF_FTP_USERNAME", raising=False)
-        monkeypatch.delenv("OSI_SAF_FTP_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        cred_file = tmp_path / ".eumetsat_osi_saf_wind_credentials"
-        cred_file.write_text(json.dumps({"username": "file_user", "password": "file_pass"}))
-
-        username, password = authenticate_osi_saf_ftp()
-        assert (username, password) == ("file_user", "file_pass")
-        assert fake_keyring[("sar-validation-osi-saf", "username")] == "file_user"
-        assert fake_keyring[("sar-validation-osi-saf", "password")] == "file_pass"
-
-    def test_no_keyring_backend_falls_through_to_runtime_error(
-        self, monkeypatch, tmp_path, broken_keyring
-    ):
-        monkeypatch.delenv("OSI_SAF_FTP_USERNAME", raising=False)
-        monkeypatch.delenv("OSI_SAF_FTP_PASSWORD", raising=False)
+        """Distinct from test_no_keyring_backend_and_no_legacy_file above:
+        here the keyring backend works fine but has nothing stored yet,
+        rather than being unavailable entirely -- both must reach the same
+        "nothing resolved" behavior."""
+        monkeypatch.delenv(env_user_var, raising=False)
+        monkeypatch.delenv(env_pass_var, raising=False)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        with pytest.raises(RuntimeError, match="OSI-SAF FTP credentials not found"):
-            authenticate_osi_saf_ftp()
-
-    def test_raises_runtime_error_when_nothing_resolves(self, monkeypatch, tmp_path, fake_keyring):
-        monkeypatch.delenv("OSI_SAF_FTP_USERNAME", raising=False)
-        monkeypatch.delenv("OSI_SAF_FTP_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        with pytest.raises(RuntimeError, match="OSI-SAF FTP credentials not found"):
-            authenticate_osi_saf_ftp()
-
-    def test_runtime_error_mentions_set_credential(self, monkeypatch, tmp_path, fake_keyring):
-        monkeypatch.delenv("OSI_SAF_FTP_USERNAME", raising=False)
-        monkeypatch.delenv("OSI_SAF_FTP_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        with pytest.raises(RuntimeError, match="sar-validate --set-credential osi_saf"):
-            authenticate_osi_saf_ftp()
+        if resolves_via_prompt:
+            monkeypatch.setattr("builtins.input", lambda prompt: "prompted_user")
+            monkeypatch.setattr("getpass.getpass", lambda prompt: "prompted_pass")
+            result = call()
+            assert result == ("prompted_user", "prompted_pass")
+        else:
+            with pytest.raises(RuntimeError, match=no_resolution_match):
+                call()
 
 
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Tests for authenticate_gportal()
-# ---------------------------------------------------------------------------
-
-class TestAuthenticateGportal:
-    def test_explicit_args_take_priority(self, monkeypatch, tmp_path, fake_keyring):
-        from sar_validation.downloaders.base import authenticate_gportal
-
-        monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
-        monkeypatch.delenv("GPORTAL_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        user, pwd = authenticate_gportal(username="alice", password="secret")
-        assert (user, pwd) == ("alice", "secret")
-
-    def test_env_vars_used_when_no_explicit_args(self, monkeypatch, tmp_path, fake_keyring):
-        from sar_validation.downloaders.base import authenticate_gportal
-
-        monkeypatch.setenv("GPORTAL_USERNAME", "bob")
-        monkeypatch.setenv("GPORTAL_PASSWORD", "hunter2")
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        user, pwd = authenticate_gportal()
-        assert (user, pwd) == ("bob", "hunter2")
-
-    def test_uses_keyring_when_no_args_or_env(self, monkeypatch, tmp_path, fake_keyring):
-        from sar_validation.downloaders.base import authenticate_gportal
-
-        monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
-        monkeypatch.delenv("GPORTAL_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        fake_keyring[("sar-validation-gportal", "username")] = "kr_user"
-        fake_keyring[("sar-validation-gportal", "password")] = "kr_pass"
-
-        user, pwd = authenticate_gportal()
-        assert (user, pwd) == ("kr_user", "kr_pass")
-
-    def test_falls_back_to_legacy_file_and_migrates_to_keyring(
-        self, monkeypatch, tmp_path, fake_keyring
-    ):
-        import json
-
-        from sar_validation.downloaders.base import authenticate_gportal
-
-        monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
-        monkeypatch.delenv("GPORTAL_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        cred_file = tmp_path / ".jaxa_gportal_credentials"
-        cred_file.write_text(json.dumps({"username": "file_user", "password": "file_pass"}))
-
-        user, pwd = authenticate_gportal()
-        assert (user, pwd) == ("file_user", "file_pass")
-        assert fake_keyring[("sar-validation-gportal", "username")] == "file_user"
-        assert fake_keyring[("sar-validation-gportal", "password")] == "file_pass"
-
-    def test_no_keyring_backend_falls_through_to_prompt(
-        self, monkeypatch, tmp_path, broken_keyring
-    ):
-        """No keyring backend + no legacy file must behave exactly like
-        "nothing resolved" -- i.e. still reach the interactive prompt for
-        G-Portal, not raise."""
-        from sar_validation.downloaders.base import authenticate_gportal
-
-        monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
-        monkeypatch.delenv("GPORTAL_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        monkeypatch.setattr("builtins.input", lambda prompt: "prompted_user")
-        monkeypatch.setattr("getpass.getpass", lambda prompt: "prompted_pass")
-
-        user, pwd = authenticate_gportal()
-        assert (user, pwd) == ("prompted_user", "prompted_pass")
-
-    def test_prompts_interactively_when_nothing_else_resolves(self, monkeypatch, tmp_path, fake_keyring):
-        from sar_validation.downloaders.base import authenticate_gportal
-
-        monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
-        monkeypatch.delenv("GPORTAL_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        monkeypatch.setattr("builtins.input", lambda prompt: "prompted_user")
-        monkeypatch.setattr("getpass.getpass", lambda prompt: "prompted_pass")
-
-        user, pwd = authenticate_gportal()
-        assert (user, pwd) == ("prompted_user", "prompted_pass")
+class TestAuthenticateGportalPromptOnlyBehavior:
+    """Behavior unique to G-Portal among the four authenticate_* helpers
+    above: it prompts instead of raising, and (unlike every migrate-to-
+    keyring path above) a prompted credential must never be persisted."""
 
     def test_interactive_prompt_not_persisted_to_credentials_file(self, monkeypatch, tmp_path):
         """Deliberate deviation from every other authenticate_* helper:
@@ -665,93 +535,6 @@ class TestAuthenticateGportal:
 
         with pytest.raises(RuntimeError, match="G-Portal credentials not found"):
             authenticate_gportal(allow_prompt=False)
-
-
-# Tests for authenticate_smos_ftp()
-# ---------------------------------------------------------------------------
-
-class TestAuthenticateSmosFtp:
-    def test_explicit_args_take_priority(self, monkeypatch, tmp_path, fake_keyring):
-        from sar_validation.downloaders.base import authenticate_smos_ftp
-
-        monkeypatch.delenv("SMOS_FTP_USERNAME", raising=False)
-        monkeypatch.delenv("SMOS_FTP_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        user, pwd = authenticate_smos_ftp(username="alice", password="secret")
-        assert (user, pwd) == ("alice", "secret")
-
-    def test_env_vars_used_when_no_explicit_args(self, monkeypatch, tmp_path, fake_keyring):
-        from sar_validation.downloaders.base import authenticate_smos_ftp
-
-        monkeypatch.setenv("SMOS_FTP_USERNAME", "bob")
-        monkeypatch.setenv("SMOS_FTP_PASSWORD", "hunter2")
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        user, pwd = authenticate_smos_ftp()
-        assert (user, pwd) == ("bob", "hunter2")
-
-    def test_uses_keyring_when_no_args_or_env(self, monkeypatch, tmp_path, fake_keyring):
-        from sar_validation.downloaders.base import authenticate_smos_ftp
-
-        monkeypatch.delenv("SMOS_FTP_USERNAME", raising=False)
-        monkeypatch.delenv("SMOS_FTP_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        fake_keyring[("sar-validation-smos", "username")] = "kr_user"
-        fake_keyring[("sar-validation-smos", "password")] = "kr_pass"
-
-        user, pwd = authenticate_smos_ftp()
-        assert (user, pwd) == ("kr_user", "kr_pass")
-
-    def test_falls_back_to_legacy_file_and_migrates_to_keyring(
-        self, monkeypatch, tmp_path, fake_keyring
-    ):
-        import json
-
-        from sar_validation.downloaders.base import authenticate_smos_ftp
-
-        monkeypatch.delenv("SMOS_FTP_USERNAME", raising=False)
-        monkeypatch.delenv("SMOS_FTP_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        cred_file = tmp_path / ".esa_smos_credentials"
-        cred_file.write_text(json.dumps({"username": "file_user", "password": "file_pass"}))
-
-        user, pwd = authenticate_smos_ftp()
-        assert (user, pwd) == ("file_user", "file_pass")
-        assert fake_keyring[("sar-validation-smos", "username")] == "file_user"
-        assert fake_keyring[("sar-validation-smos", "password")] == "file_pass"
-
-    def test_no_keyring_backend_falls_through_to_runtime_error(
-        self, monkeypatch, tmp_path, broken_keyring
-    ):
-        from sar_validation.downloaders.base import authenticate_smos_ftp
-
-        monkeypatch.delenv("SMOS_FTP_USERNAME", raising=False)
-        monkeypatch.delenv("SMOS_FTP_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        with pytest.raises(RuntimeError, match="SMOS"):
-            authenticate_smos_ftp()
-
-    def test_raises_when_nothing_configured(self, monkeypatch, tmp_path, fake_keyring):
-        from sar_validation.downloaders.base import authenticate_smos_ftp
-
-        monkeypatch.delenv("SMOS_FTP_USERNAME", raising=False)
-        monkeypatch.delenv("SMOS_FTP_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        with pytest.raises(RuntimeError, match="SMOS"):
-            authenticate_smos_ftp()
-
-    def test_runtime_error_mentions_set_credential(self, monkeypatch, tmp_path, fake_keyring):
-        from sar_validation.downloaders.base import authenticate_smos_ftp
-
-        monkeypatch.delenv("SMOS_FTP_USERNAME", raising=False)
-        monkeypatch.delenv("SMOS_FTP_PASSWORD", raising=False)
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        with pytest.raises(RuntimeError, match="sar-validate --set-credential smos"):
-            authenticate_smos_ftp()
 
 
 # ---------------------------------------------------------------------------
@@ -1365,78 +1148,6 @@ class TestAltimeterDownloaderAntimeridian:
         assert len(paths) == 1
 
 
-class TestAltimeterDownloaderForceDownload:
-    def _patch_subset(self):
-        from pathlib import Path
-
-        fake_module = MagicMock()
-
-        def fake_subset(**kwargs):
-            Path(kwargs["output_directory"], kwargs["output_filename"]).write_bytes(b"")
-
-        fake_module.subset.side_effect = fake_subset
-        return fake_module
-
-    def test_default_skips_existing(self, tmp_path):
-        from unittest.mock import patch
-
-        from sar_validation.downloaders.altimeter_downloader import AltimeterDownloader
-
-        dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
-        fake_module = self._patch_subset()
-
-        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
-            dl.download(
-                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
-                start="2026-06-01", end="2026-06-02",
-                frequencies=["1hz"], satellites=["al"],
-            )
-
-        kwargs = fake_module.subset.call_args.kwargs
-        assert kwargs["skip_existing"] is True
-        assert kwargs["overwrite"] is False
-
-    def test_force_download_overwrites(self, tmp_path):
-        from unittest.mock import patch
-
-        from sar_validation.downloaders.altimeter_downloader import AltimeterDownloader
-
-        dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False, force_download=True)
-        fake_module = self._patch_subset()
-
-        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
-            dl.download(
-                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
-                start="2026-06-01", end="2026-06-02",
-                frequencies=["1hz"], satellites=["al"],
-            )
-
-        kwargs = fake_module.subset.call_args.kwargs
-        assert kwargs["skip_existing"] is False
-        assert kwargs["overwrite"] is True
-
-    def test_force_download_kwarg_never_passed_to_subset(self, tmp_path):
-        """Regression: copernicusmarine.subset() has no force_download
-        parameter in the installed version (verified via
-        inspect.signature) — passing it raises TypeError in real
-        (non-mocked) usage."""
-        from unittest.mock import patch
-
-        from sar_validation.downloaders.altimeter_downloader import AltimeterDownloader
-
-        dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
-        fake_module = self._patch_subset()
-
-        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
-            dl.download(
-                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
-                start="2026-06-01", end="2026-06-02",
-                frequencies=["1hz"], satellites=["al"],
-            )
-
-        assert "force_download" not in fake_module.subset.call_args.kwargs
-
-
 # ---------------------------------------------------------------------------
 # InSituDownloader — antimeridian crossing
 # ---------------------------------------------------------------------------
@@ -1616,40 +1327,6 @@ class TestInSituDownloaderForceDownload:
 
         fake_module.subset.assert_called_once()
 
-    def test_force_download_kwarg_never_passed_to_subset(self, tmp_path):
-        """Regression: copernicusmarine.subset() has no force_download
-        parameter in the installed version."""
-        from unittest.mock import patch
-
-        from sar_validation.downloaders.insitu_downloader import (
-            InSituDownloader,
-            _build_csv_filename,
-        )
-
-        # No dest file pre-created: default force_download=False must still
-        # call subset() (the pre-check only short-circuits when a file
-        # already exists). The fake subset() writes straight to dest_path
-        # since it doesn't produce a real CWD-relative output file.
-        dl = InSituDownloader(output_dir=tmp_path, dry_run=False)
-        fake_module = MagicMock()
-
-        start_dt, end_dt = "2026-01-05T00:00:00", "2026-01-06T00:00:00"
-        fname = _build_csv_filename(-20.0, 0.0, 35.0, 60.0, start_dt, end_dt, -20.0, 20.0)
-        dest_path = tmp_path / fname
-
-        def fake_subset(**kwargs):
-            dest_path.write_text("platform_type\n")
-
-        fake_module.subset.side_effect = fake_subset
-
-        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
-            dl.download(
-                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
-                start="2026-01-05", end="2026-01-06",
-            )
-
-        assert "force_download" not in fake_module.subset.call_args.kwargs
-
 
 # ---------------------------------------------------------------------------
 # ScatterometerDownloader — antimeridian crossing
@@ -1732,30 +1409,6 @@ class TestScatterometerDownloaderAntimeridian:
 # ---------------------------------------------------------------------------
 
 class TestScatterometerDownloaderForceDownload:
-    def test_skips_product_whose_output_file_already_exists(self, tmp_path):
-        from unittest.mock import patch
-
-        from sar_validation.downloaders.scatterometer_downloader import ScatterometerDownloader
-
-        dl = ScatterometerDownloader(output_dir=tmp_path, dry_run=False)
-        dl._token = "fake-token"
-        (tmp_path / "OASWC12_20260705_183300_71590_metopb.nc").write_bytes(b"")
-
-        fake_eumdac = MagicMock()
-        fake_collection = MagicMock()
-        fake_collection.search.return_value = ["71590_metopb"]
-        fake_datastore = MagicMock()
-        fake_datastore.get_collection.return_value = fake_collection
-        fake_eumdac.DataStore.return_value = fake_datastore
-
-        with patch.dict("sys.modules", {"eumdac": fake_eumdac}):
-            dl.download(
-                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
-                start="2026-07-02", end="2026-07-03",
-            )
-
-        fake_datastore.get_product.assert_not_called()
-
     def test_force_download_redownloads_existing_product(self, tmp_path):
         from unittest.mock import patch
 
@@ -1787,6 +1440,61 @@ class TestScatterometerDownloaderForceDownload:
             )
 
         fake_datastore.get_product.assert_called_once()
+
+
+class TestScatterometerAndAscatForceDownloadSkipsExisting:
+    """`test_skips_product_whose_output_file_already_exists` was identical
+    logic (mock the eumdac collection.search() result, drop a pre-existing
+    output file, assert get_product() is never called) duplicated once per
+    downloader class; parametrized here over the class/product-id/filename
+    triple that differed between them."""
+
+    ASCAT_REAL_PRODUCT_ID = "ASCA_SMR_02_M02_20260705204500Z_20260705222658Z_N_O_20260705214249Z"
+
+    @pytest.mark.parametrize(
+        "downloader_module,downloader_cls_name,product_id,filename",
+        [
+            pytest.param(
+                "sar_validation.downloaders.scatterometer_downloader",
+                "ScatterometerDownloader",
+                "71590_metopb",
+                "OASWC12_20260705_183300_71590_metopb.nc",
+                id="scatterometer",
+            ),
+            pytest.param(
+                "sar_validation.downloaders.ascat_soil_moisture_downloader",
+                "ASCATSoilMoistureDownloader",
+                ASCAT_REAL_PRODUCT_ID,
+                f"{ASCAT_REAL_PRODUCT_ID}.nc",
+                id="ascat_soil_moisture",
+            ),
+        ],
+    )
+    def test_skips_product_whose_output_file_already_exists(
+        self, downloader_module, downloader_cls_name, product_id, filename, tmp_path
+    ):
+        import importlib
+
+        downloader_cls = getattr(importlib.import_module(downloader_module), downloader_cls_name)
+
+        dl = downloader_cls(output_dir=tmp_path, dry_run=False)
+        dl._token = "fake-token"
+        (tmp_path / filename).write_bytes(b"")
+
+        fake_eumdac = MagicMock()
+        fake_collection = MagicMock()
+        fake_collection.search.return_value = [product_id]
+        fake_datastore = MagicMock()
+        fake_datastore.get_collection.return_value = fake_collection
+        fake_eumdac.DataStore.return_value = fake_datastore
+
+        with patch.dict("sys.modules", {"eumdac": fake_eumdac}):
+            dl.download(
+                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+                start="2026-07-02", end="2026-07-03",
+            )
+
+        fake_datastore.get_product.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1842,30 +1550,6 @@ class TestASCATSoilMoistureDownloaderForceDownload:
     # never the literal strings "metopb"/"metopc" (unlike the OSI-104 wind
     # collection). Fake IDs below mirror that real shape.
     REAL_PRODUCT_ID = "ASCA_SMR_02_M02_20260705204500Z_20260705222658Z_N_O_20260705214249Z"
-
-    def test_skips_product_whose_output_file_already_exists(self, tmp_path):
-        from unittest.mock import patch
-
-        from sar_validation.downloaders.ascat_soil_moisture_downloader import ASCATSoilMoistureDownloader
-
-        dl = ASCATSoilMoistureDownloader(output_dir=tmp_path, dry_run=False)
-        dl._token = "fake-token"
-        (tmp_path / f"{self.REAL_PRODUCT_ID}.nc").write_bytes(b"")
-
-        fake_eumdac = MagicMock()
-        fake_collection = MagicMock()
-        fake_collection.search.return_value = [self.REAL_PRODUCT_ID]
-        fake_datastore = MagicMock()
-        fake_datastore.get_collection.return_value = fake_collection
-        fake_eumdac.DataStore.return_value = fake_datastore
-
-        with patch.dict("sys.modules", {"eumdac": fake_eumdac}):
-            dl.download(
-                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
-                start="2026-07-02", end="2026-07-03",
-            )
-
-        fake_datastore.get_product.assert_not_called()
 
     def test_downloads_product_with_real_metop_satellite_code(self, tmp_path):
         """Regression test: real SOMO12 product IDs contain M01/M02/M03, not
@@ -1988,12 +1672,6 @@ class TestASCATSoilMoistureDownloaderZipExtraction:
 # ---------------------------------------------------------------------------
 
 class TestInsituPlatformCodeMapping:
-    def test_drifter_covers_both_db_and_ad(self):
-        assert SOURCE_TYPE_TO_PLATFORM["drifter"] == ["DB", "AD"]
-
-    def test_buoy_is_db_only(self):
-        assert SOURCE_TYPE_TO_PLATFORM["buoy"] == ["DB"]
-
     def test_resolve_platform_codes_dedupes_shared_db(self):
         codes = _resolve_platform_codes(["buoy", "drifter"])
         assert codes == ["DB", "AD"]
@@ -2001,15 +1679,6 @@ class TestInsituPlatformCodeMapping:
     def test_resolve_platform_codes_unknown_source_type_raises(self):
         with pytest.raises(ValueError):
             _resolve_platform_codes(["not_a_real_type"])
-
-    def test_db_labels_as_buoy(self):
-        assert PLATFORM_CODE_TO_SOURCE_TYPE["DB"] == "buoy"
-
-    def test_ad_labels_as_drifter(self):
-        assert PLATFORM_CODE_TO_SOURCE_TYPE["AD"] == "drifter"
-
-    def test_mo_labels_as_mooring(self):
-        assert PLATFORM_CODE_TO_SOURCE_TYPE["MO"] == "mooring"
 
 
 # ---------------------------------------------------------------------------
@@ -2035,11 +1704,6 @@ class TestRadiometerDownloader:
             assert SENSORS[s]["format"] == "bytemap"
             assert s in SUPPORTED_SENSORS
             assert SENSORS[s]["url_path"]        # has a configured download URL
-
-    def test_supported_sensor_set(self):
-        assert set(SUPPORTED_SENSORS) == {
-            "amsr2", "gmi", "ssmis_f16", "ssmis_f17", "ssmis_f18", "windsat"
-        }
 
     def test_only_windsat_has_direction(self):
         assert SENSORS["windsat"]["has_direction"] is True
@@ -2167,17 +1831,21 @@ from sar_validation.downloaders.noaa_hfradar_downloader import (
 
 
 class TestSelectErddapDataset:
-    def test_us_west_6km_default(self):
-        assert select_erddap_dataset(-125, -119, 33, 38, 6) == "ucsdHfrW6"
-
-    def test_us_west_2km(self):
-        assert select_erddap_dataset(-125, -119, 33, 38, 2) == "ucsdHfrW2"
-
-    def test_us_east_gulf_6km(self):
-        assert select_erddap_dataset(-80, -70, 35, 42, 6) == "ucsdHfrE6"
+    @pytest.mark.parametrize(
+        "min_lon,max_lon,min_lat,max_lat,resolution_km,expected_dataset",
+        [
+            pytest.param(-125, -119, 33, 38, 6, "ucsdHfrW6", id="us_west_6km_default"),
+            pytest.param(-125, -119, 33, 38, 2, "ucsdHfrW2", id="us_west_2km"),
+            pytest.param(-80, -70, 35, 42, 6, "ucsdHfrE6", id="us_east_gulf_6km"),
+        ],
+    )
+    def test_selects_expected_dataset(
+        self, min_lon, max_lon, min_lat, max_lat, resolution_km, expected_dataset
+    ):
+        assert select_erddap_dataset(min_lon, max_lon, min_lat, max_lat, resolution_km) == expected_dataset
 
     def test_unsupported_region_raises(self):
-        # German Bight isn't in NOAA_HFR_REGIONS at all (Task 1's shared
+        # German Bight isn't in NOAA_HFR_REGIONS at all (this suite's shared
         # table is US-only), so match_noaa_hfr_region's own "no region"
         # message surfaces here rather than an ERDDAP-specific one.
         with pytest.raises(ValueError, match="No NOAA HF-radar region"):
@@ -2186,8 +1854,7 @@ class TestSelectErddapDataset:
     def test_unsupported_resolution_raises(self):
         with pytest.raises(ValueError, match="resolution"):
             # US-East/Gulf's shared-table entry has no 3 km dataset (only
-            # 1/2/6 km); this used to test 2 km, but Task 1's shared table
-            # added 2 km support for US-East/Gulf, so 2 km is valid now.
+            # 1/2/6 km).
             select_erddap_dataset(-80, -70, 35, 42, 3)
 
 
@@ -2408,11 +2075,6 @@ class TestNoaaHfradarDownloaderUsesSharedRegionTable:
         with pytest.raises(ValueError, match=r"1\.0|2\.0|6\.0|0\.5|1km|2km|6km|500m"):
             select_erddap_dataset(-125, -119, 33, 38, 3)
 
-    def test_match_region_removed(self):
-        import sar_validation.downloaders.noaa_hfradar_downloader as mod
-
-        assert not hasattr(mod, "match_region")
-
 
 class TestNOAAHFRadarDownloaderAntimeridian:
     def test_crossing_bbox_with_no_covering_region_on_either_side_raises(self, tmp_path):
@@ -2508,16 +2170,6 @@ class TestNOAAHFRadarDownloaderForceDownload:
 # over source-inspection alone.
 
 class TestOrchestratorHFRadarNOAAWiring:
-    def test_dispatch_source_registers_hf_radar_noaa_handler(self):
-        import inspect
-
-        from sar_validation.core.orchestrator import DataOrchestrator
-
-        src = inspect.getsource(DataOrchestrator._dispatch_source)
-        assert '"hf_radar_noaa"' in src
-        assert "_download_noaa_hfradar" in src
-        assert hasattr(DataOrchestrator, "_download_noaa_hfradar")
-
     def test_download_noaa_hfradar_dry_run_sets_metadata_and_makes_no_network_call(
         self, tmp_path
     ):
@@ -2577,16 +2229,6 @@ class TestOrchestratorHFRadarNOAAWiring:
 
 
 class TestOrchestratorHFRadarUSWiring:
-    def test_dispatch_source_registers_hf_radar_us_handler(self):
-        import inspect
-
-        from sar_validation.core.orchestrator import DataOrchestrator
-
-        src = inspect.getsource(DataOrchestrator._dispatch_source)
-        assert '"hf_radar_us"' in src
-        assert "_download_hf_radar_us" in src
-        assert hasattr(DataOrchestrator, "_download_hf_radar_us")
-
     def test_download_hf_radar_us_dry_run_sets_metadata_and_makes_no_network_call(
         self, tmp_path
     ):
@@ -2791,7 +2433,7 @@ class TestDownloadHfRadarTracksFileCount:
 # Tests for _hf_radar_regions (shared Copernicus HF-radar region lookup)
 # ---------------------------------------------------------------------------
 
-from sar_validation.downloaders._hf_radar_regions import HFR_REGIONS, resolve_hfr_region
+from sar_validation.downloaders._hf_radar_regions import resolve_hfr_region
 
 
 class TestHfRadarRegions:
@@ -2812,19 +2454,6 @@ class TestHfRadarRegions:
         # largest-overlap-area tie-break rather than "first match wins".
         assert resolve_hfr_region(0.0, 1.5, 39.6, 41.2) == "DeltaEbro"
         assert resolve_hfr_region(0.5, 4.0, 40.6, 42.9) == "ICATMAR"
-
-    def test_all_regions_have_bbox_and_flag(self):
-        assert len(HFR_REGIONS) == 25
-        for name, cfg in HFR_REGIONS.items():
-            assert len(cfg["bbox"]) == 4
-            assert isinstance(cfg["has_latest"], bool)
-
-    def test_regions_without_latest_feed(self):
-        no_latest = {n for n, c in HFR_REGIONS.items() if not c["has_latest"]}
-        assert no_latest == {
-            "ARPAS", "COSYNA", "Finnmark", "US-Alaska",
-            "US-EastGulfCoast", "US-Hawaii", "WHub",
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -2888,13 +2517,6 @@ class TestHFRadarDownloaderGrid:
 
         _, kwargs = fake_module.subset.call_args
         assert kwargs["dataset_part"] == "latest-radar-total--US-WestCoast"
-
-    def test_constructor_accepts_unused_depth_kwargs(self, tmp_path):
-        # The orchestrator always passes min_depth/max_depth; the gridded
-        # product has no depth axis, but the kwargs must still be accepted.
-        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
-
-        HFRadarDownloader(output_dir=tmp_path, dry_run=True, min_depth=-2.0, max_depth=2.0)
 
     def test_retries_with_monthly_part_when_latest_out_of_bounds(self, tmp_path):
         from datetime import datetime, timedelta, timezone
@@ -2990,62 +2612,6 @@ class TestHFRadarDownloaderGridAntimeridian:
         _, kwargs = fake_module.subset.call_args
         assert kwargs["minimum_longitude"] == -180.0
         assert kwargs["maximum_longitude"] == -120.0
-
-
-class TestHFRadarDownloaderGridForceDownload:
-    def _patch_subset(self):
-        from pathlib import Path
-
-        fake_module = MagicMock()
-
-        def fake_subset(**kwargs):
-            Path(kwargs["output_directory"], kwargs["output_filename"]).write_bytes(b"")
-
-        fake_module.subset.side_effect = fake_subset
-        return fake_module
-
-    def test_default_skips_existing(self, tmp_path):
-        from unittest.mock import patch
-
-        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
-
-        dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False)
-        fake_module = self._patch_subset()
-
-        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
-            dl.download(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")
-
-        kwargs = fake_module.subset.call_args.kwargs
-        assert kwargs["skip_existing"] is True
-        assert kwargs["overwrite"] is False
-
-    def test_force_download_overwrites(self, tmp_path):
-        from unittest.mock import patch
-
-        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
-
-        dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False, force_download=True)
-        fake_module = self._patch_subset()
-
-        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
-            dl.download(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")
-
-        kwargs = fake_module.subset.call_args.kwargs
-        assert kwargs["skip_existing"] is False
-        assert kwargs["overwrite"] is True
-
-    def test_force_download_kwarg_never_passed_to_subset(self, tmp_path):
-        from unittest.mock import patch
-
-        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
-
-        dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False)
-        fake_module = self._patch_subset()
-
-        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
-            dl.download(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")
-
-        assert "force_download" not in fake_module.subset.call_args.kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -3871,118 +3437,6 @@ class TestOrchestratorForceDownloadWiring:
         ))
         return DataOrchestrator(recipe, dry_run=True, force_download=force_download)
 
-    def test_sar_receives_force_download(self, tmp_path):
-        from unittest.mock import patch
-
-        orchestrator = self._make_orchestrator(tmp_path, force_download=True)
-        with patch("sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader") as mock_cls:
-            mock_cls.return_value.download.return_value = []
-            orchestrator._download_sar()
-        assert mock_cls.call_args.kwargs["force_download"] is True
-
-    def test_insitu_receives_force_download(self, tmp_path):
-        from unittest.mock import patch
-
-        orchestrator = self._make_orchestrator(tmp_path, force_download=True)
-        with patch("sar_validation.downloaders.insitu_downloader.InSituDownloader") as mock_cls:
-            mock_cls.return_value.download.return_value = []
-            orchestrator._download_insitu(["mooring"], -20.0, 20.0)
-        assert mock_cls.call_args.kwargs["force_download"] is True
-
-    def test_scatterometer_receives_force_download(self, tmp_path):
-        from unittest.mock import patch
-
-        from sar_validation.core.recipe import ValidationDataSource
-
-        orchestrator = self._make_orchestrator(tmp_path, force_download=True)
-        with patch(
-            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
-        ) as mock_cls:
-            mock_cls.return_value.download.return_value = []
-            orchestrator._download_scatterometer(ValidationDataSource(source_type="scatterometer"))
-        assert mock_cls.call_args.kwargs["force_download"] is True
-
-    def test_hf_radar_receives_force_download(self, tmp_path):
-        from unittest.mock import patch
-
-        from sar_validation.core.recipe import ValidationDataSource
-
-        orchestrator = self._make_orchestrator(tmp_path, force_download=True)
-        with patch("sar_validation.downloaders.hf_radar_downloader.HFRadarDownloader") as mock_cls:
-            mock_cls.return_value.download.return_value = []
-            orchestrator._download_hf_radar(ValidationDataSource(source_type="hf_radar"))
-        assert mock_cls.call_args.kwargs["force_download"] is True
-
-    def test_noaa_hfradar_receives_force_download(self, tmp_path):
-        from unittest.mock import patch
-
-        from sar_validation.core.recipe import ValidationDataSource
-
-        orchestrator = self._make_orchestrator(tmp_path, force_download=True)
-        with patch(
-            "sar_validation.downloaders.noaa_hfradar_downloader.NOAAHFRadarDownloader"
-        ) as mock_cls:
-            mock_cls.return_value.download.return_value = []
-            orchestrator._download_noaa_hfradar(ValidationDataSource(source_type="hf_radar_noaa"))
-        assert mock_cls.call_args.kwargs["force_download"] is True
-
-    def test_hf_radar_historical_receives_force_download(self, tmp_path):
-        from unittest.mock import patch
-
-        from sar_validation.core.recipe import ValidationDataSource
-
-        orchestrator = self._make_orchestrator(tmp_path, force_download=True)
-        with patch(
-            "sar_validation.downloaders.hf_radar_historical_downloader.HFRadarHistoricalDownloader"
-        ) as mock_cls:
-            mock_cls.return_value.download.return_value = []
-            orchestrator._download_hf_radar_historical(
-                ValidationDataSource(source_type="hf_radar_historical")
-            )
-        assert mock_cls.call_args.kwargs["force_download"] is True
-
-    def test_scatterometer_ftp_receives_force_download(self, tmp_path):
-        from unittest.mock import patch
-
-        from sar_validation.core.recipe import ValidationDataSource
-
-        orchestrator = self._make_orchestrator(tmp_path, force_download=True)
-        with patch(
-            "sar_validation.downloaders.scatterometer_ftp_downloader.ScatterometerFTPDownloader"
-        ) as mock_cls:
-            mock_cls.return_value.download.return_value = []
-            orchestrator._download_scatterometer_hy2b(
-                ValidationDataSource(source_type="scatterometer_hy2b")
-            )
-        assert mock_cls.call_args.kwargs["force_download"] is True
-
-    def test_currents_historical_receives_force_download(self, tmp_path):
-        from unittest.mock import patch
-
-        from sar_validation.core.recipe import ValidationDataSource
-
-        orchestrator = self._make_orchestrator(tmp_path, force_download=True)
-        with patch(
-            "sar_validation.downloaders.insitu_currents_historical_downloader."
-            "InSituCurrentsHistoricalDownloader"
-        ) as mock_cls:
-            mock_cls.return_value.download.return_value = []
-            orchestrator._download_adcp_historical(
-                ValidationDataSource(source_type="adcp_historical")
-            )
-        assert mock_cls.call_args.kwargs["force_download"] is True
-
-    def test_altimeter_receives_force_download(self, tmp_path):
-        from unittest.mock import patch
-
-        from sar_validation.core.recipe import ValidationDataSource
-
-        orchestrator = self._make_orchestrator(tmp_path, force_download=True)
-        with patch("sar_validation.downloaders.altimeter_downloader.AltimeterDownloader") as mock_cls:
-            mock_cls.return_value.download.return_value = []
-            orchestrator._download_altimeter(ValidationDataSource(source_type="altimeter"))
-        assert mock_cls.call_args.kwargs["force_download"] is True
-
     def test_default_force_download_is_false(self, tmp_path):
         from unittest.mock import patch
 
@@ -4154,35 +3608,6 @@ class TestEarthdataSoilMoistureDownloader:
         assert "Found 0 NISAR_L3_SME2_BETA_V1 granule(s)" in captured
         assert "Found 1 NISAR_L3_SME2_PROVISIONAL_V1 granule(s)" in captured
         assert "[DRY RUN] Would download 1 granule(s)" in captured
-
-    def test_single_dataset_string_still_works_unchanged(self, tmp_path, monkeypatch):
-        """Backward compatibility: a plain string `dataset` (used by
-        AMSR2/SMAP) is equivalent to a single-candidate list."""
-        from unittest.mock import patch
-
-        from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
-            EarthdataSoilMoistureDownloader,
-        )
-
-        dl = EarthdataSoilMoistureDownloader(dataset="SPL2SMP_E", version="006", output_dir=tmp_path)
-        monkeypatch.setenv("EARTHDATA_USERNAME", "test_user")
-        monkeypatch.setenv("EARTHDATA_PASSWORD", "test_pass")
-
-        fake_earthaccess = MagicMock()
-        fake_earthaccess.search_data.return_value = []
-
-        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
-            result = dl.download(
-                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
-                start="2026-07-01", end="2026-07-02",
-            )
-
-        assert result == []
-        fake_earthaccess.search_data.assert_called_once_with(
-            short_name="SPL2SMP_E", version="006",
-            bounding_box=(-10.0, 40.0, 10.0, 55.0),
-            temporal=("2026-07-01T00:00:00", "2026-07-02T00:00:00"),
-        )
 
     def test_search_and_download_amsr(self, tmp_path, monkeypatch):
         from unittest.mock import patch

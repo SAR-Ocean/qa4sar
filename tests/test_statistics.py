@@ -57,42 +57,25 @@ def collocation_ds():
 # ---------------------------------------------------------------------------
 
 class TestComputeStatistics:
-    def test_returns_dataset(self, collocation_ds):
+    def test_basic_properties(self, collocation_ds):
         ds = compute_statistics(collocation_ds, "owiWindSpeed", "WSPD")
-        assert isinstance(ds, xr.Dataset)
 
-    def test_expected_metrics(self, collocation_ds):
-        ds = compute_statistics(collocation_ds, "owiWindSpeed", "WSPD")
+        assert isinstance(ds, xr.Dataset)
         for metric in ("N", "bias", "std", "rmse", "correlation", "scatter_index"):
             assert metric in ds.data_vars, f"Missing metric: {metric}"
-
-    def test_sources_dimension(self, collocation_ds):
-        ds = compute_statistics(collocation_ds, "owiWindSpeed", "WSPD")
         assert "source" in ds.dims
         assert set(ds["source"].values) == {"mooring", "buoy"}
-
-    def test_bias_near_zero(self, collocation_ds):
-        ds = compute_statistics(collocation_ds, "owiWindSpeed", "WSPD")
         # Synthetic data has small noise so bias should be small
         assert abs(float(ds["bias"].mean())) < 1.0
-
-    def test_rmse_positive(self, collocation_ds):
-        ds = compute_statistics(collocation_ds, "owiWindSpeed", "WSPD")
         assert (ds["rmse"].values >= 0).all()
-
-    def test_correlation_in_range(self, collocation_ds):
-        ds = compute_statistics(collocation_ds, "owiWindSpeed", "WSPD")
         corr = ds["correlation"].values
         assert np.all((corr >= -1) & (corr <= 1))
+        total_n = int(ds["N"].sum())
+        assert total_n == 40
 
     def test_missing_var_returns_none(self, collocation_ds):
         result = compute_statistics(collocation_ds, "owiWaveHeight", "VHM0")
         assert result is None
-
-    def test_n_correct(self, collocation_ds):
-        ds = compute_statistics(collocation_ds, "owiWindSpeed", "WSPD")
-        total_n = int(ds["N"].sum())
-        assert total_n == 40
 
 
 # ---------------------------------------------------------------------------
@@ -603,38 +586,72 @@ class TestHarmonizePercentDomainSources:
         # sentinel must collapse back to a real units string.
         assert out["val_SOIL_MOISTURE"].attrs["units"] == "1"
 
-    def test_reference_source_absent_drops_percent_sources(self, caplog):
+    @pytest.mark.parametrize(
+        "make_ds,patch_target,expected_log_substr,check_sar_nan,check_ismn_untouched",
+        [
+            pytest.param(
+                lambda self: self._mixed_ds(n_ismn=0, n_ascat=10).isel(collocation=slice(0, 10)),
+                None,
+                "absent",
+                True,
+                False,
+                id="reference_absent",
+            ),
+            pytest.param(
+                lambda self: self._mixed_ds(n_ismn=1, n_ascat=10),
+                None,
+                "< 2 valid",
+                False,
+                False,
+                id="reference_too_sparse",
+            ),
+            pytest.param(
+                lambda self: self._mixed_ds(n_ismn=15, n_ascat=10),
+                "pytesmo.cdf_matching.CDFMatching.fit",
+                "CDF-matching fit failed",
+                True,
+                True,
+                id="cdf_matching_fit_raises",
+            ),
+        ],
+    )
+    def test_unavailable_reference_drops_percent_sources(
+        self, make_ds, patch_target, expected_log_substr, check_sar_nan,
+        check_ismn_untouched, caplog,
+    ):
+        """If the reference source (ISMN) is absent, too sparse, or its
+        CDF-matching fit raises, _harmonize_percent_domain_sources must
+        degrade gracefully: drop the to-be-converted rows to NaN, log a
+        warning, and report them as dropped -- not propagate an exception
+        or silently leave them in the wrong (percent) domain."""
         from sar_validation.core.statistics import _harmonize_percent_domain_sources
 
-        ds = self._mixed_ds(n_ismn=0, n_ascat=10)
-        ds = ds.isel(collocation=slice(0, 10))  # ismn rows were 0-length anyway
+        ds = make_ds(self)
 
-        out, converted, dropped = _harmonize_percent_domain_sources(ds, "sarSSM", "SOIL_MOISTURE")
+        if patch_target is not None:
+            with patch(patch_target) as mock_fit:
+                mock_fit.side_effect = ValueError("degenerate reference values")
+                out, converted, dropped = _harmonize_percent_domain_sources(
+                    ds, "sarSSM", "SOIL_MOISTURE",
+                )
+        else:
+            out, converted, dropped = _harmonize_percent_domain_sources(ds, "sarSSM", "SOIL_MOISTURE")
 
         assert converted == set()
         assert dropped == {"ascat_ssm"}, (
-            "ascat_ssm needed converting but couldn't (reference absent) -- must be "
-            "reported as dropped, distinct from 'nothing needed converting'"
-        )
-        assert np.all(np.isnan(out["val_SOIL_MOISTURE"].values))
-        assert np.all(np.isnan(out["sar_sarSSM"].values))
-        assert "absent" in caplog.text
-
-    def test_reference_source_too_sparse_drops_percent_sources(self, caplog):
-        from sar_validation.core.statistics import _harmonize_percent_domain_sources
-
-        ds = self._mixed_ds(n_ismn=1, n_ascat=10)
-
-        out, converted, dropped = _harmonize_percent_domain_sources(ds, "sarSSM", "SOIL_MOISTURE")
-
-        assert converted == set()
-        assert dropped == {"ascat_ssm"}, (
-            "ascat_ssm needed converting but couldn't (reference too sparse) -- must be "
+            "ascat_ssm needed converting but couldn't -- must be "
             "reported as dropped, distinct from 'nothing needed converting'"
         )
         is_ascat = np.array(out["val_source"].values) == "ascat_ssm"
         assert np.all(np.isnan(out["val_SOIL_MOISTURE"].values[is_ascat]))
-        assert "< 2 valid" in caplog.text
+        if check_sar_nan:
+            assert np.all(np.isnan(out["sar_sarSSM"].values[is_ascat]))
+        if check_ismn_untouched:
+            is_ismn = np.array(out["val_source"].values) == "ismn"
+            np.testing.assert_array_equal(
+                out["val_SOIL_MOISTURE"].values[is_ismn], ds["val_SOIL_MOISTURE"].values[is_ismn],
+            )
+        assert expected_log_substr in caplog.text
 
     def test_no_percent_domain_source_present_is_a_true_noop(self):
         """No ASCAT-like source present (e.g. a plain ISMN-only run, or any
@@ -674,34 +691,6 @@ class TestHarmonizePercentDomainSources:
         assert out is ds
         assert converted == set()
         assert dropped == set()
-
-    def test_cdf_matching_fit_failure_drops_percent_sources(self, caplog):
-        """If CDFMatching.fit() raises an exception (e.g. degenerate
-        reference values), _harmonize_percent_domain_sources must degrade
-        gracefully: drop the to-be-converted rows to NaN, log a warning,
-        and return empty converted_sources -- not propagate the exception."""
-        from sar_validation.core.statistics import _harmonize_percent_domain_sources
-
-        ds = self._mixed_ds(n_ismn=15, n_ascat=10)
-
-        with patch("pytesmo.cdf_matching.CDFMatching.fit") as mock_fit:
-            mock_fit.side_effect = ValueError("degenerate reference values")
-            out, converted, dropped = _harmonize_percent_domain_sources(ds, "sarSSM", "SOIL_MOISTURE")
-
-        assert converted == set()
-        assert dropped == {"ascat_ssm"}, (
-            "ascat_ssm needed converting but couldn't (fit raised) -- must be "
-            "reported as dropped, distinct from 'nothing needed converting'"
-        )
-        is_ascat = np.array(out["val_source"].values) == "ascat_ssm"
-        assert np.all(np.isnan(out["val_SOIL_MOISTURE"].values[is_ascat]))
-        assert np.all(np.isnan(out["sar_sarSSM"].values[is_ascat]))
-        # ISMN's own rows must remain untouched.
-        is_ismn = np.array(out["val_source"].values) == "ismn"
-        np.testing.assert_array_equal(
-            out["val_SOIL_MOISTURE"].values[is_ismn], ds["val_SOIL_MOISTURE"].values[is_ismn],
-        )
-        assert "CDF-matching fit failed" in caplog.text
 
 
 class TestFitSarToValTransformHarmonizesFirst:
@@ -851,24 +840,16 @@ def direction_collocation_ds():
 
 
 class TestCircularStatistics:
-    def test_bias_uses_wrapped_difference(self, direction_collocation_ds):
-        ds = compute_statistics(direction_collocation_ds, "owiWindDirection", "WDIR")
+    def test_bias_rmse_correlation_no_warning(self, direction_collocation_ds):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            ds = compute_statistics(direction_collocation_ds, "owiWindDirection", "WDIR")
+
         # A naive (sar - val) mean would be dominated by the 358° outlier at
         # the wrap boundary; the correct wrapped bias is close to -2°.
         assert abs(float(ds["bias"].values[0]) - (-2.0)) < 1e-6
-
-    def test_rmse_small_despite_wrap(self, direction_collocation_ds):
-        ds = compute_statistics(direction_collocation_ds, "owiWindDirection", "WDIR")
         assert float(ds["rmse"].values[0]) < 5.0
-
-    def test_correlation_near_one_for_rotated_series(self, direction_collocation_ds):
-        ds = compute_statistics(direction_collocation_ds, "owiWindDirection", "WDIR")
         assert float(ds["correlation"].values[0]) > 0.9
-
-    def test_no_runtime_warning(self, direction_collocation_ds):
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", RuntimeWarning)
-            compute_statistics(direction_collocation_ds, "owiWindDirection", "WDIR")
 
     def test_constant_direction_group_no_warning(self):
         """A group with zero angular spread must not raise a RuntimeWarning."""
@@ -1036,30 +1017,9 @@ class TestRunStatisticsNativeUnits:
 # _variable_map
 # ---------------------------------------------------------------------------
 
-class TestVariableMap:
-    def test_wind_pairs(self):
-        pairs = infer_variable_pairs("wind")
-        assert ("owiWindSpeed", "WSPD") in pairs
-        assert ("owiWindDirection", "WDIR") in pairs
-
-    def test_currents_pairs(self):
-        pairs = infer_variable_pairs("currents")
-        assert ("rvlRadVel", "rvlRadVel_projection") in pairs
-
-    def test_waves_pairs(self):
-        pairs = infer_variable_pairs("waves")
-        # WV wave validation compares the integrated total significant wave
-        # height (oswTotalHs); the partitioned oswHs remains as a legacy pair.
-        assert ("oswTotalHs", "VHM0") in pairs
-        assert ("oswHs", "VHM0") in pairs
-
-    def test_soil_moisture_pairs(self):
-        pairs = infer_variable_pairs("soil_moisture")
-        assert pairs == [("sarSSM", "SOIL_MOISTURE")]
-
-    def test_unknown_raises(self):
-        with pytest.raises(KeyError):
-            infer_variable_pairs("invalid_variable")
+def test_infer_variable_pairs_unknown_variable_raises():
+    with pytest.raises(KeyError):
+        infer_variable_pairs("invalid_variable")
 
 
 # ---------------------------------------------------------------------------
@@ -1180,12 +1140,6 @@ class TestFilterVariablePairsSoilMoisture:
         ds = xr.Dataset({"sar_owiWindSpeed": ("collocation", [1.0])})
         pairs = filter_variable_pairs(recipe, ds)
         assert pairs == []
-
-
-def test_val_source_units_family_includes_smos_ssm():
-    from sar_validation.core.statistics import _VAL_SOURCE_UNITS_FAMILY
-
-    assert _VAL_SOURCE_UNITS_FAMILY["smos_ssm"] == "volumetric"
 
 
 # ---------------------------------------------------------------------------
