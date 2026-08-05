@@ -5508,18 +5508,18 @@ class TestValidationReportMainSectionExcludesCdsSsm:
         assert key in figs
 
         # Collect every piece of text rendered anywhere on each
-        # "(CDF-matched)"-banner figure (figure-level text, axes titles,
-        # axes-level annotations, legend labels) -- robust to whether
-        # plot_scatter renders one shared axes or splits into one
-        # small-multiple subplot per source (force_split, triggered here
-        # since ascat_ssm gets CDF-harmonized into ismn's domain), unlike
-        # scraping a specific "N=..." annotation format that only exists
-        # in the unified-axes layout.
+        # "Cumulative Distribution Function-matched"-banner figure
+        # (figure-level text, axes titles, axes-level annotations, legend
+        # labels) -- robust to whether plot_scatter renders one shared
+        # axes or splits into one small-multiple subplot per source
+        # (force_split, triggered here since ascat_ssm gets CDF-harmonized
+        # into ismn's domain), unlike scraping a specific "N=..."
+        # annotation format that only exists in the unified-axes layout.
         cdf_matched_fig_found = False
         all_cdf_text = []
         for fig in figs[key]:
             banner_texts = [t.get_text() for t in fig.texts]
-            if not any("(CDF-matched)" in t for t in banner_texts):
+            if not any("Cumulative Distribution Function" in t for t in banner_texts):
                 continue
             cdf_matched_fig_found = True
             all_cdf_text.extend(banner_texts)
@@ -5530,7 +5530,7 @@ class TestValidationReportMainSectionExcludesCdsSsm:
                 if legend is not None:
                     all_cdf_text.extend(t.get_text() for t in legend.get_texts())
 
-        assert cdf_matched_fig_found, "expected at least one '(CDF-matched)' figure"
+        assert cdf_matched_fig_found, "expected at least one CDF-matched figure"
         assert any("ascat_ssm" in t for t in all_cdf_text), (
             "sanity check failed: ascat_ssm should still appear in the "
             "CDF-matched section"
@@ -5539,6 +5539,203 @@ class TestValidationReportMainSectionExcludesCdsSsm:
             f"cds_ssm must not appear anywhere in the CDF-matched section "
             f"(it gets its own separate '— C3S CDS SSM —' section); found "
             f"it in: {[t for t in all_cdf_text if 'cds_ssm' in t]}"
+        )
+
+
+class TestValidationReportCdsSection:
+    """The C3S CDS SSM section (cds_ssm_stats_ds_map) previously had no
+    summary table (unlike the CDF-matched/native-units sections, both of
+    which call plot_summary_table before their statistics bar chart) and
+    always stamped a generic "— C3S CDS SSM —" banner with no indication
+    of which product_type (ACTIVE/PASSIVE) or which satellites the section
+    actually covers."""
+
+    @staticmethod
+    def _recipe(product_type="active"):
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+
+        cfg = RecipeConfig(
+            name="test_cds_section", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[
+                ValidationDataSource(
+                    source_type="cds_ssm", download_kwargs={"product_type": product_type},
+                ),
+            ],
+        )
+        return Recipe(config=cfg)
+
+    @staticmethod
+    def _datatree_and_collocation():
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(2.0, 4.0, x), np.linspace(47.0, 49.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.full((y, x), 22.0))},
+            coords={
+                "lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                "time": pd.Timestamp("2026-01-01T12:00:00"),
+            },
+        )
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds,
+            "validation/cds_ssm/f1": xr.Dataset(
+                {"SOIL_MOISTURE": ("point", np.array([0.20, 0.22, 0.24]))},
+                coords={
+                    "lon": ("point", [2.0, 3.0, 4.0]), "lat": ("point", [47.0, 48.0, 49.0]),
+                    "time": ("point", np.array(["2026-01-01"] * 3, dtype="datetime64[ns]")),
+                },
+            ),
+            # Non-cds_ssm sources too, so the CDF-matched section isn't
+            # empty (an all-cds_ssm-only recipe is possible in principle,
+            # but leaving the CDF-matched section genuinely empty here
+            # would trigger unrelated "no valid data" warnings that have
+            # nothing to do with what this test class covers). ismn is
+            # needed alongside ascat_ssm: _harmonize_percent_domain_sources
+            # drops percent-domain sources like ascat_ssm entirely when no
+            # ismn reference is present to convert them against.
+            "validation/ascat_ssm/f1": xr.Dataset(
+                {"SOIL_MOISTURE": ("point", np.array([20.0, 24.0]))},
+                coords={
+                    "lon": ("point", [2.5, 3.5]), "lat": ("point", [47.5, 48.5]),
+                    "time": ("point", np.array(["2026-01-01"] * 2, dtype="datetime64[ns]")),
+                },
+            ),
+            "validation/ismn/f1": xr.Dataset(
+                {"SOIL_MOISTURE": ("point", np.array([0.25, 0.27]))},
+                coords={
+                    "lon": ("point", [2.2, 3.2]), "lat": ("point", [47.2, 48.2]),
+                    "time": ("point", np.array(["2026-01-01"] * 2, dtype="datetime64[ns]")),
+                },
+            ),
+        })
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": (
+                    "collocation", np.array([21.0, 23.0, 25.0, 19.0, 25.0, 20.0, 26.0]), {"units": "%"},
+                ),
+                "val_SOIL_MOISTURE": (
+                    "collocation", np.array([0.20, 0.22, 0.24, 20.0, 24.0, 0.25, 0.27]),
+                ),
+                "val_source": (
+                    "collocation",
+                    np.array([
+                        "cds_ssm", "cds_ssm", "cds_ssm", "ascat_ssm", "ascat_ssm", "ismn", "ismn",
+                    ]),
+                ),
+                "sar_scene_name": ("collocation", np.array(["sceneA"] * 7)),
+                "val_lon": ("collocation", np.array([2.0, 3.0, 4.0, 2.5, 3.5, 2.2, 3.2])),
+                "val_lat": ("collocation", np.array([47.0, 48.0, 49.0, 47.5, 48.5, 47.2, 48.2])),
+                "val_id": ("collocation", np.array(["c1", "c2", "c3", "a1", "a2", "i1", "i2"])),
+            },
+        )
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-01-01T12:00", periods=7, freq="5min")),
+        )
+        return datatree, collocation_ds
+
+    def _cds_stats(self, collocation_ds):
+        from sar_validation.core.statistics import compute_statistics
+
+        cds_only = collocation_ds.where(collocation_ds["val_source"] == "cds_ssm", drop=True)
+        return compute_statistics(cds_only, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
+
+    def test_cds_section_includes_a_summary_table(self, tmp_path):
+        from sar_validation.core.visualization import validation_report
+
+        recipe = self._recipe()
+        datatree, collocation_ds = self._datatree_and_collocation()
+        cds_stats = self._cds_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        figs = validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path,
+            cds_ssm_stats_ds_map={key: cds_stats},
+        )
+        assert key in figs
+
+        # plot_summary_table renders "Bias"/"Rmse"/"Correlation" column
+        # headers as cell text in an ax.table(...) -- look for them on a
+        # CDS-banner figure.
+        found_table = False
+        for fig in figs[key]:
+            banner_texts = [t.get_text() for t in fig.texts]
+            if not any("ESA Climate Change Initiative" in t for t in banner_texts):
+                continue
+            for ax in fig.axes:
+                cell_texts = {
+                    cell.get_text().get_text()
+                    for table in ax.tables
+                    for cell in table.get_celld().values()
+                }
+                if "Bias" in cell_texts and "Rmse" in cell_texts:
+                    found_table = True
+
+        assert found_table, "expected a CDS-section figure containing a Bias/Rmse summary table"
+
+    def test_cds_section_banner_reflects_active_product_type(self, tmp_path):
+        from sar_validation.core.visualization import validation_report
+
+        recipe = self._recipe(product_type="active")
+        datatree, collocation_ds = self._datatree_and_collocation()
+        cds_stats = self._cds_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        figs = validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path,
+            cds_ssm_stats_ds_map={key: cds_stats},
+        )
+        banner_texts = [t.get_text() for fig in figs[key] for t in fig.texts]
+        assert any("ACTIVE" in t and "ESA Climate Change Initiative" in t for t in banner_texts), (
+            f"expected an ACTIVE-labelled CDS banner; got: {banner_texts}"
+        )
+        assert not any("PASSIVE" in t for t in banner_texts)
+
+    def test_cds_section_banner_reflects_passive_product_type(self, tmp_path):
+        from sar_validation.core.visualization import validation_report
+
+        recipe = self._recipe(product_type="passive")
+        datatree, collocation_ds = self._datatree_and_collocation()
+        cds_stats = self._cds_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        figs = validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path,
+            cds_ssm_stats_ds_map={key: cds_stats},
+        )
+        banner_texts = [t.get_text() for fig in figs[key] for t in fig.texts]
+        assert any("PASSIVE" in t and "ESA Climate Change Initiative" in t for t in banner_texts), (
+            f"expected a PASSIVE-labelled CDS banner; got: {banner_texts}"
+        )
+        assert not any("ACTIVE" in t for t in banner_texts)
+
+    def test_cds_section_opening_page_names_satellites(self, tmp_path):
+        """The section's first page must carry a one-sentence description
+        of which satellites/sensors feed the product, so a reader
+        unfamiliar with the C3S CDS product knows what it actually is."""
+        from sar_validation.core.visualization import validation_report
+
+        recipe = self._recipe(product_type="active")
+        datatree, collocation_ds = self._datatree_and_collocation()
+        cds_stats = self._cds_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        figs = validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path,
+            cds_ssm_stats_ds_map={key: cds_stats},
+        )
+        all_texts = [t.get_text() for fig in figs[key] for t in fig.texts]
+        assert any("ASCAT" in t for t in all_texts), (
+            f"expected a sentence naming ASCAT (the active product's sensor) "
+            f"somewhere in the CDS section; got: {all_texts}"
         )
 
 
@@ -5723,12 +5920,13 @@ class TestCdfMatchedTitleSuffix:
         wind_key = "owiWindSpeed_vs_WSPD"
         assert wind_key in wind_figs and wind_figs[wind_key]
         assert not any(
-            any("CDF-matched" in t.get_text() for t in fig.texts)
+            any("Cumulative Distribution Function" in t.get_text() for t in fig.texts)
             for fig in wind_figs[wind_key]
         ), "wind (non-soil-moisture) report must not carry a CDF-matched banner"
 
         # Soil-moisture run: at least one figure must carry the real,
-        # rendered "(CDF-matched)" banner stamped via fig.text(...).
+        # rendered "(Cumulative Distribution Function-matched)" banner
+        # stamped via fig.text(...).
         sm_collocation_ds = collocation_ds.rename({
             "sar_owiWindSpeed": "sar_sarSSM", "val_WSPD": "val_SOIL_MOISTURE",
         }).assign(
@@ -5743,9 +5941,9 @@ class TestCdfMatchedTitleSuffix:
         sm_key = "sarSSM_vs_SOIL_MOISTURE"
         assert sm_key in sm_figs and sm_figs[sm_key]
         assert any(
-            any("CDF-matched" in t.get_text() for t in fig.texts)
+            any("Cumulative Distribution Function" in t.get_text() for t in fig.texts)
             for fig in sm_figs[sm_key]
-        ), "no soil_moisture figure carries a rendered '(CDF-matched)' banner"
+        ), "no soil_moisture figure carries a rendered CDF-matched banner"
 
 
 class TestValidationReportResidualsHistRange:
