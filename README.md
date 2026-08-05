@@ -180,7 +180,7 @@ plt.show()
 | HF Radar (delayed-mode/historical) | ocean currents | `hf_radar_historical_downloader` | Copernicus Marine | varies by platform |
 | HF Radar (US regions) | ocean currents | `hf_radar_us_downloader` | NOAA ERDDAP → NOAA THREDDS → Copernicus Marine (waterfall) | see HF Rader (NOAA HFRnet) |
 | HF Radar (NOAA HFRnet, rolling window) | ocean currents | `noaa_hfradar_downloader` | NOAA ERDDAP | 90 days rolling window |
-| HF Radar (NOAA HFRnet, full archive) | ocean currents | `noaa_hfradar_thredds_downloader` | NOAA NCEI THREDDS | 2006 - present (~1 month delay) |
+| HF Radar (NOAA HFRnet, full archive) | ocean currents | `noaa_hfradar_thredds_downloader` | NOAA NCEI THREDDS | 2006 - present (~1 month latency) |
 | ASCAT (MetOp-B/C) | wind | `scatterometer_downloader` | EUMETSAT EUMDAC | MetOp-B/C: 2012/2019 - present |
 | HY-2B / HY-2C / Oceansat-3 | wind | `scatterometer_ftp_downloader` | OSI-SAF FTP | last 3 days |
 | Radiometer — AMSR2 (NetCDF); GMI, SSMIS F16/F17/F18, WindSat (binary bytemaps) | wind (+ direction from WindSat) | `radiometer_downloader` | RSS `data.remss.com` (public HTTPS) | AMSR2/GMI/SSMIS F16/F17/F18: 2012-07-02/2014-03-04/2003-10-26/2006-11-04/2009-10-18 - present |
