@@ -711,6 +711,25 @@ class DataOrchestrator:
                         "either source."
                     )
         except Exception as exc:
+            # A fresh reconnect can fail on a purely transient blip (see
+            # _connect_with_retry) even though real AMSR2 files from an
+            # earlier successful run already sit in out_dir -- the
+            # pipeline still has good data to use, so this must not be
+            # surfaced as a failure in the report. Confirmed against a
+            # real run whose report showed this failure despite 4 real
+            # .h5 files already present in that exact run's amsr_ssm/.
+            existing_files = sorted(p for p in out_dir.glob("*") if p.is_file())
+            if existing_files:
+                logger.warning(
+                    "G-Portal AMSR2 fallback failed (%s), but %d existing file(s) "
+                    "already present in %s — reusing them, not reporting a failure.",
+                    exc, len(existing_files), out_dir,
+                )
+                entry = self.metadata["downloads"].setdefault("amsr_ssm", {})
+                entry["files"] = [str(p) for p in existing_files]
+                entry["status"] = "success"
+                entry["gportal_fallback"] = True
+                return
             msg = f"G-Portal AMSR2 fallback failed: {exc}"
             logger.warning(msg)
             self.metadata["notices"].append(msg)

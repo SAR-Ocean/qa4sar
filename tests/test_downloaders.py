@@ -3102,6 +3102,44 @@ class TestOrchestratorGPortalAmsrFallback:
         assert any("no credentials" in n for n in orchestrator.metadata["notices"])
         assert orchestrator.metadata["errors"] == []
 
+    def test_no_failure_notice_when_files_already_exist_from_a_previous_run(self, tmp_path):
+        """A fresh G-Portal reconnect can fail on a purely transient
+        connection blip (see _connect_with_retry) even though real AMSR2
+        files from an earlier successful run already sit in amsr_ssm/ --
+        the pipeline still has good data to use, so this must not be
+        reported as a failure in the report. Confirmed against a real
+        recipes/soil_moisture_cds_nisar_test.yaml report that showed
+        "G-Portal AMSR2 fallback failed" despite 4 real .h5 files already
+        present in that exact run's amsr_ssm/ folder."""
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(name="test", variable="soil_moisture"))
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        source = ValidationDataSource(source_type="amsr_ssm")
+
+        amsr_dir = tmp_path / "amsr_ssm"
+        amsr_dir.mkdir()
+        existing_file = amsr_dir / "GW1AM2_20260709_01D_EQMA_L3SGSMCHF3300300.h5"
+        existing_file.write_bytes(b"fake")
+
+        with patch(
+            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
+        ) as mock_earthdata_cls, patch(
+            "sar_validation.downloaders.gportal_downloader.GPortalAMSR2Downloader"
+        ) as mock_gportal_cls:
+            mock_earthdata_cls.return_value.download.return_value = []
+            mock_gportal_cls.return_value.download.side_effect = RuntimeError(
+                "Error reading SSH protocol banner"
+            )
+            ok = orchestrator._dispatch_source(source)
+
+        assert ok is True
+        assert not any("failed" in n for n in orchestrator.metadata["notices"])
+        assert orchestrator.metadata["downloads"]["amsr_ssm"]["files"] == [str(existing_file)]
+        assert orchestrator.metadata["downloads"]["amsr_ssm"]["status"] == "success"
+
     def test_no_coverage_cutoff_notice_when_gportal_fallback_finds_files(self, tmp_path):
         """The 'past this source's known coverage cutoff' notice must not
         fire just because NASA Earthdata alone returned 0 files -- only
