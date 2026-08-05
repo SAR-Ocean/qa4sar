@@ -21,11 +21,6 @@ class TestConstruction:
         with pytest.raises(ValueError, match="Unknown instrument"):
             InSituCurrentsHistoricalDownloader(instrument="mooring", output_dir=tmp_path)
 
-    @pytest.mark.parametrize("instrument,dataset_id", sorted(_DATASET_IDS.items()))
-    def test_each_instrument_maps_to_its_dataset_id(self, instrument, dataset_id, tmp_path):
-        dl = InSituCurrentsHistoricalDownloader(instrument=instrument, output_dir=tmp_path)
-        assert _DATASET_IDS[dl.instrument] == dataset_id
-
 
 class TestRecencyGuard:
     def test_recent_end_date_returns_empty_without_touching_network(self, tmp_path, caplog):
@@ -90,7 +85,7 @@ class TestSubsetCall:
         assert fake_module.subset.call_args.kwargs["variables"] == ["EWCT", "NSCT"]
         assert fake_module.subset.call_args.kwargs["dataset_id"] == _DATASET_IDS["glider"]
 
-    def test_force_download_kwarg_never_passed_to_subset(self, tmp_path):
+    def test_force_download_kwarg_never_passed_and_result_path_returned(self, tmp_path):
         from pathlib import Path
 
         now = datetime.now(timezone.utc)
@@ -107,10 +102,12 @@ class TestSubsetCall:
 
         fake_module.subset.side_effect = fake_subset
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
-            dl.download(_MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT, start, end)
+            out = dl.download(_MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT, start, end)
 
         assert "force_download" not in fake_module.subset.call_args.kwargs
         assert fake_module.subset.call_args.kwargs["skip_existing"] is True
+        assert len(out) == 1
+        assert out[0].exists()
 
     def test_empty_subset_result_returns_empty_and_removes_file(self, tmp_path, caplog):
         from pathlib import Path
@@ -171,28 +168,6 @@ class TestSubsetCall:
         assert out == []
         assert list(tmp_path.glob("*.csv")) == []
         assert any("adcp" in r.message and "No" in r.message for r in caplog.records)
-
-    def test_nonempty_subset_result_still_returns_the_path(self, tmp_path):
-        from pathlib import Path
-
-        now = datetime.now(timezone.utc)
-        end = (now - timedelta(days=200)).strftime("%Y-%m-%d")
-        start = (now - timedelta(days=201)).strftime("%Y-%m-%d")
-
-        dl = InSituCurrentsHistoricalDownloader(instrument="drifter", output_dir=tmp_path)
-        fake_module = MagicMock()
-
-        def fake_subset(**kwargs):
-            Path(kwargs["output_directory"], kwargs["output_filename"]).write_text(
-                "time,EWCT,NSCT\n2024-01-01T00:00:00,0.1,0.2\n"
-            )
-
-        fake_module.subset.side_effect = fake_subset
-        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
-            out = dl.download(_MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT, start, end)
-
-        assert len(out) == 1
-        assert out[0].exists()
 
 
 class TestForceDownload:
