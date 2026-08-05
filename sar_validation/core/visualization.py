@@ -112,18 +112,15 @@ __all__ = [
 # two differ in lightness) — this is what made scatterometer's matched
 # points look gray once it landed on the (then-)black slot below. Must
 # have at least as many entries as _canonical_source_order() returns
-# (currently 12, after radiometer_ssm/scatterometer_ssm joined
-# LAYER_DATA_TYPES for satellite soil moisture): a shorter palette wraps
-# and silently reassigns two unrelated sources (e.g. tidal gauge landing
-# back on altimeter's blue circle) — see the "matched tidal gauge and
-# altimeter look identical" bug this comment documents. Because slots are
-# assigned by *alphabetical position* in the combined canonical set, adding
-# a new source name can shift every alphabetically-later source onto a
-# different color than before -- this has now broken twice (once when
-# radiometer_ssm/scatterometer_ssm were added, moving plain "scatterometer"
-# off its original olive slot and onto the black one) - if a new
-# LAYER_DATA_TYPES/​_INSITU_TYPES entry is ever added, re-check every
-# existing slot for a newly-introduced grayscale collision, not just count.
+# (currently 13): a shorter palette wraps and silently reassigns two
+# unrelated sources (e.g. tidal gauge landing back on altimeter's blue
+# circle) — see the "matched tidal gauge and altimeter look identical" bug
+# this comment documents. Slots are assigned by *list position* in
+# _CANONICAL_SOURCE_ORDER below, which is append-only (see that list's own
+# comment) — so adding a new source can no longer shift any existing
+# source's color the way alphabetical sorting used to (this broke the
+# palette 3 times before the order was made append-only: see git history
+# around radiometer_ssm/scatterometer_ssm and cds_ssm being added).
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#17becf",
@@ -137,6 +134,24 @@ _SOURCE_COLORS = [
 # offset instead of by source).
 _SOURCE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<", ">"]
 
+# Fixed, append-only reference order for known validation source/platform
+# types. Each name's *list position* is its permanent color/marker slot
+# (see _source_style_map) — this used to be computed as
+# ``sorted(LAYER_DATA_TYPES | _INSITU_TYPES)``, which silently reshuffled
+# every alphabetically-later source's color whenever a new source name was
+# added anywhere in those two sets (happened 3 times: radiometer_ssm,
+# scatterometer_ssm, cds_ssm). A new source type must be appended at the
+# END of this list, never inserted alphabetically — _canonical_source_order
+# raises loudly if this list ever drifts out of sync with
+# LAYER_DATA_TYPES | _INSITU_TYPES, so a forgotten entry fails a test
+# instead of silently reassigning colors.
+_CANONICAL_SOURCE_ORDER = [
+    "altimeter", "buoy", "drifter", "ferrybox", "hf_radar", "hf_radar_grid",
+    "mooring", "radiometer", "radiometer_ssm", "scatterometer",
+    "scatterometer_ssm", "tidal_gauge",
+    "cds_ssm",
+]
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -148,18 +163,32 @@ def _source_color_map(sources: List[str]) -> Dict[str, str]:
 
 def _canonical_source_order() -> List[str]:
     """
-    Fixed, alphabetically-sorted reference order for known validation
-    source/platform types, built from the two canonical sets already
-    maintained elsewhere in the codebase (avoids introducing a third list
-    that could drift out of sync):
+    Fixed, append-only reference order for known validation source/platform
+    types — see ``_CANONICAL_SOURCE_ORDER``'s module-level comment for why
+    this must never be a sort.
 
-    * ``LAYER_DATA_TYPES`` (collocation.py) — scatterometer/altimeter/etc.
-    * ``_INSITU_TYPES`` (orchestrator.py) — mooring/buoy/etc.
+    Validates that ``_CANONICAL_SOURCE_ORDER`` still has exactly the same
+    *members* as the two canonical sets maintained elsewhere in the
+    codebase (``LAYER_DATA_TYPES`` in collocation.py and ``_INSITU_TYPES``
+    in orchestrator.py), so a new source type added to either set without
+    also being appended to ``_CANONICAL_SOURCE_ORDER`` fails loudly here
+    instead of silently reshuffling every other source's color.
     """
     from .collocation import LAYER_DATA_TYPES  # noqa: PLC0415
     from .orchestrator import _INSITU_TYPES  # noqa: PLC0415
 
-    return sorted(LAYER_DATA_TYPES | _INSITU_TYPES)
+    registered = set(LAYER_DATA_TYPES) | set(_INSITU_TYPES)
+    known = set(_CANONICAL_SOURCE_ORDER)
+    if registered != known:
+        missing = sorted(registered - known)
+        extra = sorted(known - registered)
+        raise AssertionError(
+            "visualization._CANONICAL_SOURCE_ORDER is out of sync with "
+            "LAYER_DATA_TYPES | _INSITU_TYPES. Append new entries "
+            f"{missing} to the END of _CANONICAL_SOURCE_ORDER; remove "
+            f"stale entries {extra}. Never reorder existing entries."
+        )
+    return list(_CANONICAL_SOURCE_ORDER)
 
 
 def _source_style_map(sources: List[str]) -> Dict[str, Tuple[str, str]]:
@@ -3390,6 +3419,27 @@ def validation_report(
             _, harmonized_sources, _ = _harmonize_percent_domain_sources(pair_ds, sar_var, val_var)
             pair_ds = add_rescaled_sar_column(pair_ds, sar_var, val_var)
 
+        # cds_ssm gets its own dedicated section further below
+        # (run_statistics_cds_ssm — no CDF matching) and must not also leak
+        # into this main CDF-matched section's plots. run_statistics()
+        # already excludes it from the CDF-matched stats table/bar charts
+        # (stats_ds_map), but the geographic/scatter/residuals plots below
+        # build straight from the raw collocation rows, which still carry
+        # cds_ssm — confirmed missing against a real
+        # recipes/soil_moisture_cds_sentinel_test.yaml run (cds_ssm rows
+        # showed up as their own subplot in the "(CDF-matched)" scatter/
+        # residuals pages even though the stats table correctly omitted
+        # them). Must not reassign pair_ds/geo_pair_ds themselves: the
+        # native-units section below is already cds_ssm-free by
+        # construction (restricted to native_units_stats_ds_map's own
+        # source list), but the C3S CDS section further below needs the
+        # *unfiltered* geo_pair_ds to select its own cds_ssm rows from.
+        cdf_pair_ds, cdf_geo_pair_ds = pair_ds, geo_pair_ds
+        if variable == "soil_moisture" and "val_source" in pair_ds \
+                and bool((pair_ds["val_source"] == "cds_ssm").any()):
+            cdf_pair_ds = pair_ds.where(pair_ds["val_source"] != "cds_ssm", drop=True)
+            cdf_geo_pair_ds = geo_pair_ds.where(geo_pair_ds["val_source"] != "cds_ssm", drop=True)
+
         logger.info("Generating plots for %s vs %s …", sar_var, val_var)
 
         # Geographic — returns dict[collocation_type, Figure] by default.
@@ -3448,7 +3498,7 @@ def validation_report(
             else:
                 geo_point_size = 40
             geo_result = plot_geographic(
-                datatree, geo_pair_ds, sar_var, val_var, scenes=matched_scenes,
+                datatree, cdf_geo_pair_ds, sar_var, val_var, scenes=matched_scenes,
                 point_size=geo_point_size,
                 geographic_bounds=(
                     recipe.config.geographic_bounds if geo_clamp_bounds else None
@@ -3482,7 +3532,7 @@ def validation_report(
         # busy even when no single source dominates by point count
         # (confirmed against real data, soil_moisture_satellite_example).
         force_split = bool(harmonized_sources)
-        fig_scatter = plot_scatter(pair_ds, sar_var, val_var, force_split=force_split)
+        fig_scatter = plot_scatter(cdf_pair_ds, sar_var, val_var, force_split=force_split)
         if fig_scatter is not None:
             if cdf_matched_suffix:
                 fig_scatter = _mark_cdf_matched(fig_scatter)
@@ -3514,9 +3564,9 @@ def validation_report(
 
         # Residuals
         fig_res = plot_residuals(
-            pair_ds, sar_var, val_var,
+            cdf_pair_ds, sar_var, val_var,
             hist_range=(
-                _volumetric_hist_range_overrides(pair_ds) or None
+                _volumetric_hist_range_overrides(cdf_pair_ds) or None
                 if cdf_matched_suffix else None
             ),
         )

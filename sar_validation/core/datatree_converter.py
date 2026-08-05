@@ -3118,6 +3118,7 @@ class DataTreeConverter:
         - ``amsr_ssm/*.h5``             → ``validation/amsr_ssm/<stem>`` nodes
         - ``smap_ssm/*.h5``             → ``validation/smap_ssm/<stem>`` nodes
         - ``smos_ssm/*.nc``             → ``validation/smos_ssm/<stem>`` nodes
+        - ``cds_ssm/*.nc``              → ``validation/cds_ssm/<stem>`` nodes
         - ``altimeter/*.nc``           → ``validation/altimeter/<stem>`` nodes
 
         Parameters
@@ -3340,6 +3341,27 @@ class DataTreeConverter:
                 if ds is not None:
                     datasets[f"validation/smos_ssm/{f.stem}"] = ds
                     logger.info("Converted SMOS SSM: %s", f.name)
+
+        # C3S CDS satellite soil moisture (Copernicus Climate Data Store,
+        # global 0.25° daily grid, NetCDF). product_type ("active"/
+        # "passive"/"combined") comes from the recipe's cds_ssm validation
+        # source download_kwargs -- the same channel the orchestrator reads
+        # to build the download request -- so units stay consistent with
+        # what was actually downloaded. Defaults to "active" (matching
+        # _download_cds_ssm's own default) when no recipe is given.
+        subdir = base_dir / "cds_ssm"
+        if subdir.exists():
+            cds_product_type = "active"
+            if recipe is not None:
+                for src in recipe.config.validation_sources:
+                    if src.source_type == "cds_ssm":
+                        cds_product_type = src.download_kwargs.get("product_type", "active")
+                        break
+            for f in sorted(subdir.glob("*.nc")):
+                ds = _filtered(DataTreeConverter.from_c3s_ssm(f, cds_product_type), f.name)
+                if ds is not None:
+                    datasets[f"validation/cds_ssm/{f.stem}"] = ds
+                    logger.info("Converted C3S CDS SSM: %s", f.name)
 
         # NOAA HFRnet gridded RTV currents (flattened to points, tagged
         # hf_radar_grid). Domain-filtered like the scatterometer path.

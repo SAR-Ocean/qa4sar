@@ -19,6 +19,7 @@ from sar_validation.core.recipe import (
     Recipe,
     RecipeConfig,
     TemporalBounds,
+    ValidationDataSource,
 )
 
 # ---------------------------------------------------------------------------
@@ -2645,3 +2646,63 @@ class TestFromC3sSsm:
 
         result = DataTreeConverter.from_c3s_ssm(nc_path, "active")
         assert result is None
+
+
+def _make_c3s_ssm_nc_at(tmp_path: Path, subdir_name: str = "cds_ssm") -> Path:
+    """A minimal C3S CDS SSM NetCDF, same shape convert_downloaded_data's
+    cds_ssm discovery loop must find (see from_c3s_ssm's docstring)."""
+    cds_dir = tmp_path / subdir_name
+    cds_dir.mkdir(parents=True, exist_ok=True)
+    lat = np.array([50.0, 50.25])
+    lon = np.array([10.0, 10.25])
+    sm_vals = np.array([[35.0, 40.0], [42.0, 38.0]], dtype=float)
+    time_dim = np.array(["2026-01-01"], dtype="datetime64[ns]")
+    ds = xr.Dataset(
+        {"sm": (("time", "lat", "lon"), sm_vals[np.newaxis, :, :])},
+        coords={"time": time_dim, "lat": lat, "lon": lon},
+    )
+    path = cds_dir / "c3s_ssm_20260101.nc"
+    ds.to_netcdf(path)
+    return path
+
+
+class TestConvertDownloadedDataCdsSsm:
+    """convert_downloaded_data must discover and convert cds_ssm/*.nc files
+    into validation/cds_ssm/<stem> nodes, same as its sibling *_ssm sources
+    -- otherwise CDSSoilMoistureDownloader's output is never reachable by
+    collocation/statistics/the PDF report despite from_c3s_ssm itself
+    working correctly in isolation."""
+
+    def test_cds_ssm_file_is_discovered_and_converted(self, tmp_path):
+        nc_path = _make_c3s_ssm_nc_at(tmp_path)
+
+        tree = DataTreeConverter.convert_downloaded_data(tmp_path)
+
+        assert tree is not None
+        node_paths = [node.path for node in tree.subtree]
+        assert any(p.endswith(f"validation/cds_ssm/{nc_path.stem}") for p in node_paths)
+
+    def test_product_type_from_recipe_download_kwargs_is_honored(self, tmp_path):
+        """When a recipe's cds_ssm source specifies product_type='passive',
+        the converted node must carry passive (m3 m-3) units, not the
+        'active' default."""
+        _make_c3s_ssm_nc_at(tmp_path)
+        recipe = Recipe(RecipeConfig(
+            name="cds-ssm-passive-test",
+            variable="soil_moisture",
+            geographic_bounds=GeographicBounds(0.0, 20.0, 40.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[
+                ValidationDataSource(
+                    source_type="cds_ssm",
+                    download_kwargs={"product_type": "passive"},
+                ),
+            ],
+        ))
+
+        tree = DataTreeConverter.convert_downloaded_data(tmp_path, recipe=recipe)
+
+        assert tree is not None
+        (node,) = tree["validation/cds_ssm"].children.values()
+        ds = node.to_dataset()
+        assert ds["SOIL_MOISTURE"].attrs["units"] == "m3 m-3"

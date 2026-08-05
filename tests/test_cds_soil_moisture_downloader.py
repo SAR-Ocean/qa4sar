@@ -36,6 +36,57 @@ class TestCDSSoilMoistureDownloaderDryRun:
         assert paths[0].name == "c3s_ssm_active_20260101.nc"
 
 
+class TestCDSSoilMoistureDownloaderDateRangeBoundary:
+    """Reproduces a real pipeline bug: a recipe's padded collocation window
+    (built by orchestrator._padded_temporal_bounds, which always returns a
+    full datetime, never a bare date) can extend a few hours into the next
+    calendar day even when the literal recipe end time doesn't -- e.g. a
+    19:00-20:00 SAR pass with a 360-minute tolerance pads out to 02:00 the
+    next day. The day that padded end datetime falls on must still be
+    downloaded, or every point in that source's only file lands outside the
+    later collocation time-filter and the whole source silently vanishes
+    from the report -- confirmed against a real
+    recipes/soil_moisture_cds_nisar_test.yaml run where only
+    c3s_ssm_passive_20260709.nc was fetched despite the padded window
+    reaching into 2026-07-10."""
+
+    def test_padded_end_crossing_midnight_includes_the_next_day(self, tmp_path, monkeypatch):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        requested_days: list[date] = []
+
+        def fake_download_day(self, day):
+            requested_days.append(day)
+            return None
+
+        monkeypatch.setattr(CDSSoilMoistureDownloader, "_download_day", fake_download_day)
+
+        dl = CDSSoilMoistureDownloader(product_type="passive", output_dir=tmp_path)
+        dl.download(
+            min_lon=-10.0, max_lon=30.0, min_lat=35.0, max_lat=60.0,
+            start="2026-07-09T13:00:00", end="2026-07-10T02:00:00",
+        )
+
+        assert requested_days == [date(2026, 7, 9), date(2026, 7, 10)]
+
+    def test_end_exactly_on_a_day_boundary_still_includes_that_day(self, tmp_path, monkeypatch):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        requested_days: list[date] = []
+        monkeypatch.setattr(
+            CDSSoilMoistureDownloader, "_download_day",
+            lambda self, day: requested_days.append(day) or None,
+        )
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        dl.download(
+            min_lon=-10.0, max_lon=30.0, min_lat=35.0, max_lat=60.0,
+            start="2026-07-09T00:00:00", end="2026-07-09T00:00:00",
+        )
+
+        assert requested_days == [date(2026, 7, 9)]
+
+
 class TestCDSSoilMoistureDownloaderNcPath:
     def test_nc_path_naming_active(self, tmp_path):
         from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
@@ -85,6 +136,37 @@ class TestCDSSoilMoistureDownloaderBuildRequest:
         dl = CDSSoilMoistureDownloader(product_type="combined", output_dir=tmp_path)
         req = dl._build_request(date(2020, 1, 1))
         assert req["type_of_sensor"] == ["combined"]
+
+    def test_build_request_active_uses_saturation_variable(self, tmp_path):
+        """ASCAT ('active') soil moisture is percent-saturation, not
+        volumetric -- confirmed against CDS's own live constraints.json
+        (https://cds.climate.copernicus.eu/api/catalogue/v1/collections/
+        satellite-soil-moisture/constraints.json): every active+daily+icdr
+        combination requires variable='surface_soil_moisture_saturation',
+        never '..._volumetric'. Requesting the volumetric variable for
+        'active' is rejected by the live API with a 400 Bad Request --
+        confirmed live, this exact request previously downloaded 0 files
+        for every 'active' day with no error surfaced past a WARNING log,
+        silently starving Sentinel-1 CLMS SSM recipes of C3S CDS data."""
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        req = dl._build_request(date(2026, 3, 15))
+        assert req["variable"] == ["surface_soil_moisture_saturation"]
+
+    def test_build_request_passive_uses_volumetric_variable(self, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        dl = CDSSoilMoistureDownloader(product_type="passive", output_dir=tmp_path)
+        req = dl._build_request(date(2026, 3, 15))
+        assert req["variable"] == ["surface_soil_moisture_volumetric"]
+
+    def test_build_request_combined_uses_volumetric_variable(self, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        dl = CDSSoilMoistureDownloader(product_type="combined", output_dir=tmp_path)
+        req = dl._build_request(date(2026, 3, 15))
+        assert req["variable"] == ["surface_soil_moisture_volumetric"]
 
 
 class TestCDSSoilMoistureDownloaderExtractNc:

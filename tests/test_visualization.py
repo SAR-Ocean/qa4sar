@@ -856,6 +856,65 @@ class TestSourceStyleMap:
         assert style_lower["altimeter"] == style_title["Altimeter"]
 
 
+class TestCanonicalSourceOrderStability:
+    """_canonical_source_order() must assign each known source a permanent
+    list-position slot, appended-only, rather than re-sorting alphabetically
+    -- alphabetical sorting silently reshuffles every alphabetically-later
+    source's color/marker whenever a new source name is added anywhere in
+    LAYER_DATA_TYPES/_INSITU_TYPES (this has broken the palette 3+ times;
+    see the _SOURCE_COLORS module comment)."""
+
+    # Pre-cds_ssm registration order -- the order these 12 source types
+    # already had (as plain alphabetical order) before cds_ssm joined
+    # LAYER_DATA_TYPES. Every one of these must keep this exact slot
+    # forever; only newly-registered types may be appended after them.
+    _PRE_EXISTING_ORDER = [
+        "altimeter", "buoy", "drifter", "ferrybox", "hf_radar", "hf_radar_grid",
+        "mooring", "radiometer", "radiometer_ssm", "scatterometer",
+        "scatterometer_ssm", "tidal_gauge",
+    ]
+
+    def test_pre_existing_sources_keep_their_original_slots(self):
+        from sar_validation.core.visualization import _canonical_source_order
+
+        canonical = _canonical_source_order()
+        assert canonical[: len(self._PRE_EXISTING_ORDER)] == self._PRE_EXISTING_ORDER
+
+    def test_newly_registered_source_is_appended_not_inserted(self):
+        # cds_ssm sorts alphabetically between "buoy" and "drifter"; a
+        # correct append-only order must NOT place it there.
+        from sar_validation.core.visualization import _canonical_source_order
+
+        canonical = _canonical_source_order()
+        assert canonical.index("cds_ssm") == len(self._PRE_EXISTING_ORDER)
+
+    def test_pre_existing_sources_keep_their_original_color_and_marker(self):
+        from sar_validation.core.visualization import _source_style_map
+
+        style = _source_style_map(self._PRE_EXISTING_ORDER)
+        pairs = [style[name] for name in self._PRE_EXISTING_ORDER]
+        assert pairs == [
+            ("#1f77b4", "o"), ("#ff7f0e", "s"), ("#2ca02c", "^"), ("#d62728", "D"),
+            ("#9467bd", "v"), ("#8c564b", "P"), ("#e377c2", "X"), ("#17becf", "*"),
+            ("#f032e6", "h"), ("#e6194b", "p"), ("#000080", "8"), ("#ffff00", "<"),
+        ]
+
+    def test_raises_when_order_list_drifts_out_of_sync_with_registered_sets(self, monkeypatch):
+        # If a new source type is ever added to LAYER_DATA_TYPES/_INSITU_TYPES
+        # without appending it to _canonical_source_order's fixed list, that
+        # must fail loudly (a test/CI-visible error) rather than silently
+        # falling back to a reshuffling sort.
+        import sar_validation.core.collocation as collocation_mod
+        import sar_validation.core.visualization as viz_mod
+
+        monkeypatch.setattr(
+            collocation_mod, "LAYER_DATA_TYPES",
+            collocation_mod.LAYER_DATA_TYPES | {"some_brand_new_layer_type"},
+        )
+        with pytest.raises(AssertionError, match="some_brand_new_layer_type"):
+            viz_mod._canonical_source_order()
+
+
 class TestPlotGeographic:
     def test_distinct_sources_get_distinct_markers(self, geo_datatree_and_collocation, monkeypatch):
         import matplotlib.axes
@@ -5360,6 +5419,127 @@ class TestValidationReportNativeUnitsSection:
         figs = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
 
         assert "sarSSM_vs_SOIL_MOISTURE" in figs
+
+
+class TestValidationReportMainSectionExcludesCdsSsm:
+    """cds_ssm is deliberately excluded from run_statistics()'s CDF-matched
+    pass and gets its own separate '— C3S CDS SSM —' section instead (see
+    run_statistics_cds_ssm) -- confirmed live against a real recipe run
+    that validation_statistics_*.nc (no suffix) correctly omits cds_ssm.
+    But the main section's geographic/scatter/residuals plots build
+    straight from the raw collocation_ds (unlike the summary
+    table/statistics bar charts, which correctly read from the already-
+    cds_ssm-free stats_ds_map), so cds_ssm rows leaked into the
+    "(CDF-matched)" plots even though the numeric stats were correct --
+    confirmed against a real recipes/soil_moisture_cds_sentinel_test.yaml
+    run."""
+
+    @staticmethod
+    def _recipe():
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
+
+        cfg = RecipeConfig(
+            name="test_cds_ssm_excluded_from_main_section", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        )
+        return Recipe(config=cfg)
+
+    def test_cds_ssm_rows_absent_from_cdf_matched_scatter(self, tmp_path):
+        from sar_validation.core.statistics import compute_statistics
+        from sar_validation.core.visualization import validation_report
+
+        recipe = self._recipe()
+        datatree = xr.DataTree.from_dict({
+            "validation/ascat_ssm/f1": xr.Dataset(
+                {"SOIL_MOISTURE": ("point", np.array([25.0, 35.0]))},
+                coords={
+                    "lon": ("point", [0.0, 1.0]), "lat": ("point", [45.0, 46.0]),
+                    "time": ("point", np.array(["2026-01-01"] * 2, dtype="datetime64[ns]")),
+                },
+            ),
+            "validation/ismn/f1": xr.Dataset(
+                {"SOIL_MOISTURE": ("point", np.array([0.30, 0.32]))},
+                coords={
+                    "lon": ("point", [5.0, 6.0]), "lat": ("point", [50.0, 51.0]),
+                    "time": ("point", np.array(["2026-01-01"] * 2, dtype="datetime64[ns]")),
+                },
+            ),
+            "validation/cds_ssm/f1": xr.Dataset(
+                {"SOIL_MOISTURE": ("point", np.array([0.20, 0.22, 0.24]))},
+                coords={
+                    "lon": ("point", [2.0, 3.0, 4.0]), "lat": ("point", [47.0, 48.0, 49.0]),
+                    "time": ("point", np.array(["2026-01-01"] * 3, dtype="datetime64[ns]")),
+                },
+            ),
+        })
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": (
+                    "collocation", np.array([20.0, 30.0, 31.0, 33.0, 21.0, 23.0, 25.0]), {"units": "%"},
+                ),
+                "val_SOIL_MOISTURE": (
+                    "collocation", np.array([25.0, 35.0, 0.30, 0.32, 0.20, 0.22, 0.24]),
+                ),
+                "val_source": (
+                    "collocation",
+                    np.array([
+                        "ascat_ssm", "ascat_ssm", "ismn", "ismn",
+                        "cds_ssm", "cds_ssm", "cds_ssm",
+                    ]),
+                ),
+                "val_id": ("collocation", np.array(["a1", "a2", "i1", "i2", "c1", "c2", "c3"])),
+            },
+        )
+
+        # Sanity check: run_statistics itself already excludes cds_ssm
+        # (this is the behavior the main-section plots must now match).
+        stats = compute_statistics(
+            collocation_ds.where(collocation_ds["val_source"] != "cds_ssm", drop=True),
+            "sarSSM", "SOIL_MOISTURE", group_by=["val_source"],
+        )
+        assert set(stats["source"].values) == {"ascat_ssm", "ismn"}
+        stats_map = {"sarSSM_vs_SOIL_MOISTURE": stats}
+
+        key = "sarSSM_vs_SOIL_MOISTURE"
+        figs = validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path, stats_ds_map=stats_map,
+        )
+        assert key in figs
+
+        # Collect every piece of text rendered anywhere on each
+        # "(CDF-matched)"-banner figure (figure-level text, axes titles,
+        # axes-level annotations, legend labels) -- robust to whether
+        # plot_scatter renders one shared axes or splits into one
+        # small-multiple subplot per source (force_split, triggered here
+        # since ascat_ssm gets CDF-harmonized into ismn's domain), unlike
+        # scraping a specific "N=..." annotation format that only exists
+        # in the unified-axes layout.
+        cdf_matched_fig_found = False
+        all_cdf_text = []
+        for fig in figs[key]:
+            banner_texts = [t.get_text() for t in fig.texts]
+            if not any("(CDF-matched)" in t for t in banner_texts):
+                continue
+            cdf_matched_fig_found = True
+            all_cdf_text.extend(banner_texts)
+            for ax in fig.axes:
+                all_cdf_text.append(ax.get_title())
+                all_cdf_text.extend(t.get_text() for t in ax.texts)
+                legend = ax.get_legend()
+                if legend is not None:
+                    all_cdf_text.extend(t.get_text() for t in legend.get_texts())
+
+        assert cdf_matched_fig_found, "expected at least one '(CDF-matched)' figure"
+        assert any("ascat_ssm" in t for t in all_cdf_text), (
+            "sanity check failed: ascat_ssm should still appear in the "
+            "CDF-matched section"
+        )
+        assert not any("cds_ssm" in t for t in all_cdf_text), (
+            f"cds_ssm must not appear anywhere in the CDF-matched section "
+            f"(it gets its own separate '— C3S CDS SSM —' section); found "
+            f"it in: {[t for t in all_cdf_text if 'cds_ssm' in t]}"
+        )
 
 
 class TestValidationReportNativeUnitsGeographic:

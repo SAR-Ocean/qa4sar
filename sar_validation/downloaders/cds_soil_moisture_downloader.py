@@ -62,6 +62,22 @@ _CDS_VERSION = "v202505"
 
 ProductType = Literal["active", "passive", "combined"]
 
+#: CDS's ``satellite-soil-moisture`` dataset uses a different ``variable``
+#: facet per sensor type -- confirmed live against the dataset's own
+#: constraints.json (https://cds.climate.copernicus.eu/api/catalogue/v1/
+#: collections/satellite-soil-moisture/constraints.json): every
+#: ``type_of_sensor: active`` combination requires
+#: ``surface_soil_moisture_saturation`` (percent saturation, matching
+#: ASCAT's native unit), never ``..._volumetric``; ``passive``/``combined``
+#: both require ``surface_soil_moisture_volumetric`` (m3 m-3). Requesting
+#: the volumetric variable for ``active`` is rejected by the live API with
+#: a 400 Bad Request.
+_CDS_VARIABLE_BY_PRODUCT_TYPE: dict[str, str] = {
+    "active": "surface_soil_moisture_saturation",
+    "passive": "surface_soil_moisture_volumetric",
+    "combined": "surface_soil_moisture_volumetric",
+}
+
 
 class CDSSoilMoistureDownloader:
     """
@@ -110,9 +126,17 @@ class CDSSoilMoistureDownloader:
         end: str,
     ) -> list[Path]:
         """
-        Download daily CDS soil moisture files for the date range
-        [*start*, *end*) (end-exclusive, matching the convention used
-        across the toolbox).
+        Download daily CDS soil moisture files for every calendar day in
+        [*start_date*, *end_date*] (inclusive of both boundary days, where
+        each is *start*/*end* truncated to a bare date) -- matching
+        ``SMOSDownloader``/``RadiometerDownloader``'s own day-loop
+        convention. *start*/*end* are typically full datetimes padded by
+        the orchestrator's collocation-tolerance padding (see
+        ``_padded_temporal_bounds``), which routinely extends a few hours
+        into the day after the recipe's literal end time -- since only the
+        date portion survives truncation, that boundary day must still be
+        included or a whole day's worth of otherwise-in-tolerance points
+        silently never gets downloaded.
 
         Parameters
         ----------
@@ -134,7 +158,7 @@ class CDSSoilMoistureDownloader:
 
         downloaded: list[Path] = []
         day = start_date
-        while day < end_date:
+        while day <= end_date:
             nc_path = self._nc_path_for_day(day)
             if nc_path.exists():
                 logger.info("  %s: already present (%s), skipping.", day.isoformat(), nc_path.name)
@@ -166,7 +190,7 @@ class CDSSoilMoistureDownloader:
         """Build the cdsapi request dict for a single *day*."""
         # The CDS API requires month/day as zero-padded strings.
         return {
-            "variable": ["surface_soil_moisture_volumetric"],
+            "variable": [_CDS_VARIABLE_BY_PRODUCT_TYPE[self.product_type]],
             "type_of_sensor": [self.product_type],
             "time_aggregation": ["daily"],
             "year": [str(day.year)],
@@ -243,7 +267,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-lat", type=float, required=True)
     p.add_argument("--max-lat", type=float, required=True)
     p.add_argument("--start", required=True, help="Start date (ISO-8601).")
-    p.add_argument("--end", required=True, help="End date (ISO-8601, exclusive).")
+    p.add_argument("--end", required=True, help="End date (ISO-8601, inclusive).")
     p.add_argument("--output-dir", type=Path, default=None,
                    help="Output directory (default: data/<timerange>_<bounds>/cds_ssm).")
     p.add_argument("--dry-run", action="store_true")
