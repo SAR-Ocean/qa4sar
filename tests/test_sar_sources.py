@@ -159,6 +159,35 @@ class TestNisarSme2RegistryEntry:
         assert kwargs["output_dir"] == tmp_path
         assert kwargs["dry_run"] is False
 
+    def test_build_downloader_queries_both_beta_and_provisional_collections(self, tmp_path):
+        """NISAR SME2's underlying CMR collection changed mid-mission with
+        no temporal overlap (confirmed against real CMR data and a
+        real-world coverage gap a user hit) -- both must be passed to
+        EarthdataSoilMoistureDownloader so a request can find data from
+        either era."""
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        spec = SAR_SOURCES["nisar_sme2"]
+        with patch(
+            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
+        ) as mock_cls:
+            mock_cls.return_value = MagicMock()
+            spec.build_downloader(tmp_path, False, True)
+        _, kwargs = mock_cls.call_args
+        assert kwargs["dataset"] == [
+            ("NISAR_L3_SME2_BETA_V1", "1"),
+            ("NISAR_L3_SME2_PROVISIONAL_V1", "1"),
+        ]
+
+    def test_extra_download_kwargs_passes_through_download_kwargs_only(self):
+        from sar_validation.core.recipe import SARDataSpec
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        spec = SAR_SOURCES["nisar_sme2"]
+        sd = SARDataSpec(source="nisar_sme2", swath_mode=["IW"], download_kwargs={"version": "001"})
+        kwargs = spec.extra_download_kwargs(sd)
+        assert kwargs == {"version": "001"}
+
 
 class TestSarSourceSatelliteField:
     """Each registry entry records which satellite family it belongs to,
@@ -213,32 +242,3 @@ class TestResolveSarSource:
 
         with pytest.raises(ValueError, match=match):
             resolve_sar_source(name, variable)
-
-    def test_build_downloader_queries_both_beta_and_provisional_collections(self, tmp_path):
-        """NISAR SME2's underlying CMR collection changed mid-mission with
-        no temporal overlap (confirmed against real CMR data and a
-        real-world coverage gap a user hit) -- both must be passed to
-        EarthdataSoilMoistureDownloader so a request can find data from
-        either era."""
-        from sar_validation.core.sar_sources import SAR_SOURCES
-
-        spec = SAR_SOURCES["nisar_sme2"]
-        with patch(
-            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
-        ) as mock_cls:
-            mock_cls.return_value = MagicMock()
-            spec.build_downloader(tmp_path, False, True)
-        _, kwargs = mock_cls.call_args
-        assert kwargs["dataset"] == [
-            ("NISAR_L3_SME2_BETA_V1", "1"),
-            ("NISAR_L3_SME2_PROVISIONAL_V1", "1"),
-        ]
-
-    def test_extra_download_kwargs_passes_through_download_kwargs_only(self):
-        from sar_validation.core.recipe import SARDataSpec
-        from sar_validation.core.sar_sources import SAR_SOURCES
-
-        spec = SAR_SOURCES["nisar_sme2"]
-        sd = SARDataSpec(source="nisar_sme2", swath_mode=["IW"], download_kwargs={"version": "001"})
-        kwargs = spec.extra_download_kwargs(sd)
-        assert kwargs == {"version": "001"}
