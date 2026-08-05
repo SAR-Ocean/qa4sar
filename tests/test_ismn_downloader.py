@@ -270,13 +270,13 @@ class TestArchiveResolutionPrecedence:
         return out_dir, None, local_zip
 
     @pytest.mark.parametrize(
-        "setup_fn",
+        "setup_fn,check_written",
         [
-            _auto_detect,
-            _most_recent_of_multiple,
-            _explicit_over_auto_detected,
-            _shared_cache_fallback,
-            _local_over_shared_cache,
+            (_auto_detect, True),
+            (_most_recent_of_multiple, False),
+            (_explicit_over_auto_detected, False),
+            (_shared_cache_fallback, True),
+            (_local_over_shared_cache, False),
         ],
         ids=[
             "auto_detects_zip_dropped_in_output_dir",
@@ -286,21 +286,30 @@ class TestArchiveResolutionPrecedence:
             "local_zip_takes_priority_over_shared_cache",
         ],
     )
-    def test_resolves_expected_archive(self, setup_fn, tmp_path, monkeypatch):
+    def test_resolves_expected_archive(self, setup_fn, check_written, tmp_path, monkeypatch):
         out_dir, archive_path, expected_path = setup_fn(self, tmp_path, monkeypatch)
         dl = ISMNDownloader(output_dir=out_dir)
 
         fake_interface = MagicMock()
         fake_interface.ISMN_Interface.return_value = self._fake_reader()
 
+        # check_written=True rows also cover the min_depth/max_depth kwargs and
+        # the written-file count, matching the original standalone tests these
+        # rows were folded from.
+        download_kwargs = dict(
+            min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
+            start="2026-01-01", end="2026-01-02",
+            archive_path=archive_path,
+        )
+        if check_written:
+            download_kwargs.update(min_depth=0.0, max_depth=0.05)
+
         with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
-            dl.download(
-                min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
-                start="2026-01-01", end="2026-01-02",
-                archive_path=archive_path,
-            )
+            written = dl.download(**download_kwargs)
 
         assert fake_interface.ISMN_Interface.call_args.args[0] == expected_path
+        if check_written:
+            assert len(written) == 1
 
 
 class TestISMNDownloaderSingleReadingArchive:
