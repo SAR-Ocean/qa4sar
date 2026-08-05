@@ -790,7 +790,8 @@ class TestPlotSummaryTable:
         stats_ds = xr.Dataset(
             {"foo": ("source", [1.0])}, coords={"source": ["mooring"]},
         )
-        assert plot_summary_table(stats_ds, metrics=["bias"]) is None
+        with pytest.warns(UserWarning, match="None of .* found in stats_ds"):
+            assert plot_summary_table(stats_ds, metrics=["bias"]) is None
 
     def test_returns_none_for_empty_source_coordinate(self):
         import numpy as np
@@ -802,7 +803,8 @@ class TestPlotSummaryTable:
             {"bias": ("source", np.array([], dtype=float))},
             coords={"source": np.array([], dtype=object)},
         )
-        assert plot_summary_table(stats_ds) is None
+        with pytest.warns(UserWarning, match="no source groups"):
+            assert plot_summary_table(stats_ds) is None
 
 
 class TestSourceStyleMap:
@@ -5242,12 +5244,21 @@ class TestValidationReportNativeUnitsSection:
         native_stats = compute_statistics(collocation_ds, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
         native_stats_map = {"sarSSM_vs_SOIL_MOISTURE": native_stats}
 
+        import warnings
+
         key = "sarSSM_vs_SOIL_MOISTURE"
-        figs_without = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path / "without")
-        figs_with = validation_report(
-            collocation_ds, datatree, recipe, out_dir=tmp_path / "with",
-            native_units_stats_ds_map=native_stats_map,
-        )
+        # ascat_ssm is the only val_source and ismn is absent, so the
+        # CDF-matched section (unrelated to what this test checks) warns
+        # "No valid data" for itself -- see
+        # TestValidationReportResidualsHistRange for the test that
+        # actually asserts on that behavior.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            figs_without = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path / "without")
+            figs_with = validation_report(
+                collocation_ds, datatree, recipe, out_dir=tmp_path / "with",
+                native_units_stats_ds_map=native_stats_map,
+            )
 
         assert key in figs_without and key in figs_with
         n_without = len(figs_without[key])
@@ -5301,12 +5312,20 @@ class TestValidationReportNativeUnitsSection:
             call_order.append("geographic")
             return original_geo(*args, **kwargs)
 
+        import warnings
+
         monkeypatch.setattr(viz, "plot_scatter", scatter_spy)
         monkeypatch.setattr(viz, "plot_geographic", geo_spy)
-        viz.validation_report(
-            collocation_ds, datatree, recipe, out_dir=tmp_path,
-            native_units_stats_ds_map=native_stats_map,
-        )
+        # ascat_ssm-without-ismn triggers the CDF-matched section's
+        # unrelated "No valid data" warning -- see
+        # TestValidationReportResidualsHistRange for the test that
+        # actually asserts on that behavior.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            viz.validation_report(
+                collocation_ds, datatree, recipe, out_dir=tmp_path,
+                native_units_stats_ds_map=native_stats_map,
+            )
         import matplotlib.pyplot as plt
         plt.close("all")
 
@@ -5416,7 +5435,15 @@ class TestValidationReportNativeUnitsSection:
             },
         )
 
-        figs = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        import warnings
+
+        # ascat_ssm-without-ismn triggers the CDF-matched section's
+        # unrelated "No valid data" warning -- see
+        # TestValidationReportResidualsHistRange for the test that
+        # actually asserts on that behavior.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            figs = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
 
         assert "sarSSM_vs_SOIL_MOISTURE" in figs
 
@@ -6064,7 +6091,8 @@ class TestValidationReportResidualsHistRange:
         )
 
         key = "sarSSM_vs_SOIL_MOISTURE"
-        figs = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        with pytest.warns(UserWarning, match="No valid data for sar_sarSSM vs val_SOIL_MOISTURE"):
+            figs = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
         assert key in figs
 
         # Every row is dropped to NaN by _harmonize_percent_domain_sources
