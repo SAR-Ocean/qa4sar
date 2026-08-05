@@ -464,6 +464,112 @@ class TestExecuteRecipeSkipsStatsWhenAlreadyComputed:
             mock_compute_stats.assert_called_once()
 
 
+class TestIsAlreadyDownloaded:
+    """_is_already_downloaded() gates the top-level "Step 1 skipped" shortcut
+    -- it must not be fooled by a source that recorded no *error* but also
+    never actually got real data. ISMN's "awaiting_manual_archive" status is
+    exactly that case (see ISMNDownloader/_download_ismn): the user hasn't
+    placed the shared archive yet, 0 files were collected, but that's
+    deliberately not an "error" (no notice/error is appended) -- confirmed
+    against a real run of recipes/soil_moisture_cds_nisar_test.yaml where
+    Step 1 kept getting skipped on every rerun despite ISMN never actually
+    downloading anything."""
+
+    def test_true_when_no_errors_and_every_source_succeeded(self, tmp_path):
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "downloads": {
+                "ismn": {"status": "success"},
+                "scatterometer": {"status": "success"},
+            },
+        }))
+        assert _is_already_downloaded(tmp_path) is True
+
+    def test_false_when_ismn_still_awaiting_manual_archive(self, tmp_path):
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "downloads": {"ismn": {"status": "awaiting_manual_archive"}},
+        }))
+        assert _is_already_downloaded(tmp_path) is False
+
+    def test_false_when_errors_present(self, tmp_path):
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({"errors": ["boom"]}))
+        assert _is_already_downloaded(tmp_path) is False
+
+    def test_false_when_metadata_file_missing(self, tmp_path):
+        from sar_validation.cli import _is_already_downloaded
+
+        assert _is_already_downloaded(tmp_path) is False
+
+
+class TestExecuteRecipeForcesConvertCollocateWhenDownloadActuallyRan:
+    """Steps 2/3 (convert/collocate) must not skip regenerating
+    datatree.nc/collocation_results.nc just because those files already
+    exist on disk from a *previous* run, if Step 1 actually did fresh
+    download work this run (e.g. a previously-incomplete source like ISMN
+    finally got real data) -- otherwise the stale datatree/collocation
+    never pick up the newly downloaded files. Confirmed against a real
+    rerun of recipes/soil_moisture_cds_nisar_test.yaml."""
+
+    def _recipe_with_stale_outputs(self, tmp_path):
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "datatree.nc").write_bytes(b"stale")
+        (run_dir / "collocation_results.nc").write_bytes(b"stale")
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-force-regen", variable="wind", output_dir=str(run_dir),
+        )).to_yaml(recipe_path)
+        return recipe_path, run_dir
+
+    def test_regenerates_when_download_step_actually_ran(self, tmp_path):
+        from unittest.mock import patch
+
+        recipe_path, run_dir = self._recipe_with_stale_outputs(tmp_path)
+
+        with patch("sar_validation.core.orchestrator.DataOrchestrator") as mock_cls, \
+                patch("sar_validation.cli._convert_data") as mock_convert, \
+                patch("sar_validation.cli._collocate_data") as mock_collocate:
+            mock_cls.return_value.download_all.return_value = True
+            mock_cls.return_value.base_dir = run_dir
+            cli._execute_recipe(str(recipe_path), convert=True, collocate=True)
+
+        mock_convert.assert_called_once()
+        mock_collocate.assert_called_once()
+
+    def test_still_skips_when_step1_itself_was_skipped(self, tmp_path):
+        import json
+        from unittest.mock import patch
+
+        recipe_path, run_dir = self._recipe_with_stale_outputs(tmp_path)
+        (run_dir / "download_metadata.json").write_text(json.dumps({"errors": []}))
+
+        with patch("sar_validation.core.orchestrator.DataOrchestrator") as mock_cls, \
+                patch("sar_validation.cli._convert_data") as mock_convert, \
+                patch("sar_validation.cli._collocate_data") as mock_collocate:
+            mock_cls.return_value.base_dir = run_dir
+            cli._execute_recipe(str(recipe_path), convert=True, collocate=True)
+
+        mock_convert.assert_not_called()
+        mock_collocate.assert_not_called()
+        mock_cls.return_value.download_all.assert_not_called()
+
+
 class TestBuildSoilMoistureConfig:
     def test_recipe_shape(self):
         from sar_validation.cli import _build_soil_moisture_config

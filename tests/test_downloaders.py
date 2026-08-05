@@ -3102,6 +3102,92 @@ class TestOrchestratorGPortalAmsrFallback:
         assert any("no credentials" in n for n in orchestrator.metadata["notices"])
         assert orchestrator.metadata["errors"] == []
 
+    def test_no_coverage_cutoff_notice_when_gportal_fallback_finds_files(self, tmp_path):
+        """The 'past this source's known coverage cutoff' notice must not
+        fire just because NASA Earthdata alone returned 0 files -- only
+        when AMSR2 truly has no data from *either* source. Confirmed
+        against a real recipe run where this notice appeared even though
+        G-Portal successfully downloaded real AMSR2 files."""
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(name="test", variable="soil_moisture"))
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        source = ValidationDataSource(source_type="amsr_ssm")
+
+        with patch(
+            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
+        ) as mock_earthdata_cls, patch(
+            "sar_validation.downloaders.gportal_downloader.GPortalAMSR2Downloader"
+        ) as mock_gportal_cls:
+            mock_earthdata_cls.return_value.download.return_value = []
+            mock_gportal_cls.return_value.download.return_value = [tmp_path / "gportal_file.h5"]
+            orchestrator._dispatch_source(source)
+
+        assert not any("coverage cutoff" in n for n in orchestrator.metadata["notices"])
+
+    def test_coverage_cutoff_notice_when_both_sources_find_nothing(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(name="test", variable="soil_moisture"))
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        source = ValidationDataSource(source_type="amsr_ssm")
+
+        with patch(
+            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
+        ) as mock_earthdata_cls, patch(
+            "sar_validation.downloaders.gportal_downloader.GPortalAMSR2Downloader"
+        ) as mock_gportal_cls:
+            mock_earthdata_cls.return_value.download.return_value = []
+            mock_gportal_cls.return_value.download.return_value = []
+            orchestrator._dispatch_source(source)
+
+        assert any("coverage cutoff" in n for n in orchestrator.metadata["notices"])
+
+
+class TestOrchestratorAscatCoverageCutoffNotice:
+    """EUMETSAT's ASCAT NRT dissemination access this toolbox relies on
+    stopped being populated for recent dates as of 2025-07-15 -- a request
+    ending after that date returning 0 products is expected, not an error,
+    and should say so (mirroring the equivalent AMSR2 coverage-cutoff
+    notice) rather than silently logging "Found 0 ASCAT SSM products."
+    with no explanation."""
+
+    def test_notice_when_zero_files_past_cutoff(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(name="test", variable="soil_moisture"))
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        source = ValidationDataSource(source_type="ascat_ssm")
+
+        with patch(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader"
+        ) as mock_cls:
+            mock_cls.return_value.download.return_value = []
+            orchestrator._dispatch_source(source)
+
+        assert any(
+            "ASCAT" in n and "coverage cutoff" in n for n in orchestrator.metadata["notices"]
+        )
+
+    def test_no_notice_when_files_found(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+
+        recipe = Recipe(RecipeConfig(name="test", variable="soil_moisture"))
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        source = ValidationDataSource(source_type="ascat_ssm")
+
+        with patch(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader"
+        ) as mock_cls:
+            mock_cls.return_value.download.return_value = [tmp_path / "ascat_file.nc"]
+            orchestrator._dispatch_source(source)
+
+        assert not any("coverage cutoff" in n for n in orchestrator.metadata["notices"])
+
 
 class TestOrchestratorCurrentsHistoricalWiring:
     @pytest.mark.parametrize("source_type,instrument", [

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 class TestSarSourcesRegistryShape:
     def test_registry_has_the_three_registered_sources(self):
@@ -156,6 +158,61 @@ class TestNisarSme2RegistryEntry:
         _, kwargs = mock_cls.call_args
         assert kwargs["output_dir"] == tmp_path
         assert kwargs["dry_run"] is False
+
+
+class TestSarSourceSatelliteField:
+    """Each registry entry records which satellite family it belongs to,
+    so --sar-source can accept a satellite name (e.g. "sentinel1") instead
+    of forcing users to know the internal product-specific key."""
+
+    @pytest.mark.parametrize("key, satellite", [
+        ("sentinel1_l2_ocn", "sentinel1"),
+        ("sentinel1_clms_ssm", "sentinel1"),
+        ("nisar_sme2", "nisar"),
+    ])
+    def test_satellite_field(self, key, satellite):
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        assert SAR_SOURCES[key].satellite == satellite
+
+
+class TestAvailableSatellites:
+    def test_lists_sentinel1_and_nisar(self):
+        from sar_validation.core.sar_sources import AVAILABLE_SATELLITES
+
+        assert AVAILABLE_SATELLITES == ["nisar", "sentinel1"]
+
+
+class TestResolveSarSource:
+    """resolve_sar_source(name, variable) is the single place --sar-source
+    CLI values get turned into an internal SAR_SOURCES key -- accepting
+    either a satellite family name (the new, user-facing convention) or an
+    exact internal key (kept working for backward compatibility /
+    recipe.yaml's own stored sar_data.source values)."""
+
+    @pytest.mark.parametrize("name, variable, expected", [
+        ("sentinel1", "wind", "sentinel1_l2_ocn"),
+        ("sentinel1", "waves", "sentinel1_l2_ocn"),
+        ("sentinel1", "currents", "sentinel1_l2_ocn"),
+        ("sentinel1", "soil_moisture", "sentinel1_clms_ssm"),
+        ("nisar", "soil_moisture", "nisar_sme2"),
+        ("sentinel1_clms_ssm", "soil_moisture", "sentinel1_clms_ssm"),
+    ])
+    def test_resolves(self, name, variable, expected):
+        from sar_validation.core.sar_sources import resolve_sar_source
+
+        assert resolve_sar_source(name, variable) == expected
+
+    @pytest.mark.parametrize("name, variable, match", [
+        ("nisar", "wind", "no product"),
+        ("sentinel1_clms_ssm", "wind", "only valid for"),
+        ("bogus", "wind", "sentinel1"),
+    ])
+    def test_raises(self, name, variable, match):
+        from sar_validation.core.sar_sources import resolve_sar_source
+
+        with pytest.raises(ValueError, match=match):
+            resolve_sar_source(name, variable)
 
     def test_build_downloader_queries_both_beta_and_provisional_collections(self, tmp_path):
         """NISAR SME2's underlying CMR collection changed mid-mission with

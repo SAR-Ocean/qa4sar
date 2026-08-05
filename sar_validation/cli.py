@@ -53,11 +53,16 @@ logging.getLogger("ismn_meta_collector").setLevel(logging.WARNING)
 
 
 def main(argv=None) -> None:
+    from .core.sar_sources import AVAILABLE_SATELLITES
+
     parser = argparse.ArgumentParser(
         prog="sar-validate",
         description="SAR L2 Ocean Data Validation Toolbox",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
+Available SAR sources (--sar-source): {', '.join(AVAILABLE_SATELLITES)}
+  See sar_validation.core.sar_sources for which recipe variables each supports.
+
 Examples:
   sar-validate --list-recipes
   sar-validate --create-recipe wind
@@ -154,11 +159,14 @@ Examples:
     )
     parser.add_argument(
         "--sar-source",
-        metavar="KEY",
+        metavar="SATELLITE",
         default=None,
-        help="Which SAR source to validate against (used with --create-recipe); "
-             "defaults to the category's existing source if omitted. "
-             "See sar_validation.core.sar_sources.SAR_SOURCES for valid keys.",
+        help="Which satellite to validate against (used with --create-recipe), "
+             f"e.g. {', '.join(AVAILABLE_SATELLITES)} -- defaults to the "
+             "category's existing satellite if omitted. The matching product "
+             "for the requested recipe category is picked automatically (e.g. "
+             "sentinel1 resolves to L2 OCN for wind/waves/currents, CLMS SSM "
+             "for soil_moisture). See sar_validation.core.sar_sources for details.",
     )
     parser.add_argument(
         "--hfradar-resolution",
@@ -308,20 +316,6 @@ def _list_recipes() -> None:
         print(f"  {f.name}")
 
 
-def _validate_sar_source(sar_source: str, variable: str) -> None:
-    from .core.sar_sources import SAR_SOURCES
-
-    if sar_source not in SAR_SOURCES:
-        raise ValueError(
-            f"Unknown SAR source {sar_source!r}. Choose one of: "
-            f"{', '.join(sorted(SAR_SOURCES))}"
-        )
-    spec = SAR_SOURCES[sar_source]
-    if variable not in spec.variables:
-        raise ValueError(
-            f"SAR source {sar_source!r} is only valid for: "
-            f"{', '.join(sorted(spec.variables))} (got variable={variable!r})"
-        )
 
 
 def _build_currents_config(
@@ -342,7 +336,8 @@ def _build_currents_config(
     because the HF-radar source choice below depends on knowing the final
     bbox before validation_sources is built.
     """
-    _validate_sar_source(sar_source, "currents")
+    from .core.sar_sources import resolve_sar_source
+    sar_source = resolve_sar_source(sar_source, "currents")
     from .core.recipe import (
         CollocationType,
         GeographicBounds,
@@ -448,7 +443,8 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
     unit-testable independent of the CLI's file-writing side effects,
     mirroring ``_build_currents_config``.
     """
-    _validate_sar_source(sar_source, "wind")
+    from .core.sar_sources import resolve_sar_source
+    sar_source = resolve_sar_source(sar_source, "wind")
     from .core.recipe import (
         CollocationType,
         GeographicBounds,
@@ -566,7 +562,8 @@ def _build_waves_config(limit: Optional[int] = None, sar_source: str = "sentinel
     unit-testable independent of the CLI's file-writing side effects,
     mirroring ``_build_wind_config``/``_build_currents_config``.
     """
-    _validate_sar_source(sar_source, "waves")
+    from .core.sar_sources import resolve_sar_source
+    sar_source = resolve_sar_source(sar_source, "waves")
     from .core.recipe import (
         CollocationType,
         GeographicBounds,
@@ -624,7 +621,6 @@ def _build_soil_moisture_config(limit: Optional[int] = None, sar_source: str = "
     recipe automatically gets its own template values instead of
     Sentinel-1 CLMS SSM's.
     """
-    _validate_sar_source(sar_source, "soil_moisture")
     from .core.recipe import (
         CollocationType,
         GeographicBounds,
@@ -634,12 +630,13 @@ def _build_soil_moisture_config(limit: Optional[int] = None, sar_source: str = "
         SARDataSpec,
         ValidationDataSource,
     )
-    from .core.sar_sources import SAR_SOURCES
+    from .core.sar_sources import SAR_SOURCES, resolve_sar_source
 
+    sar_source = resolve_sar_source(sar_source, "soil_moisture")
     spec = SAR_SOURCES[sar_source]
     # SARSourceSpec's default_* fields are Optional[...] because sources
     # outside the "soil_moisture" variable set (e.g. sentinel1_l2_ocn)
-    # leave them unset; _validate_sar_source above already restricted
+    # leave them unset; resolve_sar_source above already restricted
     # sar_source to a "soil_moisture" entry, both of which (today:
     # sentinel1_clms_ssm, nisar_sme2) populate every default_* field, so
     # narrow the Optional types for mypy here.
@@ -839,6 +836,7 @@ def _execute_recipe(
     orchestrator = DataOrchestrator(recipe, dry_run=dry_run, force_download=force_download)
 
     # Skip download if data was already downloaded successfully and not forcing re-download
+    download_step_ran = False
     if not dry_run and not force_download and _is_already_downloaded(orchestrator.base_dir):
         logger.info(
             "Data already downloaded in %s — skipping Step 1.",
@@ -847,6 +845,7 @@ def _execute_recipe(
         print(f"Step 1 skipped — data already present in {orchestrator.base_dir}")
         success = True
     else:
+        download_step_ran = True
         success = orchestrator.download_all()
 
         if dry_run:
@@ -863,7 +862,11 @@ def _execute_recipe(
 
     if convert:
         datatree_path = orchestrator.base_dir / "datatree.nc"
-        if not datatree_path.exists():
+        # Never skip when Step 1 actually did fresh download work this run
+        # (as opposed to being skipped itself) -- a previously-incomplete
+        # source (e.g. ISMN's shared archive finally showing up) means the
+        # existing datatree.nc no longer reflects everything on disk.
+        if download_step_ran or not datatree_path.exists():
             _convert_data(recipe, orchestrator.base_dir)
         else:
             print("Step 2 skipped — datatree.nc already exists")
@@ -880,7 +883,8 @@ def _execute_recipe(
     for method, suffix in method_runs:
         if collocate:
             collocation_path = orchestrator.base_dir / f"collocation_results{suffix}.nc"
-            if not collocation_path.exists():
+            # Same reasoning as Step 2 above: never skip when Step 1 ran fresh.
+            if download_step_ran or not collocation_path.exists():
                 _collocate_data(
                     recipe,
                     orchestrator.base_dir,
@@ -914,7 +918,12 @@ def _execute_recipe(
 
 
 def _is_already_downloaded(base_dir: Path) -> bool:
-    """Return True if *base_dir* has a download_metadata.json with no errors."""
+    """Return True if *base_dir* has a download_metadata.json with no
+    errors and no source still stuck "awaiting_manual_archive" (ISMN's
+    status when the shared archive hasn't been placed yet -- 0 files were
+    collected, but that's deliberately not an "error", so the top-level
+    errors list alone can't tell "genuinely fully downloaded" apart from
+    "silently missing a source forever" without this extra check)."""
     import json as _json
     meta_path = base_dir / "download_metadata.json"
     if not meta_path.exists():
@@ -922,7 +931,13 @@ def _is_already_downloaded(base_dir: Path) -> bool:
     try:
         with open(meta_path) as f:
             meta = _json.load(f)
-        return meta.get("errors", ["placeholder"]) == []
+        if meta.get("errors", ["placeholder"]) != []:
+            return False
+        downloads = meta.get("downloads", {})
+        return all(
+            entry.get("status") != "awaiting_manual_archive"
+            for entry in downloads.values()
+        )
     except Exception:
         return False
 

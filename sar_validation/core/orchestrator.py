@@ -78,6 +78,12 @@ _AMSR_COVERAGE_CUTOFF = "2025-09-01"
 #: point through _AMSR_COVERAGE_CUTOFF.
 _NSIDC_0451_CUTOFF = "2023-12-31"
 
+#: EUMETSAT's ASCAT NRT dissemination access this toolbox relies on
+#: stopped being populated for recent dates as of this cutoff -- a
+#: request ending after it returning 0 products is expected, not an
+#: error, and gets the same "coverage cutoff" notice AMSR2 gets above.
+_ASCAT_COVERAGE_CUTOFF = "2025-07-15"
+
 # ASCAT's collocation spec lives under its data_type tag "scatterometer_ssm"
 # in DEFAULT_LAYER_TYPE_SPECS, not its own source_type "ascat_ssm" -- see
 # that dict's comment and collocation.py's _resolve_layer_type. Every other
@@ -576,7 +582,7 @@ class DataOrchestrator:
         pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
         out_dir = self.base_dir / "ascat_ssm"
 
-        return self._run_download(
+        ok = self._run_download(
             "ascat_ssm", out_dir,
             lambda: ASCATSoilMoistureDownloader(
                 output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
@@ -588,16 +594,25 @@ class DataOrchestrator:
             ),
             "ASCAT SSM",
         )
+        if (
+            ok and not self.dry_run
+            and not self.metadata["downloads"].get("ascat_ssm", {}).get("files")
+            and cfg.temporal_bounds.end > _ASCAT_COVERAGE_CUTOFF
+        ):
+            self.metadata["notices"].append(
+                f"ASCAT: requested range ends {cfg.temporal_bounds.end}, after this "
+                f"source's known coverage cutoff ({_ASCAT_COVERAGE_CUTOFF}) — "
+                f"0 products found (expected, not an error)."
+            )
+        return ok
 
     def _download_earthdata_ssm(
         self, source, dataset: str, version: Optional[str], out_subdir: str,
-        coverage_cutoff: Optional[str] = None,
     ) -> bool:
         from ..downloaders.earthdata_soil_moisture_downloader import EarthdataSoilMoistureDownloader
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        temp   = cfg.temporal_bounds
         pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
         out_dir = self.base_dir / out_subdir
 
@@ -611,16 +626,6 @@ class DataOrchestrator:
                 start=pad_start, end=pad_end,
             )
             self._cleanup_if_empty(out_dir)
-            if not paths and coverage_cutoff and temp.end > coverage_cutoff:
-                # Use human-readable name for AMSR datasets for clarity
-                display_name = (
-                    "AMSR-E/2" if dataset in ("NSIDC-0451", "AU_Land") else dataset
-                )
-                self.metadata["notices"].append(
-                    f"{display_name}: requested range ends {temp.end}, after this "
-                    f"source's known coverage cutoff ({coverage_cutoff}) — "
-                    f"0 granules found (expected, not an error)."
-                )
             self.metadata["downloads"][out_subdir] = {
                 "status": "dry_run" if self.dry_run else "success",
                 "files":  [str(p) for p in paths],
@@ -639,11 +644,15 @@ class DataOrchestrator:
             dataset = "NSIDC-0451"
         else:
             dataset = "AU_Land"
-        ok = self._download_earthdata_ssm(
-            source, dataset=dataset, version=None, out_subdir="amsr_ssm",
-            coverage_cutoff=_AMSR_COVERAGE_CUTOFF,
-        )
+        ok = self._download_earthdata_ssm(source, dataset=dataset, version=None, out_subdir="amsr_ssm")
         if ok and not self.metadata["downloads"].get("amsr_ssm", {}).get("files"):
+            # NASA Earthdata alone returning 0 files is not yet the final
+            # word -- G-Portal (below) is a real second source, and often
+            # succeeds when Earthdata doesn't. Only note the coverage
+            # cutoff once *both* have been tried and both found nothing
+            # (see _try_gportal_amsr_fallback) -- surfacing it here
+            # unconditionally previously fired even when G-Portal went on
+            # to find real files, confirmed against a real recipe run.
             self._try_gportal_amsr_fallback()
         return ok
 
@@ -683,14 +692,24 @@ class DataOrchestrator:
                 # coverage for this window at all) -- but reported entirely
                 # silently, "status": "success" with 0 files is otherwise
                 # indistinguishable from a genuine download, and no notice
-                # exists to explain it (unlike the coverage-cutoff notice
-                # above, which only fires once the requested range is known
-                # to be past AMSR-E/2's coverage entirely).
-                self.metadata["notices"].append(
-                    "AMSR2: G-Portal fallback also found 0 files in window — "
-                    "no AMSR2 soil-moisture data available for this run from "
-                    "either source."
-                )
+                # exists to explain it. Both NASA Earthdata AND G-Portal
+                # have now been tried and both found nothing, so this is
+                # the right (and only) point to mention the known
+                # coverage-cutoff explanation, if it applies.
+                temp = cfg.temporal_bounds
+                if temp.end > _AMSR_COVERAGE_CUTOFF:
+                    self.metadata["notices"].append(
+                        f"AMSR-E/2: requested range ends {temp.end}, after this "
+                        f"source's known coverage cutoff ({_AMSR_COVERAGE_CUTOFF}) — "
+                        f"0 granules found from NASA Earthdata or the G-Portal "
+                        f"fallback (expected, not an error)."
+                    )
+                else:
+                    self.metadata["notices"].append(
+                        "AMSR2: G-Portal fallback also found 0 files in window — "
+                        "no AMSR2 soil-moisture data available for this run from "
+                        "either source."
+                    )
         except Exception as exc:
             msg = f"G-Portal AMSR2 fallback failed: {exc}"
             logger.warning(msg)
