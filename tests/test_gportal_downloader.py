@@ -9,7 +9,10 @@ import pytest
 
 paramiko = pytest.importorskip("paramiko")
 
-from sar_validation.downloaders.gportal_downloader import GPortalAMSR2Downloader  # noqa: E402
+from sar_validation.downloaders.gportal_downloader import (  # noqa: E402
+    GPortalAMSR2Downloader,
+    _connect_with_retry,
+)
 
 _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT = -10.0, 10.0, 40.0, 55.0
 
@@ -29,6 +32,81 @@ class TestGPortalAMSR2DownloaderDryRun:
         captured = capsys.readouterr().out
         assert "DRY RUN" in captured
         assert "ftp.gportal.jaxa.jp" in captured
+
+
+class TestConnectWithRetry:
+    """_connect_with_retry retries once on a transient connection-level
+    failure (observed live: "Error reading SSH protocol banner" -- the
+    TCP handshake succeeds but the server closes/goes silent before
+    sending the SSH banner) rather than aborting this whole best-effort
+    fallback source on a single blip."""
+
+    def test_succeeds_on_first_attempt_without_sleeping(self):
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch("paramiko.SFTPClient.from_transport") as mock_from_transport, \
+             patch("socket.create_connection", return_value=MagicMock()), \
+             patch("time.sleep") as mock_sleep:
+            mock_transport = MagicMock()
+            mock_transport_cls.return_value = mock_transport
+            mock_from_transport.return_value = "sftp-instance"
+
+            transport, sftp = _connect_with_retry("u", "p")
+
+        assert transport is mock_transport
+        assert sftp == "sftp-instance"
+        mock_transport_cls.assert_called_once()
+        mock_sleep.assert_not_called()
+
+    def test_retries_once_after_transient_ssh_exception_then_succeeds(self):
+        failing_transport = MagicMock()
+        failing_transport.connect.side_effect = paramiko.SSHException(
+            "Error reading SSH protocol banner"
+        )
+        working_transport = MagicMock()
+
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch("paramiko.SFTPClient.from_transport", return_value="sftp-instance"), \
+             patch("socket.create_connection", return_value=MagicMock()), \
+             patch("time.sleep") as mock_sleep:
+            mock_transport_cls.side_effect = [failing_transport, working_transport]
+
+            transport, sftp = _connect_with_retry("u", "p")
+
+        assert transport is working_transport
+        assert sftp == "sftp-instance"
+        assert mock_transport_cls.call_count == 2
+        failing_transport.close.assert_called_once()
+        mock_sleep.assert_called_once_with(2.0)
+
+    def test_gives_up_after_max_attempts_on_persistent_ssh_exception(self):
+        always_failing = MagicMock()
+        always_failing.connect.side_effect = paramiko.SSHException(
+            "Error reading SSH protocol banner"
+        )
+
+        with patch("paramiko.Transport", return_value=always_failing), \
+             patch("socket.create_connection", return_value=MagicMock()), \
+             patch("time.sleep") as mock_sleep:
+            with pytest.raises(paramiko.SSHException, match="SSH protocol banner"):
+                _connect_with_retry("u", "p")
+
+        assert always_failing.close.call_count == 2
+        mock_sleep.assert_called_once()
+
+    def test_non_retryable_exception_propagates_immediately(self):
+        """A genuine auth failure (a plain Exception, not one of the
+        transient connection-error types) must not be retried."""
+        failing_transport = MagicMock()
+        failing_transport.connect.side_effect = Exception("auth failed")
+
+        with patch("paramiko.Transport", return_value=failing_transport), \
+             patch("socket.create_connection", return_value=MagicMock()), \
+             patch("time.sleep") as mock_sleep:
+            with pytest.raises(Exception, match="auth failed"):
+                _connect_with_retry("u", "p")
+
+        failing_transport.close.assert_called_once()
+        mock_sleep.assert_not_called()
 
 
 class TestGPortalAMSR2DownloaderDiscovery:

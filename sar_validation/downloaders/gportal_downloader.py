@@ -56,6 +56,15 @@ __all__ = ["GPortalAMSR2Downloader"]
 HOST = "ftp.gportal.jaxa.jp"
 PORT = 2051
 
+#: A transient connection-level failure (observed live: "Error reading SSH
+#: protocol banner" -- the TCP handshake succeeds but the server closes or
+#: goes silent before sending its SSH banner) gets one retry after a brief
+#: backoff, rather than aborting this whole best-effort fallback source
+#: outright. A bare reconnect moments later has reliably succeeded when this
+#: was observed, so a short retry is worth it before giving up.
+_CONNECT_MAX_ATTEMPTS = 2
+_CONNECT_RETRY_BACKOFF_SECONDS = 2.0
+
 _TOP_LEVEL_DIRS = ("standard", "nrt")
 _SENSOR_NAME_PATTERN = re.compile(r"amsr2|gcom-w", re.IGNORECASE)
 # "sm" must stand on its own as a token (e.g. "L3.SM_STD"), not be part of a
@@ -65,6 +74,48 @@ _SENSOR_NAME_PATTERN = re.compile(r"amsr2|gcom-w", re.IGNORECASE)
 # still counts as a standalone token while "SMALL"/"OSMOSIS" etc. don't match.
 _PRODUCT_NAME_PATTERN = re.compile(r"(?<![a-z])sm(?![a-z])|soil|smc", re.IGNORECASE)
 _FILENAME_DATE_RE = re.compile(r"(\d{8})")
+
+
+def _connect_with_retry(username: str, password: str):
+    """
+    Open a socket to G-Portal's SFTP server and authenticate, retrying up
+    to :data:`_CONNECT_MAX_ATTEMPTS` times (with a
+    :data:`_CONNECT_RETRY_BACKOFF_SECONDS` pause between attempts) on a
+    transient connection-level failure -- ``paramiko.SSHException``
+    (covers "Error reading SSH protocol banner"), ``OSError``, or
+    ``EOFError``. Any other exception (e.g. a genuine auth failure)
+    propagates immediately, unretried.
+
+    Returns
+    -------
+    (paramiko.Transport, paramiko.SFTPClient)
+    """
+    import socket
+    import time
+
+    import paramiko
+
+    for attempt in range(1, _CONNECT_MAX_ATTEMPTS + 1):
+        transport = None
+        try:
+            sock = socket.create_connection((HOST, PORT), timeout=30)
+            transport = paramiko.Transport(sock)
+            transport.connect(username=username, password=password)
+            sftp = paramiko.SFTPClient.from_transport(transport)
+            return transport, sftp
+        except Exception as exc:
+            if transport is not None:
+                transport.close()
+            retryable = isinstance(exc, (paramiko.SSHException, OSError, EOFError))
+            if retryable and attempt < _CONNECT_MAX_ATTEMPTS:
+                logger.warning(
+                    "G-Portal SFTP connect attempt %d/%d failed (%s) — retrying in %.0fs…",
+                    attempt, _CONNECT_MAX_ATTEMPTS, exc, _CONNECT_RETRY_BACKOFF_SECONDS,
+                )
+                time.sleep(_CONNECT_RETRY_BACKOFF_SECONDS)
+                continue
+            raise
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 class GPortalAMSR2Downloader:
@@ -138,10 +189,6 @@ class GPortalAMSR2Downloader:
             )
             return []
 
-        import socket
-
-        import paramiko
-
         username, password = authenticate_gportal(
             self._username, self._password, allow_prompt=self._allow_prompt,
         )
@@ -151,13 +198,13 @@ class GPortalAMSR2Downloader:
         try:
             # paramiko.Transport.__init__/.connect() accept no timeout of
             # their own -- an unresponsive server would otherwise hang the
-            # caller indefinitely. Open the socket with a timeout first and
-            # hand it to Transport, mirroring the same fix already applied
-            # to smos_downloader.py's ftplib.FTP_TLS(..., timeout=60).
-            sock = socket.create_connection((HOST, PORT), timeout=30)
-            transport = paramiko.Transport(sock)
-            transport.connect(username=username, password=password)
-            sftp = paramiko.SFTPClient.from_transport(transport)
+            # caller indefinitely. _connect_with_retry opens the socket
+            # with a timeout first and hands it to Transport, mirroring
+            # the same fix already applied to smos_downloader.py's
+            # ftplib.FTP_TLS(..., timeout=60) -- and retries once on a
+            # transient connection-level failure (e.g. "Error reading SSH
+            # protocol banner", observed live against this exact server).
+            transport, sftp = _connect_with_retry(username, password)
             product_dirs = self._discover_product_directory(sftp)
             if not product_dirs:
                 return []
