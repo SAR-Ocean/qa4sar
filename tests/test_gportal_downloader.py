@@ -109,6 +109,12 @@ class TestConnectWithRetry:
         mock_sleep.assert_not_called()
 
 
+def _assert_downloaded_from_nrt(downloaded, sftp):
+    sftp.get.assert_called_once()
+    remote_path_used = sftp.get.call_args.args[0]
+    assert remote_path_used.startswith("nrt/")
+
+
 class TestGPortalAMSR2DownloaderDiscovery:
     def _mock_sftp(self, listing_by_path: dict[str, list[str]]):
         """Build a fake paramiko.SFTPClient whose .listdir(path) returns
@@ -177,31 +183,13 @@ class TestGPortalAMSR2DownloaderDiscovery:
         captured = capsys.readouterr().out
         assert "GPM" in captured  # the raw listing it found got printed
 
-    def test_falls_through_to_nrt_when_standard_matches_but_yields_zero_files_in_window(self, tmp_path):
-        """Regression test: standard/ has a confidently-matched AMSR2
-        product directory (as it always does on a real account), but no
-        files there fall inside the requested date window (e.g. a very
-        recent date not yet propagated to standard/'s Year/Month
-        archive). nrt/ also has a confidently-matched product directory,
-        with a file that IS in the window -- it must actually be reached
-        and downloaded, not skipped just because standard/ matched first."""
-        listing = {
-            "standard": ["GCOM-W"],
-            "standard/GCOM-W": ["GCOM-W.AMSR2"],
-            "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
-            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
-            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2026"],
-            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026": ["06"],
-            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/06": [
-                "GW1AM2_20260630_01D_EQMA_L3SGSMCLQ_2210.h5",  # before window
-            ],
-            "nrt": ["GCOM-W"],
-            "nrt/GCOM-W": ["GCOM-W.AMSR2"],
-            "nrt/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
-            "nrt/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": [
-                "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",  # in window
-            ],
-        }
+    def _run_discovery(self, tmp_path, listing, extra_check=None):
+        """Shared harness for the discovery scenarios below: wires up a fake
+        SFTP client from *listing*, patches paramiko/socket, writes fake
+        bytes on sftp.get, and runs a single download() call over the
+        standard 2026-07-01..2026-07-02 window. If *extra_check* is given,
+        it's called with (downloaded, sftp) while the patches are still
+        active. Returns the downloaded list."""
         sftp = self._mock_sftp(listing)
         sftp.get.side_effect = lambda remote, local: Path(local).write_bytes(b"data")
 
@@ -214,82 +202,83 @@ class TestGPortalAMSR2DownloaderDiscovery:
                 min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
                 start="2026-07-01", end="2026-07-02",
             )
+            if extra_check is not None:
+                extra_check(downloaded, sftp)
+        return downloaded
 
-        assert len(downloaded) == 1
-        assert "20260701" in downloaded[0].name
-        sftp.get.assert_called_once()
-        remote_path_used = sftp.get.call_args.args[0]
-        assert remote_path_used.startswith("nrt/")
-
-    def test_falls_through_past_decoy_sensor_to_real_sensor_within_same_tree(self, tmp_path):
-        """Regression test against a real G-Portal account: standard/
-        lists BOTH a decoy sensor directory whose name happens to match
-        the AMSR2 pattern (AQUA/AQUA.AMSR-E_AMSR2Format -- real directory
-        name; it's AMSR-E, a different, retired-since-2011 instrument,
-        reformatted to look like AMSR2's file layout for cross-instrument
-        continuity, not real AMSR2 data -- confirmed its own L3.SMC_10
-        archive only spans 2002-2011) ahead of the genuine GCOM-W/
-        GCOM-W.AMSR2 sensor (confirmed to hold real, current data). The
-        real sensor must still be reached even though the decoy is
-        listed first and matches the sensor-name pattern too."""
-        listing = {
-            "standard": ["AQUA", "GCOM-W"],
-            "standard/AQUA": ["AQUA.AMSR-E", "AQUA.AMSR-E_AMSR2Format"],
-            "standard/AQUA/AQUA.AMSR-E_AMSR2Format": ["L3.SMC_10"],
-            "standard/AQUA/AQUA.AMSR-E_AMSR2Format/L3.SMC_10": ["8"],
-            "standard/AQUA/AQUA.AMSR-E_AMSR2Format/L3.SMC_10/8": ["2011"],
-            "standard/GCOM-W": ["GCOM-W.AMSR2"],
-            "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
-            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
-            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2026"],
-            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026": ["07"],
-            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/07": [
-                "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",
-            ],
-        }
-        sftp = self._mock_sftp(listing)
-        sftp.get.side_effect = lambda remote, local: Path(local).write_bytes(b"data")
-
-        dl = GPortalAMSR2Downloader(output_dir=tmp_path, username="u", password="p")
-        with patch("paramiko.Transport") as mock_transport_cls, \
-             patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
-             patch("socket.create_connection", return_value=MagicMock()):
-            mock_transport_cls.return_value = MagicMock()
-            downloaded = dl.download(
-                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
-                start="2026-07-01", end="2026-07-02",
-            )
-
-        assert len(downloaded) == 1
-        assert "20260701" in downloaded[0].name
-
-    def test_filters_files_by_embedded_date(self, tmp_path):
-        listing = {
-            "standard": ["GCOM-W"],
-            "standard/GCOM-W": ["GCOM-W.AMSR2"],
-            "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
-            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
-            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2026"],
-            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026": ["07"],
-            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/07": [
-                "GW1AM2_20260630_01D_EQMA_L3SGSMCLQ_2210.h5",  # before window
-                "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",  # in window
-                "GW1AM2_20260705_01D_EQMA_L3SGSMCLQ_2210.h5",  # after window
-            ],
-        }
-        sftp = self._mock_sftp(listing)
-        sftp.get.side_effect = lambda remote, local: Path(local).write_bytes(b"data")
-
-        dl = GPortalAMSR2Downloader(output_dir=tmp_path, username="u", password="p")
-        with patch("paramiko.Transport") as mock_transport_cls, \
-             patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
-             patch("socket.create_connection", return_value=MagicMock()):
-            mock_transport_cls.return_value = MagicMock()
-            downloaded = dl.download(
-                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
-                start="2026-07-01", end="2026-07-02",
-            )
-
+    @pytest.mark.parametrize(
+        "listing,extra_check",
+        [
+            pytest.param(
+                {
+                    "standard": ["GCOM-W"],
+                    "standard/GCOM-W": ["GCOM-W.AMSR2"],
+                    "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+                    "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
+                    "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2026"],
+                    "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026": ["06"],
+                    "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/06": [
+                        "GW1AM2_20260630_01D_EQMA_L3SGSMCLQ_2210.h5",  # before window
+                    ],
+                    "nrt": ["GCOM-W"],
+                    "nrt/GCOM-W": ["GCOM-W.AMSR2"],
+                    "nrt/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+                    "nrt/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": [
+                        "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",  # in window
+                    ],
+                },
+                _assert_downloaded_from_nrt,
+                id="falls_through_to_nrt_when_standard_matches_but_yields_zero_files_in_window",
+            ),
+            pytest.param(
+                {
+                    "standard": ["AQUA", "GCOM-W"],
+                    "standard/AQUA": ["AQUA.AMSR-E", "AQUA.AMSR-E_AMSR2Format"],
+                    "standard/AQUA/AQUA.AMSR-E_AMSR2Format": ["L3.SMC_10"],
+                    "standard/AQUA/AQUA.AMSR-E_AMSR2Format/L3.SMC_10": ["8"],
+                    "standard/AQUA/AQUA.AMSR-E_AMSR2Format/L3.SMC_10/8": ["2011"],
+                    "standard/GCOM-W": ["GCOM-W.AMSR2"],
+                    "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+                    "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
+                    "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2026"],
+                    "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026": ["07"],
+                    "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/07": [
+                        "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",
+                    ],
+                },
+                None,
+                id="falls_through_past_decoy_sensor_to_real_sensor_within_same_tree",
+            ),
+            pytest.param(
+                {
+                    "standard": ["GCOM-W"],
+                    "standard/GCOM-W": ["GCOM-W.AMSR2"],
+                    "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+                    "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
+                    "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2026"],
+                    "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026": ["07"],
+                    "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/07": [
+                        "GW1AM2_20260630_01D_EQMA_L3SGSMCLQ_2210.h5",  # before window
+                        "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",  # in window
+                        "GW1AM2_20260705_01D_EQMA_L3SGSMCLQ_2210.h5",  # after window
+                    ],
+                },
+                None,
+                id="filters_files_by_embedded_date",
+            ),
+        ],
+    )
+    def test_discovery_scenarios(self, tmp_path, listing, extra_check):
+        """Regression coverage for three discovery-fallback/filtering
+        scenarios: (1) standard/ has a confidently-matched AMSR2 product
+        directory but no files in the requested window, so nrt/'s
+        confidently-matched product directory must actually be reached;
+        (2) standard/ lists both a decoy sensor directory ahead of the
+        genuine sensor, and the real sensor must still be reached; (3)
+        files outside the requested date window must be filtered out by
+        their embedded date even when they sit alongside in-window files
+        in the same directory listing."""
+        downloaded = self._run_discovery(tmp_path, listing, extra_check=extra_check)
         assert len(downloaded) == 1
         assert "20260701" in downloaded[0].name
 
@@ -349,29 +338,4 @@ class TestGPortalAMSR2DownloaderResourceCleanup:
                     pass  # Expected: the auth failure should propagate
 
             # Even though connect() failed, transport.close() should have been called
-            mock_transport.close.assert_called_once()
-
-    def test_closes_sftp_on_from_transport_failure(self, tmp_path):
-        """Verify that transport.close() is called even if from_transport() raises."""
-        dl = GPortalAMSR2Downloader(output_dir=tmp_path, username="u", password="p")
-
-        with patch("paramiko.Transport") as mock_transport_cls, \
-             patch("paramiko.SFTPClient.from_transport") as mock_from_transport, \
-             patch("socket.create_connection", return_value=MagicMock()):
-            mock_transport = MagicMock()
-            mock_transport_cls.return_value = mock_transport
-            mock_from_transport.side_effect = Exception("from_transport failed")
-
-            with patch.object(dl, "_username", "u"), \
-                 patch.object(dl, "_password", "p"):
-                try:
-                    dl.download(
-                        min_lon=_MIN_LON, max_lon=_MAX_LON,
-                        min_lat=_MIN_LAT, max_lat=_MAX_LAT,
-                        start="2026-07-01", end="2026-07-02",
-                    )
-                except Exception:
-                    pass  # Expected: the from_transport failure should propagate
-
-            # Even though from_transport() failed, transport.close() should have been called
             mock_transport.close.assert_called_once()
