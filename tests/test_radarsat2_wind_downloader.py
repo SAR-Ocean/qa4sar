@@ -6,16 +6,24 @@ from datetime import datetime
 
 import pytest
 
-_NEW_ERA_CATALOG_XML = """<?xml version="1.0" encoding="UTF-8"?>
-<catalog xmlns="http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0">
-  <dataset name="SAR-Wind-HH-64N-174E_v3r0_rsat2_s202606040552510_e202606040554070_c202606041745293.nc"
-           urlPath="sar-winds/radarsat2/2026/06/SAR-Wind-HH-64N-174E_v3r0_rsat2_s202606040552510_e202606040554070_c202606041745293.nc" />
-  <dataset name="SAR-Wind-HH-65N-168W_v3r0_rsat2_s202606030441440_e202606030443000_c202606030846560.nc"
-           urlPath="sar-winds/radarsat2/2026/06/SAR-Wind-HH-65N-168W_v3r0_rsat2_s202606030441440_e202606030443000_c202606030846560.nc" />
-  <dataset name="SAR-Wind-HH-10S-30E_v3r0_rsat2_s202606100200000_e202606100201160_c202606100300000.nc"
-           urlPath="sar-winds/radarsat2/2026/06/SAR-Wind-HH-10S-30E_v3r0_rsat2_s202606100200000_e202606100201160_c202606100300000.nc" />
-</catalog>
-"""
+# Built via string concatenation (not a triple-quoted literal) so every
+# physical line stays within this repo's 120-char ruff limit -- the real
+# urlPath values themselves are already >120 chars, so they're each split
+# across two adjacent literals with no inserted characters between them.
+_NEW_ERA_CATALOG_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<catalog xmlns="http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0">\n'
+    '  <dataset name="SAR-Wind-HH-64N-174E_v3r0_rsat2_s202606040552510_e202606040554070_c202606041745293.nc"\n'
+    '           urlPath="sar-winds/radarsat2/2026/06/'
+    'SAR-Wind-HH-64N-174E_v3r0_rsat2_s202606040552510_e202606040554070_c202606041745293.nc" />\n'
+    '  <dataset name="SAR-Wind-HH-65N-168W_v3r0_rsat2_s202606030441440_e202606030443000_c202606030846560.nc"\n'
+    '           urlPath="sar-winds/radarsat2/2026/06/'
+    'SAR-Wind-HH-65N-168W_v3r0_rsat2_s202606030441440_e202606030443000_c202606030846560.nc" />\n'
+    '  <dataset name="SAR-Wind-HH-10S-30E_v3r0_rsat2_s202606100200000_e202606100201160_c202606100300000.nc"\n'
+    '           urlPath="sar-winds/radarsat2/2026/06/'
+    'SAR-Wind-HH-10S-30E_v3r0_rsat2_s202606100200000_e202606100201160_c202606100300000.nc" />\n'
+    '</catalog>\n'
+)
 
 
 class TestParseGranuleNameOldEra:
@@ -144,11 +152,15 @@ class TestListRadarsat2GranulesBboxFilter:
 
 
 # Trimmed fragments of real NCML documents (fetched live 2026-08-05) --
-# only the parts _parse_ncml_bbox actually reads.
+# only the parts _parse_ncml_bbox actually reads. The real documents also
+# carry a `location="Not provided..."` attribute on <netcdf> and a WKT
+# `geospatial_bounds` polygon attribute; both are dropped here (neither
+# is read by the parser) partly because they're unused and partly
+# because keeping them pushes these lines past this repo's 120-char
+# ruff limit.
 _NEW_ERA_NCML_XML = """<?xml version="1.0" encoding="UTF-8"?>
-<netcdf xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" location="Not provided because of security concerns.">
+<netcdf xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2">
   <attribute name="title" value="SAR_Wind_HH_64N_174E" />
-  <attribute name="geospatial_bounds" value="POLYGON((170.64201 60.946674, 180.30565 61.870308, 178.9892 66.32337, 167.73218 65.3223, 170.64201 60.946674))" />
   <attribute name="geospatial_lat_max" type="float" value="66.32337" />
   <attribute name="geospatial_lat_min" type="float" value="60.946674" />
   <attribute name="geospatial_lon_max" type="float" value="180.30565" />
@@ -163,7 +175,7 @@ _NEW_ERA_NCML_XML = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 _OLD_ERA_NCML_XML = """<?xml version="1.0" encoding="UTF-8"?>
-<netcdf xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" location="Not provided because of security concerns.">
+<netcdf xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2">
   <attribute name="title" value="SAR_Wind" />
   <group name="CFMetadata">
     <attribute name="geospatial_lon_min" value="-141.28207" type="float" />

@@ -37,9 +37,12 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-__all__ = ["RADARSAT2WindDownloader"]
+# __all__ is declared in Task 3, once RADARSAT2WindDownloader (the only
+# public symbol) actually exists -- declaring it here would make ruff's
+# F822 flag an undefined name in __all__ (the class doesn't exist until
+# Task 3 appends it to this same file).
 
 THREDDS_BASE = "https://www.ncei.noaa.gov/thredds-ocean"
 _CATALOG_NS = "{http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0}"
@@ -149,14 +152,15 @@ def _parse_ncml_bbox(ncml_xml_text: str) -> Optional[Tuple[float, float, float, 
     era-conditional branching needed here.
     """
     root = ET.fromstring(ncml_xml_text)
-    values: dict = {}
+    values: Dict[str, float] = {}
     wanted = ("geospatial_lon_min", "geospatial_lon_max", "geospatial_lat_min", "geospatial_lat_max")
     for attr in root.iter(f"{_NCML_NS}attribute"):
         name = attr.get("name")
-        if name in wanted and name not in values:
+        value_str = attr.get("value")
+        if name in wanted and name not in values and value_str is not None:
             try:
-                values[name] = float(attr.get("value"))
-            except (TypeError, ValueError):
+                values[name] = float(value_str)
+            except ValueError:
                 continue
     if not all(k in values for k in wanted):
         return None
