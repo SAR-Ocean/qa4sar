@@ -131,6 +131,7 @@ class TestSarSourceSatelliteField:
         ("sentinel1_l2_ocn", "sentinel1"),
         ("sentinel1_clms_ssm", "sentinel1"),
         ("nisar_sme2", "nisar"),
+        ("radarsat2", "radarsat2"),
     ])
     def test_satellite_field(self, key, satellite):
         from sar_validation.core.sar_sources import SAR_SOURCES

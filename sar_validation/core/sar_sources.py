@@ -14,6 +14,7 @@ always-in-sync version of this same list:
   - sentinel1: wind, waves, currents (Sentinel-1 L2 OCN) and
     soil_moisture (Sentinel-1 CLMS SSM, 1km, Europe)
   - nisar:     soil_moisture (NISAR SME2, beta)
+  - radarsat2: wind (NOAA NCEI SAR-derived ocean surface wind speed)
 
 A future satellite is added by (1) registering a new ``SARSourceSpec`` in
 ``SAR_SOURCES`` below with its own ``satellite`` name, and (2) updating the
