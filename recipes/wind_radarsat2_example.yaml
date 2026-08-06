@@ -1,0 +1,123 @@
+name: wind_radarsat2_example
+description: 'Validate RADARSAT-2 SAR-derived wind speed (NOAA NCEI,
+
+  0.5 km, C-band) against moorings, buoys, ASCAT scatterometer,
+
+  HY-2B/HY-2C/Oceansat-3 scatterometer, 1 Hz altimeter, and RSS
+
+  radiometer (AMSR2) ocean winds. Speed only -- this product
+
+  carries no independently SAR-retrieved wind direction.'
+version: '1.0'
+variable: wind
+variable_specs:
+  components:
+  - speed
+  - direction
+geographic_bounds:
+  min_lon: 165.0
+  max_lon: 180.0
+  min_lat: 60.0
+  max_lat: 68.0
+temporal_bounds:
+  start: '2026-06-01'
+  end: '2026-06-05'
+sar_data:
+  source: radarsat2
+  swath_mode:
+  - IW
+  - EW
+  max_downloads: null
+  download_kwargs: {}
+validation_sources:
+- source_type: mooring
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: buoy
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: ferrybox
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: drifter
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: tidal_gauge
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: scatterometer
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: altimeter
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: radiometer
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: scatterometer_hy2b
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: scatterometer_hy2c
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: scatterometer_oceansat3
+  download_kwargs: {}
+  collocation_kwargs: {}
+collocation:
+  point_vs_layer:
+    time_tolerance_minutes: 30
+    spatial_tolerance_km: 25
+    interpolation_method: nearest
+    aggregation_window_km: 5.0
+    validation_temporal_averaging_minutes: 30
+    distance_weighting: gaussian
+    gaussian_sigma_km: 2.0
+  sar_footprint_radius_km: 14.0
+  layer_vs_layer:
+    layer_type_specs:
+      scatterometer:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 12.5
+        distance_weighting: equal
+      scatterometer_hy2b:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      scatterometer_hy2c:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      scatterometer_oceansat3:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      altimeter_1hz:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 7.0
+        distance_weighting: equal
+      radiometer_amsr2:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      radiometer_gmi:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      radiometer_ssmis_f16:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      radiometer_ssmis_f17:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      radiometer_ssmis_f18:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      radiometer_windsat:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+    method: cell-averaging
+output_dir: null

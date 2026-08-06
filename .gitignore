@@ -36,6 +36,7 @@ recipes/*.yaml
 !recipes/waves_atlantic.yaml
 !recipes/soil_moisture_nisar_norway.yaml
 !recipes/soil_moisture_example.yaml
+!recipes/wind_radarsat2_example.yaml
 
 # Jupyter notebooks checkpoints
 .ipynb_checkpoints/
