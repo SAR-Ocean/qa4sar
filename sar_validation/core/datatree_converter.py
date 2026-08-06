@@ -369,6 +369,131 @@ class DataTreeConverter:
         return ds
 
     @staticmethod
+    def from_radarsat2_wind(
+        nc_path: Union[str, Path],
+        product_type: str = "wind",
+    ) -> Optional[xr.Dataset]:
+        """
+        Open a RADARSAT-2 SAR wind granule (NOAA NCEI THREDDS archive) and
+        return a standardised Dataset with a native (y, x) grid, matching
+        Sentinel-1 OWI's grid shape so it reuses the existing
+        grid-collocation path unchanged.
+
+        Wind SPEED only (``owiWindSpeed``, from ``sar_wind``) -- this
+        product's ``input_dir`` field is the NWP model direction fed into
+        the CMOD wind-inversion, not an independent SAR retrieval, so no
+        ``owiWindDirection`` is produced (see design-choices.md Sec 10).
+
+        Land/ice/quality masking confirmed 2026-08-05 against a real
+        downloaded granule (SAR-Wind-HH-64N-174E_v3r0_rsat2_...): the
+        file's own ``pixel_level_quality_flags`` == 5 ("valid wind in
+        valid water region") is the strict, authoritative validity
+        criterion (matches the file's own
+        ``quality_information.total_number_of_valid_water_pixels``
+        exactly, 63,810 pixels). ``mask``/``icemask`` alone are **not**
+        a substitute for it when it's available: ``mask == -1`` (water)
+        AND ``icemask == 1`` (water) alone keeps 115,267 pixels on that
+        same file -- 51,457 more than flag 5, including flag-0 cells
+        where ``sar_wind`` is a fill-like 0.0 and flag-4 "valid in
+        buffer region" lower-confidence retrievals. ``pixel_level_quality_flags``
+        does not exist in the old filename era (confirmed live against a
+        2019 granule), so this method uses it directly when present, and
+        falls back to ``mask == -1 AND icemask == 1`` only when it's
+        absent -- a documented, era-specific approximation, not claimed
+        equivalent to the new era's precision.
+
+        Parameters
+        ----------
+        nc_path : str or Path
+            Path to a downloaded ``*_wind_level2_norcs.nc`` (old era) or
+            ``SAR-Wind-*.nc`` (new era) granule.
+        product_type : str, optional
+            Ignored -- accepted only for signature compatibility with
+            every other ``SARSourceSpec.convert`` callback. This source
+            only ever produces wind.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="sar_l2_ocn"``, or None on failure.
+        """
+        nc_path = Path(nc_path)
+        if not nc_path.exists():
+            logger.warning("RADARSAT-2 wind file not found: %s", nc_path)
+            return None
+
+        try:
+            ds_raw = xr.open_dataset(nc_path)
+        except Exception as exc:
+            logger.warning("Could not open %s: %s", nc_path, exc)
+            return None
+
+        try:
+            required = ("sar_wind", "mask", "icemask", "longitude", "latitude")
+            if not all(var in ds_raw for var in required):
+                logger.warning(
+                    "Missing required variable(s) in %s (available: %s).",
+                    nc_path.name, list(ds_raw.data_vars) + list(ds_raw.coords),
+                )
+                return None
+
+            if "pixel_level_quality_flags" in ds_raw:
+                # New filename era only. Flag 5 = "valid wind in valid
+                # water region" -- the strict, authoritative criterion
+                # (matches quality_information.total_number_of_valid_water_pixels
+                # exactly). mask/icemask alone are NOT a substitute: they
+                # let through ~51k extra pixels this flag correctly
+                # excludes (fill-like flag-0 cells, lower-confidence
+                # flag-4 "buffer region" retrievals) -- confirmed live,
+                # see design-choices.md Sec 10.
+                valid = ds_raw["pixel_level_quality_flags"].values == 5
+            else:
+                # Old filename era: pixel_level_quality_flags doesn't
+                # exist. mask/icemask are the best available signal -- a
+                # documented approximation, slightly more permissive than
+                # the new era's flag-based criterion.
+                mask = ds_raw["mask"].values
+                icemask = ds_raw["icemask"].values
+                valid = (mask == -1) & (icemask == 1)
+
+            speed = np.where(valid, ds_raw["sar_wind"].values, np.nan).astype(float)
+            lon = ds_raw["longitude"].values
+            lat = ds_raw["latitude"].values
+
+            time_str = ds_raw.attrs.get("time_coverage_start")
+            if time_str:
+                raw_time = pd.to_datetime(time_str)
+                if raw_time.tzinfo is not None:
+                    raw_time = raw_time.tz_convert(None)
+                acq_time_ns = np.datetime64(raw_time, "ns")
+            else:
+                acq_time_ns = np.datetime64("NaT", "ns")
+
+            ds = xr.Dataset(
+                {"owiWindSpeed": (("y", "x"), speed)},
+                coords={
+                    "lon": (("y", "x"), lon),
+                    "lat": (("y", "x"), lat),
+                    "time": acq_time_ns,
+                },
+            )
+            apply_cf_metadata(ds, "sar", {
+                "owiWindSpeed": {
+                    "long_name": "RADARSAT-2 SAR-derived wind speed at 10-m height neutral stability",
+                    "units": "m s-1",
+                },
+            })
+            ds.attrs["data_type"] = "sar_l2_ocn"
+            ds.attrs["source"] = "RADARSAT-2"
+            ds.attrs["filename"] = nc_path.name
+            return ds
+        except Exception as exc:
+            logger.warning("Could not extract wind data from %s: %s", nc_path.name, exc)
+            return None
+        finally:
+            ds_raw.close()
+
+    @staticmethod
     def from_insitu_csv(
         csv_path: Union[str, Path],
         source_type: str = "mooring",
