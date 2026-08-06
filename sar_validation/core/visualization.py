@@ -3763,6 +3763,16 @@ def validation_report(
                 if base_dir is not None:
                     _write_page(title, _finalize_figure_for_report(fig_nu_residuals, None))
 
+            # Summary table (immediately before the statistics bar chart,
+            # mirroring the CDF-matched and C3S CDS SSM sections' order).
+            fig_nu_table = plot_summary_table(nu_stats)
+            if fig_nu_table is not None:
+                fig_nu_table = _mark_native_units(fig_nu_table)
+                figs.append(fig_nu_table)
+                title = f"{sar_var} vs {val_var} — native units — summary table"
+                if base_dir is not None:
+                    _write_page(title, _finalize_figure_for_report(fig_nu_table, None))
+
             fig_nu_stats = plot_statistics(nu_stats)
             if fig_nu_stats is not None:
                 fig_nu_stats = _mark_native_units(fig_nu_stats)

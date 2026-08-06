@@ -5278,6 +5278,57 @@ class TestValidationReportNativeUnitsSection:
             for fig in new_figs
         ), "no newly-added figure carries the '— native units —' banner"
 
+    def test_native_units_section_includes_a_summary_table(self, tmp_path):
+        """Unlike the CDF-matched and C3S CDS SSM sections (both of which
+        call plot_summary_table before their statistics bar chart), the
+        native-units section had no summary table at all."""
+        from sar_validation.core.statistics import compute_statistics
+        from sar_validation.core.visualization import validation_report
+
+        recipe = self._recipe()
+        datatree = xr.DataTree.from_dict({
+            "validation/ascat_ssm/f1": self._ascat_node([0.0, 1.0], [45.0, 46.0], [25.0, 35.0]),
+        })
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": ("collocation", np.array([20.0, 30.0]), {"units": "%"}),
+                "val_SOIL_MOISTURE": ("collocation", np.array([25.0, 35.0])),
+                "val_source": ("collocation", np.array(["ascat_ssm", "ascat_ssm"])),
+                "val_id": ("collocation", np.array(["a1", "a2"])),
+            },
+        )
+        native_stats = compute_statistics(collocation_ds, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            figs = validation_report(
+                collocation_ds, datatree, recipe, out_dir=tmp_path,
+                native_units_stats_ds_map={key: native_stats},
+            )
+        assert key in figs
+
+        # plot_summary_table renders "Bias"/"Rmse"/"Correlation" column
+        # headers as cell text in an ax.table(...) -- look for them on a
+        # native-units-banner figure.
+        found_table = False
+        for fig in figs[key]:
+            banner_texts = [t.get_text() for t in fig.texts]
+            if not any("native units" in t for t in banner_texts):
+                continue
+            for ax in fig.axes:
+                cell_texts = {
+                    cell.get_text().get_text()
+                    for table in ax.tables
+                    for cell in table.get_celld().values()
+                }
+                if "Bias" in cell_texts and "Rmse" in cell_texts:
+                    found_table = True
+
+        assert found_table, "expected a native-units figure containing a Bias/Rmse summary table"
+
     def test_native_units_geographic_rendered_before_native_units_scatter(self, tmp_path, monkeypatch):
         """The native-units section must lead with its geographic plot too,
         matching the CDF-matched section's order (§9.3) -- previously it
