@@ -8,6 +8,7 @@ Supported SAR products:
 - Sentinel-1 L2_OCN (Level 2 Ocean): wind/waves/currents
 - Sentinel1 clms ssm (Surface Soil Moisture; Europe; daily): soil moisture
 - NISAR SME2 (beta & provisional): soil_moisture 
+- RADARSAT-2 (NOAA NCEI SAR-derived ocean wind, speed only): wind
 
 ---
 
@@ -84,6 +85,7 @@ sar_validation/
     ├── ismn_downloader.py                        # ISMN local-archive soil-moisture station selector (no download API)
     ├── noaa_hfradar_downloader.py                # NOAA HFRnet gridded surface currents via ERDDAP (rolling ~90-day window)
     ├── noaa_hfradar_thredds_downloader.py        # NOAA HFRnet gridded surface currents via NCEI THREDDS archive (2006-present)
+    ├── radarsat2_wind_downloader.py               # RADARSAT-2 SAR-derived ocean wind speed via NOAA NCEI THREDDS archive
     ├── radiometer_downloader.py                  # RSS radiometer ocean winds (AMSR2 NetCDF + GMI/SSMIS/WindSat bytemaps)
     ├── scatterometer_downloader.py               # ASCAT (MetOp) wind via EUMETSAT EUMDAC
     ├── scatterometer_ftp_downloader.py           # HY-2B/HY-2C/Oceansat-3 scatterometer wind via OSI-SAF FTP (only last 3 days)
@@ -174,6 +176,7 @@ plt.show()
 | Source | Variable | Downloader | Service | Temporal coverage |
 |--------|----------|------------|---------| ----------------- |
 | Sentinel-1 L2_OCN | wind / currents / waves | `sentinel1_l2_ocn_downloader` | Copernicus Dataspace (CDSE) | 2014-10-03 - present |
+| RADARSAT-2 | wind (speed only) | `radarsat2_wind_downloader` | NOAA NCEI THREDDS | 2014-05-02 - present |
 | Moorings / Buoys / Ferryboxes | wind / currents / waves | `insitu_downloader` | Copernicus Marine | varies by platform; max 2020-01-01 - present |
 | Delayed-mode in-situ currents (ADCP / Argo / drifter / glider) | ocean currents |   `insitu_currents_historical_downloader` | Copernicus Marine | varies by platform (6 - 24 months delay) |
 | HF Radar (near-real-time) | ocean currents | `hf_radar_downloader` | Copernicus Marine | varies by radar; max 2020-01-01 - present |
@@ -199,6 +202,15 @@ beta/provisional SAR-side source for soil moisture, selectable per recipe via
 `sar-validate --create-recipe soil_moisture --sar-source nisar_sme2` (or
 `source: nisar_sme2` in the recipe YAML) — see `docs/design-choices.md`
 §8.11 for how units and collocation defaults adapt automatically.
+
+RADARSAT-2 (C-band, 0.5 km, NOAA NCEI) is a second SAR-side source for
+wind, selectable via `sar-validate --create-recipe wind --sar-source
+radarsat2` (or `source: radarsat2` in the recipe YAML). It provides
+**wind speed only** — the product's `input_dir` field is the NWP model
+direction fed into the retrieval, not an independent SAR measurement, so
+no wind-direction comparison is produced for this source. Coverage is
+global but concentrated over Alaska/the North Pacific — see
+`docs/design-choices.md` §10.
 
 ### Collocation types
 
