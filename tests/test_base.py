@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 from sar_validation.downloaders.base import CopernicusODataClient
@@ -63,3 +64,23 @@ class TestQueryProductsDateFilterIsInclusive:
         assert "ContentDate/Start le 2025-07-03T00:00:00.000Z" in filter_str
         assert "ContentDate/Start gt" not in filter_str
         assert "ContentDate/Start lt" not in filter_str
+
+
+class TestMonthsTouched:
+    def test_single_month(self):
+        from sar_validation.downloaders.base import months_touched
+
+        result = months_touched(datetime(2024, 1, 5), datetime(2024, 1, 20))
+        assert result == [(2024, 1)]
+
+    def test_spans_year_boundary(self):
+        from sar_validation.downloaders.base import months_touched
+
+        result = months_touched(datetime(2024, 11, 15), datetime(2025, 2, 3))
+        assert result == [(2024, 11), (2024, 12), (2025, 1), (2025, 2)]
+
+    def test_same_day_start_and_end(self):
+        from sar_validation.downloaders.base import months_touched
+
+        result = months_touched(datetime(2026, 6, 4), datetime(2026, 6, 4))
+        assert result == [(2026, 6)]

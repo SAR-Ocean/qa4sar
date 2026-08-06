@@ -46,7 +46,7 @@ import numpy as np
 import xarray as xr
 
 from ._noaa_hfr_regions import _resolution_token, match_noaa_hfr_region
-from .base import normalize_datetime, prefer_ipv4_dns, split_antimeridian_bbox
+from .base import months_touched, normalize_datetime, prefer_ipv4_dns, split_antimeridian_bbox
 
 logger = logging.getLogger(__name__)
 
@@ -100,18 +100,6 @@ def _list_thredds_granules(
         if start <= ts and end_ok:
             results.append((ts, url_path))
     return sorted(results)
-
-
-def _months_touched(start: datetime, end: datetime) -> List[Tuple[int, int]]:
-    months = []
-    y, m = start.year, start.month
-    while (y, m) <= (end.year, end.month):
-        months.append((y, m))
-        m += 1
-        if m > 12:
-            m = 1
-            y += 1
-    return months
 
 
 class NOAATHREDDSHFRadarDownloader:
@@ -193,7 +181,7 @@ class NOAATHREDDSHFRadarDownloader:
         # Walk calendar months using the un-expanded end_dt: the expanded
         # end_dt_for_matching bound only widens which hours within a day are
         # matched, it never changes which month's catalog folder holds them.
-        for year, month in _months_touched(start_dt, end_dt):
+        for year, month in months_touched(start_dt, end_dt):
             catalog_url = (
                 f"{THREDDS_BASE}/catalog/ioos/hfradar/rtv/{year}/{year}{month:02d}/"
                 f"{thredds_code}/catalog.xml"
