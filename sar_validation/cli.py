@@ -455,14 +455,25 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
         ValidationDataSource,
     )
 
-    return RecipeConfig(
-        name="Wind Validation",
-        description=(
+    if sar_source == "radarsat2":
+        description = (
+            "Validate RADARSAT-2 SAR-derived wind speed (NOAA NCEI,\n"
+            "0.5 km, C-band) against moorings, buoys, ASCAT scatterometer,\n"
+            "HY-2B/HY-2C/Oceansat-3 scatterometer, 1 Hz altimeter, and RSS\n"
+            "radiometer (AMSR2) ocean winds. Speed only -- this product\n"
+            "carries no independently SAR-retrieved wind direction."
+        )
+    else:
+        description = (
             "Validate Sentinel-1 IW/EW mode wind speed and direction\n"
             "against moorings, buoys, ASCAT scatterometer, HY-2B/HY-2C/\n"
             "Oceansat-3 scatterometer, 1 Hz altimeter, and RSS radiometer\n"
             "(AMSR2) ocean winds."
-        ),
+        )
+
+    return RecipeConfig(
+        name="Wind Validation",
+        description=description,
         variable="wind",
         variable_specs={"components": ["speed", "direction"]},
         geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),

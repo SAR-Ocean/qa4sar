@@ -746,3 +746,44 @@ class TestSetCredentialCli:
         cli.main(["--set-credential", "smos"])
 
         assert called == ["smos"]
+
+
+class TestBuildWindConfigRadarsat2:
+    def test_radarsat2_source_recorded(self):
+        from sar_validation.cli import _build_wind_config
+
+        cfg = _build_wind_config(sar_source="radarsat2")
+        assert cfg.sar_data.source == "radarsat2"
+
+    def test_description_states_speed_only(self):
+        from sar_validation.cli import _build_wind_config
+
+        cfg = _build_wind_config(sar_source="radarsat2")
+        assert "Speed only" in cfg.description
+
+    def test_default_source_description_unchanged(self):
+        from sar_validation.cli import _build_wind_config
+
+        cfg = _build_wind_config(sar_source="sentinel1_l2_ocn")
+        assert "Sentinel-1 IW/EW mode wind speed and direction" in cfg.description
+
+    def test_rejects_radarsat2_for_currents(self):
+        from sar_validation.cli import _build_currents_config
+
+        with pytest.raises(ValueError, match="only valid for"):
+            _build_currents_config(sar_source="radarsat2")
+
+    def test_rejects_radarsat2_for_soil_moisture(self):
+        from sar_validation.cli import _build_soil_moisture_config
+
+        with pytest.raises(ValueError, match="only valid for"):
+            _build_soil_moisture_config(sar_source="radarsat2")
+
+    def test_cli_create_recipe_wind_radarsat2_writes_source(self, tmp_path, monkeypatch):
+        from sar_validation.cli import main
+        from sar_validation.core.recipe import Recipe
+
+        monkeypatch.chdir(tmp_path)
+        main(["--create-recipe", "wind", "--sar-source", "radarsat2"])
+        recipe = Recipe.from_yaml(tmp_path / "recipes" / "wind_validation.yaml")
+        assert recipe.config.sar_data.source == "radarsat2"
