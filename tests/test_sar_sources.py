@@ -139,10 +139,10 @@ class TestSarSourceSatelliteField:
 
 
 class TestAvailableSatellites:
-    def test_lists_sentinel1_and_nisar(self):
+    def test_lists_sentinel1_nisar_and_radarsat2(self):
         from sar_validation.core.sar_sources import AVAILABLE_SATELLITES
 
-        assert AVAILABLE_SATELLITES == ["nisar", "sentinel1"]
+        assert AVAILABLE_SATELLITES == ["nisar", "radarsat2", "sentinel1"]
 
 
 class TestResolveSarSource:
@@ -175,3 +175,63 @@ class TestResolveSarSource:
 
         with pytest.raises(ValueError, match=match):
             resolve_sar_source(name, variable)
+
+
+class TestRegistryCompleteness:
+    def test_registry_has_the_four_registered_sources(self):
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        assert set(SAR_SOURCES) == {
+            "sentinel1_l2_ocn", "sentinel1_clms_ssm", "nisar_sme2", "radarsat2",
+        }
+
+
+class TestRadarsat2RegistryEntry:
+    def test_applies_to_wind_only(self):
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        spec = SAR_SOURCES["radarsat2"]
+        assert spec.variables == frozenset({"wind"})
+        assert spec.output_subdir == "RADARSAT2_WIND"
+        assert spec.file_glob == "*.nc"
+
+    def test_no_soil_moisture_defaults(self):
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        spec = SAR_SOURCES["radarsat2"]
+        assert spec.default_min_depth is None
+        assert spec.default_time_tolerance_minutes is None
+
+    def test_build_downloader_returns_radarsat2_downloader(self, tmp_path):
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        spec = SAR_SOURCES["radarsat2"]
+        with patch(
+            "sar_validation.downloaders.radarsat2_wind_downloader.RADARSAT2WindDownloader"
+        ) as mock_cls:
+            mock_cls.return_value = MagicMock()
+            dl = spec.build_downloader(tmp_path, False, True)
+        mock_cls.assert_called_once_with(output_dir=tmp_path, dry_run=False, force_download=True)
+        assert dl is mock_cls.return_value
+
+    def test_extra_download_kwargs_passes_through_download_kwargs_only(self):
+        from sar_validation.core.recipe import SARDataSpec
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        spec = SAR_SOURCES["radarsat2"]
+        sd = SARDataSpec(source="radarsat2", swath_mode=["IW"], download_kwargs={"foo": "bar"})
+        kwargs = spec.extra_download_kwargs(sd)
+        assert kwargs == {"foo": "bar"}
+
+    def test_convert_calls_from_radarsat2_wind(self, tmp_path):
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        spec = SAR_SOURCES["radarsat2"]
+        nc_path = tmp_path / "scene.nc"
+        with patch(
+            "sar_validation.core.datatree_converter.DataTreeConverter.from_radarsat2_wind"
+        ) as mock_fn:
+            mock_fn.return_value = "fake_dataset"
+            result = spec.convert(nc_path, "wind")
+        mock_fn.assert_called_once_with(nc_path, "wind")
+        assert result == "fake_dataset"

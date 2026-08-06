@@ -189,6 +189,24 @@ def _convert_nisar_sme2(path: Path, product_type: str) -> Optional["xr.Dataset"]
     return DataTreeConverter.from_nisar_sme2(path)
 
 
+# ---------------------------------------------------------------------------
+# radarsat2 -- wind (speed only; see design-choices.md Sec 10)
+# ---------------------------------------------------------------------------
+
+def _build_radarsat2_downloader(output_dir: Path, dry_run: bool, force_download: bool) -> Any:
+    from ..downloaders.radarsat2_wind_downloader import RADARSAT2WindDownloader
+    return RADARSAT2WindDownloader(output_dir=output_dir, dry_run=dry_run, force_download=force_download)
+
+
+def _radarsat2_kwargs(sd: "SARDataSpec") -> Dict[str, Any]:
+    return dict(sd.download_kwargs)
+
+
+def _convert_radarsat2_wind(path: Path, product_type: str) -> Optional["xr.Dataset"]:
+    from .datatree_converter import DataTreeConverter
+    return DataTreeConverter.from_radarsat2_wind(path, product_type)
+
+
 SAR_SOURCES: Dict[str, SARSourceSpec] = {
     "sentinel1_l2_ocn": SARSourceSpec(
         key="sentinel1_l2_ocn",
@@ -231,6 +249,16 @@ SAR_SOURCES: Dict[str, SARSourceSpec] = {
         default_time_tolerance_minutes=360,
         default_aggregation_window_km=0.2,
         default_spatial_tolerance_km=2.0,
+    ),
+    "radarsat2": SARSourceSpec(
+        key="radarsat2",
+        satellite="radarsat2",
+        variables=frozenset({"wind"}),
+        output_subdir="RADARSAT2_WIND",
+        file_glob="*.nc",
+        build_downloader=_build_radarsat2_downloader,
+        extra_download_kwargs=_radarsat2_kwargs,
+        convert=_convert_radarsat2_wind,
     ),
 }
 
