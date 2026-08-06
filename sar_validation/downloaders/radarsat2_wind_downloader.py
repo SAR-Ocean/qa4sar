@@ -34,15 +34,20 @@ Library usage::
 
 from __future__ import annotations
 
+import logging
 import re
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# __all__ is declared in Task 3, once RADARSAT2WindDownloader (the only
-# public symbol) actually exists -- declaring it here would make ruff's
-# F822 flag an undefined name in __all__ (the class doesn't exist until
-# Task 3 appends it to this same file).
+from .base import months_touched, normalize_datetime, prefer_ipv4_dns, split_antimeridian_bbox
+
+__all__ = ["RADARSAT2WindDownloader"]
+
+logger = logging.getLogger(__name__)
 
 THREDDS_BASE = "https://www.ncei.noaa.gov/thredds-ocean"
 _CATALOG_NS = "{http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0}"
@@ -168,3 +173,118 @@ def _parse_ncml_bbox(ncml_xml_text: str) -> Optional[Tuple[float, float, float, 
         values["geospatial_lon_min"], values["geospatial_lon_max"],
         values["geospatial_lat_min"], values["geospatial_lat_max"],
     )
+
+
+class RADARSAT2WindDownloader:
+    """Download RADARSAT-2 SAR wind scenes from the NOAA NCEI THREDDS
+    archive for a bbox/time window. One `.nc` file per scene -- scenes
+    are independent SAR granules, never merged.
+
+    Parameters
+    ----------
+    output_dir : Path
+        Directory to save downloaded granules.
+    dry_run : bool
+        If True, print what would be searched and return [] without any
+        network calls.
+    force_download : bool
+        Re-download a granule even if a same-named file already exists.
+    """
+
+    def __init__(self, output_dir: Path, dry_run: bool = False, force_download: bool = False) -> None:
+        self.output_dir = Path(output_dir)
+        self.dry_run = dry_run
+        self.force_download = force_download
+
+    def download(self, min_lon, max_lon, min_lat, max_lat, start: str, end: str) -> list[Path]:
+        windows = split_antimeridian_bbox(min_lon, max_lon)
+        downloaded: list[Path] = []
+        for win_min_lon, win_max_lon in windows:
+            downloaded.extend(
+                self._download_window(win_min_lon, win_max_lon, min_lat, max_lat, start, end)
+            )
+        return downloaded
+
+    def _download_window(self, min_lon, max_lon, min_lat, max_lat, start: str, end: str) -> list[Path]:
+        start_dt = datetime.fromisoformat(normalize_datetime(start))
+        end_dt = datetime.fromisoformat(normalize_datetime(end))
+        is_end_date_only = len(end.strip().rstrip("Z")) == 10  # YYYY-MM-DD
+        end_dt_for_matching = end_dt + timedelta(days=1) if is_end_date_only else end_dt
+
+        if self.dry_run:
+            print(
+                f"[dry-run] RADARSAT-2 wind would search "
+                f"{THREDDS_BASE}/catalog/sar-winds/radarsat2/{{YYYY}}/{{MM}}/catalog.xml "
+                f"for scenes centered within "
+                f"[{min_lon - _BBOX_PAD_DEG}, {max_lon + _BBOX_PAD_DEG}] x "
+                f"[{min_lat - _BBOX_PAD_DEG}, {max_lat + _BBOX_PAD_DEG}] "
+                f"in [{start_dt}, {end_dt_for_matching}]"
+            )
+            return []
+
+        granules: List[Tuple[datetime, str, float, float]] = []
+        for year, month in months_touched(start_dt, end_dt):
+            catalog_url = f"{THREDDS_BASE}/catalog/sar-winds/radarsat2/{year}/{month:02d}/catalog.xml"
+            try:
+                with prefer_ipv4_dns(), urllib.request.urlopen(catalog_url, timeout=15) as resp:
+                    text = resp.read().decode()
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    continue
+                raise
+            granules.extend(
+                _list_radarsat2_granules(
+                    text, start_dt, end_dt_for_matching,
+                    min_lon, max_lon, min_lat, max_lat,
+                    end_exclusive=is_end_date_only,
+                )
+            )
+
+        logger.info("radarsat2_wind: %d candidate granule(s) matched", len(granules))
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        downloaded: list[Path] = []
+        for _ts, url_path, _lon, _lat in granules:
+            dest = self.output_dir / Path(url_path).name
+            if not self.force_download and dest.exists():
+                print(f"  Already downloaded: {dest}")
+                downloaded.append(dest)
+                continue
+
+            if not self._passes_ncml_check(url_path, min_lon, max_lon, min_lat, max_lat):
+                logger.info(
+                    "radarsat2_wind: skipping %s -- NCML metadata bbox does "
+                    "not overlap the requested bbox", Path(url_path).name,
+                )
+                continue
+
+            with prefer_ipv4_dns(), urllib.request.urlopen(
+                f"{THREDDS_BASE}/fileServer/{url_path}", timeout=15
+            ) as resp:
+                dest.write_bytes(resp.read())
+            downloaded.append(dest)
+
+        return downloaded
+
+    @staticmethod
+    def _passes_ncml_check(url_path: str, min_lon, max_lon, min_lat, max_lat) -> bool:
+        """True if the granule's real footprint (from its lightweight
+        NCML metadata) overlaps the requested bbox, or if the NCML
+        metadata is unavailable/unparseable -- fails OPEN in that case
+        (returns True) so a transient metadata-service hiccup doesn't
+        silently drop a real granule. A false positive here just costs
+        one unnecessary ~38MB download, not a science error; nothing
+        downstream re-checks the footprint once downloaded."""
+        try:
+            with prefer_ipv4_dns(), urllib.request.urlopen(
+                f"{THREDDS_BASE}/ncml/{url_path}", timeout=15
+            ) as resp:
+                text = resp.read().decode()
+        except urllib.error.URLError:
+            # Covers HTTPError too (it subclasses URLError).
+            return True
+        bbox = _parse_ncml_bbox(text)
+        if bbox is None:
+            return True
+        lon_min, lon_max, lat_min, lat_max = bbox
+        return not (lon_max < min_lon or lon_min > max_lon or lat_max < min_lat or lat_min > max_lat)
