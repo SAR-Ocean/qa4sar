@@ -89,6 +89,7 @@ sar_validation/
     ├── scatterometer_ftp_downloader.py           # HY-2B/HY-2C/Oceansat-3 scatterometer wind via OSI-SAF FTP (only last 3 days)
     ├── sentinel1_l2_ocn_downloader.py            # Sentinel-1 L2_OCN (wind/currents/waves) via Copernicus Dataspace (CDSE)
     ├── sentinel1_soil_moisture_downloader.py     # Sentinel-1 CLMS Surface Soil Moisture via Copernicus Dataspace (CDSE)
+    ├── cds_soil_moisture_downloader.py           # C3S CDS satellite soil moisture (ACTIVE/PASSIVE/COMBINED, 0.25°) via cdsapi
     └── smos_downloader.py                        # SMOS L2 soil moisture via ESA SMOS FTPS
 ```
 
@@ -179,7 +180,7 @@ plt.show()
 | HF Radar (delayed-mode/historical) | ocean currents | `hf_radar_historical_downloader` | Copernicus Marine | varies by platform |
 | HF Radar (US regions) | ocean currents | `hf_radar_us_downloader` | NOAA ERDDAP → NOAA THREDDS → Copernicus Marine (waterfall) | see HF Rader (NOAA HFRnet) |
 | HF Radar (NOAA HFRnet, rolling window) | ocean currents | `noaa_hfradar_downloader` | NOAA ERDDAP | 90 days rolling window |
-| HF Radar (NOAA HFRnet, full archive) | ocean currents | `noaa_hfradar_thredds_downloader` | NOAA NCEI THREDDS | 2006 - present (~1 month delay) |
+| HF Radar (NOAA HFRnet, full archive) | ocean currents | `noaa_hfradar_thredds_downloader` | NOAA NCEI THREDDS | 2006 - present (~1 month latency) |
 | ASCAT (MetOp-B/C) | wind | `scatterometer_downloader` | EUMETSAT EUMDAC | MetOp-B/C: 2012/2019 - present |
 | HY-2B / HY-2C / Oceansat-3 | wind | `scatterometer_ftp_downloader` | OSI-SAF FTP | last 3 days |
 | Radiometer — AMSR2 (NetCDF); GMI, SSMIS F16/F17/F18, WindSat (binary bytemaps) | wind (+ direction from WindSat) | `radiometer_downloader` | RSS `data.remss.com` (public HTTPS) | AMSR2/GMI/SSMIS F16/F17/F18: 2012-07-02/2014-03-04/2003-10-26/2006-11-04/2009-10-18 - present |
@@ -190,6 +191,7 @@ plt.show()
 | SMAP (SPL2SMP_E) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata | 2015 - present |
 | NISAR SME2 (beta & provisional) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata | 2025-10-01 - present |
 | SMOS (SM_OPER_MIR_SMUDP2) | soil moisture | `smos_downloader` | ESA SMOS FTPS | 2010 - present |
+| C3S CDS Soil Moisture (ACTIVE / PASSIVE / COMBINED) | soil moisture | `cds_soil_moisture_downloader` | Copernicus CDS | 1991 - present (ICDR: ~10-day latency) |
 | ISMN (International Soil Moisture Network) | soil moisture | `ismn_downloader` | Manual portal download (no API) | Varies by station |
 
 NISAR SME2 (`m3 m-3`, L-band, twice-daily per-overpass granules) is a second,
@@ -321,6 +323,22 @@ Register at: https://eoiam-idp.eo.esa.int/
 
 The `smos_downloader` uses these credentials to download SMOS L2 soil moisture products
 from the ESA SMOS FTPS archive.
+
+### Copernicus CDS — for C3S satellite soil moisture downloads
+
+`cds_soil_moisture_downloader` downloads via the
+[`cdsapi`](https://cds.climate.copernicus.eu/how-to-api) library, which reads
+credentials automatically from `~/.cdsapirc`. Create that file after registering:
+
+```ini
+url: https://cds.climate.copernicus.eu/api
+key: <your-personal-access-token>
+```
+
+Register and generate a token at: https://cds.climate.copernicus.eu
+
+Note: no `sar-validate --set-credential` command is needed; `cdsapi` reads
+`~/.cdsapirc` natively.
 
 ### ISMN — for soil moisture in-situ validation
 

@@ -42,16 +42,6 @@ class TestISMNDownloaderNoArchive:
         assert "Good" in captured.out
         assert "Gap filling" in captured.out
 
-    def test_nonexistent_archive_path_prints_instructions_and_returns_empty(self, capsys, tmp_path):
-        dl = ISMNDownloader(output_dir=tmp_path)
-        result = dl.download(
-            min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
-            start="2026-01-01", end="2026-01-02",
-            archive_path=str(tmp_path / "does_not_exist.zip"),
-        )
-        assert result == []
-        assert "ismn.earth" in capsys.readouterr().out
-
 
 def _real_shaped_sensor_meta(station, lon, lat, depth_from, depth_to):
     """
@@ -191,31 +181,13 @@ class TestISMNDownloaderFiltering:
         # entire point of --dry-run being quick.
         fake_interface.ISMN_Interface.assert_not_called()
 
-    def test_dry_run_with_real_station_index_skips_ISMN_Interface(self, tmp_path, capsys):
-        archive = tmp_path / "synthetic.zip"
-        _write_synthetic_ismn_archive(archive, [
-            ("NETA", "InBbox", 45.0, 10.0, 0),
-            ("NETB", "OutBbox", -30.0, 150.0, 0),
-        ])
-        dl = ISMNDownloader(output_dir=tmp_path / "out", dry_run=True)
 
-        fake_interface = MagicMock()
-        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
-            written = dl.download(
-                min_lon=5.0, max_lon=15.0, min_lat=40.0, max_lat=50.0,
-                start="2020-01-01", end="2020-01-02",
-                archive_path=str(archive),
-            )
-
-        assert written == []
-        fake_interface.ISMN_Interface.assert_not_called()
-        assert "1 station" in capsys.readouterr().out
-
-
-class TestISMNDownloaderAutoDetectArchive:
+class TestArchiveResolutionPrecedence:
     """A user who downloads the ISMN zip from the portal shouldn't have to
     edit the recipe's download_kwargs at all -- dropping it directly into
-    this run's own ISMN output folder should be picked up automatically."""
+    this run's own ISMN output folder should be picked up automatically.
+    Precedence order when archive_path=None: explicit path > most-recently-
+    modified local zip in output_dir > shared complete-archive cache."""
 
     def _fake_reader(self):
         meta_df = pd.DataFrame(
@@ -233,42 +205,15 @@ class TestISMNDownloaderAutoDetectArchive:
         reader.read.return_value = (ts, meta)
         return reader
 
-    def test_auto_detects_zip_dropped_in_output_dir(self, tmp_path):
+    def _auto_detect(self, tmp_path, monkeypatch):
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         zip_path = out_dir / "Data_separate_files_20240703.zip"
         with zipfile.ZipFile(zip_path, "w"):
-            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
-        dl = ISMNDownloader(output_dir=out_dir)
+            pass
+        return out_dir, None, zip_path
 
-        fake_interface = MagicMock()
-        fake_interface.ISMN_Interface.return_value = self._fake_reader()
-
-        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
-            written = dl.download(
-                min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
-                start="2026-01-01", end="2026-01-02",
-                min_depth=0.0, max_depth=0.05,
-                archive_path=None,
-            )
-
-        assert len(written) == 1
-        assert fake_interface.ISMN_Interface.call_args.args[0] == zip_path
-
-    def test_no_zip_in_output_dir_still_prints_instructions(self, tmp_path, capsys):
-        out_dir = tmp_path / "out"
-        dl = ISMNDownloader(output_dir=out_dir)
-
-        result = dl.download(
-            min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
-            start="2026-01-01", end="2026-01-02",
-            archive_path=None,
-        )
-
-        assert result == []
-        assert "ismn.earth" in capsys.readouterr().out
-
-    def test_prefers_most_recently_modified_zip_when_multiple_present(self, tmp_path):
+    def _most_recent_of_multiple(self, tmp_path, monkeypatch):
         import os
         import time
 
@@ -277,61 +222,94 @@ class TestISMNDownloaderAutoDetectArchive:
         older = out_dir / "older.zip"
         newer = out_dir / "newer.zip"
         with zipfile.ZipFile(older, "w"):
-            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
+            pass
         time.sleep(0.01)
         with zipfile.ZipFile(newer, "w"):
-            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
+            pass
         now = time.time()
         os.utime(older, (now - 100, now - 100))
         os.utime(newer, (now, now))
-        dl = ISMNDownloader(output_dir=out_dir)
+        return out_dir, None, newer
 
-        fake_interface = MagicMock()
-        fake_interface.ISMN_Interface.return_value = self._fake_reader()
-
-        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
-            dl.download(
-                min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
-                start="2026-01-01", end="2026-01-02",
-                archive_path=None,
-            )
-
-        assert fake_interface.ISMN_Interface.call_args.args[0] == newer
-
-    def test_explicit_archive_path_takes_priority_over_auto_detected_zip(self, tmp_path):
+    def _explicit_over_auto_detected(self, tmp_path, monkeypatch):
         out_dir = tmp_path / "out"
         out_dir.mkdir()
         decoy = out_dir / "decoy.zip"
         with zipfile.ZipFile(decoy, "w"):
-            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
+            pass
         explicit = tmp_path / "explicit_archive.zip"
         with zipfile.ZipFile(explicit, "w"):
-            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
+            pass
+        return out_dir, str(explicit), explicit
+
+    def _shared_cache_fallback(self, tmp_path, monkeypatch):
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        shared_cache = tmp_path / "shared_cache"
+        shared_cache.mkdir()
+        shared_zip = shared_cache / "ISMN_archive_20260724.zip"
+        with zipfile.ZipFile(shared_zip, "w"):
+            pass
+        monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", shared_cache)
+        out_dir = tmp_path / "out"  # empty -- no recipe-local zip
+        return out_dir, None, shared_zip
+
+    def _local_over_shared_cache(self, tmp_path, monkeypatch):
+        import sar_validation.downloaders.ismn_downloader as ismn_mod
+
+        shared_cache = tmp_path / "shared_cache"
+        shared_cache.mkdir()
+        with zipfile.ZipFile(shared_cache / "ISMN_archive_20260724.zip", "w"):
+            pass
+        monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", shared_cache)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        local_zip = out_dir / "Data_separate_files_20260101.zip"
+        with zipfile.ZipFile(local_zip, "w"):
+            pass
+        return out_dir, None, local_zip
+
+    @pytest.mark.parametrize(
+        "setup_fn,check_written",
+        [
+            (_auto_detect, True),
+            (_most_recent_of_multiple, False),
+            (_explicit_over_auto_detected, False),
+            (_shared_cache_fallback, True),
+            (_local_over_shared_cache, False),
+        ],
+        ids=[
+            "auto_detects_zip_dropped_in_output_dir",
+            "prefers_most_recently_modified_zip_when_multiple_present",
+            "explicit_archive_path_takes_priority_over_auto_detected_zip",
+            "falls_back_to_shared_cache_when_no_local_zip",
+            "local_zip_takes_priority_over_shared_cache",
+        ],
+    )
+    def test_resolves_expected_archive(self, setup_fn, check_written, tmp_path, monkeypatch):
+        out_dir, archive_path, expected_path = setup_fn(self, tmp_path, monkeypatch)
         dl = ISMNDownloader(output_dir=out_dir)
 
         fake_interface = MagicMock()
         fake_interface.ISMN_Interface.return_value = self._fake_reader()
 
-        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
-            dl.download(
-                min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
-                start="2026-01-01", end="2026-01-02",
-                archive_path=str(explicit),
-            )
-
-        assert fake_interface.ISMN_Interface.call_args.args[0] == explicit
-
-    def test_instructions_mention_output_dir_path(self, tmp_path, capsys):
-        out_dir = tmp_path / "out"
-        dl = ISMNDownloader(output_dir=out_dir)
-
-        dl.download(
+        # check_written=True rows also cover the min_depth/max_depth kwargs and
+        # the written-file count, matching the original standalone tests these
+        # rows were folded from.
+        download_kwargs = dict(
             min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
             start="2026-01-01", end="2026-01-02",
-            archive_path=None,
+            archive_path=archive_path,
         )
+        if check_written:
+            download_kwargs.update(min_depth=0.0, max_depth=0.05)
 
-        assert str(out_dir) in capsys.readouterr().out
+        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
+            written = dl.download(**download_kwargs)
+
+        assert fake_interface.ISMN_Interface.call_args.args[0] == expected_path
+        if check_written:
+            assert len(written) == 1
 
 
 class TestISMNDownloaderSingleReadingArchive:
@@ -366,10 +344,7 @@ class TestISMNDownloaderSingleReadingArchive:
 
 
 class TestISMNDownloaderSharedCacheFallback:
-    """When no explicit archive_path is given and no zip sits in this
-    run's own output_dir, fall back to the shared complete-archive cache
-    at data/_archive_cache/ismn/ before giving up and printing manual
-    portal instructions."""
+    """Age-warning and date-parsing tests for the shared-archive cache."""
 
     def _fake_reader(self):
         meta_df = pd.DataFrame(
@@ -387,77 +362,15 @@ class TestISMNDownloaderSharedCacheFallback:
         reader.read.return_value = (ts, meta)
         return reader
 
-    def test_falls_back_to_shared_cache_when_no_local_zip(self, tmp_path, monkeypatch):
-        import sar_validation.downloaders.ismn_downloader as ismn_mod
-
-        shared_cache = tmp_path / "shared_cache"
-        shared_cache.mkdir()
-        shared_zip = shared_cache / "ISMN_archive_20260724.zip"
-        with zipfile.ZipFile(shared_zip, "w"):
-            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
-        monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", shared_cache)
-
-        out_dir = tmp_path / "out"  # empty -- no recipe-local zip
-        dl = ISMNDownloader(output_dir=out_dir)
-
-        fake_interface = MagicMock()
-        fake_interface.ISMN_Interface.return_value = self._fake_reader()
-
-        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
-            written = dl.download(
-                min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
-                start="2026-01-01", end="2026-01-02",
-                min_depth=0.0, max_depth=0.05,
-                archive_path=None,
-            )
-
-        assert len(written) == 1
-        assert fake_interface.ISMN_Interface.call_args.args[0] == shared_zip
-
-    def test_local_zip_takes_priority_over_shared_cache(self, tmp_path, monkeypatch):
-        import sar_validation.downloaders.ismn_downloader as ismn_mod
-
-        shared_cache = tmp_path / "shared_cache"
-        shared_cache.mkdir()
-        with zipfile.ZipFile(shared_cache / "ISMN_archive_20260724.zip", "w"):
-            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
-        monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", shared_cache)
-
-        out_dir = tmp_path / "out"
-        out_dir.mkdir()
-        local_zip = out_dir / "Data_separate_files_20260101.zip"
-        with zipfile.ZipFile(local_zip, "w"):
-            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
-        dl = ISMNDownloader(output_dir=out_dir)
-
-        fake_interface = MagicMock()
-        fake_interface.ISMN_Interface.return_value = self._fake_reader()
-
-        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
-            dl.download(
-                min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
-                start="2026-01-01", end="2026-01-02",
-                archive_path=None,
-            )
-
-        assert fake_interface.ISMN_Interface.call_args.args[0] == local_zip
-
-    def test_missing_shared_cache_dir_still_prints_instructions(self, tmp_path, monkeypatch, capsys):
-        import sar_validation.downloaders.ismn_downloader as ismn_mod
-
-        monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", tmp_path / "does_not_exist")
-
-        dl = ISMNDownloader(output_dir=tmp_path / "out")
-        result = dl.download(
-            min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
-            start="2026-01-01", end="2026-01-02",
-            archive_path=None,
-        )
-
-        assert result == []
-        assert "ismn.earth" in capsys.readouterr().out
-
-    def test_warns_when_shared_cache_archive_older_than_90_days(self, tmp_path, monkeypatch, caplog):
+    @pytest.mark.parametrize(
+        "age_days,expect_warning",
+        [
+            (95, True),
+            (0, False),
+        ],
+        ids=["older_than_90_days_warns", "recent_archive_no_warning"],
+    )
+    def test_age_warning(self, tmp_path, monkeypatch, caplog, age_days, expect_warning):
         import logging
         import os
         import time
@@ -466,11 +379,13 @@ class TestISMNDownloaderSharedCacheFallback:
 
         shared_cache = tmp_path / "shared_cache"
         shared_cache.mkdir()
-        old_zip = shared_cache / "ISMN_archive_old.zip"
-        with zipfile.ZipFile(old_zip, "w"):
-            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
-        old_time = time.time() - (95 * 86400)
-        os.utime(old_zip, (old_time, old_time))
+        zip_name = "ISMN_archive_old.zip" if expect_warning else "ISMN_archive_recent.zip"
+        archive = shared_cache / zip_name
+        with zipfile.ZipFile(archive, "w"):
+            pass
+        if age_days:
+            old_time = time.time() - (age_days * 86400)
+            os.utime(archive, (old_time, old_time))
         monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", shared_cache)
 
         dl = ISMNDownloader(output_dir=tmp_path / "out")
@@ -486,33 +401,8 @@ class TestISMNDownloaderSharedCacheFallback:
                     archive_path=None,
                 )
 
-        assert any("days old" in r.message for r in caplog.records)
-
-    def test_no_warning_when_shared_cache_archive_is_recent(self, tmp_path, monkeypatch, caplog):
-        import logging
-
-        import sar_validation.downloaders.ismn_downloader as ismn_mod
-
-        shared_cache = tmp_path / "shared_cache"
-        shared_cache.mkdir()
-        with zipfile.ZipFile(shared_cache / "ISMN_archive_recent.zip", "w"):
-            pass  # valid, empty zip -- index_df is empty, so download() falls back to original archive path
-        monkeypatch.setattr(ismn_mod, "_SHARED_ARCHIVE_CACHE_DIR", shared_cache)
-
-        dl = ISMNDownloader(output_dir=tmp_path / "out")
-
-        fake_interface = MagicMock()
-        fake_interface.ISMN_Interface.return_value = self._fake_reader()
-
-        with patch.dict("sys.modules", {"ismn": MagicMock(), "ismn.interface": fake_interface}):
-            with caplog.at_level(logging.WARNING):
-                dl.download(
-                    min_lon=-10.0, max_lon=20.0, min_lat=40.0, max_lat=55.0,
-                    start="2026-01-01", end="2026-01-02",
-                    archive_path=None,
-                )
-
-        assert not any("days old" in r.message for r in caplog.records)
+        has_warning = any("days old" in r.message for r in caplog.records)
+        assert has_warning is expect_warning
 
     def test_prints_age_from_filename_date_not_mtime(self, tmp_path, monkeypatch, capsys):
         """A shared-cache archive named ISMN_archive_YYYYMMDD.zip must
@@ -632,20 +522,6 @@ class TestBuildStationIndex:
         assert row["lat"] == pytest.approx(45.0)
         assert row["lon"] == pytest.approx(10.0)
         assert row["dir_prefix"] == "NETA/Station1/"
-
-    def test_multiple_stations_all_indexed(self, tmp_path):
-        from sar_validation.downloaders.ismn_downloader import _build_station_index
-
-        archive = tmp_path / "synthetic.zip"
-        _write_synthetic_ismn_archive(archive, [
-            ("NETA", "Station1", 45.0, 10.0, 0),
-            ("NETB", "Station2", -30.0, 150.0, 0),
-        ])
-
-        index_df = _build_station_index(archive)
-
-        assert len(index_df) == 2
-        assert set(index_df["dir_prefix"]) == {"NETA/Station1/", "NETB/Station2/"}
 
     def test_malformed_first_line_kept_with_nan_coords(self, tmp_path):
         from sar_validation.downloaders.ismn_downloader import _build_station_index

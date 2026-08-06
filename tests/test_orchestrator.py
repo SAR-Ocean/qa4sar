@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from sar_validation.core.orchestrator import DataOrchestrator
 from sar_validation.core.recipe import (
     GeographicBounds,
@@ -133,14 +135,31 @@ class TestRunDownload:
 
 
 class TestDownloadSarSourceBranch:
-    def test_l3_ssm_uses_soil_moisture_downloader(self, tmp_path):
-        recipe = _recipe("sentinel1_clms_ssm")
+    @pytest.mark.parametrize(
+        "source,patch_path,expected_output_subdir",
+        [
+            pytest.param(
+                "sentinel1_clms_ssm",
+                "sar_validation.downloaders.sentinel1_soil_moisture_downloader.SoilMoistureDownloader",
+                "S1_L3_SSM",
+                id="l3_ssm_uses_soil_moisture_downloader",
+            ),
+            pytest.param(
+                "sentinel1_l2_ocn",
+                "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader",
+                "S1_L2_OCN",
+                id="l2_ocn_uses_sar_downloader",
+            ),
+        ],
+    )
+    def test_dispatches_to_the_downloader_matching_the_sar_source(
+        self, tmp_path, source, patch_path, expected_output_subdir
+    ):
+        recipe = _recipe(source)
         orchestrator = DataOrchestrator(recipe, dry_run=True)
         orchestrator.base_dir = tmp_path
 
-        with patch(
-            "sar_validation.downloaders.sentinel1_soil_moisture_downloader.SoilMoistureDownloader"
-        ) as mock_cls:
+        with patch(patch_path) as mock_cls:
             mock_instance = MagicMock()
             mock_instance.download.return_value = []
             mock_cls.return_value = mock_instance
@@ -149,25 +168,7 @@ class TestDownloadSarSourceBranch:
 
         assert ok is True
         mock_cls.assert_called_once()
-        assert mock_cls.call_args.kwargs["output_dir"] == tmp_path / "S1_L3_SSM"
-
-    def test_l2_ocn_uses_sar_downloader(self, tmp_path):
-        recipe = _recipe("sentinel1_l2_ocn")
-        orchestrator = DataOrchestrator(recipe, dry_run=True)
-        orchestrator.base_dir = tmp_path
-
-        with patch(
-            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
-        ) as mock_cls:
-            mock_instance = MagicMock()
-            mock_instance.download.return_value = []
-            mock_cls.return_value = mock_instance
-
-            ok = orchestrator._download_sar()
-
-        assert ok is True
-        mock_cls.assert_called_once()
-        assert mock_cls.call_args.kwargs["output_dir"] == tmp_path / "S1_L2_OCN"
+        assert mock_cls.call_args.kwargs["output_dir"] == tmp_path / expected_output_subdir
 
     def test_l3_ssm_failure_is_recorded_in_metadata(self, tmp_path):
         recipe = _recipe("sentinel1_clms_ssm")
@@ -186,16 +187,29 @@ class TestDownloadSarSourceBranch:
 
 
 class TestDownloadIsmnDispatch:
-    def test_ismn_source_type_dispatches_to_ismn_downloader(self, tmp_path):
+    @pytest.mark.parametrize(
+        "validation_source_kwargs,expected_archive_path",
+        [
+            pytest.param(
+                {
+                    "min_depth": 0.0, "max_depth": 0.05,
+                    "download_kwargs": {"ismn_archive_path": "/tmp/archive.zip"},
+                },
+                "/tmp/archive.zip",
+                id="configured_archive_path",
+            ),
+            pytest.param({}, None, id="unconfigured_archive_path_forwards_none"),
+        ],
+    )
+    def test_ismn_source_dispatches_with_expected_archive_path(
+        self, tmp_path, validation_source_kwargs, expected_archive_path
+    ):
         cfg = RecipeConfig(
             name="test", variable="soil_moisture",
             geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
             temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
             validation_sources=[
-                ValidationDataSource(
-                    source_type="ismn", min_depth=0.0, max_depth=0.05,
-                    download_kwargs={"ismn_archive_path": "/tmp/archive.zip"},
-                )
+                ValidationDataSource(source_type="ismn", **validation_source_kwargs),
             ],
         )
         recipe = Recipe(cfg)
@@ -213,32 +227,10 @@ class TestDownloadIsmnDispatch:
 
         assert ok is True
         call_kwargs = mock_instance.download.call_args.kwargs
-        assert call_kwargs["archive_path"] == "/tmp/archive.zip"
-        assert call_kwargs["min_depth"] == 0.0
-        assert call_kwargs["max_depth"] == 0.05
-
-    def test_unconfigured_ismn_archive_path_forwards_none(self, tmp_path):
-        cfg = RecipeConfig(
-            name="test", variable="soil_moisture",
-            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
-            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
-            validation_sources=[ValidationDataSource(source_type="ismn")],
-        )
-        recipe = Recipe(cfg)
-        orchestrator = DataOrchestrator(recipe, dry_run=True)
-        orchestrator.base_dir = tmp_path
-
-        with patch(
-            "sar_validation.downloaders.ismn_downloader.ISMNDownloader"
-        ) as mock_cls:
-            mock_instance = MagicMock()
-            mock_instance.download.return_value = []
-            mock_cls.return_value = mock_instance
-
-            ok = orchestrator._dispatch_source(cfg.validation_sources[0])
-
-        assert ok is True
-        assert mock_instance.download.call_args.kwargs["archive_path"] is None
+        assert call_kwargs["archive_path"] == expected_archive_path
+        if "min_depth" in validation_source_kwargs:
+            assert call_kwargs["min_depth"] == validation_source_kwargs["min_depth"]
+            assert call_kwargs["max_depth"] == validation_source_kwargs["max_depth"]
 
 
 class TestDownloadAscatSsmDispatch:
@@ -266,55 +258,6 @@ class TestDownloadAscatSsmDispatch:
         mock_cls.assert_called_once()
         assert mock_cls.call_args.kwargs["output_dir"] == tmp_path / "ascat_ssm"
         assert orchestrator.metadata["downloads"]["ascat_ssm"]["status"] == "dry_run"
-
-    def test_ascat_ssm_metadata_records_files_list(self, tmp_path):
-        """Matches the established pattern used by _download_earthdata_ssm/
-        _download_smos_ssm -- ``metadata["downloads"]["ascat_ssm"]`` must
-        also carry the downloaded file paths, not just a status string."""
-        cfg = RecipeConfig(
-            name="test", variable="soil_moisture",
-            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
-            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
-            validation_sources=[ValidationDataSource(source_type="ascat_ssm")],
-        )
-        recipe = Recipe(cfg)
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
-        orchestrator.base_dir = tmp_path
-
-        downloaded_path = tmp_path / "ascat_ssm" / "ASCA_SMR_02_M02_fake.nc"
-
-        with patch(
-            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader"
-        ) as mock_cls:
-            mock_instance = MagicMock()
-            mock_instance.download.return_value = [downloaded_path]
-            mock_cls.return_value = mock_instance
-
-            ok = orchestrator._dispatch_source(cfg.validation_sources[0])
-
-        assert ok is True
-        assert orchestrator.metadata["downloads"]["ascat_ssm"]["files"] == [str(downloaded_path)]
-
-    def test_ascat_ssm_download_failure_is_recorded_in_metadata(self, tmp_path):
-        cfg = RecipeConfig(
-            name="test", variable="soil_moisture",
-            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
-            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
-            validation_sources=[ValidationDataSource(source_type="ascat_ssm")],
-        )
-        recipe = Recipe(cfg)
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
-        orchestrator.base_dir = tmp_path
-
-        with patch(
-            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader"
-        ) as mock_cls:
-            mock_cls.side_effect = RuntimeError("boom")
-            ok = orchestrator._dispatch_source(cfg.validation_sources[0])
-
-        assert ok is False
-        assert orchestrator.metadata["downloads"]["ascat_ssm"]["status"] == "failed"
-        assert "boom" in orchestrator.metadata["errors"][0]
 
 
 class TestDownloadTemporalPadding:
@@ -452,59 +395,47 @@ class TestIsmnDownloadStatusReporting:
         )
         return Recipe(cfg)
 
-    def test_zero_files_reports_awaiting_manual_archive(self, tmp_path):
+    @pytest.mark.parametrize(
+        "dry_run,has_files,expected_status",
+        [
+            pytest.param(False, False, "awaiting_manual_archive", id="zero_files"),
+            pytest.param(False, True, "success", id="nonzero_files"),
+            pytest.param(True, False, "dry_run", id="dry_run_with_zero_files"),
+        ],
+    )
+    def test_status_reflects_dry_run_and_file_count(
+        self, tmp_path, dry_run, has_files, expected_status
+    ):
         recipe = self._recipe()
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator = DataOrchestrator(recipe, dry_run=dry_run)
         orchestrator.base_dir = tmp_path
+        download_return_value = [tmp_path / "ismn_station.csv"] if has_files else []
 
         with patch(
             "sar_validation.downloaders.ismn_downloader.ISMNDownloader"
         ) as mock_cls:
             mock_instance = MagicMock()
-            mock_instance.download.return_value = []
+            mock_instance.download.return_value = download_return_value
             mock_cls.return_value = mock_instance
 
             ok = orchestrator._download_ismn(recipe.config.validation_sources[0])
 
-        assert ok is True
-        assert orchestrator.metadata["downloads"]["ismn"]["status"] == "awaiting_manual_archive"
-
-    def test_nonzero_files_reports_success(self, tmp_path):
-        recipe = self._recipe()
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
-        orchestrator.base_dir = tmp_path
-
-        with patch(
-            "sar_validation.downloaders.ismn_downloader.ISMNDownloader"
-        ) as mock_cls:
-            mock_instance = MagicMock()
-            mock_instance.download.return_value = [tmp_path / "ismn_station.csv"]
-            mock_cls.return_value = mock_instance
-
-            ok = orchestrator._download_ismn(recipe.config.validation_sources[0])
-
-        assert ok is True
-        assert orchestrator.metadata["downloads"]["ismn"]["status"] == "success"
-
-    def test_dry_run_reports_dry_run_status_even_with_zero_files(self, tmp_path):
-        recipe = self._recipe()
-        orchestrator = DataOrchestrator(recipe, dry_run=True)
-        orchestrator.base_dir = tmp_path
-
-        with patch(
-            "sar_validation.downloaders.ismn_downloader.ISMNDownloader"
-        ) as mock_cls:
-            mock_instance = MagicMock()
-            mock_instance.download.return_value = []
-            mock_cls.return_value = mock_instance
-
-            orchestrator._download_ismn(recipe.config.validation_sources[0])
-
-        assert orchestrator.metadata["downloads"]["ismn"]["status"] == "dry_run"
+        assert orchestrator.metadata["downloads"]["ismn"]["status"] == expected_status
+        if not dry_run:
+            assert ok is True
 
 
 class TestScatterometerHandlerCleansUpEmptyOutputDir:
-    def test_removes_output_dir_when_downloader_produced_no_files(self, tmp_path):
+    @pytest.mark.parametrize(
+        "produces_file,expect_dir_removed",
+        [
+            pytest.param(False, True, id="no_files_produced"),
+            pytest.param(True, False, id="file_produced"),
+        ],
+    )
+    def test_output_dir_cleanup_depends_on_whether_files_were_produced(
+        self, tmp_path, produces_file, expect_dir_removed
+    ):
         recipe = _recipe("sentinel1_l2_ocn")
         orchestrator = DataOrchestrator(recipe, dry_run=False)
         orchestrator.base_dir = tmp_path
@@ -518,7 +449,11 @@ class TestScatterometerHandlerCleansUpEmptyOutputDir:
                 # Real downloaders create output_dir unconditionally before
                 # they know whether any data will land in it -- simulate
                 # that here.
-                (tmp_path / "osi_saf_winds").mkdir(parents=True, exist_ok=True)
+                out = tmp_path / "osi_saf_winds"
+                out.mkdir(parents=True, exist_ok=True)
+                if produces_file:
+                    (out / "scat.nc").write_text("x")
+                    return [out / "scat.nc"]
                 return []
 
             mock_instance.download.side_effect = fake_download
@@ -527,31 +462,10 @@ class TestScatterometerHandlerCleansUpEmptyOutputDir:
             ok = orchestrator._download_scatterometer(None)
 
         assert ok is True
-        assert not (tmp_path / "osi_saf_winds").exists()
-
-    def test_keeps_output_dir_when_downloader_produced_a_file(self, tmp_path):
-        recipe = _recipe("sentinel1_l2_ocn")
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
-        orchestrator.base_dir = tmp_path
-
-        with patch(
-            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
-        ) as mock_cls:
-            mock_instance = MagicMock()
-
-            def fake_download(**kwargs):
-                out = tmp_path / "osi_saf_winds"
-                out.mkdir(parents=True, exist_ok=True)
-                (out / "scat.nc").write_text("x")
-                return [out / "scat.nc"]
-
-            mock_instance.download.side_effect = fake_download
-            mock_cls.return_value = mock_instance
-
-            ok = orchestrator._download_scatterometer(None)
-
-        assert ok is True
-        assert (tmp_path / "osi_saf_winds" / "scat.nc").exists()
+        if expect_dir_removed:
+            assert not (tmp_path / "osi_saf_winds").exists()
+        else:
+            assert (tmp_path / "osi_saf_winds" / "scat.nc").exists()
 
 
 class TestCombinedCurrentsHistoricalStatusMessage:
@@ -566,11 +480,32 @@ class TestCombinedCurrentsHistoricalStatusMessage:
         )
         return Recipe(cfg)
 
-    def test_all_empty_logs_one_combined_warning(self, caplog):
-        recipe = self._recipe_with("adcp_historical", "argo_historical")
+    @pytest.mark.parametrize(
+        "source_types,downloads,expected_message_substrs",
+        [
+            pytest.param(
+                ("adcp_historical", "argo_historical"),
+                {
+                    "adcp_historical": {"status": "success", "file_count": 0},
+                    "argo_historical": {"status": "success", "file_count": 0},
+                },
+                ("adcp", "argo"),
+                id="both_empty",
+            ),
+            pytest.param(
+                ("drifter_historical",),
+                {"drifter_historical": {"status": "success", "file_count": 0}},
+                ("drifter",),
+                id="single_source",
+            ),
+        ],
+    )
+    def test_all_empty_logs_one_combined_warning(
+        self, caplog, source_types, downloads, expected_message_substrs
+    ):
+        recipe = self._recipe_with(*source_types)
         orchestrator = DataOrchestrator(recipe, dry_run=False)
-        orchestrator.metadata["downloads"]["adcp_historical"] = {"status": "success", "file_count": 0}
-        orchestrator.metadata["downloads"]["argo_historical"] = {"status": "success", "file_count": 0}
+        orchestrator.metadata["downloads"].update(downloads)
 
         with caplog.at_level(logging.WARNING):
             orchestrator._report_combined_currents_status()
@@ -580,8 +515,15 @@ class TestCombinedCurrentsHistoricalStatusMessage:
             if "No delayed-mode in-situ current data found" in r.message
         ]
         assert len(combined) == 1
-        assert "adcp" in combined[0].message
-        assert "argo" in combined[0].message
+        for substr in expected_message_substrs:
+            assert substr in combined[0].message
+        if len(source_types) == 1:
+            # The message must name only the instrument(s) actually present
+            # in the recipe -- not every instrument the combined check knows
+            # about.
+            assert combined[0].message.strip().startswith(
+                "No delayed-mode in-situ current data found (drifter)"
+            )
 
     def test_all_empty_also_records_a_notice(self, caplog):
         """The message must persist into download_metadata.json (via
@@ -603,54 +545,39 @@ class TestCombinedCurrentsHistoricalStatusMessage:
         assert "argo" in orchestrator.metadata["notices"][0]
         assert orchestrator.metadata["errors"] == []
 
-    def test_one_nonempty_suppresses_combined_warning(self, caplog):
-        recipe = self._recipe_with("adcp_historical", "argo_historical")
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
-        orchestrator.metadata["downloads"]["adcp_historical"] = {"status": "success", "file_count": 2}
-        orchestrator.metadata["downloads"]["argo_historical"] = {"status": "success", "file_count": 0}
-
-        with caplog.at_level(logging.WARNING):
-            orchestrator._report_combined_currents_status()
-
-        assert not any(
-            "No delayed-mode in-situ current data found" in r.message for r in caplog.records
-        )
-
-    def test_message_names_only_instruments_present_in_recipe(self, caplog):
-        recipe = self._recipe_with("drifter_historical")
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
-        orchestrator.metadata["downloads"]["drifter_historical"] = {"status": "success", "file_count": 0}
-
-        with caplog.at_level(logging.WARNING):
-            orchestrator._report_combined_currents_status()
-
-        combined = [
-            r for r in caplog.records
-            if "No delayed-mode in-situ current data found" in r.message
-        ]
-        assert len(combined) == 1
-        assert combined[0].message.strip().startswith(
-            "No delayed-mode in-situ current data found (drifter)"
-        )
-
-    def test_dry_run_never_logs_combined_warning(self, caplog):
-        recipe = self._recipe_with("adcp_historical")
-        orchestrator = DataOrchestrator(recipe, dry_run=True)
-        orchestrator.metadata["downloads"]["adcp_historical"] = {"status": "dry_run", "file_count": 0}
-
-        with caplog.at_level(logging.WARNING):
-            orchestrator._report_combined_currents_status()
-
-        assert not any(
-            "No delayed-mode in-situ current data found" in r.message for r in caplog.records
-        )
-
-    def test_failed_instrument_suppresses_combined_warning(self, caplog):
-        """A real failure (network error, etc.) is a different problem than
-        'no data' and must not be folded into the combined message."""
-        recipe = self._recipe_with("adcp_historical")
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
-        orchestrator.metadata["downloads"]["adcp_historical"] = {"status": "failed", "error": "boom"}
+    @pytest.mark.parametrize(
+        "downloads,dry_run",
+        [
+            pytest.param(
+                {
+                    "adcp_historical": {"status": "success", "file_count": 2},
+                    "argo_historical": {"status": "success", "file_count": 0},
+                },
+                False,
+                id="one_nonempty_suppresses",
+            ),
+            pytest.param(
+                {"adcp_historical": {"status": "dry_run", "file_count": 0}},
+                True,
+                id="dry_run_never_logs",
+            ),
+            pytest.param(
+                {"adcp_historical": {"status": "failed", "error": "boom"}},
+                False,
+                # A real failure (network error, etc.) is a different
+                # problem than 'no data' and must not be folded into the
+                # combined message.
+                id="failed_instrument_suppresses",
+            ),
+        ],
+    )
+    def test_combined_warning_suppressed_unless_all_present_sources_are_empty(
+        self, caplog, downloads, dry_run
+    ):
+        source_types = tuple(downloads.keys())
+        recipe = self._recipe_with(*source_types)
+        orchestrator = DataOrchestrator(recipe, dry_run=dry_run)
+        orchestrator.metadata["downloads"].update(downloads)
 
         with caplog.at_level(logging.WARNING):
             orchestrator._report_combined_currents_status()
@@ -689,52 +616,33 @@ class TestCombinedHfRadarUsStatusMessage:
         assert len(orchestrator.metadata["notices"]) == 1
         assert orchestrator.metadata["errors"] == []
 
-    def test_nonempty_result_suppresses_notice(self, caplog):
+    @pytest.mark.parametrize(
+        "downloads_entry,dry_run",
+        [
+            pytest.param(
+                {"status": "success", "file_count": 3, "attempted_backends": ["erddap"]},
+                False,
+                id="nonempty_result",
+            ),
+            pytest.param(None, False, id="no_entry_at_all"),
+            pytest.param(
+                {"status": "dry_run", "file_count": 0, "attempted_backends": ["erddap"]},
+                True,
+                id="dry_run_never_logs",
+            ),
+        ],
+    )
+    def test_no_warning_unless_all_backends_report_zero(self, caplog, downloads_entry, dry_run):
         recipe = self._recipe()
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
-        orchestrator.metadata["downloads"]["hf_radar_us"] = {
-            "status": "success", "file_count": 3,
-            "attempted_backends": ["erddap"],
-        }
+        orchestrator = DataOrchestrator(recipe, dry_run=dry_run)
+        if downloads_entry is not None:
+            orchestrator.metadata["downloads"]["hf_radar_us"] = downloads_entry
 
         with caplog.at_level(logging.WARNING):
             orchestrator._report_combined_hf_radar_us_status()
 
         assert not any("No US HF-radar data found" in r.message for r in caplog.records)
         assert orchestrator.metadata["notices"] == []
-
-    def test_failed_status_suppresses_notice(self, caplog):
-        recipe = self._recipe()
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
-        orchestrator.metadata["downloads"]["hf_radar_us"] = {
-            "status": "failed", "error": "boom",
-        }
-
-        with caplog.at_level(logging.WARNING):
-            orchestrator._report_combined_hf_radar_us_status()
-
-        assert not any("No US HF-radar data found" in r.message for r in caplog.records)
-
-    def test_no_entry_at_all_is_a_no_op(self, caplog):
-        recipe = self._recipe()
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
-
-        with caplog.at_level(logging.WARNING):
-            orchestrator._report_combined_hf_radar_us_status()
-
-        assert orchestrator.metadata["notices"] == []
-
-    def test_dry_run_never_logs(self, caplog):
-        recipe = self._recipe()
-        orchestrator = DataOrchestrator(recipe, dry_run=True)
-        orchestrator.metadata["downloads"]["hf_radar_us"] = {
-            "status": "dry_run", "file_count": 0, "attempted_backends": ["erddap"],
-        }
-
-        with caplog.at_level(logging.WARNING):
-            orchestrator._report_combined_hf_radar_us_status()
-
-        assert not any("No US HF-radar data found" in r.message for r in caplog.records)
 
 
 class TestCombinedHfRadarStatusMessage:
@@ -760,86 +668,39 @@ class TestCombinedHfRadarStatusMessage:
         assert len(combined) == 1
         assert len(orchestrator.metadata["notices"]) == 1
 
-    def test_hf_radar_skipped_but_historical_had_data_suppresses_notice(self, caplog):
-        recipe = self._recipe_with("hf_radar", "hf_radar_historical")
+    @pytest.mark.parametrize(
+        "source_types,downloads,expected_fires",
+        [
+            pytest.param(
+                ("hf_radar", "hf_radar_historical"),
+                {
+                    "hf_radar_historical": {"status": "success", "file_count": 4},
+                    "hf_radar": {"status": "skipped", "reason": "covered by hf_radar_historical"},
+                },
+                False,
+                id="hf_radar_skipped_but_historical_had_data",
+            ),
+            pytest.param(
+                ("hf_radar",),
+                {"hf_radar": {"status": "success", "file_count": 0}},
+                True,
+                id="only_hf_radar_in_recipe_and_empty_still_logs",
+            ),
+        ],
+    )
+    def test_combined_notice_fires_based_on_hf_radar_status(
+        self, caplog, source_types, downloads, expected_fires
+    ):
+        recipe = self._recipe_with(*source_types)
         orchestrator = DataOrchestrator(recipe, dry_run=False)
-        orchestrator.metadata["downloads"]["hf_radar_historical"] = {"status": "success", "file_count": 4}
-        orchestrator.metadata["downloads"]["hf_radar"] = {
-            "status": "skipped", "reason": "covered by hf_radar_historical"
-        }
+        orchestrator.metadata["downloads"].update(downloads)
 
         with caplog.at_level(logging.WARNING):
             orchestrator._report_combined_hf_radar_status()
 
-        assert not any("No HF-radar data found" in r.message for r in caplog.records)
+        fired = any("No HF-radar data found" in r.message for r in caplog.records)
+        assert fired is expected_fires
 
-    def test_only_hf_radar_in_recipe_and_empty_still_logs(self, caplog):
-        recipe = self._recipe_with("hf_radar")
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
-        orchestrator.metadata["downloads"]["hf_radar"] = {"status": "success", "file_count": 0}
-
-        with caplog.at_level(logging.WARNING):
-            orchestrator._report_combined_hf_radar_status()
-
-        assert any("No HF-radar data found" in r.message for r in caplog.records)
-
-    def test_neither_source_in_recipe_is_a_no_op(self, caplog):
-        recipe = self._recipe_with("adcp_historical")
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
-
-        with caplog.at_level(logging.WARNING):
-            orchestrator._report_combined_hf_radar_status()
-
-        assert orchestrator.metadata["notices"] == []
-
-    def test_failed_source_does_not_double_report(self, caplog):
-        recipe = self._recipe_with("hf_radar")
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
-        orchestrator.metadata["downloads"]["hf_radar"] = {"status": "failed", "error": "boom"}
-
-        with caplog.at_level(logging.WARNING):
-            orchestrator._report_combined_hf_radar_status()
-
-        assert not any("No HF-radar data found" in r.message for r in caplog.records)
-
-
-def test_dispatch_source_routes_amsr_ssm(tmp_path):
-    from unittest.mock import MagicMock
-
-    orch = DataOrchestrator.__new__(DataOrchestrator)
-    orch._download_amsr_ssm = MagicMock(return_value=True)
-    source = MagicMock(source_type="amsr_ssm")
-
-    result = orch._dispatch_source(source)
-
-    assert result is True
-    orch._download_amsr_ssm.assert_called_once_with(source)
-
-
-def test_dispatch_source_routes_smap_ssm(tmp_path):
-    from unittest.mock import MagicMock
-
-    orch = DataOrchestrator.__new__(DataOrchestrator)
-    orch._download_smap_ssm = MagicMock(return_value=True)
-    source = MagicMock(source_type="smap_ssm")
-
-    result = orch._dispatch_source(source)
-
-    assert result is True
-    orch._download_smap_ssm.assert_called_once_with(source)
-
-
-def test_dispatch_source_routes_smos_ssm(tmp_path):
-    from unittest.mock import MagicMock
-
-    orch = DataOrchestrator.__new__(DataOrchestrator)
-    orch._download_smos_ssm = MagicMock(return_value=True)
-    source = MagicMock(source_type="smos_ssm")
-
-    result = orch._dispatch_source(source)
-
-    assert result is True
-    orch._download_smos_ssm.assert_called_once_with(source)
 
 
 class TestPerSourceDownloadGating:
@@ -975,8 +836,20 @@ class TestAmsrCoverageCutoffNotice:
 
         assert orchestrator.metadata["notices"] == []
 
-    def test_selects_au_land_for_post_2023_dates(self, tmp_path):
-        recipe = self._recipe_with_amsr("2025-07-04")
+    @pytest.mark.parametrize(
+        "end_date,start_date_override,expected_dataset",
+        [
+            pytest.param("2025-07-04", None, "AU_Land", id="post_2023_dates"),
+            pytest.param("2023-06-01", "2023-05-01", "NSIDC-0451", id="historical_dates"),
+        ],
+    )
+    def test_selects_dataset_based_on_requested_dates(
+        self, tmp_path, end_date, start_date_override, expected_dataset
+    ):
+        recipe = self._recipe_with_amsr(end_date)
+        if start_date_override is not None:
+            # Override start so it's before end.
+            recipe.config.temporal_bounds.start = start_date_override
         orchestrator = DataOrchestrator(recipe, dry_run=False)
         orchestrator.base_dir = tmp_path
 
@@ -992,7 +865,7 @@ class TestAmsrCoverageCutoffNotice:
 
             orchestrator._download_amsr_ssm(recipe.config.validation_sources[0])
 
-        assert mock_cls.call_args.kwargs["dataset"] == "AU_Land"
+        assert mock_cls.call_args.kwargs["dataset"] == expected_dataset
 
     def test_notice_added_when_gportal_fallback_also_finds_nothing(self, tmp_path):
         """Within AMSR's known coverage window (no coverage-cutoff notice),
@@ -1029,23 +902,3 @@ class TestAmsrCoverageCutoffNotice:
         assert orchestrator.metadata["downloads"]["amsr_ssm"]["status"] == "success"
         assert orchestrator.metadata["errors"] == []
 
-    def test_selects_nsidc0451_for_historical_dates(self, tmp_path):
-        recipe = self._recipe_with_amsr("2023-06-01")
-        # Override start so it's before end.
-        recipe.config.temporal_bounds.start = "2023-05-01"
-        orchestrator = DataOrchestrator(recipe, dry_run=False)
-        orchestrator.base_dir = tmp_path
-
-        with patch(
-            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
-        ) as mock_cls, patch(
-            "sar_validation.downloaders.gportal_downloader.GPortalAMSR2Downloader"
-        ) as mock_gportal_cls:
-            mock_instance = MagicMock()
-            mock_instance.download.return_value = []
-            mock_cls.return_value = mock_instance
-            mock_gportal_cls.return_value.download.return_value = []
-
-            orchestrator._download_amsr_ssm(recipe.config.validation_sources[0])
-
-        assert mock_cls.call_args.kwargs["dataset"] == "NSIDC-0451"

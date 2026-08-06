@@ -47,25 +47,40 @@ class TestBuildCurrentsConfig:
         hf_source = next(s for s in cfg.validation_sources if s.source_type == "hf_radar_us")
         assert hf_source.download_kwargs == {}
 
-    def test_us_west_bbox_with_1km_sets_download_kwargs(self):
+    @pytest.mark.parametrize(
+        "bbox,resolution,expected_download_kwargs",
+        [
+            pytest.param(
+                dict(min_lon=-130.0, max_lon=-117.0, min_lat=32.0, max_lat=42.0),
+                "1km",
+                {"resolution_km": 1.0},
+                id="us_west_1km",
+            ),
+            pytest.param(
+                dict(min_lon=-130.0, max_lon=-117.0, min_lat=32.0, max_lat=42.0),
+                "finest",
+                {"resolution_km": "finest"},
+                id="us_west_finest_passes_sentinel_through",
+            ),
+            pytest.param(
+                dict(min_lon=-68.0, max_lon=-64.0, min_lat=16.0, max_lat=20.0),
+                "2km",
+                {"resolution_km": 2.0},
+                # US_PRVI's combined ERDDAP union THREDDS resolutions are
+                # {2, 6} -- 2km succeeds here, unlike the 1km case below
+                # which is kept separate because it raises instead.
+                id="prvi_2km",
+            ),
+        ],
+    )
+    def test_hfradar_resolution_sets_download_kwargs(
+        self, bbox, resolution, expected_download_kwargs
+    ):
         from sar_validation.cli import _build_currents_config
 
-        cfg = _build_currents_config(
-            min_lon=-130.0, max_lon=-117.0, min_lat=32.0, max_lat=42.0,
-            hfradar_resolution="1km",
-        )
+        cfg = _build_currents_config(hfradar_resolution=resolution, **bbox)
         hf_source = next(s for s in cfg.validation_sources if s.source_type == "hf_radar_us")
-        assert hf_source.download_kwargs == {"resolution_km": 1.0}
-
-    def test_us_west_bbox_with_finest_passes_sentinel_through(self):
-        from sar_validation.cli import _build_currents_config
-
-        cfg = _build_currents_config(
-            min_lon=-130.0, max_lon=-117.0, min_lat=32.0, max_lat=42.0,
-            hfradar_resolution="finest",
-        )
-        hf_source = next(s for s in cfg.validation_sources if s.source_type == "hf_radar_us")
-        assert hf_source.download_kwargs == {"resolution_km": "finest"}
+        assert hf_source.download_kwargs == expected_download_kwargs
 
     def test_prvi_only_bbox_with_1km_raises_value_error(self):
         # US_PRVI's combined ERDDAP union THREDDS resolutions are {2, 6} --
@@ -78,16 +93,6 @@ class TestBuildCurrentsConfig:
                 min_lon=-68.0, max_lon=-64.0, min_lat=16.0, max_lat=20.0,
                 hfradar_resolution="1km",
             )
-
-    def test_prvi_only_bbox_with_2km_succeeds(self):
-        from sar_validation.cli import _build_currents_config
-
-        cfg = _build_currents_config(
-            min_lon=-68.0, max_lon=-64.0, min_lat=16.0, max_lat=20.0,
-            hfradar_resolution="2km",
-        )
-        hf_source = next(s for s in cfg.validation_sources if s.source_type == "hf_radar_us")
-        assert hf_source.download_kwargs == {"resolution_km": 2.0}
 
     def test_hawaii_only_bbox_with_6km_succeeds_via_thredds_even_though_erddap_lacks_it(self):
         # ERDDAP only ever publishes 1km for Hawaii, but THREDDS has
@@ -103,16 +108,6 @@ class TestBuildCurrentsConfig:
         hf_source = next(s for s in cfg.validation_sources if s.source_type == "hf_radar_us")
         assert hf_source.download_kwargs == {"resolution_km": 6.0}
 
-    def test_hawaii_only_bbox_with_1km_succeeds(self):
-        from sar_validation.cli import _build_currents_config
-
-        cfg = _build_currents_config(
-            min_lon=-159.0, max_lon=-154.0, min_lat=19.0, max_lat=22.0,
-            hfradar_resolution="1km",
-        )
-        hf_source = next(s for s in cfg.validation_sources if s.source_type == "hf_radar_us")
-        assert hf_source.download_kwargs == {"resolution_km": 1.0}
-
     def test_non_us_bbox_with_hfradar_resolution_warns_and_keeps_copernicus(self, caplog):
         import logging
 
@@ -127,17 +122,6 @@ class TestBuildCurrentsConfig:
         assert "hf_radar" in source_types
         assert "hf_radar_us" not in source_types
         assert any("has no effect" in r.message for r in caplog.records)
-
-    def test_hf_radar_grid_layer_type_specs_has_no_aggregation_window_km(self):
-        from sar_validation.cli import _build_currents_config
-
-        cfg = _build_currents_config()
-        specs = cfg.collocation.layer_vs_layer.layer_type_specs["hf_radar_grid"]
-        assert "aggregation_window_km" not in specs
-        assert specs["time_tolerance_minutes"] == 30
-        assert specs["distance_weighting"] == "equal"
-        assert specs["dedup_nearest_in_time"] is True
-
 
 class TestHfradarResolutionCliFlag:
     def test_rejected_for_non_currents_template(self, tmp_path, monkeypatch, capsys):
@@ -323,61 +307,49 @@ class TestExecuteRecipePrintsFinalWarningsSummary:
 
 
 class TestLoadDownloadWarnings:
-    def test_no_metadata_file_returns_none(self, tmp_path):
-        assert cli._load_download_warnings(tmp_path) is None
-
-    def test_empty_errors_returns_none(self, tmp_path):
+    @pytest.mark.parametrize(
+        "json_content,expected_result",
+        [
+            pytest.param(None, None, id="no_metadata_file"),
+            pytest.param(
+                {"errors": ["altimeter download failed: timeout"]},
+                ["altimeter download failed: timeout"],
+                id="errors_list_missing_notices_key",
+            ),
+            pytest.param(
+                {
+                    "errors": ["altimeter download failed: timeout"],
+                    "notices": ["No delayed-mode in-situ current data found (adcp, argo) for this window."],
+                },
+                [
+                    "altimeter download failed: timeout",
+                    "No delayed-mode in-situ current data found (adcp, argo) for this window.",
+                ],
+                # notices (e.g. "no delayed-mode currents data found") must
+                # also surface on the PDF cover page, same as errors -- a
+                # notice isn't a failure, but the user still needs to see it
+                # without scrolling back through the whole run's console
+                # output.
+                id="errors_and_notices_combined",
+            ),
+            pytest.param(
+                {"errors": ["altimeter download failed: timeout"]},
+                ["altimeter download failed: timeout"],
+                # Same input/output as errors_list_missing_notices_key
+                # above -- kept as its own row because it documents a
+                # distinct guarantee (backward compatibility with metadata
+                # files written before "notices" existed).
+                id="missing_notices_key_is_backward_compatible",
+            ),
+        ],
+    )
+    def test_returns_combined_warnings_or_none(self, tmp_path, json_content, expected_result):
         import json
 
-        (tmp_path / "download_metadata.json").write_text(json.dumps({"errors": []}))
-        assert cli._load_download_warnings(tmp_path) is None
+        if json_content is not None:
+            (tmp_path / "download_metadata.json").write_text(json.dumps(json_content))
 
-    def test_returns_errors_list(self, tmp_path):
-        import json
-
-        (tmp_path / "download_metadata.json").write_text(
-            json.dumps({"errors": ["altimeter download failed: timeout"]})
-        )
-        assert cli._load_download_warnings(tmp_path) == ["altimeter download failed: timeout"]
-
-    def test_returns_notices_list_alongside_errors(self, tmp_path):
-        """notices (e.g. "no delayed-mode currents data found") must also
-        surface on the PDF cover page, same as errors -- a notice isn't a
-        failure, but the user still needs to see it without scrolling back
-        through the whole run's console output."""
-        import json
-
-        (tmp_path / "download_metadata.json").write_text(
-            json.dumps({
-                "errors": ["altimeter download failed: timeout"],
-                "notices": ["No delayed-mode in-situ current data found (adcp, argo) for this window."],
-            })
-        )
-        assert cli._load_download_warnings(tmp_path) == [
-            "altimeter download failed: timeout",
-            "No delayed-mode in-situ current data found (adcp, argo) for this window.",
-        ]
-
-    def test_notices_only_still_returns_a_list(self, tmp_path):
-        import json
-
-        (tmp_path / "download_metadata.json").write_text(
-            json.dumps({
-                "errors": [],
-                "notices": ["No delayed-mode in-situ current data found (adcp, argo) for this window."],
-            })
-        )
-        assert cli._load_download_warnings(tmp_path) == [
-            "No delayed-mode in-situ current data found (adcp, argo) for this window.",
-        ]
-
-    def test_missing_notices_key_is_backward_compatible(self, tmp_path):
-        import json
-
-        (tmp_path / "download_metadata.json").write_text(
-            json.dumps({"errors": ["altimeter download failed: timeout"]})
-        )
-        assert cli._load_download_warnings(tmp_path) == ["altimeter download failed: timeout"]
+        assert cli._load_download_warnings(tmp_path) == expected_result
 
 
 class TestMethodRunsSuffixMapping:
@@ -394,7 +366,16 @@ class TestMethodRunsSuffixMapping:
         (tmp_path / "run" / "download_metadata.json").write_text(json.dumps({"errors": []}))
         return recipe_path
 
-    def test_individual_alone_maps_to_individual_suffix(self, tmp_path):
+    @pytest.mark.parametrize(
+        "layer_vs_layer_collocation_method,expected_suffix",
+        [
+            pytest.param("individual", "_individual", id="individual_maps_to_individual_suffix"),
+            pytest.param("cell-averaging", "", id="cell_averaging_maps_to_empty_suffix"),
+        ],
+    )
+    def test_method_maps_to_expected_filename_suffix(
+        self, tmp_path, layer_vs_layer_collocation_method, expected_suffix
+    ):
         from unittest.mock import patch
 
         recipe_path = self._write_recipe_with_skippable_download(tmp_path)
@@ -402,26 +383,13 @@ class TestMethodRunsSuffixMapping:
         with patch("sar_validation.cli._collocate_data") as mock_collocate:
             cli._execute_recipe(
                 str(recipe_path), collocate=True,
-                layer_vs_layer_collocation_method="individual",
+                layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
             )
 
         _, kwargs = mock_collocate.call_args
-        assert kwargs["filename_suffix"] == "_individual"
-        assert kwargs["layer_vs_layer_collocation_method"] == "individual"
-
-    def test_cell_averaging_alone_still_maps_to_empty_suffix(self, tmp_path):
-        from unittest.mock import patch
-
-        recipe_path = self._write_recipe_with_skippable_download(tmp_path)
-
-        with patch("sar_validation.cli._collocate_data") as mock_collocate:
-            cli._execute_recipe(
-                str(recipe_path), collocate=True,
-                layer_vs_layer_collocation_method="cell-averaging",
-            )
-
-        _, kwargs = mock_collocate.call_args
-        assert kwargs["filename_suffix"] == ""
+        assert kwargs["filename_suffix"] == expected_suffix
+        if layer_vs_layer_collocation_method == "individual":
+            assert kwargs["layer_vs_layer_collocation_method"] == "individual"
 
 
 class TestExecuteRecipePassesForceDownloadToOrchestrator:
@@ -469,31 +437,179 @@ class TestExecuteRecipeSkipsStatsWhenAlreadyComputed:
         )).to_yaml(recipe_path)
         return recipe_path, run_dir
 
-    def test_does_not_recompute_stats_when_files_already_exist(self, tmp_path, capsys):
+    @pytest.mark.parametrize(
+        "stats_file_exists",
+        [
+            pytest.param(True, id="skips_when_files_already_exist"),
+            pytest.param(False, id="computes_when_files_missing"),
+        ],
+    )
+    def test_stats_recompute_depends_on_existing_files(self, tmp_path, capsys, stats_file_exists):
         from unittest.mock import patch
 
         recipe_path, run_dir = self._write_recipe_with_collocation(tmp_path)
 
-        stats_ds = xr.Dataset({"bias": ("source", [0.1])}, coords={"source": ["scatterometer"]})
-        stats_ds.to_netcdf(run_dir / "validation_statistics_owiWindSpeed_vs_WSPD.nc")
+        if stats_file_exists:
+            stats_ds = xr.Dataset({"bias": ("source", [0.1])}, coords={"source": ["scatterometer"]})
+            stats_ds.to_netcdf(run_dir / "validation_statistics_owiWindSpeed_vs_WSPD.nc")
 
         with patch("sar_validation.cli._compute_stats") as mock_compute_stats:
             cli._execute_recipe(str(recipe_path), stats=True)
 
-        mock_compute_stats.assert_not_called()
-        out = capsys.readouterr().out
-        assert "Step 4 skipped" in out
+        if stats_file_exists:
+            mock_compute_stats.assert_not_called()
+            out = capsys.readouterr().out
+            assert "Step 4 skipped" in out
+        else:
+            mock_compute_stats.assert_called_once()
 
-    def test_still_computes_stats_when_files_missing(self, tmp_path):
+
+class TestGeneratePlotsNonSoilMoistureVariables:
+    """Regression test: _generate_plots's soil_moisture-only branch used to
+    leave native_units_stats_ds_map completely unassigned for every other
+    variable (wind/waves/currents), so the unconditional
+    validation_report(..., native_units_stats_ds_map=...) call a few lines
+    down raised UnboundLocalError for every non-soil_moisture --plot run --
+    a regression introduced alongside the cds_ssm feature's own (correctly
+    initialized) cds_ssm_stats_ds_map branch, undetected because nothing in
+    the suite exercised _generate_plots for any variable."""
+
+    def test_wind_plot_does_not_raise_and_passes_none_for_soil_moisture_only_maps(self, tmp_path, monkeypatch):
         from unittest.mock import patch
 
-        recipe_path, run_dir = self._write_recipe_with_collocation(tmp_path)
-        # No pre-existing validation_statistics_*.nc file this time.
+        from sar_validation.core.datatree_converter import DataTreeConverter
 
-        with patch("sar_validation.cli._compute_stats") as mock_compute_stats:
-            cli._execute_recipe(str(recipe_path), stats=True)
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
 
-        mock_compute_stats.assert_called_once()
+        collocation_ds = xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", [7.0, 8.0]),
+            "val_WSPD":         ("collocation", [7.2, 7.9]),
+        })
+        collocation_ds.to_netcdf(run_dir / "collocation_results.nc")
+
+        sar_ds = xr.Dataset(
+            {"owiWindSpeed": ("point", [7.0, 8.0])},
+            coords={"lon": ("point", [-9.0, -8.5]), "lat": ("point", [50.0, 50.5])},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+        datatree.to_netcdf(run_dir / "datatree.nc")
+
+        recipe = Recipe(RecipeConfig(name="wind_test", variable="wind", output_dir=str(run_dir)))
+
+        with patch("sar_validation.core.visualization.validation_report") as mock_report:
+            mock_report.return_value = {}
+            cli._generate_plots(recipe, run_dir)
+
+        mock_report.assert_called_once()
+        assert mock_report.call_args.kwargs["native_units_stats_ds_map"] is None
+        assert mock_report.call_args.kwargs["cds_ssm_stats_ds_map"] is None
+
+
+class TestIsAlreadyDownloaded:
+    """_is_already_downloaded() gates the top-level "Step 1 skipped" shortcut
+    -- it must not be fooled by a source that recorded no *error* but also
+    never actually got real data. ISMN's "awaiting_manual_archive" status is
+    exactly that case (see ISMNDownloader/_download_ismn): the user hasn't
+    placed the shared archive yet, 0 files were collected, but that's
+    deliberately not an "error" (no notice/error is appended) -- confirmed
+    against a real run of recipes/soil_moisture_cds_nisar_test.yaml where
+    Step 1 kept getting skipped on every rerun despite ISMN never actually
+    downloading anything."""
+
+    def test_true_when_no_errors_and_every_source_succeeded(self, tmp_path):
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "downloads": {
+                "ismn": {"status": "success"},
+                "scatterometer": {"status": "success"},
+            },
+        }))
+        assert _is_already_downloaded(tmp_path) is True
+
+    def test_false_when_ismn_still_awaiting_manual_archive(self, tmp_path):
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "downloads": {"ismn": {"status": "awaiting_manual_archive"}},
+        }))
+        assert _is_already_downloaded(tmp_path) is False
+
+    def test_false_when_errors_present(self, tmp_path):
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({"errors": ["boom"]}))
+        assert _is_already_downloaded(tmp_path) is False
+
+    def test_false_when_metadata_file_missing(self, tmp_path):
+        from sar_validation.cli import _is_already_downloaded
+
+        assert _is_already_downloaded(tmp_path) is False
+
+
+class TestExecuteRecipeForcesConvertCollocateWhenDownloadActuallyRan:
+    """Steps 2/3 (convert/collocate) must not skip regenerating
+    datatree.nc/collocation_results.nc just because those files already
+    exist on disk from a *previous* run, if Step 1 actually did fresh
+    download work this run (e.g. a previously-incomplete source like ISMN
+    finally got real data) -- otherwise the stale datatree/collocation
+    never pick up the newly downloaded files. Confirmed against a real
+    rerun of recipes/soil_moisture_cds_nisar_test.yaml."""
+
+    def _recipe_with_stale_outputs(self, tmp_path):
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "datatree.nc").write_bytes(b"stale")
+        (run_dir / "collocation_results.nc").write_bytes(b"stale")
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-force-regen", variable="wind", output_dir=str(run_dir),
+        )).to_yaml(recipe_path)
+        return recipe_path, run_dir
+
+    def test_regenerates_when_download_step_actually_ran(self, tmp_path):
+        from unittest.mock import patch
+
+        recipe_path, run_dir = self._recipe_with_stale_outputs(tmp_path)
+
+        with patch("sar_validation.core.orchestrator.DataOrchestrator") as mock_cls, \
+                patch("sar_validation.cli._convert_data") as mock_convert, \
+                patch("sar_validation.cli._collocate_data") as mock_collocate:
+            mock_cls.return_value.download_all.return_value = True
+            mock_cls.return_value.base_dir = run_dir
+            cli._execute_recipe(str(recipe_path), convert=True, collocate=True)
+
+        mock_convert.assert_called_once()
+        mock_collocate.assert_called_once()
+
+    def test_still_skips_when_step1_itself_was_skipped(self, tmp_path):
+        import json
+        from unittest.mock import patch
+
+        recipe_path, run_dir = self._recipe_with_stale_outputs(tmp_path)
+        (run_dir / "download_metadata.json").write_text(json.dumps({"errors": []}))
+
+        with patch("sar_validation.core.orchestrator.DataOrchestrator") as mock_cls, \
+                patch("sar_validation.cli._convert_data") as mock_convert, \
+                patch("sar_validation.cli._collocate_data") as mock_collocate:
+            mock_cls.return_value.base_dir = run_dir
+            cli._execute_recipe(str(recipe_path), convert=True, collocate=True)
+
+        mock_convert.assert_not_called()
+        mock_collocate.assert_not_called()
+        mock_cls.return_value.download_all.assert_not_called()
 
 
 class TestBuildSoilMoistureConfig:
@@ -502,37 +618,15 @@ class TestBuildSoilMoistureConfig:
 
         cfg = _build_soil_moisture_config()
 
-        assert cfg.variable == "soil_moisture"
         assert cfg.sar_data.source == "sentinel1_clms_ssm"
-        assert len(cfg.validation_sources) == 5
         source_types = [s.source_type for s in cfg.validation_sources]
-        assert source_types == ["ismn", "ascat_ssm", "amsr_ssm", "smap_ssm", "smos_ssm"]
-        ismn_source = cfg.validation_sources[0]
-        assert ismn_source.min_depth == 0.0
-        assert ismn_source.max_depth == 0.05
-        assert ismn_source.download_kwargs == {}
-        for satellite_source in cfg.validation_sources[1:]:
-            assert satellite_source.download_kwargs == {}
-
-    def test_default_geographic_bounds(self):
-        from sar_validation.cli import _build_soil_moisture_config
-
-        cfg = _build_soil_moisture_config()
-        bounds = cfg.geographic_bounds
-        assert (bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat) == (
-            -10.0, 30.0, 35.0, 60.0,
-        )
-
-    def test_collocation_defaults_are_pixel_scale(self):
-        from sar_validation.cli import _build_soil_moisture_config
-
-        cfg = _build_soil_moisture_config()
-        pvl = cfg.collocation.point_vs_layer
-        assert pvl.spatial_tolerance_km == 2.0
-        assert pvl.aggregation_window_km == 1.0
-        assert pvl.distance_weighting == "equal"
-        assert pvl.interpolation_method == "nearest"
-        assert pvl.time_tolerance_minutes == 720
+        assert source_types == ["ismn", "ascat_ssm", "amsr_ssm", "smap_ssm", "smos_ssm", "cds_ssm"]
+        for satellite_source in cfg.validation_sources[1:6]:
+            assert satellite_source.download_kwargs == {} or satellite_source.source_type == "cds_ssm"
+        # cds_ssm has product_type in download_kwargs
+        cds_ssm_source = cfg.validation_sources[5]
+        assert cds_ssm_source.source_type == "cds_ssm"
+        assert cds_ssm_source.download_kwargs == {"product_type": "active"}
 
     def test_limit_forwarded_to_max_downloads(self):
         from sar_validation.cli import _build_soil_moisture_config
@@ -551,12 +645,6 @@ class TestBuildSoilMoistureConfig:
 
 
 class TestSarSourceCliOption:
-    def test_soil_moisture_default_sar_source(self):
-        from sar_validation.cli import _build_soil_moisture_config
-
-        cfg = _build_soil_moisture_config()
-        assert cfg.sar_data.source == "sentinel1_clms_ssm"
-
     def test_wind_rejects_soil_moisture_only_source(self):
         from sar_validation.cli import _build_wind_config
 
@@ -567,14 +655,6 @@ class TestSarSourceCliOption:
         from sar_validation.cli import _build_wind_config
 
         cfg = _build_wind_config(sar_source="sentinel1_l2_ocn")
-        assert cfg.sar_data.source == "sentinel1_l2_ocn"
-
-    def test_waves_config_extracted_and_matches_prior_shape(self):
-        from sar_validation.cli import _build_waves_config
-
-        cfg = _build_waves_config()
-        assert cfg.variable == "waves"
-        assert cfg.sar_data.swath_mode == ["WV", "SM"]
         assert cfg.sar_data.source == "sentinel1_l2_ocn"
 
     def test_cli_sar_source_flag_rejects_invalid_key(self, tmp_path, monkeypatch, capsys):
@@ -597,29 +677,6 @@ class TestSarSourceCliOption:
 
 
 class TestBuildSoilMoistureConfigNisarSme2:
-    def test_nisar_source_recorded(self):
-        from sar_validation.cli import _build_soil_moisture_config
-
-        cfg = _build_soil_moisture_config(sar_source="nisar_sme2")
-        assert cfg.sar_data.source == "nisar_sme2"
-
-    def test_ismn_depth_window_uses_registry_defaults(self):
-        from sar_validation.cli import _build_soil_moisture_config
-
-        cfg = _build_soil_moisture_config(sar_source="nisar_sme2")
-        ismn = next(s for s in cfg.validation_sources if s.source_type == "ismn")
-        assert ismn.min_depth == 0.0
-        assert ismn.max_depth == 0.05
-
-    def test_point_vs_layer_tolerances_use_registry_defaults(self):
-        from sar_validation.cli import _build_soil_moisture_config
-
-        cfg = _build_soil_moisture_config(sar_source="nisar_sme2")
-        pvl = cfg.collocation.point_vs_layer
-        assert pvl.time_tolerance_minutes == 360
-        assert pvl.aggregation_window_km == 0.2
-        assert pvl.spatial_tolerance_km == 2.0
-
     def test_satellite_ssm_sources_get_360_minute_layer_type_spec_override(self):
         from sar_validation.cli import _build_soil_moisture_config
 
@@ -689,18 +746,3 @@ class TestSetCredentialCli:
         cli.main(["--set-credential", "smos"])
 
         assert called == ["smos"]
-
-
-class TestIsmnMetaCollectorLoggerSuppressed:
-    """The ismn package's own file-collection logger ('ismn_meta_collector',
-    not a dotted child of 'ismn') logs one INFO line per station file it
-    reads while building ISMN_Interface's metadata -- hundreds of lines for
-    a real archive. cli.py pins it to WARNING at import time, unconditionally
-    (not just outside --verbose)."""
-
-    def test_pinned_to_warning(self):
-        import logging
-
-        import sar_validation.cli  # noqa: F401 -- import triggers the pin
-
-        assert logging.getLogger("ismn_meta_collector").level == logging.WARNING

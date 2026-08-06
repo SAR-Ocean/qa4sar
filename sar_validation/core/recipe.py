@@ -208,6 +208,9 @@ DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
     "amsr_ssm":  {"time_tolerance_minutes": 720, "aggregation_window_km": 25.0, "distance_weighting": "equal"},
     "smap_ssm":  {"time_tolerance_minutes": 720, "aggregation_window_km": 9.0,  "distance_weighting": "equal"},
     "smos_ssm":  {"time_tolerance_minutes": 720, "aggregation_window_km": 35.0, "distance_weighting": "equal"},
+    # C3S CDS composite (ACTIVE/PASSIVE/COMBINED) at 0.25° — 12h tolerance,
+    # 25km window (matches the native grid spacing).
+    "cds_ssm":   {"time_tolerance_minutes": 720, "aggregation_window_km": 25.0, "distance_weighting": "equal"},
 }
 
 

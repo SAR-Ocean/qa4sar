@@ -38,106 +38,84 @@ _NEW_ERA_CATALOG_XML = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
-class TestListThreddsGranulesOldEra:
-    def test_keeps_only_ndbc_at_requested_resolution(self):
+class TestListThreddsGranules:
+    @pytest.mark.parametrize(
+        "catalog,resolution,start,end,end_exclusive,expected_count,expected_check",
+        [
+            pytest.param(
+                _OLD_ERA_CATALOG_XML, 6,
+                datetime(2024, 1, 31, 0, 0), datetime(2024, 1, 31, 23, 59), False,
+                2,  # the two 6km _NDBC entries (22:00 and 23:00), not SIO/25hr/1km
+                lambda granules: (
+                    all(u.endswith("_NDBC.nc") for _, u in granules)
+                    and all("6km" in u for _, u in granules)
+                ),
+                id="keeps_only_ndbc_at_requested_resolution",
+            ),
+            pytest.param(
+                _OLD_ERA_CATALOG_XML, 6,
+                datetime(2024, 1, 31, 23, 0), datetime(2024, 1, 31, 23, 0), False,
+                1,
+                lambda granules: (
+                    granules[0][0] == datetime(2024, 1, 31, 23, 0)
+                    and "202401312300" in granules[0][1]
+                ),
+                id="timestamp_parsed_from_leading_12_digits",
+            ),
+            pytest.param(
+                _OLD_ERA_CATALOG_XML, 6,
+                datetime(2024, 1, 31, 22, 30), datetime(2024, 1, 31, 23, 30), False,
+                1,  # only 23:00 is inside [22:30, 23:30]; 22:00 is excluded
+                None,
+                id="window_filters_out_of_range_granule",
+            ),
+            pytest.param(
+                # Simulates _download_window's date-only-end handling: a
+                # request for end="2024-01-31" widens the matching bound to
+                # datetime(2024, 2, 1, 0, 0) so the whole of Jan 31 is
+                # covered, but with end_exclusive=True the Feb 1 00:00
+                # granule itself must not leak in.
+                _OLD_ERA_CATALOG_XML, 6,
+                datetime(2024, 1, 31, 0, 0), datetime(2024, 2, 1, 0, 0), True,
+                2,  # the two 6km _NDBC entries from Jan 31 (22:00, 23:00)
+                lambda granules: not any("202402010000" in u for _, u in granules),
+                id="end_exclusive_excludes_next_day_midnight_granule",
+            ),
+            pytest.param(
+                # Default (end_exclusive=False) behavior is unchanged: the
+                # same widened bound now inclusively matches the Feb 1 00:00
+                # granule too.
+                _OLD_ERA_CATALOG_XML, 6,
+                datetime(2024, 1, 31, 0, 0), datetime(2024, 2, 1, 0, 0), False,
+                3,  # the two Jan 31 6km _NDBC entries plus Feb 1 00:00
+                lambda granules: any("202402010000" in u for _, u in granules),
+                id="end_inclusive_default_includes_next_day_midnight_granule",
+            ),
+            pytest.param(
+                _NEW_ERA_CATALOG_XML, 6,
+                datetime(2026, 6, 30, 0, 0), datetime(2026, 6, 30, 23, 59), False,
+                2,
+                lambda granules: all("6km" in u and "500m" not in u for _, u in granules),
+                id="keeps_only_requested_resolution",
+            ),
+            pytest.param(
+                _NEW_ERA_CATALOG_XML, 6,
+                datetime(2026, 6, 30, 23, 0), datetime(2026, 6, 30, 23, 0), False,
+                1,
+                lambda granules: granules[0][0] == datetime(2026, 6, 30, 23, 0),
+                id="timestamp_parsed_from_s_token",
+            ),
+        ],
+    )
+    def test_list_thredds_granules(
+        self, catalog, resolution, start, end, end_exclusive, expected_count, expected_check,
+    ):
         from sar_validation.downloaders.noaa_hfradar_thredds_downloader import _list_thredds_granules
 
-        granules = _list_thredds_granules(
-            _OLD_ERA_CATALOG_XML, 6, datetime(2024, 1, 31, 0, 0), datetime(2024, 1, 31, 23, 59),
-        )
-        urls = [u for _, u in granules]
-        assert len(urls) == 2  # the two 6km _NDBC entries (22:00 and 23:00), not SIO/25hr/1km
-        assert all(u.endswith("_NDBC.nc") for u in urls)
-        assert all("6km" in u for u in urls)
-
-    def test_timestamp_parsed_from_leading_12_digits(self):
-        from sar_validation.downloaders.noaa_hfradar_thredds_downloader import _list_thredds_granules
-
-        granules = _list_thredds_granules(
-            _OLD_ERA_CATALOG_XML, 6, datetime(2024, 1, 31, 23, 0), datetime(2024, 1, 31, 23, 0),
-        )
-        assert len(granules) == 1
-        ts, url = granules[0]
-        assert ts == datetime(2024, 1, 31, 23, 0)
-        assert "202401312300" in url
-
-    def test_window_filters_out_of_range_granule(self):
-        from sar_validation.downloaders.noaa_hfradar_thredds_downloader import _list_thredds_granules
-
-        granules = _list_thredds_granules(
-            _OLD_ERA_CATALOG_XML, 6, datetime(2024, 1, 31, 22, 30), datetime(2024, 1, 31, 23, 30),
-        )
-        assert len(granules) == 1  # only 23:00 is inside [22:30, 23:30]; 22:00 is excluded
-
-    def test_wrong_resolution_excluded(self):
-        from sar_validation.downloaders.noaa_hfradar_thredds_downloader import _list_thredds_granules
-
-        granules = _list_thredds_granules(
-            _OLD_ERA_CATALOG_XML, 1, datetime(2024, 1, 31, 0, 0), datetime(2024, 1, 31, 23, 59),
-        )
-        assert len(granules) == 1
-        assert "1km" in granules[0][1]
-
-
-class TestListThreddsGranulesEndExclusive:
-    def test_end_exclusive_excludes_next_day_midnight_granule(self):
-        from sar_validation.downloaders.noaa_hfradar_thredds_downloader import _list_thredds_granules
-
-        # Simulates _download_window's date-only-end handling: a request for
-        # end="2024-01-31" widens the matching bound to
-        # datetime(2024, 2, 1, 0, 0) so the whole of Jan 31 is covered, but
-        # with end_exclusive=True the Feb 1 00:00 granule itself must not
-        # leak in.
-        granules = _list_thredds_granules(
-            _OLD_ERA_CATALOG_XML, 6, datetime(2024, 1, 31, 0, 0), datetime(2024, 2, 1, 0, 0),
-            end_exclusive=True,
-        )
-        urls = [u for _, u in granules]
-        assert not any("202402010000" in u for u in urls)
-        assert len(urls) == 2  # the two 6km _NDBC entries from Jan 31 (22:00, 23:00)
-
-    def test_end_inclusive_default_includes_next_day_midnight_granule(self):
-        from sar_validation.downloaders.noaa_hfradar_thredds_downloader import _list_thredds_granules
-
-        # Default (end_exclusive=False) behavior is unchanged: the same
-        # widened bound now inclusively matches the Feb 1 00:00 granule too.
-        granules = _list_thredds_granules(
-            _OLD_ERA_CATALOG_XML, 6, datetime(2024, 1, 31, 0, 0), datetime(2024, 2, 1, 0, 0),
-        )
-        urls = [u for _, u in granules]
-        assert any("202402010000" in u for u in urls)
-        assert len(urls) == 3  # the two Jan 31 6km _NDBC entries plus Feb 1 00:00
-
-
-class TestListThreddsGranulesNewEra:
-    def test_keeps_only_requested_resolution(self):
-        from sar_validation.downloaders.noaa_hfradar_thredds_downloader import _list_thredds_granules
-
-        granules = _list_thredds_granules(
-            _NEW_ERA_CATALOG_XML, 6, datetime(2026, 6, 30, 0, 0), datetime(2026, 6, 30, 23, 59),
-        )
-        urls = [u for _, u in granules]
-        assert len(urls) == 2
-        assert all("6km" in u and "500m" not in u for u in urls)
-
-    def test_500m_token_matched(self):
-        from sar_validation.downloaders.noaa_hfradar_thredds_downloader import _list_thredds_granules
-
-        granules = _list_thredds_granules(
-            _NEW_ERA_CATALOG_XML, 0.5, datetime(2026, 6, 30, 0, 0), datetime(2026, 6, 30, 23, 59),
-        )
-        assert len(granules) == 1
-        assert "500m" in granules[0][1]
-
-    def test_timestamp_parsed_from_s_token(self):
-        from sar_validation.downloaders.noaa_hfradar_thredds_downloader import _list_thredds_granules
-
-        granules = _list_thredds_granules(
-            _NEW_ERA_CATALOG_XML, 6, datetime(2026, 6, 30, 23, 0), datetime(2026, 6, 30, 23, 0),
-        )
-        assert len(granules) == 1
-        ts, _ = granules[0]
-        assert ts == datetime(2026, 6, 30, 23, 0)
+        granules = _list_thredds_granules(catalog, resolution, start, end, end_exclusive=end_exclusive)
+        assert len(granules) == expected_count
+        if expected_check is not None:
+            assert expected_check(granules)
 
 
 def _make_thredds_nc(
@@ -405,29 +383,49 @@ class TestNoaaThreddsHfRadarDownloaderDownload:
 
         assert not (tmp_path / ".thredds_tmp").exists()
 
-    def test_granule_download_uses_a_bounded_timeout(self, tmp_path):
+    @pytest.mark.parametrize(
+        "url_predicate,start,end,needs_granule_bytes",
+        [
+            pytest.param(
+                lambda url: "/fileServer/" in url,
+                "2026-06-30", "2026-06-30",
+                True,
+                id="granule_download_uses_a_bounded_timeout",
+            ),
+            pytest.param(
+                lambda url: "/fileServer/" not in url,
+                "2024-01-31", "2024-01-31",
+                False,
+                id="catalog_fetch_uses_a_bounded_timeout_of_15",
+            ),
+        ],
+    )
+    def test_bounded_timeout(self, tmp_path, url_predicate, start, end, needs_granule_bytes):
         """Regression test: urlretrieve (the original implementation) has no
         timeout parameter at all, and a stalled connection would hang the
         download indefinitely (observed live: a TCP socket stuck in
         SYN-SENT for many minutes). The fix moved to urlopen(..., timeout=...)
         for granule fetches specifically so a hung connection is bounded.
-        Lowered from 60 to 15 (Task 9b): combined with prefer_ipv4_dns(), a
-        genuinely broken IPv6 path now fails fast per address instead of
-        eating up to 6 * timeout seconds before reaching a working IPv4
-        address."""
+        Lowered from 60 to 15: combined with prefer_ipv4_dns(), a genuinely
+        broken IPv6 path now fails fast per address instead of eating up to
+        6 * timeout seconds before reaching a working IPv4 address. The
+        pre-existing timeout=30 catalog urlopen() call site is lowered to
+        15 too, for the same IPv6-black-hole reason."""
         from sar_validation.downloaders.noaa_hfradar_thredds_downloader import (
             NOAATHREDDSHFRadarDownloader,
         )
 
         catalog = _NEW_ERA_CATALOG_XML
         granule_bytes = _make_thredds_nc(tmp_path, "granule_src.nc").read_bytes()
-        granule_calls = []
+        matched_calls = []
 
         def fake_urlopen(url, timeout=None):
             cm = MagicMock()
-            if "/fileServer/" in url:
-                granule_calls.append(timeout)
-                cm.__enter__.return_value.read.return_value = granule_bytes
+            if url_predicate(url):
+                matched_calls.append(timeout)
+                cm.__enter__.return_value.read.return_value = (
+                    granule_bytes if needs_granule_bytes else catalog.encode()
+                )
             else:
                 cm.__enter__.return_value.read.return_value = catalog.encode()
             return cm
@@ -437,90 +435,51 @@ class TestNoaaThreddsHfRadarDownloaderDownload:
             side_effect=fake_urlopen,
         ):
             dl = NOAATHREDDSHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
-            dl.download(-125, -119, 33, 38, "2026-06-30", "2026-06-30")
+            dl.download(-125, -119, 33, 38, start, end)
 
-        assert granule_calls  # at least one granule was actually fetched
-        assert all(t == 15 for t in granule_calls)
+        assert matched_calls  # at least one matching call was actually made
+        assert all(t == 15 for t in matched_calls)
 
-    def test_catalog_fetch_uses_a_bounded_timeout_of_15(self, tmp_path):
-        """The catalog urlopen() call site had a pre-existing timeout=30
-        (unchanged by Task 9a); Task 9b lowers it to 15 too, for the same
-        IPv6-black-hole reason as the granule/ERDDAP call sites."""
+    @pytest.mark.parametrize(
+        "catalog,granule_matches,start,end,expected_call_count,expected_out_count",
+        [
+            pytest.param(
+                (
+                    '<?xml version="1.0"?>'
+                    '<catalog xmlns="http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0">'
+                    "</catalog>"
+                ),
+                False,
+                "2024-01-31", "2024-01-31",
+                1, 0,
+                id="catalog_fetch_wraps_network_call_in_prefer_ipv4_dns",
+            ),
+            pytest.param(
+                _NEW_ERA_CATALOG_XML,
+                True,
+                "2026-06-30T23:00:00", "2026-06-30T23:00:00",
+                2, 1,
+                id="granule_download_wraps_network_call_in_prefer_ipv4_dns",
+            ),
+        ],
+    )
+    def test_prefer_ipv4_dns_wiring(
+        self, tmp_path, catalog, granule_matches, start, end, expected_call_count, expected_out_count,
+    ):
+        """Wiring test: both the catalog and granule urlopen() call sites
+        must actually use prefer_ipv4_dns(), not just have it importable.
+        The empty-catalog scenario exercises only the catalog call site
+        (no granules match, so no fileServer fetch happens); the matching-
+        granule scenario exercises both call sites, so prefer_ipv4_dns()
+        must be entered exactly twice if both call sites are wired -- only
+        once would indicate the granule site is not."""
         from sar_validation.downloaders.noaa_hfradar_thredds_downloader import (
             NOAATHREDDSHFRadarDownloader,
         )
 
-        catalog_calls = []
-
-        def fake_urlopen(url, timeout=None):
-            cm = MagicMock()
-            if "/fileServer/" not in url:
-                catalog_calls.append(timeout)
-            cm.__enter__.return_value.read.return_value = _NEW_ERA_CATALOG_XML.encode()
-            return cm
-
-        with patch(
-            "sar_validation.downloaders.noaa_hfradar_thredds_downloader.urllib.request.urlopen",
-            side_effect=fake_urlopen,
-        ):
-            dl = NOAATHREDDSHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
-            dl.download(-125, -119, 33, 38, "2024-01-31", "2024-01-31")
-
-        assert catalog_calls  # at least one catalog fetch happened
-        assert all(t == 15 for t in catalog_calls)
-
-    def test_catalog_fetch_wraps_network_call_in_prefer_ipv4_dns(self, tmp_path):
-        """Wiring test: the catalog urlopen() call site must actually use
-        prefer_ipv4_dns(), not just have it importable. Uses a scenario
-        where the catalog is fetched but no granules match, so only the
-        catalog call site (not the granule one) can contribute calls."""
-        from sar_validation.downloaders.noaa_hfradar_thredds_downloader import (
-            NOAATHREDDSHFRadarDownloader,
+        granule_bytes = (
+            _make_thredds_nc(tmp_path, "granule_src.nc").read_bytes() if granule_matches else None
         )
-
-        empty_catalog = (
-            '<?xml version="1.0"?>'
-            '<catalog xmlns="http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0"></catalog>'
-        )
-
-        def fake_urlopen(url, timeout=None):
-            cm = MagicMock()
-            cm.__enter__.return_value.read.return_value = empty_catalog.encode()
-            return cm
-
-        with patch(
-            "sar_validation.downloaders.noaa_hfradar_thredds_downloader.prefer_ipv4_dns"
-        ) as mock_prefer:
-            mock_prefer.return_value.__exit__.return_value = False
-            with patch(
-                "sar_validation.downloaders.noaa_hfradar_thredds_downloader.urllib.request.urlopen",
-                side_effect=fake_urlopen,
-            ):
-                dl = NOAATHREDDSHFRadarDownloader(
-                    output_dir=tmp_path, dry_run=False, resolution_km=6
-                )
-                out = dl.download(-125, -119, 33, 38, "2024-01-31", "2024-01-31")
-
-        assert out == []
-        mock_prefer.assert_called_once_with()
-        mock_prefer.return_value.__enter__.assert_called_once()
-        mock_prefer.return_value.__exit__.assert_called_once()
-
-    def test_granule_download_wraps_network_call_in_prefer_ipv4_dns(self, tmp_path):
-        """Wiring test: the granule urlopen() call site must actually use
-        prefer_ipv4_dns(), not just have it importable. A single-instant
-        start==end window (rather than a whole date-only day) matches
-        exactly one granule in the new-era catalog fixture, so one catalog
-        fetch (1 month touched) plus one matching granule means
-        prefer_ipv4_dns() must be entered exactly twice if both call sites
-        are wired -- only once (from the catalog) would indicate the
-        granule site is not."""
-        from sar_validation.downloaders.noaa_hfradar_thredds_downloader import (
-            NOAATHREDDSHFRadarDownloader,
-        )
-
-        catalog = _NEW_ERA_CATALOG_XML
-        granule_bytes = _make_thredds_nc(tmp_path, "granule_src.nc").read_bytes()
 
         def fake_urlopen(url, timeout=None):
             cm = MagicMock()
@@ -539,13 +498,11 @@ class TestNoaaThreddsHfRadarDownloaderDownload:
                 side_effect=fake_urlopen,
             ):
                 dl = NOAATHREDDSHFRadarDownloader(
-                    output_dir=tmp_path, dry_run=False, resolution_km=6
+                    output_dir=tmp_path, dry_run=False, resolution_km=6,
                 )
-                out = dl.download(
-                    -125, -119, 33, 38, "2026-06-30T23:00:00", "2026-06-30T23:00:00"
-                )
+                out = dl.download(-125, -119, 33, 38, start, end)
 
-        assert len(out) == 1
-        assert mock_prefer.call_count == 2  # one catalog fetch + one granule download
-        assert mock_prefer.return_value.__enter__.call_count == 2
-        assert mock_prefer.return_value.__exit__.call_count == 2
+        assert len(out) == expected_out_count
+        assert mock_prefer.call_count == expected_call_count
+        assert mock_prefer.return_value.__enter__.call_count == expected_call_count
+        assert mock_prefer.return_value.__exit__.call_count == expected_call_count

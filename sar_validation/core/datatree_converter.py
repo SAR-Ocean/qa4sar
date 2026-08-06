@@ -1541,6 +1541,154 @@ class DataTreeConverter:
         return ds
 
     @staticmethod
+    def from_c3s_ssm(
+        nc_path: Union[str, Path],
+        product_type: str,
+    ) -> Optional[xr.Dataset]:
+        """
+        Open a C3S CDS satellite soil moisture NetCDF (0.25° daily global
+        grid) and return a standardised Dataset with a flat ``point``
+        dimension.
+
+        Supports all three sensor-class variants produced by
+        :class:`~sar_validation.downloaders.cds_soil_moisture_downloader.CDSSoilMoistureDownloader`:
+
+        * ``"active"``   — ASCAT multi-scatterometer composite, units ``%``
+        * ``"passive"``  — Multi-radiometer composite, units ``m3 m-3``
+        * ``"combined"`` — Merged active + passive, units ``m3 m-3``
+
+        The CDS NetCDF delivers a global 0.25° regular grid with dimensions
+        ``(time, lat, lon)`` and a primary ``sm`` variable.  The grid is
+        flattened to a flat ``point`` dimension so the result passes through
+        the same layer-vs-layer collocation path as other SSM sources.
+
+        Parameters
+        ----------
+        nc_path : str or Path
+            Path to a NetCDF file as downloaded and extracted by
+            :class:`~sar_validation.downloaders.cds_soil_moisture_downloader.CDSSoilMoistureDownloader`.
+        product_type : str
+            One of ``"active"``, ``"passive"``, or ``"combined"``.  Used to
+            set the correct physical units on the output variable and to
+            build the ``source`` attribute string.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="cds_ssm"`` and ``platform_type="cds_ssm"``,
+            or None on failure.
+        """
+        if product_type not in ("active", "passive", "combined"):
+            logger.warning(
+                "from_c3s_ssm: unknown product_type %r (expected active/passive/combined).",
+                product_type,
+            )
+            return None
+
+        nc_path = Path(nc_path)
+        if not nc_path.exists():
+            logger.warning("C3S SSM file not found: %s", nc_path)
+            return None
+
+        try:
+            raw = xr.open_dataset(nc_path)
+        except Exception as exc:
+            logger.warning("Could not open C3S SSM file %s: %s", nc_path, exc)
+            return None
+
+        if "sm" not in raw.variables:
+            logger.warning(
+                "Missing 'sm' variable in %s (available: %s).",
+                nc_path.name, list(raw.variables),
+            )
+            raw.close()
+            return None
+
+        # Units depend on product type:
+        #   active   → [%] (percent saturation, ASCAT)
+        #   passive  → [m3 m-3] (volumetric, radiometers)
+        #   combined → [m3 m-3] (merged, follows passive convention)
+        if product_type == "active":
+            units = "%"
+            long_name = "C3S CDS active (ASCAT) surface soil moisture composite"
+            source_label = "C3S CDS ACTIVE SSM (multi-ASCAT 0.25°)"
+        elif product_type == "passive":
+            units = "m3 m-3"
+            long_name = "C3S CDS passive (radiometer) surface soil moisture composite"
+            source_label = "C3S CDS PASSIVE SSM (multi-radiometer 0.25°)"
+        else:
+            units = "m3 m-3"
+            long_name = "C3S CDS combined (active+passive) surface soil moisture composite"
+            source_label = "C3S CDS COMBINED SSM (0.25°)"
+
+        sm_da = raw["sm"]
+
+        # CDS files may have a leading time dimension of length 1; squeeze it.
+        if "time" in sm_da.dims:
+            time_coord = pd.to_datetime(raw["time"].values[0]) if raw["time"].size > 0 else pd.NaT
+            sm_da = sm_da.isel(time=0, drop=True) if sm_da.dims[0] == "time" else sm_da
+        else:
+            time_coord = pd.NaT
+
+        # Apply CF scale/offset if present (CDS v202505 does not use them,
+        # but guard here for future versions).
+        scale = float(sm_da.attrs.get("scale_factor", 1.0))
+        offset = float(sm_da.attrs.get("add_offset", 0.0))
+        fill = sm_da.attrs.get("_FillValue", None)
+
+        sm_vals = sm_da.values.astype(float)
+        if fill is not None:
+            sm_vals = np.where(sm_vals == float(fill), np.nan, sm_vals)
+        sm_vals = sm_vals * scale + offset
+
+        # Build flat arrays; CDS dims are (lat, lon) after time squeeze.
+        if "lat" in raw.coords and "lon" in raw.coords:
+            lon_1d = raw["lon"].values.astype(float)
+            lat_1d = raw["lat"].values.astype(float)
+        elif "latitude" in raw.coords and "longitude" in raw.coords:
+            lon_1d = raw["longitude"].values.astype(float)
+            lat_1d = raw["latitude"].values.astype(float)
+        else:
+            logger.warning(
+                "Cannot find lat/lon coordinates in %s (coords: %s).",
+                nc_path.name, list(raw.coords),
+            )
+            raw.close()
+            return None
+
+        lon2d, lat2d = np.meshgrid(lon_1d, lat_1d)
+        sm_flat = sm_vals.ravel()
+        lon_flat = lon2d.ravel()
+        lat_flat = lat2d.ravel()
+
+        valid = ~np.isnan(sm_flat)
+        if not valid.any():
+            logger.warning("from_c3s_ssm: all cells NaN in %s.", nc_path.name)
+            raw.close()
+            return None
+
+        n_valid = int(valid.sum())
+        _ts = np.datetime64(time_coord, "ns") if time_coord is not pd.NaT else np.datetime64("NaT", "ns")
+        time_arr = np.full(n_valid, _ts)
+
+        var_attrs = {
+            "SOIL_MOISTURE": {
+                "units": units,
+                "long_name": long_name,
+            }
+        }
+        ds = DataTreeConverter._build_ssm_point_dataset(
+            sm_flat[valid], lon_flat[valid], lat_flat[valid], time_arr,
+            data_type="cds_ssm", var_attrs=var_attrs,
+            platform_type="cds_ssm",
+            source=source_label,
+            sensing_depth_cm="0-5", band="multi", filename=nc_path.name,
+            native_grid_deg=0.25,
+        )
+        raw.close()
+        return ds
+
+    @staticmethod
     def from_hf_radar_grid(
         nc_path: Union[str, Path],
         u_var: str = "water_u",
@@ -2970,6 +3118,7 @@ class DataTreeConverter:
         - ``amsr_ssm/*.h5``             → ``validation/amsr_ssm/<stem>`` nodes
         - ``smap_ssm/*.h5``             → ``validation/smap_ssm/<stem>`` nodes
         - ``smos_ssm/*.nc``             → ``validation/smos_ssm/<stem>`` nodes
+        - ``cds_ssm/*.nc``              → ``validation/cds_ssm/<stem>`` nodes
         - ``altimeter/*.nc``           → ``validation/altimeter/<stem>`` nodes
 
         Parameters
@@ -3192,6 +3341,27 @@ class DataTreeConverter:
                 if ds is not None:
                     datasets[f"validation/smos_ssm/{f.stem}"] = ds
                     logger.info("Converted SMOS SSM: %s", f.name)
+
+        # C3S CDS satellite soil moisture (Copernicus Climate Data Store,
+        # global 0.25° daily grid, NetCDF). product_type ("active"/
+        # "passive"/"combined") comes from the recipe's cds_ssm validation
+        # source download_kwargs -- the same channel the orchestrator reads
+        # to build the download request -- so units stay consistent with
+        # what was actually downloaded. Defaults to "active" (matching
+        # _download_cds_ssm's own default) when no recipe is given.
+        subdir = base_dir / "cds_ssm"
+        if subdir.exists():
+            cds_product_type = "active"
+            if recipe is not None:
+                for src in recipe.config.validation_sources:
+                    if src.source_type == "cds_ssm":
+                        cds_product_type = src.download_kwargs.get("product_type", "active")
+                        break
+            for f in sorted(subdir.glob("*.nc")):
+                ds = _filtered(DataTreeConverter.from_c3s_ssm(f, cds_product_type), f.name)
+                if ds is not None:
+                    datasets[f"validation/cds_ssm/{f.stem}"] = ds
+                    logger.info("Converted C3S CDS SSM: %s", f.name)
 
         # NOAA HFRnet gridded RTV currents (flattened to points, tagged
         # hf_radar_grid). Domain-filtered like the scatterometer path.

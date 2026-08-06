@@ -5,6 +5,20 @@ The single place mapping a recipe's ``sar_data.source`` key to its
 downloader, output subdirectory, converter, and per-source recipe-template
 defaults. See
 docs/superpowers/specs/2026-07-30-nisar-soil-moisture-and-sar-source-selection-design.md
+
+Available SAR sources (satellite family -> ``--sar-source`` name -> which
+recipe variables it supports), kept here for readability -- see
+``AVAILABLE_SATELLITES``/``SAR_SOURCES`` below for the code-derived,
+always-in-sync version of this same list:
+
+  - sentinel1: wind, waves, currents (Sentinel-1 L2 OCN) and
+    soil_moisture (Sentinel-1 CLMS SSM, 1km, Europe)
+  - nisar:     soil_moisture (NISAR SME2, beta)
+
+A future satellite is added by (1) registering a new ``SARSourceSpec`` in
+``SAR_SOURCES`` below with its own ``satellite`` name, and (2) updating the
+list above -- ``AVAILABLE_SATELLITES`` and ``resolve_sar_source`` need no
+changes, since both derive from the registry automatically.
 """
 
 from __future__ import annotations
@@ -18,7 +32,7 @@ if TYPE_CHECKING:
 
     from .recipe import SARDataSpec
 
-__all__ = ["SARSourceSpec", "SAR_SOURCES"]
+__all__ = ["SARSourceSpec", "SAR_SOURCES", "AVAILABLE_SATELLITES", "resolve_sar_source"]
 
 
 @dataclass(frozen=True)
@@ -26,6 +40,13 @@ class SARSourceSpec:
     """One SAR-side product a recipe can select via ``sar_data.source``."""
 
     key: str
+    #: Satellite family this product belongs to (e.g. "sentinel1",
+    #: "nisar") -- the name --sar-source accepts on the CLI. Distinct from
+    #: ``key`` because one satellite can have more than one product
+    #: (Sentinel-1 has L2 OCN for wind/waves/currents and CLMS SSM for
+    #: soil_moisture); ``resolve_sar_source`` picks the right ``key`` for
+    #: a given (satellite, variable) pair.
+    satellite: str
     #: recipe "variable" categories that accept this source
     variables: FrozenSet[str]
     #: base_dir / this
@@ -171,6 +192,7 @@ def _convert_nisar_sme2(path: Path, product_type: str) -> Optional["xr.Dataset"]
 SAR_SOURCES: Dict[str, SARSourceSpec] = {
     "sentinel1_l2_ocn": SARSourceSpec(
         key="sentinel1_l2_ocn",
+        satellite="sentinel1",
         variables=frozenset({"wind", "waves", "currents"}),
         output_subdir="S1_L2_OCN",
         file_glob="*.SAFE",
@@ -180,6 +202,7 @@ SAR_SOURCES: Dict[str, SARSourceSpec] = {
     ),
     "sentinel1_clms_ssm": SARSourceSpec(
         key="sentinel1_clms_ssm",
+        satellite="sentinel1",
         variables=frozenset({"soil_moisture"}),
         output_subdir="S1_L3_SSM",
         file_glob="*.tif*",
@@ -196,6 +219,7 @@ SAR_SOURCES: Dict[str, SARSourceSpec] = {
     ),
     "nisar_sme2": SARSourceSpec(
         key="nisar_sme2",
+        satellite="nisar",
         variables=frozenset({"soil_moisture"}),
         output_subdir="NISAR_L3_SME2",
         file_glob="*.h5",
@@ -209,3 +233,52 @@ SAR_SOURCES: Dict[str, SARSourceSpec] = {
         default_spatial_tolerance_km=2.0,
     ),
 }
+
+#: Satellite family names accepted by --sar-source, derived from the
+#: registry so this can never drift out of sync as new sources are added.
+AVAILABLE_SATELLITES: List[str] = sorted({spec.satellite for spec in SAR_SOURCES.values()})
+
+
+def resolve_sar_source(name: str, variable: str) -> str:
+    """
+    Resolve a ``--sar-source`` CLI value to an internal ``SAR_SOURCES`` key.
+
+    Accepts either a satellite family name (e.g. ``"sentinel1"``,
+    ``"nisar"`` -- see ``AVAILABLE_SATELLITES``) or an exact internal
+    registry key (e.g. ``"sentinel1_clms_ssm"``), kept working for
+    backward compatibility with recipe files that already have a specific
+    key stored in ``sar_data.source``. A satellite name resolves to
+    whichever registered product actually supports *variable* -- e.g.
+    ``"sentinel1"`` resolves to the L2 OCN product for wind/waves/currents
+    and to the CLMS SSM product for soil_moisture.
+
+    Raises
+    ------
+    ValueError
+        If *name* is not a known satellite or internal key, or if the
+        matched source (satellite or exact key) has no product for
+        *variable*.
+    """
+    if name in SAR_SOURCES:
+        spec = SAR_SOURCES[name]
+        if variable not in spec.variables:
+            raise ValueError(
+                f"SAR source {name!r} is only valid for: "
+                f"{', '.join(sorted(spec.variables))} (got variable={variable!r})"
+            )
+        return name
+
+    matches = [
+        key for key, spec in SAR_SOURCES.items()
+        if spec.satellite == name and variable in spec.variables
+    ]
+    if matches:
+        assert len(matches) == 1, f"ambiguous SAR source {name!r} for variable {variable!r}: {matches}"
+        return matches[0]
+
+    if name in AVAILABLE_SATELLITES:
+        raise ValueError(f"SAR source {name!r} has no product for variable {variable!r}.")
+    raise ValueError(
+        f"Unknown SAR source {name!r}. Available satellites: "
+        f"{', '.join(AVAILABLE_SATELLITES)}."
+    )

@@ -112,29 +112,50 @@ __all__ = [
 # two differ in lightness) — this is what made scatterometer's matched
 # points look gray once it landed on the (then-)black slot below. Must
 # have at least as many entries as _canonical_source_order() returns
-# (currently 12, after radiometer_ssm/scatterometer_ssm joined
-# LAYER_DATA_TYPES for satellite soil moisture): a shorter palette wraps
-# and silently reassigns two unrelated sources (e.g. tidal gauge landing
-# back on altimeter's blue circle) — see the "matched tidal gauge and
-# altimeter look identical" bug this comment documents. Because slots are
-# assigned by *alphabetical position* in the combined canonical set, adding
-# a new source name can shift every alphabetically-later source onto a
-# different color than before -- this has now broken twice (once when
-# radiometer_ssm/scatterometer_ssm were added, moving plain "scatterometer"
-# off its original olive slot and onto the black one) - if a new
-# LAYER_DATA_TYPES/​_INSITU_TYPES entry is ever added, re-check every
-# existing slot for a newly-introduced grayscale collision, not just count.
+# (currently 13): a shorter palette wraps and silently reassigns two
+# unrelated sources (e.g. tidal gauge landing back on altimeter's blue
+# circle) — see the "matched tidal gauge and altimeter look identical" bug
+# this comment documents. Slots are assigned by *list position* in
+# _CANONICAL_SOURCE_ORDER below, which is append-only (see that list's own
+# comment) — so adding a new source can no longer shift any existing
+# source's color the way alphabetical sorting used to (this broke the
+# palette 3 times before the order was made append-only: see git history
+# around radiometer_ssm/scatterometer_ssm and cds_ssm being added).
+#
+# radiometer's slot (index 7) was originally the pale cyan "#17becf" --
+# changed to the darker teal "#469990" because that pale cyan was hard to
+# distinguish against plot_collocation_diagnostics' mid-gray (#808080)
+# "unmatched" pattern once small marker sizes/anti-aliasing softened it.
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
-    "#9467bd", "#8c564b", "#e377c2", "#17becf",
+    "#9467bd", "#8c564b", "#e377c2", "#469990",
     "#f032e6", "#e6194b", "#000080", "#ffff00",
+    "#00ff00",
 ]
 
 # Marker shapes paired 1:1 with _SOURCE_COLORS by index, used wherever
 # validation sources need to stay identifiable independently of color (e.g.
 # when color is taken by a continuous value like wind speed or temporal
 # offset instead of by source).
-_SOURCE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<"]
+_SOURCE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<", ">"]
+
+# Fixed, append-only reference order for known validation source/platform
+# types. Each name's *list position* is its permanent color/marker slot
+# (see _source_style_map) — this used to be computed as
+# ``sorted(LAYER_DATA_TYPES | _INSITU_TYPES)``, which silently reshuffled
+# every alphabetically-later source's color whenever a new source name was
+# added anywhere in those two sets (happened 3 times: radiometer_ssm,
+# scatterometer_ssm, cds_ssm). A new source type must be appended at the
+# END of this list, never inserted alphabetically — _canonical_source_order
+# raises loudly if this list ever drifts out of sync with
+# LAYER_DATA_TYPES | _INSITU_TYPES, so a forgotten entry fails a test
+# instead of silently reassigning colors.
+_CANONICAL_SOURCE_ORDER = [
+    "altimeter", "buoy", "drifter", "ferrybox", "hf_radar", "hf_radar_grid",
+    "mooring", "radiometer", "radiometer_ssm", "scatterometer",
+    "scatterometer_ssm", "tidal_gauge",
+    "cds_ssm",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -147,18 +168,32 @@ def _source_color_map(sources: List[str]) -> Dict[str, str]:
 
 def _canonical_source_order() -> List[str]:
     """
-    Fixed, alphabetically-sorted reference order for known validation
-    source/platform types, built from the two canonical sets already
-    maintained elsewhere in the codebase (avoids introducing a third list
-    that could drift out of sync):
+    Fixed, append-only reference order for known validation source/platform
+    types — see ``_CANONICAL_SOURCE_ORDER``'s module-level comment for why
+    this must never be a sort.
 
-    * ``LAYER_DATA_TYPES`` (collocation.py) — scatterometer/altimeter/etc.
-    * ``_INSITU_TYPES`` (orchestrator.py) — mooring/buoy/etc.
+    Validates that ``_CANONICAL_SOURCE_ORDER`` still has exactly the same
+    *members* as the two canonical sets maintained elsewhere in the
+    codebase (``LAYER_DATA_TYPES`` in collocation.py and ``_INSITU_TYPES``
+    in orchestrator.py), so a new source type added to either set without
+    also being appended to ``_CANONICAL_SOURCE_ORDER`` fails loudly here
+    instead of silently reshuffling every other source's color.
     """
     from .collocation import LAYER_DATA_TYPES  # noqa: PLC0415
     from .orchestrator import _INSITU_TYPES  # noqa: PLC0415
 
-    return sorted(LAYER_DATA_TYPES | _INSITU_TYPES)
+    registered = set(LAYER_DATA_TYPES) | set(_INSITU_TYPES)
+    known = set(_CANONICAL_SOURCE_ORDER)
+    if registered != known:
+        missing = sorted(registered - known)
+        extra = sorted(known - registered)
+        raise AssertionError(
+            "visualization._CANONICAL_SOURCE_ORDER is out of sync with "
+            "LAYER_DATA_TYPES | _INSITU_TYPES. Append new entries "
+            f"{missing} to the END of _CANONICAL_SOURCE_ORDER; remove "
+            f"stale entries {extra}. Never reorder existing entries."
+        )
+    return list(_CANONICAL_SOURCE_ORDER)
 
 
 def _source_style_map(sources: List[str]) -> Dict[str, Tuple[str, str]]:
@@ -1963,8 +1998,50 @@ def plot_temporal_offset(
 # 4b. Collocation diagnostics plot
 # ---------------------------------------------------------------------------
 
+#: Target real-world spacing (degrees) between plotted SAR-footprint dots
+#: in the collocation-diagnostics plot. Calibrated against a real
+#: Sentinel-1 CLMS SSM daily mosaic's actual valid-pixel area (~503 deg^2)
+#: so that source keeps its historical ~3000-dot look; deriving each
+#: scene's own target dot count from its actual valid-pixel area (see
+#: _adaptive_footprint_target_count), rather than a single flat count for
+#: every scene, keeps this same visual spacing regardless of scene size.
+#: Without this, a small NISAR SME2 per-orbit granule (confirmed against
+#: real converted data: ~217x smaller valid-pixel area than a real
+#: Sentinel-1 scene) got the same ~3000 dots as the huge Sentinel-1
+#: mosaic, crammed ~18x closer together -- reading as a solid blob
+#: instead of discernible points.
+_FOOTPRINT_DOT_SPACING_DEG = 0.4
+#: Floor so a tiny scene still shows enough dots for its footprint shape
+#: to be recognizable, and ceiling matching the historical flat default
+#: so a huge scene's rendering cost/density never exceeds today's.
+_FOOTPRINT_MIN_DOTS = 150
+_FOOTPRINT_MAX_DOTS = 3000
+
+
+def _adaptive_footprint_target_count(
+    lons: np.ndarray, lats: np.ndarray, total_valid: int,
+) -> int:
+    """
+    Derive a target dot count from the grid's own native cell size
+    (measured directly off *lons*/*lats*) and *total_valid*'s actual
+    valid-pixel area, clamped to [:data:`_FOOTPRINT_MIN_DOTS`,
+    :data:`_FOOTPRINT_MAX_DOTS`] -- see :data:`_FOOTPRINT_DOT_SPACING_DEG`
+    for why. Falls back to :data:`_FOOTPRINT_MAX_DOTS` (today's flat
+    behavior) if the grid is degenerate (a single row or column, so no
+    cell size can be measured).
+    """
+    dlon = abs(float(lons[0, 1] - lons[0, 0])) if lons.shape[1] > 1 else 0.0
+    dlat = abs(float(lats[1, 0] - lats[0, 0])) if lats.shape[0] > 1 else 0.0
+    if dlon <= 0 or dlat <= 0:
+        return _FOOTPRINT_MAX_DOTS
+    area_deg2 = total_valid * dlon * dlat
+    count = int(area_deg2 / (_FOOTPRINT_DOT_SPACING_DEG ** 2))
+    return max(_FOOTPRINT_MIN_DOTS, min(_FOOTPRINT_MAX_DOTS, count))
+
+
 def _downsampled_valid_pixel_coords(
-    valid_mask: np.ndarray, lons: np.ndarray, lats: np.ndarray, target_count: int = 3000,
+    valid_mask: np.ndarray, lons: np.ndarray, lats: np.ndarray,
+    target_count: Optional[int] = None,
 ) -> list:
     """
     Return (lon, lat) centers of a strided subsample of *valid_mask*'s True
@@ -1974,10 +2051,20 @@ def _downsampled_valid_pixel_coords(
     CLMS Surface Soil Moisture's ~28M-cell continental raster), while still
     tracing the actual overpass-swath shape instead of a bounding rectangle
     over the grid's full nominal extent.
+
+    *target_count*, if not given, is derived from the scene's own
+    valid-pixel area via :func:`_adaptive_footprint_target_count` instead
+    of defaulting to a flat count -- so a small scene (e.g. a NISAR SME2
+    per-orbit granule) is thinned to fewer, more widely-spaced dots than a
+    large one (e.g. Sentinel-1 CLMS SSM's continental daily mosaic),
+    keeping the resulting dot-to-dot spacing roughly consistent across
+    wildly different scene sizes rather than the dot count.
     """
     total = int(valid_mask.sum())
     if total == 0:
         return []
+    if target_count is None:
+        target_count = _adaptive_footprint_target_count(lons, lats, total)
     stride = max(1, int(np.sqrt(total / target_count)))
     strided_mask = valid_mask[::stride, ::stride]
     ys, xs = np.where(strided_mask)
@@ -2927,35 +3014,118 @@ def _finalize_figure_for_report(fig, png_path: Optional[Path], dpi: int = 150):
     return _image_page_figure(plt.imread(buf, format="png"), dpi=dpi)
 
 
-def _stamp_banner(fig: "Figure", text: str, color: str) -> "Figure":
+def _stamp_banner(
+    fig: "Figure", text: str, color: str, description: Optional[str] = None,
+) -> "Figure":
     """Draw a small, visually distinct italic banner across the top of
-    *fig*. Adds an overlay text rather than touching the figure's own
-    title/suptitle (set by plot_scatter/plot_residuals/plot_statistics
-    themselves), so those plotting functions stay unchanged. Called
-    before the figure is finalized/rasterized for the report so the
-    banner survives into the saved PDF/PNG."""
+    *fig*, identifying which report section this page belongs to. When
+    *description* is given (only passed by callers stamping the first
+    page of a section), a smaller one-sentence explanation is drawn just
+    below the banner, so a reader unfamiliar with the section's method or
+    the underlying data product isn't left guessing. Adds overlay text
+    rather than touching the figure's own title/suptitle (set by
+    plot_scatter/plot_residuals/plot_statistics themselves), so those
+    plotting functions stay unchanged. Called before the figure is
+    finalized/rasterized for the report so the banner survives into the
+    saved PDF/PNG."""
     fig.text(
-        0.5, 1.04, text,
+        0.5, 1.07 if description else 1.04, text,
         ha="center", va="bottom", fontsize=9, style="italic", color=color,
     )
+    if description:
+        fig.text(
+            0.5, 1.04, description,
+            ha="center", va="bottom", fontsize=6.5, style="italic", color=color, wrap=True,
+        )
     return fig
 
 
-def _mark_native_units(fig: "Figure") -> "Figure":
+#: One-sentence clarification for the native-units section's opening page.
+_NATIVE_UNITS_DESCRIPTION = (
+    "Values shown here are in each source's original units and have not been "
+    "Cumulative Distribution Function matched, unlike the section above."
+)
+
+
+def _mark_native_units(fig: "Figure", description: Optional[str] = None) -> "Figure":
     """Stamp a "— native units —" banner across the top of *fig* so
     native-units report pages can never be mistaken for the CDF-matched
-    section's otherwise-identical-looking plots."""
-    return _stamp_banner(fig, "— native units —", "darkred")
+    section's otherwise-identical-looking plots. *description*, given only
+    for the section's first page, states these values are in their
+    original units and have not been CDF-matched (unlike the main
+    section)."""
+    return _stamp_banner(fig, "— native units —", "darkred", description)
 
 
-def _mark_cdf_matched(fig: "Figure") -> "Figure":
-    """Stamp a "(CDF-matched)" banner across the top of *fig* so
-    soil-moisture's main-section scatter/geographic/residuals pages
-    (which plot the CDF-matched/rescaled SAR series, not raw values)
-    can't be mistaken for a units bug — mirrors ``_mark_native_units``
-    but with a visually distinct color so the two banner types remain
-    distinguishable."""
-    return _stamp_banner(fig, "(CDF-matched)", "navy")
+#: C3S CDS product_type -> the label used in the section banner.
+_CDS_PRODUCT_TYPE_LABELS = {"active": "ACTIVE", "passive": "PASSIVE", "combined": "COMBINED"}
+
+#: One-sentence summary of which satellites/sensors feed each C3S CDS
+#: product_type, for the section's opening page -- confirmed against real
+#: downloaded product NetCDF attrs (``raw.attrs["platform"]``): "active" is
+#: TU Wien's ASCAT scatterometer composite (ERS-1/ERS-2 + MetOp-A/B);
+#: "passive" merges many independent microwave radiometers; "combined"
+#: merges both.
+_CDS_PRODUCT_TYPE_DESCRIPTIONS = {
+    "active": (
+        "This product is derived from ASCAT scatterometer observations aboard the "
+        "ERS-1, ERS-2, MetOp-A, and MetOp-B satellites."
+    ),
+    "passive": (
+        "This product merges observations from multiple passive microwave radiometers, "
+        "including SMMR, SSM/I, TMI, AMSR-E/AMSR2, WindSat, SMOS, SMAP, GMI, and the "
+        "FengYun-3 series."
+    ),
+    "combined": (
+        "This product merges active ASCAT scatterometer observations (ERS-1, ERS-2, "
+        "MetOp-A, MetOp-B) with passive microwave radiometer observations (SMMR, SSM/I, "
+        "TMI, AMSR-E/AMSR2, WindSat, SMOS, SMAP, GMI, and the FengYun-3 series)."
+    ),
+}
+
+
+def _cds_ssm_product_type(recipe) -> str:
+    """Return the ``product_type`` ("active"/"passive"/"combined")
+    configured for this recipe's ``cds_ssm`` validation source, defaulting
+    to "active" (matching ``_download_cds_ssm``'s own default) if absent."""
+    for src in recipe.config.validation_sources:
+        if src.source_type == "cds_ssm":
+            return str(src.download_kwargs.get("product_type", "active"))
+    return "active"
+
+
+def _mark_cds_section(
+    fig: "Figure", product_type: str = "active", description: Optional[str] = None,
+) -> "Figure":
+    """Stamp a banner naming this the C3S CDS gridded Level-3 comparison
+    section — named after the underlying ESA Climate Change Initiative
+    soil-moisture record that C3S continues operationally — to distinguish
+    it from the CDF-matched and native-units sections. *description*,
+    given only for the section's first page, states which satellites feed
+    *product_type*."""
+    label = _CDS_PRODUCT_TYPE_LABELS.get(product_type, product_type.upper())
+    text = f"— Validation against ESA Climate Change Initiative gridded Level 3 {label} product —"
+    return _stamp_banner(fig, text, "darkorange", description)
+
+
+#: One-sentence explanation of CDF matching, for the CDF-matched section's
+#: opening page.
+_CDF_MATCHED_DESCRIPTION = (
+    "Cumulative Distribution Function matching rescales each source's value "
+    "distribution onto a shared reference before comparison, removing systematic "
+    "instrument bias."
+)
+
+
+def _mark_cdf_matched(fig: "Figure", description: Optional[str] = None) -> "Figure":
+    """Stamp a "(Cumulative Distribution Function-matched)" banner across
+    the top of *fig* so soil-moisture's main-section scatter/geographic/
+    residuals pages (which plot the CDF-matched/rescaled SAR series, not
+    raw values) can't be mistaken for a units bug — mirrors
+    ``_mark_native_units`` but with a visually distinct color so the two
+    banner types remain distinguishable. *description*, given only for the
+    section's first page, explains what CDF-matching does."""
+    return _stamp_banner(fig, "(Cumulative Distribution Function-matched)", "navy", description)
 
 
 def _cdf_matched_suffix(variable: str) -> str:
@@ -3144,6 +3314,7 @@ def validation_report(
     download_warnings: Optional[list[str]] = None,
     layer_vs_layer_collocation_method: str = "cell-averaging",
     native_units_stats_ds_map: Optional[Dict[str, "xr.Dataset"]] = None,
+    cds_ssm_stats_ds_map: Optional[Dict[str, "xr.Dataset"]] = None,
 ) -> Dict[str, list]:
     """
     Run all four plot functions for every (sar_var, val_var) pair inferred
@@ -3381,6 +3552,27 @@ def validation_report(
             _, harmonized_sources, _ = _harmonize_percent_domain_sources(pair_ds, sar_var, val_var)
             pair_ds = add_rescaled_sar_column(pair_ds, sar_var, val_var)
 
+        # cds_ssm gets its own dedicated section further below
+        # (run_statistics_cds_ssm — no CDF matching) and must not also leak
+        # into this main CDF-matched section's plots. run_statistics()
+        # already excludes it from the CDF-matched stats table/bar charts
+        # (stats_ds_map), but the geographic/scatter/residuals plots below
+        # build straight from the raw collocation rows, which still carry
+        # cds_ssm — confirmed missing against a real
+        # recipes/soil_moisture_cds_sentinel_test.yaml run (cds_ssm rows
+        # showed up as their own subplot in the "(CDF-matched)" scatter/
+        # residuals pages even though the stats table correctly omitted
+        # them). Must not reassign pair_ds/geo_pair_ds themselves: the
+        # native-units section below is already cds_ssm-free by
+        # construction (restricted to native_units_stats_ds_map's own
+        # source list), but the C3S CDS section further below needs the
+        # *unfiltered* geo_pair_ds to select its own cds_ssm rows from.
+        cdf_pair_ds, cdf_geo_pair_ds = pair_ds, geo_pair_ds
+        if variable == "soil_moisture" and "val_source" in pair_ds \
+                and bool((pair_ds["val_source"] == "cds_ssm").any()):
+            cdf_pair_ds = pair_ds.where(pair_ds["val_source"] != "cds_ssm", drop=True)
+            cdf_geo_pair_ds = geo_pair_ds.where(geo_pair_ds["val_source"] != "cds_ssm", drop=True)
+
         logger.info("Generating plots for %s vs %s …", sar_var, val_var)
 
         # Geographic — returns dict[collocation_type, Figure] by default.
@@ -3439,7 +3631,7 @@ def validation_report(
             else:
                 geo_point_size = 40
             geo_result = plot_geographic(
-                datatree, geo_pair_ds, sar_var, val_var, scenes=matched_scenes,
+                datatree, cdf_geo_pair_ds, sar_var, val_var, scenes=matched_scenes,
                 point_size=geo_point_size,
                 geographic_bounds=(
                     recipe.config.geographic_bounds if geo_clamp_bounds else None
@@ -3447,17 +3639,23 @@ def validation_report(
                 two_column_by_type=(variable == "soil_moisture"),
             )
             if isinstance(geo_result, dict):
-                for group, fig_geo in geo_result.items():
+                # plot_geographic can return one Figure *per SAR scene*
+                # (two_column_by_type=True, soil_moisture's own mode) --
+                # the section-opening description belongs on the very
+                # first page of the section, not repeated on every scene.
+                for i, (group, fig_geo) in enumerate(geo_result.items()):
                     if fig_geo is not None:
                         if cdf_matched_suffix:
-                            fig_geo = _mark_cdf_matched(fig_geo)
+                            fig_geo = _mark_cdf_matched(
+                                fig_geo, description=_CDF_MATCHED_DESCRIPTION if i == 0 else None,
+                            )
                         figs.append(fig_geo)
                         title = f"{sar_var} vs {val_var} — geographic [{group}]{cdf_matched_suffix}"
                         if base_dir is not None:
                             _write_page(title, _finalize_figure_for_report(fig_geo, None))
             elif geo_result is not None:
                 if cdf_matched_suffix:
-                    geo_result = _mark_cdf_matched(geo_result)
+                    geo_result = _mark_cdf_matched(geo_result, description=_CDF_MATCHED_DESCRIPTION)
                 figs.append(geo_result)
                 title = f"{sar_var} vs {val_var} — geographic{cdf_matched_suffix}"
                 if base_dir is not None:
@@ -3473,7 +3671,7 @@ def validation_report(
         # busy even when no single source dominates by point count
         # (confirmed against real data, soil_moisture_satellite_example).
         force_split = bool(harmonized_sources)
-        fig_scatter = plot_scatter(pair_ds, sar_var, val_var, force_split=force_split)
+        fig_scatter = plot_scatter(cdf_pair_ds, sar_var, val_var, force_split=force_split)
         if fig_scatter is not None:
             if cdf_matched_suffix:
                 fig_scatter = _mark_cdf_matched(fig_scatter)
@@ -3505,9 +3703,9 @@ def validation_report(
 
         # Residuals
         fig_res = plot_residuals(
-            pair_ds, sar_var, val_var,
+            cdf_pair_ds, sar_var, val_var,
             hist_range=(
-                _volumetric_hist_range_overrides(pair_ds) or None
+                _volumetric_hist_range_overrides(cdf_pair_ds) or None
                 if cdf_matched_suffix else None
             ),
         )
@@ -3582,15 +3780,23 @@ def validation_report(
                     skip_domain_harmonization=True,
                 )
                 if isinstance(fig_nu_geo_result, dict):
-                    for group, fig_nu_geo in fig_nu_geo_result.items():
+                    # One page per group (per SAR scene, or per
+                    # collocation_type) -- the section-opening description
+                    # belongs on the first page only, not every one.
+                    for i, (group, fig_nu_geo) in enumerate(fig_nu_geo_result.items()):
                         if fig_nu_geo is not None:
-                            fig_nu_geo = _mark_native_units(fig_nu_geo)
+                            fig_nu_geo = _mark_native_units(
+                                fig_nu_geo,
+                                description=_NATIVE_UNITS_DESCRIPTION if i == 0 else None,
+                            )
                             figs.append(fig_nu_geo)
                             title = f"{sar_var} vs {val_var} — native units — geographic [{group}]"
                             if base_dir is not None:
                                 _write_page(title, _finalize_figure_for_report(fig_nu_geo, None))
                 elif fig_nu_geo_result is not None:
-                    fig_nu_geo_result = _mark_native_units(fig_nu_geo_result)
+                    fig_nu_geo_result = _mark_native_units(
+                        fig_nu_geo_result, description=_NATIVE_UNITS_DESCRIPTION,
+                    )
                     figs.append(fig_nu_geo_result)
                     title = f"{sar_var} vs {val_var} — native units — geographic"
                     if base_dir is not None:
@@ -3614,6 +3820,16 @@ def validation_report(
                 if base_dir is not None:
                     _write_page(title, _finalize_figure_for_report(fig_nu_residuals, None))
 
+            # Summary table (immediately before the statistics bar chart,
+            # mirroring the CDF-matched and C3S CDS SSM sections' order).
+            fig_nu_table = plot_summary_table(nu_stats)
+            if fig_nu_table is not None:
+                fig_nu_table = _mark_native_units(fig_nu_table)
+                figs.append(fig_nu_table)
+                title = f"{sar_var} vs {val_var} — native units — summary table"
+                if base_dir is not None:
+                    _write_page(title, _finalize_figure_for_report(fig_nu_table, None))
+
             fig_nu_stats = plot_statistics(nu_stats)
             if fig_nu_stats is not None:
                 fig_nu_stats = _mark_native_units(fig_nu_stats)
@@ -3621,6 +3837,88 @@ def validation_report(
                 title = f"{sar_var} vs {val_var} — native units — statistics"
                 if base_dir is not None:
                     _write_page(title, _finalize_figure_for_report(fig_nu_stats, None))
+
+        all_figures[key] = figs
+
+        # C3S CDS SSM section: plain (non-CDF-matched) comparison between
+        # SAR and the C3S CDS composite (ACTIVE or PASSIVE) collocated rows.
+        # Only present for soil_moisture recipes when cds_ssm rows exist.
+        if variable == "soil_moisture" and cds_ssm_stats_ds_map and key in cds_ssm_stats_ds_map:
+            cds_stats = cds_ssm_stats_ds_map[key]
+            cds_mask = geo_pair_ds["val_source"] == "cds_ssm"
+            cds_pair_ds = geo_pair_ds.where(cds_mask, drop=True)
+            cds_product_type = _cds_ssm_product_type(recipe)
+            cds_description = _CDS_PRODUCT_TYPE_DESCRIPTIONS.get(
+                cds_product_type, _CDS_PRODUCT_TYPE_DESCRIPTIONS["active"],
+            )
+
+            try:
+                fig_cds_geo_result = plot_geographic(
+                    datatree, cds_pair_ds, sar_var, val_var, scenes=matched_scenes,
+                    point_size=geo_point_size,
+                    geographic_bounds=(
+                        recipe.config.geographic_bounds if geo_clamp_bounds else None
+                    ),
+                    skip_domain_harmonization=True,
+                )
+                if isinstance(fig_cds_geo_result, dict):
+                    # One page per group (per SAR scene, or per
+                    # collocation_type) -- the section-opening description
+                    # belongs on the first page only, not every one.
+                    for i, (group, fig_cds_geo) in enumerate(fig_cds_geo_result.items()):
+                        if fig_cds_geo is not None:
+                            fig_cds_geo = _mark_cds_section(
+                                fig_cds_geo, cds_product_type,
+                                description=cds_description if i == 0 else None,
+                            )
+                            figs.append(fig_cds_geo)
+                            title = f"{sar_var} vs {val_var} — C3S CDS SSM — geographic [{group}]"
+                            if base_dir is not None:
+                                _write_page(title, _finalize_figure_for_report(fig_cds_geo, None))
+                elif fig_cds_geo_result is not None:
+                    fig_cds_geo_result = _mark_cds_section(
+                        fig_cds_geo_result, cds_product_type, description=cds_description,
+                    )
+                    figs.append(fig_cds_geo_result)
+                    title = f"{sar_var} vs {val_var} — C3S CDS SSM — geographic"
+                    if base_dir is not None:
+                        _write_page(title, _finalize_figure_for_report(fig_cds_geo_result, None))
+            except Exception as exc:
+                logger.warning("plot_geographic failed for C3S CDS SSM %s: %s", sar_var, exc)
+
+            fig_cds_scatter = plot_scatter(cds_pair_ds, sar_var, val_var)
+            if fig_cds_scatter is not None:
+                fig_cds_scatter = _mark_cds_section(fig_cds_scatter, cds_product_type)
+                figs.append(fig_cds_scatter)
+                title = f"{sar_var} vs {val_var} — C3S CDS SSM — scatter"
+                if base_dir is not None:
+                    _write_page(title, _finalize_figure_for_report(fig_cds_scatter, None))
+
+            # Summary table (immediately before the statistics bar charts,
+            # mirroring the main CDF-matched section's page order above).
+            fig_cds_table = plot_summary_table(cds_stats)
+            if fig_cds_table is not None:
+                fig_cds_table = _mark_cds_section(fig_cds_table, cds_product_type)
+                figs.append(fig_cds_table)
+                title = f"{sar_var} vs {val_var} — C3S CDS SSM — summary table"
+                if base_dir is not None:
+                    _write_page(title, _finalize_figure_for_report(fig_cds_table, None))
+
+            fig_cds_stats = plot_statistics(cds_stats)
+            if fig_cds_stats is not None:
+                fig_cds_stats = _mark_cds_section(fig_cds_stats, cds_product_type)
+                figs.append(fig_cds_stats)
+                title = f"{sar_var} vs {val_var} — C3S CDS SSM — statistics"
+                if base_dir is not None:
+                    _write_page(title, _finalize_figure_for_report(fig_cds_stats, None))
+
+            fig_cds_residuals = plot_residuals(cds_pair_ds, sar_var, val_var)
+            if fig_cds_residuals is not None:
+                fig_cds_residuals = _mark_cds_section(fig_cds_residuals, cds_product_type)
+                figs.append(fig_cds_residuals)
+                title = f"{sar_var} vs {val_var} — C3S CDS SSM — residuals"
+                if base_dir is not None:
+                    _write_page(title, _finalize_figure_for_report(fig_cds_residuals, None))
 
         all_figures[key] = figs
 

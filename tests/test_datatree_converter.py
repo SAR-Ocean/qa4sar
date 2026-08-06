@@ -19,6 +19,7 @@ from sar_validation.core.recipe import (
     Recipe,
     RecipeConfig,
     TemporalBounds,
+    ValidationDataSource,
 )
 
 # ---------------------------------------------------------------------------
@@ -161,6 +162,35 @@ def _make_collocations(n: int = 3) -> list[CollocatedPoint]:
     return result
 
 
+@pytest.mark.parametrize(
+    "method_name,filename,extra_args",
+    [
+        pytest.param("from_insitu_csv", "nonexistent.csv", (), id="from_insitu_csv"),
+        pytest.param("from_scatterometer_nc", "nonexistent.nc", (), id="from_scatterometer_nc"),
+        pytest.param("from_sar_l3_ssm_geotiff", "missing.tif", (), id="from_sar_l3_ssm_geotiff"),
+        pytest.param("from_nisar_sme2", "does_not_exist.h5", (), id="from_nisar_sme2"),
+        pytest.param("from_radiometer_nc", "nonexistent.nc", (), id="from_radiometer_nc"),
+        pytest.param("from_radiometer_bytemap", "nope.gz", (), id="from_radiometer_bytemap"),
+        pytest.param("from_hf_radar_grid", "nope.nc", (), id="from_hf_radar_grid"),
+        pytest.param("from_ascat_ssm", "does_not_exist.nc", (), id="from_ascat_ssm"),
+        pytest.param("from_amsr_ssm", "does_not_exist.h5", (), id="from_amsr_ssm"),
+        pytest.param("from_smap_ssm", "does_not_exist.h5", (), id="from_smap_ssm"),
+        pytest.param("from_smos_ssm", "does_not_exist.nc", (), id="from_smos_ssm"),
+        # from_c3s_ssm takes a required second positional arg (product_type)
+        # that none of the other 11 from_*() converters take -- folded in
+        # here (rather than left as TestFromC3sSsm's own one-off test) via
+        # extra_args so this cluster still covers all 12 converters.
+        pytest.param("from_c3s_ssm", "does_not_exist.nc", ("active",), id="from_c3s_ssm"),
+    ],
+)
+def test_converter_returns_none_for_missing_file(method_name, filename, extra_args, tmp_path):
+    """Every DataTreeConverter.from_*() static method opens with the same
+    `if not path.exists(): return None` guard -- one parametrized test
+    covers all 12 without duplicating the one-line body 12 times."""
+    method = getattr(DataTreeConverter, method_name)
+    assert method(tmp_path / filename, *extra_args) is None
+
+
 # ---------------------------------------------------------------------------
 # from_insitu_csv
 # ---------------------------------------------------------------------------
@@ -175,15 +205,6 @@ class TestFromInsituCsv:
         assert "lat" in ds.coords
         assert "time" in ds.coords
         assert "platform_id" in ds.coords
-
-    def test_point_dimension(self, tmp_path):
-        path = _make_insitu_csv(tmp_path, rows=10)
-        ds = DataTreeConverter.from_insitu_csv(path)
-        assert ds.sizes["point"] == 10
-
-    def test_returns_none_for_missing_file(self, tmp_path):
-        ds = DataTreeConverter.from_insitu_csv(tmp_path / "nonexistent.csv")
-        assert ds is None
 
     def test_attributes(self, tmp_path):
         path = _make_insitu_csv(tmp_path)
@@ -290,16 +311,6 @@ class TestFromScatterometerNc:
         ds = DataTreeConverter.from_scatterometer_nc(path)
         assert "model_speed" in ds
 
-    def test_platform_type_attr(self, tmp_path):
-        path = _make_scatterometer_nc(tmp_path)
-        ds = DataTreeConverter.from_scatterometer_nc(path)
-        assert ds.attrs["platform_type"] == "scatterometer"
-        assert ds.attrs["data_type"] == "scatterometer"
-
-    def test_returns_none_for_missing_file(self, tmp_path):
-        ds = DataTreeConverter.from_scatterometer_nc(tmp_path / "nonexistent.nc")
-        assert ds is None
-
     def test_direction_converted_from_oceanographic_to_meteorological(self, tmp_path):
         # ASCAT reports the direction the wind blows TOWARDS (oceanographic).
         # from_scatterometer_nc must rotate 180° to the meteorological
@@ -386,10 +397,6 @@ def _make_ssm_geotiff(tmp_path: Path, nrows: int = 3, ncols: int = 4) -> Path:
 
 
 class TestFromSarL3SsmGeotiff:
-    def test_missing_file_returns_none(self, tmp_path):
-        result = DataTreeConverter.from_sar_l3_ssm_geotiff(tmp_path / "missing.tif")
-        assert result is None
-
     def test_decodes_grid_and_masks_no_data(self, tmp_path):
         path = _make_ssm_geotiff(tmp_path)
         ds = DataTreeConverter.from_sar_l3_ssm_geotiff(path)
@@ -484,24 +491,6 @@ class TestFromNisarSme2:
         assert ds is not None
         assert pd.Timestamp(ds["time"].values) == pd.Timestamp("2026-06-20T01:30:00")
 
-    def test_data_type_and_source_attrs(self, tmp_path):
-        from sar_validation.core.datatree_converter import DataTreeConverter
-
-        h5_path = tmp_path / "granule.h5"
-        self._write_fake_granule(h5_path)
-
-        ds = DataTreeConverter.from_nisar_sme2(h5_path)
-
-        assert ds is not None
-        assert ds.attrs["data_type"] == "sar_l3_ssm"
-        assert ds.attrs["source"] == "NISAR SME2 (beta)"
-
-    def test_missing_file_returns_none(self, tmp_path):
-        from sar_validation.core.datatree_converter import DataTreeConverter
-
-        ds = DataTreeConverter.from_nisar_sme2(tmp_path / "does_not_exist.h5")
-        assert ds is None
-
     def test_missing_group_returns_none(self, tmp_path):
         import h5py
 
@@ -592,13 +581,6 @@ class TestFromCollocations:
     def test_empty_returns_none(self):
         ds = DataTreeConverter.from_collocations([])
         assert ds is None
-
-    def test_coordinate_times(self):
-        colls = _make_collocations(2)
-        ds = DataTreeConverter.from_collocations(colls)
-        assert "time" in ds.coords
-        assert "val_time" in ds.coords
-        assert "val_id" in ds.coords
 
     def test_nan_filling(self):
         """Variables absent in some collocations should be NaN there."""
@@ -969,15 +951,6 @@ class TestConvertDownloadedDataIsmn:
 # ---------------------------------------------------------------------------
 
 class TestToDataFrame:
-    def test_columns(self):
-        colls = _make_collocations(3)
-        df = DataTreeConverter.to_dataframe(colls)
-        assert len(df) == 3
-        assert "sar_lon" in df.columns
-        assert "sar_wind_speed" in df.columns
-        assert "val_WSPD" in df.columns
-        assert "spatial_distance_km" in df.columns
-
     def test_empty_input(self):
         df = DataTreeConverter.to_dataframe([])
         assert isinstance(df, pd.DataFrame)
@@ -1062,13 +1035,6 @@ class TestFromRadiometerNc:
         assert ds.sizes["point"] < 2 * 5 * 5           # some cells dropped
         assert np.isfinite(ds["WSPD"].values).all()    # no NaNs survive
 
-    def test_attrs_data_type_and_sensor(self, tmp_path):
-        path = _make_radiometer_nc(tmp_path, sensor="AMSR2")
-        ds = DataTreeConverter.from_radiometer_nc(path)
-        assert ds.attrs["data_type"] == "radiometer"
-        assert ds.attrs["platform_type"] == "radiometer"
-        assert ds.attrs["sensor"] == "amsr2"           # lowercased for spec lookup
-
     def test_per_cell_time_preserved(self, tmp_path):
         path = _make_radiometer_nc(tmp_path)
         ds = DataTreeConverter.from_radiometer_nc(path)
@@ -1093,10 +1059,6 @@ class TestFromRadiometerNc:
         assert ds["WSPD"].attrs["units"] == "m s-1"
         assert "valid_min" not in ds["WSPD"].attrs       # packing attrs dropped
         assert "remss.com" in ds.attrs.get("references", "")
-
-    def test_returns_none_for_missing_file(self, tmp_path):
-        ds = DataTreeConverter.from_radiometer_nc(tmp_path / "nonexistent.nc")
-        assert ds is None
 
     def test_all_nan_returns_none(self, tmp_path):
         path = _make_radiometer_nc(tmp_path, nan_frac=1.0)
@@ -1171,9 +1133,6 @@ class TestFromRadiometerBytemap:
                              [(0, 0, 5, 5, 100), (0, 2, 5, 5, 251)])
         ds = DataTreeConverter.from_radiometer_bytemap(p)
         assert ds is None            # the only touched cell has masked wind
-
-    def test_missing_file_returns_none(self, tmp_path):
-        assert DataTreeConverter.from_radiometer_bytemap(tmp_path / "nope.gz") is None
 
     def test_unresolvable_sensor_returns_none(self, tmp_path):
         p = tmp_path / "unknownprefix_20240601.gz"
@@ -1265,9 +1224,8 @@ class TestExtractRvlGridData:
         )
         assert ds is None
 
-    def test_land_flag_masks_radvel_and_std_grid(self, tmp_path):
-        # Multi-swath EW-style grid with the first 2 of 5 azimuth rows
-        # land-flagged across every range cell and every swath.
+    @staticmethod
+    def _grid_masking_scene(tmp_path):
         safe = _make_ocn_safe(
             tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=3, ny=5, nx=4, land_rows=2,
         )
@@ -1277,31 +1235,70 @@ class TestExtractRvlGridData:
         raw_radvel = raw["rvlRadVel"].values.reshape(5, -1)  # (az=5, ra*swath=12)
         expected_land_mean = float(np.nanmean(raw_radvel[:2, :]))
         raw.close()
+        return safe, 2, 4, 3, expected_land_mean  # land_rows, nx, n_swaths, mean
+
+    @staticmethod
+    def _points_masking_scene(tmp_path):
+        safe = _make_wv_rvl_safe(tmp_path, land_rows_per_file=[3])
+        raw = xr.open_dataset(sorted((safe / "measurement").glob("*.nc"))[0])
+        raw_radvel = raw["rvlRadVel"].values  # (13, 13)
+        expected_land_mean = float(np.nanmean(raw_radvel[:3, :]))
+        raw.close()
+        return safe, 3, 13, 1, expected_land_mean
+
+    @pytest.mark.parametrize(
+        "flatten_to_points,build_scene",
+        [
+            pytest.param(False, _grid_masking_scene, id="grid"),
+            pytest.param(True, _points_masking_scene, id="points"),
+        ],
+    )
+    def test_land_flag_masks_radvel_and_std(self, tmp_path, flatten_to_points, build_scene):
+        safe, land_rows, nx, n_swaths, expected_land_mean = build_scene(tmp_path)
 
         ds = DataTreeConverter._extract_rvl_grid_data(
-            safe / "measurement", safe, flatten_to_points=False
+            safe / "measurement", safe, flatten_to_points=flatten_to_points
         )
         assert ds is not None
 
-        # rvlRadVel / rvlRadVelStd are NaN in the land rows, finite elsewhere.
-        assert np.isnan(ds["rvlRadVel"].values[:2, :]).all()
-        assert np.isfinite(ds["rvlRadVel"].values[2:, :]).all()
-        assert np.isnan(ds["rvlRadVelStd"].values[:2, :]).all()
-        assert np.isfinite(ds["rvlRadVelStd"].values[2:, :]).all()
+        if flatten_to_points:
+            n_points_total = nx * nx  # 13 * 13, points scene is square
+            land_n = land_rows * nx
+            assert np.isnan(ds["rvlRadVel"].values[:land_n]).all()
+            assert np.isfinite(ds["rvlRadVel"].values[land_n:]).all()
+            assert np.isnan(ds["rvlRadVelStd"].values[:land_n]).all()
+            assert np.isfinite(ds["rvlHeading"].values).all()
+            assert ds.attrs["rvl_land_pixel_count"] == land_n
+            assert ds.attrs["rvl_land_pixel_fraction"] == pytest.approx(land_n / n_points_total)
+        else:
+            assert np.isnan(ds["rvlRadVel"].values[:land_rows, :]).all()
+            assert np.isfinite(ds["rvlRadVel"].values[land_rows:, :]).all()
+            assert np.isnan(ds["rvlRadVelStd"].values[:land_rows, :]).all()
+            assert np.isfinite(ds["rvlRadVelStd"].values[land_rows:, :]).all()
+            assert np.isfinite(ds["rvlHeading"].values).all()
+            assert np.isfinite(ds["rvlIncidenceAngle"].values).all()
+            land_n = land_rows * nx * n_swaths
+            assert ds.attrs["rvl_land_pixel_count"] == land_n
+            assert ds.attrs["rvl_land_pixel_fraction"] == pytest.approx(land_n / (5 * nx * n_swaths))
 
-        # Geometry variables are untouched by the land mask.
-        assert np.isfinite(ds["rvlHeading"].values).all()
-        assert np.isfinite(ds["rvlIncidenceAngle"].values).all()
-
-        assert ds.attrs["rvl_land_pixel_count"] == 2 * 4 * 3  # land_rows * nx * rvl_swaths
-        assert ds.attrs["rvl_land_pixel_fraction"] == pytest.approx((2 * 4 * 3) / (5 * 4 * 3))
         assert ds.attrs["rvl_land_mean_radvel"] == pytest.approx(expected_land_mean, abs=1e-5)
 
-    def test_zero_land_pixels_no_masking_grid(self, tmp_path):
-        # land_rows=0 (default) -> no rvlLandFlag written at all.
-        safe = _make_ocn_safe(tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=3, ny=5, nx=4)
+    @pytest.mark.parametrize(
+        "flatten_to_points",
+        [
+            pytest.param(False, id="grid"),
+            pytest.param(True, id="points"),
+        ],
+    )
+    def test_zero_land_pixels_no_masking(self, tmp_path, flatten_to_points):
+        if flatten_to_points:
+            safe = _make_wv_rvl_safe(tmp_path, land_rows_per_file=[0])
+        else:
+            # land_rows=0 (default) -> no rvlLandFlag written at all.
+            safe = _make_ocn_safe(tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=3, ny=5, nx=4)
+
         ds = DataTreeConverter._extract_rvl_grid_data(
-            safe / "measurement", safe, flatten_to_points=False
+            safe / "measurement", safe, flatten_to_points=flatten_to_points
         )
         assert ds is not None
         assert np.isfinite(ds["rvlRadVel"].values).all()
@@ -1319,28 +1316,6 @@ class TestExtractRvlGridData:
         assert np.isnan(ds["rvlRadVel"].values[:3, :]).all()
         assert np.isfinite(ds["rvlRadVel"].values[3:, :]).all()
         assert ds.attrs["rvl_land_pixel_count"] == 3 * 13
-
-    def test_land_flag_masks_points_single_file(self, tmp_path):
-        safe = _make_wv_rvl_safe(tmp_path, land_rows_per_file=[3])
-        raw = xr.open_dataset(sorted((safe / "measurement").glob("*.nc"))[0])
-        raw_radvel = raw["rvlRadVel"].values  # (13, 13)
-        expected_land_mean = float(np.nanmean(raw_radvel[:3, :]))
-        raw.close()
-
-        ds = DataTreeConverter._extract_rvl_grid_data(
-            safe / "measurement", safe, flatten_to_points=True
-        )
-        assert ds is not None
-        assert ds.sizes["point"] == 13 * 13
-        # Ravel order is row-major, so the first 3*13 points are the land rows.
-        assert np.isnan(ds["rvlRadVel"].values[: 3 * 13]).all()
-        assert np.isfinite(ds["rvlRadVel"].values[3 * 13 :]).all()
-        assert np.isnan(ds["rvlRadVelStd"].values[: 3 * 13]).all()
-        assert np.isfinite(ds["rvlHeading"].values).all()
-
-        assert ds.attrs["rvl_land_pixel_count"] == 3 * 13
-        assert ds.attrs["rvl_land_pixel_fraction"] == pytest.approx((3 * 13) / (13 * 13))
-        assert ds.attrs["rvl_land_mean_radvel"] == pytest.approx(expected_land_mean, abs=1e-5)
 
     def test_land_flag_accumulates_across_files(self, tmp_path):
         safe = _make_wv_rvl_safe(tmp_path, land_rows_per_file=[3, 5])
@@ -1363,26 +1338,6 @@ class TestExtractRvlGridData:
         assert ds.sizes["point"] == 2 * 13 * 13
         assert ds.attrs["rvl_land_pixel_count"] == expected_count
         assert ds.attrs["rvl_land_mean_radvel"] == pytest.approx(expected_mean, abs=1e-5)
-
-    def test_zero_land_points(self, tmp_path):
-        safe = _make_wv_rvl_safe(tmp_path, land_rows_per_file=[0])
-        ds = DataTreeConverter._extract_rvl_grid_data(
-            safe / "measurement", safe, flatten_to_points=True
-        )
-        assert ds is not None
-        assert np.isfinite(ds["rvlRadVel"].values).all()
-        assert ds.attrs["rvl_land_pixel_count"] == 0
-        assert math.isnan(ds.attrs["rvl_land_mean_radvel"])
-
-    def test_rvl_radvel_std_extracted_points(self, tmp_path):
-        safe = _make_wv_rvl_safe(tmp_path, land_rows_per_file=[0])
-        ds = DataTreeConverter._extract_rvl_grid_data(
-            safe / "measurement", safe, flatten_to_points=True
-        )
-        assert ds is not None
-        assert "rvlRadVelStd" in ds.data_vars
-        assert ds["rvlRadVelStd"].dims == ("point",)
-        assert ds.sizes["point"] == 13 * 13
 
     def test_land_mean_radvel_excludes_nan_land_cells(self, tmp_path):
         # A land-flagged cell can also have a NaN rvlRadVel (e.g. an
@@ -1619,26 +1574,11 @@ class TestFromHfRadarGrid:
         assert "EWCT" in ds and "NSCT" in ds
         assert "water_u" not in ds and "water_v" not in ds
 
-    def test_point_dimension_flattened(self, tmp_path):
-        ds = DataTreeConverter.from_hf_radar_grid(_make_hfr_grid_nc(tmp_path, 2, 3, 4))
-        assert "point" in ds.dims
-        assert ds.sizes["point"] == 2 * 3 * 4
-        for c in ("lon", "lat", "time"):
-            assert c in ds.coords
-
-    def test_data_type_and_platform_tags(self, tmp_path):
-        ds = DataTreeConverter.from_hf_radar_grid(_make_hfr_grid_nc(tmp_path))
-        assert ds.attrs["data_type"] == "hf_radar_grid"
-        assert ds.attrs["platform_type"] == "radar"
-
     def test_retains_ancillary_uncertainty_fields(self, tmp_path):
         ds = DataTreeConverter.from_hf_radar_grid(_make_hfr_grid_nc(tmp_path))
         assert "hfr_gdop" in ds        # derived from DOPx/DOPy
         assert "hfr_n_radials" in ds
         assert "hfr_n_sites" in ds
-
-    def test_returns_none_for_missing_file(self, tmp_path):
-        assert DataTreeConverter.from_hf_radar_grid(tmp_path / "nope.nc") is None
 
 
 class TestFromHfRadarGridResolutionDerivation:
@@ -1763,32 +1703,6 @@ class TestFromHfRadarGridCopernicus:
         assert ds is not None
         assert "EWCT" in ds and "NSCT" in ds
 
-    def test_data_type_tag_is_grid(self, tmp_path):
-        ds = DataTreeConverter.from_hf_radar_grid(
-            _make_copernicus_hfr_grid_nc(tmp_path), u_var="EWCT", v_var="NSCT",
-            source_label="Copernicus Marine HFR radar-total",
-        )
-        assert ds.attrs["data_type"] == "hf_radar_grid"
-        assert ds.attrs["source"] == "Copernicus Marine HFR radar-total"
-
-    def test_retains_copernicus_ancillary_fields(self, tmp_path):
-        ds = DataTreeConverter.from_hf_radar_grid(
-            _make_copernicus_hfr_grid_nc(tmp_path), u_var="EWCT", v_var="NSCT",
-            source_label="Copernicus Marine HFR radar-total",
-        )
-        assert "hfr_gdop" in ds
-        assert "hfr_ewcs" in ds and "hfr_nscs" in ds
-        assert "hfr_qc" in ds  # overall QCflag
-
-    def test_retains_per_parameter_qc_flags(self, tmp_path):
-        ds = DataTreeConverter.from_hf_radar_grid(
-            _make_copernicus_hfr_grid_nc(tmp_path), u_var="EWCT", v_var="NSCT",
-            source_label="Copernicus Marine HFR radar-total",
-        )
-        for name in ("hfr_qc_cspd", "hfr_qc_ddns", "hfr_qc_gdop",
-                     "hfr_qc_vart", "hfr_qc_position"):
-            assert name in ds, f"{name} missing from converted dataset"
-
     def test_noaa_default_args_unaffected(self, tmp_path):
         # Default u_var/v_var must still resolve NOAA's water_u/water_v.
         ds = DataTreeConverter.from_hf_radar_grid(_make_hfr_grid_nc(tmp_path))
@@ -1832,43 +1746,6 @@ class TestBuildDatatreeHfRadarHistorical:
         )
 
 
-class TestBuildDatatreeScatterometerFTPVariants:
-    @pytest.mark.parametrize("subdir_name", [
-        "scatterometer_hy2b", "scatterometer_hy2c", "scatterometer_oceansat3",
-    ])
-    def test_folder_becomes_validation_node(self, tmp_path, subdir_name):
-        base = tmp_path / "run"
-        (base / subdir_name).mkdir(parents=True)
-        _make_scatterometer_nc_at(
-            base / subdir_name, lons=[-5.0, -6.0], lats=[55.0, 56.0],
-        )
-        tree = DataTreeConverter.convert_downloaded_data(base)
-        assert tree is not None
-        node_paths = [node.path for node in tree.subtree]
-        assert any(subdir_name in p for p in node_paths)
-
-
-class TestBuildDatatreeCurrentsHistorical:
-    @pytest.mark.parametrize("instrument", [
-        "adcp_historical", "argo_historical", "drifter_historical", "glider_historical",
-    ])
-    def test_folder_becomes_validation_node(self, tmp_path, instrument):
-        base = tmp_path / "run"
-        subdir = base / instrument
-        subdir.mkdir(parents=True)
-        csv_path = _make_insitu_csv(subdir)
-        # from_insitu_csv expects EWCT/NSCT-capable columns; the shared
-        # _make_insitu_csv fixture already writes WSPD/WDIR + platform_type,
-        # which is enough to exercise the folder-discovery wiring itself.
-        tree = DataTreeConverter.convert_downloaded_data(base)
-        assert tree is not None
-        node_paths = [node.path for node in tree.subtree]
-        # Substring check (not exact equality) matching the existing
-        # TestBuildDatatreeHfRadarHistorical convention — DataTree node
-        # paths carry a leading "/" this key doesn't include.
-        assert any(f"validation/{instrument}/{csv_path.stem}" in p for p in node_paths)
-
-
 def test_build_ssm_point_dataset_sets_attrs_and_data():
     ds = DataTreeConverter._build_ssm_point_dataset(
         np.array([0.1, 0.2]), np.array([10.0, 11.0]), np.array([50.0, 51.0]),
@@ -1888,31 +1765,26 @@ def test_build_ssm_point_dataset_sets_attrs_and_data():
     assert ds.attrs["filename"] == "test.nc"
 
 
-def test_build_ssm_point_dataset_optional_sensor_and_grid():
-    ds = DataTreeConverter._build_ssm_point_dataset(
-        np.array([0.1]), np.array([10.0]), np.array([50.0]),
-        np.array(["2026-01-01"], dtype="datetime64[ns]"),
-        data_type="radiometer_ssm",
-        var_attrs={"SOIL_MOISTURE": {"units": "m3 m-3"}},
-        platform_type="amsr_ssm",
-        source="Test Source",
-        sensing_depth_cm="0-1",
-        band="X/Ka",
-        filename="test.h5",
-        sensor="amsr",
-        native_grid_deg=0.1,
-    )
-    assert ds.attrs["sensor"] == "amsr"
-    assert ds.attrs["native_grid_deg"] == 0.1
+def _assert_ssm_point_dataset(ds, *, data_type, sensing_depth_cm, band, n_points, units, sensor=None):
+    """Shared assertion tail for from_*_ssm converters: PR #26's
+    `_build_ssm_point_dataset` now stamps the same attrs from every
+    format-specific caller (ASCAT/AMSR/SMAP/SMOS), so each format test's
+    5-6 line attr-assembly check was pure duplication of this helper's
+    logic layered on top of format-specific parsing checks. `units` has
+    no default since ASCAT uses "%" while the three radiometer-family
+    converters use "m3 m-3" -- every caller must pass it explicitly."""
+    assert ds is not None
+    assert "SOIL_MOISTURE" in ds
+    assert ds["SOIL_MOISTURE"].attrs["units"] == units
+    assert ds.attrs["data_type"] == data_type
+    assert ds.attrs["sensing_depth_cm"] == sensing_depth_cm
+    assert ds.attrs["band"] == band
+    assert ds.sizes["point"] == n_points
+    if sensor is not None:
+        assert ds.attrs["sensor"] == sensor
 
 
 class TestFromASCATSsm:
-    def test_returns_none_for_missing_file(self, tmp_path):
-        from sar_validation.core.datatree_converter import DataTreeConverter
-
-        result = DataTreeConverter.from_ascat_ssm(tmp_path / "does_not_exist.nc")
-        assert result is None
-
     def test_converts_synthetic_file_via_ascat_package(self, tmp_path, monkeypatch):
         import numpy as np
         import pandas as pd
@@ -1944,14 +1816,11 @@ class TestFromASCATSsm:
         with patch.dict("sys.modules", {"ascat.eumetsat.level2": fake_ascat_module}):
             ds = DataTreeConverter.from_ascat_ssm(fake_nc)
 
-        assert ds is not None
-        assert "SOIL_MOISTURE" in ds
-        assert ds["SOIL_MOISTURE"].attrs["units"] == "%"
-        assert ds.attrs["data_type"] == "scatterometer_ssm"
-        assert ds.attrs["sensing_depth_cm"] == "0-5"
-        assert ds.attrs["band"] == "C"
+        _assert_ssm_point_dataset(
+            ds, data_type="scatterometer_ssm", sensing_depth_cm="0-5", band="C",
+            n_points=3, units="%",
+        )
         # The NaN cell (index 2) must be dropped.
-        assert ds.sizes["point"] == 3
         assert set(ds["SOIL_MOISTURE"].values) == {25.0, 50.0, 75.0}
 
     def test_returns_none_when_lon_missing_from_reader_output(self, tmp_path):
@@ -1984,12 +1853,6 @@ class TestFromASCATSsm:
 
 
 class TestFromAmsrSsm:
-    def test_returns_none_for_missing_file(self, tmp_path):
-        from sar_validation.core.datatree_converter import DataTreeConverter
-
-        result = DataTreeConverter.from_amsr_ssm(tmp_path / "does_not_exist.h5")
-        assert result is None
-
     def test_converts_synthetic_h5_file(self, tmp_path):
         import h5py
         import numpy as np
@@ -2005,15 +1868,10 @@ class TestFromAmsrSsm:
 
         ds = DataTreeConverter.from_amsr_ssm(h5_path)
 
-        assert ds is not None
-        assert "SOIL_MOISTURE" in ds
-        assert ds["SOIL_MOISTURE"].attrs["units"] == "m3 m-3"
-        assert ds.attrs["data_type"] == "radiometer_ssm"
-        assert ds.attrs["sensor"] == "amsr"
-        assert ds.attrs["sensing_depth_cm"] == "0-1"
-        assert ds.attrs["band"] == "X/Ka"
-        # The fill-value cell (-9999.0, index 2) must be dropped.
-        assert ds.sizes["point"] == 3
+        _assert_ssm_point_dataset(
+            ds, data_type="radiometer_ssm", sensing_depth_cm="0-1", band="X/Ka",
+            n_points=3, sensor="amsr", units="m3 m-3",
+        )
 
     def test_returns_none_for_corrupted_file(self, tmp_path):
         """A corrupted/truncated/non-HDF5 file at the AMSR SSM path must be
@@ -2211,12 +2069,6 @@ class TestConvertDownloadedDataAmsrHe5Discovery:
 
 
 class TestFromSmapSsm:
-    def test_returns_none_for_missing_file(self, tmp_path):
-        from sar_validation.core.datatree_converter import DataTreeConverter
-
-        result = DataTreeConverter.from_smap_ssm(tmp_path / "does_not_exist.h5")
-        assert result is None
-
     def test_converts_synthetic_h5_file(self, tmp_path):
         import h5py
         import numpy as np
@@ -2236,14 +2088,10 @@ class TestFromSmapSsm:
 
         ds = DataTreeConverter.from_smap_ssm(h5_path)
 
-        assert ds is not None
-        assert "SOIL_MOISTURE" in ds
-        assert ds["SOIL_MOISTURE"].attrs["units"] == "m3 m-3"
-        assert ds.attrs["data_type"] == "radiometer_ssm"
-        assert ds.attrs["sensor"] == "smap"
-        assert ds.attrs["sensing_depth_cm"] == "0-5"
-        assert ds.attrs["band"] == "L"
-        assert ds.sizes["point"] == 3
+        _assert_ssm_point_dataset(
+            ds, data_type="radiometer_ssm", sensing_depth_cm="0-5", band="L",
+            n_points=3, sensor="smap", units="m3 m-3",
+        )
 
     def test_drops_cells_with_malformed_fill_pattern_time_string(self, tmp_path):
         """Real SPL2SMP_E data (confirmed against a downloaded granule) uses
@@ -2305,12 +2153,6 @@ class TestFromSmapSsm:
 
 
 class TestFromSmosSsm:
-    def test_returns_none_for_missing_file(self, tmp_path):
-        from sar_validation.core.datatree_converter import DataTreeConverter
-
-        result = DataTreeConverter.from_smos_ssm(tmp_path / "does_not_exist.nc")
-        assert result is None
-
     def test_converts_synthetic_netcdf_file(self, tmp_path):
         """Fixture uses the field names/time convention CONFIRMED against a
         real downloaded SMOS product (see from_smos_ssm's docstring):
@@ -2339,15 +2181,11 @@ class TestFromSmosSsm:
 
         ds = DataTreeConverter.from_smos_ssm(nc_path)
 
-        assert ds is not None
-        assert "SOIL_MOISTURE" in ds
-        assert ds["SOIL_MOISTURE"].attrs["units"] == "m3 m-3"
-        assert ds.attrs["data_type"] == "radiometer_ssm"
-        assert ds.attrs["sensor"] == "smos"
-        assert ds.attrs["sensing_depth_cm"] == "0-5"
-        assert ds.attrs["band"] == "L"
+        _assert_ssm_point_dataset(
+            ds, data_type="radiometer_ssm", sensing_depth_cm="0-5", band="L",
+            n_points=3, sensor="smos", units="m3 m-3",
+        )
         # The -999.0 point is dropped -- 4 input points, 3 valid.
-        assert ds.sizes["point"] == 3
         assert ds["time"].values[0] == np.datetime64("2025-07-02T00:08:41")
 
     def test_returns_none_when_soil_moisture_missing_from_file(self, tmp_path):
@@ -2396,37 +2234,6 @@ class TestConvertDownloadedDataSmosTgzWarning:
             "smos_ssm" in record.message and ".nc" in record.message
             for record in caplog.records
         )
-
-    def test_no_warning_when_nc_files_present(self, tmp_path, caplog):
-        import numpy as np
-        import pandas as pd
-        import xarray as xr
-
-        smos_dir = tmp_path / "smos_ssm"
-        smos_dir.mkdir()
-        raw = xr.Dataset(
-            {"Soil_Moisture": ("obs", np.array([0.10, 0.25]))},
-            coords={
-                "Longitude": ("obs", np.array([-10.0, -5.0])),
-                "Latitude": ("obs", np.array([40.0, 45.0])),
-                "time": ("obs", pd.to_datetime(["2026-07-01T00:00:00"] * 2).values),
-            },
-        )
-        raw.to_netcdf(smos_dir / "SM_OPER_MIR_SMUDP2_fake.nc")
-
-        with caplog.at_level("WARNING"):
-            DataTreeConverter.convert_downloaded_data(tmp_path)
-
-        assert not any("smos_ssm" in record.message for record in caplog.records)
-
-    def test_no_warning_when_directory_empty(self, tmp_path, caplog):
-        smos_dir = tmp_path / "smos_ssm"
-        smos_dir.mkdir()
-
-        with caplog.at_level("WARNING"):
-            DataTreeConverter.convert_downloaded_data(tmp_path)
-
-        assert not any("smos_ssm" in record.message for record in caplog.records)
 
 
 class TestConvertDownloadedDataAscatSidecarFiles:
@@ -2527,3 +2334,175 @@ class TestFromHfRadarGridQCFlagFilter:
         assert result is not None
         # Only the NaN cell is dropped; no QCflag variable exists to filter on.
         assert result.sizes["point"] == 3
+
+
+class TestFromC3sSsm:
+    """Tests for DataTreeConverter.from_c3s_ssm."""
+
+    def test_returns_none_for_unknown_product_type(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        path = tmp_path / "fake.nc"
+        path.write_bytes(b"")
+        result = DataTreeConverter.from_c3s_ssm(path, "invalid_type")
+        assert result is None
+
+    def test_converts_active_product(self, tmp_path):
+        """Active product → units='%', data_type='cds_ssm', source contains ACTIVE."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        lat = np.array([50.0, 50.25])
+        lon = np.array([10.0, 10.25])
+        sm_vals = np.array([[35.0, np.nan], [42.0, 10.0]], dtype=float)
+
+        time_dim = np.array(["2026-01-01"], dtype="datetime64[ns]")
+        ds = xr.Dataset(
+            {"sm": (("time", "lat", "lon"), sm_vals[np.newaxis, :, :])},
+            coords={"time": time_dim, "lat": lat, "lon": lon},
+        )
+        nc_path = tmp_path / "c3s_ssm_active_20260101.nc"
+        ds.to_netcdf(nc_path)
+
+        result = DataTreeConverter.from_c3s_ssm(nc_path, "active")
+
+        assert result is not None
+        assert "SOIL_MOISTURE" in result
+        assert result["SOIL_MOISTURE"].attrs["units"] == "%"
+        assert result.attrs["data_type"] == "cds_ssm"
+        assert result.attrs["platform_type"] == "cds_ssm"
+        assert "ACTIVE" in result.attrs["source"]
+        # NaN filtered: 3 valid out of 4
+        assert result.sizes["point"] == 3
+
+    def test_converts_passive_product(self, tmp_path):
+        """Passive product → units='m3 m-3', source contains PASSIVE."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        lat = np.array([50.0])
+        lon = np.array([10.0, 10.25])
+        sm_vals = np.array([[0.3, 0.25]], dtype=float)
+
+        time_dim = np.array(["2026-01-01"], dtype="datetime64[ns]")
+        ds = xr.Dataset(
+            {"sm": (("time", "lat", "lon"), sm_vals[np.newaxis, :, :])},
+            coords={"time": time_dim, "lat": lat, "lon": lon},
+        )
+        nc_path = tmp_path / "c3s_ssm_passive_20260101.nc"
+        ds.to_netcdf(nc_path)
+
+        result = DataTreeConverter.from_c3s_ssm(nc_path, "passive")
+
+        assert result is not None
+        assert result["SOIL_MOISTURE"].attrs["units"] == "m3 m-3"
+        assert "PASSIVE" in result.attrs["source"]
+
+    def test_fill_value_masked_to_nan(self, tmp_path):
+        """Cells equal to _FillValue must be masked (dropped as NaN)."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        lat = np.array([50.0])
+        lon = np.array([10.0, 10.25, 10.5])
+        FILL = -9999.0
+        sm_vals = np.array([[30.0, FILL, 45.0]], dtype=float)
+
+        time_dim = np.array(["2026-01-01"], dtype="datetime64[ns]")
+        da = xr.DataArray(
+            sm_vals[np.newaxis, :, :],
+            dims=("time", "lat", "lon"),
+            coords={"time": time_dim, "lat": lat, "lon": lon},
+            attrs={"_FillValue": FILL},
+        )
+        ds = xr.Dataset({"sm": da})
+        nc_path = tmp_path / "c3s_ssm_active_20260101.nc"
+        ds.to_netcdf(nc_path)
+
+        result = DataTreeConverter.from_c3s_ssm(nc_path, "active")
+
+        assert result is not None
+        assert result.sizes["point"] == 2
+
+    def test_returns_none_when_sm_variable_missing(self, tmp_path):
+        """A file without 'sm' variable must return None without raising."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        ds = xr.Dataset(
+            {"other_var": (("lat", "lon"), np.ones((2, 2)))},
+            coords={"lat": [50.0, 50.25], "lon": [10.0, 10.25]},
+        )
+        nc_path = tmp_path / "c3s_ssm_active_20260101.nc"
+        ds.to_netcdf(nc_path)
+
+        result = DataTreeConverter.from_c3s_ssm(nc_path, "active")
+        assert result is None
+
+
+def _make_c3s_ssm_nc_at(tmp_path: Path, subdir_name: str = "cds_ssm") -> Path:
+    """A minimal C3S CDS SSM NetCDF, same shape convert_downloaded_data's
+    cds_ssm discovery loop must find (see from_c3s_ssm's docstring)."""
+    cds_dir = tmp_path / subdir_name
+    cds_dir.mkdir(parents=True, exist_ok=True)
+    lat = np.array([50.0, 50.25])
+    lon = np.array([10.0, 10.25])
+    sm_vals = np.array([[35.0, 40.0], [42.0, 38.0]], dtype=float)
+    time_dim = np.array(["2026-01-01"], dtype="datetime64[ns]")
+    ds = xr.Dataset(
+        {"sm": (("time", "lat", "lon"), sm_vals[np.newaxis, :, :])},
+        coords={"time": time_dim, "lat": lat, "lon": lon},
+    )
+    path = cds_dir / "c3s_ssm_20260101.nc"
+    ds.to_netcdf(path)
+    return path
+
+
+class TestConvertDownloadedDataCdsSsm:
+    """convert_downloaded_data must discover and convert cds_ssm/*.nc files
+    into validation/cds_ssm/<stem> nodes, same as its sibling *_ssm sources
+    -- otherwise CDSSoilMoistureDownloader's output is never reachable by
+    collocation/statistics/the PDF report despite from_c3s_ssm itself
+    working correctly in isolation."""
+
+    def test_cds_ssm_file_is_discovered_and_converted(self, tmp_path):
+        nc_path = _make_c3s_ssm_nc_at(tmp_path)
+
+        tree = DataTreeConverter.convert_downloaded_data(tmp_path)
+
+        assert tree is not None
+        node_paths = [node.path for node in tree.subtree]
+        assert any(p.endswith(f"validation/cds_ssm/{nc_path.stem}") for p in node_paths)
+
+    def test_product_type_from_recipe_download_kwargs_is_honored(self, tmp_path):
+        """When a recipe's cds_ssm source specifies product_type='passive',
+        the converted node must carry passive (m3 m-3) units, not the
+        'active' default."""
+        _make_c3s_ssm_nc_at(tmp_path)
+        recipe = Recipe(RecipeConfig(
+            name="cds-ssm-passive-test",
+            variable="soil_moisture",
+            geographic_bounds=GeographicBounds(0.0, 20.0, 40.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[
+                ValidationDataSource(
+                    source_type="cds_ssm",
+                    download_kwargs={"product_type": "passive"},
+                ),
+            ],
+        ))
+
+        tree = DataTreeConverter.convert_downloaded_data(tmp_path, recipe=recipe)
+
+        assert tree is not None
+        (node,) = tree["validation/cds_ssm"].children.values()
+        ds = node.to_dataset()
+        assert ds["SOIL_MOISTURE"].attrs["units"] == "m3 m-3"

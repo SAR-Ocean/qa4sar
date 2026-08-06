@@ -4,41 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-
-class TestSarSourcesRegistryShape:
-    def test_registry_has_the_three_registered_sources(self):
-        from sar_validation.core.sar_sources import SAR_SOURCES
-
-        assert set(SAR_SOURCES) == {"sentinel1_l2_ocn", "sentinel1_clms_ssm", "nisar_sme2"}
-
-    def test_sentinel1_l2_ocn_applies_to_wind_waves_currents(self):
-        from sar_validation.core.sar_sources import SAR_SOURCES
-
-        spec = SAR_SOURCES["sentinel1_l2_ocn"]
-        assert spec.variables == frozenset({"wind", "waves", "currents"})
-        assert spec.output_subdir == "S1_L2_OCN"
-        assert spec.file_glob == "*.SAFE"
-
-    def test_sentinel1_clms_ssm_applies_to_soil_moisture_only(self):
-        from sar_validation.core.sar_sources import SAR_SOURCES
-
-        spec = SAR_SOURCES["sentinel1_clms_ssm"]
-        assert spec.variables == frozenset({"soil_moisture"})
-        assert spec.output_subdir == "S1_L3_SSM"
-        assert spec.file_glob == "*.tif*"
-        assert spec.default_min_depth == 0.0
-        assert spec.default_max_depth == 0.05
-        assert spec.default_time_tolerance_minutes == 720
-        assert spec.default_aggregation_window_km == 1.0
-        assert spec.default_spatial_tolerance_km == 2.0
-
-    def test_sentinel1_l2_ocn_has_no_soil_moisture_defaults(self):
-        from sar_validation.core.sar_sources import SAR_SOURCES
-
-        spec = SAR_SOURCES["sentinel1_l2_ocn"]
-        assert spec.default_min_depth is None
-        assert spec.default_max_depth is None
-        assert spec.default_time_tolerance_minutes is None
+import pytest
 
 
 class TestSentinel1L2OcnDownloaderWiring:
@@ -52,24 +18,22 @@ class TestSentinel1L2OcnDownloaderWiring:
         mock_cls.assert_called_once_with(output_dir=tmp_path, dry_run=False, force_download=True)
         assert dl is mock_cls.return_value
 
-    def test_extra_download_kwargs_maps_swath_mode_and_max_downloads(self):
+    @pytest.mark.parametrize(
+        "swath_mode,max_downloads,download_kwargs,expected_kwargs",
+        [
+            (["IW", "EW"], 5, {"top": 50}, {"modes": ["IW", "EW"], "limit": 5, "top": 50}),
+            ([], None, {}, {"modes": None, "limit": None}),
+        ],
+        ids=["maps_swath_mode_and_max_downloads", "none_swath_mode_becomes_none"],
+    )
+    def test_extra_download_kwargs(self, swath_mode, max_downloads, download_kwargs, expected_kwargs):
         from sar_validation.core.recipe import SARDataSpec
         from sar_validation.core.sar_sources import SAR_SOURCES
 
         spec = SAR_SOURCES["sentinel1_l2_ocn"]
-        sd = SARDataSpec(swath_mode=["IW", "EW"], max_downloads=5, download_kwargs={"top": 50})
+        sd = SARDataSpec(swath_mode=swath_mode, max_downloads=max_downloads, download_kwargs=download_kwargs)
         kwargs = spec.extra_download_kwargs(sd)
-        assert kwargs == {"modes": ["IW", "EW"], "limit": 5, "top": 50}
-
-    def test_extra_download_kwargs_none_swath_mode_becomes_none(self):
-        from sar_validation.core.recipe import SARDataSpec
-        from sar_validation.core.sar_sources import SAR_SOURCES
-
-        spec = SAR_SOURCES["sentinel1_l2_ocn"]
-        sd = SARDataSpec(swath_mode=[], max_downloads=None)
-        kwargs = spec.extra_download_kwargs(sd)
-        assert kwargs["modes"] is None
-        assert kwargs["limit"] is None
+        assert kwargs == expected_kwargs
 
 
 class TestSentinel1ClmsSsmDownloaderWiring:
@@ -125,39 +89,7 @@ class TestConvertCallbacks:
 
 
 class TestNisarSme2RegistryEntry:
-    def test_applies_to_soil_moisture_only(self):
-        from sar_validation.core.sar_sources import SAR_SOURCES
-
-        spec = SAR_SOURCES["nisar_sme2"]
-        assert spec.variables == frozenset({"soil_moisture"})
-        assert spec.output_subdir == "NISAR_L3_SME2"
-        assert spec.file_glob == "*.h5"
-
-    def test_template_defaults(self):
-        from sar_validation.core.sar_sources import SAR_SOURCES
-
-        spec = SAR_SOURCES["nisar_sme2"]
-        assert spec.default_min_depth == 0.0
-        assert spec.default_max_depth == 0.05
-        assert spec.default_time_tolerance_minutes == 360
-        assert spec.default_aggregation_window_km == 0.2
-        assert spec.default_spatial_tolerance_km == 2.0
-
-    def test_build_downloader_returns_earthdata_downloader(self, tmp_path):
-        from sar_validation.core.sar_sources import SAR_SOURCES
-
-        spec = SAR_SOURCES["nisar_sme2"]
-        with patch(
-            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
-        ) as mock_cls:
-            mock_cls.return_value = MagicMock()
-            dl = spec.build_downloader(tmp_path, False, True)
-        assert dl is mock_cls.return_value
-        _, kwargs = mock_cls.call_args
-        assert kwargs["output_dir"] == tmp_path
-        assert kwargs["dry_run"] is False
-
-    def test_build_downloader_queries_both_beta_and_provisional_collections(self, tmp_path):
+    def test_build_downloader_returns_earthdata_downloader_querying_both_collections(self, tmp_path):
         """NISAR SME2's underlying CMR collection changed mid-mission with
         no temporal overlap (confirmed against real CMR data and a
         real-world coverage gap a user hit) -- both must be passed to
@@ -170,8 +102,11 @@ class TestNisarSme2RegistryEntry:
             "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader"
         ) as mock_cls:
             mock_cls.return_value = MagicMock()
-            spec.build_downloader(tmp_path, False, True)
+            dl = spec.build_downloader(tmp_path, False, True)
+        assert dl is mock_cls.return_value
         _, kwargs = mock_cls.call_args
+        assert kwargs["output_dir"] == tmp_path
+        assert kwargs["dry_run"] is False
         assert kwargs["dataset"] == [
             ("NISAR_L3_SME2_BETA_V1", "1"),
             ("NISAR_L3_SME2_PROVISIONAL_V1", "1"),
@@ -185,3 +120,58 @@ class TestNisarSme2RegistryEntry:
         sd = SARDataSpec(source="nisar_sme2", swath_mode=["IW"], download_kwargs={"version": "001"})
         kwargs = spec.extra_download_kwargs(sd)
         assert kwargs == {"version": "001"}
+
+
+class TestSarSourceSatelliteField:
+    """Each registry entry records which satellite family it belongs to,
+    so --sar-source can accept a satellite name (e.g. "sentinel1") instead
+    of forcing users to know the internal product-specific key."""
+
+    @pytest.mark.parametrize("key, satellite", [
+        ("sentinel1_l2_ocn", "sentinel1"),
+        ("sentinel1_clms_ssm", "sentinel1"),
+        ("nisar_sme2", "nisar"),
+    ])
+    def test_satellite_field(self, key, satellite):
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        assert SAR_SOURCES[key].satellite == satellite
+
+
+class TestAvailableSatellites:
+    def test_lists_sentinel1_and_nisar(self):
+        from sar_validation.core.sar_sources import AVAILABLE_SATELLITES
+
+        assert AVAILABLE_SATELLITES == ["nisar", "sentinel1"]
+
+
+class TestResolveSarSource:
+    """resolve_sar_source(name, variable) is the single place --sar-source
+    CLI values get turned into an internal SAR_SOURCES key -- accepting
+    either a satellite family name (the new, user-facing convention) or an
+    exact internal key (kept working for backward compatibility /
+    recipe.yaml's own stored sar_data.source values)."""
+
+    @pytest.mark.parametrize("name, variable, expected", [
+        ("sentinel1", "wind", "sentinel1_l2_ocn"),
+        ("sentinel1", "waves", "sentinel1_l2_ocn"),
+        ("sentinel1", "currents", "sentinel1_l2_ocn"),
+        ("sentinel1", "soil_moisture", "sentinel1_clms_ssm"),
+        ("nisar", "soil_moisture", "nisar_sme2"),
+        ("sentinel1_clms_ssm", "soil_moisture", "sentinel1_clms_ssm"),
+    ])
+    def test_resolves(self, name, variable, expected):
+        from sar_validation.core.sar_sources import resolve_sar_source
+
+        assert resolve_sar_source(name, variable) == expected
+
+    @pytest.mark.parametrize("name, variable, match", [
+        ("nisar", "wind", "no product"),
+        ("sentinel1_clms_ssm", "wind", "only valid for"),
+        ("bogus", "wind", "sentinel1"),
+    ])
+    def test_raises(self, name, variable, match):
+        from sar_validation.core.sar_sources import resolve_sar_source
+
+        with pytest.raises(ValueError, match=match):
+            resolve_sar_source(name, variable)

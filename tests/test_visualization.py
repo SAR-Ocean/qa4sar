@@ -790,7 +790,8 @@ class TestPlotSummaryTable:
         stats_ds = xr.Dataset(
             {"foo": ("source", [1.0])}, coords={"source": ["mooring"]},
         )
-        assert plot_summary_table(stats_ds, metrics=["bias"]) is None
+        with pytest.warns(UserWarning, match="None of .* found in stats_ds"):
+            assert plot_summary_table(stats_ds, metrics=["bias"]) is None
 
     def test_returns_none_for_empty_source_coordinate(self):
         import numpy as np
@@ -802,7 +803,8 @@ class TestPlotSummaryTable:
             {"bias": ("source", np.array([], dtype=float))},
             coords={"source": np.array([], dtype=object)},
         )
-        assert plot_summary_table(stats_ds) is None
+        with pytest.warns(UserWarning, match="no source groups"):
+            assert plot_summary_table(stats_ds) is None
 
 
 class TestSourceStyleMap:
@@ -854,6 +856,65 @@ class TestSourceStyleMap:
         style_lower = _source_style_map(["altimeter"])
         style_title = _source_style_map(["Altimeter"])
         assert style_lower["altimeter"] == style_title["Altimeter"]
+
+
+class TestCanonicalSourceOrderStability:
+    """_canonical_source_order() must assign each known source a permanent
+    list-position slot, appended-only, rather than re-sorting alphabetically
+    -- alphabetical sorting silently reshuffles every alphabetically-later
+    source's color/marker whenever a new source name is added anywhere in
+    LAYER_DATA_TYPES/_INSITU_TYPES (this has broken the palette 3+ times;
+    see the _SOURCE_COLORS module comment)."""
+
+    # Pre-cds_ssm registration order -- the order these 12 source types
+    # already had (as plain alphabetical order) before cds_ssm joined
+    # LAYER_DATA_TYPES. Every one of these must keep this exact slot
+    # forever; only newly-registered types may be appended after them.
+    _PRE_EXISTING_ORDER = [
+        "altimeter", "buoy", "drifter", "ferrybox", "hf_radar", "hf_radar_grid",
+        "mooring", "radiometer", "radiometer_ssm", "scatterometer",
+        "scatterometer_ssm", "tidal_gauge",
+    ]
+
+    def test_pre_existing_sources_keep_their_original_slots(self):
+        from sar_validation.core.visualization import _canonical_source_order
+
+        canonical = _canonical_source_order()
+        assert canonical[: len(self._PRE_EXISTING_ORDER)] == self._PRE_EXISTING_ORDER
+
+    def test_newly_registered_source_is_appended_not_inserted(self):
+        # cds_ssm sorts alphabetically between "buoy" and "drifter"; a
+        # correct append-only order must NOT place it there.
+        from sar_validation.core.visualization import _canonical_source_order
+
+        canonical = _canonical_source_order()
+        assert canonical.index("cds_ssm") == len(self._PRE_EXISTING_ORDER)
+
+    def test_pre_existing_sources_keep_their_original_color_and_marker(self):
+        from sar_validation.core.visualization import _source_style_map
+
+        style = _source_style_map(self._PRE_EXISTING_ORDER)
+        pairs = [style[name] for name in self._PRE_EXISTING_ORDER]
+        assert pairs == [
+            ("#1f77b4", "o"), ("#ff7f0e", "s"), ("#2ca02c", "^"), ("#d62728", "D"),
+            ("#9467bd", "v"), ("#8c564b", "P"), ("#e377c2", "X"), ("#469990", "*"),
+            ("#f032e6", "h"), ("#e6194b", "p"), ("#000080", "8"), ("#ffff00", "<"),
+        ]
+
+    def test_raises_when_order_list_drifts_out_of_sync_with_registered_sets(self, monkeypatch):
+        # If a new source type is ever added to LAYER_DATA_TYPES/_INSITU_TYPES
+        # without appending it to _canonical_source_order's fixed list, that
+        # must fail loudly (a test/CI-visible error) rather than silently
+        # falling back to a reshuffling sort.
+        import sar_validation.core.collocation as collocation_mod
+        import sar_validation.core.visualization as viz_mod
+
+        monkeypatch.setattr(
+            collocation_mod, "LAYER_DATA_TYPES",
+            collocation_mod.LAYER_DATA_TYPES | {"some_brand_new_layer_type"},
+        )
+        with pytest.raises(AssertionError, match="some_brand_new_layer_type"):
+            viz_mod._canonical_source_order()
 
 
 class TestPlotGeographic:
@@ -3094,6 +3155,148 @@ class TestPlotCollocationDiagnosticsNoValidationDataAtAll:
         assert recorded_scatter_calls == []
 
 
+class TestDownsampledValidPixelCoordsAdaptiveDensity:
+    """_downsampled_valid_pixel_coords previously targeted a flat ~3000
+    dots for every scene regardless of its physical size -- fine for
+    Sentinel-1 CLMS SSM's continental daily mosaic, but for a small NISAR
+    SME2 per-orbit granule (confirmed against real converted data: ~160x
+    smaller valid-pixel area than a real Sentinel-1 scene) the same 3000
+    dots ended up ~18x closer together, reading as a solid blob instead of
+    discernible points. With no explicit target_count, the dot count must
+    now scale with the scene's own valid-pixel area so the resulting dot
+    *spacing* stays roughly consistent across wildly different scene
+    sizes, instead of the dot *count* staying fixed."""
+
+    @staticmethod
+    def _grid(ny, nx, dlon, dlat, lon0=0.0, lat0=45.0):
+        lon_1d = lon0 + np.arange(nx) * dlon
+        lat_1d = lat0 + np.arange(ny) * dlat
+        lons, lats = np.meshgrid(lon_1d, lat_1d)
+        return lons, lats
+
+    def test_explicit_target_count_still_honored(self):
+        """Backward-compatible override path: passing target_count
+        explicitly must behave exactly as before (flat count, no area
+        adaptation)."""
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        lons, lats = self._grid(500, 500, dlon=0.01, dlat=0.01)
+        valid = np.ones((500, 500), dtype=bool)
+
+        points = _downsampled_valid_pixel_coords(valid, lons, lats, target_count=100)
+
+        assert 0 < len(points) <= 150  # stride-based, so approximate, not exact
+
+    # Grid sizes below are chosen to match the real-world order of
+    # magnitude confirmed against actual converted data in this repo: a
+    # real NISAR SME2 granule's valid-pixel area is ~2.3 deg^2, a real
+    # Sentinel-1 CLMS SSM daily mosaic's is ~503 deg^2 (~217x bigger) --
+    # reproduced here at a coarser resolution than the real grids (0.05
+    # deg/cell vs ~0.002-0.009 deg/cell) purely to keep the test arrays
+    # small and fast, while landing on a comparable ~100x area ratio.
+
+    def test_small_area_scene_gets_sparser_relative_sampling_than_flat_default(self):
+        """A small scene (NISAR-shaped: small physical area) whose
+        valid-cell count is below the historical flat 3000 target must
+        still end up *sparser* than "no subsampling at all" (what the old
+        flat-3000 default would do here, since total_valid < 3000) -- the
+        new default must actively thin a small, dense scene rather than
+        only ever thinning large ones."""
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        # 40x40 grid, all valid -> ~4 deg^2 (NISAR-scale), 1600 valid
+        # cells (below the old flat target_count=3000).
+        lons, lats = self._grid(40, 40, dlon=0.05, dlat=0.05)
+        valid = np.ones((40, 40), dtype=bool)
+
+        points = _downsampled_valid_pixel_coords(valid, lons, lats)
+
+        assert 0 < len(points) < 1600, (
+            "a small-area scene must be thinned even though its valid-cell "
+            "count is below the old flat target of 3000"
+        )
+
+    def test_large_area_scene_keeps_dense_sampling_near_historical_default(self):
+        """A large scene (Sentinel-1-shaped: ~100x the physical area of
+        the small-scene test above) must still end up close to the
+        historical ~3000-dot density, preserving today's rendering for
+        that source."""
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        # 400x400 grid -> ~400 deg^2 (Sentinel-1-scale).
+        lons, lats = self._grid(400, 400, dlon=0.05, dlat=0.05)
+        valid = np.ones((400, 400), dtype=bool)
+
+        points = _downsampled_valid_pixel_coords(valid, lons, lats)
+
+        assert 1500 <= len(points) <= 3500
+
+    def test_resulting_spacing_is_far_more_consistent_than_flat_count_would_give(self):
+        """The core property this fix exists for: the *physical spacing*
+        between plotted dots for a small scene and a large scene (~100x
+        area difference) must end up much closer to each other than a
+        flat dot-count scheme would produce (a flat scheme would give
+        these two scenes the exact same dot count, and thus ~10x
+        different spacing, since spacing scales with sqrt(area/n))."""
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        small_lons, small_lats = self._grid(40, 40, dlon=0.05, dlat=0.05)
+        small_valid = np.ones((40, 40), dtype=bool)
+        large_lons, large_lats = self._grid(400, 400, dlon=0.05, dlat=0.05)
+        large_valid = np.ones((400, 400), dtype=bool)
+
+        def _mean_nn_spacing(points):
+            pts = np.asarray(points)
+            # Cheap nearest-neighbor spacing proxy: sqrt(bbox area / n).
+            lon_range = pts[:, 0].max() - pts[:, 0].min()
+            lat_range = pts[:, 1].max() - pts[:, 1].min()
+            return np.sqrt(max(lon_range, 1e-9) * max(lat_range, 1e-9) / len(pts))
+
+        small_spacing = _mean_nn_spacing(
+            _downsampled_valid_pixel_coords(small_valid, small_lons, small_lats)
+        )
+        large_spacing = _mean_nn_spacing(
+            _downsampled_valid_pixel_coords(large_valid, large_lons, large_lats)
+        )
+
+        ratio = max(small_spacing, large_spacing) / min(small_spacing, large_spacing)
+        assert ratio < 3.5, (
+            f"expected roughly consistent dot spacing across scene sizes, "
+            f"got small={small_spacing:.4f} large={large_spacing:.4f} (ratio {ratio:.1f}x)"
+        )
+
+    def test_tiny_scene_still_gets_a_minimum_number_of_dots(self):
+        """A very small valid-cell count must not be thinned down to
+        almost nothing -- some minimum dot count keeps the footprint
+        shape recognizable."""
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        lons, lats = self._grid(60, 60, dlon=0.001, dlat=0.001)
+        valid = np.ones((60, 60), dtype=bool)  # 3600 valid cells, tiny area
+
+        points = _downsampled_valid_pixel_coords(valid, lons, lats)
+
+        assert len(points) >= 100
+
+    def test_degenerate_single_row_or_column_grid_falls_back_without_crashing(self):
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        lons, lats = self._grid(1, 500, dlon=0.01, dlat=0.01)
+        valid = np.ones((1, 500), dtype=bool)
+
+        points = _downsampled_valid_pixel_coords(valid, lons, lats)
+
+        assert len(points) > 0
+
+    def test_zero_valid_cells_returns_empty(self):
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        lons, lats = self._grid(50, 50, dlon=0.01, dlat=0.01)
+        valid = np.zeros((50, 50), dtype=bool)
+
+        assert _downsampled_valid_pixel_coords(valid, lons, lats) == []
+
+
 class TestPlotCollocationDiagnosticsSoilMoistureOverpassCoverage:
     """CLMS Surface Soil Moisture's grid has valid lon/lat everywhere across
     the continent, but the actual retrieved value is NaN except along that
@@ -5183,12 +5386,21 @@ class TestValidationReportNativeUnitsSection:
         native_stats = compute_statistics(collocation_ds, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
         native_stats_map = {"sarSSM_vs_SOIL_MOISTURE": native_stats}
 
+        import warnings
+
         key = "sarSSM_vs_SOIL_MOISTURE"
-        figs_without = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path / "without")
-        figs_with = validation_report(
-            collocation_ds, datatree, recipe, out_dir=tmp_path / "with",
-            native_units_stats_ds_map=native_stats_map,
-        )
+        # ascat_ssm is the only val_source and ismn is absent, so the
+        # CDF-matched section (unrelated to what this test checks) warns
+        # "No valid data" for itself -- see
+        # TestValidationReportResidualsHistRange for the test that
+        # actually asserts on that behavior.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            figs_without = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path / "without")
+            figs_with = validation_report(
+                collocation_ds, datatree, recipe, out_dir=tmp_path / "with",
+                native_units_stats_ds_map=native_stats_map,
+            )
 
         assert key in figs_without and key in figs_with
         n_without = len(figs_without[key])
@@ -5207,6 +5419,57 @@ class TestValidationReportNativeUnitsSection:
             any("native units" in t.get_text() for t in fig.texts)
             for fig in new_figs
         ), "no newly-added figure carries the '— native units —' banner"
+
+    def test_native_units_section_includes_a_summary_table(self, tmp_path):
+        """Unlike the CDF-matched and C3S CDS SSM sections (both of which
+        call plot_summary_table before their statistics bar chart), the
+        native-units section had no summary table at all."""
+        from sar_validation.core.statistics import compute_statistics
+        from sar_validation.core.visualization import validation_report
+
+        recipe = self._recipe()
+        datatree = xr.DataTree.from_dict({
+            "validation/ascat_ssm/f1": self._ascat_node([0.0, 1.0], [45.0, 46.0], [25.0, 35.0]),
+        })
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": ("collocation", np.array([20.0, 30.0]), {"units": "%"}),
+                "val_SOIL_MOISTURE": ("collocation", np.array([25.0, 35.0])),
+                "val_source": ("collocation", np.array(["ascat_ssm", "ascat_ssm"])),
+                "val_id": ("collocation", np.array(["a1", "a2"])),
+            },
+        )
+        native_stats = compute_statistics(collocation_ds, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            figs = validation_report(
+                collocation_ds, datatree, recipe, out_dir=tmp_path,
+                native_units_stats_ds_map={key: native_stats},
+            )
+        assert key in figs
+
+        # plot_summary_table renders "Bias"/"Rmse"/"Correlation" column
+        # headers as cell text in an ax.table(...) -- look for them on a
+        # native-units-banner figure.
+        found_table = False
+        for fig in figs[key]:
+            banner_texts = [t.get_text() for t in fig.texts]
+            if not any("native units" in t for t in banner_texts):
+                continue
+            for ax in fig.axes:
+                cell_texts = {
+                    cell.get_text().get_text()
+                    for table in ax.tables
+                    for cell in table.get_celld().values()
+                }
+                if "Bias" in cell_texts and "Rmse" in cell_texts:
+                    found_table = True
+
+        assert found_table, "expected a native-units figure containing a Bias/Rmse summary table"
 
     def test_native_units_geographic_rendered_before_native_units_scatter(self, tmp_path, monkeypatch):
         """The native-units section must lead with its geographic plot too,
@@ -5242,12 +5505,20 @@ class TestValidationReportNativeUnitsSection:
             call_order.append("geographic")
             return original_geo(*args, **kwargs)
 
+        import warnings
+
         monkeypatch.setattr(viz, "plot_scatter", scatter_spy)
         monkeypatch.setattr(viz, "plot_geographic", geo_spy)
-        viz.validation_report(
-            collocation_ds, datatree, recipe, out_dir=tmp_path,
-            native_units_stats_ds_map=native_stats_map,
-        )
+        # ascat_ssm-without-ismn triggers the CDF-matched section's
+        # unrelated "No valid data" warning -- see
+        # TestValidationReportResidualsHistRange for the test that
+        # actually asserts on that behavior.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            viz.validation_report(
+                collocation_ds, datatree, recipe, out_dir=tmp_path,
+                native_units_stats_ds_map=native_stats_map,
+            )
         import matplotlib.pyplot as plt
         plt.close("all")
 
@@ -5357,9 +5628,335 @@ class TestValidationReportNativeUnitsSection:
             },
         )
 
-        figs = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        import warnings
+
+        # ascat_ssm-without-ismn triggers the CDF-matched section's
+        # unrelated "No valid data" warning -- see
+        # TestValidationReportResidualsHistRange for the test that
+        # actually asserts on that behavior.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            figs = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
 
         assert "sarSSM_vs_SOIL_MOISTURE" in figs
+
+
+class TestValidationReportMainSectionExcludesCdsSsm:
+    """cds_ssm is deliberately excluded from run_statistics()'s CDF-matched
+    pass and gets its own separate '— C3S CDS SSM —' section instead (see
+    run_statistics_cds_ssm) -- confirmed live against a real recipe run
+    that validation_statistics_*.nc (no suffix) correctly omits cds_ssm.
+    But the main section's geographic/scatter/residuals plots build
+    straight from the raw collocation_ds (unlike the summary
+    table/statistics bar charts, which correctly read from the already-
+    cds_ssm-free stats_ds_map), so cds_ssm rows leaked into the
+    "(CDF-matched)" plots even though the numeric stats were correct --
+    confirmed against a real recipes/soil_moisture_cds_sentinel_test.yaml
+    run."""
+
+    @staticmethod
+    def _recipe():
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
+
+        cfg = RecipeConfig(
+            name="test_cds_ssm_excluded_from_main_section", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        )
+        return Recipe(config=cfg)
+
+    def test_cds_ssm_rows_absent_from_cdf_matched_scatter(self, tmp_path):
+        from sar_validation.core.statistics import compute_statistics
+        from sar_validation.core.visualization import validation_report
+
+        recipe = self._recipe()
+        datatree = xr.DataTree.from_dict({
+            "validation/ascat_ssm/f1": xr.Dataset(
+                {"SOIL_MOISTURE": ("point", np.array([25.0, 35.0]))},
+                coords={
+                    "lon": ("point", [0.0, 1.0]), "lat": ("point", [45.0, 46.0]),
+                    "time": ("point", np.array(["2026-01-01"] * 2, dtype="datetime64[ns]")),
+                },
+            ),
+            "validation/ismn/f1": xr.Dataset(
+                {"SOIL_MOISTURE": ("point", np.array([0.30, 0.32]))},
+                coords={
+                    "lon": ("point", [5.0, 6.0]), "lat": ("point", [50.0, 51.0]),
+                    "time": ("point", np.array(["2026-01-01"] * 2, dtype="datetime64[ns]")),
+                },
+            ),
+            "validation/cds_ssm/f1": xr.Dataset(
+                {"SOIL_MOISTURE": ("point", np.array([0.20, 0.22, 0.24]))},
+                coords={
+                    "lon": ("point", [2.0, 3.0, 4.0]), "lat": ("point", [47.0, 48.0, 49.0]),
+                    "time": ("point", np.array(["2026-01-01"] * 3, dtype="datetime64[ns]")),
+                },
+            ),
+        })
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": (
+                    "collocation", np.array([20.0, 30.0, 31.0, 33.0, 21.0, 23.0, 25.0]), {"units": "%"},
+                ),
+                "val_SOIL_MOISTURE": (
+                    "collocation", np.array([25.0, 35.0, 0.30, 0.32, 0.20, 0.22, 0.24]),
+                ),
+                "val_source": (
+                    "collocation",
+                    np.array([
+                        "ascat_ssm", "ascat_ssm", "ismn", "ismn",
+                        "cds_ssm", "cds_ssm", "cds_ssm",
+                    ]),
+                ),
+                "val_id": ("collocation", np.array(["a1", "a2", "i1", "i2", "c1", "c2", "c3"])),
+            },
+        )
+
+        # Sanity check: run_statistics itself already excludes cds_ssm
+        # (this is the behavior the main-section plots must now match).
+        stats = compute_statistics(
+            collocation_ds.where(collocation_ds["val_source"] != "cds_ssm", drop=True),
+            "sarSSM", "SOIL_MOISTURE", group_by=["val_source"],
+        )
+        assert set(stats["source"].values) == {"ascat_ssm", "ismn"}
+        stats_map = {"sarSSM_vs_SOIL_MOISTURE": stats}
+
+        key = "sarSSM_vs_SOIL_MOISTURE"
+        figs = validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path, stats_ds_map=stats_map,
+        )
+        assert key in figs
+
+        # Collect every piece of text rendered anywhere on each
+        # "Cumulative Distribution Function-matched"-banner figure
+        # (figure-level text, axes titles, axes-level annotations, legend
+        # labels) -- robust to whether plot_scatter renders one shared
+        # axes or splits into one small-multiple subplot per source
+        # (force_split, triggered here since ascat_ssm gets CDF-harmonized
+        # into ismn's domain), unlike scraping a specific "N=..."
+        # annotation format that only exists in the unified-axes layout.
+        cdf_matched_fig_found = False
+        all_cdf_text = []
+        for fig in figs[key]:
+            banner_texts = [t.get_text() for t in fig.texts]
+            if not any("Cumulative Distribution Function" in t for t in banner_texts):
+                continue
+            cdf_matched_fig_found = True
+            all_cdf_text.extend(banner_texts)
+            for ax in fig.axes:
+                all_cdf_text.append(ax.get_title())
+                all_cdf_text.extend(t.get_text() for t in ax.texts)
+                legend = ax.get_legend()
+                if legend is not None:
+                    all_cdf_text.extend(t.get_text() for t in legend.get_texts())
+
+        assert cdf_matched_fig_found, "expected at least one CDF-matched figure"
+        assert any("ascat_ssm" in t for t in all_cdf_text), (
+            "sanity check failed: ascat_ssm should still appear in the "
+            "CDF-matched section"
+        )
+        assert not any("cds_ssm" in t for t in all_cdf_text), (
+            f"cds_ssm must not appear anywhere in the CDF-matched section "
+            f"(it gets its own separate '— C3S CDS SSM —' section); found "
+            f"it in: {[t for t in all_cdf_text if 'cds_ssm' in t]}"
+        )
+
+
+class TestValidationReportCdsSection:
+    """The C3S CDS SSM section (cds_ssm_stats_ds_map) previously had no
+    summary table (unlike the CDF-matched/native-units sections, both of
+    which call plot_summary_table before their statistics bar chart) and
+    always stamped a generic "— C3S CDS SSM —" banner with no indication
+    of which product_type (ACTIVE/PASSIVE) or which satellites the section
+    actually covers."""
+
+    @staticmethod
+    def _recipe(product_type="active"):
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+
+        cfg = RecipeConfig(
+            name="test_cds_section", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[
+                ValidationDataSource(
+                    source_type="cds_ssm", download_kwargs={"product_type": product_type},
+                ),
+            ],
+        )
+        return Recipe(config=cfg)
+
+    @staticmethod
+    def _datatree_and_collocation():
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(2.0, 4.0, x), np.linspace(47.0, 49.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.full((y, x), 22.0))},
+            coords={
+                "lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                "time": pd.Timestamp("2026-01-01T12:00:00"),
+            },
+        )
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds,
+            "validation/cds_ssm/f1": xr.Dataset(
+                {"SOIL_MOISTURE": ("point", np.array([0.20, 0.22, 0.24]))},
+                coords={
+                    "lon": ("point", [2.0, 3.0, 4.0]), "lat": ("point", [47.0, 48.0, 49.0]),
+                    "time": ("point", np.array(["2026-01-01"] * 3, dtype="datetime64[ns]")),
+                },
+            ),
+            # Non-cds_ssm sources too, so the CDF-matched section isn't
+            # empty (an all-cds_ssm-only recipe is possible in principle,
+            # but leaving the CDF-matched section genuinely empty here
+            # would trigger unrelated "no valid data" warnings that have
+            # nothing to do with what this test class covers). ismn is
+            # needed alongside ascat_ssm: _harmonize_percent_domain_sources
+            # drops percent-domain sources like ascat_ssm entirely when no
+            # ismn reference is present to convert them against.
+            "validation/ascat_ssm/f1": xr.Dataset(
+                {"SOIL_MOISTURE": ("point", np.array([20.0, 24.0]))},
+                coords={
+                    "lon": ("point", [2.5, 3.5]), "lat": ("point", [47.5, 48.5]),
+                    "time": ("point", np.array(["2026-01-01"] * 2, dtype="datetime64[ns]")),
+                },
+            ),
+            "validation/ismn/f1": xr.Dataset(
+                {"SOIL_MOISTURE": ("point", np.array([0.25, 0.27]))},
+                coords={
+                    "lon": ("point", [2.2, 3.2]), "lat": ("point", [47.2, 48.2]),
+                    "time": ("point", np.array(["2026-01-01"] * 2, dtype="datetime64[ns]")),
+                },
+            ),
+        })
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": (
+                    "collocation", np.array([21.0, 23.0, 25.0, 19.0, 25.0, 20.0, 26.0]), {"units": "%"},
+                ),
+                "val_SOIL_MOISTURE": (
+                    "collocation", np.array([0.20, 0.22, 0.24, 20.0, 24.0, 0.25, 0.27]),
+                ),
+                "val_source": (
+                    "collocation",
+                    np.array([
+                        "cds_ssm", "cds_ssm", "cds_ssm", "ascat_ssm", "ascat_ssm", "ismn", "ismn",
+                    ]),
+                ),
+                "sar_scene_name": ("collocation", np.array(["sceneA"] * 7)),
+                "val_lon": ("collocation", np.array([2.0, 3.0, 4.0, 2.5, 3.5, 2.2, 3.2])),
+                "val_lat": ("collocation", np.array([47.0, 48.0, 49.0, 47.5, 48.5, 47.2, 48.2])),
+                "val_id": ("collocation", np.array(["c1", "c2", "c3", "a1", "a2", "i1", "i2"])),
+            },
+        )
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-01-01T12:00", periods=7, freq="5min")),
+        )
+        return datatree, collocation_ds
+
+    def _cds_stats(self, collocation_ds):
+        from sar_validation.core.statistics import compute_statistics
+
+        cds_only = collocation_ds.where(collocation_ds["val_source"] == "cds_ssm", drop=True)
+        return compute_statistics(cds_only, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
+
+    def test_cds_section_includes_a_summary_table(self, tmp_path):
+        from sar_validation.core.visualization import validation_report
+
+        recipe = self._recipe()
+        datatree, collocation_ds = self._datatree_and_collocation()
+        cds_stats = self._cds_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        figs = validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path,
+            cds_ssm_stats_ds_map={key: cds_stats},
+        )
+        assert key in figs
+
+        # plot_summary_table renders "Bias"/"Rmse"/"Correlation" column
+        # headers as cell text in an ax.table(...) -- look for them on a
+        # CDS-banner figure.
+        found_table = False
+        for fig in figs[key]:
+            banner_texts = [t.get_text() for t in fig.texts]
+            if not any("ESA Climate Change Initiative" in t for t in banner_texts):
+                continue
+            for ax in fig.axes:
+                cell_texts = {
+                    cell.get_text().get_text()
+                    for table in ax.tables
+                    for cell in table.get_celld().values()
+                }
+                if "Bias" in cell_texts and "Rmse" in cell_texts:
+                    found_table = True
+
+        assert found_table, "expected a CDS-section figure containing a Bias/Rmse summary table"
+
+    def test_cds_section_banner_reflects_active_product_type(self, tmp_path):
+        from sar_validation.core.visualization import validation_report
+
+        recipe = self._recipe(product_type="active")
+        datatree, collocation_ds = self._datatree_and_collocation()
+        cds_stats = self._cds_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        figs = validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path,
+            cds_ssm_stats_ds_map={key: cds_stats},
+        )
+        banner_texts = [t.get_text() for fig in figs[key] for t in fig.texts]
+        assert any("ACTIVE" in t and "ESA Climate Change Initiative" in t for t in banner_texts), (
+            f"expected an ACTIVE-labelled CDS banner; got: {banner_texts}"
+        )
+        assert not any("PASSIVE" in t for t in banner_texts)
+
+    def test_cds_section_banner_reflects_passive_product_type(self, tmp_path):
+        from sar_validation.core.visualization import validation_report
+
+        recipe = self._recipe(product_type="passive")
+        datatree, collocation_ds = self._datatree_and_collocation()
+        cds_stats = self._cds_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        figs = validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path,
+            cds_ssm_stats_ds_map={key: cds_stats},
+        )
+        banner_texts = [t.get_text() for fig in figs[key] for t in fig.texts]
+        assert any("PASSIVE" in t and "ESA Climate Change Initiative" in t for t in banner_texts), (
+            f"expected a PASSIVE-labelled CDS banner; got: {banner_texts}"
+        )
+        assert not any("ACTIVE" in t for t in banner_texts)
+
+    def test_cds_section_opening_page_names_satellites(self, tmp_path):
+        """The section's first page must carry a one-sentence description
+        of which satellites/sensors feed the product, so a reader
+        unfamiliar with the C3S CDS product knows what it actually is."""
+        from sar_validation.core.visualization import validation_report
+
+        recipe = self._recipe(product_type="active")
+        datatree, collocation_ds = self._datatree_and_collocation()
+        cds_stats = self._cds_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        figs = validation_report(
+            collocation_ds, datatree, recipe, out_dir=tmp_path,
+            cds_ssm_stats_ds_map={key: cds_stats},
+        )
+        all_texts = [t.get_text() for fig in figs[key] for t in fig.texts]
+        assert any("ASCAT" in t for t in all_texts), (
+            f"expected a sentence naming ASCAT (the active product's sensor) "
+            f"somewhere in the CDS section; got: {all_texts}"
+        )
 
 
 class TestValidationReportNativeUnitsGeographic:
@@ -5543,12 +6140,13 @@ class TestCdfMatchedTitleSuffix:
         wind_key = "owiWindSpeed_vs_WSPD"
         assert wind_key in wind_figs and wind_figs[wind_key]
         assert not any(
-            any("CDF-matched" in t.get_text() for t in fig.texts)
+            any("Cumulative Distribution Function" in t.get_text() for t in fig.texts)
             for fig in wind_figs[wind_key]
         ), "wind (non-soil-moisture) report must not carry a CDF-matched banner"
 
         # Soil-moisture run: at least one figure must carry the real,
-        # rendered "(CDF-matched)" banner stamped via fig.text(...).
+        # rendered "(Cumulative Distribution Function-matched)" banner
+        # stamped via fig.text(...).
         sm_collocation_ds = collocation_ds.rename({
             "sar_owiWindSpeed": "sar_sarSSM", "val_WSPD": "val_SOIL_MOISTURE",
         }).assign(
@@ -5563,9 +6161,9 @@ class TestCdfMatchedTitleSuffix:
         sm_key = "sarSSM_vs_SOIL_MOISTURE"
         assert sm_key in sm_figs and sm_figs[sm_key]
         assert any(
-            any("CDF-matched" in t.get_text() for t in fig.texts)
+            any("Cumulative Distribution Function" in t.get_text() for t in fig.texts)
             for fig in sm_figs[sm_key]
-        ), "no soil_moisture figure carries a rendered '(CDF-matched)' banner"
+        ), "no soil_moisture figure carries a rendered CDF-matched banner"
 
 
 class TestValidationReportResidualsHistRange:
@@ -5686,7 +6284,8 @@ class TestValidationReportResidualsHistRange:
         )
 
         key = "sarSSM_vs_SOIL_MOISTURE"
-        figs = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        with pytest.warns(UserWarning, match="No valid data for sar_sarSSM vs val_SOIL_MOISTURE"):
+            figs = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
         assert key in figs
 
         # Every row is dropped to NaN by _harmonize_percent_domain_sources
