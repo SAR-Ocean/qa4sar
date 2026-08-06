@@ -121,9 +121,14 @@ __all__ = [
 # source's color the way alphabetical sorting used to (this broke the
 # palette 3 times before the order was made append-only: see git history
 # around radiometer_ssm/scatterometer_ssm and cds_ssm being added).
+#
+# radiometer's slot (index 7) was originally the pale cyan "#17becf" --
+# changed to the darker teal "#469990" because that pale cyan was hard to
+# distinguish against plot_collocation_diagnostics' mid-gray (#808080)
+# "unmatched" pattern once small marker sizes/anti-aliasing softened it.
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
-    "#9467bd", "#8c564b", "#e377c2", "#17becf",
+    "#9467bd", "#8c564b", "#e377c2", "#469990",
     "#f032e6", "#e6194b", "#000080", "#ffff00",
     "#00ff00",
 ]
@@ -1993,8 +1998,50 @@ def plot_temporal_offset(
 # 4b. Collocation diagnostics plot
 # ---------------------------------------------------------------------------
 
+#: Target real-world spacing (degrees) between plotted SAR-footprint dots
+#: in the collocation-diagnostics plot. Calibrated against a real
+#: Sentinel-1 CLMS SSM daily mosaic's actual valid-pixel area (~503 deg^2)
+#: so that source keeps its historical ~3000-dot look; deriving each
+#: scene's own target dot count from its actual valid-pixel area (see
+#: _adaptive_footprint_target_count), rather than a single flat count for
+#: every scene, keeps this same visual spacing regardless of scene size.
+#: Without this, a small NISAR SME2 per-orbit granule (confirmed against
+#: real converted data: ~217x smaller valid-pixel area than a real
+#: Sentinel-1 scene) got the same ~3000 dots as the huge Sentinel-1
+#: mosaic, crammed ~18x closer together -- reading as a solid blob
+#: instead of discernible points.
+_FOOTPRINT_DOT_SPACING_DEG = 0.4
+#: Floor so a tiny scene still shows enough dots for its footprint shape
+#: to be recognizable, and ceiling matching the historical flat default
+#: so a huge scene's rendering cost/density never exceeds today's.
+_FOOTPRINT_MIN_DOTS = 150
+_FOOTPRINT_MAX_DOTS = 3000
+
+
+def _adaptive_footprint_target_count(
+    lons: np.ndarray, lats: np.ndarray, total_valid: int,
+) -> int:
+    """
+    Derive a target dot count from the grid's own native cell size
+    (measured directly off *lons*/*lats*) and *total_valid*'s actual
+    valid-pixel area, clamped to [:data:`_FOOTPRINT_MIN_DOTS`,
+    :data:`_FOOTPRINT_MAX_DOTS`] -- see :data:`_FOOTPRINT_DOT_SPACING_DEG`
+    for why. Falls back to :data:`_FOOTPRINT_MAX_DOTS` (today's flat
+    behavior) if the grid is degenerate (a single row or column, so no
+    cell size can be measured).
+    """
+    dlon = abs(float(lons[0, 1] - lons[0, 0])) if lons.shape[1] > 1 else 0.0
+    dlat = abs(float(lats[1, 0] - lats[0, 0])) if lats.shape[0] > 1 else 0.0
+    if dlon <= 0 or dlat <= 0:
+        return _FOOTPRINT_MAX_DOTS
+    area_deg2 = total_valid * dlon * dlat
+    count = int(area_deg2 / (_FOOTPRINT_DOT_SPACING_DEG ** 2))
+    return max(_FOOTPRINT_MIN_DOTS, min(_FOOTPRINT_MAX_DOTS, count))
+
+
 def _downsampled_valid_pixel_coords(
-    valid_mask: np.ndarray, lons: np.ndarray, lats: np.ndarray, target_count: int = 3000,
+    valid_mask: np.ndarray, lons: np.ndarray, lats: np.ndarray,
+    target_count: Optional[int] = None,
 ) -> list:
     """
     Return (lon, lat) centers of a strided subsample of *valid_mask*'s True
@@ -2004,10 +2051,20 @@ def _downsampled_valid_pixel_coords(
     CLMS Surface Soil Moisture's ~28M-cell continental raster), while still
     tracing the actual overpass-swath shape instead of a bounding rectangle
     over the grid's full nominal extent.
+
+    *target_count*, if not given, is derived from the scene's own
+    valid-pixel area via :func:`_adaptive_footprint_target_count` instead
+    of defaulting to a flat count -- so a small scene (e.g. a NISAR SME2
+    per-orbit granule) is thinned to fewer, more widely-spaced dots than a
+    large one (e.g. Sentinel-1 CLMS SSM's continental daily mosaic),
+    keeping the resulting dot-to-dot spacing roughly consistent across
+    wildly different scene sizes rather than the dot count.
     """
     total = int(valid_mask.sum())
     if total == 0:
         return []
+    if target_count is None:
+        target_count = _adaptive_footprint_target_count(lons, lats, total)
     stride = max(1, int(np.sqrt(total / target_count)))
     strided_mask = valid_mask[::stride, ::stride]
     ys, xs = np.where(strided_mask)

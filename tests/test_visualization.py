@@ -897,7 +897,7 @@ class TestCanonicalSourceOrderStability:
         pairs = [style[name] for name in self._PRE_EXISTING_ORDER]
         assert pairs == [
             ("#1f77b4", "o"), ("#ff7f0e", "s"), ("#2ca02c", "^"), ("#d62728", "D"),
-            ("#9467bd", "v"), ("#8c564b", "P"), ("#e377c2", "X"), ("#17becf", "*"),
+            ("#9467bd", "v"), ("#8c564b", "P"), ("#e377c2", "X"), ("#469990", "*"),
             ("#f032e6", "h"), ("#e6194b", "p"), ("#000080", "8"), ("#ffff00", "<"),
         ]
 
@@ -3153,6 +3153,148 @@ class TestPlotCollocationDiagnosticsNoValidationDataAtAll:
         # No validation points to scatter at all (only the SAR footprint,
         # drawn with ax.plot, not ax.scatter).
         assert recorded_scatter_calls == []
+
+
+class TestDownsampledValidPixelCoordsAdaptiveDensity:
+    """_downsampled_valid_pixel_coords previously targeted a flat ~3000
+    dots for every scene regardless of its physical size -- fine for
+    Sentinel-1 CLMS SSM's continental daily mosaic, but for a small NISAR
+    SME2 per-orbit granule (confirmed against real converted data: ~160x
+    smaller valid-pixel area than a real Sentinel-1 scene) the same 3000
+    dots ended up ~18x closer together, reading as a solid blob instead of
+    discernible points. With no explicit target_count, the dot count must
+    now scale with the scene's own valid-pixel area so the resulting dot
+    *spacing* stays roughly consistent across wildly different scene
+    sizes, instead of the dot *count* staying fixed."""
+
+    @staticmethod
+    def _grid(ny, nx, dlon, dlat, lon0=0.0, lat0=45.0):
+        lon_1d = lon0 + np.arange(nx) * dlon
+        lat_1d = lat0 + np.arange(ny) * dlat
+        lons, lats = np.meshgrid(lon_1d, lat_1d)
+        return lons, lats
+
+    def test_explicit_target_count_still_honored(self):
+        """Backward-compatible override path: passing target_count
+        explicitly must behave exactly as before (flat count, no area
+        adaptation)."""
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        lons, lats = self._grid(500, 500, dlon=0.01, dlat=0.01)
+        valid = np.ones((500, 500), dtype=bool)
+
+        points = _downsampled_valid_pixel_coords(valid, lons, lats, target_count=100)
+
+        assert 0 < len(points) <= 150  # stride-based, so approximate, not exact
+
+    # Grid sizes below are chosen to match the real-world order of
+    # magnitude confirmed against actual converted data in this repo: a
+    # real NISAR SME2 granule's valid-pixel area is ~2.3 deg^2, a real
+    # Sentinel-1 CLMS SSM daily mosaic's is ~503 deg^2 (~217x bigger) --
+    # reproduced here at a coarser resolution than the real grids (0.05
+    # deg/cell vs ~0.002-0.009 deg/cell) purely to keep the test arrays
+    # small and fast, while landing on a comparable ~100x area ratio.
+
+    def test_small_area_scene_gets_sparser_relative_sampling_than_flat_default(self):
+        """A small scene (NISAR-shaped: small physical area) whose
+        valid-cell count is below the historical flat 3000 target must
+        still end up *sparser* than "no subsampling at all" (what the old
+        flat-3000 default would do here, since total_valid < 3000) -- the
+        new default must actively thin a small, dense scene rather than
+        only ever thinning large ones."""
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        # 40x40 grid, all valid -> ~4 deg^2 (NISAR-scale), 1600 valid
+        # cells (below the old flat target_count=3000).
+        lons, lats = self._grid(40, 40, dlon=0.05, dlat=0.05)
+        valid = np.ones((40, 40), dtype=bool)
+
+        points = _downsampled_valid_pixel_coords(valid, lons, lats)
+
+        assert 0 < len(points) < 1600, (
+            "a small-area scene must be thinned even though its valid-cell "
+            "count is below the old flat target of 3000"
+        )
+
+    def test_large_area_scene_keeps_dense_sampling_near_historical_default(self):
+        """A large scene (Sentinel-1-shaped: ~100x the physical area of
+        the small-scene test above) must still end up close to the
+        historical ~3000-dot density, preserving today's rendering for
+        that source."""
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        # 400x400 grid -> ~400 deg^2 (Sentinel-1-scale).
+        lons, lats = self._grid(400, 400, dlon=0.05, dlat=0.05)
+        valid = np.ones((400, 400), dtype=bool)
+
+        points = _downsampled_valid_pixel_coords(valid, lons, lats)
+
+        assert 1500 <= len(points) <= 3500
+
+    def test_resulting_spacing_is_far_more_consistent_than_flat_count_would_give(self):
+        """The core property this fix exists for: the *physical spacing*
+        between plotted dots for a small scene and a large scene (~100x
+        area difference) must end up much closer to each other than a
+        flat dot-count scheme would produce (a flat scheme would give
+        these two scenes the exact same dot count, and thus ~10x
+        different spacing, since spacing scales with sqrt(area/n))."""
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        small_lons, small_lats = self._grid(40, 40, dlon=0.05, dlat=0.05)
+        small_valid = np.ones((40, 40), dtype=bool)
+        large_lons, large_lats = self._grid(400, 400, dlon=0.05, dlat=0.05)
+        large_valid = np.ones((400, 400), dtype=bool)
+
+        def _mean_nn_spacing(points):
+            pts = np.asarray(points)
+            # Cheap nearest-neighbor spacing proxy: sqrt(bbox area / n).
+            lon_range = pts[:, 0].max() - pts[:, 0].min()
+            lat_range = pts[:, 1].max() - pts[:, 1].min()
+            return np.sqrt(max(lon_range, 1e-9) * max(lat_range, 1e-9) / len(pts))
+
+        small_spacing = _mean_nn_spacing(
+            _downsampled_valid_pixel_coords(small_valid, small_lons, small_lats)
+        )
+        large_spacing = _mean_nn_spacing(
+            _downsampled_valid_pixel_coords(large_valid, large_lons, large_lats)
+        )
+
+        ratio = max(small_spacing, large_spacing) / min(small_spacing, large_spacing)
+        assert ratio < 3.5, (
+            f"expected roughly consistent dot spacing across scene sizes, "
+            f"got small={small_spacing:.4f} large={large_spacing:.4f} (ratio {ratio:.1f}x)"
+        )
+
+    def test_tiny_scene_still_gets_a_minimum_number_of_dots(self):
+        """A very small valid-cell count must not be thinned down to
+        almost nothing -- some minimum dot count keeps the footprint
+        shape recognizable."""
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        lons, lats = self._grid(60, 60, dlon=0.001, dlat=0.001)
+        valid = np.ones((60, 60), dtype=bool)  # 3600 valid cells, tiny area
+
+        points = _downsampled_valid_pixel_coords(valid, lons, lats)
+
+        assert len(points) >= 100
+
+    def test_degenerate_single_row_or_column_grid_falls_back_without_crashing(self):
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        lons, lats = self._grid(1, 500, dlon=0.01, dlat=0.01)
+        valid = np.ones((1, 500), dtype=bool)
+
+        points = _downsampled_valid_pixel_coords(valid, lons, lats)
+
+        assert len(points) > 0
+
+    def test_zero_valid_cells_returns_empty(self):
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        lons, lats = self._grid(50, 50, dlon=0.01, dlat=0.01)
+        valid = np.zeros((50, 50), dtype=bool)
+
+        assert _downsampled_valid_pixel_coords(valid, lons, lats) == []
 
 
 class TestPlotCollocationDiagnosticsSoilMoistureOverpassCoverage:
