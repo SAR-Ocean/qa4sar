@@ -106,6 +106,35 @@ def _parse_granule_name(name: str) -> Optional[Tuple[datetime, float, float]]:
     return ts, lon, lat
 
 
+def _lon_within_padded_bbox(lon: float, min_lon: float, max_lon: float) -> bool:
+    """True if *lon* (a filename-parsed center longitude, already
+    normalized to [-180, 180]) falls within [min_lon, max_lon] padded by
+    _BBOX_PAD_DEG on each side.
+
+    The naive `min_lon - PAD <= lon <= max_lon + PAD` check silently
+    fails near the antimeridian: padding max_lon=180 by 5 degrees gives
+    an upper bound of 185, a value no normalized longitude can ever
+    reach, even though a real candidate at e.g. -178 is geographically
+    only 2 degrees past the 180 edge. When the *padded* window itself
+    would exceed +-180, this also accepts the wrapped-around slice on
+    the other side of the antimeridian (e.g. lon <= -175 when max_lon +
+    PAD == 185). This is independent of whether the original,
+    unpadded [min_lon, max_lon] request already crosses the
+    antimeridian (callers -- see RADARSAT2WindDownloader.download --
+    pre-split such requests via split_antimeridian_bbox so min_lon <=
+    max_lon always holds here); it only concerns the pad's own overflow
+    past +-180."""
+    padded_min = min_lon - _BBOX_PAD_DEG
+    padded_max = max_lon + _BBOX_PAD_DEG
+    if padded_min <= lon <= padded_max:
+        return True
+    if padded_max > 180 and lon <= padded_max - 360:
+        return True
+    if padded_min < -180 and lon >= padded_min + 360:
+        return True
+    return False
+
+
 def _list_radarsat2_granules(
     catalog_xml_text: str, start: datetime, end: datetime,
     min_lon: float, max_lon: float, min_lat: float, max_lat: float,
@@ -131,7 +160,7 @@ def _list_radarsat2_granules(
         end_ok = ts < end if end_exclusive else ts <= end
         if not (start <= ts and end_ok):
             continue
-        if not (min_lon - _BBOX_PAD_DEG <= lon <= max_lon + _BBOX_PAD_DEG):
+        if not _lon_within_padded_bbox(lon, min_lon, max_lon):
             continue
         if not (min_lat - _BBOX_PAD_DEG <= lat <= max_lat + _BBOX_PAD_DEG):
             continue

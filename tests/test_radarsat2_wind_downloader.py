@@ -85,6 +85,24 @@ class TestParseGranuleNameUnmatched:
         assert _parse_granule_name("readme.txt") is None
 
 
+# A single-dataset catalog with a granule centered at 178W (-178), i.e.
+# only 2 degrees past the 180 antimeridian edge -- used to reproduce the
+# shipped wind_radarsat2_example.yaml recipe's bbox (min_lon=165,
+# max_lon=180) against a candidate that should survive the coarse pad
+# filter (the pad is 5 degrees) but, pre-fix, numerically cannot: the
+# padded window's upper edge (180 + 5 = 185) is never reached by a
+# normalized (-180..180) longitude, no matter how close to the
+# antimeridian the real candidate is on the other side.
+_NEAR_ANTIMERIDIAN_CATALOG_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<catalog xmlns="http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0">\n'
+    '  <dataset name="SAR-Wind-HH-64N-178W_v3r0_rsat2_s202606050552510_e202606050554070_c202606051745293.nc"\n'
+    '           urlPath="sar-winds/radarsat2/2026/06/'
+    'SAR-Wind-HH-64N-178W_v3r0_rsat2_s202606050552510_e202606050554070_c202606051745293.nc" />\n'
+    '</catalog>\n'
+)
+
+
 class TestListRadarsat2GranulesBboxFilter:
     def test_keeps_only_candidates_within_padded_bbox(self):
         from sar_validation.downloaders.radarsat2_wind_downloader import _list_radarsat2_granules
@@ -125,6 +143,24 @@ class TestListRadarsat2GranulesBboxFilter:
             min_lon=-179, max_lon=-170, min_lat=60, max_lat=68,
         )
         assert any("65N-168W" in url for _, url, _, _ in granules)
+
+    def test_pad_wraps_at_antimeridian_for_near_edge_window(self):
+        """The shipped wind_radarsat2_example.yaml recipe uses a
+        non-antimeridian-crossing bbox whose upper edge sits exactly at
+        180 (min_lon=165, max_lon=180). A real candidate centered at
+        178W (-178) is only 2 degrees past that edge -- well inside the
+        5-degree pad -- but a naive `lon <= max_lon + _BBOX_PAD_DEG`
+        check compares it against 185, a value no normalized longitude
+        can ever reach. The coarse filter must special-case this
+        wraparound so the candidate still comes through as a download
+        candidate."""
+        from sar_validation.downloaders.radarsat2_wind_downloader import _list_radarsat2_granules
+
+        granules = _list_radarsat2_granules(
+            _NEAR_ANTIMERIDIAN_CATALOG_XML, datetime(2026, 6, 1), datetime(2026, 6, 30),
+            min_lon=165, max_lon=180, min_lat=60, max_lat=68,
+        )
+        assert any("64N-178W" in url for _, url, _, _ in granules)
 
     def test_malformed_filename_skipped_not_crashed(self):
         from sar_validation.downloaders.radarsat2_wind_downloader import _list_radarsat2_granules
