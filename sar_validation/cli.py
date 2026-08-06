@@ -1163,6 +1163,7 @@ def _generate_plots(
             recipe, collocation_ds, base_dir, filename_suffix=f"_cds_ssm{filename_suffix}",
         ) or None
     else:
+        native_units_stats_ds_map = None
         cds_ssm_stats_ds_map = None
 
     validation_report(collocation_ds, datatree, recipe,

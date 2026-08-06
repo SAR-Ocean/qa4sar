@@ -464,6 +464,48 @@ class TestExecuteRecipeSkipsStatsWhenAlreadyComputed:
             mock_compute_stats.assert_called_once()
 
 
+class TestGeneratePlotsNonSoilMoistureVariables:
+    """Regression test: _generate_plots's soil_moisture-only branch used to
+    leave native_units_stats_ds_map completely unassigned for every other
+    variable (wind/waves/currents), so the unconditional
+    validation_report(..., native_units_stats_ds_map=...) call a few lines
+    down raised UnboundLocalError for every non-soil_moisture --plot run --
+    a regression introduced alongside the cds_ssm feature's own (correctly
+    initialized) cds_ssm_stats_ds_map branch, undetected because nothing in
+    the suite exercised _generate_plots for any variable."""
+
+    def test_wind_plot_does_not_raise_and_passes_none_for_soil_moisture_only_maps(self, tmp_path, monkeypatch):
+        from unittest.mock import patch
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        collocation_ds = xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", [7.0, 8.0]),
+            "val_WSPD":         ("collocation", [7.2, 7.9]),
+        })
+        collocation_ds.to_netcdf(run_dir / "collocation_results.nc")
+
+        sar_ds = xr.Dataset(
+            {"owiWindSpeed": ("point", [7.0, 8.0])},
+            coords={"lon": ("point", [-9.0, -8.5]), "lat": ("point", [50.0, 50.5])},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+        datatree.to_netcdf(run_dir / "datatree.nc")
+
+        recipe = Recipe(RecipeConfig(name="wind_test", variable="wind", output_dir=str(run_dir)))
+
+        with patch("sar_validation.core.visualization.validation_report") as mock_report:
+            mock_report.return_value = {}
+            cli._generate_plots(recipe, run_dir)
+
+        mock_report.assert_called_once()
+        assert mock_report.call_args.kwargs["native_units_stats_ds_map"] is None
+        assert mock_report.call_args.kwargs["cds_ssm_stats_ds_map"] is None
+
+
 class TestIsAlreadyDownloaded:
     """_is_already_downloaded() gates the top-level "Step 1 skipped" shortcut
     -- it must not be fooled by a source that recorded no *error* but also
