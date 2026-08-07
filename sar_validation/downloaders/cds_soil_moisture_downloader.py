@@ -57,8 +57,24 @@ __all__ = ["CDSSoilMoistureDownloader"]
 #: CDS dataset identifier for the satellite soil moisture product.
 _CDS_DATASET = "satellite-soil-moisture"
 
-#: Latest CDS product version.  Update when CDS publishes a new version.
-_CDS_VERSION = "v202505"
+#: Every CDS product version this dataset has published for the
+#: icdr/daily facet combination this downloader requests, submitted
+#: together as a multi-value facet on every request rather than picking
+#: one. CDS's own request validation resolves an OR-style multi-value
+#: selection to whichever value(s) actually apply to the requested
+#: year/sensor/record combination, so this works correctly across the
+#: whole archive without this downloader needing to track which version
+#: covers which year range itself -- confirmed live: a single hardcoded
+#: "latest" version (v202505) is only valid for 2025-2026 and silently
+#: 400s ("Request has not produced a valid combination of values") for
+#: anything older, e.g. a 2024-01-01 request. Extracted from
+#: https://cds.climate.copernicus.eu/api/catalogue/v1/collections/
+#: satellite-soil-moisture/constraints.json (fetched 2026-08-07); update
+#: if CDS publishes a new version and old requests start failing again.
+_CDS_VERSIONS: list[str] = [
+    "v201706", "v201812", "deprecated_v201912", "v201912_1",
+    "v202012", "v202212", "v202312", "v202505", "v202505_1",
+]
 
 ProductType = Literal["active", "passive", "combined"]
 
@@ -93,7 +109,10 @@ class CDSSoilMoistureDownloader:
     dry_run : bool
         If True, log what would be downloaded without calling the CDS API.
     version : str, optional
-        CDS product version string (default: :data:`_CDS_VERSION`).
+        Pin the request to a single CDS product version string instead of
+        the default (submit every known version -- see
+        :data:`_CDS_VERSIONS` -- and let CDS resolve the one that applies
+        to the requested date).
     """
 
     def __init__(
@@ -110,7 +129,8 @@ class CDSSoilMoistureDownloader:
         self.product_type = product_type
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
-        self._version = version or _CDS_VERSION
+        self._versions = [version] if version else list(_CDS_VERSIONS)
+        self._had_request_failure = False
 
     # ------------------------------------------------------------------
     # Public interface
@@ -157,6 +177,7 @@ class CDSSoilMoistureDownloader:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         downloaded: list[Path] = []
+        self._had_request_failure = False
         day = start_date
         while day <= end_date:
             nc_path = self._nc_path_for_day(day)
@@ -175,6 +196,22 @@ class CDSSoilMoistureDownloader:
             if nc_path_or_none is not None:
                 downloaded.append(nc_path_or_none)
             day += timedelta(days=1)
+
+        if not downloaded and self._had_request_failure:
+            # Every requested day either errored at the CDS API level or
+            # produced no extractable .nc file, and NONE of them yielded a
+            # real "no data here" empty-but-valid response -- previously
+            # this silently returned [] with "status": "success" in the
+            # orchestrator, so the actual cause (each day's own WARNING
+            # log line, e.g. a 400 Bad Request from an invalid facet
+            # combination) never reached the run's final summary. Raise so
+            # _run_download's existing exception handling records it in
+            # metadata["errors"] instead.
+            raise RuntimeError(
+                f"CDS {self.product_type} SSM: every requested day in "
+                f"[{start_date}, {end_date}] failed at the CDS API level -- "
+                f"see the per-day WARNING log lines above for the underlying cause."
+            )
 
         return downloaded
 
@@ -200,7 +237,7 @@ class CDSSoilMoistureDownloader:
             # but ICDR requests succeed even for historical dates (the server
             # returns CDR data when ICDR is not yet available for that day).
             "type_of_record": ["icdr"],
-            "version": [self._version],
+            "version": self._versions,
         }
 
     def _download_day(self, day: date) -> Optional[Path]:
@@ -227,6 +264,7 @@ class CDSSoilMoistureDownloader:
         except Exception as exc:  # noqa: BLE001 — cdsapi raises broad exceptions
             logger.warning("  %s: CDS download failed: %s", day.isoformat(), exc)
             zip_path.unlink(missing_ok=True)
+            self._had_request_failure = True
             return None
 
         nc_path = self._extract_nc(zip_path, day)
@@ -272,7 +310,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Output directory (default: data/<timerange>_<bounds>/cds_ssm).")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--version", default=None,
-                   help=f"CDS product version (default: {_CDS_VERSION}).")
+                   help="Pin a single CDS product version (default: submit every "
+                        f"known version and let CDS resolve it: {_CDS_VERSIONS}).")
     return p
 
 
