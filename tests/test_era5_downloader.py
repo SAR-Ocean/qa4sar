@@ -104,6 +104,11 @@ class TestERA5DownloaderBuildRequest:
         assert req["day"] == ["12"]
         assert req["time"] == ["18:00", "19:00", "20:00"]
         assert req["data_format"] == "netcdf"
+        # Explicit, not left to the CDS backend's per-dataset default --
+        # see the comment in _build_request for why (live 2026-08-07:
+        # omitting this made reanalysis-era5-land silently return a ZIP
+        # archive saved with a misleading ".nc" extension).
+        assert req["download_format"] == "unarchived"
         assert req["product_type"] == ["reanalysis"]
 
     def test_build_request_waves(self, tmp_path):
@@ -118,7 +123,12 @@ class TestERA5DownloaderBuildRequest:
 
         dl = ERA5Downloader(variable="soil_moisture", output_dir=tmp_path)
         req = dl._build_request(date(2026, 7, 12), [0], -10.0, 10.0, 40.0, 55.0)
-        assert req["variable"] == ["volumetric_soil_water_level_1"]
+        # "layer_1", not "level_1" -- the live CDS variable enum uses
+        # "volumetric_soil_water_layer_1"; the "level_1" spelling passes
+        # cdsapi's own client-side validation (no enum-checking there) but
+        # the CDS backend then finds no matching data (MultiAdaptorNoDataError).
+        assert req["variable"] == ["volumetric_soil_water_layer_1"]
+        assert req["download_format"] == "unarchived"
         assert "product_type" not in req
 
 

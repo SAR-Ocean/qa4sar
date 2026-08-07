@@ -52,11 +52,17 @@ _CDS_DATASET_BY_VARIABLE: dict[Era5Variable, str] = {
     "soil_moisture": "reanalysis-era5-land",
 }
 
-#: CDS variable name(s) per ERA5 variable.
+#: CDS variable name(s) per ERA5 variable. NOTE: the ERA5-Land soil
+#: moisture variable is named "..._layer_1" (not "..._level_1") in the
+#: live CDS API's variable enum -- confirmed 2026-08-07 by querying
+#: cdsapi.Client().client.get_process("reanalysis-era5-land")'s schema
+#: after a "level_1" request failed with a CDS-side "MultiAdaptorNoDataError"
+#: (the mistyped name passes cdsapi's own request validation, since it's
+#: just a string, but the backend silently finds no matching data).
 _CDS_VARIABLE_NAMES_BY_VARIABLE: dict[Era5Variable, list[str]] = {
     "wind": ["10m_u_component_of_wind", "10m_v_component_of_wind"],
     "waves": ["significant_height_of_combined_wind_waves_and_swell"],
-    "soil_moisture": ["volumetric_soil_water_level_1"],
+    "soil_moisture": ["volumetric_soil_water_layer_1"],
 }
 
 #: Grid padding (degrees) per variable, used to ensure bilinear
@@ -241,6 +247,14 @@ class ERA5Downloader:
             "time": [f"{h:02d}:00" for h in hours],
             "area": self._build_area(min_lon, max_lon, min_lat, max_lat),
             "data_format": "netcdf",
+            # Explicit, not left to the CDS backend's per-dataset default:
+            # confirmed live 2026-08-07 that omitting this facet made
+            # reanalysis-era5-land silently return a ZIP archive (saved with
+            # a misleading ".nc" extension, unreadable by xarray) for a
+            # request that otherwise had "data_format": "netcdf" set,
+            # whereas the exact same omission on reanalysis-era5-single-levels
+            # (wind/waves) already returned a plain, directly-readable file.
+            "download_format": "unarchived",
         }
         # reanalysis-era5-land has no product_type facet; the atmospheric
         # single-levels dataset requires it (reanalysis vs ensemble members).

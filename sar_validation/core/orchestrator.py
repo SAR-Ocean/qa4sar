@@ -171,6 +171,7 @@ class DataOrchestrator:
         self.force_download = force_download
         self.base_dir = self._setup_base_dir()
         self._previous_downloads: Dict[str, Any] = self._load_previous_downloads()
+        self._previous_variable: Optional[str] = self._load_previous_variable()
         self.metadata: Dict[str, Any] = {
             "recipe_name": recipe.config.name,
             "variable":    recipe.config.variable,
@@ -267,6 +268,36 @@ class DataOrchestrator:
         except Exception:
             return {}
 
+    def _load_previous_variable(self) -> Optional[str]:
+        """Read the top-level ``variable`` field of a prior run's
+        ``download_metadata.json`` in ``self.base_dir``, if present.
+
+        Used by :meth:`_already_succeeded` to detect the case where two
+        recipes with identical geographic/temporal bounds (so they share
+        ``base_dir``) request *different* ``recipe.config.variable``
+        values -- e.g. ``wind_era5.yaml`` and ``waves_era5.yaml`` in
+        ``recipes/`` both cover the same bbox/window to reuse the SAR
+        download. ERA5's downloaded file name/content depends on
+        ``variable`` (``era5_<variable>_<day>.nc``, requesting a
+        completely different CDS dataset/variable set), unlike SAR (whose
+        L2 OCN product contains both wind- and wave-relevant OWI fields
+        regardless of which recipe downloaded it) -- so a stale
+        ``era5: {"status": "success"}`` recorded under one variable must
+        NOT be trusted for another. Confirmed live 2026-08-07: running
+        waves_era5.yaml right after wind_era5.yaml (same bbox/window)
+        skipped the ERA5 download entirely, leaving zero era5 data in the
+        DataTree for "waves".
+        """
+        meta_path = self.base_dir / "download_metadata.json"
+        if not meta_path.exists():
+            return None
+        try:
+            with open(meta_path) as f:
+                variable = json.load(f).get("variable")
+            return variable if isinstance(variable, str) else None
+        except Exception:
+            return None
+
     def _already_succeeded(self, source_type: str) -> bool:
         """True if *source_type* succeeded in the previous run recorded in
         ``self._previous_downloads`` and ``force_download`` isn't set."""
@@ -274,6 +305,8 @@ class DataOrchestrator:
             return False
         prev = self._previous_downloads.get(source_type)
         if prev is None:
+            return False
+        if source_type == "era5" and self._previous_variable != self.recipe.config.variable:
             return False
         return prev.get("status") == "success"
 

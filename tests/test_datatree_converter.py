@@ -2705,26 +2705,35 @@ class TestFromEra5:
         lat = np.linspace(40.0, 41.5, n_lat)
         lon = np.linspace(-10.0, -8.5, n_lon)
         time = xr.date_range(start_hour, periods=n_time, freq="1h")
-        data_vars = {
-            v: (("time", "latitude", "longitude"), np.random.rand(n_time, n_lat, n_lon).astype("float32"))
-            for v in var_names
+        arrays = {
+            v: np.random.rand(n_time, n_lat, n_lon).astype("float32") for v in var_names
         }
+        data_vars = {v: (("time", "latitude", "longitude"), arr) for v, arr in arrays.items()}
         ds = xr.Dataset(data_vars, coords={"time": time, "latitude": lat, "longitude": lon})
         ds.to_netcdf(path)
+        return arrays
 
     def test_wind_returns_gridded_dataset_with_correct_data_type(self, tmp_path):
+        import numpy as np
+
         from sar_validation.core.datatree_converter import DataTreeConverter
 
         nc_path = tmp_path / "era5_wind_20260712.nc"
-        self._write_era5_nc(nc_path, ["u10", "v10"])
+        arrays = self._write_era5_nc(nc_path, ["u10", "v10"])
 
         ds = DataTreeConverter.from_era5(nc_path, "wind")
         assert ds is not None
         assert ds.attrs["data_type"] == "era5_wind"
         assert set(ds.dims) == {"time", "lat", "lon"}
-        assert "u10" in ds.data_vars and "v10" in ds.data_vars
+        # Raw u10/v10 components are renamed/derived into the canonical
+        # WSPD/WDIR codes _variable_map.py's VARIABLE_PAIRS (and therefore
+        # statistics.py/visualization.py) expect for every wind source.
+        assert "WSPD" in ds.data_vars and "WDIR" in ds.data_vars
+        assert "u10" not in ds.data_vars and "v10" not in ds.data_vars
+        expected_wspd = np.hypot(arrays["u10"], arrays["v10"])
+        np.testing.assert_allclose(ds["WSPD"].values, expected_wspd, rtol=1e-5)
 
-    def test_waves_returns_swh_variable(self, tmp_path):
+    def test_waves_returns_vhm0_variable(self, tmp_path):
         from sar_validation.core.datatree_converter import DataTreeConverter
 
         nc_path = tmp_path / "era5_waves_20260712.nc"
@@ -2733,9 +2742,10 @@ class TestFromEra5:
         ds = DataTreeConverter.from_era5(nc_path, "waves")
         assert ds is not None
         assert ds.attrs["data_type"] == "era5_waves"
-        assert "swh" in ds.data_vars
+        assert "VHM0" in ds.data_vars
+        assert "swh" not in ds.data_vars
 
-    def test_soil_moisture_returns_swvl1_variable(self, tmp_path):
+    def test_soil_moisture_returns_soil_moisture_variable(self, tmp_path):
         from sar_validation.core.datatree_converter import DataTreeConverter
 
         nc_path = tmp_path / "era5_soil_moisture_20260712.nc"
@@ -2744,7 +2754,8 @@ class TestFromEra5:
         ds = DataTreeConverter.from_era5(nc_path, "soil_moisture")
         assert ds is not None
         assert ds.attrs["data_type"] == "era5_soil_moisture"
-        assert "swvl1" in ds.data_vars
+        assert "SOIL_MOISTURE" in ds.data_vars
+        assert "swvl1" not in ds.data_vars
 
     def test_multiple_daily_files_concatenated_along_time(self, tmp_path):
         from sar_validation.core.datatree_converter import DataTreeConverter
@@ -2876,7 +2887,8 @@ class TestConvertDownloadedDataEra5:
         assert era5_ds.sizes["time"] == 24
         assert era5_ds.attrs["data_type"] == "era5_wind"
         assert "swh" not in era5_ds.data_vars
-        assert "u10" in era5_ds.data_vars and not era5_ds["u10"].isnull().any()
+        assert "VHM0" not in era5_ds.data_vars
+        assert "WSPD" in era5_ds.data_vars and not era5_ds["WSPD"].isnull().any()
 
 
 class TestFromEra5Antimeridian:

@@ -89,6 +89,38 @@ _ERA5_VARS: dict[str, dict] = {
 _ERA5_WINDOW_SUFFIX_RE = re.compile(r"^(?P<stem>.+)_w(?P<idx>\d+)$")
 
 
+def _normalize_era5_grib_coords(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Normalize an ERA5 daily NetCDF's coordinate names/extra coords to the
+    ``time``/``lat``/``lon`` convention the rest of this converter (and
+    ``sar_validation.core.model_collocation``) expects.
+
+    Live-verified 2026-08-07: the CDS API's ``"data_format": "netcdf"``
+    facet for ``reanalysis-era5-single-levels`` (and ``-land``) is actually
+    produced by converting the underlying GRIB message via ``cfgrib``,
+    which names the time dimension ``valid_time`` (not ``time``) and adds
+    two GRIB-bookkeeping coordinates that carry no useful information for a
+    deterministic reanalysis request: ``number`` (ensemble member, always
+    0) and ``expver`` (experiment version, e.g. preliminary ERA5T vs final
+    ERA5). Applied per-file (before any concatenation) so both the
+    single-file and antimeridian-stitched paths through :meth:`from_era5`
+    end up with a consistent ``time`` dim to concatenate/index on.
+    """
+    rename = {}
+    if "latitude" in ds.coords:
+        rename["latitude"] = "lat"
+    if "longitude" in ds.coords:
+        rename["longitude"] = "lon"
+    if "valid_time" in ds.coords and "time" not in ds.coords:
+        rename["valid_time"] = "time"
+    if rename:
+        ds = ds.rename(rename)
+    drop = [c for c in ("number", "expver") if c in ds.coords]
+    if drop:
+        ds = ds.drop_vars(drop)
+    return ds
+
+
 def _group_era5_paths_by_day(paths: List[Path]) -> Dict[str, List[Path]]:
     """
     Group ERA5 file paths by their day-stem, so a day's antimeridian-split
@@ -1988,14 +2020,14 @@ class DataTreeConverter:
             per_day: List[xr.Dataset] = []
             for _, group_paths in sorted(groups.items()):
                 if len(group_paths) == 1:
-                    per_day.append(xr.open_dataset(group_paths[0]))
+                    per_day.append(_normalize_era5_grib_coords(xr.open_dataset(group_paths[0])))
                 else:
                     stitched = _stitch_antimeridian_window_files(group_paths)
                     if stitched is None:
                         for d in per_day:
                             d.close()
                         return None
-                    per_day.append(stitched)
+                    per_day.append(_normalize_era5_grib_coords(stitched))
 
             raw = per_day[0] if len(per_day) == 1 else xr.concat(per_day, dim="time")
             # ERA5 regional daily files are small (bbox-limited); load fully
@@ -2008,13 +2040,9 @@ class DataTreeConverter:
             logger.warning("Could not open ERA5 file(s) %s: %s", paths, exc)
             return None
 
-        rename = {}
-        if "latitude" in raw.coords:
-            rename["latitude"] = "lat"
-        if "longitude" in raw.coords:
-            rename["longitude"] = "lon"
-        if rename:
-            raw = raw.rename(rename)
+        # lat/lon/time already normalized per-file by _normalize_era5_grib_coords
+        # above (before concatenation, so "time" is guaranteed to be the
+        # concat dim regardless of which raw name the CDS response used).
 
         spec = _ERA5_VARS[variable]
         missing = [v for v in spec["raw"] if v not in raw.variables]
@@ -2031,6 +2059,37 @@ class DataTreeConverter:
             da = raw[var].astype("float32")
             da.attrs.update(spec["cf"][var])
             data_vars[var] = da
+
+        # Rename/derive to the canonical val_var codes _variable_map.py's
+        # VARIABLE_PAIRS (and therefore statistics.py/visualization.py)
+        # expect -- every OTHER wind/waves/soil_moisture validation source
+        # is renamed to these same codes at conversion time (see e.g.
+        # from_scatterometer_nc's WSPD/WDIR rename, from_radiometer_bytemap's
+        # WindSat rotation). ERA5's raw CDS short names (u10/v10, swh,
+        # swvl1) never matched them, so run_statistics() silently produced
+        # zero rows for every era5_* source -- confirmed against a live CDS
+        # run 2026-08-07 (wind_era5.yaml: "no statistics produced").
+        if variable == "wind":
+            u10, v10 = data_vars["u10"], data_vars["v10"]
+            wspd = np.hypot(u10, v10).astype("float32")
+            wspd.attrs = {
+                "units": "m s-1",
+                "standard_name": "wind_speed",
+                "long_name": "ERA5 10m wind speed (derived from u10/v10)",
+            }
+            # Meteorological "from" direction, clockwise from north -- the
+            # same convention every other WDIR column in this codebase uses.
+            wdir = ((270.0 - np.degrees(np.arctan2(v10, u10))) % 360.0).astype("float32")
+            wdir.attrs = {
+                "units": "degree",
+                "standard_name": "wind_from_direction",
+                "long_name": "ERA5 10m wind direction (meteorological convention, derived from u10/v10)",
+            }
+            data_vars = {"WSPD": wspd, "WDIR": wdir}
+        elif variable == "waves":
+            data_vars = {"VHM0": data_vars["swh"]}
+        elif variable == "soil_moisture":
+            data_vars = {"SOIL_MOISTURE": data_vars["swvl1"]}
 
         ds = xr.Dataset(
             data_vars,
