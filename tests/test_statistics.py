@@ -78,6 +78,47 @@ class TestComputeStatistics:
         assert result is None
 
 
+class TestCorrelationMinimumSampleSize:
+    """Pearson r is mathematically degenerate at N=2 (any two points define
+    a line, so r is always exactly +-1 regardless of how well the series
+    actually agree) and empirically still highly unstable through N=4.
+    Below MIN_N_FOR_CORRELATION, correlation must be NaN -- every other
+    metric (bias/std/rmse/scatter_index) must still be computed normally,
+    only correlation is gated."""
+
+    @staticmethod
+    def _ds(sar_vals, val_vals):
+        return xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", np.asarray(sar_vals, dtype=float)),
+            "val_WSPD":         ("collocation", np.asarray(val_vals, dtype=float)),
+            "val_source":       ("collocation", ["buoy"] * len(sar_vals)),
+        })
+
+    @pytest.mark.parametrize("n", [2, 3, 4])
+    def test_correlation_nan_below_threshold(self, n):
+        from sar_validation.core.statistics import MIN_N_FOR_CORRELATION
+        assert n < MIN_N_FOR_CORRELATION  # sanity-check the threshold itself
+
+        rng = np.random.default_rng(0)
+        sar = rng.uniform(2, 14, size=n)
+        val = sar + rng.normal(0, 0.1, size=n)
+        ds = compute_statistics(self._ds(sar, val), "owiWindSpeed", "WSPD")
+
+        assert np.isnan(float(ds["correlation"].values[0]))
+        assert not np.isnan(float(ds["bias"].values[0]))
+        assert not np.isnan(float(ds["rmse"].values[0]))
+
+    def test_correlation_computed_at_threshold(self):
+        from sar_validation.core.statistics import MIN_N_FOR_CORRELATION
+
+        rng = np.random.default_rng(0)
+        sar = rng.uniform(2, 14, size=MIN_N_FOR_CORRELATION)
+        val = sar + rng.normal(0, 0.1, size=MIN_N_FOR_CORRELATION)
+        ds = compute_statistics(self._ds(sar, val), "owiWindSpeed", "WSPD")
+
+        assert not np.isnan(float(ds["correlation"].values[0]))
+
+
 # ---------------------------------------------------------------------------
 # compute_statistics_soil_moisture (pytesmo CDF-matching + ubRMSD)
 # ---------------------------------------------------------------------------
@@ -864,6 +905,39 @@ class TestCircularStatistics:
             warnings.simplefilter("error", RuntimeWarning)
             result = compute_statistics(ds, "owiWindDirection", "WDIR")
         assert np.isnan(float(result["correlation"].values[0]))
+
+    def test_correlation_nan_below_min_n_even_with_real_spread(self):
+        """The Jammalamadaka-Sarma circular correlation has the identical
+        N=2 degeneracy as Pearson r (always exactly +-1, confirmed
+        empirically) -- gated by the same MIN_N_FOR_CORRELATION threshold,
+        even when there's genuine angular spread (unlike
+        test_constant_direction_group_no_warning's zero-spread NaN, which
+        comes from a different code path)."""
+        ds = xr.Dataset(
+            {
+                "sar_owiWindDirection": ("collocation", [10.0, 200.0]),
+                "val_WDIR":             ("collocation", [15.0, 190.0]),
+                "val_source":           ("collocation", ["buoy", "buoy"]),
+            }
+        )
+        result = compute_statistics(ds, "owiWindDirection", "WDIR")
+        assert np.isnan(float(result["correlation"].values[0]))
+        assert not np.isnan(float(result["bias"].values[0]))
+
+    def test_correlation_computed_at_min_n_threshold(self):
+        from sar_validation.core.statistics import MIN_N_FOR_CORRELATION
+
+        sar_deg = np.linspace(10.0, 350.0, MIN_N_FOR_CORRELATION)
+        val_deg = (sar_deg + 2.0) % 360.0
+        ds = xr.Dataset(
+            {
+                "sar_owiWindDirection": ("collocation", sar_deg),
+                "val_WDIR":             ("collocation", val_deg),
+                "val_source":           ("collocation", ["buoy"] * len(sar_deg)),
+            }
+        )
+        result = compute_statistics(ds, "owiWindDirection", "WDIR")
+        assert not np.isnan(float(result["correlation"].values[0]))
 
 
 # ---------------------------------------------------------------------------

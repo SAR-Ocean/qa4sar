@@ -2249,12 +2249,29 @@ class TestOrchestratorHFRadarUSWiring:
             geographic_bounds=GeographicBounds(-125.0, -119.0, 33.0, 38.0),
             temporal_bounds=TemporalBounds(_RECENT_START, _RECENT_END),
         ))
+        import urllib.error
+
         orchestrator = DataOrchestrator(recipe, dry_run=True)
         source = ValidationDataSource(source_type="hf_radar_us")
 
+        # ERDDAP's own dry-run contract is unchanged: it only formats a
+        # preview URL from parameters, no network call. THREDDS's dry-run
+        # now queries each touched month's (lightweight) catalog.xml for a
+        # real candidate count (see NOAATHREDDSHFRadarDownloader) -- the
+        # waterfall still cascades into it even after ERDDAP's dry-run
+        # "succeeds" (see the comment below), so its urlopen must be
+        # mocked too; a 404 for every month simulates "not yet published",
+        # which the THREDDS dry-run branch handles by reporting zero
+        # matched granules rather than raising.
+        def thredds_404(url, timeout=None):
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
         with patch(
             "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
-        ) as m:
+        ) as erddap_urlopen, patch(
+            "sar_validation.downloaders.noaa_hfradar_thredds_downloader.urllib.request.urlopen",
+            side_effect=thredds_404,
+        ):
             result = orchestrator._download_hf_radar_us(source)
 
         assert result is True
@@ -2267,7 +2284,7 @@ class TestOrchestratorHFRadarUSWiring:
         # whichever was tried last. For this US_WEST/recent-date bbox,
         # ERDDAP is the first (and only) backend that applies.
         assert orchestrator.metadata["downloads"]["hf_radar_us"]["backend"] == "erddap"
-        m.assert_not_called()
+        erddap_urlopen.assert_not_called()
 
     def test_download_hf_radar_us_honours_resolution_km_override(self, tmp_path):
         from sar_validation.core.orchestrator import DataOrchestrator

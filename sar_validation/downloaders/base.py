@@ -50,6 +50,7 @@ __all__ = [
     "is_date_recent",
     "build_output_dir",
     "split_antimeridian_bbox",
+    "months_touched",
     "copernicus_marine_download_kwargs",
     "prefer_ipv4_dns",
 ]
@@ -886,6 +887,25 @@ def split_antimeridian_bbox(min_lon: float, max_lon: float) -> list[tuple[float,
     if min_lon <= max_lon:
         return [(min_lon, max_lon)]
     return [(min_lon, 180.0), (-180.0, max_lon)]
+
+
+def months_touched(start: datetime, end: datetime) -> list[tuple[int, int]]:
+    """
+    Return every (year, month) pair touched by the inclusive [start, end]
+    range, e.g. (2024, 11, 15) to (2025, 2, 3) -> [(2024, 11), (2024, 12),
+    (2025, 1), (2025, 2)]. Used by THREDDS-archive downloaders (NOAA
+    HF-radar, RADARSAT-2 wind) to know which monthly catalog.xml files to
+    fetch.
+    """
+    months: list[tuple[int, int]] = []
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        months.append((y, m))
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+    return months
 
 
 # ---------------------------------------------------------------------------

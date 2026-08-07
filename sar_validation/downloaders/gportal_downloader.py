@@ -74,6 +74,21 @@ _SENSOR_NAME_PATTERN = re.compile(r"amsr2|gcom-w", re.IGNORECASE)
 # still counts as a standalone token while "SMALL"/"OSMOSIS" etc. don't match.
 _PRODUCT_NAME_PATTERN = re.compile(r"(?<![a-z])sm(?![a-z])|soil|smc", re.IGNORECASE)
 _FILENAME_DATE_RE = re.compile(r"(\d{8})")
+# G-Portal's standard/ tree mixes daily granules ("..._01D_...") with
+# whole-month composite files ("..._01M_...") in the same Year/Month
+# listing -- both can carry an embedded date that matches the requested
+# window below, since a monthly file's date uses day="00" as a
+# placeholder for "the whole month" (e.g. "20260100"), which the plain
+# lexicographic start_date <= date <= end_date comparison can't tell
+# apart from a real day once collocation-tolerance padding pushes the
+# window's start into the previous month. This downloader/
+# DataTreeConverter.from_amsr_ssm's whole pipeline is built for daily L3
+# grids only -- a monthly file has a different HDF5 group layout (no
+# "Time Information" group) that from_amsr_ssm can't parse, confirmed
+# live: it falls through to the unrelated NSIDC-0451 branch and logs
+# "Missing vsm/longitude/latitude field(s)" before being silently
+# dropped.
+_NON_DAILY_AGGREGATION_RE = re.compile(r"_\d{2}M_")
 
 
 def _connect_with_retry(username: str, password: str):
@@ -127,7 +142,11 @@ class GPortalAMSR2Downloader:
     output_dir : Path
         Directory to save downloaded files.
     dry_run : bool
-        If True, print what would be downloaded without connecting.
+        If True and credentials are already configured, connect and report
+        real matching file availability without downloading anything; if
+        credentials are not configured, print a message to set them up
+        instead of prompting interactively (a dry run never blocks on
+        input).
     force_download : bool
         If True, re-download files even if already present in output_dir.
     username, password : str, optional
@@ -180,18 +199,26 @@ class GPortalAMSR2Downloader:
         end_dt = normalize_datetime(end)
 
         if self.dry_run:
-            print(
-                f"[DRY RUN] Would connect to {HOST}:{PORT} via SFTP and discover/download "
-                f"AMSR2 soil-moisture files with date in [{start_dt}, {end_dt}]\n"
-                f"  (bbox [{min_lon},{max_lon}] x [{min_lat},{max_lat}] not filtered -- "
-                f"SFTP has no spatial query)\n"
-                f"  Output: {self.output_dir}"
+            # Report real file availability when credentials are already
+            # configured -- but never prompt for one during a "dry" run
+            # (allow_prompt=False regardless of self._allow_prompt): a
+            # dry-run must never block on interactive input.
+            try:
+                username, password = authenticate_gportal(
+                    self._username, self._password, allow_prompt=False,
+                )
+            except RuntimeError:
+                print(
+                    "[DRY RUN] G-Portal credentials are not configured -- run "
+                    "`sar-validate --set-credential gportal` (or set "
+                    "GPORTAL_USERNAME / GPORTAL_PASSWORD) to see which AMSR2 "
+                    f"soil-moisture files are available for [{start_dt}, {end_dt}]."
+                )
+                return []
+        else:
+            username, password = authenticate_gportal(
+                self._username, self._password, allow_prompt=self._allow_prompt,
             )
-            return []
-
-        username, password = authenticate_gportal(
-            self._username, self._password, allow_prompt=self._allow_prompt,
-        )
 
         transport = None
         sftp = None
@@ -349,12 +376,20 @@ class GPortalAMSR2Downloader:
 
         matches = []
         for dir_path, name in candidates:
+            if _NON_DAILY_AGGREGATION_RE.search(name):
+                continue
             m = _FILENAME_DATE_RE.search(name)
             if m and start_date <= m.group(1) <= end_date:
                 matches.append((dir_path, name))
 
         print(f"Found {len(matches)} AMSR2 file(s) in window.")
         if not matches:
+            return []
+
+        if self.dry_run:
+            print("[DRY RUN] Would download:")
+            for _dir_path, name in matches:
+                print(f"  {name}")
             return []
 
         self.output_dir.mkdir(parents=True, exist_ok=True)

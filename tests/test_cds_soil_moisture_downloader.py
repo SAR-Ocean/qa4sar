@@ -5,6 +5,8 @@ from __future__ import annotations
 import zipfile
 from datetime import date
 
+import pytest
+
 
 class TestCDSSoilMoistureDownloaderDryRun:
     def test_dry_run_returns_empty_without_network_call(self, tmp_path):
@@ -87,6 +89,71 @@ class TestCDSSoilMoistureDownloaderDateRangeBoundary:
         assert requested_days == [date(2026, 7, 9)]
 
 
+class TestCDSSoilMoistureDownloaderFailurePropagation:
+    """Previously, when every requested day's CDS API call itself errored
+    (e.g. a 400 Bad Request from an invalid facet combination),
+    download() silently returned [] with no exception -- orchestrator.py's
+    _run_download treats that as an ordinary "status": "success" with 0
+    files, so the actual cause (each day's own WARNING log line) never
+    reached the run's final "Warnings from this run" summary. A recipe
+    could report zero CDS data with no visible explanation at all."""
+
+    def test_raises_when_every_day_errors_at_the_api_level(self, tmp_path, monkeypatch):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        def fake_download_day(self, day):
+            self._had_request_failure = True
+            return None
+
+        monkeypatch.setattr(CDSSoilMoistureDownloader, "_download_day", fake_download_day)
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        with pytest.raises(RuntimeError, match="every requested day"):
+            dl.download(
+                min_lon=-10.0, max_lon=30.0, min_lat=35.0, max_lat=60.0,
+                start="2024-01-01", end="2024-01-02",
+            )
+
+    def test_no_raise_when_some_days_succeed(self, tmp_path, monkeypatch):
+        """A mix of successes and API-level failures must not raise --
+        per-day independence (see the module docstring) means a partial
+        result is still useful and must be returned normally."""
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        def fake_download_day(self, day):
+            if day == date(2024, 1, 1):
+                self._had_request_failure = True
+                return None
+            return self._nc_path_for_day(day)
+
+        monkeypatch.setattr(CDSSoilMoistureDownloader, "_download_day", fake_download_day)
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        result = dl.download(
+            min_lon=-10.0, max_lon=30.0, min_lat=35.0, max_lat=60.0,
+            start="2024-01-01", end="2024-01-02",
+        )
+        assert result == [dl._nc_path_for_day(date(2024, 1, 2))]
+
+    def test_no_raise_when_zero_files_is_a_genuinely_empty_response(self, tmp_path, monkeypatch):
+        """Every day returning None WITHOUT ever setting
+        _had_request_failure (i.e. every CDS API call itself succeeded,
+        just with no extractable data) must be treated as the existing
+        benign "no data for this window" outcome, not a failure."""
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        monkeypatch.setattr(
+            CDSSoilMoistureDownloader, "_download_day", lambda self, day: None,
+        )
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        result = dl.download(
+            min_lon=-10.0, max_lon=30.0, min_lat=35.0, max_lat=60.0,
+            start="2024-01-01", end="2024-01-02",
+        )
+        assert result == []
+
+
 class TestCDSSoilMoistureDownloaderNcPath:
     def test_nc_path_naming_active(self, tmp_path):
         from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
@@ -167,6 +234,35 @@ class TestCDSSoilMoistureDownloaderBuildRequest:
         dl = CDSSoilMoistureDownloader(product_type="combined", output_dir=tmp_path)
         req = dl._build_request(date(2026, 3, 15))
         assert req["variable"] == ["surface_soil_moisture_volumetric"]
+
+    def test_build_request_submits_every_known_version_by_default(self, tmp_path):
+        """A single hardcoded "latest" version (v202505) is only valid for
+        2025-2026 per CDS's own live constraints.json -- confirmed live,
+        requesting it for an older date (e.g. 2024-01-01) gets rejected
+        with a 400 "Request has not produced a valid combination of
+        values", even though older versions of this exact same dataset do
+        cover that date. Every known version must be submitted together
+        (an OR-style multi-value facet) so CDS's own constraint solver
+        picks whichever applies to the requested day, regardless of which
+        year is requested."""
+        from sar_validation.downloaders.cds_soil_moisture_downloader import (
+            _CDS_VERSIONS,
+            CDSSoilMoistureDownloader,
+        )
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        req = dl._build_request(date(2024, 1, 1))
+        assert req["version"] == _CDS_VERSIONS
+        assert len(_CDS_VERSIONS) > 1
+
+    def test_build_request_honors_explicit_version_override(self, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        dl = CDSSoilMoistureDownloader(
+            product_type="active", output_dir=tmp_path, version="v202312",
+        )
+        req = dl._build_request(date(2024, 1, 1))
+        assert req["version"] == ["v202312"]
 
 
 class TestCDSSoilMoistureDownloaderExtractNc:

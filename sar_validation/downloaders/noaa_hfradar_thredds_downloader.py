@@ -46,7 +46,7 @@ import numpy as np
 import xarray as xr
 
 from ._noaa_hfr_regions import _resolution_token, match_noaa_hfr_region
-from .base import normalize_datetime, prefer_ipv4_dns, split_antimeridian_bbox
+from .base import months_touched, normalize_datetime, prefer_ipv4_dns, split_antimeridian_bbox
 
 logger = logging.getLogger(__name__)
 
@@ -102,18 +102,6 @@ def _list_thredds_granules(
     return sorted(results)
 
 
-def _months_touched(start: datetime, end: datetime) -> List[Tuple[int, int]]:
-    months = []
-    y, m = start.year, start.month
-    while (y, m) <= (end.year, end.month):
-        months.append((y, m))
-        m += 1
-        if m > 12:
-            m = 1
-            y += 1
-    return months
-
-
 class NOAATHREDDSHFRadarDownloader:
     """Download a NOAA HF-radar current grid from the NCEI THREDDS archive.
 
@@ -122,7 +110,9 @@ class NOAATHREDDSHFRadarDownloader:
     output_dir : Path
         Directory to save the merged NetCDF.
     dry_run : bool
-        If True, print what would be fetched and return [] without network calls.
+        If True, query each touched month's (lightweight) catalog.xml and
+        report the real matched-granule count/filenames, but never touch a
+        full fileServer download; always returns [].
     resolution_km : float
         Grid resolution (0.5/1/2/6 km depending on region); default 6.
     """
@@ -175,14 +165,6 @@ class NOAATHREDDSHFRadarDownloader:
         is_end_date_only = len(end.strip().rstrip("Z")) == 10  # YYYY-MM-DD
         end_dt_for_matching = end_dt + timedelta(days=1) if is_end_date_only else end_dt
 
-        if self.dry_run:
-            print(
-                f"[dry-run] NOAA THREDDS HF-radar ({region_name}, {token}) would search "
-                f"{THREDDS_BASE}/catalog/ioos/hfradar/rtv/{{YYYY}}/{{YYYYMM}}/{thredds_code}/"
-                f"catalog.xml for [{start_dt}, {end_dt_for_matching}]"
-            )
-            return None
-
         logger.info(
             "hf_radar_thredds: resolved region=%s resolution=%s, searching "
             "catalogs for [%s, %s]", region_name, token, start_dt, end_dt_for_matching,
@@ -193,7 +175,7 @@ class NOAATHREDDSHFRadarDownloader:
         # Walk calendar months using the un-expanded end_dt: the expanded
         # end_dt_for_matching bound only widens which hours within a day are
         # matched, it never changes which month's catalog folder holds them.
-        for year, month in _months_touched(start_dt, end_dt):
+        for year, month in months_touched(start_dt, end_dt):
             catalog_url = (
                 f"{THREDDS_BASE}/catalog/ioos/hfradar/rtv/{year}/{year}{month:02d}/"
                 f"{thredds_code}/catalog.xml"
@@ -214,6 +196,18 @@ class NOAATHREDDSHFRadarDownloader:
             )
 
         logger.info("hf_radar_thredds: %d granule(s) matched", len(granules))
+
+        if self.dry_run:
+            # Still queries each touched month's (lightweight) catalog.xml
+            # above -- so this reports real candidate availability -- but
+            # never touches a full fileServer download.
+            print(
+                f"[dry-run] NOAA THREDDS HF-radar ({region_name}, {token}): "
+                f"{len(granules)} granule(s) matched in [{start_dt}, {end_dt_for_matching}]"
+            )
+            for _ts, url_path in granules:
+                print(f"  {Path(url_path).name}")
+            return None
 
         if not granules:
             if not any_catalog_fetched:

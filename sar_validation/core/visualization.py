@@ -673,16 +673,29 @@ def plot_scatter(
 
     # Annotate with N, bias, RMSE
     from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg  # noqa: PLC0415
+    from .statistics import MIN_N_FOR_CORRELATION, _circular_corrcoef_deg  # noqa: PLC0415
 
-    if val_var in CIRCULAR_VAL_VARS:
+    is_circular = val_var in CIRCULAR_VAL_VARS
+    if is_circular:
         diff = circular_diff_deg(df[sar_col].values, df[val_col].values)
     else:
         diff = df[sar_col].values - df[val_col].values
     n = len(diff)
     bias = float(np.mean(diff))
     rmse = float(np.sqrt(np.mean(diff ** 2)))
-    if n > 1 and np.std(df[val_col].values) > 0 and np.std(df[sar_col].values) > 0:
-        corr = float(np.corrcoef(df[val_col].values, df[sar_col].values)[0, 1])
+    if n >= MIN_N_FOR_CORRELATION:
+        if is_circular:
+            # Matches compute_statistics's own circular-vs-Pearson choice
+            # (see its docstring) -- a plain Pearson r on raw degree
+            # values would treat e.g. 359 deg and 1 deg as maximally
+            # different instead of 2 deg apart, diverging from the
+            # correlation actually reported in the stats CSV/table for
+            # the same variable pair.
+            corr = _circular_corrcoef_deg(df[sar_col].values, df[val_col].values)
+        elif np.std(df[val_col].values) > 0 and np.std(df[sar_col].values) > 0:
+            corr = float(np.corrcoef(df[val_col].values, df[sar_col].values)[0, 1])
+        else:
+            corr = float("nan")
     else:
         corr = float("nan")
     annotation = f"N={n}\nBias={bias:.3g}\nRMSE={rmse:.3g}\nr={corr:.3f}"
@@ -1400,6 +1413,68 @@ def plot_geographic(
             else:
                 ax.set_xlim(geographic_bounds.min_lon, geographic_bounds.max_lon)
                 ax.set_ylim(geographic_bounds.min_lat, geographic_bounds.max_lat)
+        elif HAS_CARTOPY:
+            # Never rely on cartopy's own autoscale here: GeoAxes.pcolormesh
+            # silently falls back to the entire [-180, 180]x[-90, 90] globe
+            # (instead of the plotted cells' true extent) whenever any
+            # plotted longitude lies outside the canonical [-180, 180] range
+            # -- which SAR geolocation grids routinely do at swath edges near
+            # the dateline (e.g. an interpolated GCP at 180.3 deg instead of
+            # -179.7). _pad_extent_to_min_aspect below then reads that
+            # already-wrong global x-range back via get_xlim() and stretches
+            # the y-range to match, producing a full-world map. Compute the
+            # extent explicitly from the actual finite lon/lat instead, the
+            # same way the whole-bbox map (plot_collocation_diagnostics)
+            # already does.
+            lon_parts = [np.asarray(scene_ds["lon"].values).ravel()]
+            lat_parts = [np.asarray(scene_ds["lat"].values).ravel()]
+            if n_pts > 0 and "val_lon" in sub_coll and "val_lat" in sub_coll:
+                lon_parts.append(np.asarray(sub_coll["val_lon"].values).ravel())
+                lat_parts.append(np.asarray(sub_coll["val_lat"].values).ravel())
+            finite_lon = np.concatenate(lon_parts)
+            finite_lon = finite_lon[np.isfinite(finite_lon)]
+            finite_lat = np.concatenate(lat_parts)
+            finite_lat = finite_lat[np.isfinite(finite_lat)]
+            if finite_lon.size and finite_lat.size:
+                # Match matplotlib's own default autoscale margin (5% of
+                # span on each side, axes.xmargin/ymargin) so switching from
+                # implicit autoscale to an explicit set_extent here doesn't
+                # also change how tightly scenes are framed.
+                xmargin = plt.rcParams["axes.xmargin"]
+                ymargin = plt.rcParams["axes.ymargin"]
+
+                def _pad(lo: float, hi: float, margin: float) -> Tuple[float, float]:
+                    pad = margin * (hi - lo)
+                    return lo - pad, hi + pad
+
+                lat_min, lat_max = _pad(
+                    float(finite_lat.min()), float(finite_lat.max()), ymargin
+                )
+                lat_min = max(lat_min, -90.0)
+                lat_max = min(lat_max, 90.0)
+                if scene_crosses_dateline.get(scene_name):
+                    # Shift into the axes' own central_longitude=180 frame
+                    # (see _scene_projection) so the crossing span becomes
+                    # one contiguous range with no wraparound, then set the
+                    # extent in that same frame.
+                    shifted_lon = (finite_lon % 360) - 180
+                    lon_min, lon_max = _pad(
+                        float(shifted_lon.min()), float(shifted_lon.max()), xmargin
+                    )
+                    lon_min = max(lon_min, -180.0)
+                    lon_max = min(lon_max, 180.0)
+                    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ax.projection)
+                else:
+                    # Clamp rather than pass through: a raw value just past
+                    # +/-180 (the GCP-overshoot case above) is otherwise
+                    # itself enough to trigger the same cartopy fallback
+                    # inside set_extent.
+                    lon_min, lon_max = _pad(
+                        float(finite_lon.min()), float(finite_lon.max()), xmargin
+                    )
+                    lon_min = max(lon_min, -180.0)
+                    lon_max = min(lon_max, 180.0)
+                    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=transform)
         # Also deferred until now, for the same reason as _set_lonlat_ticks
         # below: it needs the finalized autoscaled extent from
         # ax.get_xlim()/get_ylim(). Applies to both the HAS_CARTOPY
@@ -1977,8 +2052,13 @@ def plot_temporal_offset(
         ax.scatter(df["temporal_distance_minutes"], df["abs_residual"],
                    s=18, alpha=0.6, color="#1f77b4", rasterized=True)
 
+    from .statistics import MIN_N_FOR_CORRELATION  # noqa: PLC0415
+
     n = len(df)
-    if n > 1 and np.std(df["temporal_distance_minutes"].values) > 0 and np.std(df["abs_residual"].values) > 0:
+    if (
+        n >= MIN_N_FOR_CORRELATION
+        and np.std(df["temporal_distance_minutes"].values) > 0 and np.std(df["abs_residual"].values) > 0
+    ):
         corr = float(np.corrcoef(df["temporal_distance_minutes"].values, df["abs_residual"].values)[0, 1])
     else:
         corr = float("nan")

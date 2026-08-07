@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import sys
@@ -43,6 +44,8 @@ __all__ = [
     "SOURCE_TYPE_TO_PLATFORM",
     "PLATFORM_CODE_TO_SOURCE_TYPE",
 ]
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Dataset constants
@@ -294,10 +297,20 @@ class InSituDownloader:
                 shutil.move(str(candidates[0]), str(dest_path))
                 print(f"  Saved to {dest_path}")
             else:
-                raise FileNotFoundError(
-                    f"copernicusmarine download completed but output CSV not found.\n"
-                    f"Expected: {expected_filename}"
+                # copernicusmarine.subset() doesn't raise when a request
+                # genuinely matches zero rows -- it reports
+                # "successful"/"DOWNLOADED" and simply writes no file at
+                # all (confirmed live against a real remote bbox with no
+                # CMEMS in-situ platforms for the requested period). Same
+                # "no data" outcome insitu_currents_historical_downloader.py
+                # already treats this way: not a real failure, so don't
+                # raise -- the caller's download() loop treats a None
+                # return as "no data for this window" and moves on.
+                logger.debug(
+                    "No in-situ observations in [%s, %s]; copernicusmarine "
+                    "wrote no output file.", start_dt, end_dt,
                 )
+                return None
 
         # Apply platform-type filter
         if source_types:

@@ -369,6 +369,131 @@ class DataTreeConverter:
         return ds
 
     @staticmethod
+    def from_radarsat2_wind(
+        nc_path: Union[str, Path],
+        product_type: str = "wind",
+    ) -> Optional[xr.Dataset]:
+        """
+        Open a RADARSAT-2 SAR wind granule (NOAA NCEI THREDDS archive) and
+        return a standardised Dataset with a native (y, x) grid, matching
+        Sentinel-1 OWI's grid shape so it reuses the existing
+        grid-collocation path unchanged.
+
+        Wind SPEED only (``owiWindSpeed``, from ``sar_wind``) -- this
+        product's ``input_dir`` field is the NWP model direction fed into
+        the CMOD wind-inversion, not an independent SAR retrieval, so no
+        ``owiWindDirection`` is produced (see design-choices.md Sec 10).
+
+        Land/ice/quality masking confirmed 2026-08-05 against a real
+        downloaded granule (SAR-Wind-HH-64N-174E_v3r0_rsat2_...): the
+        file's own ``pixel_level_quality_flags`` == 5 ("valid wind in
+        valid water region") is the strict, authoritative validity
+        criterion (matches the file's own
+        ``quality_information.total_number_of_valid_water_pixels``
+        exactly, 63,810 pixels). ``mask``/``icemask`` alone are **not**
+        a substitute for it when it's available: ``mask == -1`` (water)
+        AND ``icemask == 1`` (water) alone keeps 115,267 pixels on that
+        same file -- 51,457 more than flag 5, including flag-0 cells
+        where ``sar_wind`` is a fill-like 0.0 and flag-4 "valid in
+        buffer region" lower-confidence retrievals. ``pixel_level_quality_flags``
+        does not exist in the old filename era (confirmed live against a
+        2019 granule), so this method uses it directly when present, and
+        falls back to ``mask == -1 AND icemask == 1`` only when it's
+        absent -- a documented, era-specific approximation, not claimed
+        equivalent to the new era's precision.
+
+        Parameters
+        ----------
+        nc_path : str or Path
+            Path to a downloaded ``*_wind_level2_norcs.nc`` (old era) or
+            ``SAR-Wind-*.nc`` (new era) granule.
+        product_type : str, optional
+            Ignored -- accepted only for signature compatibility with
+            every other ``SARSourceSpec.convert`` callback. This source
+            only ever produces wind.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="sar_l2_ocn"``, or None on failure.
+        """
+        nc_path = Path(nc_path)
+        if not nc_path.exists():
+            logger.warning("RADARSAT-2 wind file not found: %s", nc_path)
+            return None
+
+        try:
+            ds_raw = xr.open_dataset(nc_path)
+        except Exception as exc:
+            logger.warning("Could not open %s: %s", nc_path, exc)
+            return None
+
+        try:
+            required = ("sar_wind", "mask", "icemask", "longitude", "latitude")
+            if not all(var in ds_raw for var in required):
+                logger.warning(
+                    "Missing required variable(s) in %s (available: %s).",
+                    nc_path.name, list(ds_raw.data_vars) + list(ds_raw.coords),
+                )
+                return None
+
+            if "pixel_level_quality_flags" in ds_raw:
+                # New filename era only. Flag 5 = "valid wind in valid
+                # water region" -- the strict, authoritative criterion
+                # (matches quality_information.total_number_of_valid_water_pixels
+                # exactly). mask/icemask alone are NOT a substitute: they
+                # let through ~51k extra pixels this flag correctly
+                # excludes (fill-like flag-0 cells, lower-confidence
+                # flag-4 "buffer region" retrievals) -- confirmed live,
+                # see design-choices.md Sec 10.
+                valid = ds_raw["pixel_level_quality_flags"].values == 5
+            else:
+                # Old filename era: pixel_level_quality_flags doesn't
+                # exist. mask/icemask are the best available signal -- a
+                # documented approximation, slightly more permissive than
+                # the new era's flag-based criterion.
+                mask = ds_raw["mask"].values
+                icemask = ds_raw["icemask"].values
+                valid = (mask == -1) & (icemask == 1)
+
+            speed = np.where(valid, ds_raw["sar_wind"].values, np.nan).astype(float)
+            lon = ds_raw["longitude"].values
+            lat = ds_raw["latitude"].values
+
+            time_str = ds_raw.attrs.get("time_coverage_start")
+            if time_str:
+                raw_time = pd.to_datetime(time_str)
+                if raw_time.tzinfo is not None:
+                    raw_time = raw_time.tz_convert(None)
+                acq_time_ns = np.datetime64(raw_time, "ns")
+            else:
+                acq_time_ns = np.datetime64("NaT", "ns")
+
+            ds = xr.Dataset(
+                {"owiWindSpeed": (("y", "x"), speed)},
+                coords={
+                    "lon": (("y", "x"), lon),
+                    "lat": (("y", "x"), lat),
+                    "time": acq_time_ns,
+                },
+            )
+            apply_cf_metadata(ds, "sar", {
+                "owiWindSpeed": {
+                    "long_name": "RADARSAT-2 SAR-derived wind speed at 10-m height neutral stability",
+                    "units": "m s-1",
+                },
+            })
+            ds.attrs["data_type"] = "sar_l2_ocn"
+            ds.attrs["source"] = "RADARSAT-2"
+            ds.attrs["filename"] = nc_path.name
+            return ds
+        except Exception as exc:
+            logger.warning("Could not extract wind data from %s: %s", nc_path.name, exc)
+            return None
+        finally:
+            ds_raw.close()
+
+    @staticmethod
     def from_insitu_csv(
         csv_path: Union[str, Path],
         source_type: str = "mooring",
@@ -1101,11 +1226,18 @@ class DataTreeConverter:
         - **NSIDC-0451** (L3 daily global grid; used for dates on or
           before 2023-12-31, per the orchestrator's ``_NSIDC_0451_CUTOFF``)
           -- handled below.
-        - **AU_Land_NRT_R02**/**AU_Land** (L2B half-orbit swath,
-          HDF-EOS5; the historical-coverage-extension replacement for
-          NSIDC-0451, used for dates after that cutoff) -- detected via
-          the presence of an ``HDFEOS/SWATHS`` group and delegated to
-          :meth:`_from_amsr_ssm_au_land_swath`.
+        - **AU_Land_NRT_R02**/**AU_Land** (L2B half-orbit granule,
+          HDF-EOS5 POINTS layout -- not SWATHS, despite the product's own
+          "half-orbit swath" description; the historical-coverage-
+          extension replacement for NSIDC-0451, used for dates after that
+          cutoff) -- detected via the presence of an ``HDFEOS/POINTS``
+          group and delegated to :meth:`_from_amsr_ssm_au_land_points`.
+          **Confirmed against a real downloaded granule**
+          (AMSR_U2_L2_Land_B02_202312312326_D.he5) -- the field layout
+          guessed before that (a ``SWATHS`` group with separate named
+          datasets) does not match any real granule and always fell
+          through to the "Missing vsm/longitude/latitude field(s)"
+          warning below.
 
         Field names for the NSIDC-0451 branch are assumed from the
         NSIDC-0451 v3.1 technical readme: ``vsm`` (surface, <=2cm,
@@ -1139,8 +1271,8 @@ class DataTreeConverter:
 
         try:
             with h5py.File(path, "r") as f:
-                if "HDFEOS/SWATHS" in f:
-                    return DataTreeConverter._from_amsr_ssm_au_land_swath(f, path)
+                if "HDFEOS/POINTS" in f:
+                    return DataTreeConverter._from_amsr_ssm_au_land_points(f, path)
                 if "Geophysical Data" in f and "Time Information" in f:
                     return DataTreeConverter._from_amsr_ssm_gportal_l3_grid(f, path)
                 # ... existing NSIDC-0451 L3 daily-grid parsing continues below,
@@ -1190,52 +1322,57 @@ class DataTreeConverter:
         )
 
     @staticmethod
-    def _from_amsr_ssm_au_land_swath(f: Any, path: Path) -> Optional[xr.Dataset]:
+    def _from_amsr_ssm_au_land_points(f: Any, path: Path) -> Optional[xr.Dataset]:
         """
-        Parse an ``AU_Land``/``AU_Land_NRT_R02`` L2B half-orbit swath
-        granule (HDF-EOS5 format) -- the historical-coverage-extension
-        replacement for the fully-discontinued NSIDC-0451 L3 daily grid.
+        Parse an ``AU_Land``/``AU_Land_NRT_R02`` L2B half-orbit granule
+        (HDF-EOS5 format) -- the historical-coverage-extension replacement
+        for the fully-discontinued NSIDC-0451 L3 daily grid.
 
-        Field paths (``HDFEOS/SWATHS/AMSR2_Land/Data Fields/Soil_Moisture``
-        etc.) are a best-effort guess based on NSIDC's ``au_land-v001-
-        userguide.pdf`` Table 2 and the general HDF-EOS5 swath convention
-        used by other NSIDC AMSR products -- **this has not been confirmed
-        against a real downloaded granule** (no NASA Earthdata credentials
-        were available when this method was introduced; unlike
-        :meth:`from_ascat_ssm`, which *is* backed by a real downloaded
-        product). If a real granule uses different field names or group
-        nesting, the lookups below will raise ``KeyError`` and this method
-        returns None rather than propagating the exception or producing
-        wrong data -- update the paths here (and the synthetic-HDF5 test
-        fixture in ``TestFromAmsrSsmAuLandFormat``) once a real granule can
-        be inspected.
+        **Confirmed against a real downloaded granule**
+        (AMSR_U2_L2_Land_B02_202312312326_D.he5, fetched live 2026-08-07):
+        despite the product's own "half-orbit swath" description, its
+        real on-disk layout is HDF-EOS5's POINTS structure, not SWATHS --
+        a single compound (structured) dataset at
+        ``HDFEOS/POINTS/AMSR-2 Level 2 Land Data/Data/Combined NPD and SCA
+        Output Fields``, whose named fields include ``Time``,
+        ``Latitude``, ``Longitude``, and -- per NSIDC's collection
+        abstract -- two independent, co-equal soil-moisture retrievals
+        with no stated "primary" one: ``SoilMoistureNPD`` (Normalized
+        Polarization Difference) and ``SoilMoistureSCA`` (Single Channel
+        Algorithm), each with its own ``RetrievalQualityFlag{NPD,SCA}``.
+        NPD is used here (see design-choices.md) since it matches the
+        algorithm NSIDC-0451, this product's predecessor, used
+        exclusively. ``Time`` is seconds since 1993-01-01T00:00:00 (TAI93
+        convention, common to NASA/JAXA AMSR products) -- confirmed
+        numerically live, not seconds since the Unix epoch. -9999.0 is
+        the fill value for both the soil-moisture and QC fields (same
+        convention as the NSIDC-0451 branch above).
         """
         try:
-            swath_group = f["HDFEOS/SWATHS/AMSR2_Land"]
-            sm = swath_group["Data Fields/Soil_Moisture"][:]
-            lat = swath_group["Geolocation Fields/Latitude"][:]
-            lon = swath_group["Geolocation Fields/Longitude"][:]
-            time_raw = swath_group["Geolocation Fields/Time"][:]
-        except KeyError as exc:
+            data = f["HDFEOS/POINTS/AMSR-2 Level 2 Land Data/Data/Combined NPD and SCA Output Fields"][:]
+            sm = data["SoilMoistureNPD"]
+            lat = data["Latitude"]
+            lon = data["Longitude"]
+            time_raw = data["Time"]
+        except (KeyError, ValueError) as exc:
             logger.warning(
-                "from_amsr_ssm: AU_Land swath file %s is missing an expected "
-                "field/group (%s) -- field layout is unconfirmed against a "
-                "real granule (see docstring); refusing to guess.",
-                path.name, exc,
+                "from_amsr_ssm: AU_Land file %s is missing an expected "
+                "field/group (%s).", path.name, exc,
             )
             return None
 
-        valid = ~np.isnan(sm)
+        valid = (sm != -9999.0) & ~np.isnan(sm)
         if not valid.any():
             logger.warning("from_amsr_ssm: all cells invalid in %s.", path.name)
             return None
 
-        time_vals = pd.to_datetime(time_raw[valid], unit="s")
+        # TAI93: seconds since 1993-01-01T00:00:00, not the Unix epoch.
+        time_vals = pd.Timestamp("1993-01-01") + pd.to_timedelta(time_raw[valid], unit="s")
         var_attrs = {
             "SOIL_MOISTURE": {
                 "units": "m3 m-3",
                 "standard_name": "volume_fraction_of_water_in_soil",
-                "long_name": "AMSR-E/2 surface soil moisture (~0-1cm, X/Ka-band)",
+                "long_name": "AMSR-E/2 surface soil moisture (~0-1cm, X/Ka-band, NPD algorithm)",
             }
         }
         return DataTreeConverter._build_ssm_point_dataset(

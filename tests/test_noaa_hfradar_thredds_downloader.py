@@ -154,18 +154,36 @@ class TestNoaaThreddsHfRadarDownloaderDownload:
         with pytest.raises(ValueError):
             dl.download(2.0, 8.0, 53.0, 55.0, "2024-01-31", "2024-01-31")
 
-    def test_dry_run_makes_no_network_call(self, tmp_path):
+    def test_dry_run_queries_catalog_but_never_downloads(self, tmp_path, capsys):
+        """dry-run must answer whether real granules exist for the
+        requested bbox/time -- so it does fetch each touched month's
+        (lightweight) catalog.xml -- but must never reach a full
+        fileServer download, and must always return []."""
         from sar_validation.downloaders.noaa_hfradar_thredds_downloader import (
             NOAATHREDDSHFRadarDownloader,
         )
 
+        requested_urls = []
+
+        def fake_urlopen(url, timeout=None):
+            requested_urls.append(url)
+            cm = MagicMock()
+            cm.__enter__.return_value.read.return_value = _OLD_ERA_CATALOG_XML.encode()
+            return cm
+
         dl = NOAATHREDDSHFRadarDownloader(output_dir=tmp_path, dry_run=True, resolution_km=6)
         with patch(
-            "sar_validation.downloaders.noaa_hfradar_thredds_downloader.urllib.request.urlopen"
-        ) as m:
+            "sar_validation.downloaders.noaa_hfradar_thredds_downloader.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
             out = dl.download(-125, -119, 33, 38, "2024-01-31", "2024-01-31")
+
         assert out == []
-        m.assert_not_called()
+        assert requested_urls  # the catalog.xml call did happen
+        assert not any("/fileServer/" in u for u in requested_urls)
+        assert not any(tmp_path.glob("*.nc"))
+        out_text = capsys.readouterr().out
+        assert "granule(s) matched" in out_text
 
     def test_no_matching_granules_but_catalog_reachable_returns_empty_list(self, tmp_path):
         from sar_validation.downloaders.noaa_hfradar_thredds_downloader import (

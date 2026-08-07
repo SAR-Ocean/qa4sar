@@ -1141,6 +1141,55 @@ was out of scope for this fix).
 > `core/visualization.py` (`plot_collocation_diagnostics`,
 > `_diagnostics_zoom_extent`).
 
+### 8.12 AU_Land AMSR2: real format confirmed, NPD chosen over SCA
+
+`_from_amsr_ssm_au_land_points` (formerly `_from_amsr_ssm_au_land_swath`)
+originally guessed its field layout from NSIDC's user guide, with no real
+granule available to check against (§ its own docstring said so
+explicitly). Once NASA Earthdata credentials were available, a live
+download (`AMSR_U2_L2_Land_B02_202312312326_D.he5`) showed the guess was
+wrong in three independent ways, all of which caused `from_amsr_ssm` to
+silently drop every AU_Land file with a "Missing vsm/longitude/latitude
+field(s)" warning:
+
+1. **Group type**: the real file uses HDF-EOS5's `POINTS` structure
+   (`HDFEOS/POINTS/AMSR-2 Level 2 Land Data/...`), not `SWATHS` — despite
+   the product's own name describing it as a "half-orbit swath". The
+   detection check (`"HDFEOS/SWATHS" in f`) never matched, so the format
+   silently fell through to the unrelated NSIDC-0451 branch.
+2. **Field storage**: fields are not separate named datasets
+   (`Data Fields/Soil_Moisture` etc.) — they're columns of one compound
+   (structured) dataset, `Data/Combined NPD and SCA Output Fields`.
+3. **Time epoch**: the `Time` field is seconds since **1993-01-01**
+   (TAI93 — common across NASA/JAXA AMSR products), not the Unix epoch.
+   Confirmed numerically: a real granule's `Time` values only land on its
+   own filename-embedded acquisition timestamp under the 1993 epoch: e.g.
+   `978221822` -> `2024-01-01T00:17:02`, matching a granule named
+   `..._202312312326_...` (swath started 2023-12-31 23:26, continuing a
+   few minutes past midnight).
+
+**NPD vs. SCA**: the real product carries two independent, co-equal
+soil-moisture retrievals per point — `SoilMoistureNPD` (Normalized
+Polarization Difference) and `SoilMoistureSCA` (Single Channel
+Algorithm) — with no "primary" one stated anywhere (not in the field
+metadata, not in NSIDC's own collection abstract: "estimated ... using
+two different approaches"). NPD was chosen because it matches the
+algorithm NSIDC-0451 — this product's direct predecessor, whose
+coverage AU_Land extends — used exclusively; SCA is never used as a
+fallback (a fill-value NPD row is dropped even when SCA has a real
+value for that same point, rather than silently mixing two differently-
+biased retrieval algorithms within one dataset).
+
+Fill value (`-9999.0`) and its NSIDC-0451-matching drop convention are
+unchanged. Live-verified end to end: 19,004 of 31,781 points in the
+sample granule survived filtering, with soil-moisture values in the
+expected 0-0.5 m³ m⁻³ range and timestamps landing within the granule's
+own acquisition window.
+
+> Code: `core/datatree_converter.py` (`from_amsr_ssm`,
+> `_from_amsr_ssm_au_land_points`), `tests/test_datatree_converter.py`
+> (`TestFromAmsrSsmAuLandFormat`).
+
 ## 9. Visualization / report choices
 
 ### 9.1 Adaptive geographic marker sizing
@@ -1214,3 +1263,101 @@ order as the CDF-matched section above it.
 
 > Code: `core/visualization.py` (`validation_report`'s per-pair loop and
 > native-units block).
+
+## 10. RADARSAT-2 (NOAA NCEI): a second SAR source, selected per recipe
+
+A second SAR-side source for `wind` recipes, alongside Sentinel-1
+L2_OCN, following the exact registry pattern §8.11 established for
+NISAR SME2/soil_moisture: `sar_sources.SAR_SOURCES["radarsat2"]`,
+`variables=frozenset({"wind"})`.
+
+**Two filename eras in NOAA's THREDDS archive, no hardcoded cutoff
+date.** Live-confirmed: pre-2024 catalogs use
+`RSAT2_{PROVIDER}_{YYYY}_{MM}_{DD}_{HH}_{MM}_{SS}_{seq}_{lon}{E|W}_{lat}{N|S}_{POL}_C5_{MODEL}_wind_level2_norcs.nc`;
+2024-onward catalogs use
+`SAR-Wind-{POL}-{lat}{N|S}-{lon}{E|W}_v{maj}r{min}_rsat2_s{start}_e{end}_c{created}.nc`.
+`radarsat2_wind_downloader._parse_granule_name` matches whichever regex a
+filename fits, rather than picking by date — this codebase already has
+one example of a hardcoded-transition-date guess turning out wrong
+(NISAR SME2's `AU_Land_NRT_R02`/CMR-collection cutover, §8.11).
+
+**Catalog XML has no spatial search, but THREDDS' NCML metadata service
+gives an exact per-granule bbox for free — a two-stage filter, coarse
+then precise, with no full-scene download wasted on a non-overlapping
+candidate.** THREDDS' `catalog.xml` exposes only `name`/`urlPath`/
+`dataSize` per granule, no bbox. Both filename eras embed a scene-center
+lon/lat (decimal precision pre-2024, integer degrees from 2024);
+`_list_radarsat2_granules` uses it as a coarse, purely-local pre-filter,
+keeping any candidate whose center falls within the requested bbox
+padded by 5°. Every THREDDS granule also has a lightweight (~25-30KB,
+confirmed live, zero data values) `/ncml/{urlPath}` metadata endpoint.
+`RADARSAT2WindDownloader._passes_ncml_check` fetches it for each
+surviving candidate and parses its real `geospatial_lat/lon_min/max`
+(`_parse_ncml_bbox` — new era: root-level global attributes, the file's
+own stated values; old era: nested under `<group name="CFMetadata">`,
+auto-computed server-side by THREDDS since the raw old-era file has no
+such attributes at all) before deciding whether to issue the actual
+~38MB `fileServer` download. A candidate whose real footprint doesn't
+overlap the requested bbox is never downloaded. If the NCML fetch or
+parse fails for any reason, the check fails *open* (treats the
+candidate as passing) rather than silently dropping a possibly-real
+granule — the cost of a false positive is one extra download, not a
+missed scene.
+
+**Land/ice/quality masking rule, empirically derived from a real
+downloaded granule** (`SAR-Wind-HH-64N-174E_v3r0_rsat2_...`,
+2026-06-04) — and corrected once, mid-design, after re-verifying against
+that same file. Cross-tabulating the file's `pixel_level_quality_flags`
+against its `mask` (`-1`=water/`0`=shore/`1`=land) and `icemask`
+(`1`=water/`2`=land/`3`=sea_ice/`4`=snow, `0`=no-data):
+
+| flag | meaning | n pixels | mostly |
+|---|---|---|---|
+| 5 | valid wind, valid water | 63,810 | 100% water (both mask and icemask) |
+| 4 | valid wind, buffer region | 977,221 (92% of scene) | 90% **land** |
+| 1 | invalid wind, buffer region | 19,836 | 85% land |
+| 0 | invalid wind, valid water | 1,518 | 100% water |
+
+Every flag-`5` pixel is `mask == -1 AND icemask == 1` — but **the
+reverse is not true**. Filtering by `mask == -1 AND icemask == 1` alone
+(an earlier design draft's assumption, before this correction) actually
+keeps 115,267 pixels — 51,457 more than flag `5`. The extra pixels are
+genuinely water per `mask`/`icemask`, but the retrieval algorithm itself
+flagged them unreliable for other reasons: flag `0`'s "water" pixels all
+have `sar_wind == 0.0` exactly (fill-like, not real calm wind), and flag
+`4`'s "buffer region" pixels — despite being labeled "valid" — are
+lower-confidence retrievals near a coast/ice edge, and 90% of *all*
+flag-`4` pixels (not just the water/water subset) are land. So
+`mask`/`icemask` are not a substitute for the quality flag when it's
+available.
+
+`pixel_level_quality_flags` does not exist in the pre-2024 filename era
+(confirmed live against a 2019 granule). `DataTreeConverter.from_radarsat2_wind`
+therefore uses `pixel_level_quality_flags == 5` directly when present,
+and falls back to `mask == -1 AND icemask == 1` only for the old era —
+a documented, era-specific approximation known to be slightly more
+permissive than the new era's flag-based precision, not claimed
+equivalent to it. This still mirrors the existing ASCAT precedent
+(`_ASCAT_REJECT_FLAGS`) of explicit, documented land/ice/quality
+rejection rather than trusting a product's raw fill values alone.
+
+**Wind speed only — no `owiWindDirection`.** The product's `input_dir`
+field is "interpolated directions used for wind inversion" — the NWP
+model direction fed into the CMOD retrieval to resolve its 180°
+ambiguity, not an independently SAR-measured direction. Producing it as
+`owiWindDirection` would silently compare SAR-derived speed against a
+model's own direction, masquerading as a SAR quantity.
+`_variable_map.filter_variable_pairs` already filters
+`VARIABLE_PAIRS["wind"]` down to pairs where both the `sar_<var>` and
+`val_<var>` columns exist in the collocation dataset — simply omitting
+`owiWindDirection` from the converter's output is sufficient by itself;
+no other code changes anywhere in the pipeline.
+
+> Code: `downloaders/radarsat2_wind_downloader.py`
+> (`RADARSAT2WindDownloader`, `_parse_granule_name`,
+> `_list_radarsat2_granules`, `_parse_ncml_bbox`,
+> `RADARSAT2WindDownloader._passes_ncml_check`), `downloaders/base.py`
+> (`months_touched`, shared with the NOAA HF-radar THREDDS downloader),
+> `core/datatree_converter.py` (`from_radarsat2_wind`),
+> `core/sar_sources.py` (`SAR_SOURCES["radarsat2"]`), `cli.py`
+> (`_build_wind_config`'s `radarsat2` description branch).

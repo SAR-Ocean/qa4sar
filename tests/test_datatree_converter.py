@@ -504,6 +504,148 @@ class TestFromNisarSme2:
         assert ds is None
 
 
+def _make_radarsat2_wind_nc(
+    tmp_path: Path, name: str = "radarsat2_wind.nc", include_quality_flags: bool = True,
+) -> Path:
+    """Build a synthetic RADARSAT-2 wind granule.
+
+    With include_quality_flags=True (new filename era), the grid
+    reproduces a real, live-confirmed (2026-08-05) finding: mask/icemask
+    alone are NOT a substitute for pixel_level_quality_flags. Cell (0,1)
+    is water/water per mask/icemask (the same condition the old-era
+    fallback below relies on) yet is flagged 4 ("valid wind in buffer
+    region" -- NOT the strict flag 5) and must still be dropped. An
+    earlier design draft assumed mask==-1 & icemask==1 implied flag==5;
+    this was checked directly against a real downloaded granule and
+    found false (the mask/icemask condition alone kept 115,267 pixels
+    vs. flag==5's 63,810) -- see design-choices.md Sec 10.
+
+    With include_quality_flags=False (old filename era, where this
+    variable does not exist), the converter's mask/icemask fallback path
+    is exercised instead, and every water/water cell is kept.
+
+      (0,0) flag 5, water/water           -> kept    (speed 5.0)
+      (0,1) flag 4, water/water (buffer)  -> dropped  when flags present
+                                              (speed 12.0 -- proves the
+                                              flag, not mask/icemask,
+                                              decides)
+      (0,2) flag 0, water/water, fill-like -> dropped when flags present
+                                              (speed 0.0)
+      (1,0) flag 4, land/land              -> dropped either way
+                                              (speed 3.0)
+      (1,1) flag 1, shore/water            -> dropped either way
+                                              (speed 20.0)
+      (1,2) flag 5, water/water            -> kept    (speed 7.5)
+    """
+    sar_wind = np.array([[5.0, 12.0, 0.0], [3.0, 20.0, 7.5]], dtype="float32")
+    mask = np.array([[-1, -1, -1], [1, 0, -1]], dtype="int16")
+    icemask = np.array([[1, 1, 1], [2, 1, 1]], dtype="int16")
+    lon = np.array([[170.0, 171.0, 172.0], [170.0, 171.0, 172.0]], dtype="float32")
+    lat = np.array([[64.0, 64.0, 64.0], [63.0, 63.0, 63.0]], dtype="float32")
+
+    data_vars = {
+        "sar_wind": (("y", "x"), sar_wind),
+        "mask": (("y", "x"), mask),
+        "icemask": (("y", "x"), icemask),
+    }
+    if include_quality_flags:
+        data_vars["pixel_level_quality_flags"] = (
+            ("y", "x"), np.array([[5, 4, 0], [4, 1, 5]], dtype="int16"),
+        )
+
+    ds = xr.Dataset(
+        data_vars,
+        coords={
+            "longitude": (("y", "x"), lon),
+            "latitude": (("y", "x"), lat),
+        },
+    )
+    ds["sar_wind"].attrs["_FillValue"] = np.float32(-999.0)
+    ds["mask"].attrs["flag_values"] = [-1, 0, 1]
+    ds["mask"].attrs["flag_meanings"] = "water shore land"
+    ds["icemask"].attrs["_FillValue"] = np.int16(0)
+    ds["icemask"].attrs["flag_meanings"] = "no_data water land sea_ice snow"
+    ds.attrs["time_coverage_start"] = "2026-06-04T05:52:51Z"
+    path = tmp_path / name
+    ds.to_netcdf(path)
+    return path
+
+
+class TestFromRadarsat2Wind:
+    def test_only_owi_wind_speed_produced_no_direction(self, tmp_path):
+        path = _make_radarsat2_wind_nc(tmp_path)
+        ds = DataTreeConverter.from_radarsat2_wind(path)
+        assert ds is not None
+        assert "owiWindSpeed" in ds
+        assert "owiWindDirection" not in ds
+
+    def test_quality_flag_5_kept_others_dropped(self, tmp_path):
+        path = _make_radarsat2_wind_nc(tmp_path, include_quality_flags=True)
+        ds = DataTreeConverter.from_radarsat2_wind(path)
+        speed = ds["owiWindSpeed"].values
+        assert speed[0, 0] == pytest.approx(5.0)   # flag 5 -- kept
+        assert speed[1, 2] == pytest.approx(7.5)   # flag 5 -- kept
+        assert np.isnan(speed[0, 1])                # flag 4
+        assert np.isnan(speed[0, 2])                # flag 0
+        assert np.isnan(speed[1, 0])                # flag 4
+        assert np.isnan(speed[1, 1])                # flag 1
+
+    def test_mask_icemask_water_alone_is_not_sufficient_when_flag_present(self, tmp_path):
+        """Regression guard for the mistake an earlier design draft made:
+        cell (0,1) is water/water per mask/icemask (the same condition
+        the old-era fallback relies on) but its quality flag is 4, not
+        5 -- it must be dropped, proving the converter checks the flag
+        directly rather than falling back to mask/icemask when the flag
+        is present."""
+        path = _make_radarsat2_wind_nc(tmp_path, include_quality_flags=True)
+        ds = DataTreeConverter.from_radarsat2_wind(path)
+        assert np.isnan(ds["owiWindSpeed"].values[0, 1])
+
+    def test_old_era_falls_back_to_mask_icemask(self, tmp_path):
+        path = _make_radarsat2_wind_nc(tmp_path, include_quality_flags=False)
+        ds = DataTreeConverter.from_radarsat2_wind(path)
+        speed = ds["owiWindSpeed"].values
+        # Without pixel_level_quality_flags, every water/water cell (per
+        # mask/icemask) is kept -- including (0,1) and (0,2), unlike the
+        # flag-based new-era test above.
+        assert speed[0, 0] == pytest.approx(5.0)
+        assert speed[0, 1] == pytest.approx(12.0)
+        assert speed[0, 2] == pytest.approx(0.0)
+        assert speed[1, 2] == pytest.approx(7.5)
+        assert np.isnan(speed[1, 0])   # land
+        assert np.isnan(speed[1, 1])   # shore (mask=0, not -1)
+
+    def test_grid_shape_and_coords(self, tmp_path):
+        path = _make_radarsat2_wind_nc(tmp_path)
+        ds = DataTreeConverter.from_radarsat2_wind(path)
+        assert ds["owiWindSpeed"].dims == ("y", "x")
+        assert ds["lon"].shape == (2, 3)
+        assert ds["lat"].shape == (2, 3)
+
+    def test_time_parsed_from_time_coverage_start(self, tmp_path):
+        path = _make_radarsat2_wind_nc(tmp_path)
+        ds = DataTreeConverter.from_radarsat2_wind(path)
+        assert pd.Timestamp(ds["time"].values) == pd.Timestamp("2026-06-04T05:52:51")
+
+    def test_cf_metadata_and_attrs(self, tmp_path):
+        path = _make_radarsat2_wind_nc(tmp_path)
+        ds = DataTreeConverter.from_radarsat2_wind(path)
+        assert ds["owiWindSpeed"].attrs["units"] == "m s-1"
+        assert ds.attrs["data_type"] == "sar_l2_ocn"
+        assert ds.attrs["source"] == "RADARSAT-2"
+
+    def test_missing_file_returns_none(self, tmp_path):
+        ds = DataTreeConverter.from_radarsat2_wind(tmp_path / "does_not_exist.nc")
+        assert ds is None
+
+    def test_missing_sar_wind_variable_returns_none(self, tmp_path):
+        ds_raw = xr.Dataset({"other_var": (("y", "x"), np.zeros((2, 2)))})
+        path = tmp_path / "no_sar_wind.nc"
+        ds_raw.to_netcdf(path)
+        ds = DataTreeConverter.from_radarsat2_wind(path)
+        assert ds is None
+
+
 class TestFromAltimeter:
     def test_wind_speed_renamed_to_wspd(self, tmp_path):
         path = _make_altimeter_nc(tmp_path)
@@ -1913,34 +2055,80 @@ class TestFromAmsrSsm:
 
 
 class TestFromAmsrSsmAuLandFormat:
-    def test_reads_au_land_swath_granule(self, tmp_path):
-        import h5py
-        import numpy as np
+    """The real AU_Land granule structure (confirmed 2026-08-07 via a live
+    NASA Earthdata download of AMSR_U2_L2_Land_B02_202312312326_D.he5):
+    an HDF-EOS5 POINTS layout, not SWATHS -- a single compound dataset
+    with named fields, including two independent soil-moisture retrievals
+    (NPD, SCA) with no stated "primary" one. See
+    _from_amsr_ssm_au_land_points's docstring and design-choices.md for
+    why NPD is used."""
 
+    _DTYPE = np.dtype([
+        ("Time", "f8"), ("Latitude", "f4"), ("Longitude", "f4"),
+        ("SoilMoistureNPD", "f4"), ("RetrievalQualityFlagNPD", "i4"),
+        ("SoilMoistureSCA", "f4"), ("RetrievalQualityFlagSCA", "i4"),
+    ])
+
+    def _write_granule(self, path, rows):
+        import h5py
+
+        arr = np.array(rows, dtype=self._DTYPE)
+        with h5py.File(path, "w") as f:
+            group = f.create_group("HDFEOS/POINTS/AMSR-2 Level 2 Land Data/Data")
+            group.create_dataset("Combined NPD and SCA Output Fields", data=arr)
+
+    def test_reads_au_land_points_granule(self, tmp_path):
         from sar_validation.core.datatree_converter import DataTreeConverter
 
         path = tmp_path / "AMSR2_AU_Land_sample.he5"
-        with h5py.File(path, "w") as f:
-            swath = f.create_group("HDFEOS/SWATHS/AMSR2_Land")
-            data_fields = swath.create_group("Data Fields")
-            geo_fields = swath.create_group("Geolocation Fields")
-            data_fields.create_dataset(
-                "Soil_Moisture", data=np.array([0.05, 0.12, np.nan, 0.30], dtype="float32"),
-            )
-            geo_fields.create_dataset("Latitude", data=np.array([50.0, 50.5, 51.0, 51.5], dtype="float32"))
-            geo_fields.create_dataset("Longitude", data=np.array([-9.0, -8.5, -8.0, -7.5], dtype="float32"))
-            geo_fields.create_dataset(
-                "Time", data=np.array([1.7e9, 1.7e9 + 60, 1.7e9 + 120, 1.7e9 + 180], dtype="float64"),
-            )
+        # TAI93 seconds for 2024-01-01T00:17:02 -> matches the real
+        # sample granule's own filename-embedded timestamp.
+        t0 = 978221822.0
+        self._write_granule(path, [
+            (t0, 50.0, -9.0, 0.05, 0, -9999.0, -9999),
+            (t0 + 1, 50.5, -8.5, 0.12, 0, 0.10, 0),
+            (t0 + 2, 51.0, -8.0, -9999.0, -9999, 0.20, 0),  # fill NPD, dropped
+            (t0 + 3, 51.5, -7.5, 0.30, 1, 0.28, 1),
+        ])
 
         ds = DataTreeConverter.from_amsr_ssm(path)
 
         assert ds is not None
-        assert ds.sizes["point"] == 3  # the NaN row is dropped
+        assert ds.sizes["point"] == 3  # the fill-value NPD row is dropped
         assert float(ds["SOIL_MOISTURE"].values[0]) == pytest.approx(0.05)
         assert ds.attrs["platform_type"] == "amsr_ssm"
         assert ds.attrs["data_type"] == "radiometer_ssm"
         assert ds.attrs["sensor"] == "amsr"
+
+    def test_time_uses_tai93_epoch_not_unix_epoch(self, tmp_path):
+        """seconds-since-1993 (TAI93), not seconds-since-1970 (Unix) --
+        confirmed live: the real sample granule's Time field numerically
+        matches its own filename-embedded acquisition timestamp only
+        under the 1993 epoch."""
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        path = tmp_path / "AMSR2_AU_Land_time.he5"
+        t0 = 978221822.0  # -> 2024-01-01T00:17:02 under TAI93
+        self._write_granule(path, [(t0, 50.0, -9.0, 0.05, 0, 0.05, 0)])
+
+        ds = DataTreeConverter.from_amsr_ssm(path)
+
+        assert ds is not None
+        assert pd.Timestamp(ds["time"].values[0]) == pd.Timestamp("2024-01-01T00:17:02")
+
+    def test_sca_field_is_not_used(self, tmp_path):
+        """Rows where NPD is filled but SCA has a real value must still be
+        dropped -- NPD is the chosen algorithm (see design-choices.md),
+        SCA is never a fallback."""
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        path = tmp_path / "AMSR2_AU_Land_sca_only.he5"
+        t0 = 978221822.0
+        self._write_granule(path, [(t0, 50.0, -9.0, -9999.0, -9999, 0.25, 0)])
+
+        ds = DataTreeConverter.from_amsr_ssm(path)
+
+        assert ds is None
 
 
 class TestFromAmsrSsmGPortalL3GridFormat:
@@ -2048,18 +2236,19 @@ class TestConvertDownloadedDataAmsrHe5Discovery:
         amsr_dir = tmp_path / "amsr_ssm"
         amsr_dir.mkdir()
         path = amsr_dir / "AMSR2_AU_Land_sample.he5"
+        # Real AU_Land layout (see TestFromAmsrSsmAuLandFormat / §8.12 of
+        # design-choices.md): HDF-EOS5 POINTS, one compound dataset.
+        dtype = np.dtype([
+            ("Time", "f8"), ("Latitude", "f4"), ("Longitude", "f4"),
+            ("SoilMoistureNPD", "f4"), ("RetrievalQualityFlagNPD", "i4"),
+        ])
+        arr = np.array(
+            [(978221822.0, 50.0, -9.0, 0.05, 0), (978221823.0, 50.5, -8.5, 0.12, 0)],
+            dtype=dtype,
+        )
         with h5py.File(path, "w") as f:
-            swath = f.create_group("HDFEOS/SWATHS/AMSR2_Land")
-            data_fields = swath.create_group("Data Fields")
-            geo_fields = swath.create_group("Geolocation Fields")
-            data_fields.create_dataset(
-                "Soil_Moisture", data=np.array([0.05, 0.12], dtype="float32"),
-            )
-            geo_fields.create_dataset("Latitude", data=np.array([50.0, 50.5], dtype="float32"))
-            geo_fields.create_dataset("Longitude", data=np.array([-9.0, -8.5], dtype="float32"))
-            geo_fields.create_dataset(
-                "Time", data=np.array([1.7e9, 1.7e9 + 60], dtype="float64"),
-            )
+            group = f.create_group("HDFEOS/POINTS/AMSR-2 Level 2 Land Data/Data")
+            group.create_dataset("Combined NPD and SCA Output Fields", data=arr)
 
         tree = DataTreeConverter.convert_downloaded_data(tmp_path)
 

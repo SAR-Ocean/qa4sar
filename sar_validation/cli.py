@@ -455,18 +455,40 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
         ValidationDataSource,
     )
 
-    return RecipeConfig(
-        name="Wind Validation",
-        description=(
+    if sar_source == "radarsat2":
+        description = (
+            "Validate RADARSAT-2 SAR-derived wind speed (NOAA NCEI,\n"
+            "0.5 km, C-band) against moorings, buoys, ASCAT scatterometer,\n"
+            "HY-2B/HY-2C/Oceansat-3 scatterometer, 1 Hz altimeter, and RSS\n"
+            "radiometer (AMSR2) ocean winds. Speed only -- this product\n"
+            "carries no independently SAR-retrieved wind direction."
+        )
+        # RADARSAT-2 has no SAR-retrieved direction component (see
+        # description above), and swath_mode is Sentinel-1-specific
+        # terminology (SARDataSpec.swath_mode's own docstring: "ignored
+        # (harmless no-op) by every other source") -- both were
+        # previously hardcoded to the Sentinel-1 values regardless of
+        # sar_source, which was accurate for neither field's actual
+        # meaning for this source.
+        components = ["speed"]
+        swath_mode: list[str] = []
+    else:
+        description = (
             "Validate Sentinel-1 IW/EW mode wind speed and direction\n"
             "against moorings, buoys, ASCAT scatterometer, HY-2B/HY-2C/\n"
             "Oceansat-3 scatterometer, 1 Hz altimeter, and RSS radiometer\n"
             "(AMSR2) ocean winds."
-        ),
+        )
+        components = ["speed", "direction"]
+        swath_mode = ["IW", "EW"]
+
+    return RecipeConfig(
+        name="Wind Validation",
+        description=description,
         variable="wind",
-        variable_specs={"components": ["speed", "direction"]},
+        variable_specs={"components": components},
         geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
-        sar_data=SARDataSpec(source=sar_source, swath_mode=["IW", "EW"], max_downloads=limit),
+        sar_data=SARDataSpec(source=sar_source, swath_mode=swath_mode, max_downloads=limit),
         validation_sources=[
             ValidationDataSource(source_type="mooring"),
             ValidationDataSource(source_type="buoy"),
