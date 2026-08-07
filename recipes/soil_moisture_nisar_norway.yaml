@@ -40,6 +40,10 @@ validation_sources:
 - source_type: smos_ssm
   download_kwargs: {}
   collocation_kwargs: {}
+- source_type: cds_ssm
+  download_kwargs:
+    product_type: passive
+  collocation_kwargs: {}
 collocation:
   point_vs_layer:
     time_tolerance_minutes: 360
