@@ -540,6 +540,7 @@ class DataOrchestrator:
             "smap_ssm":      self._download_smap_ssm,
             "smos_ssm":      self._download_smos_ssm,
             "cds_ssm":       self._download_cds_ssm,
+            "era5":          self._download_era5,
         }
         handler = handlers.get(source.source_type)
         if handler is None:
@@ -777,6 +778,28 @@ class DataOrchestrator:
                 start=pad_start, end=pad_end,
             ),
             f"C3S CDS SSM ({product_type})",
+        )
+
+    def _download_era5(self, source) -> bool:
+        from ..downloaders.era5_downloader import ERA5Downloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        out_dir = self.base_dir / "era5"
+
+        return self._run_download(
+            "era5", out_dir,
+            lambda: ERA5Downloader(
+                variable=cfg.variable,  # type: ignore[arg-type]
+                output_dir=out_dir, dry_run=self.dry_run,
+            ),
+            lambda: dict(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=pad_start, end=pad_end,
+            ),
+            f"ERA5 ({cfg.variable})",
         )
 
     def _download_scatterometer_ftp(self, source, satellite: str) -> bool:

@@ -279,3 +279,31 @@ class TestWindTemplate:
         assert specs["scatterometer"]["aggregation_window_km"] == 12.5
 
 
+
+
+class TestEra5RejectedForCurrents:
+    def test_era5_validation_source_in_currents_recipe_raises(self, tmp_path):
+        import pytest
+
+        from sar_validation.core.recipe import Recipe
+
+        yaml_body = (
+            "name: t\nvariable: currents\n"
+            "validation_sources:\n- source_type: era5\n"
+        )
+        yaml_path = tmp_path / "r.yaml"
+        yaml_path.write_text(yaml_body)
+        with pytest.raises(ValueError, match="era5.*currents|currents.*era5"):
+            Recipe.from_yaml(yaml_path)
+
+    def test_era5_validation_source_in_wind_recipe_is_accepted(self, tmp_path):
+        from sar_validation.core.recipe import Recipe
+
+        yaml_body = (
+            "name: t\nvariable: wind\n"
+            "validation_sources:\n- source_type: era5\n"
+        )
+        yaml_path = tmp_path / "r.yaml"
+        yaml_path.write_text(yaml_body)
+        recipe = Recipe.from_yaml(yaml_path)
+        assert recipe.config.validation_sources[0].source_type == "era5"

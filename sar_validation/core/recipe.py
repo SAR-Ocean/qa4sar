@@ -426,6 +426,25 @@ class Recipe:
                 layer_type_specs=lvl_config.get("layer_type_specs", {}),
             )
 
+        validation_sources = [
+            ValidationDataSource(
+                source_type=src["source_type"],
+                min_depth=src.get("min_depth"),
+                max_depth=src.get("max_depth"),
+                download_kwargs=src.get("download_kwargs", {}),
+                collocation_kwargs=src.get("collocation_kwargs", {}),
+            )
+            for src in data.get("validation_sources", [])
+        ]
+        if data.get("variable") == "currents" and any(
+            s.source_type == "era5" for s in validation_sources
+        ):
+            raise ValueError(
+                "source_type 'era5' is not valid for a 'currents' recipe -- "
+                "ERA5 has no ocean-currents variable. Remove the era5 "
+                "validation source, or switch the recipe's variable."
+            )
+
         config = RecipeConfig(
             name=data["name"],
             variable=data["variable"],
@@ -443,16 +462,7 @@ class Recipe:
                 end=temporal.get("end",   "2026-01-02"),
             ),
             sar_data=_build_sar_data_spec(sar, data.get("variable", "")),
-            validation_sources=[
-                ValidationDataSource(
-                    source_type=src["source_type"],
-                    min_depth=src.get("min_depth"),
-                    max_depth=src.get("max_depth"),
-                    download_kwargs=src.get("download_kwargs", {}),
-                    collocation_kwargs=src.get("collocation_kwargs", {}),
-                )
-                for src in data.get("validation_sources", [])
-            ],
+            validation_sources=validation_sources,
             collocation=CollocationType(
                 point_vs_layer=point_vs_layer,
                 layer_vs_layer=layer_vs_layer,

@@ -902,3 +902,58 @@ class TestAmsrCoverageCutoffNotice:
         assert orchestrator.metadata["downloads"]["amsr_ssm"]["status"] == "success"
         assert orchestrator.metadata["errors"] == []
 
+
+class TestDownloadEra5:
+    def _recipe(self, variable="wind"):
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+        cfg = RecipeConfig(
+            name="t", variable=variable,
+            geographic_bounds=GeographicBounds(-10.0, 10.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-07-12T18:00:00", "2026-07-12T23:00:00"),
+            validation_sources=[ValidationDataSource(source_type="era5")],
+        )
+        return Recipe(cfg)
+
+    def test_dispatches_to_download_era5(self, tmp_path, monkeypatch):
+        from sar_validation.core.orchestrator import DataOrchestrator
+
+        recipe = self._recipe()
+        orch = DataOrchestrator(recipe, dry_run=True)
+        called = {}
+
+        def fake_download_era5(self, source):
+            called["source_type"] = source.source_type
+            return True
+
+        monkeypatch.setattr(DataOrchestrator, "_download_era5", fake_download_era5)
+        result = orch._dispatch_source(recipe.config.validation_sources[0])
+        assert result is True
+        assert called["source_type"] == "era5"
+
+    def test_download_era5_builds_downloader_with_recipe_variable(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from sar_validation.core.orchestrator import DataOrchestrator
+
+        recipe = self._recipe(variable="waves")
+        orch = DataOrchestrator(recipe, dry_run=True)
+
+        fake_dl = MagicMock()
+        fake_dl.download.return_value = []
+        fake_cls = MagicMock(return_value=fake_dl)
+
+        # _download_era5 does a local `from ..downloaders.era5_downloader
+        # import ERA5Downloader` -- patch the name on that module so the
+        # local import picks up the fake at call time.
+        import sar_validation.downloaders.era5_downloader as dl_mod
+        monkeypatch.setattr(dl_mod, "ERA5Downloader", fake_cls)
+
+        ok = orch._download_era5(recipe.config.validation_sources[0])
+        assert ok is True
+        assert fake_cls.call_args.kwargs["variable"] == "waves"
