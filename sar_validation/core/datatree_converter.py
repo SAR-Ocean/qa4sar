@@ -1226,11 +1226,18 @@ class DataTreeConverter:
         - **NSIDC-0451** (L3 daily global grid; used for dates on or
           before 2023-12-31, per the orchestrator's ``_NSIDC_0451_CUTOFF``)
           -- handled below.
-        - **AU_Land_NRT_R02**/**AU_Land** (L2B half-orbit swath,
-          HDF-EOS5; the historical-coverage-extension replacement for
-          NSIDC-0451, used for dates after that cutoff) -- detected via
-          the presence of an ``HDFEOS/SWATHS`` group and delegated to
-          :meth:`_from_amsr_ssm_au_land_swath`.
+        - **AU_Land_NRT_R02**/**AU_Land** (L2B half-orbit granule,
+          HDF-EOS5 POINTS layout -- not SWATHS, despite the product's own
+          "half-orbit swath" description; the historical-coverage-
+          extension replacement for NSIDC-0451, used for dates after that
+          cutoff) -- detected via the presence of an ``HDFEOS/POINTS``
+          group and delegated to :meth:`_from_amsr_ssm_au_land_points`.
+          **Confirmed against a real downloaded granule**
+          (AMSR_U2_L2_Land_B02_202312312326_D.he5) -- the field layout
+          guessed before that (a ``SWATHS`` group with separate named
+          datasets) does not match any real granule and always fell
+          through to the "Missing vsm/longitude/latitude field(s)"
+          warning below.
 
         Field names for the NSIDC-0451 branch are assumed from the
         NSIDC-0451 v3.1 technical readme: ``vsm`` (surface, <=2cm,
@@ -1264,8 +1271,8 @@ class DataTreeConverter:
 
         try:
             with h5py.File(path, "r") as f:
-                if "HDFEOS/SWATHS" in f:
-                    return DataTreeConverter._from_amsr_ssm_au_land_swath(f, path)
+                if "HDFEOS/POINTS" in f:
+                    return DataTreeConverter._from_amsr_ssm_au_land_points(f, path)
                 if "Geophysical Data" in f and "Time Information" in f:
                     return DataTreeConverter._from_amsr_ssm_gportal_l3_grid(f, path)
                 # ... existing NSIDC-0451 L3 daily-grid parsing continues below,
@@ -1315,52 +1322,57 @@ class DataTreeConverter:
         )
 
     @staticmethod
-    def _from_amsr_ssm_au_land_swath(f: Any, path: Path) -> Optional[xr.Dataset]:
+    def _from_amsr_ssm_au_land_points(f: Any, path: Path) -> Optional[xr.Dataset]:
         """
-        Parse an ``AU_Land``/``AU_Land_NRT_R02`` L2B half-orbit swath
-        granule (HDF-EOS5 format) -- the historical-coverage-extension
-        replacement for the fully-discontinued NSIDC-0451 L3 daily grid.
+        Parse an ``AU_Land``/``AU_Land_NRT_R02`` L2B half-orbit granule
+        (HDF-EOS5 format) -- the historical-coverage-extension replacement
+        for the fully-discontinued NSIDC-0451 L3 daily grid.
 
-        Field paths (``HDFEOS/SWATHS/AMSR2_Land/Data Fields/Soil_Moisture``
-        etc.) are a best-effort guess based on NSIDC's ``au_land-v001-
-        userguide.pdf`` Table 2 and the general HDF-EOS5 swath convention
-        used by other NSIDC AMSR products -- **this has not been confirmed
-        against a real downloaded granule** (no NASA Earthdata credentials
-        were available when this method was introduced; unlike
-        :meth:`from_ascat_ssm`, which *is* backed by a real downloaded
-        product). If a real granule uses different field names or group
-        nesting, the lookups below will raise ``KeyError`` and this method
-        returns None rather than propagating the exception or producing
-        wrong data -- update the paths here (and the synthetic-HDF5 test
-        fixture in ``TestFromAmsrSsmAuLandFormat``) once a real granule can
-        be inspected.
+        **Confirmed against a real downloaded granule**
+        (AMSR_U2_L2_Land_B02_202312312326_D.he5, fetched live 2026-08-07):
+        despite the product's own "half-orbit swath" description, its
+        real on-disk layout is HDF-EOS5's POINTS structure, not SWATHS --
+        a single compound (structured) dataset at
+        ``HDFEOS/POINTS/AMSR-2 Level 2 Land Data/Data/Combined NPD and SCA
+        Output Fields``, whose named fields include ``Time``,
+        ``Latitude``, ``Longitude``, and -- per NSIDC's collection
+        abstract -- two independent, co-equal soil-moisture retrievals
+        with no stated "primary" one: ``SoilMoistureNPD`` (Normalized
+        Polarization Difference) and ``SoilMoistureSCA`` (Single Channel
+        Algorithm), each with its own ``RetrievalQualityFlag{NPD,SCA}``.
+        NPD is used here (see design-choices.md) since it matches the
+        algorithm NSIDC-0451, this product's predecessor, used
+        exclusively. ``Time`` is seconds since 1993-01-01T00:00:00 (TAI93
+        convention, common to NASA/JAXA AMSR products) -- confirmed
+        numerically live, not seconds since the Unix epoch. -9999.0 is
+        the fill value for both the soil-moisture and QC fields (same
+        convention as the NSIDC-0451 branch above).
         """
         try:
-            swath_group = f["HDFEOS/SWATHS/AMSR2_Land"]
-            sm = swath_group["Data Fields/Soil_Moisture"][:]
-            lat = swath_group["Geolocation Fields/Latitude"][:]
-            lon = swath_group["Geolocation Fields/Longitude"][:]
-            time_raw = swath_group["Geolocation Fields/Time"][:]
-        except KeyError as exc:
+            data = f["HDFEOS/POINTS/AMSR-2 Level 2 Land Data/Data/Combined NPD and SCA Output Fields"][:]
+            sm = data["SoilMoistureNPD"]
+            lat = data["Latitude"]
+            lon = data["Longitude"]
+            time_raw = data["Time"]
+        except (KeyError, ValueError) as exc:
             logger.warning(
-                "from_amsr_ssm: AU_Land swath file %s is missing an expected "
-                "field/group (%s) -- field layout is unconfirmed against a "
-                "real granule (see docstring); refusing to guess.",
-                path.name, exc,
+                "from_amsr_ssm: AU_Land file %s is missing an expected "
+                "field/group (%s).", path.name, exc,
             )
             return None
 
-        valid = ~np.isnan(sm)
+        valid = (sm != -9999.0) & ~np.isnan(sm)
         if not valid.any():
             logger.warning("from_amsr_ssm: all cells invalid in %s.", path.name)
             return None
 
-        time_vals = pd.to_datetime(time_raw[valid], unit="s")
+        # TAI93: seconds since 1993-01-01T00:00:00, not the Unix epoch.
+        time_vals = pd.Timestamp("1993-01-01") + pd.to_timedelta(time_raw[valid], unit="s")
         var_attrs = {
             "SOIL_MOISTURE": {
                 "units": "m3 m-3",
                 "standard_name": "volume_fraction_of_water_in_soil",
-                "long_name": "AMSR-E/2 surface soil moisture (~0-1cm, X/Ka-band)",
+                "long_name": "AMSR-E/2 surface soil moisture (~0-1cm, X/Ka-band, NPD algorithm)",
             }
         }
         return DataTreeConverter._build_ssm_point_dataset(

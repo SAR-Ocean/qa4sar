@@ -1141,6 +1141,55 @@ was out of scope for this fix).
 > `core/visualization.py` (`plot_collocation_diagnostics`,
 > `_diagnostics_zoom_extent`).
 
+### 8.12 AU_Land AMSR2: real format confirmed, NPD chosen over SCA
+
+`_from_amsr_ssm_au_land_points` (formerly `_from_amsr_ssm_au_land_swath`)
+originally guessed its field layout from NSIDC's user guide, with no real
+granule available to check against (§ its own docstring said so
+explicitly). Once NASA Earthdata credentials were available, a live
+download (`AMSR_U2_L2_Land_B02_202312312326_D.he5`) showed the guess was
+wrong in three independent ways, all of which caused `from_amsr_ssm` to
+silently drop every AU_Land file with a "Missing vsm/longitude/latitude
+field(s)" warning:
+
+1. **Group type**: the real file uses HDF-EOS5's `POINTS` structure
+   (`HDFEOS/POINTS/AMSR-2 Level 2 Land Data/...`), not `SWATHS` — despite
+   the product's own name describing it as a "half-orbit swath". The
+   detection check (`"HDFEOS/SWATHS" in f`) never matched, so the format
+   silently fell through to the unrelated NSIDC-0451 branch.
+2. **Field storage**: fields are not separate named datasets
+   (`Data Fields/Soil_Moisture` etc.) — they're columns of one compound
+   (structured) dataset, `Data/Combined NPD and SCA Output Fields`.
+3. **Time epoch**: the `Time` field is seconds since **1993-01-01**
+   (TAI93 — common across NASA/JAXA AMSR products), not the Unix epoch.
+   Confirmed numerically: a real granule's `Time` values only land on its
+   own filename-embedded acquisition timestamp under the 1993 epoch: e.g.
+   `978221822` -> `2024-01-01T00:17:02`, matching a granule named
+   `..._202312312326_...` (swath started 2023-12-31 23:26, continuing a
+   few minutes past midnight).
+
+**NPD vs. SCA**: the real product carries two independent, co-equal
+soil-moisture retrievals per point — `SoilMoistureNPD` (Normalized
+Polarization Difference) and `SoilMoistureSCA` (Single Channel
+Algorithm) — with no "primary" one stated anywhere (not in the field
+metadata, not in NSIDC's own collection abstract: "estimated ... using
+two different approaches"). NPD was chosen because it matches the
+algorithm NSIDC-0451 — this product's direct predecessor, whose
+coverage AU_Land extends — used exclusively; SCA is never used as a
+fallback (a fill-value NPD row is dropped even when SCA has a real
+value for that same point, rather than silently mixing two differently-
+biased retrieval algorithms within one dataset).
+
+Fill value (`-9999.0`) and its NSIDC-0451-matching drop convention are
+unchanged. Live-verified end to end: 19,004 of 31,781 points in the
+sample granule survived filtering, with soil-moisture values in the
+expected 0-0.5 m³ m⁻³ range and timestamps landing within the granule's
+own acquisition window.
+
+> Code: `core/datatree_converter.py` (`from_amsr_ssm`,
+> `_from_amsr_ssm_au_land_points`), `tests/test_datatree_converter.py`
+> (`TestFromAmsrSsmAuLandFormat`).
+
 ## 9. Visualization / report choices
 
 ### 9.1 Adaptive geographic marker sizing

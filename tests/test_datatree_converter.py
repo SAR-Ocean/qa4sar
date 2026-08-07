@@ -2055,34 +2055,80 @@ class TestFromAmsrSsm:
 
 
 class TestFromAmsrSsmAuLandFormat:
-    def test_reads_au_land_swath_granule(self, tmp_path):
-        import h5py
-        import numpy as np
+    """The real AU_Land granule structure (confirmed 2026-08-07 via a live
+    NASA Earthdata download of AMSR_U2_L2_Land_B02_202312312326_D.he5):
+    an HDF-EOS5 POINTS layout, not SWATHS -- a single compound dataset
+    with named fields, including two independent soil-moisture retrievals
+    (NPD, SCA) with no stated "primary" one. See
+    _from_amsr_ssm_au_land_points's docstring and design-choices.md for
+    why NPD is used."""
 
+    _DTYPE = np.dtype([
+        ("Time", "f8"), ("Latitude", "f4"), ("Longitude", "f4"),
+        ("SoilMoistureNPD", "f4"), ("RetrievalQualityFlagNPD", "i4"),
+        ("SoilMoistureSCA", "f4"), ("RetrievalQualityFlagSCA", "i4"),
+    ])
+
+    def _write_granule(self, path, rows):
+        import h5py
+
+        arr = np.array(rows, dtype=self._DTYPE)
+        with h5py.File(path, "w") as f:
+            group = f.create_group("HDFEOS/POINTS/AMSR-2 Level 2 Land Data/Data")
+            group.create_dataset("Combined NPD and SCA Output Fields", data=arr)
+
+    def test_reads_au_land_points_granule(self, tmp_path):
         from sar_validation.core.datatree_converter import DataTreeConverter
 
         path = tmp_path / "AMSR2_AU_Land_sample.he5"
-        with h5py.File(path, "w") as f:
-            swath = f.create_group("HDFEOS/SWATHS/AMSR2_Land")
-            data_fields = swath.create_group("Data Fields")
-            geo_fields = swath.create_group("Geolocation Fields")
-            data_fields.create_dataset(
-                "Soil_Moisture", data=np.array([0.05, 0.12, np.nan, 0.30], dtype="float32"),
-            )
-            geo_fields.create_dataset("Latitude", data=np.array([50.0, 50.5, 51.0, 51.5], dtype="float32"))
-            geo_fields.create_dataset("Longitude", data=np.array([-9.0, -8.5, -8.0, -7.5], dtype="float32"))
-            geo_fields.create_dataset(
-                "Time", data=np.array([1.7e9, 1.7e9 + 60, 1.7e9 + 120, 1.7e9 + 180], dtype="float64"),
-            )
+        # TAI93 seconds for 2024-01-01T00:17:02 -> matches the real
+        # sample granule's own filename-embedded timestamp.
+        t0 = 978221822.0
+        self._write_granule(path, [
+            (t0, 50.0, -9.0, 0.05, 0, -9999.0, -9999),
+            (t0 + 1, 50.5, -8.5, 0.12, 0, 0.10, 0),
+            (t0 + 2, 51.0, -8.0, -9999.0, -9999, 0.20, 0),  # fill NPD, dropped
+            (t0 + 3, 51.5, -7.5, 0.30, 1, 0.28, 1),
+        ])
 
         ds = DataTreeConverter.from_amsr_ssm(path)
 
         assert ds is not None
-        assert ds.sizes["point"] == 3  # the NaN row is dropped
+        assert ds.sizes["point"] == 3  # the fill-value NPD row is dropped
         assert float(ds["SOIL_MOISTURE"].values[0]) == pytest.approx(0.05)
         assert ds.attrs["platform_type"] == "amsr_ssm"
         assert ds.attrs["data_type"] == "radiometer_ssm"
         assert ds.attrs["sensor"] == "amsr"
+
+    def test_time_uses_tai93_epoch_not_unix_epoch(self, tmp_path):
+        """seconds-since-1993 (TAI93), not seconds-since-1970 (Unix) --
+        confirmed live: the real sample granule's Time field numerically
+        matches its own filename-embedded acquisition timestamp only
+        under the 1993 epoch."""
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        path = tmp_path / "AMSR2_AU_Land_time.he5"
+        t0 = 978221822.0  # -> 2024-01-01T00:17:02 under TAI93
+        self._write_granule(path, [(t0, 50.0, -9.0, 0.05, 0, 0.05, 0)])
+
+        ds = DataTreeConverter.from_amsr_ssm(path)
+
+        assert ds is not None
+        assert pd.Timestamp(ds["time"].values[0]) == pd.Timestamp("2024-01-01T00:17:02")
+
+    def test_sca_field_is_not_used(self, tmp_path):
+        """Rows where NPD is filled but SCA has a real value must still be
+        dropped -- NPD is the chosen algorithm (see design-choices.md),
+        SCA is never a fallback."""
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        path = tmp_path / "AMSR2_AU_Land_sca_only.he5"
+        t0 = 978221822.0
+        self._write_granule(path, [(t0, 50.0, -9.0, -9999.0, -9999, 0.25, 0)])
+
+        ds = DataTreeConverter.from_amsr_ssm(path)
+
+        assert ds is None
 
 
 class TestFromAmsrSsmGPortalL3GridFormat:
@@ -2190,18 +2236,19 @@ class TestConvertDownloadedDataAmsrHe5Discovery:
         amsr_dir = tmp_path / "amsr_ssm"
         amsr_dir.mkdir()
         path = amsr_dir / "AMSR2_AU_Land_sample.he5"
+        # Real AU_Land layout (see TestFromAmsrSsmAuLandFormat / §8.12 of
+        # design-choices.md): HDF-EOS5 POINTS, one compound dataset.
+        dtype = np.dtype([
+            ("Time", "f8"), ("Latitude", "f4"), ("Longitude", "f4"),
+            ("SoilMoistureNPD", "f4"), ("RetrievalQualityFlagNPD", "i4"),
+        ])
+        arr = np.array(
+            [(978221822.0, 50.0, -9.0, 0.05, 0), (978221823.0, 50.5, -8.5, 0.12, 0)],
+            dtype=dtype,
+        )
         with h5py.File(path, "w") as f:
-            swath = f.create_group("HDFEOS/SWATHS/AMSR2_Land")
-            data_fields = swath.create_group("Data Fields")
-            geo_fields = swath.create_group("Geolocation Fields")
-            data_fields.create_dataset(
-                "Soil_Moisture", data=np.array([0.05, 0.12], dtype="float32"),
-            )
-            geo_fields.create_dataset("Latitude", data=np.array([50.0, 50.5], dtype="float32"))
-            geo_fields.create_dataset("Longitude", data=np.array([-9.0, -8.5], dtype="float32"))
-            geo_fields.create_dataset(
-                "Time", data=np.array([1.7e9, 1.7e9 + 60], dtype="float64"),
-            )
+            group = f.create_group("HDFEOS/POINTS/AMSR-2 Level 2 Land Data/Data")
+            group.create_dataset("Combined NPD and SCA Output Fields", data=arr)
 
         tree = DataTreeConverter.convert_downloaded_data(tmp_path)
 
