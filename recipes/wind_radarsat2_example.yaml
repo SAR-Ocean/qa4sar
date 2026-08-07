@@ -13,7 +13,6 @@ variable: wind
 variable_specs:
   components:
   - speed
-  - direction
 geographic_bounds:
   min_lon: 165.0
   max_lon: 180.0
@@ -24,9 +23,7 @@ temporal_bounds:
   end: '2026-06-05'
 sar_data:
   source: radarsat2
-  swath_mode:
-  - IW
-  - EW
+  swath_mode: []
   max_downloads: null
   download_kwargs: {}
 validation_sources:
