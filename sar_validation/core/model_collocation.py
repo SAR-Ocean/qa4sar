@@ -60,3 +60,25 @@ def build_spatial_interpolator(
     return RegularGridInterpolator(
         (lat_ax, lon_ax), field, method="linear", bounds_error=False, fill_value=np.nan,
     )
+
+
+# ---------------------------------------------------------------------------
+# Temporal interpolation
+# ---------------------------------------------------------------------------
+
+def _hyperbolic_interp(
+    val1: np.ndarray, val2: np.ndarray, val3: np.ndarray, t_prime: np.ndarray,
+) -> np.ndarray:
+    """
+    KNMI quadratic temporal interpolation through three equally-spaced
+    (1-hour apart) values -- ported from
+    ``collocate_nwp_to_sat.py``'s ``_quadratic_interp``.
+
+    *val1*/*val2*/*val3* are the (already spatially-resolved) field values
+    at ``t2 - 1h`` / ``t2`` / ``t2 + 1h``. ``t_prime = (t_obs - t2) / 1h``,
+    in ``[0, 1)``.
+    """
+    a = (val3 + val1 - 2.0 * val2) / 2.0
+    b = (val3 - val1) / 2.0
+    c = val2
+    return a * t_prime**2 + b * t_prime + c
