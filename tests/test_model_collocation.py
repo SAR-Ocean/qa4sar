@@ -164,3 +164,69 @@ class TestModelValuesAtPoints:
             np.array([80.0]), np.array([80.0]), times, era5_ds, "nearest",
         )
         assert np.isnan(result["u10"][0])
+
+
+class TestModelLayerCollocationIndividualGrid:
+    def test_produces_one_match_per_valid_sar_pixel(self):
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_ds()
+        sar_lon = np.array([[-9.5, -9.0], [-9.5, -9.0]])
+        sar_lat = np.array([[41.0, 41.0], [40.5, 40.5]])
+        sar_time = np.array([np.datetime64("2026-07-12T01:00:00")])
+        sar_data = {"owiWindSpeed": np.array([[[5.0, 6.0], [7.0, 8.0]]])}
+
+        colloc = ModelLayerCollocation(method="individual", temporal_method="nearest")
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        assert len(results) == 4
+        for r in results:
+            assert r.val_data["u10"] == pytest.approx(10.0)
+            assert r.spatial_distance_km == 0.0
+            assert r.temporal_distance_minutes == 0.0
+            assert r.val_source == "era5"
+            assert r.collocation_type == "model_vs_layer"
+
+    def test_nan_sar_pixel_produces_no_match(self):
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_ds()
+        sar_lon = np.array([[-9.5]])
+        sar_lat = np.array([[41.0]])
+        sar_time = np.array([np.datetime64("2026-07-12T01:00:00")])
+        sar_data = {"owiWindSpeed": np.array([[[np.nan]]])}
+
+        colloc = ModelLayerCollocation(method="individual", temporal_method="nearest")
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        assert results == []
+
+
+class TestModelLayerCollocationIndividualPoints:
+    def test_wv_mode_always_interpolates_directly_regardless_of_method(self):
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_ds()
+        sar_point_vars = {"oswHs": np.array([2.0, 3.0])}
+        sar_lons = np.array([-9.5, -9.0])
+        sar_lats = np.array([41.0, 40.5])
+        sar_times = np.array([
+            np.datetime64("2026-07-12T01:00:00"),
+            np.datetime64("2026-07-12T01:00:00"),
+        ])
+
+        # method="cell-averaging" globally, but WV points still use direct
+        # interpolation -- there's no dense SAR grid to aggregate within one
+        # ERA5 cell for sparse imagette points.
+        colloc = ModelLayerCollocation(method="cell-averaging", temporal_method="nearest")
+        results = colloc.collocate_points(
+            sar_point_vars=sar_point_vars, sar_lons=sar_lons, sar_lats=sar_lats,
+            sar_times=sar_times, era5_ds=era5_ds, val_source="era5", sar_scene_name="wv1",
+        )
+        assert len(results) == 2
+        assert all(r.val_data["u10"] == pytest.approx(10.0) for r in results)
+        assert all(r.collocation_type == "model_vs_layer" for r in results)

@@ -20,7 +20,7 @@ import pandas as pd
 import xarray as xr
 from scipy.interpolate import RegularGridInterpolator
 
-from .collocation import CollocatedPoint, PointLayerCollocation
+from .collocation import CollocatedPoint
 
 logger = logging.getLogger(__name__)
 
@@ -162,3 +162,197 @@ def _model_values_at_points(
             out[var][group_mask] = blended
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# ModelLayerCollocation
+# ---------------------------------------------------------------------------
+
+class ModelLayerCollocation:
+    """
+    Collocate a gridded background-field model source (currently only
+    ERA5) against a SAR scene, using bilinear spatial interpolation plus
+    nearest-hour or hyperbolic (KNMI quadratic) temporal interpolation.
+
+    Unlike ``PointLayerCollocation``/``LayerLayerCollocation``, this class
+    consumes the validation source as a raw GRIDDED ``xr.Dataset`` (dims:
+    ``time``, ``lat``, ``lon``), not a flattened point ``DataFrame`` -- the
+    whole point is to interpolate the model field onto arbitrary SAR
+    locations, not to match against pre-existing rows.
+
+    Parameters
+    ----------
+    method : str
+        ``"individual"`` -- interpolate ERA5 directly onto every SAR
+        pixel/point (dense). ``"cell-averaging"`` -- one match per ERA5
+        native grid cell, averaging the SAR pixels within it (sparse,
+        model-scale). Only affects grid-mode (IW/EW) scenes;
+        :meth:`collocate_points` (WV mode) always uses direct
+        interpolation regardless of this setting.
+    temporal_method : str
+        ``"nearest"`` or ``"hyperbolic"`` (KNMI quadratic).
+    time_tolerance_minutes, aggregation_window_km, distance_weighting,
+    gaussian_sigma_km : see ``PointLayerCollocation`` -- only used by the
+        ``"cell-averaging"`` grid-mode path (Task 9).
+    """
+
+    collocation_type: str = "model_vs_layer"
+
+    def __init__(
+        self,
+        method: str = "cell-averaging",
+        temporal_method: str = "hyperbolic",
+        time_tolerance_minutes: int = 60,
+        aggregation_window_km: float = 12.5,
+        distance_weighting: str = "equal",
+        gaussian_sigma_km: float = 12.5,
+    ) -> None:
+        if method not in ("individual", "cell-averaging"):
+            raise ValueError(f"Unknown method {method!r}. Use 'individual' or 'cell-averaging'.")
+        if temporal_method not in ("nearest", "hyperbolic"):
+            raise ValueError(f"Unknown temporal_method {temporal_method!r}. Use 'nearest' or 'hyperbolic'.")
+        self.method = method
+        self.temporal_method = temporal_method
+        self.time_tolerance_minutes = time_tolerance_minutes
+        self.aggregation_window_km = aggregation_window_km
+        self.distance_weighting = distance_weighting
+        self.gaussian_sigma_km = gaussian_sigma_km
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def collocate(
+        self,
+        sar_data: Dict[str, np.ndarray],
+        sar_lon: np.ndarray,
+        sar_lat: np.ndarray,
+        sar_time: np.ndarray,
+        era5_ds: xr.Dataset,
+        val_source: str,
+        sar_scene_name: str = "",
+    ) -> List[CollocatedPoint]:
+        """Grid-mode (IW/EW) SAR scene. *sar_lon*/*sar_lat* shape ``(y, x)``;
+        *sar_data* values shape ``(1, y, x)``; *sar_time* shape ``(1,)``.
+        Dispatches to :attr:`method`."""
+        if self.method == "individual":
+            return self._collocate_individual_grid(
+                sar_data, sar_lon, sar_lat, sar_time, era5_ds, val_source, sar_scene_name,
+            )
+        return self._collocate_cell_averaging_grid(
+            sar_data, sar_lon, sar_lat, sar_time, era5_ds, val_source, sar_scene_name,
+        )
+
+    def collocate_points(
+        self,
+        sar_point_vars: Dict[str, np.ndarray],
+        sar_lons: np.ndarray,
+        sar_lats: np.ndarray,
+        sar_times: np.ndarray,
+        era5_ds: xr.Dataset,
+        val_source: str,
+        sar_scene_name: str = "",
+    ) -> List[CollocatedPoint]:
+        """
+        WV-mode (sparse imagette points) SAR scene, all arrays shape
+        ``(n_points,)``. Always interpolates ERA5 directly at each point
+        regardless of :attr:`method` -- WV imagettes are already sparse
+        SAR-anchor points (~200 km apart), so there is no dense SAR grid
+        within one ERA5 cell to aggregate the way cell-averaging does for
+        grid-mode scenes; interpolating ERA5 exactly at each point is the
+        natural match here. See docs/design-choices.md.
+        """
+        times_np = pd.to_datetime(sar_times).to_numpy()
+        model_values = _model_values_at_points(sar_lons, sar_lats, times_np, era5_ds, self.temporal_method)
+
+        results: List[CollocatedPoint] = []
+        for i in range(len(sar_lons)):
+            if not (np.isfinite(sar_lons[i]) and np.isfinite(sar_lats[i])):
+                continue
+            val_point = {var: float(arr[i]) for var, arr in model_values.items() if np.isfinite(arr[i])}
+            if not val_point:
+                continue
+            sar_point = {var: float(arr[i]) for var, arr in sar_point_vars.items() if np.isfinite(arr[i])}
+            if not sar_point:
+                continue
+            obs_time = pd.Timestamp(times_np[i]).to_pydatetime()
+            results.append(CollocatedPoint(
+                sar_lon=float(sar_lons[i]), sar_lat=float(sar_lats[i]), sar_time=obs_time,
+                sar_data=sar_point,
+                val_lon=float(sar_lons[i]), val_lat=float(sar_lats[i]), val_time=obs_time,
+                val_data=val_point,
+                spatial_distance_km=0.0, temporal_distance_minutes=0.0,
+                val_source=val_source, val_id=None,
+                collocation_type=self.collocation_type,
+                sar_y_idx=0, sar_x_idx=i,
+                sar_scene_name=sar_scene_name,
+            ))
+        return results
+
+    # ------------------------------------------------------------------
+    # Individual (grid mode)
+    # ------------------------------------------------------------------
+
+    def _collocate_individual_grid(
+        self,
+        sar_data: Dict[str, np.ndarray],
+        sar_lon: np.ndarray,
+        sar_lat: np.ndarray,
+        sar_time: np.ndarray,
+        era5_ds: xr.Dataset,
+        val_source: str,
+        sar_scene_name: str,
+    ) -> List[CollocatedPoint]:
+        ny, nx = sar_lon.shape
+        lons_flat = sar_lon.ravel()
+        lats_flat = sar_lat.ravel()
+        obs_time = pd.Timestamp(np.atleast_1d(sar_time)[0]).to_pydatetime()
+        times_flat = np.full(lons_flat.shape, np.datetime64(obs_time), dtype="datetime64[ns]")
+
+        model_values = _model_values_at_points(lons_flat, lats_flat, times_flat, era5_ds, self.temporal_method)
+
+        results: List[CollocatedPoint] = []
+        for flat_idx in range(lons_flat.size):
+            if not (np.isfinite(lons_flat[flat_idx]) and np.isfinite(lats_flat[flat_idx])):
+                continue
+            val_point = {
+                var: float(arr[flat_idx]) for var, arr in model_values.items() if np.isfinite(arr[flat_idx])
+            }
+            if not val_point:
+                continue
+            sar_point = {
+                var: float(sar_data[var][0].ravel()[flat_idx])
+                for var in sar_data
+                if np.isfinite(sar_data[var][0].ravel()[flat_idx])
+            }
+            if not sar_point:
+                continue
+            y_idx, x_idx = divmod(flat_idx, nx)
+            results.append(CollocatedPoint(
+                sar_lon=float(lons_flat[flat_idx]), sar_lat=float(lats_flat[flat_idx]), sar_time=obs_time,
+                sar_data=sar_point,
+                val_lon=float(lons_flat[flat_idx]), val_lat=float(lats_flat[flat_idx]), val_time=obs_time,
+                val_data=val_point,
+                spatial_distance_km=0.0, temporal_distance_minutes=0.0,
+                val_source=val_source, val_id=None,
+                collocation_type=self.collocation_type,
+                sar_y_idx=y_idx, sar_x_idx=x_idx,
+                sar_scene_name=sar_scene_name,
+            ))
+        return results
+
+    # ------------------------------------------------------------------
+    # Cell-averaging (grid mode) -- placeholder, implemented in Task 9
+    # ------------------------------------------------------------------
+
+    def _collocate_cell_averaging_grid(
+        self,
+        sar_data: Dict[str, np.ndarray],
+        sar_lon: np.ndarray,
+        sar_lat: np.ndarray,
+        sar_time: np.ndarray,
+        era5_ds: xr.Dataset,
+        val_source: str,
+        sar_scene_name: str,
+    ) -> List[CollocatedPoint]:
+        raise NotImplementedError("cell-averaging is implemented in Task 9")
