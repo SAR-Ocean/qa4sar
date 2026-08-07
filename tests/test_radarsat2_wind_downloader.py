@@ -253,16 +253,35 @@ class TestParseNcmlBbox:
 
 
 class TestRadarsat2WindDownloaderDownload:
-    def test_dry_run_makes_no_network_call(self, tmp_path):
+    def test_dry_run_queries_catalog_but_never_ncml_or_fileserver(self, tmp_path, capsys):
+        """dry-run must answer whether real scenes exist for the requested
+        bbox/time -- so it does fetch each touched month's (lightweight)
+        catalog.xml -- but must never reach the per-candidate NCML check
+        or a full fileServer download, and must always return []."""
         from sar_validation.downloaders.radarsat2_wind_downloader import RADARSAT2WindDownloader
 
-        dl = RADARSAT2WindDownloader(output_dir=tmp_path, dry_run=True)
+        requested_urls = []
+
+        def fake_urlopen(url, timeout=None):
+            requested_urls.append(url)
+            cm = MagicMock()
+            cm.__enter__.return_value.read.return_value = _NEW_ERA_CATALOG_XML.encode()
+            return cm
+
         with patch(
-            "sar_validation.downloaders.radarsat2_wind_downloader.urllib.request.urlopen"
-        ) as m:
+            "sar_validation.downloaders.radarsat2_wind_downloader.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            dl = RADARSAT2WindDownloader(output_dir=tmp_path, dry_run=True)
             out = dl.download(170, 180, 60, 68, "2026-06-01", "2026-06-30")
+
         assert out == []
-        m.assert_not_called()
+        assert requested_urls  # the catalog.xml call did happen
+        assert not any("/ncml/" in u or "/fileServer/" in u for u in requested_urls)
+        assert not any(tmp_path.glob("*.nc"))
+        out_text = capsys.readouterr().out
+        assert "1 candidate scene" in out_text  # only 64N-174E is inside [170,180]
+        assert "64N-174E" in out_text
 
     def test_month_404_skipped_not_raised(self, tmp_path):
         import urllib.error
@@ -302,6 +321,81 @@ class TestRadarsat2WindDownloaderDownload:
 
         assert len(out) == 1  # only 64N-174E is inside the non-wrapping [170,180] window
         assert "64N-174E" in out[0].name
+
+    def test_fresh_download_prints_confirmation(self, tmp_path, capsys):
+        """A freshly-downloaded granule must print a confirmation line, the
+        same way every other downloader in this pipeline reports progress
+        -- previously nothing was printed for a first-time RADARSAT-2
+        download (only the "Already downloaded" cache-hit case printed)."""
+        from sar_validation.downloaders.radarsat2_wind_downloader import RADARSAT2WindDownloader
+
+        def fake_urlopen(url, timeout=None):
+            cm = MagicMock()
+            if "/fileServer/" in url:
+                cm.__enter__.return_value.read.return_value = b"fake-netcdf-bytes"
+            elif "/ncml/" in url:
+                cm.__enter__.return_value.read.return_value = _NEW_ERA_NCML_XML.encode()
+            else:
+                cm.__enter__.return_value.read.return_value = _NEW_ERA_CATALOG_XML.encode()
+            return cm
+
+        with patch(
+            "sar_validation.downloaders.radarsat2_wind_downloader.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            dl = RADARSAT2WindDownloader(output_dir=tmp_path, dry_run=False)
+            out = dl.download(170, 180, 60, 68, "2026-06-01", "2026-06-30")
+
+        assert len(out) == 1
+        out_text = capsys.readouterr().out
+        assert "Downloaded" in out_text
+        assert "64N-174E" in out_text
+
+    def test_date_only_end_excludes_scene_after_that_days_midnight(self, tmp_path):
+        """A recipe end bound of "2026-06-05" (date-only) normalizes to
+        that date's literal midnight -- the same instant normalize_datetime
+        and the in-situ downloader already treat it as -- not "through the
+        end of that day". A granule timestamped 2026-06-05T05:24:00 (i.e.
+        after that midnight) must therefore be excluded."""
+        from sar_validation.downloaders.radarsat2_wind_downloader import RADARSAT2WindDownloader
+
+        inside_name = (
+            "SAR-Wind-HH-64N-174E_v3r0_rsat2_s202606040552510_"
+            "e202606040554070_c202606041745293.nc"
+        )
+        after_midnight_name = (
+            "SAR-Wind-HH-66N-181E_v3r0_rsat2_s202606050524000_"
+            "e202606050525160_c202606050613357.nc"
+        )
+        catalog = (
+            '<?xml version="1.0"?>'
+            '<catalog xmlns="http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0">'
+            f'<dataset name="{inside_name}" urlPath="sar-winds/radarsat2/2026/06/{inside_name}" />'
+            f'<dataset name="{after_midnight_name}" '
+            f'urlPath="sar-winds/radarsat2/2026/06/{after_midnight_name}" />'
+            "</catalog>"
+        )
+
+        def fake_urlopen(url, timeout=None):
+            cm = MagicMock()
+            if "/fileServer/" in url:
+                cm.__enter__.return_value.read.return_value = b"fake-netcdf-bytes"
+            elif "/ncml/" in url:
+                cm.__enter__.return_value.read.return_value = _NEW_ERA_NCML_XML.encode()
+            else:
+                cm.__enter__.return_value.read.return_value = catalog.encode()
+            return cm
+
+        with patch(
+            "sar_validation.downloaders.radarsat2_wind_downloader.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            dl = RADARSAT2WindDownloader(output_dir=tmp_path, dry_run=False)
+            out = dl.download(165, 180, 60, 68, "2026-06-01", "2026-06-05")
+
+        names = {p.name for p in out}
+        assert inside_name in names
+        assert after_midnight_name not in names
         assert out[0].exists()
         assert out[0].read_bytes() == b"fake-netcdf-bytes"
 

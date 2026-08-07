@@ -39,7 +39,7 @@ import re
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -214,8 +214,10 @@ class RADARSAT2WindDownloader:
     output_dir : Path
         Directory to save downloaded granules.
     dry_run : bool
-        If True, print what would be searched and return [] without any
-        network calls.
+        If True, query each touched month's (lightweight) catalog.xml and
+        report the real candidate scene count/filenames, but never touch
+        the per-candidate NCML check or a full fileServer download; always
+        returns [].
     force_download : bool
         Re-download a granule even if a same-named file already exists.
     """
@@ -236,20 +238,14 @@ class RADARSAT2WindDownloader:
 
     def _download_window(self, min_lon, max_lon, min_lat, max_lat, start: str, end: str) -> list[Path]:
         start_dt = datetime.fromisoformat(normalize_datetime(start))
+        # A bare date (e.g. "2026-06-05") normalizes to that date's literal
+        # midnight -- the same instant normalize_datetime and every other
+        # exact-instant comparison in this pipeline (e.g. the in-situ
+        # download window) already treat it as. A granule timestamped
+        # later that same day is therefore genuinely outside the requested
+        # window and must not be matched; end_dt is used as-is, with no
+        # "widen to the whole day" special-casing.
         end_dt = datetime.fromisoformat(normalize_datetime(end))
-        is_end_date_only = len(end.strip().rstrip("Z")) == 10  # YYYY-MM-DD
-        end_dt_for_matching = end_dt + timedelta(days=1) if is_end_date_only else end_dt
-
-        if self.dry_run:
-            print(
-                f"[dry-run] RADARSAT-2 wind would search "
-                f"{THREDDS_BASE}/catalog/sar-winds/radarsat2/{{YYYY}}/{{MM}}/catalog.xml "
-                f"for scenes centered within "
-                f"[{min_lon - _BBOX_PAD_DEG}, {max_lon + _BBOX_PAD_DEG}] x "
-                f"[{min_lat - _BBOX_PAD_DEG}, {max_lat + _BBOX_PAD_DEG}] "
-                f"in [{start_dt}, {end_dt_for_matching}]"
-            )
-            return []
 
         granules: List[Tuple[datetime, str, float, float]] = []
         for year, month in months_touched(start_dt, end_dt):
@@ -263,13 +259,27 @@ class RADARSAT2WindDownloader:
                 raise
             granules.extend(
                 _list_radarsat2_granules(
-                    text, start_dt, end_dt_for_matching,
+                    text, start_dt, end_dt,
                     min_lon, max_lon, min_lat, max_lat,
-                    end_exclusive=is_end_date_only,
                 )
             )
 
         logger.info("radarsat2_wind: %d candidate granule(s) matched", len(granules))
+
+        if self.dry_run:
+            # Still queries each touched month's (lightweight) catalog.xml
+            # above -- so this reports real candidate availability -- but
+            # never touches the per-candidate NCML check or a full
+            # ~38MB fileServer download.
+            print(
+                f"[dry-run] RADARSAT-2 wind: {len(granules)} candidate scene(s) "
+                f"in [{start_dt}, {end_dt}] within "
+                f"[{min_lon - _BBOX_PAD_DEG}, {max_lon + _BBOX_PAD_DEG}] x "
+                f"[{min_lat - _BBOX_PAD_DEG}, {max_lat + _BBOX_PAD_DEG}]"
+            )
+            for _ts, url_path, _lon, _lat in granules:
+                print(f"  {Path(url_path).name}")
+            return []
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         downloaded: list[Path] = []
@@ -291,6 +301,7 @@ class RADARSAT2WindDownloader:
                 f"{THREDDS_BASE}/fileServer/{url_path}", timeout=15
             ) as resp:
                 dest.write_bytes(resp.read())
+            print(f"  Downloaded: {dest}")
             downloaded.append(dest)
 
         return downloaded
