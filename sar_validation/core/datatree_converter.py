@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -43,6 +43,44 @@ _ASCAT_REJECT_FLAGS = {
     "wind_inversion_not_successful",
     "not_enough_good_sigma0_for_wind_retrieval",
     "distance_to_gmf_too_large",
+}
+
+#: ERA5 variable metadata per recipe variable -- raw CDS/NetCDF short
+#: names, the data_type tag stamped on the result, and CF-ish attrs. Kept
+#: gridded (never flattened to `point`, unlike every other validation
+#: source) since ModelLayerCollocation interpolates it directly onto SAR
+#: pixel locations at collocation time.
+_ERA5_VARS: dict[str, dict] = {
+    "wind": {
+        "raw": ["u10", "v10"],
+        "data_type": "era5_wind",
+        "cf": {
+            "u10": {"units": "m s-1", "standard_name": "eastward_wind", "long_name": "ERA5 10m u-component of wind"},
+            "v10": {"units": "m s-1", "standard_name": "northward_wind", "long_name": "ERA5 10m v-component of wind"},
+        },
+    },
+    "waves": {
+        "raw": ["swh"],
+        "data_type": "era5_waves",
+        "cf": {
+            "swh": {
+                "units": "m",
+                "standard_name": "sea_surface_wave_significant_height",
+                "long_name": "ERA5 significant height of combined wind waves and swell",
+            },
+        },
+    },
+    "soil_moisture": {
+        "raw": ["swvl1"],
+        "data_type": "era5_soil_moisture",
+        "cf": {
+            "swvl1": {
+                "units": "m3 m-3",
+                "standard_name": "volume_fraction_of_water_in_soil_layer",
+                "long_name": "ERA5-Land volumetric soil water layer 1 (0-7cm, H-TESSEL)",
+            },
+        },
+    },
 }
 
 
@@ -1826,6 +1864,102 @@ class DataTreeConverter:
         return ds
 
     @staticmethod
+    def from_era5(
+        nc_paths: Union[str, Path, Sequence[Union[str, Path]]],
+        variable: str,
+    ) -> Optional[xr.Dataset]:
+        """
+        Open one or more ERA5 daily NetCDF files (as downloaded by
+        :class:`~sar_validation.downloaders.era5_downloader.ERA5Downloader`)
+        and return one combined, GRIDDED Dataset (dims: ``time``, ``lat``,
+        ``lon``) covering every requested day.
+
+        Unlike every other validation-source converter, the result is NOT
+        flattened to a ``point`` dimension -- the whole point of ERA5's
+        collocation method (bilinear spatial + nearest-hour/hyperbolic
+        temporal interpolation, see
+        ``sar_validation.core.model_collocation``) is to interpolate this
+        grid directly onto SAR pixel/point locations at collocation time.
+
+        Parameters
+        ----------
+        nc_paths : Path or list of Path
+            One or more ERA5 daily NetCDF files for the SAME *variable*.
+            Multiple files are concatenated along ``time`` so the hyperbolic
+            method can find bracketing hours across a day boundary.
+        variable : str
+            One of ``"wind"``, ``"waves"``, ``"soil_moisture"``.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type``/``platform_type`` set to
+            ``"era5_wind"``/``"era5_waves"``/``"era5_soil_moisture"``, or
+            None on failure.
+        """
+        if variable not in _ERA5_VARS:
+            logger.warning("from_era5: unknown variable %r (expected wind/waves/soil_moisture).", variable)
+            return None
+
+        paths = [Path(p) for p in ([nc_paths] if isinstance(nc_paths, (str, Path)) else nc_paths)]
+        existing = sorted(p for p in paths if p.exists())
+        if not existing:
+            logger.warning("from_era5: no files found among %s", paths)
+            return None
+
+        # xr.open_mfdataset requires the optional `dask` package, which
+        # isn't a dependency of this project -- open each daily file
+        # individually and concatenate along time instead, matching how
+        # the rest of this codebase (e.g. from_c3s_ssm) avoids that
+        # dependency.
+        try:
+            per_day = [xr.open_dataset(p) for p in existing]
+            raw = per_day[0] if len(per_day) == 1 else xr.concat(per_day, dim="time")
+            # ERA5 regional daily files are small (bbox-limited); load fully
+            # into memory now so the Dataset returned below doesn't hold
+            # lazy references into a file handle that's about to be closed.
+            raw = raw.load()
+            for d in per_day:
+                d.close()
+        except Exception as exc:
+            logger.warning("Could not open ERA5 file(s) %s: %s", paths, exc)
+            return None
+
+        rename = {}
+        if "latitude" in raw.coords:
+            rename["latitude"] = "lat"
+        if "longitude" in raw.coords:
+            rename["longitude"] = "lon"
+        if rename:
+            raw = raw.rename(rename)
+
+        spec = _ERA5_VARS[variable]
+        missing = [v for v in spec["raw"] if v not in raw.variables]
+        if missing:
+            logger.warning(
+                "from_era5: missing variable(s) %s in %s (available: %s).",
+                missing, paths, list(raw.variables),
+            )
+            raw.close()
+            return None
+
+        data_vars = {}
+        for var in spec["raw"]:
+            da = raw[var].astype("float32")
+            da.attrs.update(spec["cf"][var])
+            data_vars[var] = da
+
+        ds = xr.Dataset(
+            data_vars,
+            coords={"time": raw["time"], "lat": raw["lat"], "lon": raw["lon"]},
+        )
+        ds.attrs["data_type"] = spec["data_type"]
+        ds.attrs["platform_type"] = spec["data_type"]
+        ds.attrs["source"] = f"ERA5 reanalysis ({variable}, Copernicus CDS)"
+        raw.close()
+        return ds
+
+    @staticmethod
     def from_hf_radar_grid(
         nc_path: Union[str, Path],
         u_var: str = "water_u",
@@ -3257,6 +3391,7 @@ class DataTreeConverter:
         - ``smos_ssm/*.nc``             → ``validation/smos_ssm/<stem>`` nodes
         - ``cds_ssm/*.nc``              → ``validation/cds_ssm/<stem>`` nodes
         - ``altimeter/*.nc``           → ``validation/altimeter/<stem>`` nodes
+        - ``era5/*.nc``                 → single combined, GRIDDED ``validation/era5/era5`` node
 
         Parameters
         ----------
@@ -3581,6 +3716,24 @@ class DataTreeConverter:
                 if ds is not None:
                     datasets[f"validation/radiometer/{f.stem}"] = ds
                     logger.info("Converted radiometer: %s", f.name)
+
+        # ERA5 reanalysis (Copernicus CDS) -- kept as a single combined,
+        # GRIDDED node (not flattened to `point`, unlike every other
+        # validation source) since ModelLayerCollocation interpolates it
+        # directly onto SAR pixel locations at collocation time. Every
+        # daily file downloaded for this run is opened together so the
+        # hyperbolic method can find bracketing hours across a day
+        # boundary. Not passed through _filtered() -- that helper assumes
+        # a `point` dimension.
+        subdir = base_dir / "era5"
+        if subdir.exists():
+            era5_files = sorted(subdir.glob("*.nc"))
+            era5_variable = recipe.config.variable if recipe is not None else None
+            if era5_files and era5_variable in ("wind", "waves", "soil_moisture"):
+                ds = DataTreeConverter.from_era5(era5_files, era5_variable)
+                if ds is not None:
+                    datasets["validation/era5/era5"] = ds
+                    logger.info("Converted ERA5 (%s): %d file(s)", era5_variable, len(era5_files))
 
         if not datasets:
             logger.warning("No convertible data found in %s", base_dir)

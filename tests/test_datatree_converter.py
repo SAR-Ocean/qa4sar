@@ -2695,3 +2695,123 @@ class TestConvertDownloadedDataCdsSsm:
         (node,) = tree["validation/cds_ssm"].children.values()
         ds = node.to_dataset()
         assert ds["SOIL_MOISTURE"].attrs["units"] == "m3 m-3"
+
+
+class TestFromEra5:
+    def _write_era5_nc(self, path, var_names, n_lat=4, n_lon=4, n_time=3, start_hour="2026-07-12T00:00:00"):
+        import numpy as np
+        import xarray as xr
+
+        lat = np.linspace(40.0, 41.5, n_lat)
+        lon = np.linspace(-10.0, -8.5, n_lon)
+        time = xr.date_range(start_hour, periods=n_time, freq="1h")
+        data_vars = {
+            v: (("time", "latitude", "longitude"), np.random.rand(n_time, n_lat, n_lon).astype("float32"))
+            for v in var_names
+        }
+        ds = xr.Dataset(data_vars, coords={"time": time, "latitude": lat, "longitude": lon})
+        ds.to_netcdf(path)
+
+    def test_wind_returns_gridded_dataset_with_correct_data_type(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_wind_20260712.nc"
+        self._write_era5_nc(nc_path, ["u10", "v10"])
+
+        ds = DataTreeConverter.from_era5(nc_path, "wind")
+        assert ds is not None
+        assert ds.attrs["data_type"] == "era5_wind"
+        assert set(ds.dims) == {"time", "lat", "lon"}
+        assert "u10" in ds.data_vars and "v10" in ds.data_vars
+
+    def test_waves_returns_swh_variable(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_waves_20260712.nc"
+        self._write_era5_nc(nc_path, ["swh"])
+
+        ds = DataTreeConverter.from_era5(nc_path, "waves")
+        assert ds is not None
+        assert ds.attrs["data_type"] == "era5_waves"
+        assert "swh" in ds.data_vars
+
+    def test_soil_moisture_returns_swvl1_variable(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_soil_moisture_20260712.nc"
+        self._write_era5_nc(nc_path, ["swvl1"])
+
+        ds = DataTreeConverter.from_era5(nc_path, "soil_moisture")
+        assert ds is not None
+        assert ds.attrs["data_type"] == "era5_soil_moisture"
+        assert "swvl1" in ds.data_vars
+
+    def test_multiple_daily_files_concatenated_along_time(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        day1 = tmp_path / "era5_wind_20260712.nc"
+        day2 = tmp_path / "era5_wind_20260713.nc"
+        self._write_era5_nc(day1, ["u10", "v10"], n_time=24, start_hour="2026-07-12T00:00:00")
+        self._write_era5_nc(day2, ["u10", "v10"], n_time=24, start_hour="2026-07-13T00:00:00")
+
+        ds = DataTreeConverter.from_era5([day1, day2], "wind")
+        assert ds is not None
+        assert ds.sizes["time"] == 48
+
+    def test_unknown_variable_returns_none(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_currents_20260712.nc"
+        self._write_era5_nc(nc_path, ["u10"])
+
+        assert DataTreeConverter.from_era5(nc_path, "currents") is None
+
+    def test_missing_file_returns_none(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        assert DataTreeConverter.from_era5(tmp_path / "nope.nc", "wind") is None
+
+    def test_missing_expected_variable_returns_none(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_wind_20260712.nc"
+        self._write_era5_nc(nc_path, ["v10"])  # missing u10
+
+        assert DataTreeConverter.from_era5(nc_path, "wind") is None
+
+
+class TestConvertDownloadedDataEra5:
+    def test_era5_dir_discovered_and_combined_into_one_node(self, tmp_path):
+        import numpy as np
+        import xarray as xr
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import (
+            GeographicBounds, Recipe, RecipeConfig, TemporalBounds,
+        )
+
+        era5_dir = tmp_path / "era5"
+        era5_dir.mkdir()
+        lat = np.linspace(40.0, 41.5, 4)
+        lon = np.linspace(-10.0, -8.5, 4)
+        for day, stem in [("2026-07-12T00:00:00", "20260712"), ("2026-07-13T00:00:00", "20260713")]:
+            time = xr.date_range(day, periods=24, freq="1h")
+            ds = xr.Dataset(
+                {
+                    "u10": (("time", "latitude", "longitude"), np.random.rand(24, 4, 4).astype("float32")),
+                    "v10": (("time", "latitude", "longitude"), np.random.rand(24, 4, 4).astype("float32")),
+                },
+                coords={"time": time, "latitude": lat, "longitude": lon},
+            )
+            ds.to_netcdf(era5_dir / f"era5_wind_{stem}.nc")
+
+        recipe = Recipe(RecipeConfig(
+            name="t", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, -8.5, 40.0, 41.5),
+            temporal_bounds=TemporalBounds("2026-07-12", "2026-07-13"),
+        ))
+
+        tree = DataTreeConverter.convert_downloaded_data(tmp_path, recipe=recipe)
+        assert tree is not None
+        era5_ds = tree["validation/era5/era5"].to_dataset()
+        assert era5_ds.sizes["time"] == 48
+        assert era5_ds.attrs["data_type"] == "era5_wind"
