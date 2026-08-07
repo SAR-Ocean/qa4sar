@@ -1455,6 +1455,7 @@ def run_collocation(
     from pathlib import Path as _Path
 
     from .datatree_converter import DataTreeConverter
+    from .model_collocation import ModelLayerCollocation
 
     base_dir = _Path(base_dir)
     coll_cfg = recipe.config.collocation
@@ -1540,9 +1541,41 @@ def run_collocation(
                         "colloc_kwargs": source_type_overrides.get(source_type, {}),
                     }
 
+    # Gridded "model" sources (currently only ERA5) -- kept as raw, native
+    # (time, lat, lon) Datasets rather than flattened into `buckets`/
+    # `val_dfs` like every other validation source, since
+    # ModelLayerCollocation interpolates the field directly onto SAR pixel
+    # locations at collocation time instead of matching against
+    # pre-existing rows. Detected by a "era5_" data_type prefix rather
+    # than a "point" dimension check.
+    model_sources: Dict[str, "xr.Dataset"] = {}
+    model_source_metadata: Dict[str, Dict[str, Any]] = {}
+    if "validation" in datatree.children:
+        for name, node in datatree["validation"].children.items():
+            ds = node.to_dataset()
+            if ds.attrs.get("data_type", "").startswith("era5_"):
+                model_sources[name] = ds
+                model_source_metadata[name] = {
+                    "colloc_kwargs": source_type_overrides.get("era5", {}),
+                }
+            # One level deeper -- DataTreeConverter places ERA5 at
+            # "validation/era5/era5" (same "may be nested one level
+            # deeper" layout as every other satellite-product source; see
+            # the two-level scan above), so the actual leaf Dataset (and
+            # its data_type attr) lives one level below the group node
+            # checked above, which itself carries no attrs of its own.
+            for subname, subnode in node.children.items():
+                sub_ds = subnode.to_dataset()
+                if sub_ds.attrs.get("data_type", "").startswith("era5_"):
+                    path = f"{name}/{subname}"
+                    model_sources[path] = sub_ds
+                    model_source_metadata[path] = {
+                        "colloc_kwargs": source_type_overrides.get("era5", {}),
+                    }
+
     _merge_sibling_ssm_nodes(buckets, source_metadata, layer_vs_layer_specs)
 
-    total_sources = sum(len(v) for v in buckets.values())
+    total_sources = sum(len(v) for v in buckets.values()) + len(model_sources)
     if total_sources == 0:
         logger.warning("No validation nodes with 'point' dimension found — nothing to collocate.")
         return None
@@ -1744,6 +1777,32 @@ def run_collocation(
                         sar_name, val_name, collocation_type, len(matches),
                     )
 
+            # ERA5 (or any future gridded "model" source) -- see
+            # docs/design-choices.md. WV imagettes are sparse SAR-anchor
+            # points, so ModelLayerCollocation.collocate_points always
+            # interpolates ERA5 directly at each imagette regardless of
+            # the recipe's chosen method.
+            for val_name, val_ds in model_sources.items():
+                per_source_kwargs = model_source_metadata.get(val_name, {}).get("colloc_kwargs", {})
+                layer_type = val_ds.attrs.get("data_type", "era5")
+                model_kwargs = dict(layer_vs_layer_specs.get(layer_type, {}))
+                model_kwargs.update(per_source_kwargs)
+                model_colloc = ModelLayerCollocation(
+                    method=model_kwargs.get("method", "cell-averaging"),
+                    temporal_method=model_kwargs.get("temporal_method", "hyperbolic"),
+                )
+                source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
+                matches = model_colloc.collocate_points(
+                    sar_point_vars=sar_point_vars,
+                    sar_lons=sar_lons, sar_lats=sar_lats, sar_times=sar_times,
+                    era5_ds=val_ds, val_source=source_label, sar_scene_name=sar_name,
+                )
+                all_collocations.extend(matches)
+                logger.info(
+                    "SAR '%s' × validation '%s' [model_vs_layer/points]: %d match(es)",
+                    sar_name, val_name, len(matches),
+                )
+
         else:
             # =========== IW/EW MODE (Grid-based) ===========
             sar_lon = sar_ds["lon"].values           # (y, x)
@@ -1819,6 +1878,34 @@ def run_collocation(
                         "SAR '%s' × validation '%s' [%s]: %d match(es)",
                         sar_name, val_name, ctype, len(matches),
                     )
+
+            # ERA5 (or any future gridded "model" source) -- see
+            # docs/design-choices.md and
+            # docs/superpowers/specs/2026-08-06-era5-model-validation-design.md.
+            for val_name, val_ds in model_sources.items():
+                per_source_kwargs = model_source_metadata.get(val_name, {}).get("colloc_kwargs", {})
+                layer_type = val_ds.attrs.get("data_type", "era5")
+                model_kwargs = dict(layer_vs_layer_specs.get(layer_type, {}))
+                model_kwargs.update(per_source_kwargs)
+                model_colloc = ModelLayerCollocation(
+                    method=model_kwargs.get("method", "cell-averaging"),
+                    temporal_method=model_kwargs.get("temporal_method", "hyperbolic"),
+                    time_tolerance_minutes=model_kwargs.get("time_tolerance_minutes", 60),
+                    aggregation_window_km=model_kwargs.get("aggregation_window_km", 12.5),
+                    distance_weighting=model_kwargs.get("distance_weighting", "equal"),
+                    gaussian_sigma_km=model_kwargs.get("gaussian_sigma_km", 12.5),
+                )
+                source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
+                matches = model_colloc.collocate(
+                    sar_data=sar_data_3d, sar_lon=sar_lon, sar_lat=sar_lat,
+                    sar_time=sar_time_arr, era5_ds=val_ds,
+                    val_source=source_label, sar_scene_name=sar_name,
+                )
+                all_collocations.extend(matches)
+                logger.info(
+                    "SAR '%s' × validation '%s' [model_vs_layer]: %d match(es)",
+                    sar_name, val_name, len(matches),
+                )
 
     if not all_collocations:
         logger.warning("Collocation complete — no matches found.")

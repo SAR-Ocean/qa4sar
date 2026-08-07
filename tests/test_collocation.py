@@ -1818,3 +1818,94 @@ class TestAverageWithinSarTolerance:
         )
 
         assert len(result) == 0
+
+
+class TestRunCollocationEra5Wiring:
+    def _build_datatree_and_recipe(self, tmp_path):
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.core.recipe import (
+            CollocationType,
+            GeographicBounds,
+            LayerVsLayerCollocation,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+
+        # SAR grid-mode scene: 4x4 pixels, single acquisition time.
+        sar_lat = np.linspace(40.5, 41.5, 4)
+        sar_lon = np.linspace(-9.5, -8.5, 4)
+        sar_lon2d, sar_lat2d = np.meshgrid(sar_lon, sar_lat)
+        sar_time = np.datetime64("2026-07-12T01:00:00")
+        sar_ds = xr.Dataset(
+            {"owiWindSpeed": (("y", "x"), np.full((4, 4), 7.5))},
+            coords={
+                "lon": (("y", "x"), sar_lon2d), "lat": (("y", "x"), sar_lat2d),
+                "time": sar_time,
+            },
+        )
+
+        # ERA5 validation node: 2x2 native cells, hours 0/1/2, constant
+        # ramp value = hour_index * 10 (spatially uniform, as in
+        # test_model_collocation.py's _make_era5_ds) so the expected
+        # interpolated value is predictable.
+        era5_lat = np.linspace(40.0, 42.0, 2)
+        era5_lon = np.linspace(-10.0, -8.0, 2)
+        era5_time = pd.to_datetime(
+            ["2026-07-12T00:00:00", "2026-07-12T01:00:00", "2026-07-12T02:00:00"]
+        )
+        u10 = np.stack([np.full((2, 2), h * 10.0) for h in range(3)])
+        era5_ds = xr.Dataset(
+            {"u10": (("time", "lat", "lon"), u10)},
+            coords={"time": era5_time, "lat": era5_lat, "lon": era5_lon},
+        )
+        era5_ds.attrs["data_type"] = "era5_wind"
+        era5_ds.attrs["platform_type"] = "era5_wind"
+
+        tree = xr.DataTree.from_dict({
+            "/sar/scene1": sar_ds,
+            "/validation/era5/era5": era5_ds,
+        })
+
+        cfg = RecipeConfig(
+            name="t", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, -8.0, 40.0, 42.0),
+            temporal_bounds=TemporalBounds("2026-07-12T00:00:00", "2026-07-12T02:00:00"),
+            validation_sources=[ValidationDataSource(source_type="era5")],
+            collocation=CollocationType(
+                layer_vs_layer=LayerVsLayerCollocation(layer_type_specs={
+                    "era5_wind": {
+                        "method": "cell-averaging", "temporal_method": "nearest",
+                        # Deliberately generous: the ERA5 grid here spans a
+                        # full 2deg x 2deg box while the SAR grid only
+                        # covers the inner 1deg x 1deg, so the nearest SAR
+                        # pixel to an ERA5 corner cell is ~70km away. This
+                        # test only verifies era5 nodes get wired into
+                        # run_collocation at all -- aggregation-window
+                        # tuning itself is covered by Task 9's dedicated
+                        # unit tests, so a wide window here avoids the test
+                        # being fragile to the exact synthetic geometry.
+                        "aggregation_window_km": 300.0, "distance_weighting": "equal",
+                    },
+                }),
+            ),
+        )
+        return tree, Recipe(cfg)
+
+    def test_era5_node_produces_model_vs_layer_matches(self, tmp_path):
+        from sar_validation.core.collocation import run_collocation
+
+        tree, recipe = self._build_datatree_and_recipe(tmp_path)
+        result_ds = run_collocation(recipe, tree, tmp_path)
+
+        assert result_ds is not None
+        assert "val_source" in result_ds
+        sources = set(result_ds["val_source"].values.tolist())
+        assert "era5_wind" in sources
+
+        era5_mask = result_ds["val_source"].values == "era5_wind"
+        assert int(era5_mask.sum()) > 0
