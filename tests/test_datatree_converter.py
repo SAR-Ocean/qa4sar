@@ -2732,6 +2732,39 @@ class TestFromEra5:
         assert "u10" not in ds.data_vars and "v10" not in ds.data_vars
         expected_wspd = np.hypot(arrays["u10"], arrays["v10"])
         np.testing.assert_allclose(ds["WSPD"].values, expected_wspd, rtol=1e-5)
+        # WDIR: meteorological "wind FROM" direction, clockwise from north.
+        # Independently re-derived from the same random u10/v10 fixture
+        # arrays (not copied from the implementation's own expression).
+        expected_wdir = (270.0 - np.degrees(np.arctan2(arrays["v10"], arrays["u10"]))) % 360.0
+        np.testing.assert_allclose(ds["WDIR"].values, expected_wdir, rtol=1e-5)
+
+    def test_wind_direction_hand_checkable_case(self, tmp_path):
+        """u10=0, v10=-1 is wind blowing FROM the north (northerly wind) --
+        the meteorological convention gives WDIR = 0/360 degrees exactly.
+        A concrete, hand-checkable sanity case independent of the general
+        formula re-derivation above."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        lat = np.array([40.0])
+        lon = np.array([-10.0])
+        time = xr.date_range("2026-07-12T00:00:00", periods=1, freq="1h")
+        ds_in = xr.Dataset(
+            {
+                "u10": (("time", "latitude", "longitude"), np.zeros((1, 1, 1), dtype="float32")),
+                "v10": (("time", "latitude", "longitude"), -np.ones((1, 1, 1), dtype="float32")),
+            },
+            coords={"time": time, "latitude": lat, "longitude": lon},
+        )
+        nc_path = tmp_path / "era5_wind_20260712.nc"
+        ds_in.to_netcdf(nc_path)
+
+        ds = DataTreeConverter.from_era5(nc_path, "wind")
+        assert ds is not None
+        wdir = float(ds["WDIR"].values.ravel()[0])
+        assert wdir == pytest.approx(0.0) or wdir == pytest.approx(360.0)
 
     def test_waves_returns_vhm0_variable(self, tmp_path):
         from sar_validation.core.datatree_converter import DataTreeConverter
