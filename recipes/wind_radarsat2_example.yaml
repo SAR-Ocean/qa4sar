@@ -1,4 +1,4 @@
-name: wind_radarsat2_example
+name: wind_radarsat2_validation
 description: 'Validate RADARSAT-2 SAR-derived wind speed (NOAA NCEI,
 
   0.5 km, C-band) against moorings, buoys, ASCAT scatterometer,
@@ -14,13 +14,13 @@ variable_specs:
   components:
   - speed
 geographic_bounds:
-  min_lon: 165.0
-  max_lon: 180.0
+  min_lon: -179.0
+  max_lon: -155.0
   min_lat: 60.0
-  max_lat: 68.0
+  max_lat: 75.0
 temporal_bounds:
-  start: '2026-06-01'
-  end: '2026-06-05'
+  start: '2026-06-10'
+  end: '2026-06-12'
 sar_data:
   source: radarsat2
   swath_mode: []
