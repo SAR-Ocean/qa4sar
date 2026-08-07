@@ -2,7 +2,7 @@
 
 A standalone Python package for validating Level 2 SAR products against multi-source in-situ and satellite observations.
 
-Supports validation of **wind** (speed + direction), **ocean currents**, **significant wave height**, and **soil moisture**.
+Supports validation of **wind** (speed + direction), **ocean currents**, **significant wave height**, and **soil moisture** -- against in-situ, satellite, and model (ERA5) sources.
 
 Supported SAR products:
 - Sentinel-1 L2_OCN (Level 2 Ocean): wind/waves/currents
@@ -76,6 +76,7 @@ sar_validation/
     ├── altimeter_downloader.py                  # Along-track SWH/wind altimetry via Copernicus Marine
     ├── ascat_soil_moisture_downloader.py        # ASCAT (MetOp) soil moisture (SOMO12) via EUMETSAT EUMDAC (discontinued after 2025-07-15)
     ├── earthdata_soil_moisture_downloader.py    # AMSR-E/2, SMAP, and NISAR SME2 soil moisture via NASA Earthdata
+    ├── era5_downloader.py                       # ERA5 reanalysis (wind/waves/soil_moisture) via Copernicus CDS
     ├── gportal_downloader.py                    # AMSR2 soil moisture via JAXA G-Portal (SFTP)
     ├── hf_radar_downloader.py                   # Near-real-time HF-radar surface currents via Copernicus Marine
     ├── hf_radar_historical_downloader.py        # Delayed-mode/historical HF-radar currents via Copernicus Marine
