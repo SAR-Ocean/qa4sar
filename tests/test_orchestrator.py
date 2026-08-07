@@ -780,6 +780,89 @@ class TestPerSourceDownloadGating:
         mock_smos.assert_called_once()
 
 
+class TestLoadPreviousVariableAndEra5Gating:
+    """_load_previous_variable()/_already_succeeded("era5") together detect
+    the case where two recipes with identical geographic/temporal bounds
+    (so they share base_dir) request different recipe.config.variable
+    values -- e.g. wind_era5.yaml vs waves_era5.yaml. Scoped to era5 only,
+    matching cli.py's _is_already_downloaded's own era5-only scoping (see
+    TestIsAlreadyDownloaded in test_cli.py)."""
+
+    def _era5_recipe(self, variable):
+        cfg = RecipeConfig(
+            name="t", variable=variable,
+            geographic_bounds=GeographicBounds(-10.0, 10.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[ValidationDataSource(source_type="era5")],
+        )
+        return Recipe(cfg)
+
+    def test_load_previous_variable_reads_top_level_field(self, tmp_path):
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind", "downloads": {}, "errors": [],
+        }))
+        recipe = self._era5_recipe("wind")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        assert orchestrator._load_previous_variable() == "wind"
+
+    def test_load_previous_variable_none_when_metadata_missing(self, tmp_path):
+        recipe = self._era5_recipe("wind")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        assert orchestrator._load_previous_variable() is None
+
+    def test_already_succeeded_era5_true_when_variable_matches(self, tmp_path):
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"era5": {"status": "success"}},
+            "errors": [],
+        }))
+        recipe = self._era5_recipe("wind")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        orchestrator._previous_downloads = orchestrator._load_previous_downloads()
+        orchestrator._previous_variable = orchestrator._load_previous_variable()
+        assert orchestrator._already_succeeded("era5") is True
+
+    def test_already_succeeded_era5_false_when_variable_differs(self, tmp_path):
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"era5": {"status": "success"}},
+            "errors": [],
+        }))
+        recipe = self._era5_recipe("waves")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        orchestrator._previous_downloads = orchestrator._load_previous_downloads()
+        orchestrator._previous_variable = orchestrator._load_previous_variable()
+        assert orchestrator._already_succeeded("era5") is False
+
+    def test_already_succeeded_non_era5_source_ignores_variable_mismatch(self, tmp_path):
+        """A non-era5 source_type recorded successfully must not be
+        affected by a top-level variable mismatch -- the mismatch check in
+        _already_succeeded is explicitly scoped to source_type == "era5"."""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success"}},
+            "errors": [],
+        }))
+        recipe = self._era5_recipe("waves")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        orchestrator._previous_downloads = orchestrator._load_previous_downloads()
+        orchestrator._previous_variable = orchestrator._load_previous_variable()
+        assert orchestrator._already_succeeded("sar") is True
+
+
 class TestAmsrCoverageCutoffNotice:
     def _recipe_with_amsr(self, end_date: str):
         cfg = RecipeConfig(

@@ -6,7 +6,12 @@ import pytest
 import xarray as xr
 
 from sar_validation import cli
-from sar_validation.core.recipe import Recipe, RecipeConfig, SARDataSpec
+from sar_validation.core.recipe import (
+    Recipe,
+    RecipeConfig,
+    SARDataSpec,
+    ValidationDataSource,
+)
 
 
 def _waves_recipe(swath_mode):
@@ -554,6 +559,91 @@ class TestIsAlreadyDownloaded:
         from sar_validation.cli import _is_already_downloaded
 
         assert _is_already_downloaded(tmp_path) is False
+
+    def test_true_when_era5_recipe_variable_matches_recorded(self, tmp_path):
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "variable": "wind",
+            "downloads": {"era5": {"status": "success"}},
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="wind_era5_test",
+            variable="wind",
+            validation_sources=[ValidationDataSource(source_type="era5")],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is True
+
+    def test_false_when_era5_recipe_variable_differs_from_recorded(self, tmp_path):
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "variable": "wind",
+            "downloads": {"era5": {"status": "success"}},
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="waves_era5_test",
+            variable="waves",
+            validation_sources=[ValidationDataSource(source_type="era5")],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is False
+
+    def test_true_when_recorded_variable_missing_legacy_metadata(self, tmp_path):
+        """Legacy/synthetic download_metadata.json without a top-level
+        "variable" key must keep the old trust-it behavior -- this is the
+        exact case that caused a live, unmocked network download during
+        Task 15 when a naive first version of the mismatch check ignored
+        the "recorded_variable is not None" guard."""
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "downloads": {"era5": {"status": "success"}},
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="wind_era5_test",
+            variable="wind",
+            validation_sources=[ValidationDataSource(source_type="era5")],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is True
+
+    def test_true_when_non_era5_recipe_variable_differs_from_recorded(self, tmp_path):
+        """A non-ERA5 recipe/source pair sharing a base_dir with a
+        differing recorded ``variable`` must behave exactly as it did
+        before commit 7fcba5b -- i.e. the top-level variable mismatch is
+        irrelevant to sources other than era5, matching
+        DataOrchestrator._already_succeeded's own
+        ``source_type == "era5"`` scoping. Without that scoping, this
+        recipe/base_dir pair would wrongly bypass "Step 1 skipped" and
+        re-dispatch every _HISTORICAL_FIRST_TYPES source unconditionally
+        (they have no _already_succeeded gate of their own in
+        download_all()'s step 2)."""
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "variable": "currents",
+            "downloads": {
+                "sar": {"status": "success"},
+                "adcp_historical": {"status": "success"},
+            },
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="currents_test",
+            variable="waves",
+            validation_sources=[ValidationDataSource(source_type="adcp_historical")],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is True
 
 
 class TestExecuteRecipeForcesConvertCollocateWhenDownloadActuallyRan:

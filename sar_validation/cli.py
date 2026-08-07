@@ -949,21 +949,32 @@ def _is_already_downloaded(base_dir: Path, recipe: Optional["Recipe"] = None) ->
     errors list alone can't tell "genuinely fully downloaded" apart from
     "silently missing a source forever" without this extra check).
 
-    Also returns False when *recipe* is given and its ``variable`` differs
-    from the recorded run's -- two recipes with identical geographic/
-    temporal bounds share ``base_dir`` (e.g. ``wind_era5.yaml`` and
-    ``waves_era5.yaml`` both cover the same bbox/window to reuse the SAR
-    download), but ERA5's downloaded file depends on ``variable``
-    (``era5_<variable>_<day>.nc``, an entirely different CDS dataset/
-    variable set per variable) -- unlike SAR, whose L2 OCN product already
-    contains every OWI field regardless of which recipe downloaded it.
-    Without this check, Step 1 is skipped wholesale and the new variable's
-    ERA5 data is never fetched (confirmed live 2026-08-07: waves_era5.yaml
-    run right after wind_era5.yaml produced a DataTree with zero era5
-    nodes). Falling through to ``orchestrator.download_all()`` here is
-    safe/cheap: its own per-source ``_already_succeeded`` check (see
-    ``DataOrchestrator._load_previous_variable``) still skips re-downloading
-    SAR, only ERA5 actually re-dispatches."""
+    Also returns False when *recipe* requests an ``era5`` validation source
+    and its ``variable`` differs from the recorded run's -- two recipes
+    with identical geographic/temporal bounds share ``base_dir`` (e.g.
+    ``wind_era5.yaml`` and ``waves_era5.yaml`` both cover the same bbox/
+    window to reuse the SAR download), but ERA5's downloaded file depends
+    on ``variable`` (``era5_<variable>_<day>.nc``, an entirely different
+    CDS dataset/variable set per variable) -- unlike SAR, whose L2 OCN
+    product already contains every OWI field regardless of which recipe
+    downloaded it. Without this check, Step 1 is skipped wholesale and the
+    new variable's ERA5 data is never fetched (confirmed live 2026-08-07:
+    waves_era5.yaml run right after wind_era5.yaml produced a DataTree with
+    zero era5 nodes). Falling through to ``orchestrator.download_all()``
+    here is safe/cheap: its own per-source ``_already_succeeded`` check
+    (see ``DataOrchestrator._load_previous_variable``) still skips
+    re-downloading SAR, only ERA5 actually re-dispatches.
+
+    This mismatch check is deliberately scoped to recipes that actually
+    request an ``era5`` source -- matching ``DataOrchestrator.
+    _already_succeeded``'s own ``source_type == "era5"`` scoping. Without
+    that scoping, ANY non-ERA5 recipe pair sharing a ``base_dir`` with a
+    differing ``variable`` (recorded once, globally, per run -- not
+    per-source) would have this fast path bypassed on every rerun, forcing
+    every ``_HISTORICAL_FIRST_TYPES`` source (hf_radar_historical,
+    adcp_historical, argo_historical, drifter_historical,
+    glider_historical) to redispatch unconditionally, since step 2 of
+    ``download_all()`` has no ``_already_succeeded`` gate of its own."""
     import json as _json
     meta_path = base_dir / "download_metadata.json"
     if not meta_path.exists():
@@ -980,7 +991,10 @@ def _is_already_downloaded(base_dir: Path, recipe: Optional["Recipe"] = None) ->
         # trust-it behavior applies (a minimal ``{"errors": [], ...}``
         # fixture, as several tests use to force this shortcut without
         # touching the network, must keep working).
-        if recipe is not None and recorded_variable is not None \
+        recipe_has_era5 = recipe is not None and any(
+            s.source_type == "era5" for s in recipe.config.validation_sources
+        )
+        if recipe is not None and recipe_has_era5 and recorded_variable is not None \
                 and recorded_variable != recipe.config.variable:
             return False
         downloads = meta.get("downloads", {})
