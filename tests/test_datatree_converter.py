@@ -2784,9 +2784,13 @@ class TestConvertDownloadedDataEra5:
     def test_era5_dir_discovered_and_combined_into_one_node(self, tmp_path):
         import numpy as np
         import xarray as xr
+
         from sar_validation.core.datatree_converter import DataTreeConverter
         from sar_validation.core.recipe import (
-            GeographicBounds, Recipe, RecipeConfig, TemporalBounds,
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
         )
 
         era5_dir = tmp_path / "era5"
@@ -2823,9 +2827,13 @@ class TestConvertDownloadedDataEra5:
         incident for the same bug class)."""
         import numpy as np
         import xarray as xr
+
         from sar_validation.core.datatree_converter import DataTreeConverter
         from sar_validation.core.recipe import (
-            GeographicBounds, Recipe, RecipeConfig, TemporalBounds,
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
         )
 
         era5_dir = tmp_path / "era5"
