@@ -28,6 +28,22 @@ logger = logging.getLogger(__name__)
 #: the CLI's console.
 _BINS_RESIZED_MESSAGE = "The bins have been resized"
 
+#: Minimum sample size for a reported correlation coefficient to be
+#: treated as meaningful rather than a numerically-precise-looking
+#: artifact of too few points. Pearson r is mathematically degenerate
+#: for N=2 (any two points define a line, so r is always exactly +-1
+#: regardless of how well the series actually agree) and empirically
+#: still highly unstable through N=4. The Jammalamadaka-Sarma circular
+#: correlation used for circular variables (e.g. wind direction) has
+#: the identical degeneracy at N=2 and near-identical instability at
+#: N=3/4 -- confirmed empirically: independent random samples at
+#: N=3/4/5 give |r|>0.8 in ~40%/20%/13% of trials for both correlation
+#: types, essentially interchangeably. Below this threshold,
+#: correlation is reported as NaN instead of a spurious +-1 or a value
+#: with no real statistical meaning; every other metric (bias, std,
+#: rmse, scatter_index) is still computed and reported normally.
+MIN_N_FOR_CORRELATION = 5
+
 __all__ = [
     "compute_statistics",
     "compute_statistics_soil_moisture",
@@ -37,6 +53,7 @@ __all__ = [
     "run_statistics",
     "run_statistics_native_units",
     "run_statistics_cds_ssm",
+    "MIN_N_FOR_CORRELATION",
 ]
 
 
@@ -101,7 +118,7 @@ def _core_metrics(sar_vals: np.ndarray, val_vals: np.ndarray) -> dict:
     rmse = float(np.sqrt(np.mean(diff ** 2)))
     mean_val = float(np.mean(val_vals))
     si = rmse / abs(mean_val) if abs(mean_val) > 1e-10 else float("nan")
-    if n > 1 and np.std(sar_vals) > 0 and np.std(val_vals) > 0:
+    if n >= MIN_N_FOR_CORRELATION and np.std(sar_vals) > 0 and np.std(val_vals) > 0:
         corr = float(np.corrcoef(sar_vals, val_vals)[0, 1])
     else:
         corr = float("nan")
@@ -149,7 +166,12 @@ def compute_statistics(
     * **bias** — mean(sar − val)
     * **std** — standard deviation of (sar − val)
     * **rmse** — root-mean-square error
-    * **correlation** — Pearson r (or Jammalamadaka–Sarma circular correlation if val_var is circular)
+    * **correlation** — Pearson r (or Jammalamadaka–Sarma circular correlation
+      if val_var is circular); NaN if the group has fewer than
+      :data:`MIN_N_FOR_CORRELATION` pairs, since both correlation types are
+      mathematically degenerate at N=2 (any two points give exactly ±1,
+      however poorly they actually agree) and empirically still highly
+      unstable through N=4
     * **scatter_index** — RMSE / |mean(val)|  (dimensionless, NaN if mean_val ≈ 0)
 
     If ``val_var`` is a circular quantity (currently just ``"WDIR"`` — see
@@ -232,7 +254,10 @@ def compute_statistics(
             rmse = float(np.sqrt(np.mean(diff ** 2)))
             mean_val = _circular_mean_deg(val_vals)
             si = rmse / abs(mean_val) if abs(mean_val) > 1e-10 else float("nan")
-            corr = _circular_corrcoef_deg(sar_vals, val_vals) if n > 1 else float("nan")
+            corr = (
+                _circular_corrcoef_deg(sar_vals, val_vals)
+                if n >= MIN_N_FOR_CORRELATION else float("nan")
+            )
             record = {
                 "N":             n,
                 "bias":          bias,

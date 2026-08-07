@@ -673,16 +673,29 @@ def plot_scatter(
 
     # Annotate with N, bias, RMSE
     from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg  # noqa: PLC0415
+    from .statistics import MIN_N_FOR_CORRELATION, _circular_corrcoef_deg  # noqa: PLC0415
 
-    if val_var in CIRCULAR_VAL_VARS:
+    is_circular = val_var in CIRCULAR_VAL_VARS
+    if is_circular:
         diff = circular_diff_deg(df[sar_col].values, df[val_col].values)
     else:
         diff = df[sar_col].values - df[val_col].values
     n = len(diff)
     bias = float(np.mean(diff))
     rmse = float(np.sqrt(np.mean(diff ** 2)))
-    if n > 1 and np.std(df[val_col].values) > 0 and np.std(df[sar_col].values) > 0:
-        corr = float(np.corrcoef(df[val_col].values, df[sar_col].values)[0, 1])
+    if n >= MIN_N_FOR_CORRELATION:
+        if is_circular:
+            # Matches compute_statistics's own circular-vs-Pearson choice
+            # (see its docstring) -- a plain Pearson r on raw degree
+            # values would treat e.g. 359 deg and 1 deg as maximally
+            # different instead of 2 deg apart, diverging from the
+            # correlation actually reported in the stats CSV/table for
+            # the same variable pair.
+            corr = _circular_corrcoef_deg(df[sar_col].values, df[val_col].values)
+        elif np.std(df[val_col].values) > 0 and np.std(df[sar_col].values) > 0:
+            corr = float(np.corrcoef(df[val_col].values, df[sar_col].values)[0, 1])
+        else:
+            corr = float("nan")
     else:
         corr = float("nan")
     annotation = f"N={n}\nBias={bias:.3g}\nRMSE={rmse:.3g}\nr={corr:.3f}"
@@ -2039,8 +2052,13 @@ def plot_temporal_offset(
         ax.scatter(df["temporal_distance_minutes"], df["abs_residual"],
                    s=18, alpha=0.6, color="#1f77b4", rasterized=True)
 
+    from .statistics import MIN_N_FOR_CORRELATION  # noqa: PLC0415
+
     n = len(df)
-    if n > 1 and np.std(df["temporal_distance_minutes"].values) > 0 and np.std(df["abs_residual"].values) > 0:
+    if (
+        n >= MIN_N_FOR_CORRELATION
+        and np.std(df["temporal_distance_minutes"].values) > 0 and np.std(df["abs_residual"].values) > 0
+    ):
         corr = float(np.corrcoef(df["temporal_distance_minutes"].values, df["abs_residual"].values)[0, 1])
     else:
         corr = float("nan")

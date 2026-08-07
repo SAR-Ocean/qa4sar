@@ -173,6 +173,60 @@ class TestPlotScatter:
         assert fig is not None
         plt.close("all")
 
+    def test_correlation_nan_below_min_n(self):
+        """Pearson r is degenerate at N=2 (always exactly +-1) and still
+        highly unstable through N=4 -- the annotation box must report NaN,
+        not a spuriously precise-looking number, below
+        statistics.MIN_N_FOR_CORRELATION."""
+        import matplotlib.pyplot as plt
+
+        n = 3
+        rng = np.random.default_rng(0)
+        sar = rng.uniform(3, 12, n)
+        ds = xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", sar),
+            "val_WSPD":         ("collocation", sar + rng.normal(0, 0.1, n)),
+            "val_source":       ("collocation", ["buoy"] * n),
+        })
+        fig = plot_scatter(ds, "owiWindSpeed", "WSPD")
+        annotation = next(t.get_text() for t in fig.axes[0].texts if t.get_text().startswith("N="))
+        assert "r=nan" in annotation
+        plt.close(fig)
+
+    def test_wind_direction_annotation_uses_circular_correlation(self):
+        """The on-plot 'r=' annotation must match compute_statistics's own
+        circular-vs-Pearson choice for a circular val_var (WDIR) -- a
+        plain Pearson r on raw degree values treats e.g. 359 deg and 1 deg
+        as maximally different rather than 2 deg apart, diverging from
+        the correlation actually reported in the stats CSV/table for the
+        same variable pair. Uses data that straddles the 0/360 wrap
+        boundary, where Pearson and circular correlation visibly differ."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.statistics import _circular_corrcoef_deg
+
+        sar_deg = np.array([10.0, 90.0, 180.0, 270.0, 359.0])
+        val_deg = (sar_deg + 2.0) % 360.0
+        n = len(sar_deg)
+        ds = xr.Dataset({
+            "sar_owiWindDirection": ("collocation", sar_deg),
+            "val_WDIR":             ("collocation", val_deg),
+            "val_source":           ("collocation", ["buoy"] * n),
+            # _deduplicate_obs groups by val_source + val_lat/lon/id/time
+            # (whichever are present) -- without distinct lat/lon here,
+            # all 5 rows share the same val_source and collapse to 1.
+            "val_lat":              ("collocation", np.linspace(50.0, 55.0, n)),
+            "val_lon":              ("collocation", np.linspace(-5.0, 0.0, n)),
+        })
+        expected_circular_r = _circular_corrcoef_deg(sar_deg, val_deg)
+        pearson_r = float(np.corrcoef(val_deg, sar_deg)[0, 1])
+        assert abs(expected_circular_r - pearson_r) > 0.1  # they must actually differ here
+
+        fig = plot_scatter(ds, "owiWindDirection", "WDIR")
+        annotation = next(t.get_text() for t in fig.axes[0].texts if t.get_text().startswith("N="))
+        assert f"r={expected_circular_r:.3f}" in annotation
+        plt.close(fig)
+
     def test_axis_labels_include_units_when_present(self):
         import matplotlib.pyplot as plt
 
