@@ -53,6 +53,7 @@ def _make_ocn_safe(
     nx: int = 4,
     seed: int = 0,
     land_rows: int = 0,
+    owi_land_rows: int = 0,
 ) -> Path:
     """
     Build a *.SAFE dir containing one '-ocn-' measurement NetCDF.
@@ -63,6 +64,12 @@ def _make_ocn_safe(
     land_rows=N -> the first N rows of the rvlAzSize axis are written with
         rvlLandFlag=1 (land) across every column/swath; the rest are 0.
         land_rows=0 (default) omits rvlLandFlag entirely, simulating a
+        product that doesn't carry it.
+    owi_land_rows=N -> the first N rows of the owiAzSize axis are written
+        with owiMask land-bit set (row 0 uses combo value 5 = land +
+        no_data, mirroring a real product's bitmask combinations; the rest
+        of the land rows use plain 1); the remaining rows are 0 (valid).
+        owi_land_rows=0 (default) omits owiMask entirely, simulating a
         product that doesn't carry it.
     """
     rng = np.random.default_rng(seed)
@@ -77,6 +84,12 @@ def _make_ocn_safe(
         data["owiWindDirection"] = (odims, rng.uniform(0, 360, (ny, nx)).astype("float32"))
         data["owiLon"] = (odims, rng.uniform(-20.0, -19.0, (ny, nx)).astype("float32"))
         data["owiLat"] = (odims, rng.uniform(50.0, 51.0, (ny, nx)).astype("float32"))
+        if owi_land_rows > 0:
+            owi_mask = np.zeros((ny, nx), dtype="int8")
+            owi_mask[:owi_land_rows, :] = 1
+            if owi_land_rows > 1:
+                owi_mask[0, :] = 5  # land + no_data combo, first row
+            data["owiMask"] = (odims, owi_mask)
 
     if rvl_swaths is not None:
         if wv:
@@ -1603,6 +1616,97 @@ class TestIwSafeCurrentsNoOwiFallback:
         assert "owiWindSpeed" in ds.data_vars
         assert ds["owiNrcs"].dims == ("y", "x")
         assert ds["owiNrcs"].shape == (ny, nx)
+
+
+# ---------------------------------------------------------------------------
+# _extract_owi_grid_data (land masking via owiMask)
+# ---------------------------------------------------------------------------
+
+class TestOwiMaskLandFiltering:
+    def test_land_bit_masks_windspeed_and_direction(self, tmp_path):
+        safe = _make_ocn_safe(
+            tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=None, ny=5, nx=4, owi_land_rows=2,
+        )
+        raw = xr.open_dataset(
+            safe / "measurement"
+            / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+        raw_speed = raw["owiWindSpeed"].values.copy()
+        raw_dir = raw["owiWindDirection"].values.copy()
+        raw_mask = raw["owiMask"].values.copy()
+        raw.close()
+
+        ds = DataTreeConverter._extract_owi_grid_data(safe / "measurement", safe)
+        assert ds is not None
+
+        land_rows = 2
+        # Land-flagged rows (first 2, values 5 and 1) -> NaN in both
+        # owiWindSpeed and owiWindDirection.
+        assert np.isnan(ds["owiWindSpeed"].values[:land_rows, :]).all()
+        assert np.isnan(ds["owiWindDirection"].values[:land_rows, :]).all()
+        # Valid rows (owiMask == 0) are unchanged from the raw synthetic
+        # values.
+        np.testing.assert_array_equal(
+            ds["owiWindSpeed"].values[land_rows:, :], raw_speed[land_rows:, :]
+        )
+        np.testing.assert_array_equal(
+            ds["owiWindDirection"].values[land_rows:, :], raw_dir[land_rows:, :]
+        )
+        # owiMask itself passes through unmodified for downstream inspection.
+        np.testing.assert_array_equal(ds["owiMask"].values, raw_mask)
+
+        land_n = land_rows * 4  # nx
+        assert ds.attrs["owi_land_pixel_count"] == land_n
+        assert ds.attrs["owi_land_pixel_fraction"] == pytest.approx(land_n / (5 * 4))
+
+    def test_zero_land_pixels_no_masking(self, tmp_path):
+        # owi_land_rows=0 (default) -> no owiMask written at all -> nothing
+        # masked, matching the RVL land_rows=0 convention.
+        safe = _make_ocn_safe(tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=None, ny=5, nx=4)
+        ds = DataTreeConverter._extract_owi_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert np.isfinite(ds["owiWindSpeed"].values).all()
+        assert np.isfinite(ds["owiWindDirection"].values).all()
+        assert ds.attrs["owi_land_pixel_count"] == 0
+
+    def test_land_masking_is_logged(self, tmp_path, caplog):
+        safe = _make_ocn_safe(
+            tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=None, ny=5, nx=4, owi_land_rows=2,
+        )
+        with caplog.at_level("WARNING"):
+            ds = DataTreeConverter._extract_owi_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert any(
+            "land-flagged" in r.message and "owiMask" in r.message
+            for r in caplog.records
+        )
+
+    def test_ice_and_rfi_bits_not_filtered(self, tmp_path):
+        # Scope check: only the land bit (1) is filtered. Ice (2) and rfi
+        # (8) pixels must be left untouched (no follow-up implemented yet).
+        ny, nx = 3, 2
+        rng = np.random.default_rng(7)
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        owi_mask = np.array([[2, 2], [8, 8], [0, 0]], dtype="int8")
+        ds_raw = xr.Dataset(
+            {
+                "owiWindSpeed": (odims, rng.uniform(2, 15, (ny, nx)).astype("float32")),
+                "owiWindDirection": (odims, rng.uniform(0, 360, (ny, nx)).astype("float32")),
+                "owiLon": (odims, rng.uniform(-20.0, -19.0, (ny, nx)).astype("float32")),
+                "owiLat": (odims, rng.uniform(50.0, 51.0, (ny, nx)).astype("float32")),
+                "owiMask": (odims, owi_mask),
+            },
+            attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
+        )
+        ds_raw.to_netcdf(meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc")
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+        assert ds is not None
+        assert np.isfinite(ds["owiWindSpeed"].values).all()
+        assert np.isfinite(ds["owiWindDirection"].values).all()
+        assert ds.attrs["owi_land_pixel_count"] == 0
 
 
 # ---------------------------------------------------------------------------

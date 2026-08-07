@@ -3337,6 +3337,29 @@ class DataTreeConverter:
                 else np.ones_like(owi_windspeed, dtype=np.int8)
             )
 
+            # Land-flag masking. owiMask is a CF bitmask (flag_values
+            # 0/1/2/4/8 = valid/land/ice/no_data/rfi) whose bits combine via
+            # bitwise OR (e.g. 5 = land + no_data simultaneously). Land
+            # pixels must not feed into wind validation, so owiWindSpeed and
+            # owiWindDirection (a direction without a valid speed is
+            # meaningless) are NaN'd out there. Only the land bit (1) is
+            # checked -- ice/no_data/rfi are intentionally left unfiltered.
+            owi_land_pixel_count = 0
+            owi_land_pixel_fraction = float("nan")
+            if "owiMask" in ds_raw:
+                land_mask = (owi_mask & 1) != 0
+                owi_land_pixel_count = int(np.sum(land_mask))
+                owi_land_pixel_fraction = owi_land_pixel_count / land_mask.size
+                if owi_land_pixel_count > 0:
+                    owi_windspeed = np.where(land_mask, np.nan, owi_windspeed)
+                    owi_winddir = np.where(land_mask, np.nan, owi_winddir)
+                    logger.warning(
+                        "scene %s: %d/%d OWI cells land-flagged (%.1f%%) via "
+                        "owiMask -- owiWindSpeed/owiWindDirection NaN'd out",
+                        safe_dir.name, owi_land_pixel_count, land_mask.size,
+                        100 * owi_land_pixel_fraction,
+                    )
+
             # Get acquisition time (scalar for grid)
             time_str = ds_raw.attrs.get("firstMeasurementTime")
             if time_str:
@@ -3385,6 +3408,8 @@ class DataTreeConverter:
             ds.attrs["safe_dir"] = safe_dir.name
             ds.attrs["measurement_type"] = "owi"
             ds.attrs["swath_mode"] = "IW/EW/SM"
+            ds.attrs["owi_land_pixel_count"] = owi_land_pixel_count
+            ds.attrs["owi_land_pixel_fraction"] = owi_land_pixel_fraction
 
             logger.info(
                 "Extracted OWI data from product %s (grid shape: %s)",
