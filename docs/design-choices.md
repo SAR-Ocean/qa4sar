@@ -435,6 +435,83 @@ as a legacy fallback.
 > `core/recipe.py` (`DEFAULT_LAYER_TYPE_SPECS`, `CollocationType`),
 > `core/visualization.py` (`_deduplicate_obs`).
 
+### 5.7 ERA5 model validation
+
+ERA5 is collocated as a distinct third collocation type, `model_vs_layer`,
+implemented by `ModelLayerCollocation` in `model_collocation.py` — bilinear
+spatial + nearest-hour/hyperbolic temporal interpolation, ported from
+`relevant_code_for_toolbox/s1_ocn_nwp_coloc/collocate_nwp_to_sat.py`. This is
+a different match strategy from `point_vs_layer`/`layer_vs_layer`
+(§5.1–§5.6) because ERA5, unlike every other validation source, is a
+complete background field defined everywhere, not a real observation with
+coverage gaps.
+
+**Why this method does NOT replace the existing `layer_vs_layer` sources**
+
+Raised explicitly by the user during brainstorming ("check whether this
+method could also be suitable to take over some of the existing
+collocation methods") and investigated after the design was otherwise
+settled. Conclusion: no — and this reasoning is written up here since it
+documents a real design boundary someone could otherwise reasonably
+question again later:
+
+- **Scatterometer/altimeter are geometrically incompatible**: they're
+  swath (2-D curved) or along-track (1-D) products, not a regular lat/lon
+  grid. `RegularGridInterpolator` requires strictly monotonic 1-D lat/lon
+  axes — meaningless for a single track, and not applicable to a curved
+  swath without a lossy re-gridding preprocessing step of its own.
+- **Radiometer / `hf_radar_grid` / CDS satellite SSM are geometrically
+  compatible (regular grids) but still shouldn't switch**: unlike ERA5,
+  these are real observations with genuine coverage gaps (swath limits,
+  land/RFI/rain flags, radar range, QC drops), not a field defined
+  everywhere by construction. Bilinear interpolation across real gaps
+  either (a) returns NaN whenever any of the 4 surrounding cells is
+  missing — silently losing matches the current nearest-real-observation
+  approach would have found — or (b) if gap-handling isn't done
+  carefully, risks fabricating a value across a genuine data gap, which
+  is a real correctness regression for a tool whose entire job is
+  comparing SAR against real independent observations. The current
+  point-matching + aggregation-window/distance-weighting approach is
+  well-suited to sparse/gapped real data by construction: it only
+  produces a match where a real observation exists within tolerance, and
+  never invents one.
+- **Speed is not a differentiator**: building one `RegularGridInterpolator`
+  per time slice and querying it vectorized is roughly comparable in cost
+  to building the current unit-sphere KD-tree once and querying it — both
+  are effectively O(n log n) build / O(m log n) query at these data
+  sizes. Gap-handling logic needed to make bilinear interpolation safe for
+  real gridded observations would likely erase whatever small edge it
+  has.
+- The property that makes ERA5's method both feasible and correct is
+  specifically that a model field is *complete* — defined everywhere, no
+  missing-data concept. That's also why this same method is the right
+  tool again for any *future model* layer (e.g. the ORAS5 currents model
+  mentioned as a later addition), but not a general upgrade path for the
+  existing observational layer types.
+
+**Cell-averaging needs no spatial interpolation.** In `cell-averaging` mode
+the match point *is* the ERA5 grid's own native cell center, so the
+"bilinear-interpolated" ERA5 value at that point is just the value already
+sitting on the grid node — only the temporal interpolation (nearest-hour or
+hyperbolic) does real work. Actual spatial bilinear interpolation across
+grid cells is only exercised by `individual` mode (arbitrary SAR pixel/point
+locations that don't coincide with a grid node) and by WV-mode's
+`collocate_points` (sparse, non-grid vignette locations).
+
+**Antimeridian handling.** The reference script's longitude wrap-padding is
+deliberately not ported into `build_spatial_interpolator` (Task 5), since
+it's only correct for a global grid and ERA5 downloads here are regional.
+Instead, a crossing recipe bbox is split into two non-crossing download
+windows (`split_antimeridian_bbox`), stitched into one contiguous grid by
+the converter (shifting one window's longitude axis by +360°), with SAR
+query longitudes remapped to match at collocation time
+(`_normalize_query_lon`/`_wrap_lon_to_pm180` in `model_collocation.py`) —
+see Task 14.
+
+> Code: `core/model_collocation.py` (`ModelLayerCollocation`,
+> `build_spatial_interpolator`, `collocate_points`), `core/collocation.py`
+> (`run_collocation` dispatch table).
+
 ---
 
 ## 6. Circular variables (wind direction)
