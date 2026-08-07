@@ -110,7 +110,9 @@ class NOAATHREDDSHFRadarDownloader:
     output_dir : Path
         Directory to save the merged NetCDF.
     dry_run : bool
-        If True, print what would be fetched and return [] without network calls.
+        If True, query each touched month's (lightweight) catalog.xml and
+        report the real matched-granule count/filenames, but never touch a
+        full fileServer download; always returns [].
     resolution_km : float
         Grid resolution (0.5/1/2/6 km depending on region); default 6.
     """
@@ -163,14 +165,6 @@ class NOAATHREDDSHFRadarDownloader:
         is_end_date_only = len(end.strip().rstrip("Z")) == 10  # YYYY-MM-DD
         end_dt_for_matching = end_dt + timedelta(days=1) if is_end_date_only else end_dt
 
-        if self.dry_run:
-            print(
-                f"[dry-run] NOAA THREDDS HF-radar ({region_name}, {token}) would search "
-                f"{THREDDS_BASE}/catalog/ioos/hfradar/rtv/{{YYYY}}/{{YYYYMM}}/{thredds_code}/"
-                f"catalog.xml for [{start_dt}, {end_dt_for_matching}]"
-            )
-            return None
-
         logger.info(
             "hf_radar_thredds: resolved region=%s resolution=%s, searching "
             "catalogs for [%s, %s]", region_name, token, start_dt, end_dt_for_matching,
@@ -202,6 +196,18 @@ class NOAATHREDDSHFRadarDownloader:
             )
 
         logger.info("hf_radar_thredds: %d granule(s) matched", len(granules))
+
+        if self.dry_run:
+            # Still queries each touched month's (lightweight) catalog.xml
+            # above -- so this reports real candidate availability -- but
+            # never touches a full fileServer download.
+            print(
+                f"[dry-run] NOAA THREDDS HF-radar ({region_name}, {token}): "
+                f"{len(granules)} granule(s) matched in [{start_dt}, {end_dt_for_matching}]"
+            )
+            for _ts, url_path in granules:
+                print(f"  {Path(url_path).name}")
+            return None
 
         if not granules:
             if not any_catalog_fetched:

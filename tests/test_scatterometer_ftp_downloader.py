@@ -259,15 +259,54 @@ class TestScatterometerFTPDownloaderForceDownload:
 
 
 class TestScatterometerFTPDownloaderDryRun:
-    def test_dry_run_prints_and_touches_no_network(self, tmp_path, capsys):
+    def test_dry_run_without_credentials_prints_setup_message_without_network(
+        self, tmp_path, capsys,
+    ):
+        """authenticate_osi_saf_ftp never prompts interactively -- it either
+        resolves credentials or raises RuntimeError immediately -- so a
+        dry-run with no credentials configured must print a setup message
+        and never touch the FTP connection at all."""
         now = datetime.now(timezone.utc)
         end = now.strftime("%Y-%m-%d")
         start = (now - timedelta(days=1)).strftime("%Y-%m-%d")
 
         dl = ScatterometerFTPDownloader(satellite="hy2c", output_dir=tmp_path, dry_run=True)
-        with patch("ftplib.FTP") as mock_ftp_cls:
+        with patch("ftplib.FTP") as mock_ftp_cls, patch(
+            "sar_validation.downloaders.scatterometer_ftp_downloader.authenticate_osi_saf_ftp",
+            side_effect=RuntimeError("OSI-SAF FTP credentials not found."),
+        ):
             out = dl.download(_MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT, start, end)
 
         assert out == []
         mock_ftp_cls.assert_not_called()
-        assert "DRY RUN" in capsys.readouterr().out
+        captured = capsys.readouterr().out
+        assert "DRY RUN" in captured
+        assert "not configured" in captured
+        assert "--set-credential osi_saf" in captured
+
+    def test_dry_run_with_credentials_reports_real_matches_without_downloading(
+        self, tmp_path, capsys,
+    ):
+        """Credentials ARE configured -- dry-run connects and lists real
+        matching files, but never calls retrbinary()."""
+        now = datetime.now(timezone.utc)
+        ts = now.strftime("%Y%m%d_%H%M%S")
+        name = f"oscat_{ts}_ocsat3_1_o_250_4007_ovw_l2.nc"
+        end = now.strftime("%Y-%m-%d")
+        start = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        dl = ScatterometerFTPDownloader(satellite="oceansat3", output_dir=tmp_path, dry_run=True)
+        fake_ftp = MagicMock()
+        fake_ftp.nlst.return_value = [name]
+        with patch("ftplib.FTP", return_value=fake_ftp), patch(
+            "sar_validation.downloaders.scatterometer_ftp_downloader.authenticate_osi_saf_ftp",
+            return_value=("user", "pass"),
+        ):
+            out = dl.download(_MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT, start, end)
+
+        assert out == []
+        fake_ftp.retrbinary.assert_not_called()
+        assert not any(tmp_path.glob("*.nc"))
+        captured = capsys.readouterr().out
+        assert "DRY RUN" in captured
+        assert name in captured

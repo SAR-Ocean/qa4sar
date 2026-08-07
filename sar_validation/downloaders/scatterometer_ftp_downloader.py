@@ -100,7 +100,10 @@ class ScatterometerFTPDownloader:
     output_dir : Path
         Directory to save downloaded (and gunzipped) files.
     dry_run : bool
-        If True, print what would be downloaded without actually downloading.
+        If True and credentials are already configured, connect and report
+        real matching file availability without downloading anything; if
+        credentials are not configured, print a message to set them up
+        (never raises/prompts).
     username, password : str, optional
         OSI-SAF FTP credentials. If omitted, resolved via authenticate_osi_saf_ftp().
     """
@@ -168,16 +171,24 @@ class ScatterometerFTPDownloader:
         path = _SATELLITE_PATHS[self.satellite]
 
         if self.dry_run:
-            print(
-                f"[DRY RUN] Would connect to {FTP_HOST}{path} and download 25 km "
-                f"{self.satellite} files with timestamp in [{start_dt}, {end_dt_for_matching}]\n"
-                f"  (bbox [{min_lon},{max_lon}] x [{min_lat},{max_lat}] not filtered — "
-                f"full-orbit files; recipe-domain filtering happens downstream)\n"
-                f"  Output: {self.output_dir}"
-            )
-            return []
-
-        username, password = authenticate_osi_saf_ftp(self._username, self._password)
+            # Report real file availability when credentials are already
+            # configured; authenticate_osi_saf_ftp never prompts
+            # interactively (unlike G-Portal's SFTP path) -- it either
+            # resolves credentials or raises RuntimeError immediately, so
+            # there's no interactive-prompt risk to guard against here.
+            try:
+                username, password = authenticate_osi_saf_ftp(self._username, self._password)
+            except RuntimeError:
+                print(
+                    "[DRY RUN] OSI-SAF FTP credentials are not configured -- run "
+                    "`sar-validate --set-credential osi_saf` (or set "
+                    "OSI_SAF_FTP_USERNAME / OSI_SAF_FTP_PASSWORD) to see which "
+                    f"{self.satellite} files are available for "
+                    f"[{start_dt}, {end_dt_for_matching}]."
+                )
+                return []
+        else:
+            username, password = authenticate_osi_saf_ftp(self._username, self._password)
 
         import ftplib
 
@@ -204,6 +215,12 @@ class ScatterometerFTPDownloader:
 
             print(f"Found {len(matches)} {self.satellite} 25 km file(s) in window.")
             if not matches:
+                return []
+
+            if self.dry_run:
+                print("[DRY RUN] Would download:")
+                for name in sorted(matches):
+                    print(f"  {name}")
                 return []
 
             self.output_dir.mkdir(parents=True, exist_ok=True)

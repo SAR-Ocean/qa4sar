@@ -18,11 +18,21 @@ _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT = -10.0, 10.0, 40.0, 55.0
 
 
 class TestGPortalAMSR2DownloaderDryRun:
-    def test_dry_run_prints_params_without_network(self, tmp_path, capsys):
-        dl = GPortalAMSR2Downloader(
-            output_dir=tmp_path, dry_run=True, username="u", password="p",
-        )
-        with patch("paramiko.Transport") as mock_transport_cls:
+    def test_dry_run_without_credentials_prints_setup_message_without_network(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        """No credentials configured (constructor args, env vars, keyring,
+        or legacy file) -- dry-run must never prompt interactively for
+        one, so it prints a setup message and makes no connection
+        attempt at all."""
+        monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
+        monkeypatch.delenv("GPORTAL_PASSWORD", raising=False)
+        dl = GPortalAMSR2Downloader(output_dir=tmp_path, dry_run=True)
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch(
+                 "sar_validation.downloaders.base._resolve_from_keyring_or_legacy_file",
+                 return_value=(None, None),
+             ):
             out = dl.download(
                 min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
                 start="2026-07-01", end="2026-07-02",
@@ -31,7 +41,46 @@ class TestGPortalAMSR2DownloaderDryRun:
         mock_transport_cls.assert_not_called()
         captured = capsys.readouterr().out
         assert "DRY RUN" in captured
-        assert "ftp.gportal.jaxa.jp" in captured
+        assert "not configured" in captured
+        assert "--set-credential gportal" in captured
+
+    def test_dry_run_with_credentials_reports_real_matches_without_downloading(
+        self, tmp_path, capsys,
+    ):
+        """Credentials ARE configured -- dry-run connects and lists real
+        matching files (so the user knows whether any exist for the
+        requested window), but never calls sftp.get()."""
+        listing = {
+            "standard": ["GCOM-W"],
+            "standard/GCOM-W": ["GCOM-W.AMSR2"],
+            "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2026"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026": ["07"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/07": [
+                "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",
+            ],
+        }
+        sftp = MagicMock()
+        sftp.listdir.side_effect = lambda path: listing.get(path, [])
+
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, dry_run=True, username="u", password="p",
+        )
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
+             patch("socket.create_connection", return_value=MagicMock()):
+            mock_transport_cls.return_value = MagicMock()
+            out = dl.download(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        assert out == []
+        sftp.get.assert_not_called()
+        captured = capsys.readouterr().out
+        assert "DRY RUN" in captured
+        assert "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5" in captured
 
 
 class TestConnectWithRetry:
@@ -281,6 +330,49 @@ class TestGPortalAMSR2DownloaderDiscovery:
         downloaded = self._run_discovery(tmp_path, listing, extra_check=extra_check)
         assert len(downloaded) == 1
         assert "20260701" in downloaded[0].name
+
+    def test_monthly_composite_file_excluded_even_when_date_falls_in_window(self, tmp_path):
+        """Real G-Portal directories mix daily granules ("..._01D_...")
+        with a whole-month composite file ("..._01M_...", dated
+        "{year}{month}00" -- day "00" as a placeholder for "the whole
+        month") in the same Year/Month listing. Once collocation-tolerance
+        padding pushes the requested window's start back across a month
+        boundary, the monthly file's "00"-day date can satisfy the plain
+        start_date <= date <= end_date comparison just like a real day
+        would -- it must still never be selected: from_amsr_ssm can't
+        parse a monthly file's HDF5 layout (no "Time Information" group),
+        so it silently drops it with a "Missing vsm/longitude/latitude
+        field(s)" warning instead of using the real daily granule that
+        was also available in the same window."""
+        listing = {
+            "standard": ["GCOM-W"],
+            "standard/GCOM-W": ["GCOM-W.AMSR2"],
+            "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["3300300"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/3300300": ["2026"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/3300300/2026": ["06", "07"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/3300300/2026/06": [],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/3300300/2026/07": [
+                "GW1AM2_20260700_01M_EQMA_L3SGSMCHF3300300.h5",  # monthly composite
+                "GW1AM2_20260701_01D_EQMA_L3SGSMCHF3300300.h5",  # real daily granule
+            ],
+        }
+        sftp = self._mock_sftp(listing)
+        sftp.get.side_effect = lambda remote, local: Path(local).write_bytes(b"data")
+
+        dl = GPortalAMSR2Downloader(output_dir=tmp_path, username="u", password="p")
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
+             patch("socket.create_connection", return_value=MagicMock()):
+            mock_transport_cls.return_value = MagicMock()
+            downloaded = dl.download(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-06-25", end="2026-07-02",
+            )
+
+        assert len(downloaded) == 1
+        assert "01D" in downloaded[0].name
+        assert "01M" not in downloaded[0].name
 
 
 class TestGPortalAMSR2DownloaderForceDownload:
