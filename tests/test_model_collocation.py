@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 
@@ -81,3 +82,85 @@ class TestHyperbolicInterp:
             np.array([val1]), np.array([val2]), np.array([val3]), np.array([t]),
         )
         assert result[0] == pytest.approx(expected)
+
+
+def _make_era5_ds(n_lat=3, n_lon=3, hours=("2026-07-12T00:00:00", "2026-07-12T01:00:00", "2026-07-12T02:00:00")):
+    import xarray as xr
+
+    lat = np.linspace(40.0, 42.0, n_lat)
+    lon = np.linspace(-10.0, -8.0, n_lon)
+    time = pd.to_datetime(list(hours))
+    # u10 is a simple, known ramp so interpolated values are predictable:
+    # value(lat, lon, hour_index) = hour_index * 10 (spatially constant),
+    # so temporal interpolation is exactly checkable regardless of query
+    # location.
+    u10 = np.stack([np.full((n_lat, n_lon), h * 10.0) for h in range(len(hours))])
+    ds = xr.Dataset(
+        {"u10": (("time", "lat", "lon"), u10)},
+        coords={"time": time, "lat": lat, "lon": lon},
+    )
+    return ds
+
+
+class TestModelValuesAtPoints:
+    # NOTE: _make_era5_ds's grid spans lon [-10, -8] and lat [40, 42] --
+    # these ranges don't overlap, so query points below deliberately use
+    # distinct lon/lat values within each's own range (e.g. lon=-9.0,
+    # lat=41.0), never the same number for both.
+
+    def test_nearest_hour_picks_closest_hour_value(self):
+        from sar_validation.core.model_collocation import _model_values_at_points
+
+        era5_ds = _make_era5_ds()
+        # 00:50 is nearest to hour 1 (01:00) -> expect value 10.0
+        times = np.array([np.datetime64("2026-07-12T00:50:00")])
+        result = _model_values_at_points(
+            np.array([-9.0]), np.array([41.0]), times, era5_ds, "nearest",
+        )
+        assert result["u10"][0] == pytest.approx(10.0)
+
+    def test_hyperbolic_interpolates_between_hours(self):
+        from sar_validation.core.model_collocation import _model_values_at_points
+
+        era5_ds = _make_era5_ds()
+        # Exactly halfway between hour 1 (value 10) and hour 2 (value 20):
+        # linear part of the quadratic dominates for this evenly-spaced
+        # ramp -- expect 15.0.
+        times = np.array([np.datetime64("2026-07-12T01:30:00")])
+        result = _model_values_at_points(
+            np.array([-9.0]), np.array([41.0]), times, era5_ds, "hyperbolic",
+        )
+        assert result["u10"][0] == pytest.approx(15.0)
+
+    def test_hyperbolic_returns_nan_when_no_bracketing_hour(self):
+        from sar_validation.core.model_collocation import _model_values_at_points
+
+        era5_ds = _make_era5_ds()  # only hours 0,1,2 available
+        # 02:30 needs hour 3, which doesn't exist.
+        times = np.array([np.datetime64("2026-07-12T02:30:00")])
+        result = _model_values_at_points(
+            np.array([-9.0]), np.array([41.0]), times, era5_ds, "hyperbolic",
+        )
+        assert np.isnan(result["u10"][0])
+
+    def test_multiple_points_sharing_one_time_are_batched(self):
+        from sar_validation.core.model_collocation import _model_values_at_points
+
+        era5_ds = _make_era5_ds()
+        times = np.array([np.datetime64("2026-07-12T01:00:00")] * 3)
+        result = _model_values_at_points(
+            np.array([-9.5, -9.0, -8.5]), np.array([40.5, 41.0, 41.5]),
+            times, era5_ds, "nearest",
+        )
+        assert result["u10"].shape == (3,)
+        assert np.allclose(result["u10"], 10.0)
+
+    def test_out_of_grid_point_returns_nan(self):
+        from sar_validation.core.model_collocation import _model_values_at_points
+
+        era5_ds = _make_era5_ds()
+        times = np.array([np.datetime64("2026-07-12T01:00:00")])
+        result = _model_values_at_points(
+            np.array([80.0]), np.array([80.0]), times, era5_ds, "nearest",
+        )
+        assert np.isnan(result["u10"][0])
