@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -82,6 +82,77 @@ _ERA5_VARS: dict[str, dict] = {
         },
     },
 }
+
+#: Matches a window-suffixed ERA5 daily filename stem, e.g.
+#: "era5_wind_20260712_w0" -> stem="era5_wind_20260712", idx=0. Produced by
+#: ERA5Downloader.download() when a recipe bbox crosses the antimeridian.
+_ERA5_WINDOW_SUFFIX_RE = re.compile(r"^(?P<stem>.+)_w(?P<idx>\d+)$")
+
+
+def _group_era5_paths_by_day(paths: List[Path]) -> Dict[str, List[Path]]:
+    """
+    Group ERA5 file paths by their day-stem, so a day's antimeridian-split
+    window pair (``..._w0.nc`` / ``..._w1.nc``) is grouped together for
+    stitching before concatenation across days, while an ordinary
+    non-split day's single file is its own group of one.
+    """
+    groups: Dict[str, List[Path]] = {}
+    for p in paths:
+        m = _ERA5_WINDOW_SUFFIX_RE.match(p.stem)
+        key = m.group("stem") if m else p.stem
+        groups.setdefault(key, []).append(p)
+    return groups
+
+
+def _stitch_antimeridian_window_files(paths: List[Path]) -> Optional[xr.Dataset]:
+    """
+    Combine the 2 antimeridian-split window files for one day (see
+    ``ERA5Downloader.download`` / ``split_antimeridian_bbox``) into a
+    single contiguous grid: window 1 (west, originally ``-180..max_lon``)
+    has its longitude axis shifted by +360 degrees so it becomes
+    numerically continuous with window 0 (east, ``min_lon..180``), then
+    the two are concatenated along the longitude dimension.
+
+    The combined lon axis may extend past 180 (e.g. up to 190) -- this is
+    fine, it's a coordinate array, not required to stay within +/-180; SAR
+    query longitudes are remapped to match at collocation time (see
+    ``model_collocation._normalize_query_lon``).
+
+    Both windows are requested inclusive of the shared antimeridian
+    boundary (``split_antimeridian_bbox`` returns ``[min_lon, 180]`` and
+    ``[-180, max_lon]``), so the east window's ``180.0`` and the west
+    window's shifted ``-180.0 -> 180.0`` commonly land on the exact same
+    grid cell -- the duplicate is dropped after concatenation so the
+    combined lon axis stays strictly increasing.
+
+    Returns ``None`` (closing any opened files first) if *paths* doesn't
+    contain exactly window indices ``{0, 1}``.
+    """
+    by_idx: Dict[int, xr.Dataset] = {}
+    for p in paths:
+        m = _ERA5_WINDOW_SUFFIX_RE.match(p.stem)
+        if not m:
+            logger.warning("Expected a window-suffixed ERA5 file, got %s", p.name)
+            for d in by_idx.values():
+                d.close()
+            return None
+        by_idx[int(m.group("idx"))] = xr.open_dataset(p)
+
+    if set(by_idx) != {0, 1}:
+        logger.warning("Expected exactly window indices {0, 1}, got %s", sorted(by_idx))
+        for d in by_idx.values():
+            d.close()
+        return None
+
+    east = by_idx[0]
+    west = by_idx[1]
+    lon_name = "longitude" if "longitude" in west.coords else "lon"
+    west = west.assign_coords({lon_name: west[lon_name] + 360.0})
+    combined = xr.concat([east, west], dim=lon_name)
+    combined = combined.drop_duplicates(lon_name, keep="first")
+    east.close()
+    west.close()
+    return combined
 
 
 def _subset_point_ds(
@@ -1913,7 +1984,19 @@ class DataTreeConverter:
         # the rest of this codebase (e.g. from_c3s_ssm) avoids that
         # dependency.
         try:
-            per_day = [xr.open_dataset(p) for p in existing]
+            groups = _group_era5_paths_by_day(existing)
+            per_day: List[xr.Dataset] = []
+            for _, group_paths in sorted(groups.items()):
+                if len(group_paths) == 1:
+                    per_day.append(xr.open_dataset(group_paths[0]))
+                else:
+                    stitched = _stitch_antimeridian_window_files(group_paths)
+                    if stitched is None:
+                        for d in per_day:
+                            d.close()
+                        return None
+                    per_day.append(stitched)
+
             raw = per_day[0] if len(per_day) == 1 else xr.concat(per_day, dim="time")
             # ERA5 regional daily files are small (bbox-limited); load fully
             # into memory now so the Dataset returned below doesn't hold

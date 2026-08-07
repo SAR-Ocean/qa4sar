@@ -63,6 +63,34 @@ def build_spatial_interpolator(
 
 
 # ---------------------------------------------------------------------------
+# Antimeridian support
+# ---------------------------------------------------------------------------
+
+def _normalize_query_lon(query_lon: np.ndarray, lon_ax: np.ndarray) -> np.ndarray:
+    """
+    Remap query longitudes to match an antimeridian-stitched ERA5 grid's
+    axis (see ``DataTreeConverter._stitch_antimeridian_window_files``),
+    whose lon axis may extend past 180 degrees. SAR pixel longitudes
+    always use the standard -180..180 convention; only the stitched west
+    window's original (negative) values were shifted by +360 to build
+    that axis, so any query longitude below 0 needs the same +360 shift
+    to land in the grid's actual coordinate range. No-op (returns
+    *query_lon* unchanged) when the grid was not stitched
+    (``lon_ax.max() <= 180``).
+    """
+    if lon_ax.max() <= 180.0:
+        return query_lon
+    return np.where(query_lon < 0, query_lon + 360.0, query_lon)
+
+
+def _wrap_lon_to_pm180(lon: float) -> float:
+    """Wrap a longitude value back into the standard -180..180 convention
+    -- used when reporting an ERA5 native cell centre that came from an
+    antimeridian-stitched grid axis extending past 180."""
+    return lon - 360.0 if lon > 180.0 else lon
+
+
+# ---------------------------------------------------------------------------
 # Temporal interpolation
 # ---------------------------------------------------------------------------
 
@@ -117,6 +145,7 @@ def _model_values_at_points(
     era5_times = pd.to_datetime(era5_ds["time"].values).to_numpy()
     lat_ax = era5_ds["lat"].values
     lon_ax = era5_ds["lon"].values
+    lons = _normalize_query_lon(np.asarray(lons, dtype=float), lon_ax)
 
     out: Dict[str, np.ndarray] = {var: np.full(n, np.nan, dtype=np.float64) for var in model_vars}
 
@@ -411,7 +440,7 @@ class ModelLayerCollocation:
         n_lat, n_lon = lat2d.shape
         for cy in range(n_lat):
             for cx in range(n_lon):
-                cell_lon = float(lon2d[cy, cx])
+                cell_lon = _wrap_lon_to_pm180(float(lon2d[cy, cx]))
                 cell_lat = float(lat2d[cy, cx])
                 val_point = {
                     var: float(cell_values[var][cy, cx])

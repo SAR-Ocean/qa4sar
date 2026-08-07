@@ -36,7 +36,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Optional
 
-from .base import build_output_dir, normalize_datetime
+from .base import build_output_dir, normalize_datetime, split_antimeridian_bbox
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +146,12 @@ class ERA5Downloader:
         """
         Download daily ERA5 files covering every calendar day whose
         needed-hour range (see :func:`_hours_needed_for_day`) is non-empty
-        within [*start*, *end*].
+        within [*start*, *end*]. A bbox crossing the antimeridian
+        (``min_lon > max_lon``) is split into two non-crossing windows via
+        :func:`~sar_validation.downloaders.base.split_antimeridian_bbox`,
+        each downloaded to its own ``_w0``/``_w1``-suffixed file per day;
+        :meth:`~sar_validation.core.datatree_converter.DataTreeConverter.from_era5`
+        stitches them back into one contiguous grid.
 
         Parameters
         ----------
@@ -166,6 +171,9 @@ class ERA5Downloader:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        windows = split_antimeridian_bbox(min_lon, max_lon)
+        multi_window = len(windows) > 1
+
         downloaded: list[Path] = []
         day = window_start.date()
         end_day = window_end.date()
@@ -175,24 +183,28 @@ class ERA5Downloader:
                 day += timedelta(days=1)
                 continue
 
-            nc_path = self._nc_path_for_day(day)
-            if nc_path.exists():
-                logger.info("  %s: already present (%s), skipping.", day.isoformat(), nc_path.name)
-                downloaded.append(nc_path)
-                day += timedelta(days=1)
-                continue
+            for win_idx, (win_min_lon, win_max_lon) in enumerate(windows):
+                idx_arg = win_idx if multi_window else None
+                nc_path = self._nc_path_for_day(day, idx_arg)
+                if nc_path.exists():
+                    logger.info(
+                        "  %s (window %s): already present (%s), skipping.",
+                        day.isoformat(), idx_arg, nc_path.name,
+                    )
+                    downloaded.append(nc_path)
+                    continue
 
-            if self.dry_run:
-                logger.info(
-                    "  [dry-run] would download ERA5 %s for %s (hours %s)",
-                    self.variable, day.isoformat(), hours,
-                )
-                day += timedelta(days=1)
-                continue
+                if self.dry_run:
+                    logger.info(
+                        "  [dry-run] would download ERA5 %s for %s window [%.2f, %.2f] (hours %s)",
+                        self.variable, day.isoformat(), win_min_lon, win_max_lon, hours,
+                    )
+                    continue
 
-            result = self._download_day(day, hours, min_lon, max_lon, min_lat, max_lat)
-            if result is not None:
-                downloaded.append(result)
+                result = self._download_day(day, hours, win_min_lon, win_max_lon, min_lat, max_lat, idx_arg)
+                if result is not None:
+                    downloaded.append(result)
+
             day += timedelta(days=1)
 
         return downloaded
@@ -201,15 +213,20 @@ class ERA5Downloader:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _nc_path_for_day(self, day: date) -> Path:
-        return self.output_dir / f"era5_{self.variable}_{day.strftime('%Y%m%d')}.nc"
+    def _nc_path_for_day(self, day: date, window_idx: Optional[int] = None) -> Path:
+        suffix = f"_w{window_idx}" if window_idx is not None else ""
+        return self.output_dir / f"era5_{self.variable}_{day.strftime('%Y%m%d')}{suffix}.nc"
 
     def _build_area(self, min_lon: float, max_lon: float, min_lat: float, max_lat: float) -> list[float]:
         """CDS ``area`` facet: ``[north, west, south, east]``, padded by one
         native grid cell so bilinear interpolation never extrapolates at a
-        SAR scene's edges."""
+        SAR scene's edges -- clipped at +/-180 so a window that already
+        touches the antimeridian (from split_antimeridian_bbox) is never
+        padded past it into an invalid CDS area value."""
         pad = _GRID_PAD_DEG_BY_VARIABLE[self.variable]
-        return [max_lat + pad, min_lon - pad, min_lat - pad, max_lon + pad]
+        west = max(min_lon - pad, -180.0)
+        east = min(max_lon + pad, 180.0)
+        return [max_lat + pad, west, min_lat - pad, east]
 
     def _build_request(
         self, day: date, hours: list[int],
@@ -234,8 +251,10 @@ class ERA5Downloader:
     def _download_day(
         self, day: date, hours: list[int],
         min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+        window_idx: Optional[int] = None,
     ) -> Optional[Path]:
-        """Download one day's ERA5 file. Returns the NC path, or ``None`` on
+        """Download one day's ERA5 file (one antimeridian-split window, if
+        *window_idx* is given). Returns the NC path, or ``None`` on
         failure."""
         try:
             import cdsapi  # noqa: PLC0415 — optional dependency, imported lazily
@@ -245,16 +264,19 @@ class ERA5Downloader:
                 "pip install 'sar-l2-validation-toolbox[soil_moisture]'"
             ) from exc
 
-        nc_path = self._nc_path_for_day(day)
+        nc_path = self._nc_path_for_day(day, window_idx)
         request = self._build_request(day, hours, min_lon, max_lon, min_lat, max_lat)
         dataset = _CDS_DATASET_BY_VARIABLE[self.variable]
 
-        logger.info("  %s: requesting CDS %s (%s) ...", day.isoformat(), dataset, self.variable)
+        logger.info(
+            "  %s (window %s): requesting CDS %s (%s) ...",
+            day.isoformat(), window_idx, dataset, self.variable,
+        )
         try:
             client = cdsapi.Client(quiet=True)
             client.retrieve(dataset, request).download(str(nc_path))
         except Exception as exc:  # noqa: BLE001 — cdsapi raises broad exceptions
-            logger.warning("  %s: CDS download failed: %s", day.isoformat(), exc)
+            logger.warning("  %s (window %s): CDS download failed: %s", day.isoformat(), window_idx, exc)
             nc_path.unlink(missing_ok=True)
             return None
         return nc_path

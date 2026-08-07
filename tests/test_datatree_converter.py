@@ -2877,3 +2877,62 @@ class TestConvertDownloadedDataEra5:
         assert era5_ds.attrs["data_type"] == "era5_wind"
         assert "swh" not in era5_ds.data_vars
         assert "u10" in era5_ds.data_vars and not era5_ds["u10"].isnull().any()
+
+
+class TestFromEra5Antimeridian:
+    def _write_window_nc(self, path, lon_values, n_lat=3, n_time=3, start_hour="2026-07-12T00:00:00"):
+        import numpy as np
+        import xarray as xr
+
+        lat = np.linspace(40.0, 42.0, n_lat)
+        lon = np.array(lon_values)
+        time = xr.date_range(start_hour, periods=n_time, freq="1h")
+        u10 = np.random.rand(n_time, n_lat, len(lon)).astype("float32")
+        v10 = np.random.rand(n_time, n_lat, len(lon)).astype("float32")
+        ds = xr.Dataset(
+            {
+                "u10": (("time", "latitude", "longitude"), u10),
+                "v10": (("time", "latitude", "longitude"), v10),
+            },
+            coords={"time": time, "latitude": lat, "longitude": lon},
+        )
+        ds.to_netcdf(path)
+
+    def test_group_by_day_separates_window_pairs_from_single_files(self, tmp_path):
+        from sar_validation.core.datatree_converter import _group_era5_paths_by_day
+
+        paths = [
+            tmp_path / "era5_wind_20260712_w0.nc",
+            tmp_path / "era5_wind_20260712_w1.nc",
+            tmp_path / "era5_wind_20260713.nc",
+        ]
+        groups = _group_era5_paths_by_day(paths)
+        assert groups == {
+            "era5_wind_20260712": [paths[0], paths[1]],
+            "era5_wind_20260713": [paths[2]],
+        }
+
+    def test_stitch_helper_returns_none_if_window_missing(self, tmp_path):
+        from sar_validation.core.datatree_converter import _stitch_antimeridian_window_files
+
+        w0 = tmp_path / "era5_wind_20260712_w0.nc"
+        self._write_window_nc(w0, [175.0, 180.0])
+
+        assert _stitch_antimeridian_window_files([w0]) is None
+
+    def test_stitches_two_window_files_into_one_contiguous_lon_axis(self, tmp_path):
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        east = tmp_path / "era5_wind_20260712_w0.nc"
+        west = tmp_path / "era5_wind_20260712_w1.nc"
+        self._write_window_nc(east, [175.0, 177.5, 180.0])
+        self._write_window_nc(west, [-180.0, -177.5, -175.0])
+
+        ds = DataTreeConverter.from_era5([east, west], "wind")
+        assert ds is not None
+        lon = sorted(ds["lon"].values.tolist())
+        # West window shifted by +360: [-180,-177.5,-175] -> [180,182.5,185]
+        assert np.allclose(lon, [175.0, 177.5, 180.0, 182.5, 185.0])
+        assert all(b > a for a, b in zip(lon, lon[1:]))  # strictly increasing after stitch

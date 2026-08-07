@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+import xarray as xr
 
 
 class TestBuildSpatialInterpolator:
@@ -298,3 +299,66 @@ class TestModelLayerCollocationCellAveraging:
             era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         assert results == []
+
+
+class TestAntimeridianLonHelpers:
+    def test_normalize_query_lon_no_op_when_grid_not_stitched(self):
+        from sar_validation.core.model_collocation import _normalize_query_lon
+
+        lon_ax = np.array([170.0, 175.0, 180.0])
+        query = np.array([-179.0, 172.0])
+        result = _normalize_query_lon(query, lon_ax)
+        assert np.array_equal(result, query)
+
+    def test_normalize_query_lon_shifts_negative_values_for_stitched_grid(self):
+        from sar_validation.core.model_collocation import _normalize_query_lon
+
+        lon_ax = np.array([175.0, 180.0, 182.5, 185.0])  # stitched, max > 180
+        query = np.array([-178.0, 177.0])
+        result = _normalize_query_lon(query, lon_ax)
+        assert result[0] == pytest.approx(182.0)  # -178 + 360
+        assert result[1] == pytest.approx(177.0)  # already positive, unchanged
+
+    def test_wrap_lon_to_pm180(self):
+        from sar_validation.core.model_collocation import _wrap_lon_to_pm180
+
+        assert _wrap_lon_to_pm180(185.0) == pytest.approx(-175.0)
+        assert _wrap_lon_to_pm180(170.0) == pytest.approx(170.0)
+
+
+class TestModelLayerCollocationAntimeridian:
+    def test_individual_grid_interpolates_correctly_across_stitched_axis(self):
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        # Stitched ERA5 grid: lon axis [175, 180, 182.5, 185] (originally
+        # [175,180] east + [-180,-177.5] shifted to [180,182.5] west --
+        # simplified to a 4-point axis for a clean, hand-checkable test.
+        lat = np.array([40.0, 41.0])
+        lon = np.array([175.0, 180.0, 182.5, 185.0])
+        time = pd.to_datetime(["2026-07-12T01:00:00"])
+        u10 = np.full((1, 2, 4), 20.0)
+        era5_ds = xr.Dataset(
+            {"u10": (("time", "lat", "lon"), u10)},
+            coords={"time": time, "lat": lat, "lon": lon},
+        )
+
+        # SAR pixel at lon=-178 (standard convention) sits at the
+        # equivalent stitched-axis position 182 -- squarely inside the
+        # stitched grid's coverage, between 180 and 182.5.
+        sar_lon = np.array([[-178.0]])
+        sar_lat = np.array([[40.5]])
+        sar_time = np.array([np.datetime64("2026-07-12T01:00:00")])
+        sar_data = {"owiWindSpeed": np.array([[[7.0]]])}
+
+        colloc = ModelLayerCollocation(method="individual", temporal_method="nearest")
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        assert len(results) == 1
+        # Field is spatially uniform (20.0 everywhere) so the interpolated
+        # value is exact regardless of exact position within bounds.
+        assert results[0].val_data["u10"] == pytest.approx(20.0)
+        # Reported lon must stay in the SAR pixel's own standard
+        # convention, not the grid's internal shifted axis.
+        assert results[0].sar_lon == pytest.approx(-178.0)

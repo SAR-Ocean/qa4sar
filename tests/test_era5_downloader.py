@@ -164,7 +164,7 @@ class TestERA5DownloaderDayLoop:
 
         requested_days: list[date] = []
 
-        def fake_download_day(self, day, hours, min_lon, max_lon, min_lat, max_lat):
+        def fake_download_day(self, day, hours, min_lon, max_lon, min_lat, max_lat, window_idx=None):
             requested_days.append(day)
             return None
 
@@ -212,3 +212,55 @@ class TestERA5DownloaderDayLoop:
         )
         assert called == []
         assert paths == [existing]
+
+
+class TestERA5DownloaderAntimeridian:
+    def test_non_crossing_bbox_downloads_single_unsuffixed_file(self, tmp_path, monkeypatch):
+        from sar_validation.downloaders.era5_downloader import ERA5Downloader
+
+        requested = []
+        monkeypatch.setattr(
+            ERA5Downloader, "_download_day",
+            lambda self, day, hours, mn, mx, mnlat, mxlat, window_idx=None: (
+                requested.append((mn, mx, window_idx)) or self._nc_path_for_day(day, window_idx)
+            ),
+        )
+        dl = ERA5Downloader(variable="wind", output_dir=tmp_path)
+        paths = dl.download(
+            min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+            start="2026-07-12T00:00:00", end="2026-07-12T23:00:00",
+        )
+        assert requested == [(-10.0, 10.0, None)]
+        assert paths == [tmp_path / "era5_wind_20260712.nc"]
+
+    def test_crossing_bbox_downloads_two_suffixed_files(self, tmp_path, monkeypatch):
+        from sar_validation.downloaders.era5_downloader import ERA5Downloader
+
+        requested = []
+        monkeypatch.setattr(
+            ERA5Downloader, "_download_day",
+            lambda self, day, hours, mn, mx, mnlat, mxlat, window_idx=None: (
+                requested.append((mn, mx, window_idx)) or self._nc_path_for_day(day, window_idx)
+            ),
+        )
+        dl = ERA5Downloader(variable="wind", output_dir=tmp_path)
+        paths = dl.download(
+            min_lon=170.0, max_lon=-170.0, min_lat=40.0, max_lat=55.0,
+            start="2026-07-12T00:00:00", end="2026-07-12T23:00:00",
+        )
+        assert requested == [(170.0, 180.0, 0), (-180.0, -170.0, 1)]
+        assert paths == [
+            tmp_path / "era5_wind_20260712_w0.nc",
+            tmp_path / "era5_wind_20260712_w1.nc",
+        ]
+
+    def test_build_area_clips_padding_at_dateline(self, tmp_path):
+        from sar_validation.downloaders.era5_downloader import ERA5Downloader
+
+        dl = ERA5Downloader(variable="wind", output_dir=tmp_path)
+        # East window touches 180 exactly -- padding must not push past it.
+        area = dl._build_area(min_lon=170.0, max_lon=180.0, min_lat=40.0, max_lat=55.0)
+        assert area == [55.25, 169.75, 39.75, 180.0]
+        # West window touches -180 exactly.
+        area = dl._build_area(min_lon=-180.0, max_lon=-170.0, min_lat=40.0, max_lat=55.0)
+        assert area == [55.25, -180.0, 39.75, -169.75]
