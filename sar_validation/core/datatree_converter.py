@@ -3727,8 +3727,12 @@ class DataTreeConverter:
         # a `point` dimension.
         subdir = base_dir / "era5"
         if subdir.exists():
-            era5_files = sorted(subdir.glob("*.nc"))
             era5_variable = recipe.config.variable if recipe is not None else None
+            era5_files = (
+                sorted(subdir.glob(f"era5_{era5_variable}_*.nc"))
+                if era5_variable is not None
+                else []
+            )
             if era5_files and era5_variable in ("wind", "waves", "soil_moisture"):
                 ds = DataTreeConverter.from_era5(era5_files, era5_variable)
                 if ds is not None:

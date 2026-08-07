@@ -2815,3 +2815,57 @@ class TestConvertDownloadedDataEra5:
         era5_ds = tree["validation/era5/era5"].to_dataset()
         assert era5_ds.sizes["time"] == 48
         assert era5_ds.attrs["data_type"] == "era5_wind"
+
+    def test_stale_files_from_other_variable_are_ignored(self, tmp_path):
+        """Reruns of a recipe with a different `variable` in the same output
+        dir must not have their leftover era5_<other>_*.nc files globbed in
+        alongside the current variable's files (see HF-radar stale-cache
+        incident for the same bug class)."""
+        import numpy as np
+        import xarray as xr
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import (
+            GeographicBounds, Recipe, RecipeConfig, TemporalBounds,
+        )
+
+        era5_dir = tmp_path / "era5"
+        era5_dir.mkdir()
+        lat = np.linspace(40.0, 41.5, 4)
+        lon = np.linspace(-10.0, -8.5, 4)
+
+        # Current variable: wind, single day, 24 hourly steps.
+        wind_time = xr.date_range("2026-07-12T00:00:00", periods=24, freq="1h")
+        wind_ds = xr.Dataset(
+            {
+                "u10": (("time", "latitude", "longitude"), np.random.rand(24, 4, 4).astype("float32")),
+                "v10": (("time", "latitude", "longitude"), np.random.rand(24, 4, 4).astype("float32")),
+            },
+            coords={"time": wind_time, "latitude": lat, "longitude": lon},
+        )
+        wind_ds.to_netcdf(era5_dir / "era5_wind_20260712.nc")
+
+        # Stale leftover from a previous run of a different recipe/variable
+        # (waves) that was never cleared out of the shared output dir.
+        waves_time = xr.date_range("2026-07-11T00:00:00", periods=24, freq="1h")
+        waves_ds = xr.Dataset(
+            {"swh": (("time", "latitude", "longitude"), np.random.rand(24, 4, 4).astype("float32"))},
+            coords={"time": waves_time, "latitude": lat, "longitude": lon},
+        )
+        waves_ds.to_netcdf(era5_dir / "era5_waves_20260711.nc")
+
+        recipe = Recipe(RecipeConfig(
+            name="t", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, -8.5, 40.0, 41.5),
+            temporal_bounds=TemporalBounds("2026-07-12", "2026-07-12"),
+        ))
+
+        tree = DataTreeConverter.convert_downloaded_data(tmp_path, recipe=recipe)
+        assert tree is not None
+        era5_ds = tree["validation/era5/era5"].to_dataset()
+
+        # Only the wind file's 24 timesteps should appear -- the stale waves
+        # file must be ignored, not concatenated in.
+        assert era5_ds.sizes["time"] == 24
+        assert era5_ds.attrs["data_type"] == "era5_wind"
+        assert "swh" not in era5_ds.data_vars
+        assert "u10" in era5_ds.data_vars and not era5_ds["u10"].isnull().any()
