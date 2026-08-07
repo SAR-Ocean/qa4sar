@@ -307,3 +307,14 @@ class TestEra5RejectedForCurrents:
         yaml_path.write_text(yaml_body)
         recipe = Recipe.from_yaml(yaml_path)
         assert recipe.config.validation_sources[0].source_type == "era5"
+
+
+class TestEra5DefaultLayerTypeSpecs:
+    def test_era5_wind_and_waves_and_soil_moisture_have_defaults(self):
+        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+
+        for key in ("era5_wind", "era5_waves", "era5_soil_moisture"):
+            spec = DEFAULT_LAYER_TYPE_SPECS[key]
+            assert spec["method"] in ("individual", "cell-averaging")
+            assert spec["temporal_method"] in ("nearest", "hyperbolic")
+            assert spec["aggregation_window_km"] > 0

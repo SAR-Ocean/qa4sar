@@ -112,7 +112,7 @@ __all__ = [
 # two differ in lightness) — this is what made scatterometer's matched
 # points look gray once it landed on the (then-)black slot below. Must
 # have at least as many entries as _canonical_source_order() returns
-# (currently 13): a shorter palette wraps and silently reassigns two
+# (currently 16): a shorter palette wraps and silently reassigns two
 # unrelated sources (e.g. tidal gauge landing back on altimeter's blue
 # circle) — see the "matched tidal gauge and altimeter look identical" bug
 # this comment documents. Slots are assigned by *list position* in
@@ -126,18 +126,27 @@ __all__ = [
 # changed to the darker teal "#469990" because that pale cyan was hard to
 # distinguish against plot_collocation_diagnostics' mid-gray (#808080)
 # "unmatched" pattern once small marker sizes/anti-aliasing softened it.
+#
+# The last three entries (olive/cyan/lavender) were appended for
+# era5_wind/era5_waves/era5_soil_moisture joining _CANONICAL_SOURCE_ORDER --
+# same append-only rule applies here as there, to avoid the exact wrap
+# collision this comment already warns about.
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#469990",
     "#f032e6", "#e6194b", "#000080", "#ffff00",
     "#00ff00",
+    "#808000", "#42d4f4", "#dcbeff",
 ]
 
 # Marker shapes paired 1:1 with _SOURCE_COLORS by index, used wherever
 # validation sources need to stay identifiable independently of color (e.g.
 # when color is taken by a continuous value like wind speed or temporal
 # offset instead of by source).
-_SOURCE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<", ">"]
+_SOURCE_MARKERS = [
+    "o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<", ">",
+    "H", "d", "+",
+]
 
 # Fixed, append-only reference order for known validation source/platform
 # types. Each name's *list position* is its permanent color/marker slot
@@ -155,6 +164,7 @@ _CANONICAL_SOURCE_ORDER = [
     "mooring", "radiometer", "radiometer_ssm", "scatterometer",
     "scatterometer_ssm", "tidal_gauge",
     "cds_ssm",
+    "era5_wind", "era5_waves", "era5_soil_moisture",
 ]
 
 

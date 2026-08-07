@@ -211,6 +211,35 @@ DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
     # C3S CDS composite (ACTIVE/PASSIVE/COMBINED) at 0.25° — 12h tolerance,
     # 25km window (matches the native grid spacing).
     "cds_ssm":   {"time_tolerance_minutes": 720, "aggregation_window_km": 25.0, "distance_weighting": "equal"},
+    # ERA5 reanalysis (Copernicus CDS) -- a complete background field, not
+    # an observation with real coverage gaps, so its collocation uses
+    # bilinear spatial + nearest-hour/hyperbolic temporal interpolation
+    # (ModelLayerCollocation in model_collocation.py) rather than the
+    # KD-tree point-matching every other layer type above uses. See
+    # docs/design-choices.md for why that method is NOT extended to the
+    # observational sources above it.
+    #
+    # aggregation_window_km is ~half the native grid spacing (0.25 deg /
+    # 27.75 km for wind/waves, 0.1 deg / 11.1 km for land soil moisture),
+    # matching the convention already used for scatterometer/altimeter
+    # above, so cell-averaging's per-cell SAR aggregation windows don't
+    # overlap neighbouring ERA5 cells. time_tolerance_minutes is a nominal
+    # value only used as a merged_kwargs fallback -- the actual match is
+    # always at the SAR scene's own exact time (temporal_distance_minutes
+    # is always 0 for era5 results), so this key is not read by
+    # ModelLayerCollocation.
+    "era5_wind": {
+        "time_tolerance_minutes": 60, "aggregation_window_km": 12.5,
+        "distance_weighting": "equal", "method": "cell-averaging", "temporal_method": "hyperbolic",
+    },
+    "era5_waves": {
+        "time_tolerance_minutes": 60, "aggregation_window_km": 12.5,
+        "distance_weighting": "equal", "method": "cell-averaging", "temporal_method": "hyperbolic",
+    },
+    "era5_soil_moisture": {
+        "time_tolerance_minutes": 720, "aggregation_window_km": 5.0,
+        "distance_weighting": "equal", "method": "cell-averaging", "temporal_method": "hyperbolic",
+    },
 }
 
 

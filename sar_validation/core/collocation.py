@@ -289,6 +289,13 @@ LAYER_DATA_TYPES = {
     "scatterometer", "altimeter", "hf_radar", "hf_radar_grid", "radiometer",
     "scatterometer_ssm", "radiometer_ssm",
     "cds_ssm",
+    # ERA5 nodes never reach _detect_collocation_type in practice (they
+    # lack a "point" dimension and are pulled out by run_collocation's own
+    # model_sources scan before that check runs) -- these entries exist
+    # purely so _canonical_source_order()'s registered-set check (in
+    # visualization.py) includes era5's val_source labels for permanent
+    # palette slots. See docs/design-choices.md.
+    "era5_wind", "era5_waves", "era5_soil_moisture",
 }
 # path-fragment fallbacks when attributes are absent
 LAYER_SOURCE_PATHS = {

@@ -970,6 +970,15 @@ class TestCanonicalSourceOrderStability:
         with pytest.raises(AssertionError, match="some_brand_new_layer_type"):
             viz_mod._canonical_source_order()
 
+    def test_era5_sources_appended_after_cds_ssm(self):
+        from sar_validation.core.visualization import _canonical_source_order
+
+        canonical = _canonical_source_order()
+        cds_ssm_idx = canonical.index("cds_ssm")
+        assert canonical[cds_ssm_idx + 1: cds_ssm_idx + 4] == [
+            "era5_wind", "era5_waves", "era5_soil_moisture",
+        ]
+
 
 class TestPlotGeographic:
     def test_distinct_sources_get_distinct_markers(self, geo_datatree_and_collocation, monkeypatch):
