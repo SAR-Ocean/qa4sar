@@ -29,9 +29,44 @@ CLI usage::
 
 from __future__ import annotations
 
+import argparse
+import logging
+import sys
 from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Literal, Optional
 
-__all__ = ["_hours_needed_for_day"]
+from .base import build_output_dir, normalize_datetime
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["_hours_needed_for_day", "ERA5Downloader", "main"]
+
+Era5Variable = Literal["wind", "waves", "soil_moisture"]
+
+#: CDS dataset identifier per ERA5 variable (wind/waves vs soil_moisture
+#: come from different datasets).
+_CDS_DATASET_BY_VARIABLE: dict[Era5Variable, str] = {
+    "wind": "reanalysis-era5-single-levels",
+    "waves": "reanalysis-era5-single-levels",
+    "soil_moisture": "reanalysis-era5-land",
+}
+
+#: CDS variable name(s) per ERA5 variable.
+_CDS_VARIABLE_NAMES_BY_VARIABLE: dict[Era5Variable, list[str]] = {
+    "wind": ["10m_u_component_of_wind", "10m_v_component_of_wind"],
+    "waves": ["significant_height_of_combined_wind_waves_and_swell"],
+    "soil_moisture": ["volumetric_soil_water_level_1"],
+}
+
+#: Grid padding (degrees) per variable, used to ensure bilinear
+#: interpolation never extrapolates at a SAR scene's edges. ERA5 Land has
+#: 0.1° resolution; ERA5 single-levels (wind, waves) have 0.25° resolution.
+_GRID_PAD_DEG_BY_VARIABLE: dict[Era5Variable, float] = {
+    "wind": 0.25,
+    "waves": 0.25,
+    "soil_moisture": 0.1,
+}
 
 #: Margin (hours) added on both sides of the recipe's own padded temporal
 #: window before it's clipped to a calendar day, giving the hyperbolic
@@ -68,3 +103,197 @@ def _hours_needed_for_day(
     if lo > hi:
         return []
     return list(range(lo.hour, hi.hour + 1))
+
+
+class ERA5Downloader:
+    """
+    Download ERA5 reanalysis data via ``cdsapi``, using the gridded
+    area/bbox datasets so the result can feed bilinear spatial
+    interpolation (see module docstring).
+
+    Parameters
+    ----------
+    variable : str
+        One of ``"wind"``, ``"waves"``, ``"soil_moisture"``.
+    output_dir : Path
+        Directory to save downloaded NetCDF files.
+    dry_run : bool
+        If True, log what would be downloaded without calling the CDS API.
+    """
+
+    def __init__(self, variable: Era5Variable, output_dir: Path, dry_run: bool = False) -> None:
+        if variable not in _CDS_DATASET_BY_VARIABLE:
+            raise ValueError(
+                f"variable must be one of {sorted(_CDS_DATASET_BY_VARIABLE)}; got {variable!r}"
+            )
+        self.variable = variable
+        self.output_dir = Path(output_dir)
+        self.dry_run = dry_run
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def download(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+    ) -> list[Path]:
+        """
+        Download daily ERA5 files covering every calendar day whose
+        needed-hour range (see :func:`_hours_needed_for_day`) is non-empty
+        within [*start*, *end*].
+
+        Parameters
+        ----------
+        min_lon, max_lon, min_lat, max_lat : float
+            Geographic bounds -- padded internally by one native grid cell
+            (see :meth:`_build_area`).
+        start, end : str
+            ISO-8601 date or datetime strings.
+
+        Returns
+        -------
+        list[Path]
+            Paths to downloaded (or already-cached) NetCDF files.
+        """
+        window_start = datetime.fromisoformat(normalize_datetime(start))
+        window_end = datetime.fromisoformat(normalize_datetime(end))
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        downloaded: list[Path] = []
+        day = window_start.date()
+        end_day = window_end.date()
+        while day <= end_day:
+            hours = _hours_needed_for_day(day, window_start, window_end)
+            if not hours:
+                day += timedelta(days=1)
+                continue
+
+            nc_path = self._nc_path_for_day(day)
+            if nc_path.exists():
+                logger.info("  %s: already present (%s), skipping.", day.isoformat(), nc_path.name)
+                downloaded.append(nc_path)
+                day += timedelta(days=1)
+                continue
+
+            if self.dry_run:
+                logger.info(
+                    "  [dry-run] would download ERA5 %s for %s (hours %s)",
+                    self.variable, day.isoformat(), hours,
+                )
+                day += timedelta(days=1)
+                continue
+
+            result = self._download_day(day, hours, min_lon, max_lon, min_lat, max_lat)
+            if result is not None:
+                downloaded.append(result)
+            day += timedelta(days=1)
+
+        return downloaded
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _nc_path_for_day(self, day: date) -> Path:
+        return self.output_dir / f"era5_{self.variable}_{day.strftime('%Y%m%d')}.nc"
+
+    def _build_area(self, min_lon: float, max_lon: float, min_lat: float, max_lat: float) -> list[float]:
+        """CDS ``area`` facet: ``[north, west, south, east]``, padded by one
+        native grid cell so bilinear interpolation never extrapolates at a
+        SAR scene's edges."""
+        pad = _GRID_PAD_DEG_BY_VARIABLE[self.variable]
+        return [max_lat + pad, min_lon - pad, min_lat - pad, max_lon + pad]
+
+    def _build_request(
+        self, day: date, hours: list[int],
+        min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    ) -> dict:
+        """Build the cdsapi request dict for a single *day*."""
+        request: dict = {
+            "variable": _CDS_VARIABLE_NAMES_BY_VARIABLE[self.variable],
+            "year": [str(day.year)],
+            "month": [f"{day.month:02d}"],
+            "day": [f"{day.day:02d}"],
+            "time": [f"{h:02d}:00" for h in hours],
+            "area": self._build_area(min_lon, max_lon, min_lat, max_lat),
+            "data_format": "netcdf",
+        }
+        # reanalysis-era5-land has no product_type facet; the atmospheric
+        # single-levels dataset requires it (reanalysis vs ensemble members).
+        if _CDS_DATASET_BY_VARIABLE[self.variable] != "reanalysis-era5-land":
+            request["product_type"] = ["reanalysis"]
+        return request
+
+    def _download_day(
+        self, day: date, hours: list[int],
+        min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    ) -> Optional[Path]:
+        """Download one day's ERA5 file. Returns the NC path, or ``None`` on
+        failure."""
+        try:
+            import cdsapi  # noqa: PLC0415 — optional dependency, imported lazily
+        except ImportError as exc:
+            raise ImportError(
+                "cdsapi is required for ERA5 downloads. Install it with: "
+                "pip install 'sar-l2-validation-toolbox[soil_moisture]'"
+            ) from exc
+
+        nc_path = self._nc_path_for_day(day)
+        request = self._build_request(day, hours, min_lon, max_lon, min_lat, max_lat)
+        dataset = _CDS_DATASET_BY_VARIABLE[self.variable]
+
+        logger.info("  %s: requesting CDS %s (%s) ...", day.isoformat(), dataset, self.variable)
+        try:
+            client = cdsapi.Client(quiet=True)
+            client.retrieve(dataset, request).download(str(nc_path))
+        except Exception as exc:  # noqa: BLE001 — cdsapi raises broad exceptions
+            logger.warning("  %s: CDS download failed: %s", day.isoformat(), exc)
+            nc_path.unlink(missing_ok=True)
+            return None
+        return nc_path
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Download ERA5 reanalysis data.")
+    p.add_argument("--variable", choices=["wind", "waves", "soil_moisture"], required=True)
+    p.add_argument("--min-lon", type=float, required=True)
+    p.add_argument("--max-lon", type=float, required=True)
+    p.add_argument("--min-lat", type=float, required=True)
+    p.add_argument("--max-lat", type=float, required=True)
+    p.add_argument("--start", required=True, help="Start date/datetime (ISO-8601).")
+    p.add_argument("--end", required=True, help="End date/datetime (ISO-8601, inclusive).")
+    p.add_argument("--output-dir", type=Path, default=None,
+                   help="Output directory (default: data/<timerange>_<bounds>/era5).")
+    p.add_argument("--dry-run", action="store_true")
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    args = _build_arg_parser().parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+    out_dir = Path(args.output_dir) if args.output_dir else (
+        build_output_dir(args.start, args.end, args.min_lon, args.max_lon,
+                         args.min_lat, args.max_lat) / "era5"
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dl = ERA5Downloader(variable=args.variable, output_dir=out_dir, dry_run=args.dry_run)
+    dl.download(
+        min_lon=args.min_lon, max_lon=args.max_lon,
+        min_lat=args.min_lat, max_lat=args.max_lat,
+        start=args.start, end=args.end,
+    )
+
+
+if __name__ == "__main__":
+    main()
