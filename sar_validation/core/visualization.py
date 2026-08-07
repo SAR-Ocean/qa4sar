@@ -903,12 +903,14 @@ def plot_geographic(
     two_column_by_type : bool
         When True and split_by == "collocation_type": instead of one
         Figure per collocation_type (each containing a grid of every
-        scene), build one Figure *per scene*, with point_vs_layer drawn
-        in the left column and layer_vs_layer in the right (falling back
-        to a single column if a scene only has one of the two types).
-        Returns dict[scene_name, Figure] in this mode instead of
-        dict[collocation_type, Figure]. Ignored (no-op) unless split_by
-        == "collocation_type".
+        scene), build one Figure *per scene*, with one column per
+        collocation_type actually present in the data for that scene
+        (e.g. point_vs_layer, layer_vs_layer, and ERA5's model_vs_layer),
+        ordered point_vs_layer, layer_vs_layer, then any other type
+        alphabetically, falling back to a single column if a scene only
+        has one type present. Returns dict[scene_name, Figure] in this
+        mode instead of dict[collocation_type, Figure]. Ignored (no-op)
+        unless split_by == "collocation_type".
     skip_domain_harmonization : bool
         When True, force ``domains_differ`` to False unconditionally,
         skipping the whole SAR-vs-validation units-mismatch detection and
@@ -1498,14 +1500,32 @@ def plot_geographic(
             # pcolormesh/scatter calls above have run their autoscale.
             _set_lonlat_ticks(ax, gl)
 
+    # Preferred left-to-right column order for _build_scene_pair_figure:
+    # point_vs_layer, then layer_vs_layer, then any other collocation_type
+    # (e.g. ERA5's model_vs_layer) alphabetically -- keeps today's
+    # soil-moisture column order stable while still picking up whatever
+    # collocation_type values are actually present in the data.
+    _CTYPE_COLUMN_ORDER = {"point_vs_layer": 0, "layer_vs_layer": 1}
+
     def _build_scene_pair_figure(scene_name):
-        """Build one two-column Figure for *scene_name*: point_vs_layer
-        collocations on the left, layer_vs_layer on the right (or a single
-        column if only one type has data for this scene)."""
+        """Build one multi-column Figure for *scene_name*: one panel per
+        collocation_type actually present in the data (e.g. point_vs_layer,
+        layer_vs_layer, and ERA5's model_vs_layer), or a single column if
+        only one type has data for this scene. The set of columns is
+        derived from what's actually present in
+        ``point_collocation_ds["collocation_type"]`` rather than a fixed
+        pair of hardcoded strings, so any collocation_type -- present or
+        future -- gets its own panel instead of being silently dropped."""
+        if "collocation_type" not in point_collocation_ds:
+            return None
+
+        ctypes_present = sorted(
+            {str(v) for v in point_collocation_ds["collocation_type"].values},
+            key=lambda c: (_CTYPE_COLUMN_ORDER.get(c, len(_CTYPE_COLUMN_ORDER)), c),
+        )
+
         type_datasets = []
-        for ctype in ("point_vs_layer", "layer_vs_layer"):
-            if "collocation_type" not in point_collocation_ds:
-                continue
+        for ctype in ctypes_present:
             type_mask = (
                 (point_collocation_ds["collocation_type"] == ctype)
                 & (point_collocation_ds["sar_scene_name"] == scene_name)
@@ -2980,9 +3000,27 @@ def _extract_validation_data_for_plot(datatree):
     def process_node(node, source_name):
         """Recursively process a validation node."""
         ds = node.to_dataset()
-        
-        # If this node has lon/lat, process it
-        if "lon" in ds.coords and "lat" in ds.coords:
+
+        # If this node has lon/lat, process it. Requires a "point"
+        # dimension -- true for every validation source EXCEPT ERA5's
+        # model nodes, whose DataTreeConverter.from_era5 deliberately
+        # keeps native (time, lat, lon) GRID dims (never flattened to
+        # "point" -- see that function's own docstring), so its lon and
+        # lat coords are two INDEPENDENT 1-D axes of different lengths,
+        # not paired per-observation coordinates. Without this guard,
+        # those mismatched-length axis arrays get treated as if they were
+        # flattened per-observation points, corrupting all_lons/all_lats/
+        # all_platform_types/all_times with bogus "observations" tagged
+        # with era5's platform_type -- confirmed live: they never match a
+        # real SAR-interpolated location, so they always land in the
+        # diagnostics plot's gray "unmatched" tier with era5's marker but
+        # no legend entry ("the era5 model data is invisible"). ERA5's
+        # actually-matched points are already represented correctly
+        # elsewhere (the "matched" tier reads collocation_results.nc /
+        # matched_lookup directly, not this raw-datatree scan), so
+        # skipping gridded nodes here only removes the bogus unmatched
+        # noise -- it does not affect era5's matched-point rendering.
+        if "lon" in ds.coords and "lat" in ds.coords and "point" in ds.dims:
             lons = ds["lon"].values
             lats = ds["lat"].values
             times = ds.coords.get("time", None)
