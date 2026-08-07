@@ -230,3 +230,71 @@ class TestModelLayerCollocationIndividualPoints:
         assert len(results) == 2
         assert all(r.val_data["u10"] == pytest.approx(10.0) for r in results)
         assert all(r.collocation_type == "model_vs_layer" for r in results)
+
+
+class TestModelLayerCollocationCellAveraging:
+    def test_produces_one_match_per_era5_cell_with_nearby_sar(self):
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_ds(n_lat=2, n_lon=2)  # 4 native cells
+        # Dense SAR grid covering the same small area, 10x10 pixels.
+        lat_pix = np.linspace(39.8, 42.2, 10)
+        lon_pix = np.linspace(-10.2, -7.8, 10)
+        sar_lon, sar_lat = np.meshgrid(lon_pix, lat_pix)
+        sar_time = np.array([np.datetime64("2026-07-12T01:00:00")])
+        sar_data = {"owiWindSpeed": np.full((1, 10, 10), 7.5)}
+
+        colloc = ModelLayerCollocation(
+            method="cell-averaging", temporal_method="nearest",
+            aggregation_window_km=60.0, distance_weighting="equal",
+        )
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        assert len(results) == 4  # one per ERA5 native cell
+        for r in results:
+            assert r.val_data["u10"] == pytest.approx(10.0)
+            assert r.sar_data["owiWindSpeed"] == pytest.approx(7.5)
+            assert r.collocation_type == "model_vs_layer"
+            assert r.temporal_distance_minutes == 0.0
+
+    def test_cell_with_no_nearby_sar_produces_no_match(self):
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_ds(n_lat=2, n_lon=2)
+        # SAR grid far away from the ERA5 cells -- no overlap within the
+        # aggregation window.
+        sar_lon = np.array([[50.0]])
+        sar_lat = np.array([[50.0]])
+        sar_time = np.array([np.datetime64("2026-07-12T01:00:00")])
+        sar_data = {"owiWindSpeed": np.array([[[7.5]]])}
+
+        colloc = ModelLayerCollocation(
+            method="cell-averaging", temporal_method="nearest", aggregation_window_km=5.0,
+        )
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        assert results == []
+
+    def test_hyperbolic_no_bracketing_hour_returns_no_matches(self):
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_ds(n_lat=2, n_lon=2)  # hours 0,1,2 only
+        lat_pix = np.linspace(39.8, 42.2, 5)
+        lon_pix = np.linspace(-10.2, -7.8, 5)
+        sar_lon, sar_lat = np.meshgrid(lon_pix, lat_pix)
+        # 02:30 needs hour 3, which doesn't exist.
+        sar_time = np.array([np.datetime64("2026-07-12T02:30:00")])
+        sar_data = {"owiWindSpeed": np.full((1, 5, 5), 7.5)}
+
+        colloc = ModelLayerCollocation(
+            method="cell-averaging", temporal_method="hyperbolic", aggregation_window_km=60.0,
+        )
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        assert results == []

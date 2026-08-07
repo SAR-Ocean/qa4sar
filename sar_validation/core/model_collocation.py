@@ -13,14 +13,14 @@ sources (scatterometer/altimeter/radiometer/hf_radar_grid/satellite SSM).
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 from scipy.interpolate import RegularGridInterpolator
 
-from .collocation import CollocatedPoint
+from .collocation import CollocatedPoint, PointLayerCollocation
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ def build_spatial_interpolator(
 # ---------------------------------------------------------------------------
 
 def _hyperbolic_interp(
-    val1: np.ndarray, val2: np.ndarray, val3: np.ndarray, t_prime: np.ndarray,
+    val1: np.ndarray, val2: np.ndarray, val3: np.ndarray, t_prime: Union[float, np.ndarray],
 ) -> np.ndarray:
     """
     KNMI quadratic temporal interpolation through three equally-spaced
@@ -342,7 +342,7 @@ class ModelLayerCollocation:
         return results
 
     # ------------------------------------------------------------------
-    # Cell-averaging (grid mode) -- placeholder, implemented in Task 9
+    # Cell-averaging (grid mode)
     # ------------------------------------------------------------------
 
     def _collocate_cell_averaging_grid(
@@ -355,4 +355,96 @@ class ModelLayerCollocation:
         val_source: str,
         sar_scene_name: str,
     ) -> List[CollocatedPoint]:
-        raise NotImplementedError("cell-averaging is implemented in Task 9")
+        """
+        For each native ERA5 grid cell overlapping the SAR scene:
+        interpolate ERA5 TEMPORALLY (nearest-hour or hyperbolic) to the
+        scene's acquisition time -- no spatial interpolation is needed
+        here, since the match point IS the grid's own native cell centre
+        -- then average every SAR pixel within ``aggregation_window_km``
+        of that cell centre, reusing the exact same distance-weighted
+        aggregation machinery ``PointLayerCollocation`` already uses for
+        every other layer source (``_nearby_cells_with_distances`` +
+        ``_compute_aggregated_sar_value``).
+        """
+        obs_time = pd.Timestamp(np.atleast_1d(sar_time)[0]).to_pydatetime()
+        obs_np = np.datetime64(obs_time)
+        era5_times = pd.to_datetime(era5_ds["time"].values).to_numpy()
+        floor_hour = obs_np.astype("datetime64[h]")
+
+        if self.temporal_method == "nearest":
+            hour_idxs = [int(np.argmin(np.abs(era5_times - obs_np)))]
+        else:
+            idx2 = int(np.searchsorted(era5_times, floor_hour))
+            if idx2 >= len(era5_times) or era5_times[idx2] != floor_hour:
+                idx2 -= 1
+            if idx2 < 1 or idx2 + 1 >= len(era5_times):
+                logger.warning(
+                    "ModelLayerCollocation: no bracketing ERA5 hour for scene '%s' at %s "
+                    "-- skipping cell-averaging pass.", sar_scene_name, obs_time,
+                )
+                return []
+            hour_idxs = [idx2 - 1, idx2, idx2 + 1]
+
+        lat_ax = era5_ds["lat"].values
+        lon_ax = era5_ds["lon"].values
+        lon2d, lat2d = np.meshgrid(lon_ax, lat_ax)
+
+        model_vars: List[str] = [str(v) for v in era5_ds.data_vars]
+        cell_values: Dict[str, np.ndarray] = {}
+        for var in model_vars:
+            fields = [era5_ds[var].isel(time=h).values for h in hour_idxs]
+            if self.temporal_method == "nearest":
+                cell_values[var] = fields[0]
+            else:
+                t2 = era5_times[hour_idxs[1]]
+                t_prime = float((obs_np - t2) / np.timedelta64(1, "h"))
+                cell_values[var] = _hyperbolic_interp(fields[0], fields[1], fields[2], t_prime)
+
+        helper = PointLayerCollocation(
+            aggregation_window_km=self.aggregation_window_km,
+            distance_weighting=self.distance_weighting,
+            gaussian_sigma_km=self.gaussian_sigma_km,
+        )
+        grid_tree = PointLayerCollocation._build_grid_tree(sar_lon, sar_lat)
+
+        results: List[CollocatedPoint] = []
+        n_lat, n_lon = lat2d.shape
+        for cy in range(n_lat):
+            for cx in range(n_lon):
+                cell_lon = float(lon2d[cy, cx])
+                cell_lat = float(lat2d[cy, cx])
+                val_point = {
+                    var: float(cell_values[var][cy, cx])
+                    for var in model_vars if np.isfinite(cell_values[var][cy, cx])
+                }
+                if not val_point:
+                    continue
+
+                nearby = helper._nearby_cells_with_distances(
+                    cell_lon, cell_lat, sar_lon, sar_lat, self.aggregation_window_km, grid_tree=grid_tree,
+                )
+                if not nearby:
+                    continue
+
+                sar_aggregated = helper._compute_aggregated_sar_value(
+                    nearby, sar_data, t_idx=0,
+                    weighting_method=self.distance_weighting,
+                    sigma_km=self.gaussian_sigma_km,
+                    agg_window_km=self.aggregation_window_km,
+                )
+                if not sar_aggregated:
+                    continue
+
+                mean_dist = float(np.mean([d for _, _, d in nearby]))
+                results.append(CollocatedPoint(
+                    sar_lon=cell_lon, sar_lat=cell_lat, sar_time=obs_time,
+                    sar_data=sar_aggregated,
+                    val_lon=cell_lon, val_lat=cell_lat, val_time=obs_time,
+                    val_data=val_point,
+                    spatial_distance_km=mean_dist, temporal_distance_minutes=0.0,
+                    val_source=val_source, val_id=None,
+                    collocation_type=self.collocation_type,
+                    sar_y_idx=cy, sar_x_idx=cx,
+                    sar_scene_name=sar_scene_name,
+                ))
+        return results
