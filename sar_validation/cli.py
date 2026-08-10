@@ -974,8 +974,42 @@ def _is_already_downloaded(base_dir: Path, recipe: Optional["Recipe"] = None) ->
     every ``_HISTORICAL_FIRST_TYPES`` source (hf_radar_historical,
     adcp_historical, argo_historical, drifter_historical,
     glider_historical) to redispatch unconditionally, since step 2 of
-    ``download_all()`` has no ``_already_succeeded`` gate of its own."""
+    ``download_all()`` has no ``_already_succeeded`` gate of its own.
+
+    Also returns False when *recipe* requests a validation source_type
+    that is NOT present among the recorded run's ``downloads`` keys at
+    all -- e.g. ``recipes/wind_era5.yaml`` (validation_sources = [era5])
+    and ``recipes/wind_example.yaml`` (validation_sources = [mooring,
+    buoy, ..., scatterometer, ..., NOT era5]) share identical geographic/
+    temporal bounds and therefore the same auto-derived ``base_dir``.
+    Running ``wind_example.yaml`` first records ``downloads: {"sar":
+    ..., "scatterometer": ..., ...}`` with no ``"era5"`` key; running
+    ``wind_era5.yaml`` next would otherwise wrongly trust that recorded
+    run as "already downloaded" and skip the ERA5 download entirely,
+    silently producing a report with zero ERA5 data -- the same failure
+    mode as the era5-variable-mismatch case above, but triggered by a
+    difference in which source TYPES were requested rather than a
+    difference in era5's own ``variable``. This is a broader,
+    ADDITIONAL check on top of the era5-variable check (which still
+    catches its own narrower case: same source_type present in both, but
+    a different ``variable`` value -- a source_type-SET comparison alone
+    would miss that, since "era5" would appear in both sets).
+
+    ``DataOrchestrator._INSITU_TYPES`` (mooring/buoy/drifter/ferrybox/
+    tidal_gauge) are downloaded as one batched call and recorded under a
+    single ``"insitu"`` key (see ``DataOrchestrator._download_insitu``),
+    not one key per source_type -- normalized here via
+    ``_normalize_recorded_source_type`` before the set comparison so a
+    recipe requesting e.g. ``mooring`` alone isn't wrongly treated as
+    "not downloaded" just because the recorded key is ``"insitu"``, not
+    ``"mooring"``."""
     import json as _json
+
+    from .core.orchestrator import _INSITU_TYPES
+
+    def _normalize_recorded_source_type(source_type: str) -> str:
+        return "insitu" if source_type in _INSITU_TYPES else source_type
+
     meta_path = base_dir / "download_metadata.json"
     if not meta_path.exists():
         return False
@@ -984,6 +1018,7 @@ def _is_already_downloaded(base_dir: Path, recipe: Optional["Recipe"] = None) ->
             meta = _json.load(f)
         if meta.get("errors", ["placeholder"]) != []:
             return False
+        downloads = meta.get("downloads", {})
         recorded_variable = meta.get("variable")
         # A real download_metadata.json (written by DataOrchestrator) always
         # has "variable" set -- only a synthetic/legacy file could omit it,
@@ -997,7 +1032,14 @@ def _is_already_downloaded(base_dir: Path, recipe: Optional["Recipe"] = None) ->
         if recipe is not None and recipe_has_era5 and recorded_variable is not None \
                 and recorded_variable != recipe.config.variable:
             return False
-        downloads = meta.get("downloads", {})
+        if recipe is not None and recipe.config.validation_sources:
+            requested_types = {
+                _normalize_recorded_source_type(s.source_type)
+                for s in recipe.config.validation_sources
+            }
+            recorded_types = set(downloads.keys())
+            if not requested_types <= recorded_types:
+                return False
         return all(
             entry.get("status") != "awaiting_manual_archive"
             for entry in downloads.values()

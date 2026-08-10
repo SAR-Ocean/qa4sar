@@ -645,6 +645,112 @@ class TestIsAlreadyDownloaded:
         ))
         assert _is_already_downloaded(tmp_path, recipe) is True
 
+    def test_false_when_recipe_requests_source_type_missing_from_recorded_downloads(self, tmp_path):
+        """C2 regression: recipes/wind_era5.yaml (validation_sources=[era5])
+        and recipes/wind_example.yaml (validation_sources=[mooring, ...,
+        scatterometer, ..., NOT era5]) share identical geographic/temporal
+        bounds and therefore the same auto-derived base_dir. Running
+        wind_example.yaml first records downloads with no "era5" key;
+        running wind_era5.yaml next must NOT be treated as
+        already-downloaded (the era5-variable-mismatch check alone misses
+        this, since era5 never appears in either set)."""
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "variable": "wind",
+            "downloads": {
+                "sar": {"status": "success"},
+                "scatterometer": {"status": "success"},
+            },
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="wind_era5_test",
+            variable="wind",
+            validation_sources=[ValidationDataSource(source_type="era5")],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is False
+
+    def test_false_when_recorded_downloads_lack_requested_scatterometer(self, tmp_path):
+        """Reverse of the case above: recorded downloads had era5 (not
+        scatterometer); the current recipe wants scatterometer -- must
+        also trigger re-download."""
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "variable": "wind",
+            "downloads": {
+                "sar": {"status": "success"},
+                "era5": {"status": "success"},
+            },
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="wind_example_test",
+            variable="wind",
+            validation_sources=[ValidationDataSource(source_type="scatterometer")],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is False
+
+    def test_true_when_recorded_and_requested_source_types_match_exactly(self, tmp_path):
+        """No-regression case: recorded downloads and the current recipe's
+        requested source_types match exactly -- the skip must still fire,
+        no wasted re-download for the common case."""
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "variable": "wind",
+            "downloads": {
+                "sar": {"status": "success"},
+                "scatterometer": {"status": "success"},
+                "altimeter": {"status": "success"},
+            },
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="wind_example_test",
+            variable="wind",
+            validation_sources=[
+                ValidationDataSource(source_type="scatterometer"),
+                ValidationDataSource(source_type="altimeter"),
+            ],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is True
+
+    def test_true_when_recorded_insitu_key_covers_individual_insitu_source_types(self, tmp_path):
+        """DataOrchestrator._download_insitu batches mooring/buoy/drifter/
+        ferrybox/tidal_gauge under a single "insitu" downloads key, not one
+        key per source_type -- a recipe requesting e.g. just "mooring" must
+        still match against a recorded "insitu" key (no false re-download
+        for the common in-situ case)."""
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "variable": "wind",
+            "downloads": {
+                "sar": {"status": "success"},
+                "insitu": {"status": "success", "source_types": ["mooring", "buoy"]},
+            },
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="wind_insitu_test",
+            variable="wind",
+            validation_sources=[
+                ValidationDataSource(source_type="mooring"),
+                ValidationDataSource(source_type="buoy"),
+            ],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is True
+
 
 class TestExecuteRecipeForcesConvertCollocateWhenDownloadActuallyRan:
     """Steps 2/3 (convert/collocate) must not skip regenerating
