@@ -1089,6 +1089,51 @@ class TestSARDownloaderForceDownload:
 
 
 # ---------------------------------------------------------------------------
+# SARDownloader — found_count
+# ---------------------------------------------------------------------------
+
+class TestSARDownloaderFoundCount:
+    def _record(self, id_="abc"):
+        return {
+            "Id": id_, "Name": "S1A_IW_OCN__2SDV_20260702T000000",
+            "ContentDate_Start": "2026-07-02T00:00:00Z",
+            "ContentDate_End": "2026-07-02T00:00:10Z",
+            "ContentLength_GB": 1.0, "Online": True,
+        }
+
+    def test_found_count_set_from_query_even_in_dry_run(self, tmp_path):
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
+
+        dl = SARDownloader(output_dir=tmp_path, dry_run=True)
+        fake_client = MagicMock()
+        fake_client.query_products.return_value = [self._record("a"), self._record("b")]
+        dl._client = fake_client
+
+        out = dl.download(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2026-07-02", end="2026-07-03",
+        )
+
+        assert out == []
+        assert dl.found_count == 2
+
+    def test_found_count_zero_when_no_products_match(self, tmp_path):
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
+
+        dl = SARDownloader(output_dir=tmp_path, dry_run=True)
+        fake_client = MagicMock()
+        fake_client.query_products.return_value = []
+        dl._client = fake_client
+
+        dl.download(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2026-07-02", end="2026-07-03",
+        )
+
+        assert dl.found_count == 0
+
+
+# ---------------------------------------------------------------------------
 # AltimeterDownloader — antimeridian crossing
 # ---------------------------------------------------------------------------
 
