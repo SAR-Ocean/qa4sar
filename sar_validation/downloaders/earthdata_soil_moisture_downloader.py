@@ -142,6 +142,8 @@ class EarthdataSoilMoistureDownloader:
                 print(f"  {_describe_granule(granule)}")
             all_results.extend(results)
 
+        self.found_count = len(all_results)
+
         if self.dry_run:
             print(f"[DRY RUN] Would download {len(all_results)} granule(s) to {self.output_dir}")
             return []

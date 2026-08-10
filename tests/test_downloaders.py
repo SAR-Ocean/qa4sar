@@ -3858,6 +3858,59 @@ class TestEarthdataSoilMoistureDownloader:
         )
         fake_earthaccess.download.assert_not_called()
 
+    def test_found_count_set_from_search_even_in_dry_run(self, tmp_path, monkeypatch):
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
+            EarthdataSoilMoistureDownloader,
+        )
+
+        dl = EarthdataSoilMoistureDownloader(
+            dataset="NISAR_L3_PR_SME2_BETA", output_dir=tmp_path, dry_run=True,
+        )
+        monkeypatch.setenv("EARTHDATA_USERNAME", "test_user")
+        monkeypatch.setenv("EARTHDATA_PASSWORD", "test_pass")
+
+        granule = MagicMock()
+        granule.data_links.return_value = ["https://example.com/NISAR_L3_PR_SME2_20260301.h5"]
+        granule.size.return_value = 42.5
+
+        fake_earthaccess = MagicMock()
+        fake_earthaccess.search_data.return_value = [granule]
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            out = dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        assert out == []
+        assert dl.found_count == 1
+
+    def test_found_count_zero_when_search_returns_nothing(self, tmp_path, monkeypatch):
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
+            EarthdataSoilMoistureDownloader,
+        )
+
+        dl = EarthdataSoilMoistureDownloader(
+            dataset="NSIDC-0451", output_dir=tmp_path, dry_run=True,
+        )
+        monkeypatch.setenv("EARTHDATA_USERNAME", "test_user")
+        monkeypatch.setenv("EARTHDATA_PASSWORD", "test_pass")
+
+        fake_earthaccess = MagicMock()
+        fake_earthaccess.search_data.return_value = []
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        assert dl.found_count == 0
+
 # ---------------------------------------------------------------------------
 # HFRadarUSDownloader
 # ---------------------------------------------------------------------------
