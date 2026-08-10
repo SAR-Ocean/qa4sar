@@ -15,7 +15,7 @@ dependencies = [
     "xarray>=2024.1",
     "numpy",
     "pandas",
-    "scipy",           # scipy.spatial.cKDTree — collocation nearest-neighbour search
+    "scipy>=1.10",     # scipy.spatial.cKDTree (collocation NN search) + RegularGridInterpolator descending-axis support (model_collocation.py)
     "netCDF4",         # xarray netcdf4 engine — datatree read/write in cli.py
     "pyyaml",
     "requests",

@@ -52,8 +52,13 @@ def build_spatial_interpolator(
     difference; it just needs a monotonically increasing *lon_ax*,
     whatever its numeric range.
 
-    *lat_ax*/*lon_ax* must be strictly monotonically increasing (true for
-    every ERA5 CDS download in this toolbox). Returns NaN (via
+    *lat_ax*/*lon_ax* must be strictly monotonically increasing. CDS
+    itself always returns ERA5 latitude DESCENDING (north -> south); it is
+    ``DataTreeConverter.from_era5`` that establishes the ascending
+    invariant this function relies on (via an explicit ``raw.sortby
+    ("lat")`` before this Dataset is ever built) -- this function does not
+    re-sort itself. Longitude is naturally ascending already, including
+    the antimeridian-stitched case (see below). Returns NaN (via
     ``bounds_error=False, fill_value=np.nan``) for any query point outside
     the grid's coverage.
     """

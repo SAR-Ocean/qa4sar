@@ -2801,6 +2801,72 @@ class TestConvertDownloadedDataCdsSsm:
         assert ds["SOIL_MOISTURE"].attrs["units"] == "m3 m-3"
 
 
+class TestNormalizeEra5GribCoords:
+    """_normalize_era5_grib_coords (added in commit 7fcba5b) has no
+    dedicated test anywhere -- every from_era5 fixture in this file
+    already writes pre-normalized time/latitude/longitude names, so this
+    function's actual GRIB-bookkeeping-coordinate-stripping logic is
+    never exercised by any other test (I2). Real CDS netcdf-via-cfgrib
+    responses name the time dimension "valid_time" (not "time") and add
+    "number" (ensemble member) and "expver" (experiment version, shaped
+    (valid_time,) -- not scalar) bookkeeping coordinates."""
+
+    def test_valid_time_renamed_and_number_expver_dropped(self):
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import _normalize_era5_grib_coords
+
+        n_time, n_lat, n_lon = 3, 2, 2
+        valid_time = xr.date_range("2026-07-12T00:00:00", periods=n_time, freq="1h")
+        raw = xr.Dataset(
+            {
+                "u10": (("valid_time", "latitude", "longitude"), np.random.rand(n_time, n_lat, n_lon)),
+            },
+            coords={
+                "valid_time": valid_time,
+                "latitude": np.linspace(40.0, 41.0, n_lat),
+                "longitude": np.linspace(-10.0, -9.0, n_lon),
+                "number": 0,
+                # Real CDS files carry expver shaped (valid_time,), not
+                # scalar -- e.g. every hour tagged "0001" (final ERA5).
+                "expver": ("valid_time", ["0001"] * n_time),
+            },
+        )
+
+        result = _normalize_era5_grib_coords(raw)
+
+        assert "time" in result.dims and "time" in result.coords
+        assert "valid_time" not in result.dims and "valid_time" not in result.coords
+        assert "number" not in result.coords
+        assert "expver" not in result.coords
+        assert "lat" in result.coords and "lon" in result.coords
+        np.testing.assert_array_equal(result["time"].values, valid_time.values)
+
+    def test_noop_when_already_normalized(self):
+        """A file that already has time/lat/lon (e.g. this test suite's
+        own from_era5 fixtures, or a genuinely pre-normalized file) must
+        pass through unchanged -- no crash from a missing "latitude" etc."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import _normalize_era5_grib_coords
+
+        raw = xr.Dataset(
+            {"u10": (("time", "lat", "lon"), np.random.rand(2, 2, 2))},
+            coords={
+                "time": xr.date_range("2026-07-12T00:00:00", periods=2, freq="1h"),
+                "lat": [40.0, 41.0],
+                "lon": [-10.0, -9.0],
+            },
+        )
+
+        result = _normalize_era5_grib_coords(raw)
+
+        assert set(result.dims) == {"time", "lat", "lon"}
+        assert "number" not in result.coords and "expver" not in result.coords
+
+
 class TestFromEra5:
     def _write_era5_nc(self, path, var_names, n_lat=4, n_lon=4, n_time=3, start_hour="2026-07-12T00:00:00"):
         import numpy as np
@@ -2816,6 +2882,48 @@ class TestFromEra5:
         ds = xr.Dataset(data_vars, coords={"time": time, "latitude": lat, "longitude": lon})
         ds.to_netcdf(path)
         return arrays
+
+    def test_descending_latitude_axis_is_sorted_ascending(self, tmp_path):
+        """I1 regression: real CDS ERA5 responses always return latitude
+        DESCENDING (north -> south, e.g. 60.25, 60.00, ..., 34.75), not
+        ascending like every other fixture in this test class. This only
+        "worked" before because scipy>=1.10's RegularGridInterpolator
+        happens to tolerate descending axes -- from_era5 must establish a
+        genuinely ascending axis itself (via an explicit sortby), matching
+        build_spatial_interpolator's documented invariant regardless of
+        the installed scipy version."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        n_lat, n_lon, n_time = 4, 4, 3
+        lat = np.linspace(42.0, 40.0, n_lat)  # descending, CDS's real order
+        lon = np.linspace(-10.0, -8.5, n_lon)
+        time = xr.date_range("2026-07-12T00:00:00", periods=n_time, freq="1h")
+        ds_in = xr.Dataset(
+            {
+                "u10": (("time", "latitude", "longitude"), np.random.rand(n_time, n_lat, n_lon).astype("float32")),
+                "v10": (("time", "latitude", "longitude"), np.random.rand(n_time, n_lat, n_lon).astype("float32")),
+            },
+            coords={"time": time, "latitude": lat, "longitude": lon},
+        )
+        nc_path = tmp_path / "era5_wind_20260712.nc"
+        ds_in.to_netcdf(nc_path)
+
+        ds = DataTreeConverter.from_era5(nc_path, "wind")
+        assert ds is not None
+        assert np.all(np.diff(ds["lat"].values) > 0)
+        # Sorting lat must not scramble which u10 value belongs to which
+        # latitude -- the sorted lat=40.0 row must still carry the values
+        # originally written at lat=40.0 (the LAST row of the descending
+        # input fixture), not accidentally swapped with lat=42.0's row.
+        original_ds = xr.open_dataset(nc_path)
+        for lat_val in lat:
+            original_row = original_ds["u10"].sel(latitude=lat_val).values
+            sorted_row = ds["u10"].sel(lat=lat_val).values
+            np.testing.assert_allclose(sorted_row, original_row, rtol=1e-5)
+        original_ds.close()
 
     def test_wind_returns_gridded_dataset_with_correct_data_type(self, tmp_path):
         import numpy as np

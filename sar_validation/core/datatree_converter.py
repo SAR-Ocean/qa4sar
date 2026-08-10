@@ -2030,6 +2030,15 @@ class DataTreeConverter:
                     per_day.append(_normalize_era5_grib_coords(stitched))
 
             raw = per_day[0] if len(per_day) == 1 else xr.concat(per_day, dim="time")
+            # CDS always returns ERA5 latitude descending (north -> south,
+            # e.g. 60.25, 60.00, ..., 34.75) -- model_collocation.py's
+            # build_spatial_interpolator (a scipy RegularGridInterpolator)
+            # requires a monotonic axis, and this toolbox relies on it
+            # actually being ASCENDING (see that function's docstring).
+            # scipy >= 1.10 also accepts descending axes transparently, so
+            # this worked "by luck" on newer scipy -- sortby establishes a
+            # genuinely ascending axis regardless of scipy version.
+            raw = raw.sortby("lat")
             # ERA5 regional daily files are small (bbox-limited); load fully
             # into memory now so the Dataset returned below doesn't hold
             # lazy references into a file handle that's about to be closed.
