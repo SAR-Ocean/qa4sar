@@ -2434,6 +2434,7 @@ class TestOrchestratorDepthResolution:
         ) as mock_sar_cls:
             mock_cls.return_value.download.return_value = None
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             orchestrator.download_all()
 
         _, kwargs = mock_cls.call_args
@@ -2462,6 +2463,7 @@ class TestOrchestratorDepthResolution:
         ) as mock_sar_cls:
             mock_cls.return_value.download.return_value = None
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             orchestrator.download_all()
 
         _, kwargs = mock_cls.call_args
@@ -3339,6 +3341,7 @@ class TestOrchestratorHistoricalFirstDedup:
             "sar_validation.downloaders.hf_radar_downloader.HFRadarDownloader"
         ) as mock_nrt_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_hist_cls.return_value.download.return_value = [tmp_path / "one.nc"]
             ok = orchestrator.download_all()
 
@@ -3374,6 +3377,7 @@ class TestOrchestratorHistoricalFirstDedup:
             "sar_validation.downloaders.hf_radar_downloader.HFRadarDownloader"
         ) as mock_nrt_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_hist_cls.return_value.download.return_value = []
             mock_nrt_cls.return_value.download.return_value = []
             ok = orchestrator.download_all()
@@ -3401,6 +3405,7 @@ class TestOrchestratorHistoricalFirstDedup:
             "sar_validation.downloaders.hf_radar_downloader.HFRadarDownloader"
         ) as mock_nrt_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_nrt_cls.return_value.download.return_value = []
             ok = orchestrator.download_all()
 
@@ -3433,6 +3438,7 @@ class TestOrchestratorHistoricalFirstDedup:
             "sar_validation.downloaders.insitu_downloader.InSituDownloader"
         ) as mock_insitu_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_hist_cls.return_value.download.return_value = [tmp_path / "drifter.csv"]
             mock_insitu_cls.return_value.download.return_value = []
             ok = orchestrator.download_all()
@@ -3465,6 +3471,7 @@ class TestOrchestratorHistoricalFirstDedup:
             "sar_validation.downloaders.insitu_downloader.InSituDownloader"
         ) as mock_insitu_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_hist_cls.return_value.download.return_value = []
             mock_insitu_cls.return_value.download.return_value = []
             ok = orchestrator.download_all()
@@ -3499,6 +3506,7 @@ class TestOrchestratorHistoricalFirstDedup:
             "sar_validation.downloaders.insitu_downloader.InSituDownloader"
         ) as mock_insitu_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_hist_cls.return_value.download.return_value = [tmp_path / "drifter.csv"]
             ok = orchestrator.download_all()
 
@@ -3531,6 +3539,7 @@ class TestOrchestratorHistoricalFirstDedup:
             "sar_validation.downloaders.insitu_downloader.InSituDownloader"
         ) as mock_insitu_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_hist_cls.return_value.download.return_value = [tmp_path / "drifter.csv"]
             mock_insitu_cls.return_value.download.return_value = []
             orchestrator.download_all()
@@ -3585,6 +3594,7 @@ class TestOrchestratorAntimeridianDryRun:
             "sar_validation.downloaders.altimeter_downloader.AltimeterDownloader"
         ) as mock_alt_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_insitu_cls.return_value.download.return_value = []
             mock_alt_cls.return_value.download.return_value = []
             ok = orchestrator.download_all()

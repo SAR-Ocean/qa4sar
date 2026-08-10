@@ -1040,3 +1040,169 @@ class TestDownloadEra5:
         ok = orch._download_era5(recipe.config.validation_sources[0])
         assert ok is True
         assert fake_cls.call_args.kwargs["variable"] == "waves"
+
+
+class TestSarEmptyStopsPipeline:
+    def _recipe_with_validation_source(self) -> Recipe:
+        cfg = RecipeConfig(
+            name="test", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            sar_data=SARDataSpec(source="sentinel1_l2_ocn"),
+            validation_sources=[ValidationDataSource(source_type="scatterometer")],
+        )
+        return Recipe(cfg)
+
+    def test_zero_sar_products_skips_validation_downloads(self, tmp_path):
+        recipe = self._recipe_with_validation_source()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
+        ) as mock_scat_cls:
+            mock_sar = MagicMock()
+            mock_sar.download.return_value = []
+            mock_sar.found_count = 0
+            mock_sar_cls.return_value = mock_sar
+
+            ok = orchestrator.download_all()
+
+        mock_scat_cls.assert_not_called()
+        assert ok is True
+        assert orchestrator.metadata["sar_data_found"] is False
+        assert any("No SAR data found" in n for n in orchestrator.metadata["notices"])
+
+    def test_nonzero_sar_products_still_downloads_validation_sources(self, tmp_path):
+        recipe = self._recipe_with_validation_source()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
+        ) as mock_scat_cls:
+            mock_sar = MagicMock()
+            mock_sar.download.return_value = [tmp_path / "scene.SAFE"]
+            mock_sar.found_count = 1
+            mock_sar_cls.return_value = mock_sar
+
+            mock_scat = MagicMock()
+            mock_scat.download.return_value = []
+            mock_scat_cls.return_value = mock_scat
+
+            orchestrator.download_all()
+
+        mock_scat_cls.assert_called_once()
+        assert orchestrator.metadata["sar_data_found"] is True
+
+    def test_dry_run_also_stops_when_zero_sar_products_found(self, tmp_path):
+        recipe = self._recipe_with_validation_source()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
+        ) as mock_scat_cls:
+            mock_sar = MagicMock()
+            mock_sar.download.return_value = []
+            mock_sar.found_count = 0
+            mock_sar_cls.return_value = mock_sar
+
+            orchestrator.download_all()
+
+        mock_scat_cls.assert_not_called()
+
+    def test_sar_failure_does_not_trigger_the_stop(self, tmp_path):
+        """A SAR download that raises must keep today's behavior (continue
+        to validation downloads, ok=False) -- zero-found and failed are
+        different outcomes."""
+        recipe = self._recipe_with_validation_source()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
+        ) as mock_scat_cls:
+            mock_sar = MagicMock()
+            mock_sar.download.side_effect = RuntimeError("boom")
+            mock_sar_cls.return_value = mock_sar
+
+            mock_scat = MagicMock()
+            mock_scat.download.return_value = []
+            mock_scat_cls.return_value = mock_scat
+
+            ok = orchestrator.download_all()
+
+        mock_scat_cls.assert_called_once()
+        assert ok is False
+        assert orchestrator.metadata["sar_data_found"] is True
+
+    def test_already_succeeded_cache_restore_also_triggers_the_gate(self, tmp_path):
+        """A previous run's cached SAR entry with found_count == 0 must
+        stop download_all() the same way a fresh zero-result SAR download
+        does -- not just skip re-downloading SAR itself. Exercises the
+        `_already_succeeded("sar")` branch specifically, which is a
+        different code path from `previous_sar_data_found()` below (that
+        one is read by cli.py's resume shortcut, which never calls
+        download_all() at all)."""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success", "found_count": 0, "files": []}},
+        }))
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        with patch(
+            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
+        ) as mock_scat_cls:
+            ok = orchestrator.download_all()
+
+        mock_scat_cls.assert_not_called()
+        assert ok is True
+        assert orchestrator.metadata["sar_data_found"] is False
+
+    def test_previous_sar_data_found_reads_cached_metadata(self, tmp_path):
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success", "found_count": 0, "files": []}},
+        }))
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        assert orchestrator.previous_sar_data_found() is False
+
+    def test_previous_sar_data_found_falls_back_to_files_len(self, tmp_path):
+        """Back-compat: metadata written before this feature has no
+        found_count key at all; falls back to len(files)."""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success", "files": ["a.SAFE"]}},
+        }))
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        assert orchestrator.previous_sar_data_found() is True
+
+    def test_previous_sar_data_found_true_when_no_previous_run(self, tmp_path):
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        assert orchestrator.previous_sar_data_found() is True

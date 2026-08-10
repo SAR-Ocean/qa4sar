@@ -153,6 +153,19 @@ def _padded_temporal_bounds(cfg, *source_types: str) -> "tuple[str, str]":
     return start, end
 
 
+def _sar_entry_found_data(entry: Dict[str, Any]) -> bool:
+    """True if a recorded ``"sar"`` download-metadata entry represents at
+    least one product found for the window, a failed download attempt
+    (whose true "was there data" answer is unknown, so must not be
+    treated as empty), or the absence of any recorded entry at all (no
+    previous run to consult, so there's nothing to gate on). Falls back
+    to ``len(files)`` for entries recorded before ``found_count`` existed
+    (see the SAR-emptiness design doc)."""
+    if not entry or entry.get("status") == "failed":
+        return True
+    return entry.get("found_count", len(entry.get("files", []))) > 0
+
+
 class DataOrchestrator:
     """
     Orchestrate all downloads for a single validation run.
@@ -310,6 +323,13 @@ class DataOrchestrator:
             return False
         return prev.get("status") == "success"
 
+    def previous_sar_data_found(self) -> bool:
+        """True if a previous run's recorded SAR entry (if any) found at
+        least one product for this window. Used by the CLI's "already
+        downloaded" resume shortcut, which reuses a prior run's cached
+        metadata without calling :meth:`download_all` again."""
+        return _sar_entry_found_data(self._previous_downloads.get("sar", {}))
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -333,6 +353,17 @@ class DataOrchestrator:
             logger.info("Skipping SAR download: already succeeded in a previous run.")
         elif not self._download_sar():
             ok = False
+
+        sar_entry = self.metadata["downloads"].get("sar", {})
+        sar_data_found = _sar_entry_found_data(sar_entry)
+        self.metadata["sar_data_found"] = sar_data_found
+        if not sar_data_found:
+            msg = "No SAR data found for this window/region — skipping validation-data downloads."
+            logger.warning(msg)
+            self.metadata["notices"].append(msg)
+            if not self.dry_run:
+                self._save_metadata()
+            return ok
 
         # 2. Delayed-mode ("*_historical") sources first. hf_radar and the
         # NRT in-situ batch (below) consult file_count from these results
@@ -441,6 +472,10 @@ class DataOrchestrator:
                 **spec.extra_download_kwargs(cfg.sar_data),
             ),
             f"SAR ({cfg.sar_data.source})",
+            result_to_metadata=lambda result, dl: {
+                "files": [str(p) for p in (result or [])],
+                "found_count": getattr(dl, "found_count", len(result or [])),
+            },
         )
 
     def _download_insitu(
