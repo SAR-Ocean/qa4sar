@@ -229,6 +229,7 @@ class RADARSAT2WindDownloader:
 
     def download(self, min_lon, max_lon, min_lat, max_lat, start: str, end: str) -> list[Path]:
         windows = split_antimeridian_bbox(min_lon, max_lon)
+        self.found_count = 0
         downloaded: list[Path] = []
         for win_min_lon, win_max_lon in windows:
             downloaded.extend(
@@ -265,6 +266,7 @@ class RADARSAT2WindDownloader:
             )
 
         logger.info("radarsat2_wind: %d candidate granule(s) matched", len(granules))
+        self.found_count += len(granules)
 
         if self.dry_run:
             # Still queries each touched month's (lightweight) catalog.xml

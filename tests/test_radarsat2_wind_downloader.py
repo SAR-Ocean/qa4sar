@@ -581,3 +581,38 @@ class TestRadarsat2WindDownloaderDownload:
         # 1 catalog fetch + 1 NCML fetch + 1 fileServer download (only
         # 64N-174E is inside the [170,180] window)
         assert mock_prefer.call_count == 3
+
+    def test_found_count_set_from_catalog_even_in_dry_run(self, tmp_path):
+        from sar_validation.downloaders.radarsat2_wind_downloader import RADARSAT2WindDownloader
+
+        def fake_urlopen(url, timeout=None):
+            cm = MagicMock()
+            cm.__enter__.return_value.read.return_value = _NEW_ERA_CATALOG_XML.encode()
+            return cm
+
+        with patch(
+            "sar_validation.downloaders.radarsat2_wind_downloader.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            dl = RADARSAT2WindDownloader(output_dir=tmp_path, dry_run=True)
+            out = dl.download(170, 180, 60, 68, "2026-06-01", "2026-06-30")
+
+        assert out == []
+        assert dl.found_count == 1  # only 64N-174E is inside [170,180]
+
+    def test_found_count_zero_when_month_404s(self, tmp_path):
+        import urllib.error
+
+        from sar_validation.downloaders.radarsat2_wind_downloader import RADARSAT2WindDownloader
+
+        def fake_urlopen(url, timeout=None):
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+        with patch(
+            "sar_validation.downloaders.radarsat2_wind_downloader.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            dl = RADARSAT2WindDownloader(output_dir=tmp_path, dry_run=False)
+            dl.download(170, 180, 60, 68, "2014-01-01", "2014-01-31")
+
+        assert dl.found_count == 0
