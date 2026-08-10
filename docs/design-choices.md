@@ -62,6 +62,13 @@ The mapping from recipe variable ("wind" / "currents" / "waves") to the
 compared pairs — e.g. `owiWindSpeed` vs `WSPD` — is the single source of
 truth for both statistics and plots.
 
+**Exception: ERA5 wind.** `from_era5` deliberately does NOT rename/derive
+`u10`/`v10` to `WSPD`/`WDIR` at conversion time — they stay as raw vector
+components through conversion and collocation-time spatial/temporal
+interpolation, and `WSPD`/`WDIR` are derived only afterwards, in
+`model_collocation.py`. This is the one source where the "renamed at
+conversion time" rule above doesn't hold. See §5.7 for why.
+
 > Code: `core/_variable_map.py` (`VARIABLE_PAIRS`),
 > `core/datatree_converter.py` (`from_scatterometer_nc`, `from_altimeter`
 > rename maps).
@@ -548,9 +555,38 @@ see Task 14.
   where an ocean/land mask would be nonsensical (the whole point of that
   request is land).
 
+**`u10`/`v10` stay raw through conversion; `WSPD`/`WDIR` are derived only
+after interpolation.** Every other validation source is renamed to the
+canonical `WSPD`/`WDIR` codes at conversion time (§2). ERA5 wind is the
+one deliberate exception: `from_era5` keeps `u10`/`v10` as raw vector
+components, and `model_collocation.py`'s `_derive_wind_wspd_wdir` derives
+`WSPD`/`WDIR` from them only AFTER bilinear-spatial/hyperbolic-temporal
+interpolation has completed (called from `_model_values_at_points` and
+`_collocate_cell_averaging_grid`). This is necessary because `WDIR` is a
+circular quantity (§6) — 0° and 360° are the same direction — and cannot
+be correctly linearly or hyperbolically blended as an ordinary scalar the
+way `u10`/`v10` can. Deriving a direction first and then interpolating it
+as a plain number produces wrong results whenever the true direction
+crosses the 0°/360° seam (e.g. blending 359° and 1° naively yields ~180°,
+not ~0°). This was a real bug: an earlier version of `from_era5` derived
+`WSPD`/`WDIR` at conversion time, and the interpolation in
+`model_collocation.py` treated `WDIR` as an ordinary linear scalar,
+producing `val_WDIR` values as far out as -14.77°/376.77° (outside
+`[0, 360)`) against real CDS data. Fixed by moving the derivation
+downstream, past the point where interpolation happens (commit
+`0b196ee`). Because `WSPD`/`WDIR` never exist as a datatree-node variable
+for this source, `annotate_collocation_ds` (`core/_cf_metadata.py`)
+carries a small fixed CF-attrs fallback keyed on `("era5_wind", "WSPD"
+| "WDIR")` so era5-only wind recipes still get correct `units`/
+`standard_name` on the final `val_WSPD`/`val_WDIR` columns, matching what
+`from_era5` used to stamp directly before the derivation moved.
+
 > Code: `core/model_collocation.py` (`ModelLayerCollocation`,
-> `build_spatial_interpolator`, `collocate_points`), `core/collocation.py`
-> (`run_collocation` dispatch table).
+> `build_spatial_interpolator`, `collocate_points`,
+> `_derive_wind_wspd_wdir`), `core/datatree_converter.py` (`from_era5`),
+> `core/_cf_metadata.py` (`annotate_collocation_ds`,
+> `_DERIVED_VAL_VAR_ATTRS`), `core/collocation.py` (`run_collocation`
+> dispatch table).
 
 ---
 

@@ -2092,7 +2092,10 @@ class DataTreeConverter:
         # after collocation -- so the eventual val_data/
         # collocation_results.nc output still ends up with the same
         # WSPD/WDIR columns every other wind validation source produces,
-        # just computed at the right time. See docs/design-choices.md.
+        # just computed at the right time. This is the one exception to
+        # §2's "renamed at conversion time" invariant -- see
+        # docs/design-choices.md §2 ("Canonical variable naming") and §5.7
+        # ("ERA5 model validation").
         if variable == "waves":
             data_vars = {"VHM0": data_vars["swh"]}
         elif variable == "soil_moisture":

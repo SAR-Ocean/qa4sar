@@ -112,8 +112,9 @@ def _derive_wind_wspd_wdir(values: Dict[str, np.ndarray]) -> Dict[str, np.ndarra
     0/360 seam (e.g. blending 359 and 1 degrees naively yields ~180, not
     ~0). Deriving WSPD/WDIR from u10/v10 AFTER interpolation sidesteps
     this entirely, since u10/v10 themselves are ordinary (non-circular)
-    scalar components that interpolate correctly. See C1 in
-    docs/design-choices.md.
+    scalar components that interpolate correctly. See docs/design-choices.md
+    §5.7 ("ERA5 model validation") and §6 ("Circular variables") for the
+    full rationale.
 
     No-op (returns *values* unchanged) unless both ``"u10"`` and
     ``"v10"`` are present -- a self-describing gate, since only wind data
