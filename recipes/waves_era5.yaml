@@ -4,13 +4,13 @@ description: 'Validate Sentinel-1 significant wave height (WV/SM modes)
 version: '1.0'
 variable: waves
 geographic_bounds:
-  min_lon: 10.0
-  max_lon: 25.0
-  min_lat: 33.0
-  max_lat: 42.0
+  min_lon: -70.0
+  max_lon: -20.0
+  min_lat: 0.0
+  max_lat: 40.0
 temporal_bounds:
-  start: '2026-07-12 18:00:00'
-  end: '2026-07-12 19:00:00'
+  start: '2026-07-12 07:00:00'
+  end: '2026-07-12 11:00:00'
 sar_data:
   source: sentinel1_l2_ocn
   swath_mode:
