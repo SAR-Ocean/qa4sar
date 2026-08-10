@@ -59,8 +59,20 @@ _CDS_DATASET_BY_VARIABLE: dict[Era5Variable, str] = {
 #: after a "level_1" request failed with a CDS-side "MultiAdaptorNoDataError"
 #: (the mistyped name passes cdsapi's own request validation, since it's
 #: just a string, but the backend silently finds no matching data).
+#: "land_sea_mask" ("lsm" on the wire) is requested alongside u10/v10 for
+#: wind only, in the SAME CDS call (no extra download round-trip). It's
+#: used purely as a masking input by ModelLayerCollocation to skip ERA5
+#: grid cells whose own center is land -- ERA5's wind field is computed
+#: with different surface-roughness/friction physics over land vs. sea, so
+#: a land grid point's wind isn't meaningfully comparable to SAR ocean wind
+#: retrieval even when nearby SAR ocean pixels exist within its
+#: aggregation window. NOT added for waves (a real downloaded
+#: era5_waves_*.nc already has swh natively NaN'd over land -- ECMWF's
+#: ocean wave model, confirmed live 2026-08-10) or soil_moisture
+#: (reanalysis-era5-land is land-only by definition; a land-sea mask would
+#: be nonsensical there).
 _CDS_VARIABLE_NAMES_BY_VARIABLE: dict[Era5Variable, list[str]] = {
-    "wind": ["10m_u_component_of_wind", "10m_v_component_of_wind"],
+    "wind": ["10m_u_component_of_wind", "10m_v_component_of_wind", "land_sea_mask"],
     "waves": ["significant_height_of_combined_wind_waves_and_swell"],
     "soil_moisture": ["volumetric_soil_water_layer_1"],
 }

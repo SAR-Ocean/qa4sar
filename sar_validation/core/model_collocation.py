@@ -153,6 +153,26 @@ def _model_values_at_points(
     valid_mask = np.isfinite(lons) & np.isfinite(lats)
     unique_times = np.unique(times_np[valid_mask]) if np.any(valid_mask) else np.array([], dtype=times_np.dtype)
 
+    # Interpolation-contamination guard (companion to the cell-averaging
+    # land-skip above): land_sea_mask ("lsm", present only for wind -- see
+    # DataTreeConverter.from_era5) is time-invariant, so it's bilinearly
+    # interpolated ONCE here (no per-hour rebuild needed, unlike the
+    # per-variable interpolators below) at every query point. A point
+    # whose interpolated lsm exceeds 0.5 is close enough to a land grid
+    # cell that its bilinearly-interpolated ERA5 wind value is itself
+    # meaningfully blended with land-physics wind -- masked to NaN for
+    # every model variable, same threshold/rationale as the cell-averaging
+    # skip. `None` (not just all-zero) when era5_ds has no lsm at all, so
+    # waves/soil_moisture/pre-fix wind Datasets are unaffected.
+    land_mask = None
+    if "lsm" in era5_ds.variables and np.any(valid_mask):
+        lsm_interp = build_spatial_interpolator(lat_ax, lon_ax, era5_ds["lsm"].values)
+        lsm_at_points = np.full(n, np.nan, dtype=np.float64)
+        lsm_at_points[valid_mask] = lsm_interp(
+            np.column_stack([lats[valid_mask], lons[valid_mask]])
+        )
+        land_mask = np.isfinite(lsm_at_points) & (lsm_at_points > 0.5)
+
     interp_cache: Dict[Tuple[str, int], RegularGridInterpolator] = {}
 
     def _get_interp(var: str, hour_idx: int) -> RegularGridInterpolator:
@@ -189,6 +209,10 @@ def _model_values_at_points(
                     np.full(group_pts.shape[0], t_prime, dtype=float),
                 )
             out[var][group_mask] = blended
+
+    if land_mask is not None and np.any(land_mask):
+        for var in model_vars:
+            out[var][land_mask] = np.nan
 
     return out
 
@@ -418,6 +442,15 @@ class ModelLayerCollocation:
         lon_ax = era5_ds["lon"].values
         lon2d, lat2d = np.meshgrid(lon_ax, lat_ax)
 
+        # land_sea_mask ("lsm", present only for wind -- see
+        # DataTreeConverter.from_era5 / era5_downloader.py): a (lat, lon)
+        # coordinate, not a data_var, so `era5_ds.data_vars` below never
+        # sees it. Guarded with getattr/`.get` semantics via `in
+        # era5_ds.variables` so waves/soil_moisture Datasets (which never
+        # had lsm added) fall through unchanged -- no land-skip applied
+        # when there's no data to skip on.
+        lsm_grid = era5_ds["lsm"].values if "lsm" in era5_ds.variables else None
+
         model_vars: List[str] = [str(v) for v in era5_ds.data_vars]
         cell_values: Dict[str, np.ndarray] = {}
         for var in model_vars:
@@ -440,6 +473,16 @@ class ModelLayerCollocation:
         n_lat, n_lon = lat2d.shape
         for cy in range(n_lat):
             for cx in range(n_lon):
+                # Cheap early skip, before any SAR-pixel aggregation work:
+                # a cell whose own center is over land (lsm > 0.5, standard
+                # ECMWF/oceanographic threshold) is skipped entirely, even
+                # if valid ocean SAR pixels exist nearby -- ERA5's wind
+                # field uses different surface-roughness/friction physics
+                # over land vs. sea, so a land grid point's wind isn't
+                # comparable to SAR ocean wind retrieval regardless of
+                # proximity to the coast.
+                if lsm_grid is not None and lsm_grid[cy, cx] > 0.5:
+                    continue
                 cell_lon = _wrap_lon_to_pm180(float(lon2d[cy, cx]))
                 cell_lat = float(lat2d[cy, cx])
                 val_point = {

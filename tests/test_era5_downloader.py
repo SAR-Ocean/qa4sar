@@ -98,7 +98,13 @@ class TestERA5DownloaderBuildRequest:
 
         dl = ERA5Downloader(variable="wind", output_dir=tmp_path)
         req = dl._build_request(date(2026, 7, 12), [18, 19, 20], -10.0, 10.0, 40.0, 55.0)
-        assert req["variable"] == ["10m_u_component_of_wind", "10m_v_component_of_wind"]
+        # land_sea_mask is requested alongside u10/v10 (same CDS call, no
+        # extra download round-trip) so ModelLayerCollocation can skip ERA5
+        # grid cells whose own center is land -- see
+        # sar_validation.core.model_collocation._collocate_cell_averaging_grid.
+        assert req["variable"] == [
+            "10m_u_component_of_wind", "10m_v_component_of_wind", "land_sea_mask",
+        ]
         assert req["year"] == ["2026"]
         assert req["month"] == ["07"]
         assert req["day"] == ["12"]
@@ -116,7 +122,11 @@ class TestERA5DownloaderBuildRequest:
 
         dl = ERA5Downloader(variable="waves", output_dir=tmp_path)
         req = dl._build_request(date(2026, 7, 12), [0], -10.0, 10.0, 40.0, 55.0)
+        # No land_sea_mask here: a real downloaded era5_waves_*.nc already
+        # has swh natively NaN'd over land grid points (ECMWF's ocean wave
+        # model), confirmed live 2026-08-10 -- no land-mask fix needed.
         assert req["variable"] == ["significant_height_of_combined_wind_waves_and_swell"]
+        assert "land_sea_mask" not in req["variable"]
 
     def test_build_request_soil_moisture_has_no_product_type_facet(self, tmp_path):
         from sar_validation.downloaders.era5_downloader import ERA5Downloader
@@ -130,6 +140,9 @@ class TestERA5DownloaderBuildRequest:
         assert req["variable"] == ["volumetric_soil_water_layer_1"]
         assert req["download_format"] == "unarchived"
         assert "product_type" not in req
+        # reanalysis-era5-land is land-only by definition -- a land-sea
+        # mask is nonsensical here.
+        assert "land_sea_mask" not in req["variable"]
 
 
 class TestERA5DownloaderInvalidVariable:

@@ -2091,10 +2091,31 @@ class DataTreeConverter:
         elif variable == "soil_moisture":
             data_vars = {"SOIL_MOISTURE": data_vars["swvl1"]}
 
+        # land_sea_mask ("lsm" on the wire, requested only for wind -- see
+        # era5_downloader.py's _CDS_VARIABLE_NAMES_BY_VARIABLE) is a
+        # per-cell land-mask LOOKUP, not a per-hour model quantity to
+        # interpolate/report at collocation points. It's kept as a
+        # non-dimension COORDINATE (not a data_var), which means every
+        # downstream consumer that iterates `era5_ds.data_vars`
+        # (_model_values_at_points, _collocate_cell_averaging_grid in
+        # sar_validation.core.model_collocation) already skips it
+        # automatically -- it never leaks into val_data as a spurious
+        # val_lsm statistics column. Collapsed from (time, lat, lon) to
+        # (lat, lon) since it's time-invariant in reality (the CDS API
+        # just echoes the same value at every requested hour).
+        lsm_2d = None
+        if variable == "wind" and "lsm" in raw.variables:
+            lsm_da = raw["lsm"].astype("float32")
+            if "time" in lsm_da.dims:
+                lsm_da = lsm_da.isel(time=0, drop=True)
+            lsm_2d = lsm_da
+
         ds = xr.Dataset(
             data_vars,
             coords={"time": raw["time"], "lat": raw["lat"], "lon": raw["lon"]},
         )
+        if lsm_2d is not None:
+            ds = ds.assign_coords(lsm=(("lat", "lon"), lsm_2d.values))
         ds.attrs["data_type"] = spec["data_type"]
         ds.attrs["platform_type"] = spec["data_type"]
         ds.attrs["source"] = f"ERA5 reanalysis ({variable}, Copernicus CDS)"

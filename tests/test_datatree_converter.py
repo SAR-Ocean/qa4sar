@@ -2842,6 +2842,61 @@ class TestFromEra5:
         expected_wdir = (270.0 - np.degrees(np.arctan2(arrays["v10"], arrays["u10"]))) % 360.0
         np.testing.assert_allclose(ds["WDIR"].values, expected_wdir, rtol=1e-5)
 
+    def test_wind_lsm_present_becomes_lat_lon_coord_not_data_var(self, tmp_path):
+        """land_sea_mask ("lsm" on the wire) is a per-cell land-mask
+        LOOKUP, not a per-hour model quantity to interpolate/report at
+        collocation points -- it must not show up as a spurious extra
+        val_<name> statistics column downstream. Keeping it as a
+        coordinate (not a data_var) achieves that for free: every
+        downstream consumer that iterates `era5_ds.data_vars`
+        (_model_values_at_points, _collocate_cell_averaging_grid) already
+        skips coordinates automatically."""
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_wind_20260712.nc"
+        arrays = self._write_era5_nc(nc_path, ["u10", "v10", "lsm"], n_time=3)
+
+        ds = DataTreeConverter.from_era5(nc_path, "wind")
+        assert ds is not None
+        assert "lsm" not in ds.data_vars
+        assert "lsm" in ds.coords
+        # Time-invariant in reality (CDS just echoes it per-hour) -- kept
+        # collapsed to (lat, lon) only, matching the raw fixture's
+        # first-hour slice.
+        assert set(ds["lsm"].dims) == {"lat", "lon"}
+        np.testing.assert_allclose(ds["lsm"].values, arrays["lsm"][0])
+
+    def test_wind_without_lsm_still_works(self, tmp_path):
+        """Backward compatibility: a wind file with no lsm variable (e.g.
+        a fixture or an older cached download) must not crash, and the
+        Dataset simply has no lsm coord."""
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_wind_20260712.nc"
+        self._write_era5_nc(nc_path, ["u10", "v10"])
+
+        ds = DataTreeConverter.from_era5(nc_path, "wind")
+        assert ds is not None
+        assert "lsm" not in ds.coords
+        assert "lsm" not in ds.data_vars
+
+    def test_waves_lsm_not_extracted_even_if_present(self, tmp_path):
+        """lsm extraction is scoped to wind only -- waves never requests
+        it (see era5_downloader.py), but even if a stray lsm variable
+        showed up in a waves file, from_era5 must not extract it (only the
+        wind branch does)."""
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_waves_20260712.nc"
+        self._write_era5_nc(nc_path, ["swh", "lsm"])
+
+        ds = DataTreeConverter.from_era5(nc_path, "waves")
+        assert ds is not None
+        assert "lsm" not in ds.coords
+        assert "lsm" not in ds.data_vars
+
     def test_wind_direction_hand_checkable_case(self, tmp_path):
         """u10=0, v10=-1 is wind blowing FROM the north (northerly wind) --
         the meteorological convention gives WDIR = 0/360 degrees exactly.

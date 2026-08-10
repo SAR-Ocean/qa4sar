@@ -85,7 +85,10 @@ class TestHyperbolicInterp:
         assert result[0] == pytest.approx(expected)
 
 
-def _make_era5_ds(n_lat=3, n_lon=3, hours=("2026-07-12T00:00:00", "2026-07-12T01:00:00", "2026-07-12T02:00:00")):
+def _make_era5_ds(
+    n_lat=3, n_lon=3, hours=("2026-07-12T00:00:00", "2026-07-12T01:00:00", "2026-07-12T02:00:00"),
+    lsm=None,
+):
     import xarray as xr
 
     lat = np.linspace(40.0, 42.0, n_lat)
@@ -100,6 +103,11 @@ def _make_era5_ds(n_lat=3, n_lon=3, hours=("2026-07-12T00:00:00", "2026-07-12T01
         {"u10": (("time", "lat", "lon"), u10)},
         coords={"time": time, "lat": lat, "lon": lon},
     )
+    if lsm is not None:
+        # Matches DataTreeConverter.from_era5's representation: a
+        # (lat, lon)-only non-dimension coordinate (not a data_var), so it
+        # never leaks into model_vars/val_data iteration.
+        ds = ds.assign_coords(lsm=(("lat", "lon"), np.broadcast_to(lsm, (n_lat, n_lon)).astype(float)))
     return ds
 
 
@@ -165,6 +173,60 @@ class TestModelValuesAtPoints:
             np.array([80.0]), np.array([80.0]), times, era5_ds, "nearest",
         )
         assert np.isnan(result["u10"][0])
+
+    def test_lsm_never_returned_as_its_own_key(self):
+        """lsm is a masking input, not a model variable -- it must never
+        appear as its own key in the returned dict, whether or not it's
+        present on era5_ds."""
+        from sar_validation.core.model_collocation import _model_values_at_points
+
+        lsm = np.zeros((3, 3))
+        era5_ds = _make_era5_ds(lsm=lsm)
+        times = np.array([np.datetime64("2026-07-12T01:00:00")])
+        result = _model_values_at_points(
+            np.array([-9.0]), np.array([41.0]), times, era5_ds, "nearest",
+        )
+        assert "lsm" not in result
+
+    def test_land_influenced_point_masks_all_model_vars_to_nan(self):
+        """Interpolation-contamination guard for the 'individual'
+        collocation path (bilinear ERA5 interpolation at an exact SAR
+        pixel location): a query point close enough to a land grid cell
+        that the bilinearly-interpolated lsm value itself exceeds 0.5 is
+        treated as too land-influenced to be a valid ocean wind match --
+        mirrors the cell-averaging land-skip's rationale, applied via
+        interpolation instead of grid-cell-center-is-land."""
+        from sar_validation.core.model_collocation import _model_values_at_points
+
+        # 3x3 grid, corner cell (lat=40, lon=-10) is fully land (lsm=1.0),
+        # everything else fully sea (lsm=0.0).
+        lsm = np.zeros((3, 3))
+        lsm[0, 0] = 1.0
+        era5_ds = _make_era5_ds(lsm=lsm)
+        times = np.array([np.datetime64("2026-07-12T01:00:00")])
+        # Query point right at the land cell's own center -> interpolated
+        # lsm = 1.0 > 0.5 -> masked to NaN.
+        result = _model_values_at_points(
+            np.array([-10.0]), np.array([40.0]), times, era5_ds, "nearest",
+        )
+        assert np.isnan(result["u10"][0])
+
+    def test_sea_influenced_point_keeps_model_vars_with_lsm_present(self):
+        """No regression: a query point far from any land cell (bilinearly
+        interpolated lsm <= 0.5) still returns its model value normally
+        when lsm is present on era5_ds."""
+        from sar_validation.core.model_collocation import _model_values_at_points
+
+        lsm = np.zeros((3, 3))
+        lsm[0, 0] = 1.0
+        era5_ds = _make_era5_ds(lsm=lsm)
+        times = np.array([np.datetime64("2026-07-12T01:00:00")])
+        # Query point at the grid's opposite corner (lat=42, lon=-8) --
+        # far from the single land cell at (lat=40, lon=-10).
+        result = _model_values_at_points(
+            np.array([-8.0]), np.array([42.0]), times, era5_ds, "nearest",
+        )
+        assert result["u10"][0] == pytest.approx(10.0)
 
 
 class TestModelLayerCollocationIndividualGrid:
@@ -279,6 +341,112 @@ class TestModelLayerCollocationCellAveraging:
             era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         assert results == []
+
+    def test_land_cell_produces_no_match_even_with_nearby_ocean_sar(self):
+        """A coastal ERA5 grid cell whose own center is over land (lsm >
+        0.5) must be skipped entirely -- even though there are valid
+        ocean SAR pixels within its aggregation window. Root cause: ERA5's
+        wind field uses different surface-roughness/friction physics over
+        land vs. sea, so a land grid point's wind isn't comparable to SAR
+        ocean wind retrieval regardless of nearby ocean pixels."""
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        lsm = np.array([[0.9, 0.0], [0.0, 0.0]])  # cell (0,0) is land
+        era5_ds = _make_era5_ds(n_lat=2, n_lon=2, lsm=lsm)
+        lat_pix = np.linspace(39.8, 42.2, 10)
+        lon_pix = np.linspace(-10.2, -7.8, 10)
+        sar_lon, sar_lat = np.meshgrid(lon_pix, lat_pix)
+        sar_time = np.array([np.datetime64("2026-07-12T01:00:00")])
+        sar_data = {"owiWindSpeed": np.full((1, 10, 10), 7.5)}
+
+        colloc = ModelLayerCollocation(
+            method="cell-averaging", temporal_method="nearest",
+            aggregation_window_km=60.0, distance_weighting="equal",
+        )
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        # 4 native cells total, minus the 1 land cell -> 3 matches.
+        assert len(results) == 3
+        land_lat, land_lon = era5_ds["lat"].values[0], era5_ds["lon"].values[0]
+        assert not any(
+            r.val_lat == pytest.approx(land_lat) and r.val_lon == pytest.approx(land_lon)
+            for r in results
+        )
+
+    def test_sea_cell_still_matches_with_lsm_present(self):
+        """No regression for the sea case: when lsm is present but every
+        cell is sea (lsm <= 0.5), all cells still produce a match exactly
+        as before this fix."""
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        lsm = np.zeros((2, 2))  # all sea
+        era5_ds = _make_era5_ds(n_lat=2, n_lon=2, lsm=lsm)
+        lat_pix = np.linspace(39.8, 42.2, 10)
+        lon_pix = np.linspace(-10.2, -7.8, 10)
+        sar_lon, sar_lat = np.meshgrid(lon_pix, lat_pix)
+        sar_time = np.array([np.datetime64("2026-07-12T01:00:00")])
+        sar_data = {"owiWindSpeed": np.full((1, 10, 10), 7.5)}
+
+        colloc = ModelLayerCollocation(
+            method="cell-averaging", temporal_method="nearest",
+            aggregation_window_km=60.0, distance_weighting="equal",
+        )
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        assert len(results) == 4
+
+    def test_no_lsm_in_dataset_is_backward_compatible(self):
+        """A waves/soil_moisture-shaped era5_ds (or an old wind fixture
+        from before this fix) has no lsm coord at all -- must not crash,
+        and no land-skip is applied since there's no data to skip on."""
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_ds(n_lat=2, n_lon=2)  # no lsm
+        assert "lsm" not in era5_ds.variables
+        lat_pix = np.linspace(39.8, 42.2, 10)
+        lon_pix = np.linspace(-10.2, -7.8, 10)
+        sar_lon, sar_lat = np.meshgrid(lon_pix, lat_pix)
+        sar_time = np.array([np.datetime64("2026-07-12T01:00:00")])
+        sar_data = {"owiWindSpeed": np.full((1, 10, 10), 7.5)}
+
+        colloc = ModelLayerCollocation(
+            method="cell-averaging", temporal_method="nearest",
+            aggregation_window_km=60.0, distance_weighting="equal",
+        )
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        assert len(results) == 4
+
+    def test_lsm_never_appears_as_val_data_key(self):
+        """Even when lsm is present, it must never leak into a result's
+        val_data as a spurious val_lsm statistics column."""
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        lsm = np.zeros((2, 2))
+        era5_ds = _make_era5_ds(n_lat=2, n_lon=2, lsm=lsm)
+        lat_pix = np.linspace(39.8, 42.2, 10)
+        lon_pix = np.linspace(-10.2, -7.8, 10)
+        sar_lon, sar_lat = np.meshgrid(lon_pix, lat_pix)
+        sar_time = np.array([np.datetime64("2026-07-12T01:00:00")])
+        sar_data = {"owiWindSpeed": np.full((1, 10, 10), 7.5)}
+
+        colloc = ModelLayerCollocation(
+            method="cell-averaging", temporal_method="nearest",
+            aggregation_window_km=60.0, distance_weighting="equal",
+        )
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        assert len(results) == 4
+        for r in results:
+            assert "lsm" not in r.val_data
 
     def test_hyperbolic_no_bracketing_hour_returns_no_matches(self):
         from sar_validation.core.model_collocation import ModelLayerCollocation
