@@ -1072,6 +1072,44 @@ class TestRunStatisticsNativeUnits:
         assert results == {}
         assert not (tmp_path / "validation_statistics_sarSSM_vs_SOIL_MOISTURE_native_units.nc").exists()
 
+    def test_era5_soil_moisture_family_is_volumetric(self):
+        """I4: era5_soil_moisture (ERA5-Land's swvl1, units "m3 m-3") must
+        be registered in the same "volumetric" family as ISMN/AMSR/SMAP/
+        SMOS -- otherwise a volumetric-SAR recipe (e.g. NISAR SME2's
+        sarSSM, also "m3 m-3") combined with era5_soil_moisture would
+        silently drop it from the native-units statistics section."""
+        from sar_validation.core.statistics import _VAL_SOURCE_UNITS_FAMILY
+
+        assert _VAL_SOURCE_UNITS_FAMILY["era5_soil_moisture"] == "volumetric"
+
+    def test_era5_soil_moisture_included_alongside_other_volumetric_sources(self, tmp_path):
+        """Behavioral counterpart to the dict-level check above: a
+        volumetric-SAR collocation_ds (sar units "m3 m-3", matching a
+        NISAR-like source) must keep era5_soil_moisture rows in the
+        native-units results, same as ismn."""
+        from sar_validation.core.statistics import run_statistics_native_units
+
+        recipe = self._make_recipe(tmp_path)
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": (
+                    "collocation", np.array([0.10, 0.20, 0.15, 0.25]),
+                    {"units": "m3 m-3"},
+                ),
+                "val_SOIL_MOISTURE": ("collocation", np.array([0.12, 0.22, 0.14, 0.24])),
+                "val_source": (
+                    "collocation",
+                    np.array(["ismn", "ismn", "era5_soil_moisture", "era5_soil_moisture"]),
+                ),
+            },
+        )
+
+        results = run_statistics_native_units(collocation_ds, recipe, tmp_path)
+
+        assert "sarSSM_vs_SOIL_MOISTURE" in results
+        stats_ds = results["sarSSM_vs_SOIL_MOISTURE"]
+        assert set(stats_ds["source"].values.tolist()) == {"ismn", "era5_soil_moisture"}
+
     def test_non_soil_moisture_recipe_returns_empty(self, tmp_path):
         from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
         from sar_validation.core.statistics import run_statistics_native_units

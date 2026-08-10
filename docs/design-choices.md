@@ -508,6 +508,46 @@ query longitudes remapped to match at collocation time
 (`_normalize_query_lon`/`_wrap_lon_to_pm180` in `model_collocation.py`) —
 see Task 14.
 
+**Land-pixel filtering, on both sides of the SAR/ERA5 comparison.**
+
+- *SAR side (`owiMask`, all Sentinel-1 IW/EW wind recipes, not ERA5-
+  specific):* `_extract_owi_grid_data` NaNs out `owiWindSpeed`/
+  `owiWindDirection` wherever OWI's own `owiMask` bitmask carries the land
+  bit (bit 0; a CF flag_values bitmask, so e.g. mask value 5 = land +
+  no_data simultaneously). This applies to *every* Sentinel-1 OWI wind
+  conversion this toolbox does, regardless of which validation source the
+  recipe uses — not something added specifically for ERA5. Live-verified
+  to be a low-risk no-op against real Sentinel-1 products: ESA's own OCN
+  processor already NaNs `owiWindSpeed`/`owiWindDirection` over land
+  before this toolbox ever sees the file. It's kept anyway as a
+  defensive/correctness measure — relying on an upstream processor's
+  behavior with no independent check would be fragile if that ever
+  changes.
+- *ERA5 side (`land_sea_mask`/`lsm`, wind only):* ERA5's own `lsm` field
+  (requested only for the `wind` variable — see
+  `era5_downloader.py`'s `_CDS_VARIABLE_NAMES_BY_VARIABLE`) is used to
+  exclude ERA5 grid cells/query points that are themselves over land,
+  using the standard oceanographic/ECMWF `lsm > 0.5` threshold. In
+  `cell-averaging` mode a native ERA5 cell whose own center is land-
+  flagged is skipped entirely, even if valid ocean SAR pixels exist
+  nearby within the aggregation window (`_collocate_cell_averaging_grid`).
+  In `individual`/WV-mode (`_model_values_at_points`), `lsm` is itself
+  bilinearly interpolated to each query point, and any point whose
+  interpolated `lsm` exceeds 0.5 has every model variable masked to NaN
+  — a point close enough to a land grid cell that its bilinearly-
+  interpolated wind value is itself meaningfully blended with land-
+  physics wind is treated as too land-contaminated to be a valid ocean
+  wind match. The rationale is physical, not just cosmetic: ERA5's land
+  and sea near-surface wind fields use different surface-roughness/
+  friction physics, so a land grid point's "wind" isn't a comparable
+  quantity to SAR ocean wind retrieval regardless of proximity to the
+  coast. This side of the filtering is scoped to `wind` only — `waves`
+  already gets native NaN-over-land behavior from ERA5's own
+  ocean-wave-model output (no separate `lsm` request needed), and
+  `soil_moisture` uses the land-only `reanalysis-era5-land` dataset,
+  where an ocean/land mask would be nonsensical (the whole point of that
+  request is land).
+
 > Code: `core/model_collocation.py` (`ModelLayerCollocation`,
 > `build_spatial_interpolator`, `collocate_points`), `core/collocation.py`
 > (`run_collocation` dispatch table).

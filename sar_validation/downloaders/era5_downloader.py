@@ -287,7 +287,7 @@ class ERA5Downloader:
         except ImportError as exc:
             raise ImportError(
                 "cdsapi is required for ERA5 downloads. Install it with: "
-                "pip install 'sar-l2-validation-toolbox[soil_moisture]'"
+                "pip install 'sar-l2-validation-toolbox[era5]'"
             ) from exc
 
         nc_path = self._nc_path_for_day(day, window_idx)

@@ -987,6 +987,14 @@ _VAL_SOURCE_UNITS_FAMILY: dict[str, str] = {
     "amsr_ssm": "volumetric",
     "smap_ssm": "volumetric",
     "smos_ssm": "volumetric",
+    # ERA5-Land's swvl1 ("volume_fraction_of_water_in_soil_layer", units
+    # "m3 m-3" -- see datatree_converter.py's _ERA5_VARS) is volumetric,
+    # same family as ISMN/AMSR/SMAP/SMOS. Harmless no-op for the
+    # currently-shipped soil_moisture_era5.yaml (CLMS SSM, percent-
+    # saturation SAR units), but needed so a volumetric-SAR recipe (e.g.
+    # NISAR SME2's sarSSM, also "m3 m-3") combined with era5_soil_moisture
+    # doesn't silently drop it from the native-units statistics section.
+    "era5_soil_moisture": "volumetric",
 }
 
 
