@@ -15,7 +15,7 @@ Product documentation for each source kind is recorded in the per-node
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import xarray as xr
 
@@ -197,6 +197,33 @@ _COLLOCATION_GEOMETRY_ATTRS: Dict[str, Dict[str, str]] = {
 }
 
 
+#: CF attrs for ``val_<var>`` columns that are DERIVED at collocation time
+#: rather than renamed at conversion time, so no datatree node variable
+#: named ``<var>`` ever exists for the ``datatree.subtree`` walk below to
+#: find. Currently only ERA5 wind: ``DataTreeConverter.from_era5``
+#: deliberately keeps ``u10``/``v10`` raw through conversion (WDIR is a
+#: circular quantity and must not be linearly/hyperbolically interpolated
+#: -- see docs/design-choices.md §2/§5.7), so ``WSPD``/``WDIR`` only come
+#: into existence inside ``model_collocation._derive_wind_wspd_wdir``,
+#: after this module's attrs lookup would otherwise run. Values match what
+#: ``from_era5`` used to stamp directly before that derivation moved
+#: downstream (commit 0b196ee). Keyed by ``(platform_type, var_name)``, and
+#: consulted as a fallback in :func:`annotate_collocation_ds` only when the
+#: normal datatree-node lookup finds nothing for a given platform type.
+_DERIVED_VAL_VAR_ATTRS: Dict[Tuple[str, str], Dict[str, str]] = {
+    ("era5_wind", "WSPD"): {
+        "standard_name": "wind_speed",
+        "long_name": "ERA5 10m wind speed (derived from u10/v10)",
+        "units": "m s-1",
+    },
+    ("era5_wind", "WDIR"): {
+        "standard_name": "wind_from_direction",
+        "long_name": "ERA5 10m wind direction (meteorological convention, derived from u10/v10)",
+        "units": "degree",
+    },
+}
+
+
 def annotate_collocation_ds(result_ds: xr.Dataset, datatree: xr.DataTree) -> xr.Dataset:
     """
     Copy CF metadata from datatree nodes onto a collocation Dataset in place.
@@ -235,6 +262,15 @@ def annotate_collocation_ds(result_ds: xr.Dataset, datatree: xr.DataTree) -> xr.
     mixed-units case where *some* sources resolved via platform_type and
     others didn't -- that scenario still falls through to the
     ``val_units``/``val_long_name`` branch below.
+
+    A second, narrower fallback covers :data:`_DERIVED_VAL_VAR_ATTRS`: for
+    a ``(platform_type, var_name)`` pair with no datatree-node match at
+    all (e.g. ``("era5_wind", "WSPD")`` -- that variable is derived after
+    collocation, so no node ever carries it), the fixed table is consulted
+    per platform type, same as a normal ``source_attrs_by_platform`` hit.
+    This keeps era5-only wind recipes from ending up with empty
+    ``val_WSPD``/``val_WDIR`` attrs just because ERA5 has no source
+    variable of that name to borrow from.
     """
     source_attrs: Dict[str, Dict[str, Any]] = {}
     source_attrs_by_platform: Dict[tuple, Dict[str, Any]] = {}
@@ -259,7 +295,9 @@ def annotate_collocation_ds(result_ds: xr.Dataset, datatree: xr.DataTree) -> xr.
             var_name = name[len("val_"):]
             platform_types_present = sorted(set(str(v) for v in result_ds["val_source"].values))
             attrs_per_platform = {
-                pt: source_attrs_by_platform.get((pt, var_name)) for pt in platform_types_present
+                pt: source_attrs_by_platform.get((pt, var_name))
+                or _DERIVED_VAL_VAR_ATTRS.get((pt, var_name))
+                for pt in platform_types_present
             }
             known_attrs = [a for a in attrs_per_platform.values() if a]
             distinct_units = {a.get("units") for a in known_attrs}
