@@ -9,8 +9,8 @@ geographic_bounds:
   min_lat: 33.0
   max_lat: 42.0
 temporal_bounds:
-  start: '2026-08-15 00:00:00'
-  end: '2026-08-15 06:00:00'
+  start: '2026-07-12 18:00:00'
+  end: '2026-07-12 19:00:00'
 sar_data:
   source: sentinel1_l2_ocn
   swath_mode:
