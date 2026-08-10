@@ -148,6 +148,7 @@ class TestERA5DownloaderBuildRequest:
 class TestERA5DownloaderInvalidVariable:
     def test_rejects_unknown_variable(self, tmp_path):
         import pytest
+
         from sar_validation.downloaders.era5_downloader import ERA5Downloader
 
         with pytest.raises(ValueError, match="variable must be one of"):
