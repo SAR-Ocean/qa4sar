@@ -170,3 +170,31 @@ class TestSoilMoistureDownloaderDownload:
         noise_path = tmp_path / _PRODUCT_NAME / "c_gls_SSM1km-NOISE_202601010000_CEURO_S1CSAR_V1.1.1.tiff"
         assert noise_path.exists()
         assert noise_path not in paths
+
+
+class TestSoilMoistureDownloaderFoundCount:
+    def test_found_count_set_from_query_even_in_dry_run(self, tmp_path):
+        dl = SoilMoistureDownloader(output_dir=tmp_path, dry_run=True)
+        fake_client = MagicMock()
+        fake_client.query_clms_products.return_value = [_fake_record()]
+        dl._client = fake_client
+
+        paths = dl.download(
+            min_lon=_EU_MIN_LON, max_lon=_EU_MAX_LON,
+            min_lat=_EU_MIN_LAT, max_lat=_EU_MAX_LAT,
+            start="2026-01-01", end="2026-01-02",
+        )
+
+        assert paths == []
+        assert dl.found_count == 1
+
+    def test_found_count_zero_when_bbox_outside_extent(self, tmp_path):
+        dl = SoilMoistureDownloader(output_dir=tmp_path, dry_run=True)
+
+        dl.download(
+            min_lon=_FAR_MIN_LON, max_lon=_FAR_MAX_LON,
+            min_lat=_FAR_MIN_LAT, max_lat=_FAR_MAX_LAT,
+            start="2026-01-01", end="2026-01-02",
+        )
+
+        assert dl.found_count == 0

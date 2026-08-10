@@ -207,6 +207,7 @@ class SoilMoistureDownloader:
             min_lat=min_lat, max_lat=max_lat,
             start=start, end=end, top=top,
         )
+        self.found_count = len(df)
 
         if df.empty:
             print("No CLMS Surface Soil Moisture products found.")
