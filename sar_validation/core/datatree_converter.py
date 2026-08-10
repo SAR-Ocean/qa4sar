@@ -2065,28 +2065,26 @@ class DataTreeConverter:
         # expect -- every OTHER wind/waves/soil_moisture validation source
         # is renamed to these same codes at conversion time (see e.g.
         # from_scatterometer_nc's WSPD/WDIR rename, from_radiometer_bytemap's
-        # WindSat rotation). ERA5's raw CDS short names (u10/v10, swh,
-        # swvl1) never matched them, so run_statistics() silently produced
-        # zero rows for every era5_* source -- confirmed against a live CDS
-        # run 2026-08-07 (wind_era5.yaml: "no statistics produced").
-        if variable == "wind":
-            u10, v10 = data_vars["u10"], data_vars["v10"]
-            wspd = np.hypot(u10, v10).astype("float32")
-            wspd.attrs = {
-                "units": "m s-1",
-                "standard_name": "wind_speed",
-                "long_name": "ERA5 10m wind speed (derived from u10/v10)",
-            }
-            # Meteorological "from" direction, clockwise from north -- the
-            # same convention every other WDIR column in this codebase uses.
-            wdir = ((270.0 - np.degrees(np.arctan2(v10, u10))) % 360.0).astype("float32")
-            wdir.attrs = {
-                "units": "degree",
-                "standard_name": "wind_from_direction",
-                "long_name": "ERA5 10m wind direction (meteorological convention, derived from u10/v10)",
-            }
-            data_vars = {"WSPD": wspd, "WDIR": wdir}
-        elif variable == "waves":
+        # WindSat rotation). ERA5's raw CDS short names (swh, swvl1) never
+        # matched them, so run_statistics() silently produced zero rows for
+        # every era5_waves/era5_soil_moisture source -- confirmed against a
+        # live CDS run 2026-08-07 (wind_era5.yaml: "no statistics produced").
+        #
+        # Wind is the one deliberate exception: u10/v10 are kept as raw
+        # components here, NOT renamed/derived into WSPD/WDIR. WDIR is a
+        # CIRCULAR quantity, and this Dataset is exactly what gets
+        # bilinearly-spatially / hyperbolically-temporally interpolated at
+        # collocation time (see model_collocation.py) -- interpolating an
+        # already-derived direction as an ordinary linear scalar produces
+        # wrong answers whenever the true value crosses the 0/360 seam
+        # (e.g. blending 359 and 1 degrees naively yields ~180, not ~0).
+        # model_collocation.py's `_derive_wind_wspd_wdir` instead derives
+        # WSPD/WDIR from the FINAL, already-interpolated u10/v10 values,
+        # after collocation -- so the eventual val_data/
+        # collocation_results.nc output still ends up with the same
+        # WSPD/WDIR columns every other wind validation source produces,
+        # just computed at the right time. See docs/design-choices.md.
+        if variable == "waves":
             data_vars = {"VHM0": data_vars["swh"]}
         elif variable == "soil_moisture":
             data_vars = {"SOIL_MOISTURE": data_vars["swvl1"]}

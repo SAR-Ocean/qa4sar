@@ -85,6 +85,138 @@ class TestHyperbolicInterp:
         assert result[0] == pytest.approx(expected)
 
 
+class TestDeriveWindWspdWdir:
+    """Direct unit tests for _derive_wind_wspd_wdir -- the C1 fix's core
+    helper, which derives WSPD/WDIR from FINAL (already interpolated)
+    u10/v10 components instead of from_era5 deriving WDIR (a circular
+    quantity) BEFORE interpolation."""
+
+    def test_noop_without_both_components(self):
+        from sar_validation.core.model_collocation import _derive_wind_wspd_wdir
+
+        values = {"u10": np.array([1.0]), "swh": np.array([2.0])}
+        result = _derive_wind_wspd_wdir(values)
+        assert "WSPD" not in result and "WDIR" not in result
+        assert result["u10"][0] == pytest.approx(1.0)
+        assert result["swh"][0] == pytest.approx(2.0)
+
+    def test_noop_for_non_wind_dict(self):
+        from sar_validation.core.model_collocation import _derive_wind_wspd_wdir
+
+        values = {"VHM0": np.array([1.5])}
+        result = _derive_wind_wspd_wdir(values)
+        assert result == values
+
+    def test_hand_checkable_northerly_wind(self):
+        """u10=0, v10=-1 is wind blowing FROM the north -- meteorological
+        convention gives WDIR = 0/360 degrees exactly."""
+        from sar_validation.core.model_collocation import _derive_wind_wspd_wdir
+
+        values = {"u10": np.array([0.0]), "v10": np.array([-1.0])}
+        result = _derive_wind_wspd_wdir(values)
+        assert "u10" not in result and "v10" not in result
+        assert result["WSPD"][0] == pytest.approx(1.0)
+        assert result["WDIR"][0] == pytest.approx(0.0) or result["WDIR"][0] == pytest.approx(360.0)
+
+    @pytest.mark.parametrize("angle_deg", [10.0, 90.0, 180.0, 270.0, 355.0, 0.5, 359.5])
+    def test_wdir_round_trips_and_stays_in_valid_range(self, angle_deg):
+        """Property-style check: for a range of target angles (including
+        ones right next to the 0/360 seam), a unit vector built from that
+        angle round-trips back through _derive_wind_wspd_wdir to the same
+        angle, always within [0, 360)."""
+        from sar_validation.core.model_collocation import _derive_wind_wspd_wdir
+
+        rad = np.radians(270.0 - angle_deg)
+        values = {"u10": np.array([np.cos(rad)]), "v10": np.array([np.sin(rad)])}
+        result = _derive_wind_wspd_wdir(values)
+        assert 0.0 <= result["WDIR"][0] < 360.0
+        assert result["WDIR"][0] == pytest.approx(angle_deg % 360.0, abs=1e-3)
+        assert result["WSPD"][0] == pytest.approx(1.0, abs=1e-6)
+
+
+def _make_era5_wind_ds(
+    angles_deg, hours=("2026-07-12T00:00:00", "2026-07-12T01:00:00", "2026-07-12T02:00:00"),
+    n_lat=3, n_lon=3, speed=10.0,
+):
+    """Synthetic gridded ERA5 wind Dataset (u10/v10, spatially constant per
+    hour) where hour ``i`` corresponds to the compass wind direction
+    ``angles_deg[i]`` (meteorological "from" convention) -- built by
+    inverting the same WDIR formula _derive_wind_wspd_wdir uses, so tests
+    can specify a target direction per hour directly rather than raw
+    components."""
+    lat = np.linspace(40.0, 42.0, n_lat)
+    lon = np.linspace(-10.0, -8.0, n_lon)
+    time = pd.to_datetime(list(hours))
+    u_list, v_list = [], []
+    for a in angles_deg:
+        rad = np.radians(270.0 - a)
+        u_list.append(np.full((n_lat, n_lon), speed * np.cos(rad)))
+        v_list.append(np.full((n_lat, n_lon), speed * np.sin(rad)))
+    ds = xr.Dataset(
+        {
+            "u10": (("time", "lat", "lon"), np.stack(u_list)),
+            "v10": (("time", "lat", "lon"), np.stack(v_list)),
+        },
+        coords={"time": time, "lat": lat, "lon": lon},
+    )
+    return ds
+
+
+class TestModelValuesAtPointsWindDirectionSeam:
+    """Regression tests for C1: WDIR must never be interpolated as an
+    ordinary linear/hyperbolic scalar across the 0/360 wrap. Exercises the
+    full _model_values_at_points path (spatial + hyperbolic temporal
+    interpolation of u10/v10, THEN WSPD/WDIR derivation) end to end."""
+
+    def test_output_has_wspd_wdir_not_u10_v10_when_both_present(self):
+        from sar_validation.core.model_collocation import _model_values_at_points
+
+        era5_ds = _make_era5_wind_ds([10.0, 20.0, 30.0])
+        times = np.array([np.datetime64("2026-07-12T01:00:00")])
+        result = _model_values_at_points(
+            np.array([-9.0]), np.array([41.0]), times, era5_ds, "nearest",
+        )
+        assert "WSPD" in result and "WDIR" in result
+        assert "u10" not in result and "v10" not in result
+
+    def test_wdir_interpolated_across_seam_is_near_zero_not_180(self):
+        """hour0=355deg (away from the seam), hour1=359deg, hour2=1deg --
+        the true wind direction crosses the 0/360 seam between hour1 and
+        hour2. Querying halfway between them (t_prime=0.5) must produce a
+        WDIR close to 0/360 (the "short way around"), never close to 180
+        (the "long way around" a naive linear interpolation of the angle
+        itself would wrongly produce)."""
+        from sar_validation.core.model_collocation import _model_values_at_points
+
+        era5_ds = _make_era5_wind_ds([355.0, 359.0, 1.0])
+        times = np.array([np.datetime64("2026-07-12T01:30:00")])  # t_prime=0.5
+        result = _model_values_at_points(
+            np.array([-9.0]), np.array([41.0]), times, era5_ds, "hyperbolic",
+        )
+        wdir = result["WDIR"][0]
+        assert 0.0 <= wdir < 360.0
+        wrap_distance = min(wdir, 360.0 - wdir)
+        assert wrap_distance < 30.0, f"expected WDIR near the 0/360 seam, got {wdir}"
+        assert abs(wdir - 180.0) > 100.0, f"WDIR landed near 180 (the wrong, long way around): {wdir}"
+
+    @pytest.mark.parametrize("a0,a1,a2", [
+        (355.0, 359.0, 1.0),
+        (358.0, 0.5, 3.0),
+        (350.0, 355.0, 5.0),
+        (10.0, 20.0, 30.0),   # away from the seam -- no regression
+        (170.0, 180.0, 190.0),  # crosses 180 -- NOT a seam, ordinary case
+    ])
+    def test_wdir_always_in_valid_range(self, a0, a1, a2):
+        from sar_validation.core.model_collocation import _model_values_at_points
+
+        era5_ds = _make_era5_wind_ds([a0, a1, a2])
+        times = np.array([np.datetime64("2026-07-12T01:30:00")])
+        result = _model_values_at_points(
+            np.array([-9.0]), np.array([41.0]), times, era5_ds, "hyperbolic",
+        )
+        assert 0.0 <= result["WDIR"][0] < 360.0
+
+
 def _make_era5_ds(
     n_lat=3, n_lon=3, hours=("2026-07-12T00:00:00", "2026-07-12T01:00:00", "2026-07-12T02:00:00"),
     lsm=None,
@@ -268,6 +400,28 @@ class TestModelLayerCollocationIndividualGrid:
         )
         assert results == []
 
+    def test_wind_dataset_produces_wspd_wdir_not_u10_v10(self):
+        """C1 regression: when era5_ds has both u10/v10 (a wind Dataset),
+        the final collocated val_data must carry WSPD/WDIR -- derived from
+        the interpolated components -- not raw u10/v10."""
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_wind_ds([10.0, 20.0, 30.0])
+        sar_lon = np.array([[-9.0]])
+        sar_lat = np.array([[41.0]])
+        sar_time = np.array([np.datetime64("2026-07-12T01:00:00")])
+        sar_data = {"owiWindSpeed": np.array([[[7.0]]])}
+
+        colloc = ModelLayerCollocation(method="individual", temporal_method="nearest")
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        assert len(results) == 1
+        assert "WSPD" in results[0].val_data and "WDIR" in results[0].val_data
+        assert "u10" not in results[0].val_data and "v10" not in results[0].val_data
+        assert 0.0 <= results[0].val_data["WDIR"] < 360.0
+
 
 class TestModelLayerCollocationIndividualPoints:
     def test_wv_mode_always_interpolates_directly_regardless_of_method(self):
@@ -293,6 +447,26 @@ class TestModelLayerCollocationIndividualPoints:
         assert len(results) == 2
         assert all(r.val_data["u10"] == pytest.approx(10.0) for r in results)
         assert all(r.collocation_type == "model_vs_layer" for r in results)
+
+    def test_wind_dataset_produces_wspd_wdir_not_u10_v10(self):
+        """C1 regression: WV-mode (collocate_points) also shares
+        _model_values_at_points -- must produce WSPD/WDIR, not u10/v10."""
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_wind_ds([10.0, 20.0, 30.0])
+        sar_point_vars = {"oswHs": np.array([2.0])}
+        sar_lons = np.array([-9.0])
+        sar_lats = np.array([41.0])
+        sar_times = np.array([np.datetime64("2026-07-12T01:00:00")])
+
+        colloc = ModelLayerCollocation(method="individual", temporal_method="nearest")
+        results = colloc.collocate_points(
+            sar_point_vars=sar_point_vars, sar_lons=sar_lons, sar_lats=sar_lats,
+            sar_times=sar_times, era5_ds=era5_ds, val_source="era5", sar_scene_name="wv1",
+        )
+        assert len(results) == 1
+        assert "WSPD" in results[0].val_data and "WDIR" in results[0].val_data
+        assert "u10" not in results[0].val_data and "v10" not in results[0].val_data
 
 
 class TestModelLayerCollocationCellAveraging:
@@ -467,6 +641,33 @@ class TestModelLayerCollocationCellAveraging:
             era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         assert results == []
+
+    def test_wind_dataset_produces_wspd_wdir_not_u10_v10(self):
+        """C1 regression: cell-averaging's per-cell val_point must carry
+        WSPD/WDIR (derived from interpolated u10/v10), not raw
+        u10/v10."""
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_wind_ds([10.0, 20.0, 30.0], n_lat=2, n_lon=2)
+        lat_pix = np.linspace(39.8, 42.2, 10)
+        lon_pix = np.linspace(-10.2, -7.8, 10)
+        sar_lon, sar_lat = np.meshgrid(lon_pix, lat_pix)
+        sar_time = np.array([np.datetime64("2026-07-12T01:00:00")])
+        sar_data = {"owiWindSpeed": np.full((1, 10, 10), 7.5)}
+
+        colloc = ModelLayerCollocation(
+            method="cell-averaging", temporal_method="nearest",
+            aggregation_window_km=60.0, distance_weighting="equal",
+        )
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        assert len(results) == 4
+        for r in results:
+            assert "WSPD" in r.val_data and "WDIR" in r.val_data
+            assert "u10" not in r.val_data and "v10" not in r.val_data
+            assert 0.0 <= r.val_data["WDIR"] < 360.0
 
 
 class TestAntimeridianLonHelpers:

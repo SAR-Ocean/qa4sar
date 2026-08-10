@@ -2829,18 +2829,20 @@ class TestFromEra5:
         assert ds is not None
         assert ds.attrs["data_type"] == "era5_wind"
         assert set(ds.dims) == {"time", "lat", "lon"}
-        # Raw u10/v10 components are renamed/derived into the canonical
-        # WSPD/WDIR codes _variable_map.py's VARIABLE_PAIRS (and therefore
-        # statistics.py/visualization.py) expect for every wind source.
-        assert "WSPD" in ds.data_vars and "WDIR" in ds.data_vars
-        assert "u10" not in ds.data_vars and "v10" not in ds.data_vars
-        expected_wspd = np.hypot(arrays["u10"], arrays["v10"])
-        np.testing.assert_allclose(ds["WSPD"].values, expected_wspd, rtol=1e-5)
-        # WDIR: meteorological "wind FROM" direction, clockwise from north.
-        # Independently re-derived from the same random u10/v10 fixture
-        # arrays (not copied from the implementation's own expression).
-        expected_wdir = (270.0 - np.degrees(np.arctan2(arrays["v10"], arrays["u10"]))) % 360.0
-        np.testing.assert_allclose(ds["WDIR"].values, expected_wdir, rtol=1e-5)
+        # u10/v10 are kept as raw components -- NOT renamed/derived into
+        # WSPD/WDIR here. WDIR is a circular quantity and this Dataset is
+        # exactly what gets bilinearly/hyperbolically interpolated at
+        # collocation time; deriving WDIR before that interpolation would
+        # break across the 0/360 seam (see C1 fix,
+        # model_collocation._derive_wind_wspd_wdir, which now does this
+        # derivation AFTER interpolation instead).
+        assert "u10" in ds.data_vars and "v10" in ds.data_vars
+        assert "WSPD" not in ds.data_vars and "WDIR" not in ds.data_vars
+        np.testing.assert_allclose(ds["u10"].values, arrays["u10"], rtol=1e-5)
+        np.testing.assert_allclose(ds["v10"].values, arrays["v10"], rtol=1e-5)
+        # CF attrs from _ERA5_VARS's wind entry must be preserved.
+        assert ds["u10"].attrs["standard_name"] == "eastward_wind"
+        assert ds["v10"].attrs["standard_name"] == "northward_wind"
 
     def test_wind_lsm_present_becomes_lat_lon_coord_not_data_var(self, tmp_path):
         """land_sea_mask ("lsm" on the wire) is a per-cell land-mask
@@ -2897,11 +2899,13 @@ class TestFromEra5:
         assert "lsm" not in ds.coords
         assert "lsm" not in ds.data_vars
 
-    def test_wind_direction_hand_checkable_case(self, tmp_path):
+    def test_wind_components_hand_checkable_case_passthrough(self, tmp_path):
         """u10=0, v10=-1 is wind blowing FROM the north (northerly wind) --
-        the meteorological convention gives WDIR = 0/360 degrees exactly.
-        A concrete, hand-checkable sanity case independent of the general
-        formula re-derivation above."""
+        from_era5 must pass these raw components through unchanged (no
+        WSPD/WDIR derivation at conversion time any more). The
+        corresponding WDIR=0/360 hand-check now lives in
+        test_model_collocation.py against `_derive_wind_wspd_wdir`, which
+        runs the derivation AFTER interpolation instead (see C1 fix)."""
         import numpy as np
         import xarray as xr
 
@@ -2922,8 +2926,8 @@ class TestFromEra5:
 
         ds = DataTreeConverter.from_era5(nc_path, "wind")
         assert ds is not None
-        wdir = float(ds["WDIR"].values.ravel()[0])
-        assert wdir == pytest.approx(0.0) or wdir == pytest.approx(360.0)
+        assert float(ds["u10"].values.ravel()[0]) == pytest.approx(0.0)
+        assert float(ds["v10"].values.ravel()[0]) == pytest.approx(-1.0)
 
     def test_waves_returns_vhm0_variable(self, tmp_path):
         from sar_validation.core.datatree_converter import DataTreeConverter
@@ -3080,7 +3084,7 @@ class TestConvertDownloadedDataEra5:
         assert era5_ds.attrs["data_type"] == "era5_wind"
         assert "swh" not in era5_ds.data_vars
         assert "VHM0" not in era5_ds.data_vars
-        assert "WSPD" in era5_ds.data_vars and not era5_ds["WSPD"].isnull().any()
+        assert "u10" in era5_ds.data_vars and not era5_ds["u10"].isnull().any()
 
 
 class TestFromEra5Antimeridian:

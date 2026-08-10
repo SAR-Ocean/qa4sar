@@ -94,6 +94,45 @@ def _wrap_lon_to_pm180(lon: float) -> float:
 # Temporal interpolation
 # ---------------------------------------------------------------------------
 
+def _derive_wind_wspd_wdir(values: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """
+    Derive ``WSPD``/``WDIR`` from already-interpolated ``u10``/``v10``
+    wind components, replacing them in the returned dict.
+
+    This MUST run only on FINAL, already spatially/temporally interpolated
+    component values -- never before interpolation. ``WDIR`` is a
+    CIRCULAR quantity (0 degrees and 360 degrees are the same direction);
+    interpolating a pre-derived direction as an ordinary linear/hyperbolic
+    scalar produces wrong answers whenever the true value crosses the
+    0/360 seam (e.g. blending 359 and 1 degrees naively yields ~180, not
+    ~0). Deriving WSPD/WDIR from u10/v10 AFTER interpolation sidesteps
+    this entirely, since u10/v10 themselves are ordinary (non-circular)
+    scalar components that interpolate correctly. See C1 in
+    docs/design-choices.md.
+
+    No-op (returns *values* unchanged) unless both ``"u10"`` and
+    ``"v10"`` are present -- a self-describing gate, since only wind data
+    ever carries these keys (waves/soil_moisture Datasets are untouched).
+
+    ``u10``/``v10`` are removed from the returned dict -- only ``WSPD``/
+    ``WDIR`` remain, matching the output contract every other wind
+    validation source (and every downstream consumer -- _variable_map.py,
+    statistics.py) already expects.
+    """
+    if "u10" not in values or "v10" not in values:
+        return values
+    u10 = values["u10"]
+    v10 = values["v10"]
+    wspd = np.hypot(u10, v10)
+    # Meteorological "from" direction, clockwise from north -- the same
+    # convention every other WDIR column in this codebase uses.
+    wdir = (270.0 - np.degrees(np.arctan2(v10, u10))) % 360.0
+    out = {k: v for k, v in values.items() if k not in ("u10", "v10")}
+    out["WSPD"] = wspd
+    out["WDIR"] = wdir
+    return out
+
+
 def _hyperbolic_interp(
     val1: np.ndarray, val2: np.ndarray, val3: np.ndarray, t_prime: Union[float, np.ndarray],
 ) -> np.ndarray:
@@ -214,7 +253,11 @@ def _model_values_at_points(
         for var in model_vars:
             out[var][land_mask] = np.nan
 
-    return out
+    # Derive WSPD/WDIR from the now-FINAL, interpolated u10/v10 values --
+    # must happen here, AFTER all spatial/temporal interpolation above, not
+    # before (see C1 fix / _derive_wind_wspd_wdir's docstring). No-op for
+    # waves/soil_moisture (no u10/v10 keys).
+    return _derive_wind_wspd_wdir(out)
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +504,15 @@ class ModelLayerCollocation:
                 t2 = era5_times[hour_idxs[1]]
                 t_prime = float((obs_np - t2) / np.timedelta64(1, "h"))
                 cell_values[var] = _hyperbolic_interp(fields[0], fields[1], fields[2], t_prime)
+
+        # Derive WSPD/WDIR from the now-FINAL, per-cell interpolated
+        # u10/v10 values -- see C1 fix / _derive_wind_wspd_wdir's
+        # docstring for why this must happen AFTER temporal interpolation,
+        # not before. No-op for waves/soil_moisture. `model_vars` is
+        # refreshed to match the (possibly renamed) keys so the val_point
+        # comprehension below iterates the right set.
+        cell_values = _derive_wind_wspd_wdir(cell_values)
+        model_vars = list(cell_values.keys())
 
         helper = PointLayerCollocation(
             aggregation_window_km=self.aggregation_window_km,
