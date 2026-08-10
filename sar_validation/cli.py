@@ -862,6 +862,12 @@ def _execute_recipe(
     # Skip download if data was already downloaded successfully and not forcing re-download
     download_step_ran = False
     if not dry_run and not force_download and _is_already_downloaded(orchestrator.base_dir, recipe):
+        if not orchestrator.previous_sar_data_found():
+            print(
+                "\nNo SAR data found for this window — stopping before "
+                "validation downloads and further pipeline steps."
+            )
+            return
         logger.info(
             "Data already downloaded in %s — skipping Step 1.",
             orchestrator.base_dir,
@@ -871,6 +877,19 @@ def _execute_recipe(
     else:
         download_step_ran = True
         success = orchestrator.download_all()
+
+        if not orchestrator.metadata.get("sar_data_found", True):
+            if dry_run:
+                print(
+                    "\nNo SAR data found for this window — stopping dry run "
+                    "before validation sources."
+                )
+            else:
+                print(
+                    "\nNo SAR data found for this window — stopping before "
+                    "validation downloads and further pipeline steps."
+                )
+            return
 
         if dry_run:
             print("\nDry run complete — no data was downloaded.")

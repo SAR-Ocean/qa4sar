@@ -1014,3 +1014,105 @@ class TestBuildWindConfigRadarsat2:
         main(["--create-recipe", "wind", "--sar-source", "radarsat2"])
         recipe = Recipe.from_yaml(tmp_path / "recipes" / "wind_validation.yaml")
         assert recipe.config.sar_data.source == "radarsat2"
+
+
+class TestExecuteRecipeStopsWhenNoSarData:
+    def test_real_run_stops_before_convert_when_sar_data_found_false(self, tmp_path, capsys):
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-no-sar", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        def fake_download_all(self):
+            self.metadata["sar_data_found"] = False
+            return True
+
+        with patch(
+            "sar_validation.core.orchestrator.DataOrchestrator.download_all",
+            fake_download_all,
+        ), patch("sar_validation.cli._convert_data") as mock_convert:
+            cli._execute_recipe(str(recipe_path), force_download=True, convert=True)
+
+        mock_convert.assert_not_called()
+        out = capsys.readouterr().out
+        assert "No SAR data found" in out
+
+    def test_dry_run_stops_before_dry_run_complete_message(self, tmp_path, capsys):
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-no-sar-dry", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        def fake_download_all(self):
+            self.metadata["sar_data_found"] = False
+            return True
+
+        with patch(
+            "sar_validation.core.orchestrator.DataOrchestrator.download_all",
+            fake_download_all,
+        ):
+            cli._execute_recipe(str(recipe_path), dry_run=True)
+
+        out = capsys.readouterr().out
+        assert "No SAR data found" in out
+        assert "Dry run complete" not in out
+
+    def test_real_run_proceeds_when_sar_data_found_true(self, tmp_path, capsys):
+        """Sanity check the gate doesn't fire on a normal successful run."""
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-has-sar", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        def fake_download_all(self):
+            self.metadata["sar_data_found"] = True
+            return True
+
+        with patch(
+            "sar_validation.core.orchestrator.DataOrchestrator.download_all",
+            fake_download_all,
+        ):
+            cli._execute_recipe(str(recipe_path), force_download=True)
+
+        out = capsys.readouterr().out
+        assert "No SAR data found" not in out
+        assert "All downloads completed" in out
+
+    def test_resume_shortcut_stops_when_cached_sar_found_count_is_zero(self, tmp_path, capsys):
+        import json
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "errors": [],
+            "notices": [],
+            "downloads": {"sar": {"status": "success", "found_count": 0, "files": []}},
+        }))
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-resume-no-sar", variable="wind", output_dir=str(run_dir),
+        )).to_yaml(recipe_path)
+
+        with patch("sar_validation.cli._convert_data") as mock_convert:
+            cli._execute_recipe(str(recipe_path), convert=True)
+
+        mock_convert.assert_not_called()
+        out = capsys.readouterr().out
+        assert "No SAR data found" in out
