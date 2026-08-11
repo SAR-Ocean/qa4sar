@@ -422,6 +422,11 @@ def _build_currents_config(
             ValidationDataSource(source_type="argo_historical"),
             ValidationDataSource(source_type="drifter_historical"),
             ValidationDataSource(source_type="glider_historical"),
+            # HyCOM ocean model (surface currents) -- unconditional, unlike
+            # hf_radar_sources above: HyCOM has global coverage, so it
+            # applies regardless of bbox (no NOAA-region-overlap branching
+            # needed the way hf_radar_us/hf_radar differ).
+            ValidationDataSource(source_type="hycom"),
         ],
         collocation=CollocationType(
             point_vs_layer=PointVsLayerCollocation(),

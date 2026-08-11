@@ -128,6 +128,25 @@ class TestBuildCurrentsConfig:
         assert "hf_radar_us" not in source_types
         assert any("has no effect" in r.message for r in caplog.records)
 
+    def test_hycom_always_included_regardless_of_bbox(self):
+        from sar_validation.cli import _build_currents_config
+
+        # Default (non-US) bbox
+        cfg = _build_currents_config()
+        assert "hycom" in [s.source_type for s in cfg.validation_sources]
+
+        # US-West bbox (exercises the hf_radar_us branch)
+        cfg_us = _build_currents_config(min_lon=-130.0, max_lon=-117.0, min_lat=32.0, max_lat=42.0)
+        assert "hycom" in [s.source_type for s in cfg_us.validation_sources]
+
+    def test_hycom_source_has_no_download_kwargs_by_default(self):
+        from sar_validation.cli import _build_currents_config
+
+        cfg = _build_currents_config()
+        hycom_source = next(s for s in cfg.validation_sources if s.source_type == "hycom")
+        assert hycom_source.download_kwargs == {}
+        assert hycom_source.collocation_kwargs == {}
+
 class TestHfradarResolutionCliFlag:
     def test_rejected_for_non_currents_template(self, tmp_path, monkeypatch, capsys):
         from sar_validation.cli import main
