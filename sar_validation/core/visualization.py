@@ -127,25 +127,45 @@ __all__ = [
 # distinguish against plot_collocation_diagnostics' mid-gray (#808080)
 # "unmatched" pattern once small marker sizes/anti-aliasing softened it.
 #
-# The last three entries (olive/cyan/lavender) were appended for
+# The last three entries (olive/cyan/purple) were appended for
 # era5_wind/era5_waves/era5_soil_moisture joining _CANONICAL_SOURCE_ORDER --
 # same append-only rule applies here as there, to avoid the exact wrap
-# collision this comment already warns about.
+# collision this comment already warns about. era5_soil_moisture's slot
+# was originally the pale lavender "#dcbeff" -- changed to the bolder
+# "#800080" (2026-08-11) because that pale lavender was hard to pick out
+# against a light land/ocean background at the reduced alpha/marker size
+# soil_moisture's matched-layer tier uses (see matched_layer_alpha in
+# _plot_collocation_diagnostics_impl).
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#469990",
     "#f032e6", "#e6194b", "#000080", "#ffff00",
     "#00ff00",
-    "#808000", "#42d4f4", "#dcbeff",
+    "#808000", "#42d4f4", "#800080",
 ]
 
 # Marker shapes paired 1:1 with _SOURCE_COLORS by index, used wherever
 # validation sources need to stay identifiable independently of color (e.g.
 # when color is taken by a continuous value like wind speed or temporal
-# offset instead of by source).
+# offset instead of by source). Every entry must be one of matplotlib's
+# *filled* markers (matplotlib.markers.MarkerStyle.filled_markers) -- an
+# unfilled/stroke-only marker (e.g. "+", "x", "1"-"4", "|", "_") renders
+# via linewidth, not facecolor, and several call sites (e.g.
+# plot_collocation_diagnostics' non-waves matched-point tiers) explicitly
+# pass linewidths=0 -- confirmed live 2026-08-11: era5_soil_moisture's
+# slot (index 15) was "+", making its 352 real, correctly-positioned,
+# correctly-colored matched points render as literally zero visible
+# pixels on recipes/soil_moisture_era5.yaml's/soil_moisture_nisar_era5_2.
+# yaml's diagnostics plots -- era5_wind/era5_waves (indices 13/14) never
+# hit this since "H"/"d" are filled. matplotlib's filled-marker set has
+# exactly 15 distinct shapes, already all in use by the first 15 slots
+# below, so era5_soil_moisture's slot (16th) reuses "v" -- hf_radar's
+# shape (index 4), distinguished by its own unique color -- since
+# hf_radar (currents-only) and era5_soil_moisture (soil_moisture-only)
+# can never appear in the same report.
 _SOURCE_MARKERS = [
     "o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<", ">",
-    "H", "d", "+",
+    "H", "d", "v",
 ]
 
 # Fixed, append-only reference order for known validation source/platform

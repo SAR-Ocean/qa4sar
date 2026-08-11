@@ -1540,6 +1540,47 @@ both raised directly against real report output:
 > Code: `core/visualization.py` (`_draw_scene_panel`'s SAR-field scatter
 > and validation-point scatter calls).
 
+### 9.5 era5_soil_moisture's canonical marker/color were literally invisible
+
+`_SOURCE_MARKERS`/`_SOURCE_COLORS` assign each `_CANONICAL_SOURCE_ORDER`
+entry a fixed `(color, marker)` pair by list position (§9.1's sibling
+mechanism — see those lists' own module comments for the append-only
+rule). `era5_soil_moisture` is the 16th entry, and matplotlib's *filled*
+marker set (`matplotlib.markers.MarkerStyle.filled_markers`) has exactly
+15 distinct shapes — all already claimed by the first 15 entries — so its
+slot originally fell back to `"+"`, an *unfilled* (stroke-only) marker.
+
+That's fine wherever a caller lets matplotlib pick a default line width,
+but `plot_collocation_diagnostics`'s non-waves matched-point tiers
+(Tier 3/4) explicitly pass `linewidths=0.0` (§9.1: dense sources like
+ASCAT/SMAP/SMOS need a lower fixed alpha instead of an outline). An
+unfilled marker's entire visible representation *is* its stroke — with
+zero line width, `era5_soil_moisture`'s real, correctly-positioned,
+correctly-colored matched points rendered as literally zero visible
+pixels. `era5_wind`/`era5_waves` (indices 13/14, markers `"H"`/`"d"`)
+never hit this, since both are filled shapes — confirmed live 2026-08-11:
+`recipes/soil_moisture_era5.yaml` (352 era5 matches) and
+`recipes/soil_moisture_nisar_era5_2.yaml` (5208 era5 matches) both showed
+a legend entry and count for "Era5_Soil_Moisture matched" with zero
+markers actually visible anywhere on the map or in the legend swatch
+itself.
+
+Fix: `era5_soil_moisture`'s marker slot now reuses `"v"` (hf_radar's
+shape, index 4) instead of `"+"` — hf_radar is currents-only and
+era5_soil_moisture is soil_moisture-only, so the two can never appear in
+the same report despite sharing a shape; distinguished regardless by
+each keeping its own unique color. Separately, and reported directly
+against the same live-verified plots: `era5_soil_moisture`'s color
+(`"#dcbeff"`, pale lavender) was hard to pick out against a light
+land/ocean background at soil_moisture's reduced matched-layer alpha —
+changed to a bolder `"#800080"`.
+
+A regression test (`test_every_source_marker_is_filled`) asserts every
+`_SOURCE_MARKERS` entry is one of matplotlib's filled markers, so this
+can't recur silently for a future source appended to the canonical order.
+
+> Code: `core/visualization.py` (`_SOURCE_MARKERS`, `_SOURCE_COLORS`).
+
 ## 10. RADARSAT-2 (NOAA NCEI): a second SAR source, selected per recipe
 
 A second SAR-side source for `wind` recipes, alongside Sentinel-1
