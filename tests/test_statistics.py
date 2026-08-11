@@ -1162,7 +1162,7 @@ class TestFilterVariablePairs:
             "val_source":     ("collocation", ["altimeter", "altimeter"]),
         })
         pairs = filter_variable_pairs(recipe, ds)
-        assert pairs == [("oswTotalHs", "VAVH")]
+        assert pairs == [("oswTotalHs", "SWH")]
 
     def test_falls_back_to_oswHs_when_oswTotalHs_absent(self):
         recipe = _waves_recipe(["WV", "SM"])
@@ -1172,7 +1172,7 @@ class TestFilterVariablePairs:
             "val_source": ("collocation", ["altimeter", "altimeter"]),
         })
         pairs = filter_variable_pairs(recipe, ds)
-        assert pairs == [("oswHs", "VAVH")]
+        assert pairs == [("oswHs", "SWH")]
 
     def test_owiSignificantWaveHeight_excluded_when_all_nan(self):
         """owiSignificantWaveHeight must NOT be selected when its column is
@@ -1185,7 +1185,7 @@ class TestFilterVariablePairs:
             "val_source":                   ("collocation", ["altimeter", "altimeter"]),
         })
         pairs = filter_variable_pairs(recipe, ds)
-        assert pairs == [("oswTotalHs", "VAVH")]
+        assert pairs == [("oswTotalHs", "SWH")]
 
     def test_owiSignificantWaveHeight_additive_when_it_has_data(self):
         """When owiSignificantWaveHeight has at least one real value, stats
@@ -1199,7 +1199,7 @@ class TestFilterVariablePairs:
             "val_source":                   ("collocation", ["altimeter", "altimeter"]),
         })
         pairs = filter_variable_pairs(recipe, ds)
-        assert set(pairs) == {("oswTotalHs", "VAVH"), ("owiSignificantWaveHeight", "VAVH")}
+        assert set(pairs) == {("oswTotalHs", "SWH"), ("owiSignificantWaveHeight", "SWH")}
 
     def test_does_not_double_count_oswTotalHs_and_oswHs(self):
         """oswTotalHs must win outright over oswHs — oswHs must not also
@@ -1212,20 +1212,42 @@ class TestFilterVariablePairs:
             "val_source":     ("collocation", ["altimeter", "altimeter"]),
         })
         pairs = filter_variable_pairs(recipe, ds)
-        assert pairs == [("oswTotalHs", "VAVH")]
+        assert pairs == [("oswTotalHs", "SWH")]
 
-    def test_multiple_val_vars_cross_single_sar_winner(self):
-        """Validation-side candidates are unaffected: every val_var that
-        exists still produces its own pair against the one winning sar_var."""
+    def test_multiple_val_vars_merge_into_one_swh_pair(self):
+        """VHM0 and VAVH (correlated-but-distinct wave-height estimators,
+        see docs/design-choices.md §5.8) must merge into ONE "SWH" pair
+        instead of each producing its own separate report section --
+        row 0 (altimeter) only ever reports VAVH, row 1 (buoy) only ever
+        reports VHM0, matching real converter output (from_altimeter never
+        writes VHM0; from_era5 never writes VAVH)."""
         recipe = _waves_recipe(["WV", "SM"])
         ds = xr.Dataset({
             "sar_oswTotalHs": ("collocation", [1.4, 1.5]),
-            "val_VAVH":       ("collocation", [1.42, 1.48]),
-            "val_VHM0":       ("collocation", [1.40, 1.50]),
+            "val_VAVH":       ("collocation", [1.42, np.nan]),
+            "val_VHM0":       ("collocation", [np.nan, 1.50]),
             "val_source":     ("collocation", ["altimeter", "buoy"]),
         })
         pairs = filter_variable_pairs(recipe, ds)
-        assert set(pairs) == {("oswTotalHs", "VAVH"), ("oswTotalHs", "VHM0")}
+        assert pairs == [("oswTotalHs", "SWH")]
+        assert ds["val_SWH"].values.tolist() == pytest.approx([1.42, 1.50])
+        assert ds["val_var_code"].values.tolist() == ["VAVH", "VHM0"]
+
+    def test_merge_prefers_vhm0_when_a_row_has_both(self):
+        """Defensive: even if some row still has both VHM0 and VAVH
+        populated (from_insitu_csv already prevents this for real in-situ
+        data), the merge must not crash and must apply the same VHM0 >
+        VAVH > VGHS precedence documented in docs/design-choices.md §5.8."""
+        recipe = _waves_recipe(["WV", "SM"])
+        ds = xr.Dataset({
+            "sar_oswTotalHs": ("collocation", [1.4]),
+            "val_VAVH":       ("collocation", [1.0]),
+            "val_VHM0":       ("collocation", [1.1]),
+            "val_source":     ("collocation", ["mooring"]),
+        })
+        filter_variable_pairs(recipe, ds)
+        assert ds["val_SWH"].values.tolist() == pytest.approx([1.1])
+        assert ds["val_var_code"].values.tolist() == ["VHM0"]
 
     def test_owiSignificantWaveHeight_alone_when_primary_absent(self):
         """When neither oswTotalHs nor oswHs exists, owiSignificantWaveHeight
@@ -1237,7 +1259,7 @@ class TestFilterVariablePairs:
             "val_source":                   ("collocation", ["altimeter", "altimeter"]),
         })
         pairs = filter_variable_pairs(recipe, ds)
-        assert pairs == [("owiSignificantWaveHeight", "VAVH")]
+        assert pairs == [("owiSignificantWaveHeight", "SWH")]
 
 
 class TestFilterVariablePairsSoilMoisture:
