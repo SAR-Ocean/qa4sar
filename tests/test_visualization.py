@@ -6780,3 +6780,31 @@ class TestValidationReportResidualsHistRange:
             "ismn's volumetric domain -- its residuals are no longer on "
             "the raw percent scale by the time this page is built"
         )
+
+
+class TestHycomCanonicalSourceOrder:
+    def test_hycom_present_and_appended_at_end(self):
+        from sar_validation.core.visualization import _CANONICAL_SOURCE_ORDER
+
+        assert "hycom" in _CANONICAL_SOURCE_ORDER
+        assert _CANONICAL_SOURCE_ORDER[-1] == "hycom"
+
+    def test_canonical_source_order_still_in_sync_with_registered_sets(self):
+        from sar_validation.core.visualization import _canonical_source_order
+
+        # Raises internally if _CANONICAL_SOURCE_ORDER drifts out of sync
+        # with LAYER_DATA_TYPES | _INSITU_TYPES -- this is the existing
+        # loud-failure guard; this test just exercises it after hycom's
+        # addition to LAYER_DATA_TYPES (Task 5) and here.
+        order = _canonical_source_order()
+        assert "hycom" in order
+
+    def test_source_colors_and_markers_have_enough_entries(self):
+        from sar_validation.core.visualization import (
+            _CANONICAL_SOURCE_ORDER,
+            _SOURCE_COLORS,
+            _SOURCE_MARKERS,
+        )
+
+        assert len(_SOURCE_COLORS) >= len(_CANONICAL_SOURCE_ORDER)
+        assert len(_SOURCE_MARKERS) >= len(_CANONICAL_SOURCE_ORDER)
