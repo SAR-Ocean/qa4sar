@@ -238,12 +238,57 @@ class TestFromDict:
 # CLI 'currents' recipe template
 # ---------------------------------------------------------------------------
 
+# hf_radar-family source_type strings -- every one of these dispatches (via
+# Orchestrator._dispatch_source's handlers dict in
+# sar_validation/core/orchestrator.py) to an hf_radar*-flavored downloader
+# whose collocated data_type is always "hf_radar_grid". Any recipe using one
+# of these needs the Finnmark-bugfix hf_radar_grid layer_type_specs entry;
+# a recipe using none of them (e.g. a HyCOM-only currents recipe) has
+# nothing to configure that spec for and is legitimately exempt.
+HF_RADAR_FAMILY_SOURCE_TYPES = frozenset(
+    {"hf_radar", "hf_radar_noaa", "hf_radar_historical", "hf_radar_us"}
+)
+
+
+def _recipe_uses_hf_radar_family_source(recipe: Recipe) -> bool:
+    """True if any of the recipe's validation_sources is hf_radar-family
+    (and therefore requires an hf_radar_grid layer_type_specs entry)."""
+    return any(
+        source.source_type in HF_RADAR_FAMILY_SOURCE_TYPES
+        for source in recipe.config.validation_sources
+    )
+
+
+def _assert_hf_radar_grid_spec_is_correct(recipe: Recipe, path) -> None:
+    """Shared assertion body for the Finnmark-bugfix hf_radar_grid spec,
+    factored out so both the packaged-recipe sweep and the synthetic
+    regression-guard test below exercise identical logic."""
+    specs = recipe.config.collocation.layer_vs_layer.layer_type_specs
+    spec = specs["hf_radar_grid"]
+    assert spec["time_tolerance_minutes"] == 30, path
+    assert spec["dedup_nearest_in_time"] is True, path
+    # Bare "hf_radar" is dead config (data_type is always
+    # "hf_radar_grid" for every HF-radar source) -- removed from
+    # every packaged recipe rather than left as confusing,
+    # unreachable tuning.
+    assert "hf_radar" not in specs, path
+
+
 class TestCurrentsRecipeYamlFilesHfRadarGridSpec:
-    """Every packaged currents_*.yaml recipe must carry the same
-    hf_radar_grid tolerance/dedup fix as the cli.py template it was
-    generated from -- a recipe's own layer_type_specs override wins over
-    the Python-side default, so fixing only the default wouldn't have
-    fixed the Finnmark bug for any already-written recipe file."""
+    """Every packaged currents_*.yaml recipe that actually uses an
+    hf_radar-family validation source must carry the same hf_radar_grid
+    tolerance/dedup fix as the cli.py template it was generated from -- a
+    recipe's own layer_type_specs override wins over the Python-side
+    default, so fixing only the default wouldn't have fixed the Finnmark
+    bug for any already-written recipe file.
+
+    Recipes with NO hf_radar-family validation source (e.g.
+    currents_hycom.yaml, which validates SAR currents against HyCOM model
+    output only) have nothing to configure an hf_radar_grid spec for and
+    are explicitly, intentionally exempt -- see
+    test_hycom_only_recipe_is_exempt_from_hf_radar_grid_spec and the
+    synthetic-recipe tests below for coverage of that exemption itself.
+    """
 
     def test_all_currents_recipes_have_updated_hf_radar_grid_spec(self):
         import pathlib
@@ -255,17 +300,82 @@ class TestCurrentsRecipeYamlFilesHfRadarGridSpec:
         # broken (e.g. a typo'd pattern) and silently testing nothing.
         assert len(paths) > 0
 
+        checked = 0
         for path in paths:
             recipe = Recipe.from_yaml(path)
-            specs = recipe.config.collocation.layer_vs_layer.layer_type_specs
-            spec = specs["hf_radar_grid"]
-            assert spec["time_tolerance_minutes"] == 30, path
-            assert spec["dedup_nearest_in_time"] is True, path
-            # Bare "hf_radar" is dead config (data_type is always
-            # "hf_radar_grid" for every HF-radar source) -- removed from
-            # every packaged recipe rather than left as confusing,
-            # unreachable tuning.
-            assert "hf_radar" not in specs, path
+            if not _recipe_uses_hf_radar_family_source(recipe):
+                # Explicit, commented skip -- this recipe has no
+                # hf_radar/hf_radar_us/hf_radar_noaa/hf_radar_historical
+                # validation source (e.g. a HyCOM-only recipe), so there is
+                # no hf_radar_grid spec for it to correctly have.
+                continue
+            _assert_hf_radar_grid_spec_is_correct(recipe, path)
+            checked += 1
+
+        # Guard against the exemption logic itself silently swallowing
+        # every recipe (e.g. a typo in HF_RADAR_FAMILY_SOURCE_TYPES) and
+        # this test passing vacuously without checking anything.
+        assert checked > 0
+
+    def test_hycom_only_recipe_is_exempt_from_hf_radar_grid_spec(self):
+        """currents_hycom.yaml (added for HyCOM-only currents validation)
+        has no hf_radar-family validation source, so it must not be
+        required to carry an hf_radar_grid spec -- confirms the exemption
+        against the actual packaged file, not just a synthetic stand-in."""
+        import pathlib
+
+        path = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "recipes"
+            / "currents_hycom.yaml"
+        )
+        recipe = Recipe.from_yaml(path)
+        assert not _recipe_uses_hf_radar_family_source(recipe)
+        specs = recipe.config.collocation.layer_vs_layer.layer_type_specs
+        assert "hf_radar_grid" not in specs
+
+    def test_synthetic_recipe_without_hf_radar_source_is_exempt(self, tmp_path):
+        """Exemption is driven by validation_sources content, not by
+        filename -- prove it with a synthetic recipe (independent of
+        currents_hycom.yaml's current contents) so this exemption path has
+        its own regression coverage."""
+        yaml_body = (
+            "name: t\nvariable: currents\n"
+            "validation_sources:\n- source_type: hycom\n"
+            "collocation:\n  layer_vs_layer:\n    layer_type_specs: {}\n"
+        )
+        yaml_path = tmp_path / "r.yaml"
+        yaml_path.write_text(yaml_body)
+        recipe = Recipe.from_yaml(yaml_path)
+
+        assert not _recipe_uses_hf_radar_family_source(recipe)
+        # Would have raised KeyError under the pre-fix blanket check.
+        specs = recipe.config.collocation.layer_vs_layer.layer_type_specs
+        assert "hf_radar_grid" not in specs
+
+    def test_synthetic_recipe_with_hf_radar_source_and_wrong_spec_is_caught(self, tmp_path):
+        """Regression guard for the exemption logic itself: a recipe that
+        DOES use an hf_radar-family source but ships a wrong hf_radar_grid
+        spec must still fail -- the exemption must only apply to recipes
+        with no hf_radar-family source, never quietly widen to swallow a
+        real hf_radar recipe with a broken spec."""
+        yaml_body = (
+            "name: t\nvariable: currents\n"
+            "validation_sources:\n- source_type: hf_radar_us\n"
+            "collocation:\n"
+            "  layer_vs_layer:\n"
+            "    layer_type_specs:\n"
+            "      hf_radar_grid:\n"
+            "        time_tolerance_minutes: 15\n"
+            "        dedup_nearest_in_time: false\n"
+        )
+        yaml_path = tmp_path / "r.yaml"
+        yaml_path.write_text(yaml_body)
+        recipe = Recipe.from_yaml(yaml_path)
+
+        assert _recipe_uses_hf_radar_family_source(recipe)
+        with pytest.raises(AssertionError):
+            _assert_hf_radar_grid_spec_is_correct(recipe, yaml_path)
 
 
 class TestWindTemplate:
