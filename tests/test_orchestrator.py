@@ -1206,3 +1206,60 @@ class TestSarEmptyStopsPipeline:
         orchestrator = DataOrchestrator(recipe, dry_run=False)
 
         assert orchestrator.previous_sar_data_found() is True
+
+
+class TestDownloadHycom:
+    def _recipe(self):
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+        cfg = RecipeConfig(
+            name="t", variable="currents",
+            geographic_bounds=GeographicBounds(-10.0, 10.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2025-01-01T00:00:00", "2025-01-01T06:00:00"),
+            validation_sources=[ValidationDataSource(source_type="hycom")],
+        )
+        return Recipe(cfg)
+
+    def test_dispatches_to_download_hycom(self, tmp_path, monkeypatch):
+        from sar_validation.core.orchestrator import DataOrchestrator
+
+        recipe = self._recipe()
+        orch = DataOrchestrator(recipe, dry_run=True)
+        called = {}
+
+        def fake_download_hycom(self, source):
+            called["source_type"] = source.source_type
+            return True
+
+        monkeypatch.setattr(DataOrchestrator, "_download_hycom", fake_download_hycom)
+        result = orch._dispatch_source(recipe.config.validation_sources[0])
+        assert result is True
+        assert called["source_type"] == "hycom"
+
+    def test_download_hycom_builds_downloader_and_calls_download(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from sar_validation.core.orchestrator import DataOrchestrator
+
+        recipe = self._recipe()
+        orch = DataOrchestrator(recipe, dry_run=True)
+
+        fake_dl = MagicMock()
+        fake_dl.download.return_value = []
+        fake_cls = MagicMock(return_value=fake_dl)
+
+        import sar_validation.downloaders.hycom_downloader as dl_mod
+        monkeypatch.setattr(dl_mod, "HycomDownloader", fake_cls)
+
+        ok = orch._download_hycom(recipe.config.validation_sources[0])
+        assert ok is True
+        fake_cls.assert_called_once()
+        fake_dl.download.assert_called_once()
+        call_kwargs = fake_dl.download.call_args.kwargs
+        assert call_kwargs["min_lon"] == -10.0
+        assert call_kwargs["max_lon"] == 10.0

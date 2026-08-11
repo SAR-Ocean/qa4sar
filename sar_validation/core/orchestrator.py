@@ -609,6 +609,7 @@ class DataOrchestrator:
             "smos_ssm":      self._download_smos_ssm,
             "cds_ssm":       self._download_cds_ssm,
             "era5":          self._download_era5,
+            "hycom":         self._download_hycom,
         }
         handler = handlers.get(source.source_type)
         if handler is None:
@@ -868,6 +869,25 @@ class DataOrchestrator:
                 start=pad_start, end=pad_end,
             ),
             f"ERA5 ({cfg.variable})",
+        )
+
+    def _download_hycom(self, source) -> bool:
+        from ..downloaders.hycom_downloader import HycomDownloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        out_dir = self.base_dir / "hycom"
+
+        return self._run_download(
+            "hycom", out_dir,
+            lambda: HycomDownloader(output_dir=out_dir, dry_run=self.dry_run),
+            lambda: dict(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=pad_start, end=pad_end,
+            ),
+            "HyCOM",
         )
 
     def _download_scatterometer_ftp(self, source, satellite: str) -> bool:
