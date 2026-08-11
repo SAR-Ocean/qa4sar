@@ -866,8 +866,11 @@ class TestRunStatisticsSoilMoistureDispatch:
 
 @pytest.fixture
 def direction_collocation_ds():
-    """Direction pairs that straddle the 0°/360° wrap boundary."""
-    sar_deg = np.array([10.0, 90.0, 180.0, 270.0, 359.0])
+    """Direction pairs that straddle the 0°/360° wrap boundary.
+
+    Needs >= MIN_N_FOR_CORRELATION points so the correlation isn't gated to NaN.
+    """
+    sar_deg = np.array([10.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0, 350.0, 359.0])
     val_deg = (sar_deg + 2.0) % 360.0  # sar - val should wrap to ~-2° everywhere
 
     ds = xr.Dataset(
