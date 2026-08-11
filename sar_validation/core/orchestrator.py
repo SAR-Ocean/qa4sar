@@ -153,17 +153,54 @@ def _padded_temporal_bounds(cfg, *source_types: str) -> "tuple[str, str]":
     return start, end
 
 
-def _sar_entry_found_data(entry: Dict[str, Any]) -> bool:
+def _sar_entry_found_data(
+    entry: Dict[str, Any],
+    sar_dir: Optional[Path] = None,
+    file_glob: Optional[str] = None,
+) -> bool:
     """True if a recorded ``"sar"`` download-metadata entry represents at
     least one product found for the window, a failed download attempt
     (whose true "was there data" answer is unknown, so must not be
     treated as empty), or the absence of any recorded entry at all (no
-    previous run to consult, so there's nothing to gate on). Falls back
-    to ``len(files)`` for entries recorded before ``found_count`` existed
-    (see the SAR-emptiness design doc)."""
+    previous run to consult, so there's nothing to gate on).
+
+    Entries recorded before ``found_count`` existed can have an empty
+    ``"files"`` list even though real products were found and downloaded:
+    ``SARDownloader.download()`` (and its per-source siblings) only
+    appends *newly* downloaded files to the list it returns -- a product
+    that was already present on disk (skipped as a duplicate) is never
+    appended. So a fully successful old-schema run where every matched
+    product happened to already be cached ends up recording ``files: []``
+    despite real data being present -- confirmed live 2026-08-11: a
+    ``currents_useastcoast.yaml`` run's copied-over ``download_metadata.json``
+    (written before ``found_count`` existed, SAR genuinely downloaded but
+    every product already cached from an earlier run) was misread as "no
+    SAR data found," even though the SAR files were sitting right there in
+    ``S1_L2_OCN/``. For an entry with no ``found_count`` and an empty
+    ``"files"`` list, check *sar_dir* directly (matching *file_glob*, e.g.
+    ``SARSourceSpec.file_glob``) instead of trusting that ambiguous empty
+    list -- callers that can't supply *sar_dir*/*file_glob* keep the old
+    ``len(files)`` behaviour.
+
+    When the disk check runs, it also backfills ``entry["found_count"]``
+    and ``entry["files"]`` in place from what it actually found -- *entry*
+    is typically the same dict a caller is about to save as part of its
+    own metadata (e.g. ``download_all()``'s already-succeeded copy-forward
+    path), so this heals a stale old-schema entry into a self-consistent
+    one instead of leaving the gap to be silently re-read (and re-scanned)
+    on every future run."""
     if not entry or entry.get("status") == "failed":
         return True
-    return entry.get("found_count", len(entry.get("files", []))) > 0
+    if "found_count" in entry:
+        return entry["found_count"] > 0
+    if entry.get("files"):
+        return True
+    if sar_dir is not None and file_glob is not None and sar_dir.exists():
+        found_files = sorted(sar_dir.rglob(file_glob))
+        entry["found_count"] = len(found_files)
+        entry["files"] = [str(p) for p in found_files]
+        return len(found_files) > 0
+    return False
 
 
 class DataOrchestrator:
@@ -323,12 +360,24 @@ class DataOrchestrator:
             return False
         return prev.get("status") == "success"
 
+    def _sar_dir_and_glob(self) -> tuple:
+        """(sar_dir, file_glob) for this recipe's SAR source -- passed to
+        _sar_entry_found_data so it can check disk directly for old-schema
+        metadata entries (see that function's docstring)."""
+        from .sar_sources import SAR_SOURCES
+
+        spec = SAR_SOURCES[self.recipe.config.sar_data.source]
+        return self.base_dir / spec.output_subdir, spec.file_glob
+
     def previous_sar_data_found(self) -> bool:
         """True if a previous run's recorded SAR entry (if any) found at
         least one product for this window. Used by the CLI's "already
         downloaded" resume shortcut, which reuses a prior run's cached
         metadata without calling :meth:`download_all` again."""
-        return _sar_entry_found_data(self._previous_downloads.get("sar", {}))
+        sar_dir, file_glob = self._sar_dir_and_glob()
+        return _sar_entry_found_data(
+            self._previous_downloads.get("sar", {}), sar_dir=sar_dir, file_glob=file_glob,
+        )
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -355,7 +404,8 @@ class DataOrchestrator:
             ok = False
 
         sar_entry = self.metadata["downloads"].get("sar", {})
-        sar_data_found = _sar_entry_found_data(sar_entry)
+        sar_dir, file_glob = self._sar_dir_and_glob()
+        sar_data_found = _sar_entry_found_data(sar_entry, sar_dir=sar_dir, file_glob=file_glob)
         self.metadata["sar_data_found"] = sar_data_found
         if not sar_data_found:
             msg = "No SAR data found for this window/region — skipping validation-data downloads."
