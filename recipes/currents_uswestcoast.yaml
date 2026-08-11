@@ -37,6 +37,9 @@ validation_sources:
 - source_type: mooring
   download_kwargs: {}
   collocation_kwargs: {}
+- source_type: hycom
+  download_kwargs: {}
+  collocation_kwargs: {}
 collocation:
   point_vs_layer:
     time_tolerance_minutes: 30

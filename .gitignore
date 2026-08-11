@@ -33,6 +33,7 @@ recipes/*.yaml
 !recipes/wind_era5.yaml
 !recipes/currents_uswestcoast.yaml
 !recipes/currents_useastcoast.yaml
+!recipes/currents_hycom.yaml
 !recipes/waves_pacific.yaml
 !recipes/waves_atlantic.yaml
 !recipes/waves_era5.yaml
