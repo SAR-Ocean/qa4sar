@@ -301,6 +301,11 @@ LAYER_DATA_TYPES = {
     # visualization.py) includes era5's val_source labels for permanent
     # palette slots. See docs/design-choices.md.
     "era5_wind", "era5_waves", "era5_soil_moisture",
+    # HyCOM never reaches _detect_collocation_type in practice either (see
+    # the ERA5 comment above) -- this entry exists purely so
+    # _canonical_source_order()'s registered-set check (visualization.py)
+    # includes hycom's val_source label for a permanent palette slot.
+    "hycom",
 }
 # path-fragment fallbacks when attributes are absent
 LAYER_SOURCE_PATHS = {
@@ -308,6 +313,27 @@ LAYER_SOURCE_PATHS = {
     "hf_radar_grid", "hfr_noaa", "radiometer", "ascat_ssm", "amsr_ssm", "smap_ssm",
     "smos_ssm", "cds_ssm",
 }
+
+
+def _model_source_type(data_type: str) -> Optional[str]:
+    """
+    Map a gridded "model" validation Dataset's ``data_type`` attribute to
+    the ``source_type`` key used in the recipe's ``validation_sources``
+    (and therefore in ``source_type_overrides``) -- e.g. ``"era5_wind"``
+    -> ``"era5"``, ``"hycom"`` -> ``"hycom"``. Returns ``None`` if
+    *data_type* isn't a recognized model source.
+
+    ERA5 spans three ``data_type`` values (one recipe `source_type` per
+    three possible `variable`s: wind/waves/soil_moisture), all sharing
+    the recipe `source_type` literal ``"era5"`` -- hence the prefix
+    match. HyCOM only ever produces ``data_type="hycom"``, identical to
+    its own `source_type`, so it's an exact match, no stripping needed.
+    """
+    if data_type.startswith("era5_"):
+        return "era5"
+    if data_type == "hycom":
+        return "hycom"
+    return None
 
 
 def _detect_collocation_type(val_ds: "xr.Dataset", source_path: str) -> str:
@@ -1553,22 +1579,23 @@ def run_collocation(
                         "colloc_kwargs": source_type_overrides.get(source_type, {}),
                     }
 
-    # Gridded "model" sources (currently only ERA5) -- kept as raw, native
+    # Gridded "model" sources (ERA5, HyCOM) -- kept as raw, native
     # (time, lat, lon) Datasets rather than flattened into `buckets`/
     # `val_dfs` like every other validation source, since
     # ModelLayerCollocation interpolates the field directly onto SAR pixel
     # locations at collocation time instead of matching against
-    # pre-existing rows. Detected by a "era5_" data_type prefix rather
-    # than a "point" dimension check.
+    # pre-existing rows. Detected via _model_source_type() rather than a
+    # "point" dimension check.
     model_sources: Dict[str, "xr.Dataset"] = {}
     model_source_metadata: Dict[str, Dict[str, Any]] = {}
     if "validation" in datatree.children:
         for name, node in datatree["validation"].children.items():
             ds = node.to_dataset()
-            if ds.attrs.get("data_type", "").startswith("era5_"):
+            model_source_type = _model_source_type(ds.attrs.get("data_type", ""))
+            if model_source_type is not None:
                 model_sources[name] = ds
                 model_source_metadata[name] = {
-                    "colloc_kwargs": source_type_overrides.get("era5", {}),
+                    "colloc_kwargs": source_type_overrides.get(model_source_type, {}),
                 }
             # One level deeper -- DataTreeConverter places ERA5 at
             # "validation/era5/era5" (same "may be nested one level
@@ -1578,11 +1605,12 @@ def run_collocation(
             # checked above, which itself carries no attrs of its own.
             for subname, subnode in node.children.items():
                 sub_ds = subnode.to_dataset()
-                if sub_ds.attrs.get("data_type", "").startswith("era5_"):
+                sub_model_source_type = _model_source_type(sub_ds.attrs.get("data_type", ""))
+                if sub_model_source_type is not None:
                     path = f"{name}/{subname}"
                     model_sources[path] = sub_ds
                     model_source_metadata[path] = {
-                        "colloc_kwargs": source_type_overrides.get("era5", {}),
+                        "colloc_kwargs": source_type_overrides.get(sub_model_source_type, {}),
                     }
 
     _merge_sibling_ssm_nodes(buckets, source_metadata, layer_vs_layer_specs)

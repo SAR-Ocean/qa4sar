@@ -112,7 +112,7 @@ __all__ = [
 # two differ in lightness) — this is what made scatterometer's matched
 # points look gray once it landed on the (then-)black slot below. Must
 # have at least as many entries as _canonical_source_order() returns
-# (currently 16): a shorter palette wraps and silently reassigns two
+# (currently 17): a shorter palette wraps and silently reassigns two
 # unrelated sources (e.g. tidal gauge landing back on altimeter's blue
 # circle) — see the "matched tidal gauge and altimeter look identical" bug
 # this comment documents. Slots are assigned by *list position* in
@@ -127,16 +127,18 @@ __all__ = [
 # distinguish against plot_collocation_diagnostics' mid-gray (#808080)
 # "unmatched" pattern once small marker sizes/anti-aliasing softened it.
 #
-# The last three entries (olive/cyan/lavender) were appended for
-# era5_wind/era5_waves/era5_soil_moisture joining _CANONICAL_SOURCE_ORDER --
-# same append-only rule applies here as there, to avoid the exact wrap
-# collision this comment already warns about.
+# The three entries before last (olive/cyan/lavender) were appended for
+# era5_wind/era5_waves/era5_soil_moisture joining _CANONICAL_SOURCE_ORDER,
+# and the final entry (lime, "x" marker) for hycom -- same append-only
+# rule applies here as there, to avoid the exact wrap collision this
+# comment already warns about.
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#469990",
     "#f032e6", "#e6194b", "#000080", "#ffff00",
     "#00ff00",
     "#808000", "#42d4f4", "#dcbeff",
+    "#bcf60c",
 ]
 
 # Marker shapes paired 1:1 with _SOURCE_COLORS by index, used wherever
@@ -146,6 +148,7 @@ _SOURCE_COLORS = [
 _SOURCE_MARKERS = [
     "o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<", ">",
     "H", "d", "+",
+    "x",
 ]
 
 # Fixed, append-only reference order for known validation source/platform
@@ -165,6 +168,7 @@ _CANONICAL_SOURCE_ORDER = [
     "scatterometer_ssm", "tidal_gauge",
     "cds_ssm",
     "era5_wind", "era5_waves", "era5_soil_moisture",
+    "hycom",
 ]
 
 
