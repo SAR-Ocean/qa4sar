@@ -2,7 +2,7 @@
 
 A standalone Python package for validating Level 2 SAR products against multi-source in-situ and satellite observations.
 
-Supports validation of **wind** (speed + direction), **ocean currents**, **significant wave height**, and **soil moisture** -- against in-situ, satellite, and model (ERA5) sources.
+Supports validation of **wind** (speed + direction), **ocean currents**, **significant wave height**, and **soil moisture** -- against in-situ, satellite, and model (ERA5, HyCOM) sources.
 
 Supported SAR products:
 - Sentinel-1 L2_OCN (Level 2 Ocean): wind/waves/currents
@@ -81,6 +81,7 @@ sar_validation/
     ├── hf_radar_downloader.py                   # Near-real-time HF-radar surface currents via Copernicus Marine
     ├── hf_radar_historical_downloader.py        # Delayed-mode/historical HF-radar currents via Copernicus Marine
     ├── hf_radar_us_downloader.py                # US HF-radar waterfall selector: NOAA ERDDAP → NOAA THREDDS → Copernicus Marine
+    ├── hycom_downloader.py                      # HyCOM ocean model surface currents (water_u/water_v) via THREDDS OPeNDAP
     ├── insitu_currents_historical_downloader.py # Delayed-mode in-situ currents (ADCP/Argo/drifter/glider) via Copernicus Marine
     ├── insitu_downloader.py                      # Moorings/buoys/ferrybox via Copernicus Marine
     ├── ismn_downloader.py                        # ISMN local-archive soil-moisture station selector (no download API)
@@ -95,6 +96,8 @@ sar_validation/
     ├── cds_soil_moisture_downloader.py           # C3S CDS satellite soil moisture (ACTIVE/PASSIVE/COMBINED, 0.25°) via cdsapi
     └── smos_downloader.py                        # SMOS L2 soil moisture via ESA SMOS FTPS
 ```
+
+HyCOM model coverage in this toolbox: ESPC-D-V02 (2024-08-10 -> present), GOFS 3.1 Analysis / GLBy0.08 expt_93.0 (2018-12-04 -> 2024-09-04), auto-selected by recipe date. Earlier GOFS 3.1 sub-experiments, GOFS 3.1 Reanalysis, and GOFS 3.0 are not supported.
 
 ---
 

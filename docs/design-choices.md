@@ -686,6 +686,62 @@ and every geographic/scatter panel's legend correctly reads
 > `core/visualization.py` (`plot_scatter`, `_plot_scatter_small_multiples`,
 > `plot_geographic`'s `val_var_code`-aware legend/title grouping).
 
+### 5.9 HyCOM model validation
+
+HyCOM (hycom.org) ocean-model surface currents (`water_u`/`water_v`,
+renamed `EWCT`/`NSCT` at conversion time) are the second consumer of the
+generic `ModelLayerCollocation` machinery built for ERA5 (§5.7) --
+confirming that design's anticipation that a future ocean-currents model
+would reuse it directly. `ModelLayerCollocation` needed zero changes for
+HyCOM; the only addition was `_derive_currents_radial_projection` in
+`model_collocation.py`, mirroring `_derive_wind_wspd_wdir`'s self-gating
+call shape but computing the existing `EWCT`/`NSCT` -> `rvlRadVel_projection`
+line-of-sight projection (`_project_currents_to_radial`, already used by
+every other currents validation source) instead of a wind speed/direction
+derivation.
+
+**Depth**: always HyCOM's `depth=0.0` surface z-level, `method="nearest"`
+on the `.sel()` (never exact float equality). SAR, HF-radar, and this
+toolbox's in-situ currents sources (drifter, ferrybox, mooring, ADCP,
+Argo, glider) are all treated as near-surface measurements -- the
+existing `min_depth`/`max_depth` recipe fields (default +/-20 m) already
+filter in-situ sources to a near-surface band before collocation, so
+comparing all of them against HyCOM's z=0 level is the physically
+consistent choice. Matching each observation's own reported depth to
+HyCOM's nearest z-level (of 40 available) was considered and rejected as
+unnecessary complexity.
+
+**Model-version routing**: `source_type: "hycom"` auto-selects between
+two datasets by date -- ESPC-D-V02 (2024-08-10 -> present) and GOFS 3.1
+Analysis, `GLBy0.08/expt_93.0` (2018-12-04 -> 2024-09-04) -- covering
+2018-12-04 to present with no gap. A recipe window straddling the
+2024-08-10 cutover downloads and concatenates both.
+
+**Why HyCOM coverage starts 2018-12-04, not 2014-07-01**: HYCOM's own
+summary docs describe "GOFS 3.1 Analysis" as spanning 2014-07-01 to
+2024-09-04, but this is not one continuously queryable THREDDS dataset --
+it's fragmented across several `expt_9X.X` sub-experiments with shifting
+grid names (`GLBu0.08` -> `GLBv0.08` -> `GLBy0.08`), whose exact
+pre-2018-12-04 boundaries could not be confirmed against live THREDDS
+catalogs. Rather than hardcode an unverified dataset path or boundary
+date -- the exact mistake §8.11 (NISAR SME2) and §10 (RADARSAT-2) already
+document as a real, previously-made error in this codebase -- only the
+one continuously-verified GOFS 3.1 dataset (`expt_93.0`) is wired in.
+This is why `recipes/currents_arpas_historic.yaml` (dated 2018-03-05)
+does not have a `hycom` validation source: its window falls entirely
+before this toolbox's HyCOM coverage. GOFS 3.1's earlier sub-experiments,
+GOFS 3.1 Reanalysis (1994-2015), and GOFS 3.0 (2008-2018) are deferred as
+future work, the same way ERA5's design deferred ORAS5.
+
+**Why `ESPC-D-V02` and `GLBy0.08/expt_93.0` need different download code
+paths**: live-verified to have genuinely different wire shapes.
+`ESPC-D-V02` publishes separate, continuous `u3z`/`v3z` OPeNDAP datasets
+spanning its whole coverage range in one open each. `GLBy0.08/expt_93.0`
+publishes one *combined* `water_u`+`water_v` dataset **per calendar
+year**, so a multi-year recipe window against GOFS 3.1 opens/concatenates
+one dataset per touched year -- the same shape of problem ERA5 already
+solves for per-day CDS files.
+
 ---
 
 ## 6. Circular variables (wind direction)
