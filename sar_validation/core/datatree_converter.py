@@ -729,6 +729,27 @@ class DataTreeConverter:
                 df[col] = hcsp * trig(hcdt_rad)
                 logger.debug("Derived %s from HCSP+HCDT", col)
 
+        # A single in-situ platform can report more than one significant
+        # wave height estimate in the same row -- VHM0 (spectral Hm0) and
+        # VAVH (time-domain H1/3) are independently-computed, non-identical
+        # quantities (confirmed live 2026-08-10: mooring 6200442 reported
+        # VAVH=1.0 and VHM0=1.1 for the same reading), and CMEMS's
+        # long-format export pivots each into its own column above. Left
+        # as-is, that one physical observation would land in BOTH the
+        # VAVH-paired (altimeter) and VHM0-paired (ERA5) report sections --
+        # double-counting a single match across two comparisons. Keep only
+        # the highest-precedence column per row (VHM0 > VAVH > VGHS,
+        # matching _variable_map.py's own wave_val_params fallback order)
+        # and null the rest, so each observation contributes to exactly one
+        # comparison; a row reporting only one of them is untouched.
+        wave_height_cols = [c for c in ("VHM0", "VAVH", "VGHS") if c in df.columns]
+        if len(wave_height_cols) > 1:
+            claimed = pd.Series(False, index=df.index)
+            for col in wave_height_cols:
+                has_val = df[col].notna()
+                df.loc[claimed & has_val, col] = np.nan
+                claimed = claimed | has_val
+
         coord_cols = {"lon", "lat", "time", "platform_id", "platform_type"}
         data_cols  = [c for c in df.columns if c not in coord_cols]
 

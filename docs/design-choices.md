@@ -588,6 +588,51 @@ carries a small fixed CF-attrs fallback keyed on `("era5_wind", "WSPD"
 > `_DERIVED_VAL_VAR_ATTRS`), `core/collocation.py` (`run_collocation`
 > dispatch table).
 
+### 5.8 Wave-height precedence: VHM0 vs VAVH, when an in-situ platform reports both
+
+`VHM0` and `VAVH` are both "significant wave height" in meters, but from
+different algorithms, and are intentionally kept as separate `val_var`
+codes rather than merged into one (§2's "canonical variable naming"
+invariant does not apply here):
+
+- **VHM0** — *spectral* significant wave height (Hm0 = 4×√m0, from the
+  zeroth moment of the wave energy spectrum). This is what ERA5's `swh`
+  is renamed to at conversion time (`from_era5`, §5.7) and is the modern
+  standard most wave models and buoys report.
+- **VAVH** — significant wave height by the classical *time-domain*
+  definition (H1/3: mean height of the highest one-third of individual
+  waves, from zero-crossing analysis). This is what the altimeter
+  converters (`from_altimeter`) always produce.
+
+They're correlated but not identical — confirmed live 2026-08-10 against
+`recipes/waves_era5_and_satellites2.yaml`: mooring platform `6200442`
+reported `VAVH=1.0` and `VHM0=1.1` for the same reading. Copernicus Marine
+in-situ platforms (mooring/tidal_gauge/drifter/buoy) are the only sources
+that can report both in the same row — altimeter only ever produces
+`VAVH`, ERA5 only ever produces `VHM0` — since `insitu_downloader.py`
+requests the full `ALL_VARIABLES` set regardless of which codes a given
+platform actually carries, and the CMEMS long-format CSV pivots each
+reported code into its own column (`from_insitu_csv`).
+
+Left unhandled, that single mooring observation landed in **both**
+`oswTotalHs_vs_VAVH` (paired with altimeter) and `oswTotalHs_vs_VHM0`
+(paired with era5) — one physical match, double-counted across two
+report sections. The collocation-diagnostics plot showing altimeter and
+era5 markers together is unrelated and correct (it's a spatial coverage
+map across all sources, not per-variable) — the bug was specifically
+this one point contributing to two separate statistics groups.
+
+Fix: `from_insitu_csv` now keeps only the highest-precedence wave-height
+column per row (`VHM0 > VAVH > VGHS`, reusing the same precedence order
+`_variable_map.py`'s `wave_val_params` already establishes for SAR-side
+fallback) and nulls the rest, so each observation contributes to exactly
+one comparison — VHM0 and VAVH still appear as separate, independently
+named report sections for sources that only ever produce one of them.
+
+> Code: `core/datatree_converter.py` (`from_insitu_csv`'s wave-height
+> precedence block), `core/_variable_map.py` (`wave_val_params`,
+> `filter_variable_pairs`).
+
 ---
 
 ## 6. Circular variables (wind direction)

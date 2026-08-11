@@ -272,6 +272,41 @@ class TestFromInsituCsv:
         ds = DataTreeConverter.from_insitu_csv(path, source_type="tidal_gauge")
         assert set(ds["platform_type"].values) == {"tidal_gauge"}
 
+    def test_wave_height_precedence_when_platform_reports_both_vhm0_and_vavh(self, tmp_path):
+        """A CMEMS in-situ platform can report both VHM0 (spectral Hm0) and
+        VAVH (time-domain H1/3) for the same observation -- confirmed live
+        2026-08-10 (mooring 6200442, VAVH=1.0/VHM0=1.1 in the same
+        collocation row). Left as-is, that single observation lands in BOTH
+        the oswTotalHs_vs_VAVH (paired with altimeter) and
+        oswTotalHs_vs_VHM0 (paired with era5) report sections --
+        double-counting one physical reading across two comparisons.
+        Only the highest-precedence column (VHM0 > VAVH > VGHS, matching
+        _variable_map.py's own wave_val_params order) should survive per
+        row; a platform reporting only one of them is untouched."""
+        df = pd.DataFrame({
+            "longitude": [-10.0, -9.0, -8.0],
+            "latitude":  [50.0, 51.0, 52.0],
+            "time":      pd.date_range("2026-01-01", periods=3, freq="h"),
+            "VHM0":      [1.1, np.nan, 2.2],
+            "VAVH":      [1.0, 3.0,    np.nan],
+            "platform_id": ["MO001", "MO002", "MO003"],
+            "platform_type": ["MO", "MO", "MO"],
+        })
+        path = tmp_path / "insitu_waves.csv"
+        df.to_csv(path, index=False)
+
+        ds = DataTreeConverter.from_insitu_csv(path, source_type="mooring")
+
+        # Row 0: both reported -- VHM0 (higher precedence) wins, VAVH nulled.
+        assert ds["VHM0"].values[0] == pytest.approx(1.1)
+        assert math.isnan(ds["VAVH"].values[0])
+        # Row 1: only VAVH reported -- untouched.
+        assert ds["VAVH"].values[1] == pytest.approx(3.0)
+        assert math.isnan(ds["VHM0"].values[1])
+        # Row 2: only VHM0 reported -- untouched.
+        assert ds["VHM0"].values[2] == pytest.approx(2.2)
+        assert math.isnan(ds["VAVH"].values[2])
+
 
 # ---------------------------------------------------------------------------
 # from_scatterometer_nc
