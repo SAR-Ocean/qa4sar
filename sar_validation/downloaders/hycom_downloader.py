@@ -39,12 +39,18 @@ CLI usage::
 
 from __future__ import annotations
 
+import argparse
 import logging
+import sys
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from .base import build_output_dir, normalize_datetime
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["_resolve_hycom_segments"]
+__all__ = ["HycomDownloader", "_resolve_hycom_segments", "main"]
 
 #: First date this toolbox has verified HyCOM coverage for -- the start of
 #: GLBy0.08/expt_93.0, the one continuously-verified GOFS 3.1 Analysis
@@ -92,3 +98,213 @@ def _resolve_hycom_segments(
         ("gofs31_930", start, _HYCOM_CUTOVER_DATE),
         ("espc_d_v02", _HYCOM_CUTOVER_DATE, window_end),
     ]
+
+
+class HycomDownloader:
+    """
+    Download HyCOM surface current velocity (water_u/water_v, depth=0.0)
+    via THREDDS OPeNDAP, using xarray's lazy ``.sel()`` subsetting so only
+    the requested bbox/time/depth slice is pulled over the network -- see
+    module docstring for the two datasets this spans.
+
+    Parameters
+    ----------
+    output_dir : Path
+        Directory to save downloaded NetCDF files.
+    dry_run : bool
+        If True, probe each resolved dataset's ``time`` coordinate only
+        (cheap -- no full u/v grid load) and report real day-level
+        coverage without downloading.
+    """
+
+    def __init__(self, output_dir: Path, dry_run: bool = False) -> None:
+        self.output_dir = Path(output_dir)
+        self.dry_run = dry_run
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def download(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+    ) -> list[Path]:
+        """
+        Download one combined NetCDF per HyCOM dataset-segment touched by
+        [*start*, *end*] (see :func:`_resolve_hycom_segments`).
+
+        Parameters
+        ----------
+        min_lon, max_lon, min_lat, max_lat : float
+            Geographic bounds -- padded internally by one native grid
+            cell (see :data:`_GRID_PAD_DEG`).
+        start, end : str
+            ISO-8601 date or datetime strings.
+
+        Returns
+        -------
+        list[Path]
+            Paths to downloaded (or already-cached) NetCDF files.
+        """
+        window_start = datetime.fromisoformat(normalize_datetime(start))
+        window_end = datetime.fromisoformat(normalize_datetime(end))
+        segments = _resolve_hycom_segments(window_start, window_end)
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        downloaded: list[Path] = []
+        for dataset_key, seg_start, seg_end in segments:
+            nc_path = self._nc_path_for_segment(dataset_key, seg_start, seg_end)
+            if nc_path.exists():
+                logger.info("  %s: already present (%s), skipping.", dataset_key, nc_path.name)
+                downloaded.append(nc_path)
+                continue
+
+            if self.dry_run:
+                self._probe_coverage(dataset_key, seg_start, seg_end)
+                continue
+
+            result = self._download_segment(
+                dataset_key, seg_start, seg_end, min_lon, max_lon, min_lat, max_lat,
+            )
+            if result is not None:
+                downloaded.append(result)
+
+        return downloaded
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _nc_path_for_segment(self, dataset_key: str, seg_start: datetime, seg_end: datetime) -> Path:
+        return self.output_dir / (
+            f"hycom_{dataset_key}_{seg_start:%Y%m%dT%H%M%S}_{seg_end:%Y%m%dT%H%M%S}.nc"
+        )
+
+    def _dodsc_urls(self, dataset_key: str, seg_start: datetime, seg_end: datetime) -> dict[str, str]:
+        """
+        Map of ``{label: dodsC url}`` to open for this segment.
+
+        ``espc_d_v02`` -> one continuous dataset per component (``"u"``,
+        ``"v"`` labels). ``gofs31_930`` -> one COMBINED water_u+water_v
+        dataset per calendar year touched by [*seg_start*, *seg_end*]
+        (``"uv_<year>"`` labels) -- see module docstring for why these two
+        datasets have different shapes on the wire.
+        """
+        if dataset_key == "espc_d_v02":
+            base = "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02"
+            return {"u": f"{base}/u3z", "v": f"{base}/v3z"}
+
+        base = "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z"
+        years = range(seg_start.year, seg_end.year + 1)
+        return {f"uv_{year}": f"{base}/{year}" for year in years}
+
+    def _probe_coverage(self, dataset_key: str, seg_start: datetime, seg_end: datetime) -> None:
+        """Lazily open each URL for this segment and report which
+        requested days actually have granules in the live dataset's
+        ``time`` coordinate -- no full u/v grid load. Analogous to
+        ``noaa_hfradar_thredds_downloader.py``'s ``catalog.xml`` probe."""
+        import numpy as np
+        import xarray as xr
+
+        for label, url in self._dodsc_urls(dataset_key, seg_start, seg_end).items():
+            try:
+                remote = xr.open_dataset(url)
+            except Exception as exc:  # noqa: BLE001 — remote OPeNDAP errors are broad
+                logger.warning("  [dry-run] %s (%s): could not open %s: %s", dataset_key, label, url, exc)
+                continue
+            times = remote.time.values
+            remote.close()
+            in_window = times[(times >= np.datetime64(seg_start)) & (times <= np.datetime64(seg_end))]
+            logger.info(
+                "  [dry-run] %s (%s): %d granule(s) in [%s, %s]",
+                dataset_key, label, len(in_window), seg_start, seg_end,
+            )
+
+    def _download_segment(
+        self,
+        dataset_key: str,
+        seg_start: datetime,
+        seg_end: datetime,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+    ) -> Optional[Path]:
+        """Download one dataset-segment's water_u/water_v subset, combine
+        into one NetCDF. Returns the NC path, or ``None`` on failure."""
+        import xarray as xr
+
+        west = min_lon - _GRID_PAD_DEG
+        east = max_lon + _GRID_PAD_DEG
+        south = min_lat - _GRID_PAD_DEG
+        north = max_lat + _GRID_PAD_DEG
+
+        nc_path = self._nc_path_for_segment(dataset_key, seg_start, seg_end)
+        urls = self._dodsc_urls(dataset_key, seg_start, seg_end)
+
+        try:
+            opened = {label: xr.open_dataset(url) for label, url in urls.items()}
+            if dataset_key == "espc_d_v02":
+                merged = xr.merge([opened["u"][["water_u"]], opened["v"][["water_v"]]])
+            else:
+                per_year = [opened[label][["water_u", "water_v"]] for label in sorted(opened)]
+                merged = per_year[0] if len(per_year) == 1 else xr.concat(per_year, dim="time")
+
+            subset = merged.sel(
+                time=slice(seg_start, seg_end),
+                lat=slice(south, north),
+                lon=slice(west, east),
+            ).sel(depth=0.0, method="nearest")
+            subset = subset.load()
+            for ds in opened.values():
+                ds.close()
+        except Exception as exc:  # noqa: BLE001 — remote OPeNDAP errors are broad
+            logger.warning("  %s: HyCOM OPeNDAP download failed: %s", dataset_key, exc)
+            return None
+
+        subset.to_netcdf(nc_path)
+        return nc_path
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Download HyCOM surface current data.")
+    p.add_argument("--min-lon", type=float, required=True)
+    p.add_argument("--max-lon", type=float, required=True)
+    p.add_argument("--min-lat", type=float, required=True)
+    p.add_argument("--max-lat", type=float, required=True)
+    p.add_argument("--start", required=True, help="Start date/datetime (ISO-8601).")
+    p.add_argument("--end", required=True, help="End date/datetime (ISO-8601, inclusive).")
+    p.add_argument("--output-dir", type=Path, default=None,
+                   help="Output directory (default: data/<timerange>_<bounds>/hycom).")
+    p.add_argument("--dry-run", action="store_true")
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    args = _build_arg_parser().parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+    out_dir = Path(args.output_dir) if args.output_dir else (
+        build_output_dir(args.start, args.end, args.min_lon, args.max_lon,
+                         args.min_lat, args.max_lat) / "hycom"
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dl = HycomDownloader(output_dir=out_dir, dry_run=args.dry_run)
+    dl.download(
+        min_lon=args.min_lon, max_lon=args.max_lon,
+        min_lat=args.min_lat, max_lat=args.max_lat,
+        start=args.start, end=args.end,
+    )
+
+
+if __name__ == "__main__":
+    main()
