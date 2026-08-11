@@ -248,22 +248,27 @@ class HycomDownloader:
         nc_path = self._nc_path_for_segment(dataset_key, seg_start, seg_end)
         urls = self._dodsc_urls(dataset_key, seg_start, seg_end)
 
+        opened: dict[str, xr.Dataset] = {}
         try:
-            opened = {label: xr.open_dataset(url) for label, url in urls.items()}
-            if dataset_key == "espc_d_v02":
-                merged = xr.merge([opened["u"][["water_u"]], opened["v"][["water_v"]]])
-            else:
-                per_year = [opened[label][["water_u", "water_v"]] for label in sorted(opened)]
-                merged = per_year[0] if len(per_year) == 1 else xr.concat(per_year, dim="time")
+            try:
+                for label, url in urls.items():
+                    opened[label] = xr.open_dataset(url)
 
-            subset = merged.sel(
-                time=slice(seg_start, seg_end),
-                lat=slice(south, north),
-                lon=slice(west, east),
-            ).sel(depth=0.0, method="nearest")
-            subset = subset.load()
-            for ds in opened.values():
-                ds.close()
+                if dataset_key == "espc_d_v02":
+                    merged = xr.merge([opened["u"][["water_u"]], opened["v"][["water_v"]]])
+                else:
+                    per_year = [opened[label][["water_u", "water_v"]] for label in sorted(opened)]
+                    merged = per_year[0] if len(per_year) == 1 else xr.concat(per_year, dim="time")
+
+                subset = merged.sel(
+                    time=slice(seg_start, seg_end),
+                    lat=slice(south, north),
+                    lon=slice(west, east),
+                ).sel(depth=0.0, method="nearest")
+                subset = subset.load()
+            finally:
+                for ds in opened.values():
+                    ds.close()
         except Exception as exc:  # noqa: BLE001 — remote OPeNDAP errors are broad
             logger.warning("  %s: HyCOM OPeNDAP download failed: %s", dataset_key, exc)
             return None

@@ -174,3 +174,49 @@ class TestHycomDownloaderDownload:
                 min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
                 start="2018-03-05T00:00:00", end="2018-03-07T00:00:00",
             )
+
+
+class TestDownloadSegmentResourceCleanup:
+    def test_all_opened_datasets_are_closed_when_a_later_step_fails(self, tmp_path, monkeypatch):
+        """A failure in xr.merge (i.e. *after* every open_dataset call has
+        already succeeded) must still close every dataset that was opened
+        -- regression test for the resource leak where close() lived after
+        the risky merge/sel/load statements inside the same try block."""
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import HycomDownloader
+
+        closed = []
+
+        class FakeDataset:
+            def __init__(self, label):
+                self.label = label
+
+            def __getitem__(self, _keys):
+                return self
+
+            def close(self):
+                closed.append(self.label)
+
+        opened_labels = []
+
+        def fake_open_dataset(url, *a, **kw):
+            label = "u" if url.endswith("u3z") else "v"
+            opened_labels.append(label)
+            return FakeDataset(label)
+
+        def fake_merge(_datasets, *a, **kw):
+            raise RuntimeError("simulated merge failure")
+
+        monkeypatch.setattr(xr, "open_dataset", fake_open_dataset)
+        monkeypatch.setattr(xr, "merge", fake_merge)
+
+        dl = HycomDownloader(output_dir=tmp_path)
+        result = dl._download_segment(
+            "espc_d_v02", datetime(2025, 1, 1), datetime(2025, 1, 2),
+            -10.0, 10.0, 40.0, 55.0,
+        )
+
+        assert result is None
+        assert opened_labels == ["u", "v"]
+        assert sorted(closed) == ["u", "v"]
