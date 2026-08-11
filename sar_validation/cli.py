@@ -504,6 +504,10 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
             ValidationDataSource(source_type="scatterometer_hy2b"),
             ValidationDataSource(source_type="scatterometer_hy2c"),
             ValidationDataSource(source_type="scatterometer_oceansat3"),
+            # ERA5 reanalysis (Copernicus CDS) -- tuning comes from
+            # DEFAULT_LAYER_TYPE_SPECS's "era5_wind" entry (recipe.py), no
+            # per-recipe layer_vs_layer override needed.
+            ValidationDataSource(source_type="era5"),
         ],
         collocation=CollocationType(
             point_vs_layer=PointVsLayerCollocation(),
@@ -613,6 +617,10 @@ def _build_waves_config(limit: Optional[int] = None, sar_source: str = "sentinel
             ValidationDataSource(source_type="tidal_gauge"),
             ValidationDataSource(source_type="drifter"),
             ValidationDataSource(source_type="altimeter"),
+            # ERA5 reanalysis (Copernicus CDS) -- tuning comes from
+            # DEFAULT_LAYER_TYPE_SPECS's "era5_waves" entry (recipe.py), no
+            # per-recipe layer_vs_layer override needed.
+            ValidationDataSource(source_type="era5"),
         ],
         collocation=CollocationType(
             point_vs_layer=PointVsLayerCollocation(),
@@ -724,6 +732,10 @@ def _build_soil_moisture_config(limit: Optional[int] = None, sar_source: str = "
                 source_type="cds_ssm",
                 download_kwargs={"product_type": cds_product_type},
             ),
+            # ERA5-Land reanalysis (Copernicus CDS) -- tuning comes from
+            # DEFAULT_LAYER_TYPE_SPECS's "era5_soil_moisture" entry
+            # (recipe.py), no per-recipe layer_vs_layer override needed.
+            ValidationDataSource(source_type="era5"),
         ],
         collocation=CollocationType(
             point_vs_layer=PointVsLayerCollocation(

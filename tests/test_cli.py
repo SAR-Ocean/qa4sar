@@ -808,6 +808,41 @@ class TestExecuteRecipeForcesConvertCollocateWhenDownloadActuallyRan:
         mock_cls.return_value.download_all.assert_not_called()
 
 
+class TestBuildWindConfigEra5:
+    def test_includes_era5_alongside_observational_sources(self):
+        from sar_validation.cli import _build_wind_config
+
+        cfg = _build_wind_config()
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "era5" in source_types
+        # era5 has no download_kwargs/collocation_kwargs of its own here --
+        # ModelLayerCollocation's tuning comes from DEFAULT_LAYER_TYPE_SPECS's
+        # "era5_wind" entry (recipe.py), not a per-recipe override.
+        era5_source = next(s for s in cfg.validation_sources if s.source_type == "era5")
+        assert era5_source.download_kwargs == {}
+
+    def test_radarsat2_also_gets_era5(self):
+        """validation_sources isn't conditioned on sar_source elsewhere in
+        this template (mooring/buoy/etc. are shared by every source) --
+        era5 follows the same pattern."""
+        from sar_validation.cli import _build_wind_config
+
+        cfg = _build_wind_config(sar_source="radarsat2")
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "era5" in source_types
+
+
+class TestBuildWavesConfigEra5:
+    def test_includes_era5_alongside_observational_sources(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config()
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "era5" in source_types
+        era5_source = next(s for s in cfg.validation_sources if s.source_type == "era5")
+        assert era5_source.download_kwargs == {}
+
+
 class TestBuildSoilMoistureConfig:
     def test_recipe_shape(self):
         from sar_validation.cli import _build_soil_moisture_config
@@ -816,7 +851,7 @@ class TestBuildSoilMoistureConfig:
 
         assert cfg.sar_data.source == "sentinel1_clms_ssm"
         source_types = [s.source_type for s in cfg.validation_sources]
-        assert source_types == ["ismn", "ascat_ssm", "amsr_ssm", "smap_ssm", "smos_ssm", "cds_ssm"]
+        assert source_types == ["ismn", "ascat_ssm", "amsr_ssm", "smap_ssm", "smos_ssm", "cds_ssm", "era5"]
         for satellite_source in cfg.validation_sources[1:6]:
             assert satellite_source.download_kwargs == {} or satellite_source.source_type == "cds_ssm"
         # cds_ssm has product_type in download_kwargs
