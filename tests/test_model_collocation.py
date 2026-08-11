@@ -361,6 +361,76 @@ class TestModelValuesAtPoints:
         assert result["u10"][0] == pytest.approx(10.0)
 
 
+class TestModelValuesAtPointsThreeHourlySpacing:
+    """Regression tests for the hyperbolic-interpolation bracket-spacing
+    bug: the pre-fix code hardcoded a 1-hour gap between bracket points in
+    ``t_prime = (t - t2) / 1h``, which is correct for ERA5's genuinely
+    hourly granules but silently WRONG for HyCOM's real 3-hourly cadence
+    (00:00, 03:00, 06:00, ...). These use synthetic data spaced 3 hours
+    apart -- modeling HyCOM's real granule spacing -- and hand-computed
+    expected values, so they fail against the pre-fix hardcoded-1h code
+    (which computes t_prime = 1.0 instead of the correct 1/3) and pass
+    after the fix."""
+
+    def test_hyperbolic_uses_actual_bracket_spacing_not_hardcoded_1h(self):
+        from sar_validation.core.model_collocation import _model_values_at_points
+
+        # 4 granules, 3 hours apart: 00:00, 03:00, 06:00, 09:00. u10 is a
+        # linear ramp (value = hour_index * 10), so the correct
+        # (spacing-aware) hyperbolic result reduces to ordinary linear
+        # interpolation -- hand-checkable independent of the quadratic
+        # formula's curvature term.
+        era5_ds = _make_era5_ds(
+            hours=(
+                "2026-07-12T00:00:00", "2026-07-12T03:00:00",
+                "2026-07-12T06:00:00", "2026-07-12T09:00:00",
+            ),
+        )
+        # Bracket center t2 = 03:00 (value 10.0), forward neighbor 06:00
+        # (value 20.0). Query 1 hour past t2: true fractional position
+        # within the 3-hour gap is 1/3, NOT 1.0 (what hardcoded-1h would
+        # compute). Hand-computed expected value:
+        #   t_prime = 1/3
+        #   a = (20 + 0 - 2*10) / 2 = 0.0
+        #   b = (20 - 0) / 2 = 10.0
+        #   c = 10.0
+        #   expected = a*(1/3)**2 + b*(1/3) + c = 10/3 + 10 = 13.333...
+        times = np.array([np.datetime64("2026-07-12T04:00:00")])
+        result = _model_values_at_points(
+            np.array([-9.0]), np.array([41.0]), times, era5_ds, "hyperbolic",
+        )
+        expected = 0.0 * (1 / 3) ** 2 + 10.0 * (1 / 3) + 10.0
+        assert expected == pytest.approx(13.333333, abs=1e-4)
+        assert result["u10"][0] == pytest.approx(expected, abs=1e-6)
+        # The pre-fix hardcoded-1h bug would instead compute t_prime=1.0,
+        # landing exactly on val3 (20.0) -- explicitly guard against that
+        # wrong answer resurfacing.
+        assert result["u10"][0] != pytest.approx(20.0, abs=1e-6)
+
+    def test_irregular_bracket_spacing_is_nan_not_a_fabricated_value(self):
+        """When the backward and forward gaps around the bracket center
+        differ (a genuinely irregular cadence -- e.g. around a real HyCOM
+        data gap), the quadratic formula's equal-spacing assumption no
+        longer holds for a single shared unit. Fabricating an answer using
+        either gap would be silently wrong, so this must come back NaN
+        (with a debug-level log, not a crash) rather than guessing."""
+        from sar_validation.core.model_collocation import _model_values_at_points
+
+        # Backward gap (03:00 -> 00:00) = 3h, forward gap (07:00 -> 03:00)
+        # = 4h -- irregular.
+        era5_ds = _make_era5_ds(
+            hours=(
+                "2026-07-12T00:00:00", "2026-07-12T03:00:00",
+                "2026-07-12T07:00:00", "2026-07-12T10:00:00",
+            ),
+        )
+        times = np.array([np.datetime64("2026-07-12T04:00:00")])
+        result = _model_values_at_points(
+            np.array([-9.0]), np.array([41.0]), times, era5_ds, "hyperbolic",
+        )
+        assert np.isnan(result["u10"][0])
+
+
 class TestModelLayerCollocationIndividualGrid:
     def test_produces_one_match_per_valid_sar_pixel(self):
         from sar_validation.core.model_collocation import ModelLayerCollocation
@@ -668,6 +738,71 @@ class TestModelLayerCollocationCellAveraging:
             assert "WSPD" in r.val_data and "WDIR" in r.val_data
             assert "u10" not in r.val_data and "v10" not in r.val_data
             assert 0.0 <= r.val_data["WDIR"] < 360.0
+
+
+class TestModelLayerCollocationCellAveragingThreeHourlySpacing:
+    """Cell-averaging-path counterpart to
+    TestModelValuesAtPointsThreeHourlySpacing -- same bracket-spacing bug,
+    same fix, exercised through ``_collocate_cell_averaging_grid`` instead
+    of ``_model_values_at_points`` (its ``t_prime`` is computed
+    independently, at a different call site)."""
+
+    def test_hyperbolic_uses_actual_bracket_spacing_not_hardcoded_1h(self):
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_ds(
+            n_lat=2, n_lon=2,
+            hours=(
+                "2026-07-12T00:00:00", "2026-07-12T03:00:00",
+                "2026-07-12T06:00:00", "2026-07-12T09:00:00",
+            ),
+        )
+        lat_pix = np.linspace(39.8, 42.2, 10)
+        lon_pix = np.linspace(-10.2, -7.8, 10)
+        sar_lon, sar_lat = np.meshgrid(lon_pix, lat_pix)
+        # Same 1-hour-past-t2 query as the _model_values_at_points version.
+        sar_time = np.array([np.datetime64("2026-07-12T04:00:00")])
+        sar_data = {"owiWindSpeed": np.full((1, 10, 10), 7.5)}
+
+        colloc = ModelLayerCollocation(
+            method="cell-averaging", temporal_method="hyperbolic",
+            aggregation_window_km=60.0, distance_weighting="equal",
+        )
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            era5_ds=era5_ds, val_source="hycom", sar_scene_name="scene1",
+        )
+        assert len(results) == 4
+        expected = 0.0 * (1 / 3) ** 2 + 10.0 * (1 / 3) + 10.0
+        for r in results:
+            assert r.val_data["u10"] == pytest.approx(expected, abs=1e-6)
+            assert r.val_data["u10"] != pytest.approx(20.0, abs=1e-6)
+
+    def test_irregular_bracket_spacing_skips_pass_not_fabricated_value(self):
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_ds(
+            n_lat=2, n_lon=2,
+            hours=(
+                "2026-07-12T00:00:00", "2026-07-12T03:00:00",
+                "2026-07-12T07:00:00", "2026-07-12T10:00:00",
+            ),
+        )
+        lat_pix = np.linspace(39.8, 42.2, 10)
+        lon_pix = np.linspace(-10.2, -7.8, 10)
+        sar_lon, sar_lat = np.meshgrid(lon_pix, lat_pix)
+        sar_time = np.array([np.datetime64("2026-07-12T04:00:00")])
+        sar_data = {"owiWindSpeed": np.full((1, 10, 10), 7.5)}
+
+        colloc = ModelLayerCollocation(
+            method="cell-averaging", temporal_method="hyperbolic",
+            aggregation_window_km=60.0, distance_weighting="equal",
+        )
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            era5_ds=era5_ds, val_source="hycom", sar_scene_name="scene1",
+        )
+        assert results == []
 
 
 class TestAntimeridianLonHelpers:
