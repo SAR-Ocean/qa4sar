@@ -67,6 +67,20 @@ _HYCOM_CUTOVER_DATE = datetime(2024, 8, 10)
 #: extrapolate at a SAR scene's edges -- one native grid cell (1/12 deg).
 _GRID_PAD_DEG = 1.0 / 12.0
 
+#: Live-verified 2026-08-11: both real HyCOM THREDDS datasets (GOFS 3.1
+#: expt_93.0 and ESPC-D-V02) carry a ``tau`` (forecast lead-time) data
+#: variable whose ``units`` attribute is the CF-noncompliant string
+#: "hours since analysis" -- "analysis" is not a parseable reference
+#: date, so xarray's default ``decode_times=True`` raises
+#: "unable to decode time units 'hours since analysis'" on a plain
+#: ``xr.open_dataset(url)``, breaking every real network call this
+#: downloader makes (dry-run probe and actual download alike). This was
+#: never caught by the mocked unit tests since they never exercise real
+#: CF decoding. ``tau`` is never consumed downstream (only
+#: water_u/water_v/time/lat/lon/depth are used), so it's simplest to
+#: exclude it from the open entirely rather than special-case its decode.
+_DROP_VARS = ["tau"]
+
 
 def _resolve_hycom_segments(
     window_start: datetime, window_end: datetime,
@@ -214,7 +228,7 @@ class HycomDownloader:
 
         for label, url in self._dodsc_urls(dataset_key, seg_start, seg_end).items():
             try:
-                remote = xr.open_dataset(url)
+                remote = xr.open_dataset(url, drop_variables=_DROP_VARS)
             except Exception as exc:  # noqa: BLE001 — remote OPeNDAP errors are broad
                 logger.warning("  [dry-run] %s (%s): could not open %s: %s", dataset_key, label, url, exc)
                 continue
@@ -252,7 +266,7 @@ class HycomDownloader:
         try:
             try:
                 for label, url in urls.items():
-                    opened[label] = xr.open_dataset(url)
+                    opened[label] = xr.open_dataset(url, drop_variables=_DROP_VARS)
 
                 if dataset_key == "espc_d_v02":
                     merged = xr.merge([opened["u"][["water_u"]], opened["v"][["water_v"]]])

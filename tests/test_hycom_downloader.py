@@ -176,6 +176,99 @@ class TestHycomDownloaderDownload:
             )
 
 
+class TestTauVariableDropped:
+    """Live-verified 2026-08-11: both real HyCOM THREDDS datasets
+    (GLBy0.08/expt_93.0 and ESPC-D-V02) carry a ``tau`` (forecast
+    lead-time) data variable with a CF-noncompliant ``units`` attribute of
+    ``"hours since analysis"`` -- "analysis" is not a parseable reference
+    date, so xarray's default ``decode_times=True`` blows up on
+    ``xr.open_dataset(url)`` with "unable to decode time units 'hours
+    since analysis'". This broke every real network call (dry-run probe
+    AND actual download) even though the mocked unit tests above never
+    exercised real CF decoding and so never caught it. ``tau`` is never
+    consumed anywhere downstream (only ``water_u``/``water_v``/``time``/
+    ``lat``/``lon``/``depth`` are used) -- it must be excluded via
+    ``drop_variables`` before xarray attempts CF decoding."""
+
+    def test_probe_coverage_drops_tau_variable(self, tmp_path, monkeypatch):
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import HycomDownloader
+
+        calls = []
+
+        class FakeLazyDataset:
+            def __init__(self):
+                self.time = xr.DataArray(
+                    pd.date_range("2025-01-01", periods=4, freq="3h"), dims="time",
+                )
+
+            def close(self):
+                pass
+
+        def fake_open_dataset(url, *a, **kw):
+            calls.append(kw)
+            return FakeLazyDataset()
+
+        monkeypatch.setattr(xr, "open_dataset", fake_open_dataset)
+
+        dl = HycomDownloader(output_dir=tmp_path, dry_run=True)
+        dl.download(
+            min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+            start="2025-01-01T00:00:00", end="2025-01-01T06:00:00",
+        )
+        assert len(calls) == 2  # u3z and v3z, ESPC-D-V02
+        for kw in calls:
+            assert "tau" in kw.get("drop_variables", ()), (
+                "xr.open_dataset must drop_variables=['tau'] -- the real "
+                "HyCOM datasets' tau variable has units='hours since "
+                "analysis', which is not CF-decodable and breaks the "
+                "default decode_times=True open."
+            )
+
+    def test_download_segment_drops_tau_variable(self, tmp_path, monkeypatch):
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import HycomDownloader
+
+        calls = []
+
+        class FakeDataset:
+            def __getitem__(self, _keys):
+                return self
+
+            def close(self):
+                pass
+
+        def fake_open_dataset(url, *a, **kw):
+            calls.append(kw)
+            return FakeDataset()
+
+        def fake_merge(_datasets, *a, **kw):
+            return FakeDataset()
+
+        monkeypatch.setattr(xr, "open_dataset", fake_open_dataset)
+        monkeypatch.setattr(xr, "merge", fake_merge)
+
+        dl = HycomDownloader(output_dir=tmp_path)
+        # sel()/load()/to_netcdf() chain on FakeDataset — stub minimally.
+        FakeDataset.sel = lambda self, *a, **kw: self
+        FakeDataset.load = lambda self: self
+        FakeDataset.to_netcdf = lambda self, path: None
+
+        dl._download_segment(
+            "espc_d_v02", datetime(2025, 1, 1), datetime(2025, 1, 2),
+            -10.0, 10.0, 40.0, 55.0,
+        )
+        assert len(calls) == 2  # u3z and v3z
+        for kw in calls:
+            assert "tau" in kw.get("drop_variables", ()), (
+                "xr.open_dataset must drop_variables=['tau'] -- same real "
+                "decode bug as the dry-run probe path."
+            )
+
+
 class TestDownloadSegmentResourceCleanup:
     def test_all_opened_datasets_are_closed_when_a_later_step_fails(self, tmp_path, monkeypatch):
         """A failure in xr.merge (i.e. *after* every open_dataset call has
