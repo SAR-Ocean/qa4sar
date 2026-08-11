@@ -1988,6 +1988,87 @@ class DataTreeConverter:
         return ds
 
     @staticmethod
+    def from_hycom(
+        nc_paths: Union[str, Path, Sequence[Union[str, Path]]],
+    ) -> Optional[xr.Dataset]:
+        """
+        Open one or more HyCOM segment NetCDF files (as downloaded by
+        :class:`~sar_validation.downloaders.hycom_downloader.HycomDownloader`)
+        and return one combined, GRIDDED Dataset (dims: ``time``, ``lat``,
+        ``lon``) covering every requested segment.
+
+        Unlike every other validation-source converter (except
+        :meth:`from_era5`), the result is NOT flattened to a ``point``
+        dimension -- ``ModelLayerCollocation`` interpolates this grid
+        directly onto SAR pixel/point locations at collocation time.
+
+        ``water_u``/``water_v`` are renamed to ``EWCT``/``NSCT`` here (not
+        left raw, unlike ERA5 wind's ``u10``/``v10``) -- these are just
+        renamed vector components, not a derived circular quantity, so
+        renaming at conversion time is safe. This matches
+        ``from_hf_radar_grid``'s existing ``water_u``/``water_v`` ->
+        ``EWCT``/``NSCT`` convention.
+
+        Parameters
+        ----------
+        nc_paths : Path or list of Path
+            One or more HyCOM segment NetCDF files. Multiple files (e.g.
+            a recipe window straddling the ESPC-D-V02/GOFS 3.1 cutover)
+            are concatenated along ``time``.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type``/``platform_type`` set to
+            ``"hycom"``, or None on failure.
+        """
+        paths = [Path(p) for p in ([nc_paths] if isinstance(nc_paths, (str, Path)) else nc_paths)]
+        existing = sorted(p for p in paths if p.exists())
+        if not existing:
+            logger.warning("from_hycom: no files found among %s", paths)
+            return None
+
+        try:
+            per_file = [xr.open_dataset(p) for p in existing]
+            raw = per_file[0] if len(per_file) == 1 else xr.concat(per_file, dim="time")
+            raw = raw.load()
+            for d in per_file:
+                d.close()
+        except Exception as exc:
+            logger.warning("Could not open HyCOM file(s) %s: %s", paths, exc)
+            return None
+
+        missing = [v for v in ("water_u", "water_v") if v not in raw.variables]
+        if missing:
+            logger.warning(
+                "from_hycom: missing variable(s) %s in %s (available: %s).",
+                missing, paths, list(raw.variables),
+            )
+            raw.close()
+            return None
+
+        ewct = raw["water_u"].astype("float32")
+        ewct.attrs.update({
+            "units": "m s-1", "standard_name": "eastward_sea_water_velocity",
+            "long_name": "HyCOM eastward sea water velocity (surface)",
+        })
+        nsct = raw["water_v"].astype("float32")
+        nsct.attrs.update({
+            "units": "m s-1", "standard_name": "northward_sea_water_velocity",
+            "long_name": "HyCOM northward sea water velocity (surface)",
+        })
+
+        ds = xr.Dataset(
+            {"EWCT": ewct, "NSCT": nsct},
+            coords={"time": raw["time"], "lat": raw["lat"], "lon": raw["lon"]},
+        )
+        ds.attrs["data_type"] = "hycom"
+        ds.attrs["platform_type"] = "hycom"
+        ds.attrs["source"] = "HyCOM ocean model (surface currents)"
+        raw.close()
+        return ds
+
+    @staticmethod
     def from_era5(
         nc_paths: Union[str, Path, Sequence[Union[str, Path]]],
         variable: str,
@@ -3611,6 +3692,7 @@ class DataTreeConverter:
         - ``cds_ssm/*.nc``              → ``validation/cds_ssm/<stem>`` nodes
         - ``altimeter/*.nc``           → ``validation/altimeter/<stem>`` nodes
         - ``era5/*.nc``                 → single combined, GRIDDED ``validation/era5/era5`` node
+        - ``hycom/*.nc``                → single combined, GRIDDED ``validation/hycom/hycom`` node
 
         Parameters
         ----------
@@ -3957,6 +4039,21 @@ class DataTreeConverter:
                 if ds is not None:
                     datasets["validation/era5/era5"] = ds
                     logger.info("Converted ERA5 (%s): %d file(s)", era5_variable, len(era5_files))
+
+        # HyCOM ocean model -- kept as a single combined, GRIDDED node
+        # (not flattened to `point`), same rationale as ERA5. Only
+        # relevant for currents recipes -- HyCOM has no wind/wave/soil-
+        # moisture variable. Not passed through _filtered() -- that
+        # helper assumes a `point` dimension.
+        subdir = base_dir / "hycom"
+        if subdir.exists():
+            hycom_variable = recipe.config.variable if recipe is not None else None
+            hycom_files = sorted(subdir.glob("hycom_*.nc")) if hycom_variable == "currents" else []
+            if hycom_files:
+                ds = DataTreeConverter.from_hycom(hycom_files)
+                if ds is not None:
+                    datasets["validation/hycom/hycom"] = ds
+                    logger.info("Converted HyCOM: %d file(s)", len(hycom_files))
 
         if not datasets:
             logger.warning("No convertible data found in %s", base_dir)
