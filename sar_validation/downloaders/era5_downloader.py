@@ -294,10 +294,14 @@ class ERA5Downloader:
         request = self._build_request(day, hours, min_lon, max_lon, min_lat, max_lat)
         dataset = _CDS_DATASET_BY_VARIABLE[self.variable]
 
-        logger.info(
-            "  %s (window %s): requesting CDS %s (%s) ...",
-            day.isoformat(), window_idx, dataset, self.variable,
-        )
+        # print(), not just logger.info(): the CDS request below can take a
+        # long time and the CLI's root logger defaults to WARNING (cli.py),
+        # so an INFO-only message here would leave the terminal silent --
+        # every other downloader (scatterometer_ftp_downloader,
+        # altimeter_downloader, smos_downloader, ...) announces its fetch
+        # via print() for the same reason.
+        window_suffix = f" (window {window_idx})" if window_idx is not None else ""
+        print(f"  Downloading ERA5 {self.variable} for {day.isoformat()}{window_suffix} …")
         try:
             client = cdsapi.Client(quiet=True)
             client.retrieve(dataset, request).download(str(nc_path))

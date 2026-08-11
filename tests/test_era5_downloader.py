@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import sys
 from datetime import date, datetime
+from unittest.mock import MagicMock, patch
 
 
 class TestHoursNeededForDay:
@@ -288,3 +290,29 @@ class TestERA5DownloaderAntimeridian:
         # West window touches -180 exactly.
         area = dl._build_area(min_lon=-180.0, max_lon=-170.0, min_lat=40.0, max_lat=55.0)
         assert area == [55.25, -180.0, 39.75, -169.75]
+
+
+class TestERA5DownloaderRealDownloadPrintsProgress:
+    """A real (non-dry-run) download must print a progress message to the
+    terminal, matching every other downloader (scatterometer_ftp_downloader,
+    altimeter_downloader, smos_downloader, ...), each of which announces its
+    fetch via ``print(...)`` rather than ``logger.info(...)`` alone -- the
+    CLI's root logger defaults to WARNING (see cli.py's
+    ``logging.basicConfig(level=logging.WARNING, ...)``), so an INFO-only
+    message is invisible in a normal (non ``--verbose``) run and a user
+    watching the terminal sees nothing happen during the CDS request, which
+    can take a long time."""
+
+    def test_download_day_prints_progress_message(self, tmp_path, capsys):
+        from sar_validation.downloaders.era5_downloader import ERA5Downloader
+
+        dl = ERA5Downloader(variable="wind", output_dir=tmp_path)
+        fake_client = MagicMock()
+        with patch.dict(sys.modules, {"cdsapi": MagicMock(Client=MagicMock(return_value=fake_client))}):
+            dl._download_day(date(2026, 7, 12), [18, 19, 20], -10.0, 10.0, 40.0, 55.0)
+
+        captured = capsys.readouterr().out
+        assert "Downloading" in captured
+        assert "ERA5" in captured
+        assert "wind" in captured
+        assert "2026-07-12" in captured
