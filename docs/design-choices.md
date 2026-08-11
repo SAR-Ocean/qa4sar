@@ -1596,6 +1596,66 @@ both raised directly against real report output:
 > Code: `core/visualization.py` (`_draw_scene_panel`'s SAR-field scatter
 > and validation-point scatter calls).
 
+### 9.5 hycom's (and era5_soil_moisture's) canonical marker were literally invisible
+
+`_SOURCE_MARKERS`/`_SOURCE_COLORS` assign each `_CANONICAL_SOURCE_ORDER`
+entry a fixed `(color, marker)` pair by list position (§9.1's sibling
+mechanism — see those lists' own module comments for the append-only
+rule). matplotlib's *filled* marker set
+(`matplotlib.markers.MarkerStyle.filled_markers`) has exactly 15 distinct
+shapes, all claimed by the first 15 entries, so both `era5_soil_moisture`
+(16th) and `hycom` (17th, the last entry) originally fell back to unfilled
+(stroke-only) markers — `"+"` and `"x"` respectively.
+
+That's fine wherever a caller lets matplotlib pick a default line width,
+but `plot_collocation_diagnostics`'s non-waves matched-point tiers
+(Tier 3/4) explicitly pass `linewidths=0.0` (§9.1: dense sources like
+ASCAT/SMAP/SMOS need a lower fixed alpha instead of an outline). An
+unfilled marker's entire visible representation *is* its stroke — with
+zero line width, both sources' real, correctly-positioned,
+correctly-colored matched points rendered as literally zero visible
+pixels. `era5_wind`/`era5_waves` (indices 13/14, markers `"H"`/`"d"`)
+never hit this, since both are filled shapes.
+
+Confirmed live 2026-08-11 for `hycom` against `recipes/
+currents_useastcoast.yaml` (2538 hycom matches): the diagnostics plot
+showed a legend entry and count for "Hycom matched (2538)" with nothing
+actually visible anywhere on the map or in the legend swatch. (The
+identical `era5_soil_moisture` case was independently caught and fixed
+the same day on a sibling branch, against `recipes/soil_moisture_era5.
+yaml`/`recipes/soil_moisture_nisar_era5_2.yaml`; that branch's fix
+predates this branch's divergence, so this branch still carried the
+original unfilled `"+"` until it was ported over alongside the `hycom`
+fix below, to keep the new regression test — see below — passing here.)
+
+Fix: `hycom`'s marker slot now reuses `"H"` (era5_wind's shape, index 13)
+instead of `"x"`. Unlike `era5_soil_moisture`'s reuse of hf_radar's `"v"`
+(safe because the two are *conventionally* never used together — one is
+currents-only, the other soil_moisture-only), `hycom`'s reuse of an
+era5-family marker rests on a *stronger, code-enforced* guarantee:
+`Recipe._from_dict` (`core/recipe.py`) raises `ValueError` for a `hycom`
+source on any non-`currents` recipe, and separately for an `era5` source
+on any `currents` recipe — so `hycom` and `era5_wind` can never both
+appear in one *valid* recipe, let alone one report, not merely by
+convention. `era5_soil_moisture`'s marker slot now reuses `"v"` (ported
+from the sibling branch's identical fix), distinguished from `hycom` by
+each keeping its own unique color regardless of the shared shapes.
+
+Separately: `era5_soil_moisture`'s color (`"#dcbeff"`, pale lavender) was
+also ported from the sibling branch's fix — hard to pick out against a
+light land/ocean background at soil_moisture's reduced matched-layer
+alpha — changed to a bolder `"#800080"`. `hycom`'s own color (`"#bcf60c"`,
+lime) was checked independently against the same live
+`currents_useastcoast.yaml` plot and reads clearly at currents' full
+`alpha=1.0` Tier 3 opacity, so it was left unchanged.
+
+A regression test (`test_every_source_marker_is_filled`, in
+`TestHycomCanonicalSourceOrder`) asserts every `_SOURCE_MARKERS` entry is
+one of matplotlib's filled markers, so this can't recur silently for a
+future source appended to the canonical order.
+
+> Code: `core/visualization.py` (`_SOURCE_MARKERS`, `_SOURCE_COLORS`).
+
 ## 10. RADARSAT-2 (NOAA NCEI): a second SAR source, selected per recipe
 
 A second SAR-side source for `wind` recipes, alongside Sentinel-1

@@ -6808,3 +6808,23 @@ class TestHycomCanonicalSourceOrder:
 
         assert len(_SOURCE_COLORS) >= len(_CANONICAL_SOURCE_ORDER)
         assert len(_SOURCE_MARKERS) >= len(_CANONICAL_SOURCE_ORDER)
+
+    def test_every_source_marker_is_filled(self):
+        """An unfilled/stroke-only marker (e.g. "+", "x", "1"-"4", "|",
+        "_") renders via linewidth, not facecolor -- several call sites
+        (e.g. plot_collocation_diagnostics' non-waves matched-point
+        tiers) explicitly pass linewidths=0, which makes an unfilled
+        marker's matched points literally invisible regardless of color/
+        alpha/position. Confirmed live 2026-08-11: hycom's "x" slot made
+        2538 real, correctly-positioned matched points render as zero
+        visible pixels on currents_useastcoast.yaml's diagnostics plot.
+        Every _SOURCE_MARKERS entry must stay one of matplotlib's filled
+        markers so this can't recur for a future source appended to
+        _CANONICAL_SOURCE_ORDER."""
+        from matplotlib.markers import MarkerStyle
+
+        from sar_validation.core.visualization import _SOURCE_MARKERS
+
+        filled = set(MarkerStyle.filled_markers)
+        not_filled = [m for m in _SOURCE_MARKERS if m not in filled]
+        assert not not_filled, f"unfilled marker(s) in _SOURCE_MARKERS: {not_filled}"

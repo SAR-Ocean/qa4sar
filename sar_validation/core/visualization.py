@@ -127,28 +127,78 @@ __all__ = [
 # distinguish against plot_collocation_diagnostics' mid-gray (#808080)
 # "unmatched" pattern once small marker sizes/anti-aliasing softened it.
 #
-# The three entries before last (olive/cyan/lavender) were appended for
+# The three entries before last (olive/cyan/purple) were appended for
 # era5_wind/era5_waves/era5_soil_moisture joining _CANONICAL_SOURCE_ORDER,
-# and the final entry (lime, "x" marker) for hycom -- same append-only
-# rule applies here as there, to avoid the exact wrap collision this
-# comment already warns about.
+# and the final entry (lime) for hycom -- same append-only rule applies
+# here as there, to avoid the exact wrap collision this comment already
+# warns about.
+#
+# era5_soil_moisture's slot was originally the pale lavender "#dcbeff" --
+# changed to the bolder "#800080" because that pale lavender was hard to
+# pick out against a light land/ocean background at the reduced alpha/
+# marker size soil_moisture's matched-layer tier uses (see
+# matched_layer_alpha in _plot_collocation_diagnostics_impl); ported from
+# the identical, already live-verified fix on a sibling branch (see
+# _SOURCE_MARKERS below) rather than re-verified independently here.
+#
+# hycom's lime color was live-verified 2026-08-11 against a real
+# currents_useastcoast.yaml diagnostics plot (2538 matches, full
+# alpha=1.0 for currents' Tier 3 layer matches) and reads clearly against
+# both the ocean background and the dense blue in-situ layer next to it,
+# so it did not need changing -- only its marker shape was the problem
+# (see _SOURCE_MARKERS below).
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#469990",
     "#f032e6", "#e6194b", "#000080", "#ffff00",
     "#00ff00",
-    "#808000", "#42d4f4", "#dcbeff",
+    "#808000", "#42d4f4", "#800080",
     "#bcf60c",
 ]
 
 # Marker shapes paired 1:1 with _SOURCE_COLORS by index, used wherever
 # validation sources need to stay identifiable independently of color (e.g.
 # when color is taken by a continuous value like wind speed or temporal
-# offset instead of by source).
+# offset instead of by source). Every entry must be one of matplotlib's
+# *filled* markers (matplotlib.markers.MarkerStyle.filled_markers) -- an
+# unfilled/stroke-only marker (e.g. "+", "x", "1"-"4", "|", "_") renders
+# via linewidth, not facecolor, and several call sites (e.g.
+# plot_collocation_diagnostics' non-waves matched-point tiers) explicitly
+# pass linewidths=0 -- confirmed live: an unfilled marker's matched points
+# render as literally zero visible pixels regardless of how correct their
+# position/color is. matplotlib's filled-marker set has exactly 15
+# distinct shapes, already all in use by the first 15 slots below, so the
+# last two slots must each reuse an earlier shape:
+#
+# - era5_soil_moisture's slot (16th) was "+" -- reused "v" (hf_radar's
+#   shape, index 4) instead. hf_radar is currents-only and
+#   era5_soil_moisture is soil_moisture-only, so the two can never appear
+#   in the same report despite sharing a shape; distinguished regardless
+#   by each keeping its own unique color. Ported from the identical,
+#   already live-verified fix on a sibling branch (that branch's fix
+#   predates this one's divergence, so this branch still had the original
+#   unfilled "+" until now).
+# - hycom's slot (17th, the final entry) was "x" -- reused "H" (era5_wind's
+#   shape, index 13) instead (confirmed live 2026-08-11: hycom's 2538
+#   real, correctly-positioned, correctly-colored matched points on
+#   currents_useastcoast.yaml's diagnostics plot rendered as zero visible
+#   pixels with "x"). This reuse is on an even stronger footing than
+#   era5_soil_moisture/hf_radar's (which relies on the two conventionally
+#   never being used together): hycom and every era5_* source are
+#   mutually exclusive by CODE, not just convention -- Recipe._from_dict
+#   (core/recipe.py) raises ValueError for a "hycom" source on any
+#   non-currents recipe, and separately for an "era5" source on any
+#   currents recipe, so hycom and era5_wind can never both appear in one
+#   valid recipe, let alone one report.
+#
+# test_every_source_marker_is_filled (tests/test_visualization.py) is a
+# regression test asserting every entry below is one of matplotlib's
+# filled markers, so this can't recur silently for a future source
+# appended to _CANONICAL_SOURCE_ORDER.
 _SOURCE_MARKERS = [
     "o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<", ">",
-    "H", "d", "+",
-    "x",
+    "H", "d", "v",
+    "H",
 ]
 
 # Fixed, append-only reference order for known validation source/platform
