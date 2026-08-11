@@ -205,7 +205,7 @@ class TestPlotScatter:
 
         from sar_validation.core.statistics import _circular_corrcoef_deg
 
-        sar_deg = np.array([10.0, 90.0, 180.0, 270.0, 359.0])
+        sar_deg = np.array([10, 50, 80, 110, 130, 180, 230, 270, 310, 359])
         val_deg = (sar_deg + 2.0) % 360.0
         n = len(sar_deg)
         ds = xr.Dataset({
