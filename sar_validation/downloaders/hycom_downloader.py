@@ -44,9 +44,12 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .base import build_output_dir, normalize_datetime
+
+if TYPE_CHECKING:
+    import xarray as xr
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +115,68 @@ def _resolve_hycom_segments(
         ("gofs31_930", start, _HYCOM_CUTOVER_DATE),
         ("espc_d_v02", _HYCOM_CUTOVER_DATE, window_end),
     ]
+
+
+def _select_hycom_lon_window(
+    merged: "xr.Dataset", west: float, east: float, time_lat_sel: dict,
+) -> "xr.Dataset":
+    """
+    Select *merged*'s ``lon``/``time``/``lat`` window, converting *west*/
+    *east* (this toolbox's standard -180..180 convention, already padded
+    by :data:`_GRID_PAD_DEG`) into HyCOM's REAL native 0-360 ``lon``
+    convention first.
+
+    Live-confirmed 2026-08-11: both real HyCOM THREDDS datasets
+    (``ESPC-D-V02`` and ``GLBy0.08/expt_93.0``) carry a ``lon`` coordinate
+    ranging 0.0 .. 359.92, NOT -180..180. Selecting directly with the raw
+    (possibly negative) recipe bounds against that axis either matches
+    NOTHING (a bbox fully in the negative range, e.g. US East Coast --
+    silent zero-length ``lon`` dimension) or silently drops part of the
+    intended coverage (a bbox straddling 0 deg longitude).
+
+    *west*/*east* are converted via Python's ``%`` operator, which
+    returns a non-negative result for a positive divisor (e.g.
+    ``-77.08 % 360 == 282.92``).
+
+    Two cases:
+
+    - Non-wrapping (``west_360 <= east_360``, the common case, e.g. US
+      East Coast: 282.92 <= 292.08): a single ``.sel(lon=slice(...))``
+      works correctly against the native axis.
+    - Wrapping (``west_360 > east_360``, e.g. a bbox straddling 0 deg,
+      like -10..10 -> 350..10): the target range spans HyCOM's own
+      0/360 seam. Select two segments -- ``[west_360, 360]`` and
+      ``[0, east_360]`` -- and shift the SECOND segment's ``lon``
+      coordinate by +360 before concatenating, so the combined axis
+      stays monotonically increasing (e.g. 350...359.92, then
+      360...370.08, never wrapping back down to 0). This mirrors
+      ``DataTreeConverter._stitch_antimeridian_window_files``'s existing
+      ERA5 antimeridian handling (see ``datatree_converter.py``), just
+      triggered by a different root condition -- a globally 0-360-native
+      dataset, not an explicitly antimeridian-crossing recipe bbox.
+
+    After either case, the EXISTING ``_normalize_query_lon`` machinery in
+    ``model_collocation.py`` (which already shifts negative SAR-pixel
+    query longitudes by +360 whenever the grid's ``lon`` axis extends
+    past 180) correctly interpolates against the resulting axis with no
+    further changes needed there -- ``from_hycom`` passes the downloaded
+    ``lon`` coordinate through unchanged, so this function's native-
+    convention axis (possibly extending past 360 in the wrapping case)
+    is exactly what ``model_collocation._model_values_at_points`` sees.
+    """
+    import xarray as xr
+
+    west_360 = west % 360.0
+    east_360 = east % 360.0
+
+    if west_360 <= east_360:
+        return merged.sel(lon=slice(west_360, east_360), **time_lat_sel)
+
+    seg_a = merged.sel(lon=slice(west_360, 360.0), **time_lat_sel)
+    seg_b = merged.sel(lon=slice(0.0, east_360), **time_lat_sel)
+    seg_b = seg_b.assign_coords(lon=seg_b["lon"] + 360.0)
+    combined = xr.concat([seg_a, seg_b], dim="lon")
+    return combined.drop_duplicates("lon", keep="first")
 
 
 class HycomDownloader:
@@ -222,7 +287,14 @@ class HycomDownloader:
         """Lazily open each URL for this segment and report which
         requested days actually have granules in the live dataset's
         ``time`` coordinate -- no full u/v grid load. Analogous to
-        ``noaa_hfradar_thredds_downloader.py``'s ``catalog.xml`` probe."""
+        ``noaa_hfradar_thredds_downloader.py``'s ``catalog.xml`` probe.
+
+        Takes no ``lon``/``lat`` bounds and does no spatial filtering at
+        all (only ``remote.time.values`` is read) -- unlike
+        :func:`_select_hycom_lon_window`'s 0-360-conversion fix in
+        :meth:`_download_segment`, there is nothing here that needs the
+        same conversion; this was traced, not assumed.
+        """
         import numpy as np
         import xarray as xr
 
@@ -274,11 +346,9 @@ class HycomDownloader:
                     per_year = [opened[label][["water_u", "water_v"]] for label in sorted(opened)]
                     merged = per_year[0] if len(per_year) == 1 else xr.concat(per_year, dim="time")
 
-                subset = merged.sel(
-                    time=slice(seg_start, seg_end),
-                    lat=slice(south, north),
-                    lon=slice(west, east),
-                ).sel(depth=0.0, method="nearest")
+                time_lat_sel = {"time": slice(seg_start, seg_end), "lat": slice(south, north)}
+                subset = _select_hycom_lon_window(merged, west, east, time_lat_sel)
+                subset = subset.sel(depth=0.0, method="nearest")
                 subset = subset.load()
             finally:
                 for ds in opened.values():

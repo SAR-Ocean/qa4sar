@@ -269,6 +269,227 @@ class TestTauVariableDropped:
             )
 
 
+class TestDownloadSegmentLonConvention:
+    """
+    Live-confirmed 2026-08-11: HyCOM's REAL ``lon`` coordinate axis (both
+    ``ESPC-D-V02`` and ``GLBy0.08/expt_93.0``) uses the 0-360 convention
+    (0.0 .. 359.92), not this toolbox's standard -180..180 convention that
+    every recipe bbox uses. ``_download_segment`` used to build ``west``/
+    ``east`` directly from the (possibly negative) recipe bbox and
+    ``.sel(lon=slice(west, east))`` against that native axis -- for any
+    bbox with negative bounds (most of the Americas, Atlantic Europe,
+    etc.) this matched nothing (zero-length ``lon`` axis, no error) or
+    silently dropped part of the intended coverage (bbox straddling 0 deg).
+
+    Unlike the ``FakeDataset``/``FakeLazyDataset`` stubs used elsewhere in
+    this file (whose ``.sel()`` is a no-op passthrough or absent
+    entirely), these tests build REAL ``xr.Dataset`` objects with a
+    genuine global 0-360 ``lon`` axis and only monkeypatch
+    ``xr.open_dataset`` to serve them in place of the network call --
+    real ``xr.merge``/``.sel``/``.load``/``.to_netcdf`` all run for real,
+    so a wrong longitude conversion actually shows up as wrong/missing
+    data, exactly the class of bug that the old fully-stubbed tests could
+    never have caught.
+    """
+
+    #: 0.5-degree global lon axis, 0.0 .. 359.5 -- coarse enough to keep
+    #: these tests fast, fine-grained enough to assert real coverage
+    #: bounds and cell-level correctness.
+    _LON_STEP = 0.5
+
+    @classmethod
+    def _make_component_dataset(cls, var_name: str, seg_start):
+        """One real in-memory ``xr.Dataset`` mimicking a single HyCOM
+        component file (e.g. ESPC-D-V02's ``u3z``): a genuine global
+        0-360 ``lon`` axis, a small ``lat`` range covering every bbox
+        used below, two ``depth`` levels, two ``time`` steps straddling
+        *seg_start*. The data pattern is simply ``value == lon`` at every
+        point -- lets assertions verify not just "non-empty" but exactly
+        which cells were selected."""
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        lon = np.round(np.arange(0.0, 360.0, cls._LON_STEP), 4)
+        lat = np.round(np.arange(20.0, 70.0, 0.5), 4)
+        depth = np.array([0.0, 10.0])
+        time = pd.date_range(seg_start, periods=2, freq="3h")
+
+        arr = np.broadcast_to(
+            lon[None, None, None, :],
+            (len(time), len(depth), len(lat), len(lon)),
+        ).astype("float64").copy()
+
+        return xr.Dataset(
+            {var_name: (("time", "depth", "lat", "lon"), arr)},
+            coords={"time": time, "depth": depth, "lat": lat, "lon": lon},
+        )
+
+    def _patch_open_dataset(self, monkeypatch, seg_start):
+        """Serve real fake ``water_u``/``water_v`` Datasets for the two
+        ESPC-D-V02 URLs; delegate any other path (e.g. reading back the
+        ``.nc`` file this test writes) to the REAL ``xr.open_dataset``."""
+        import xarray as xr
+
+        real_open_dataset = xr.open_dataset
+        u_ds = self._make_component_dataset("water_u", seg_start)
+        v_ds = self._make_component_dataset("water_v", seg_start)
+
+        def fake_open_dataset(url, *a, **kw):
+            if url == "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/u3z":
+                return u_ds
+            if url == "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/v3z":
+                return v_ds
+            return real_open_dataset(url, *a, **kw)
+
+        monkeypatch.setattr(xr, "open_dataset", fake_open_dataset)
+
+    def test_negative_lon_bbox_us_east_coast_downloads_nonempty_correct_lon(
+        self, tmp_path, monkeypatch,
+    ):
+        """The exact real-world failing case: a fully-negative-longitude
+        bbox (US East Coast, min_lon=-77.0, max_lon=-68.0) used to
+        ``.sel(lon=slice(-77.08, -67.92))`` against a 0-360-only axis,
+        matching NOTHING -- a silent zero-length ``lon`` dimension. After
+        the fix, the recipe bounds are converted to their 0-360
+        equivalents (282.92 .. 292.08) before selecting."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import HycomDownloader
+
+        seg_start, seg_end = datetime(2025, 1, 1), datetime(2025, 1, 2)
+        self._patch_open_dataset(monkeypatch, seg_start)
+
+        dl = HycomDownloader(output_dir=tmp_path)
+        nc_path = dl._download_segment(
+            "espc_d_v02", seg_start, seg_end,
+            -77.0, -68.0, 35.0, 44.0,
+        )
+
+        assert nc_path is not None and nc_path.exists()
+        result = xr.open_dataset(nc_path)
+        try:
+            assert result.sizes["lon"] > 0, (
+                "negative-longitude bbox produced a zero-length lon axis -- "
+                "the exact live-confirmed bug (west/east never converted to "
+                "HyCOM's native 0-360 convention)."
+            )
+            lon = result["lon"].values
+            # west_360 = (-77 - 1/12) % 360 = 282.9166...
+            # east_360 = (-68 + 1/12) % 360 = 292.0833...
+            assert lon.min() >= 282.9
+            assert lon.max() <= 292.1
+            assert lon.min() < 283.5  # real coverage starts near the west edge
+            assert lon.max() > 291.5  # real coverage extends to the east edge
+            # data pattern is value == lon -- confirms these are genuinely
+            # the correct source cells, not e.g. wrapped to the wrong
+            # hemisphere.
+            np.testing.assert_allclose(result["water_u"].isel(time=0, lat=0).values, lon)
+        finally:
+            result.close()
+
+    def test_wrapping_bbox_straddling_zero_degrees_stitches_monotonic_lon(
+        self, tmp_path, monkeypatch,
+    ):
+        """A bbox straddling 0 deg longitude (e.g. -10..10) converts to a
+        0-360 window that itself straddles HyCOM's own 0/360 seam
+        (349.92..10.08) -- must select two segments and shift the second
+        by +360 so the combined axis stays monotonically increasing,
+        mirroring ``DataTreeConverter._stitch_antimeridian_window_files``'s
+        existing ERA5 antimeridian handling."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import HycomDownloader
+
+        seg_start, seg_end = datetime(2025, 1, 1), datetime(2025, 1, 2)
+        self._patch_open_dataset(monkeypatch, seg_start)
+
+        dl = HycomDownloader(output_dir=tmp_path)
+        nc_path = dl._download_segment(
+            "espc_d_v02", seg_start, seg_end,
+            -10.0, 10.0, 40.0, 55.0,
+        )
+
+        assert nc_path is not None and nc_path.exists()
+        result = xr.open_dataset(nc_path)
+        try:
+            lon = result["lon"].values
+            assert len(lon) > 0
+            # Strictly increasing -- required by RegularGridInterpolator
+            # (see model_collocation.build_spatial_interpolator's
+            # documented contract).
+            assert np.all(np.diff(lon) > 0), (
+                f"combined lon axis is not monotonically increasing: {lon}"
+            )
+            # west segment: near-360 values (originally 349.92..359.5).
+            assert lon.min() >= 349.5
+            assert lon.min() < 350.5
+            # east segment: shifted by +360 (originally 0..10.08).
+            assert lon.max() > 369.0
+            assert lon.max() <= 370.5
+            # No numeric wrap-around back down to small values -- the
+            # whole point of the +360 shift.
+            assert lon.max() > 360.0
+            # Data-level correctness: the shifted segment's values must
+            # still equal their ORIGINAL (pre-shift) longitude -- e.g. the
+            # cell now at lon=365.0 came from the source's lon=5.0 cell.
+            water_u = result["water_u"].isel(time=0, lat=0)
+            # >= (not >): the shifted segment starts AT exactly 360.0
+            # (the former 0.0), so that boundary point belongs to the
+            # shifted comparison, not the unshifted one.
+            shifted_mask = lon >= 360.0
+            np.testing.assert_allclose(
+                water_u.values[shifted_mask], lon[shifted_mask] - 360.0,
+            )
+            unshifted_mask = ~shifted_mask
+            np.testing.assert_allclose(
+                water_u.values[unshifted_mask], lon[unshifted_mask],
+            )
+        finally:
+            result.close()
+
+    def test_ordinary_positive_lon_bbox_still_works_no_regression(
+        self, tmp_path, monkeypatch,
+    ):
+        """An ordinary positive-longitude bbox (Vestlandet recipe's
+        min_lon=0.5, max_lon=6.0) must keep working exactly as before --
+        it never touches HyCOM's 0/360 seam, so this is the non-wrapping
+        common case that happened to "work" pre-fix (a purely positive
+        bbox is unaffected by the -180..180-vs-0-360 mismatch)."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import HycomDownloader
+
+        seg_start, seg_end = datetime(2025, 1, 1), datetime(2025, 1, 2)
+        self._patch_open_dataset(monkeypatch, seg_start)
+
+        dl = HycomDownloader(output_dir=tmp_path)
+        nc_path = dl._download_segment(
+            "espc_d_v02", seg_start, seg_end,
+            0.5, 6.0, 58.0, 62.5,
+        )
+
+        assert nc_path is not None and nc_path.exists()
+        result = xr.open_dataset(nc_path)
+        try:
+            lon = result["lon"].values
+            assert len(lon) > 0
+            assert np.all(np.diff(lon) > 0)
+            # west_360 = 0.5 - 1/12 = 0.4167; east_360 = 6.0 + 1/12 = 6.0833
+            assert lon.min() >= 0.4
+            assert lon.max() <= 6.1
+            assert lon.min() < 1.0
+            assert lon.max() > 5.5
+            np.testing.assert_allclose(
+                result["water_u"].isel(time=0, lat=0).values, lon,
+            )
+        finally:
+            result.close()
+
+
 class TestDownloadSegmentResourceCleanup:
     def test_all_opened_datasets_are_closed_when_a_later_step_fails(self, tmp_path, monkeypatch):
         """A failure in xr.merge (i.e. *after* every open_dataset call has
