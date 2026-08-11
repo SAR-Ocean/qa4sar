@@ -626,12 +626,65 @@ Fix: `from_insitu_csv` now keeps only the highest-precedence wave-height
 column per row (`VHM0 > VAVH > VGHS`, reusing the same precedence order
 `_variable_map.py`'s `wave_val_params` already establishes for SAR-side
 fallback) and nulls the rest, so each observation contributes to exactly
-one comparison — VHM0 and VAVH still appear as separate, independently
-named report sections for sources that only ever produce one of them.
+one comparison.
+
+**Merged into one report section (2026-08-11).** VHM0 and VAVH originally
+still produced two entirely separate `filter_variable_pairs` entries
+(`oswTotalHs_vs_VHM0`, `oswTotalHs_vs_VAVH`), each running the *whole*
+report pipeline (geographic × every `collocation_type` present in the
+dataset, scatter, stats, residuals) a second time. Two problems, both
+raised directly by the user after reviewing a real report: (1) the report
+roughly doubled in length for no informational gain, since VHM0 and VAVH
+are the same physical quantity by different algorithms, not genuinely
+different things to compare separately; (2) a `collocation_type` unique to
+one variable's sources (e.g. era5's `model_vs_layer`, since ERA5 only ever
+populates VHM0) still got a geographic panel drawn under the *other*
+variable's pass, where every point is guaranteed NaN for that pass's
+column — pure waste, and confusing ("the ERA5 model gives only NaNs" was
+the user's exact complaint).
+
+Fix: `merge_wave_height_columns` (`_variable_map.py`) coalesces
+`val_VHM0`/`val_VAVH`/`val_VGHS` into one `val_SWH` column in place on
+`collocation_ds` (same `VHM0 > VAVH > VGHS` precedence — a no-op choice in
+practice, since a row has at most one populated after the `from_insitu_csv`
+fix above), plus a `val_var_code` companion column recording which raw
+code each row's value came from. `filter_variable_pairs` returns exactly
+one `(sar_var, "SWH")` pair for waves instead of one per code present, so
+the whole pipeline runs once. This did **not** require touching
+`plot_geographic`'s existing `collocation_type` splitting at all: since
+ERA5 (VHM0) is exclusively `model_vs_layer` and altimeter (VAVH) is
+exclusively `point_vs_layer`/`layer_vs_layer` for this variable, that
+split already puts them in separate panels within the same section —
+merging the *variable* pair, not the *collocation-type* split, was the
+actual fix. The one case needing new code is a `val_source` that mixes
+codes across rows (only possible for CMEMS in-situ platforms, e.g. a
+"mooring" group with one VHM0-only and one VAVH-only station): `plot_scatter`
+/`_plot_scatter_small_multiples`/`plot_geographic`'s legend/subplot-title
+building now groups by `(val_source, val_var_code)` instead of
+`val_source` alone whenever `val_var_code` is present, giving e.g.
+"mooring [VHM0]" and "mooring [VAVH]" as distinct, clearly labeled entries
+— satisfying "VHM0/VAVH can keep their own name, shown next to each
+other" without a source's two estimators silently pooling into one dot
+color. `plot_statistics`'s bar-chart / the stats CSV still group by
+`val_source` alone (not further split by code) — a deliberate, smaller
+scope than the plots: the real-data case this was built against has at
+most one mooring point total, so a bias/RMSE numeric split by code was
+judged not worth the added `statistics.py` complexity unless a real
+recipe surfaces a source with enough per-code volume to need it.
+
+Live-verified 2026-08-11 against `recipes/waves_era5_and_satellites2.yaml`
+(166 era5, 16 altimeter, 1 mooring match): `validation_report.pdf` went
+from 20 pages to 11, `validation_statistics_oswTotalHs_vs_VHM0.csv` +
+`..._VAVH.csv` became one `..._SWH.csv` with all three sources as rows,
+and every geographic/scatter panel's legend correctly reads
+`era5_waves [VHM0]`, `altimeter [VAVH]`, `mooring [VHM0]`.
 
 > Code: `core/datatree_converter.py` (`from_insitu_csv`'s wave-height
 > precedence block), `core/_variable_map.py` (`wave_val_params`,
-> `filter_variable_pairs`).
+> `filter_variable_pairs`, `merge_wave_height_columns`,
+> `WAVE_HEIGHT_VAL_VARS`, `WAVE_HEIGHT_MERGED_VAL_VAR`),
+> `core/visualization.py` (`plot_scatter`, `_plot_scatter_small_multiples`,
+> `plot_geographic`'s `val_var_code`-aware legend/title grouping).
 
 ---
 

@@ -386,6 +386,43 @@ class TestPlotScatter:
         import matplotlib.pyplot as plt
         plt.close("all")
 
+    def test_small_multiples_splits_by_var_code_when_present(self):
+        """Waves' merged VHM0/VAVH/VGHS "SWH" pair (see
+        merge_wave_height_columns) carries a val_var_code column -- a
+        source reporting more than one code (e.g. "mooring" mixing a
+        VHM0-only and a VAVH-only station) must get one titled subplot
+        per code, not one subplot silently pooling both estimators."""
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.visualization import plot_scatter
+
+        rng = np.random.default_rng(0)
+        n = 20
+        sar = rng.uniform(0.5, 3.0, n * 2 + 2)
+        val = sar + rng.normal(0, 0.1, n * 2 + 2)
+        ds = xr.Dataset({
+            "sar_oswTotalHs": ("collocation", sar),
+            "val_SWH":        ("collocation", val),
+            "val_var_code":   ("collocation", ["VHM0"] * n + ["VAVH"] * n + ["VHM0", "VAVH"]),
+            "val_source":     ("collocation", ["era5_waves"] * n + ["altimeter"] * n
+                                               + ["mooring", "mooring"]),
+            # Two DISTINCT mooring stations (different val_id/position) --
+            # otherwise _deduplicate_obs's groupby(val_source, val_lat,
+            # val_lon, ...) collapses them into one observation.
+            "val_id":         ("collocation", [""] * (n * 2) + ["mo1", "mo2"]),
+            "val_lat":        ("collocation", np.concatenate([np.full(n * 2, 50.0), [51.0, 52.0]])),
+            "val_lon":        ("collocation", np.concatenate([np.full(n * 2, -10.0), [-11.0, -12.0]])),
+        })
+        fig = plot_scatter(ds, "oswTotalHs", "SWH", force_split=True)
+        titles = [ax.get_title() for ax in fig.axes if ax.get_visible()]
+        assert any("mooring [VHM0]" in t for t in titles)
+        assert any("mooring [VAVH]" in t for t in titles)
+        assert any("era5_waves [VHM0]" in t for t in titles)
+        assert any("altimeter [VAVH]" in t for t in titles)
+        plt.close("all")
+
 
 class TestPlotScatterColorByTemporalOffset:
     def test_returns_figure_with_colorbar(self, collocation_ds):
@@ -1136,6 +1173,50 @@ class TestPlotGeographic:
         assert legend is not None
         labels = [t.get_text() for t in legend.get_texts()]
         assert "No data (NaN)" in labels
+
+    def test_legend_labels_include_var_code_for_merged_wave_height_pair(self):
+        """Waves' merged VHM0/VAVH/VGHS "SWH" pair (see
+        merge_wave_height_columns) carries a val_var_code column -- the
+        geographic legend must state which code each source used (e.g.
+        "era5_waves [VHM0]", "altimeter [VAVH]") since marker shape
+        already discriminates source and fill color already discriminates
+        value, leaving legend text as the only channel left for the code."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        n = 4
+        sar_ds = xr.Dataset(
+            {"oswTotalHs": ("point", np.array([1.4, 1.5, 1.6, 1.7]))},
+            coords={
+                "lon": ("point", np.array([-10.0, -9.5, -9.0, -8.5])),
+                "lat": ("point", np.array([50.0, 50.5, 51.0, 51.5])),
+                "time": pd.Timestamp("2026-08-01T00:00:00"),
+            },
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+
+        collocation_ds = xr.Dataset({
+            "sar_oswTotalHs": ("collocation", np.array([1.41, 1.52, 1.61, 1.72])),
+            "val_SWH":        ("collocation", np.array([1.40, 1.50, 1.60, 1.70])),
+            "val_var_code":   ("collocation", ["VHM0", "VHM0", "VAVH", "VAVH"]),
+            "val_source":     ("collocation", ["era5_waves", "era5_waves", "altimeter", "altimeter"]),
+            "sar_scene_name": ("collocation", ["sceneA"] * n),
+            "val_lon":        ("collocation", np.array([-9.9, -9.4, -8.9, -8.4])),
+            "val_lat":        ("collocation", np.array([50.1, 50.6, 51.1, 51.6])),
+        })
+
+        fig = plot_geographic(datatree, collocation_ds, "oswTotalHs", "SWH", split_by=None)
+        plt.close("all")
+
+        assert fig is not None
+        ax = [a for a in fig.axes if a.get_visible()][0]
+        legend = ax.get_legend()
+        assert legend is not None
+        labels = [t.get_text() for t in legend.get_texts()]
+        assert "era5_waves [VHM0]" in labels
+        assert "altimeter [VAVH]" in labels
 
 
 def _soil_moisture_domain_mismatch_scene(

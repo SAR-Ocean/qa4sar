@@ -162,7 +162,10 @@ class TestLoadPrecomputedStats:
         must look them up the same way — not via the static
         infer_variable_pairs list, which used the wrong key
         (oswTotalHs_vs_VHM0) and silently found nothing for a mixed-mode
-        WV/SM recipe where only sar_oswTotalHs/val_VAVH exist."""
+        WV/SM recipe where only sar_oswTotalHs/val_VAVH exist. VAVH/VHM0
+        merge into one "SWH" pair (docs/design-choices.md §5.8), so the
+        key/filename is oswTotalHs_vs_SWH even though this fixture only
+        ever populates val_VAVH."""
         recipe = _waves_recipe(["WV", "SM"])
         collocation_ds = xr.Dataset({
             "sar_oswTotalHs": ("collocation", [1.4, 1.5]),
@@ -171,12 +174,12 @@ class TestLoadPrecomputedStats:
         })
 
         stats_ds = xr.Dataset({"bias": ("source", [0.02])}, coords={"source": ["altimeter"]})
-        stats_ds.to_netcdf(tmp_path / "validation_statistics_oswTotalHs_vs_VAVH.nc")
+        stats_ds.to_netcdf(tmp_path / "validation_statistics_oswTotalHs_vs_SWH.nc")
 
         result = cli._load_precomputed_stats(recipe, collocation_ds, tmp_path)
 
-        assert set(result.keys()) == {"oswTotalHs_vs_VAVH"}
-        assert float(result["oswTotalHs_vs_VAVH"]["bias"].values[0]) == 0.02
+        assert set(result.keys()) == {"oswTotalHs_vs_SWH"}
+        assert float(result["oswTotalHs_vs_SWH"]["bias"].values[0]) == 0.02
 
     def test_missing_stats_file_is_skipped(self, tmp_path):
         """A pair that filter_variable_pairs selects but has no saved .nc
@@ -202,11 +205,11 @@ class TestLoadPrecomputedStats:
         })
 
         stats_ds = xr.Dataset({"bias": ("source", [0.02])}, coords={"source": ["altimeter"]})
-        stats_ds.to_netcdf(tmp_path / "validation_statistics_oswTotalHs_vs_VAVH_individual.nc")
+        stats_ds.to_netcdf(tmp_path / "validation_statistics_oswTotalHs_vs_SWH_individual.nc")
 
         result = cli._load_precomputed_stats(recipe, collocation_ds, tmp_path, filename_suffix="_individual")
 
-        assert set(result.keys()) == {"oswTotalHs_vs_VAVH"}
+        assert set(result.keys()) == {"oswTotalHs_vs_SWH"}
 
 
 class TestComputeStatsWritesNativeUnitsForSoilMoisture:

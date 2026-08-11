@@ -579,7 +579,10 @@ def plot_scatter(
         warnings.warn(f"No valid data for {sar_col} vs {val_col}.")
         return None
 
-    extra_cols = [c for c in ("val_id", "val_lat", "val_lon", "temporal_distance_minutes") if c in collocation_ds]
+    extra_cols = [
+        c for c in ("val_id", "val_lat", "val_lon", "temporal_distance_minutes", "val_var_code")
+        if c in collocation_ds
+    ]
     base_cols = [sar_col, val_col, "val_source"] + extra_cols
     df_raw = collocation_ds[base_cols].to_dataframe()
     if "val_time" in collocation_ds.coords:
@@ -654,13 +657,28 @@ def plot_scatter(
     sources = df["val_source"].unique().tolist()
     style = _source_style_map(sources)
 
+    # Waves' merged VHM0/VAVH/VGHS "SWH" pair (see merge_wave_height_columns)
+    # carries a val_var_code column -- split by (val_source, val_var_code)
+    # instead of val_source alone, so a source reporting more than one code
+    # (e.g. a "mooring" group mixing VHM0-only and VAVH-only stations) gets
+    # a distinctly labeled legend entry per code rather than pooling two
+    # different estimators under one indistinguishable dot color.
+    has_var_code = "val_var_code" in df.columns
+    groups = (
+        sorted(df[["val_source", "val_var_code"]].drop_duplicates().itertuples(index=False, name=None))
+        if has_var_code else [(src, None) for src in sorted(sources)]
+    )
+
     offset_sm = None
     offset_vmin = offset_vmax = None
     if color_by_offset:
         offset_vmin = float(df["temporal_distance_minutes"].min())
         offset_vmax = float(df["temporal_distance_minutes"].max())
-    for src in sorted(sources):
-        sub = df[df["val_source"] == src]
+    for src, var_code in groups:
+        sub = (
+            df[(df["val_source"] == src) & (df["val_var_code"] == var_code)]
+            if var_code is not None else df[df["val_source"] == src]
+        )
         marker = style[src][1]
         if color_by_offset:
             offset_sm = ax.scatter(
@@ -670,7 +688,7 @@ def plot_scatter(
                 marker=marker, rasterized=True,
             )
         else:
-            label = src if by_source else None
+            label = (f"{src} [{var_code}]" if var_code is not None else src) if by_source else None
             ax.scatter(sub[val_col], sub[sar_col], s=18, alpha=0.6,
                        color=style[src][0], marker=marker, label=label, rasterized=True)
 
@@ -753,13 +771,28 @@ def _plot_scatter_small_multiples(
     (and one colorbar) across every subplot so offsets stay comparable
     source to source -- previously this parameter was silently dropped
     whenever a split was triggered, producing a duplicate of the plain
-    by-source view under a "colored by temporal offset" title."""
+    by-source view under a "colored by temporal offset" title.
+
+    When *df* carries a ``val_var_code`` column (waves' merged VHM0/VAVH/
+    VGHS "SWH" pair -- see merge_wave_height_columns), splitting is by
+    (val_source, val_var_code) instead of val_source alone, so a source
+    that reports more than one code (e.g. a "mooring" group mixing
+    VHM0-only and VAVH-only stations) gets one subplot per code rather
+    than silently pooling two distinct estimators into one panel -- each
+    subplot's title states its code explicitly (e.g. "mooring [VHM0]")."""
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
+    has_var_code = "val_var_code" in df.columns
+    if has_var_code:
+        groups = sorted(
+            df[["val_source", "val_var_code"]].drop_duplicates().itertuples(index=False, name=None)
+        )
+    else:
+        groups = [(src, None) for src in sorted(df["val_source"].unique())]
     sources = sorted(df["val_source"].unique())
     color_map = _source_color_map(sources)
     ncols = 2
-    nrows = math.ceil(len(sources) / ncols)
+    nrows = math.ceil(len(groups) / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 6 * nrows), squeeze=False)
 
     color_by_offset = color_by == "temporal_offset" and "temporal_distance_minutes" in df.columns
@@ -769,10 +802,13 @@ def _plot_scatter_small_multiples(
         offset_vmin = float(df["temporal_distance_minutes"].min())
         offset_vmax = float(df["temporal_distance_minutes"].max())
 
-    for idx, src in enumerate(sources):
+    for idx, (src, var_code) in enumerate(groups):
         r, c = divmod(idx, ncols)
         sub_ax = axes[r][c]
-        sub = df[df["val_source"] == src]
+        sub = (
+            df[(df["val_source"] == src) & (df["val_var_code"] == var_code)]
+            if var_code is not None else df[df["val_source"] == src]
+        )
         if color_by_offset:
             last_offset_sm = sub_ax.scatter(
                 sub[val_col], sub[sar_col], s=18, alpha=0.7,
@@ -784,15 +820,16 @@ def _plot_scatter_small_multiples(
                             color=color_map[src], rasterized=True)
         sub_ax.set_xlabel(_labeled_var(collocation_ds, val_col, val_var, val_source=src))
         sub_ax.set_ylabel(_labeled_var(collocation_ds, sar_col, sar_var))
-        sub_ax.set_title(f"{src} (N={len(sub)})", fontsize=9)
+        title = f"{src} (N={len(sub)})" if var_code is None else f"{src} [{var_code}] (N={len(sub)})"
+        sub_ax.set_title(title, fontsize=9)
         sub_ax.grid(True, linewidth=0.4)
 
         sub_vals = np.concatenate([sub[val_col].values, sub[sar_col].values])
         sub_vmin, sub_vmax = _pad_degenerate_range(float(np.nanmin(sub_vals)), float(np.nanmax(sub_vals)))
         sub_ax.plot([sub_vmin, sub_vmax], [sub_vmin, sub_vmax], "k--", linewidth=1, label="1:1")
 
-    visible_axes = [axes[idx // ncols][idx % ncols] for idx in range(len(sources))]
-    for idx in range(len(sources), nrows * ncols):
+    visible_axes = [axes[idx // ncols][idx % ncols] for idx in range(len(groups))]
+    for idx in range(len(groups), nrows * ncols):
         axes[idx // ncols][idx % ncols].set_visible(False)
 
     fig.suptitle(f"{sar_var} vs {val_var}")
@@ -1290,6 +1327,8 @@ def plot_geographic(
                 col_list.append(val_col)
             if "val_source" in sub_coll:
                 col_list.append("val_source")
+            if "val_var_code" in sub_coll:
+                col_list.append("val_var_code")
             df_pts = sub_coll[col_list].to_dataframe()
             if "val_time" in sub_coll.coords:
                 df_pts["val_time"] = sub_coll.coords["val_time"].values
@@ -1367,10 +1406,29 @@ def plot_geographic(
                     # reaches this function at all -- point_collocation_ds
                     # above already excludes it, rows and all.
                     present = set(valid_pts["val_source"].astype(str))
-                    handles += _source_marker_handles(
-                        ((s, mkr) for s, (_, mkr) in source_style.items() if s in present),
-                        markersize=5,
-                    )
+                    if "val_var_code" in valid_pts.columns:
+                        # Waves' merged VHM0/VAVH/VGHS "SWH" pair (see
+                        # merge_wave_height_columns): marker shape already
+                        # discriminates source and fill color already
+                        # discriminates value, so append the originating
+                        # code to the legend TEXT instead -- one entry per
+                        # code a source actually uses (almost always one,
+                        # e.g. "era5_waves [VHM0]"/"altimeter [VAVH]", but
+                        # two for a source like "mooring" that mixes
+                        # VHM0-only and VAVH-only stations).
+                        codes_by_source = valid_pts.groupby("val_source")["val_var_code"].unique()
+                        legend_items = []
+                        for s, (_, mkr) in source_style.items():
+                            if s not in present:
+                                continue
+                            for code in sorted(codes_by_source.get(s, [])):
+                                legend_items.append((f"{s} [{code}]", mkr))
+                        handles += _source_marker_handles(legend_items, markersize=5)
+                    else:
+                        handles += _source_marker_handles(
+                            ((s, mkr) for s, (_, mkr) in source_style.items() if s in present),
+                            markersize=5,
+                        )
                 if len(nan_pts):
                     handles.append(
                         mlines.Line2D([], [], marker="o", linestyle="None",
