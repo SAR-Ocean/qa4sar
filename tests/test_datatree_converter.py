@@ -3433,12 +3433,29 @@ class TestConvertDownloadedDataHycom:
         )
         ds.to_netcdf(hycom_dir / "hycom_espc_d_v02_20240810T000000_20240811T000000.nc")
 
+        # Alongside hycom/, add an unrelated altimeter file (discovery for
+        # this source is unconditional -- not gated on recipe.variable) so
+        # the resulting tree is guaranteed non-None for a reason unrelated
+        # to hycom. That way the "hycom" exclusion assertion below always
+        # runs and actually proves hycom specifically was excluded, rather
+        # than merely observing that the whole tree came back empty.
+        # _make_altimeter_nc's fixture points sit at lat 50-51N, lon
+        # 352-353E (i.e. -8..-7 once normalised to -180..180) around
+        # 2026-07-08T18:00 -- unrelated to the hycom fixture's own bounds
+        # above, since the hycom gate only checks recipe.variable and
+        # never looks at bounds. The recipe's own bounds/tolerances must
+        # cover the altimeter fixture's domain so it survives the
+        # `_filtered()` recipe-domain crop and isn't itself dropped.
+        altimeter_dir = tmp_path / "altimeter"
+        altimeter_dir.mkdir()
+        _make_altimeter_nc(altimeter_dir)
+
         recipe = Recipe(RecipeConfig(
             name="t", variable="wind",
-            geographic_bounds=GeographicBounds(-10.0, -8.5, 40.0, 41.5),
-            temporal_bounds=TemporalBounds("2024-08-10", "2024-08-11"),
+            geographic_bounds=GeographicBounds(-9.0, -6.0, 49.0, 52.0),
+            temporal_bounds=TemporalBounds("2026-07-08", "2026-07-09"),
         ))
 
         tree = DataTreeConverter.convert_downloaded_data(tmp_path, recipe=recipe)
-        if tree is not None:
-            assert "hycom" not in getattr(tree.get("validation"), "children", {})
+        assert tree is not None
+        assert "hycom" not in getattr(tree.get("validation"), "children", {})
