@@ -1098,6 +1098,60 @@ class TestPlotGeographic:
         assert 5 in recorded_sizes, f"layer_vs_layer's point_size=5 never used, got {recorded_sizes!r}"
         assert 15 in recorded_sizes, f"point_vs_layer's point_size=15 never used, got {recorded_sizes!r}"
 
+    def test_point_geometry_sar_scatter_sized_larger_than_validation_points(self, monkeypatch):
+        """WV-mode-style SAR data (1-D lon/lat, drawn via scatter rather
+        than pcolormesh) used to render at a fixed s=20 regardless of the
+        validation-point marker size layered on top -- confirmed against a
+        real waves report where pt_size=40 validation markers completely
+        hid the s=20 SAR points underneath. The SAR scatter must size
+        itself relative to this panel's own pt_size so it remains visible
+        as a halo around each validation dot."""
+        import matplotlib.axes
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        n = 4
+        sar_ds = xr.Dataset(
+            {"owiWindSpeed": ("point", np.array([6.0, 6.5, 7.0, 7.5]))},
+            coords={
+                "lon": ("point", np.array([-10.0, -9.5, -9.0, -8.5])),
+                "lat": ("point", np.array([50.0, 50.5, 51.0, 51.5])),
+                "time": pd.Timestamp("2026-07-02T12:00:00"),
+            },
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+
+        collocation_ds = xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", np.array([6.1, 6.4, 6.9, 7.3])),
+            "val_WSPD":         ("collocation", np.array([6.0, 6.5, 7.0, 7.5])),
+            "val_source":       ("collocation", ["mooring"] * n),
+            "sar_scene_name":   ("collocation", ["sceneA"] * n),
+            "val_lon":          ("collocation", np.array([-9.9, -9.4, -8.9, -8.4])),
+            "val_lat":          ("collocation", np.array([50.1, 50.6, 51.1, 51.6])),
+        })
+
+        recorded_sizes = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded_sizes.append(kwargs.get("s"))
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        fig = plot_geographic(
+            datatree, collocation_ds, "owiWindSpeed", "WSPD",
+            split_by=None, point_size=40,
+        )
+        plt.close("all")
+
+        assert fig is not None
+        assert 40 in recorded_sizes, f"validation point_size=40 never used, got {recorded_sizes!r}"
+        assert 90 in recorded_sizes, (
+            f"SAR scatter should use point_size + 50 = 90, got {recorded_sizes!r}"
+        )
+
     def test_gridded_scene_with_nan_geolocation_does_not_raise(
         self, geo_datatree_and_collocation,
     ):

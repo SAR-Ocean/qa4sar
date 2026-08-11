@@ -1289,10 +1289,19 @@ def plot_geographic(
             kw = {"transform": transform} if transform else {}
             # Check if data is gridded (2D) or point-based (1D)
             if arr.ndim == 1:
-                # Point data (e.g., WV mode) — use scatter
+                # Point data (e.g., WV mode) — use scatter. Sized relative
+                # to this panel's own validation-point size (pt_size) so
+                # the SAR marker forms a visible halo around each
+                # validation dot layered on top (zorder=5 below) instead
+                # of being fully hidden underneath it -- confirmed against
+                # a real waves report where a fixed s=20 was completely
+                # covered by pt_size=40 validation markers. +50 (not the
+                # original fix's +30): still not enough of a halo once the
+                # validation dots' own black edge (linewidths=0.9, bumped
+                # from 0.4 below) grew more visible too.
                 ax.scatter(
                     scene_ds["lon"].values, scene_ds["lat"].values, c=arr,
-                    cmap=cmap, norm=sar_norm, s=20, edgecolors="none",
+                    cmap=cmap, norm=sar_norm, s=pt_size + 50, edgecolors="none",
                     zorder=3, rasterized=True, **kw,
                 )
             else:
@@ -1365,14 +1374,14 @@ def plot_geographic(
                             grp["val_lon"], grp["val_lat"],
                             c=grp[val_col], cmap=val_cmap, norm=val_norm,
                             marker=marker, s=pt_size,
-                            edgecolors="black", linewidths=0.4,
+                            edgecolors="black", linewidths=0.9,
                             rasterized=True, **kw_sc,
                         )
                 elif len(valid_pts):
                     ax.scatter(
                         valid_pts["val_lon"], valid_pts["val_lat"],
                         c=valid_pts[val_col], cmap=val_cmap, norm=val_norm,
-                        s=pt_size, edgecolors="black", linewidths=0.4,
+                        s=pt_size, edgecolors="black", linewidths=0.9,
                         rasterized=True, **kw_sc,
                     )
                 if len(nan_pts):
@@ -1449,13 +1458,13 @@ def plot_geographic(
                     color, marker = source_style.get(str(src), ("#ff0000", "o"))
                     ax.scatter(grp["val_lon"], grp["val_lat"],
                                s=pt_size, c=color, marker=marker,
-                               edgecolors="black", linewidths=0.4,
+                               edgecolors="black", linewidths=0.9,
                                label=str(src), rasterized=True, **kw_sc)
                 ax.legend(fontsize=6, loc="upper right", framealpha=0.7)
             else:
                 ax.scatter(df_pts["val_lon"], df_pts["val_lat"],
                            s=pt_size, c="#ff7f0e",
-                           edgecolors="black", linewidths=0.4, **kw_sc)
+                           edgecolors="black", linewidths=0.9, **kw_sc)
 
         n_dedup = len(df_pts) if n_pts > 0 else 0
         ax.set_title(

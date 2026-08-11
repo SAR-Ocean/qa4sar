@@ -1515,6 +1515,31 @@ order as the CDF-matched section above it.
 > Code: `core/visualization.py` (`validation_report`'s per-pair loop and
 > native-units block).
 
+### 9.4 Geographic plot: SAR marker halo and validation-point edge width
+
+For point-geometry SAR data (WV mode — `plot_geographic`'s `arr.ndim == 1`
+branch, `_draw_scene_panel`), the SAR field is itself drawn as a scatter,
+underneath the validation points (`zorder=3` vs. the validation layer's
+`zorder=5`). It was originally a fixed `s=20` regardless of the
+validation markers drawn on top of it — confirmed against a real waves
+report where `pt_size=40` validation dots completely hid it: no SAR
+"halo" was visible at all around any matched point. Fixed in two rounds,
+both raised directly against real report output:
+
+1. Size the SAR scatter relative to *this panel's own* `pt_size`
+   (`pt_size + 30`) instead of a fixed constant, so it scales with
+   whatever validation marker size a given variable/collocation_type
+   combination uses (5/15/25/40, see §9.1).
+2. `+30` still weren't visible enough once the validation dots' own black
+   edge was also examined more closely — bumped to `pt_size + 50`, and
+   the validation-point edge width (`edgecolors="black", linewidths=0.4`,
+   all four validation-scatter call sites in `_draw_scene_panel`) bumped
+   to `linewidths=0.9` so the boundary between a validation dot and the
+   SAR halo behind it is actually distinguishable at report print size.
+
+> Code: `core/visualization.py` (`_draw_scene_panel`'s SAR-field scatter
+> and validation-point scatter calls).
+
 ## 10. RADARSAT-2 (NOAA NCEI): a second SAR source, selected per recipe
 
 A second SAR-side source for `wind` recipes, alongside Sentinel-1
