@@ -42,7 +42,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -83,6 +83,41 @@ _GRID_PAD_DEG = 1.0 / 12.0
 #: water_u/water_v/time/lat/lon/depth are used), so it's simplest to
 #: exclude it from the open entirely rather than special-case its decode.
 _DROP_VARS = ["tau"]
+
+#: HyCOM granule cadence (hours) -- both real datasets (ESPC-D-V02 and
+#: GOFS 3.1 Analysis / expt_93.0) emit one synoptic snapshot every 3
+#: hours (00, 03, 06, ... UTC), unlike ERA5's hourly cadence.
+_CADENCE_HOURS = 3
+
+#: Margin (hours), on top of whatever [seg_start, seg_end] window this
+#: downloader is handed, added on BOTH sides before building the actual
+#: OPeNDAP ``time=slice(...)`` request -- mirrors
+#: ``era5_downloader._HOUR_BUFFER``, sized to HyCOM's 3-hourly (not
+#: ERA5's 1-hourly) cadence, and applied by THIS downloader itself since
+#: the generic orchestrator/recipe-level padding
+#: (``DEFAULT_LAYER_TYPE_SPECS["hycom"]["time_tolerance_minutes"]``) is
+#: not read by ``ModelLayerCollocation`` and is not sized for
+#: bracket-finding at all.
+#:
+#: Derivation (traced against ``ModelLayerCollocation._model_values_at_
+#: points``'s ``floor_hour``/``searchsorted``/``idx2`` logic, not just
+#: estimated): for an observation time T, ``floor_hour`` truncates T down
+#: to the nearest HOUR (not cadence) boundary, and the bracket centre
+#: ``t2`` is the largest actual granule <= ``floor_hour``. Since HyCOM
+#: granules fall on hour boundaries that are multiples of the cadence,
+#: ``floor_hour - t2`` is at most ``cadence - 1`` hours, and
+#: ``T - floor_hour`` is less than 1 hour, so ``T - t2 < cadence`` always
+#: (e.g. cadence=3h, T=11:59:59, granules at 09:00/12:00 -> t2=09:00,
+#: T - t2 = 2h59m59s < 3h). The bracket needed is
+#: ``[t2 - cadence, t2, t2 + cadence]``, so in the worst case the
+#: EARLIEST granule needed is up to just-under ``2 * cadence`` before T
+#: (``t2 - cadence``, with ``t2`` up to just-under ``cadence`` before T),
+#: and the LATEST granule needed is up to exactly ``cadence`` after T
+#: (when T lands exactly on a granule, ``t2 == T``). A symmetric
+#: ``2 * cadence`` buffer on both sides covers this worst case at every
+#: recipe-window edge (slightly generous on the "after" side, which only
+#: strictly needs ``1 * cadence`` -- simple, safe, harmless extra data).
+_BRACKET_BUFFER_HOURS = 2 * _CADENCE_HOURS
 
 
 def _resolve_hycom_segments(
@@ -265,6 +300,28 @@ class HycomDownloader:
             f"hycom_{dataset_key}_{seg_start:%Y%m%dT%H%M%S}_{seg_end:%Y%m%dT%H%M%S}.nc"
         )
 
+    @staticmethod
+    def _buffered_bounds(seg_start: datetime, seg_end: datetime) -> tuple[datetime, datetime]:
+        """Widen [*seg_start*, *seg_end*] by :data:`_BRACKET_BUFFER_HOURS`
+        on both sides for the actual OPeNDAP request -- see that
+        constant's docstring for the worst-case bracket derivation. The
+        buffered start is clamped at :data:`_HYCOM_MIN_DATE` so a segment
+        already clamped there by :func:`_resolve_hycom_segments` never
+        has its real request pushed further back before real HyCOM
+        coverage begins (harmless either way since a ``.sel(time=slice)``
+        past the coordinate's actual start just truncates, but clamping
+        keeps the requested bounds meaningful).
+
+        Note: the *nc_path* filename (see :meth:`_nc_path_for_segment`)
+        deliberately stays keyed on the UNBUFFERED *seg_start*/*seg_end*
+        -- only the actual network request widens.
+        """
+        buffered_start = max(
+            seg_start - timedelta(hours=_BRACKET_BUFFER_HOURS), _HYCOM_MIN_DATE,
+        )
+        buffered_end = seg_end + timedelta(hours=_BRACKET_BUFFER_HOURS)
+        return buffered_start, buffered_end
+
     def _dodsc_urls(self, dataset_key: str, seg_start: datetime, seg_end: datetime) -> dict[str, str]:
         """
         Map of ``{label: dodsC url}`` to open for this segment.
@@ -294,11 +351,18 @@ class HycomDownloader:
         :func:`_select_hycom_lon_window`'s 0-360-conversion fix in
         :meth:`_download_segment`, there is nothing here that needs the
         same conversion; this was traced, not assumed.
+
+        Reports coverage over the SAME :meth:`_buffered_bounds`-widened
+        window a real (non-dry-run) download would actually request, so
+        dry-run output doesn't misleadingly under-report what a real run
+        fetches.
         """
         import numpy as np
         import xarray as xr
 
-        for label, url in self._dodsc_urls(dataset_key, seg_start, seg_end).items():
+        buffered_start, buffered_end = self._buffered_bounds(seg_start, seg_end)
+
+        for label, url in self._dodsc_urls(dataset_key, buffered_start, buffered_end).items():
             try:
                 remote = xr.open_dataset(url, drop_variables=_DROP_VARS)
             except Exception as exc:  # noqa: BLE001 — remote OPeNDAP errors are broad
@@ -306,10 +370,12 @@ class HycomDownloader:
                 continue
             times = remote.time.values
             remote.close()
-            in_window = times[(times >= np.datetime64(seg_start)) & (times <= np.datetime64(seg_end))]
+            in_window = times[
+                (times >= np.datetime64(buffered_start)) & (times <= np.datetime64(buffered_end))
+            ]
             logger.info(
                 "  [dry-run] %s (%s): %d granule(s) in [%s, %s]",
-                dataset_key, label, len(in_window), seg_start, seg_end,
+                dataset_key, label, len(in_window), buffered_start, buffered_end,
             )
 
     def _download_segment(
@@ -332,7 +398,8 @@ class HycomDownloader:
         north = max_lat + _GRID_PAD_DEG
 
         nc_path = self._nc_path_for_segment(dataset_key, seg_start, seg_end)
-        urls = self._dodsc_urls(dataset_key, seg_start, seg_end)
+        buffered_start, buffered_end = self._buffered_bounds(seg_start, seg_end)
+        urls = self._dodsc_urls(dataset_key, buffered_start, buffered_end)
 
         opened: dict[str, xr.Dataset] = {}
         try:
@@ -346,7 +413,7 @@ class HycomDownloader:
                     per_year = [opened[label][["water_u", "water_v"]] for label in sorted(opened)]
                     merged = per_year[0] if len(per_year) == 1 else xr.concat(per_year, dim="time")
 
-                time_lat_sel = {"time": slice(seg_start, seg_end), "lat": slice(south, north)}
+                time_lat_sel = {"time": slice(buffered_start, buffered_end), "lat": slice(south, north)}
                 subset = _select_hycom_lon_window(merged, west, east, time_lat_sel)
                 subset = subset.sel(depth=0.0, method="nearest")
                 subset = subset.load()

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -488,6 +488,146 @@ class TestDownloadSegmentLonConvention:
             )
         finally:
             result.close()
+
+
+class TestBracketBuffer:
+    """Live-reproduced 2026-08-11 running recipes/currents_useastcoast.yaml
+    end-to-end (~20-minute SAR window): the download succeeded, but
+    ModelLayerCollocation logged "no bracketing ERA5 hour for scene ...
+    -- skipping cell-averaging pass" for every SAR scene, producing ZERO
+    HyCOM collocation matches. Root cause: HyCOM's real granule cadence is
+    3 hours, but HycomDownloader requested exactly the recipe's own
+    (generically, thinly-padded) window with no internal margin of its
+    own -- unlike ERA5Downloader, which already carries its own
+    ``_HOUR_BUFFER`` for exactly this reason (see that module's
+    docstring). ModelLayerCollocation's hyperbolic bracket needs 3
+    consecutive granules ``[t2 - cadence, t2, t2 + cadence]`` around each
+    SAR scene time T; tracing its floor-hour/searchsorted logic shows the
+    bracket CENTER t2 can be up to just-under-one-cadence-period (< 3h)
+    before T, so the EARLIEST granule ever needed can be up to
+    just-under-2*cadence (< 6h) before T, and the LATEST up to one
+    cadence (3h) after T. HycomDownloader must buffer its own OPeNDAP
+    request window by 2*cadence on both sides to guarantee a full bracket
+    is always downloaded, even for a SAR scene at the very edge of the
+    recipe's core window."""
+
+    @staticmethod
+    def _make_fake_dataset_classes(sel_calls):
+        class FakeDataset:
+            def __getitem__(self, _keys):
+                return self
+
+            def sel(self, *a, **kw):
+                sel_calls.append(kw)
+                return self
+
+            def load(self):
+                return self
+
+            def to_netcdf(self, path):
+                pass
+
+            def close(self):
+                pass
+
+        def fake_open_dataset(url, *a, **kw):
+            return FakeDataset()
+
+        def fake_merge(_datasets, *a, **kw):
+            return FakeDataset()
+
+        return fake_open_dataset, fake_merge
+
+    def test_download_segment_requests_buffered_time_slice(self, tmp_path, monkeypatch):
+        """The real failing scenario: a narrow ~20-minute segment window
+        must still produce a much wider OPeNDAP time-slice request so a
+        full 3-granule bracket is available around the scene time."""
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import (
+            _BRACKET_BUFFER_HOURS,
+            HycomDownloader,
+        )
+
+        sel_calls: list = []
+        fake_open_dataset, fake_merge = self._make_fake_dataset_classes(sel_calls)
+        monkeypatch.setattr(xr, "open_dataset", fake_open_dataset)
+        monkeypatch.setattr(xr, "merge", fake_merge)
+
+        dl = HycomDownloader(output_dir=tmp_path)
+        seg_start = datetime(2026, 7, 14, 10, 30, 0)
+        seg_end = datetime(2026, 7, 14, 10, 50, 0)
+        dl._download_segment("espc_d_v02", seg_start, seg_end, -77.0, -68.0, 35.0, 44.0)
+
+        # Two .sel() calls happen (lon/lat/time window, then depth=0.0
+        # nearest-match) -- find the one carrying the time bounds.
+        time_calls = [kw for kw in sel_calls if "time" in kw]
+        assert len(time_calls) == 1
+        time_slice = time_calls[0]["time"]
+        assert time_slice.start <= seg_start - timedelta(hours=_BRACKET_BUFFER_HOURS)
+        assert time_slice.stop >= seg_end + timedelta(hours=_BRACKET_BUFFER_HOURS)
+
+    def test_buffered_start_clamped_at_hycom_min_date(self, tmp_path, monkeypatch):
+        """A segment already clamped to _HYCOM_MIN_DATE by
+        _resolve_hycom_segments must not have its actual OPeNDAP request
+        pushed further back before that date by the bracket buffer."""
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import (
+            _HYCOM_MIN_DATE,
+            HycomDownloader,
+        )
+
+        sel_calls: list = []
+        fake_open_dataset, fake_merge = self._make_fake_dataset_classes(sel_calls)
+        monkeypatch.setattr(xr, "open_dataset", fake_open_dataset)
+        monkeypatch.setattr(xr, "merge", fake_merge)
+
+        dl = HycomDownloader(output_dir=tmp_path)
+        seg_start = _HYCOM_MIN_DATE  # already clamped, as _resolve_hycom_segments produces
+        seg_end = datetime(2018, 12, 10)
+        dl._download_segment("gofs31_930", seg_start, seg_end, 0.5, 6.0, 40.0, 55.0)
+
+        time_calls = [kw for kw in sel_calls if "time" in kw]
+        assert len(time_calls) == 1
+        time_slice = time_calls[0]["time"]
+        assert time_slice.start >= _HYCOM_MIN_DATE
+
+    def test_probe_coverage_uses_buffered_window(self, tmp_path, monkeypatch, caplog):
+        """dry-run coverage reporting must reflect the same buffered
+        window a real download would request -- otherwise dry-run output
+        would misleadingly under-report what a real run actually
+        fetches."""
+        import logging
+
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import HycomDownloader
+
+        class FakeLazyDataset:
+            def __init__(self):
+                # 5 hours before the raw requested start -- outside the
+                # raw window, but inside the buffered (6h) one.
+                self.time = xr.DataArray(
+                    pd.to_datetime(["2025-01-01T19:00:00"]), dims="time",
+                )
+
+            def close(self):
+                pass
+
+        def fake_open_dataset(url, *a, **kw):
+            return FakeLazyDataset()
+
+        monkeypatch.setattr(xr, "open_dataset", fake_open_dataset)
+
+        dl = HycomDownloader(output_dir=tmp_path, dry_run=True)
+        with caplog.at_level(logging.INFO):
+            dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2025-01-02T00:00:00", end="2025-01-02T01:00:00",
+            )
+        assert "1 granule(s)" in caplog.text
 
 
 class TestDownloadSegmentResourceCleanup:
