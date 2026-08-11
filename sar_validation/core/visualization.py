@@ -112,7 +112,7 @@ __all__ = [
 # two differ in lightness) — this is what made scatterometer's matched
 # points look gray once it landed on the (then-)black slot below. Must
 # have at least as many entries as _canonical_source_order() returns
-# (currently 13): a shorter palette wraps and silently reassigns two
+# (currently 16): a shorter palette wraps and silently reassigns two
 # unrelated sources (e.g. tidal gauge landing back on altimeter's blue
 # circle) — see the "matched tidal gauge and altimeter look identical" bug
 # this comment documents. Slots are assigned by *list position* in
@@ -126,18 +126,47 @@ __all__ = [
 # changed to the darker teal "#469990" because that pale cyan was hard to
 # distinguish against plot_collocation_diagnostics' mid-gray (#808080)
 # "unmatched" pattern once small marker sizes/anti-aliasing softened it.
+#
+# The last three entries (olive/cyan/purple) were appended for
+# era5_wind/era5_waves/era5_soil_moisture joining _CANONICAL_SOURCE_ORDER --
+# same append-only rule applies here as there, to avoid the exact wrap
+# collision this comment already warns about. era5_soil_moisture's slot
+# was originally the pale lavender "#dcbeff" -- changed to the bolder
+# "#800080" (2026-08-11) because that pale lavender was hard to pick out
+# against a light land/ocean background at the reduced alpha/marker size
+# soil_moisture's matched-layer tier uses (see matched_layer_alpha in
+# _plot_collocation_diagnostics_impl).
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#469990",
     "#f032e6", "#e6194b", "#000080", "#ffff00",
     "#00ff00",
+    "#808000", "#42d4f4", "#800080",
 ]
 
 # Marker shapes paired 1:1 with _SOURCE_COLORS by index, used wherever
 # validation sources need to stay identifiable independently of color (e.g.
 # when color is taken by a continuous value like wind speed or temporal
-# offset instead of by source).
-_SOURCE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<", ">"]
+# offset instead of by source). Every entry must be one of matplotlib's
+# *filled* markers (matplotlib.markers.MarkerStyle.filled_markers) -- an
+# unfilled/stroke-only marker (e.g. "+", "x", "1"-"4", "|", "_") renders
+# via linewidth, not facecolor, and several call sites (e.g.
+# plot_collocation_diagnostics' non-waves matched-point tiers) explicitly
+# pass linewidths=0 -- confirmed live 2026-08-11: era5_soil_moisture's
+# slot (index 15) was "+", making its 352 real, correctly-positioned,
+# correctly-colored matched points render as literally zero visible
+# pixels on recipes/soil_moisture_era5.yaml's/soil_moisture_nisar_era5_2.
+# yaml's diagnostics plots -- era5_wind/era5_waves (indices 13/14) never
+# hit this since "H"/"d" are filled. matplotlib's filled-marker set has
+# exactly 15 distinct shapes, already all in use by the first 15 slots
+# below, so era5_soil_moisture's slot (16th) reuses "v" -- hf_radar's
+# shape (index 4), distinguished by its own unique color -- since
+# hf_radar (currents-only) and era5_soil_moisture (soil_moisture-only)
+# can never appear in the same report.
+_SOURCE_MARKERS = [
+    "o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<", ">",
+    "H", "d", "v",
+]
 
 # Fixed, append-only reference order for known validation source/platform
 # types. Each name's *list position* is its permanent color/marker slot
@@ -155,6 +184,7 @@ _CANONICAL_SOURCE_ORDER = [
     "mooring", "radiometer", "radiometer_ssm", "scatterometer",
     "scatterometer_ssm", "tidal_gauge",
     "cds_ssm",
+    "era5_wind", "era5_waves", "era5_soil_moisture",
 ]
 
 
@@ -569,7 +599,10 @@ def plot_scatter(
         warnings.warn(f"No valid data for {sar_col} vs {val_col}.")
         return None
 
-    extra_cols = [c for c in ("val_id", "val_lat", "val_lon", "temporal_distance_minutes") if c in collocation_ds]
+    extra_cols = [
+        c for c in ("val_id", "val_lat", "val_lon", "temporal_distance_minutes", "val_var_code")
+        if c in collocation_ds
+    ]
     base_cols = [sar_col, val_col, "val_source"] + extra_cols
     df_raw = collocation_ds[base_cols].to_dataframe()
     if "val_time" in collocation_ds.coords:
@@ -644,13 +677,28 @@ def plot_scatter(
     sources = df["val_source"].unique().tolist()
     style = _source_style_map(sources)
 
+    # Waves' merged VHM0/VAVH/VGHS "SWH" pair (see merge_wave_height_columns)
+    # carries a val_var_code column -- split by (val_source, val_var_code)
+    # instead of val_source alone, so a source reporting more than one code
+    # (e.g. a "mooring" group mixing VHM0-only and VAVH-only stations) gets
+    # a distinctly labeled legend entry per code rather than pooling two
+    # different estimators under one indistinguishable dot color.
+    has_var_code = "val_var_code" in df.columns
+    groups = (
+        sorted(df[["val_source", "val_var_code"]].drop_duplicates().itertuples(index=False, name=None))
+        if has_var_code else [(src, None) for src in sorted(sources)]
+    )
+
     offset_sm = None
     offset_vmin = offset_vmax = None
     if color_by_offset:
         offset_vmin = float(df["temporal_distance_minutes"].min())
         offset_vmax = float(df["temporal_distance_minutes"].max())
-    for src in sorted(sources):
-        sub = df[df["val_source"] == src]
+    for src, var_code in groups:
+        sub = (
+            df[(df["val_source"] == src) & (df["val_var_code"] == var_code)]
+            if var_code is not None else df[df["val_source"] == src]
+        )
         marker = style[src][1]
         if color_by_offset:
             offset_sm = ax.scatter(
@@ -660,7 +708,7 @@ def plot_scatter(
                 marker=marker, rasterized=True,
             )
         else:
-            label = src if by_source else None
+            label = (f"{src} [{var_code}]" if var_code is not None else src) if by_source else None
             ax.scatter(sub[val_col], sub[sar_col], s=18, alpha=0.6,
                        color=style[src][0], marker=marker, label=label, rasterized=True)
 
@@ -743,13 +791,28 @@ def _plot_scatter_small_multiples(
     (and one colorbar) across every subplot so offsets stay comparable
     source to source -- previously this parameter was silently dropped
     whenever a split was triggered, producing a duplicate of the plain
-    by-source view under a "colored by temporal offset" title."""
+    by-source view under a "colored by temporal offset" title.
+
+    When *df* carries a ``val_var_code`` column (waves' merged VHM0/VAVH/
+    VGHS "SWH" pair -- see merge_wave_height_columns), splitting is by
+    (val_source, val_var_code) instead of val_source alone, so a source
+    that reports more than one code (e.g. a "mooring" group mixing
+    VHM0-only and VAVH-only stations) gets one subplot per code rather
+    than silently pooling two distinct estimators into one panel -- each
+    subplot's title states its code explicitly (e.g. "mooring [VHM0]")."""
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
+    has_var_code = "val_var_code" in df.columns
+    if has_var_code:
+        groups = sorted(
+            df[["val_source", "val_var_code"]].drop_duplicates().itertuples(index=False, name=None)
+        )
+    else:
+        groups = [(src, None) for src in sorted(df["val_source"].unique())]
     sources = sorted(df["val_source"].unique())
     color_map = _source_color_map(sources)
     ncols = 2
-    nrows = math.ceil(len(sources) / ncols)
+    nrows = math.ceil(len(groups) / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 6 * nrows), squeeze=False)
 
     color_by_offset = color_by == "temporal_offset" and "temporal_distance_minutes" in df.columns
@@ -759,10 +822,13 @@ def _plot_scatter_small_multiples(
         offset_vmin = float(df["temporal_distance_minutes"].min())
         offset_vmax = float(df["temporal_distance_minutes"].max())
 
-    for idx, src in enumerate(sources):
+    for idx, (src, var_code) in enumerate(groups):
         r, c = divmod(idx, ncols)
         sub_ax = axes[r][c]
-        sub = df[df["val_source"] == src]
+        sub = (
+            df[(df["val_source"] == src) & (df["val_var_code"] == var_code)]
+            if var_code is not None else df[df["val_source"] == src]
+        )
         if color_by_offset:
             last_offset_sm = sub_ax.scatter(
                 sub[val_col], sub[sar_col], s=18, alpha=0.7,
@@ -774,15 +840,16 @@ def _plot_scatter_small_multiples(
                             color=color_map[src], rasterized=True)
         sub_ax.set_xlabel(_labeled_var(collocation_ds, val_col, val_var, val_source=src))
         sub_ax.set_ylabel(_labeled_var(collocation_ds, sar_col, sar_var))
-        sub_ax.set_title(f"{src} (N={len(sub)})", fontsize=9)
+        title = f"{src} (N={len(sub)})" if var_code is None else f"{src} [{var_code}] (N={len(sub)})"
+        sub_ax.set_title(title, fontsize=9)
         sub_ax.grid(True, linewidth=0.4)
 
         sub_vals = np.concatenate([sub[val_col].values, sub[sar_col].values])
         sub_vmin, sub_vmax = _pad_degenerate_range(float(np.nanmin(sub_vals)), float(np.nanmax(sub_vals)))
         sub_ax.plot([sub_vmin, sub_vmax], [sub_vmin, sub_vmax], "k--", linewidth=1, label="1:1")
 
-    visible_axes = [axes[idx // ncols][idx % ncols] for idx in range(len(sources))]
-    for idx in range(len(sources), nrows * ncols):
+    visible_axes = [axes[idx // ncols][idx % ncols] for idx in range(len(groups))]
+    for idx in range(len(groups), nrows * ncols):
         axes[idx // ncols][idx % ncols].set_visible(False)
 
     fig.suptitle(f"{sar_var} vs {val_var}")
@@ -893,12 +960,14 @@ def plot_geographic(
     two_column_by_type : bool
         When True and split_by == "collocation_type": instead of one
         Figure per collocation_type (each containing a grid of every
-        scene), build one Figure *per scene*, with point_vs_layer drawn
-        in the left column and layer_vs_layer in the right (falling back
-        to a single column if a scene only has one of the two types).
-        Returns dict[scene_name, Figure] in this mode instead of
-        dict[collocation_type, Figure]. Ignored (no-op) unless split_by
-        == "collocation_type".
+        scene), build one Figure *per scene*, with one column per
+        collocation_type actually present in the data for that scene
+        (e.g. point_vs_layer, layer_vs_layer, and ERA5's model_vs_layer),
+        ordered point_vs_layer, layer_vs_layer, then any other type
+        alphabetically, falling back to a single column if a scene only
+        has one type present. Returns dict[scene_name, Figure] in this
+        mode instead of dict[collocation_type, Figure]. Ignored (no-op)
+        unless split_by == "collocation_type".
     skip_domain_harmonization : bool
         When True, force ``domains_differ`` to False unconditionally,
         skipping the whole SAR-vs-validation units-mismatch detection and
@@ -1240,10 +1309,19 @@ def plot_geographic(
             kw = {"transform": transform} if transform else {}
             # Check if data is gridded (2D) or point-based (1D)
             if arr.ndim == 1:
-                # Point data (e.g., WV mode) — use scatter
+                # Point data (e.g., WV mode) — use scatter. Sized relative
+                # to this panel's own validation-point size (pt_size) so
+                # the SAR marker forms a visible halo around each
+                # validation dot layered on top (zorder=5 below) instead
+                # of being fully hidden underneath it -- confirmed against
+                # a real waves report where a fixed s=20 was completely
+                # covered by pt_size=40 validation markers. +50 (not the
+                # original fix's +30): still not enough of a halo once the
+                # validation dots' own black edge (linewidths=0.9, bumped
+                # from 0.4 below) grew more visible too.
                 ax.scatter(
                     scene_ds["lon"].values, scene_ds["lat"].values, c=arr,
-                    cmap=cmap, norm=sar_norm, s=20, edgecolors="none",
+                    cmap=cmap, norm=sar_norm, s=pt_size + 50, edgecolors="none",
                     zorder=3, rasterized=True, **kw,
                 )
             else:
@@ -1278,6 +1356,8 @@ def plot_geographic(
                 col_list.append(val_col)
             if "val_source" in sub_coll:
                 col_list.append("val_source")
+            if "val_var_code" in sub_coll:
+                col_list.append("val_var_code")
             df_pts = sub_coll[col_list].to_dataframe()
             if "val_time" in sub_coll.coords:
                 df_pts["val_time"] = sub_coll.coords["val_time"].values
@@ -1314,14 +1394,14 @@ def plot_geographic(
                             grp["val_lon"], grp["val_lat"],
                             c=grp[val_col], cmap=val_cmap, norm=val_norm,
                             marker=marker, s=pt_size,
-                            edgecolors="black", linewidths=0.4,
+                            edgecolors="black", linewidths=0.9,
                             rasterized=True, **kw_sc,
                         )
                 elif len(valid_pts):
                     ax.scatter(
                         valid_pts["val_lon"], valid_pts["val_lat"],
                         c=valid_pts[val_col], cmap=val_cmap, norm=val_norm,
-                        s=pt_size, edgecolors="black", linewidths=0.4,
+                        s=pt_size, edgecolors="black", linewidths=0.9,
                         rasterized=True, **kw_sc,
                     )
                 if len(nan_pts):
@@ -1355,10 +1435,29 @@ def plot_geographic(
                     # reaches this function at all -- point_collocation_ds
                     # above already excludes it, rows and all.
                     present = set(valid_pts["val_source"].astype(str))
-                    handles += _source_marker_handles(
-                        ((s, mkr) for s, (_, mkr) in source_style.items() if s in present),
-                        markersize=5,
-                    )
+                    if "val_var_code" in valid_pts.columns:
+                        # Waves' merged VHM0/VAVH/VGHS "SWH" pair (see
+                        # merge_wave_height_columns): marker shape already
+                        # discriminates source and fill color already
+                        # discriminates value, so append the originating
+                        # code to the legend TEXT instead -- one entry per
+                        # code a source actually uses (almost always one,
+                        # e.g. "era5_waves [VHM0]"/"altimeter [VAVH]", but
+                        # two for a source like "mooring" that mixes
+                        # VHM0-only and VAVH-only stations).
+                        codes_by_source = valid_pts.groupby("val_source")["val_var_code"].unique()
+                        legend_items = []
+                        for s, (_, mkr) in source_style.items():
+                            if s not in present:
+                                continue
+                            for code in sorted(codes_by_source.get(s, [])):
+                                legend_items.append((f"{s} [{code}]", mkr))
+                        handles += _source_marker_handles(legend_items, markersize=5)
+                    else:
+                        handles += _source_marker_handles(
+                            ((s, mkr) for s, (_, mkr) in source_style.items() if s in present),
+                            markersize=5,
+                        )
                 if len(nan_pts):
                     handles.append(
                         mlines.Line2D([], [], marker="o", linestyle="None",
@@ -1379,13 +1478,13 @@ def plot_geographic(
                     color, marker = source_style.get(str(src), ("#ff0000", "o"))
                     ax.scatter(grp["val_lon"], grp["val_lat"],
                                s=pt_size, c=color, marker=marker,
-                               edgecolors="black", linewidths=0.4,
+                               edgecolors="black", linewidths=0.9,
                                label=str(src), rasterized=True, **kw_sc)
                 ax.legend(fontsize=6, loc="upper right", framealpha=0.7)
             else:
                 ax.scatter(df_pts["val_lon"], df_pts["val_lat"],
                            s=pt_size, c="#ff7f0e",
-                           edgecolors="black", linewidths=0.4, **kw_sc)
+                           edgecolors="black", linewidths=0.9, **kw_sc)
 
         n_dedup = len(df_pts) if n_pts > 0 else 0
         ax.set_title(
@@ -1488,14 +1587,32 @@ def plot_geographic(
             # pcolormesh/scatter calls above have run their autoscale.
             _set_lonlat_ticks(ax, gl)
 
+    # Preferred left-to-right column order for _build_scene_pair_figure:
+    # point_vs_layer, then layer_vs_layer, then any other collocation_type
+    # (e.g. ERA5's model_vs_layer) alphabetically -- keeps today's
+    # soil-moisture column order stable while still picking up whatever
+    # collocation_type values are actually present in the data.
+    _CTYPE_COLUMN_ORDER = {"point_vs_layer": 0, "layer_vs_layer": 1}
+
     def _build_scene_pair_figure(scene_name):
-        """Build one two-column Figure for *scene_name*: point_vs_layer
-        collocations on the left, layer_vs_layer on the right (or a single
-        column if only one type has data for this scene)."""
+        """Build one multi-column Figure for *scene_name*: one panel per
+        collocation_type actually present in the data (e.g. point_vs_layer,
+        layer_vs_layer, and ERA5's model_vs_layer), or a single column if
+        only one type has data for this scene. The set of columns is
+        derived from what's actually present in
+        ``point_collocation_ds["collocation_type"]`` rather than a fixed
+        pair of hardcoded strings, so any collocation_type -- present or
+        future -- gets its own panel instead of being silently dropped."""
+        if "collocation_type" not in point_collocation_ds:
+            return None
+
+        ctypes_present = sorted(
+            {str(v) for v in point_collocation_ds["collocation_type"].values},
+            key=lambda c: (_CTYPE_COLUMN_ORDER.get(c, len(_CTYPE_COLUMN_ORDER)), c),
+        )
+
         type_datasets = []
-        for ctype in ("point_vs_layer", "layer_vs_layer"):
-            if "collocation_type" not in point_collocation_ds:
-                continue
+        for ctype in ctypes_present:
             type_mask = (
                 (point_collocation_ds["collocation_type"] == ctype)
                 & (point_collocation_ds["sar_scene_name"] == scene_name)
@@ -2970,9 +3087,27 @@ def _extract_validation_data_for_plot(datatree):
     def process_node(node, source_name):
         """Recursively process a validation node."""
         ds = node.to_dataset()
-        
-        # If this node has lon/lat, process it
-        if "lon" in ds.coords and "lat" in ds.coords:
+
+        # If this node has lon/lat, process it. Requires a "point"
+        # dimension -- true for every validation source EXCEPT ERA5's
+        # model nodes, whose DataTreeConverter.from_era5 deliberately
+        # keeps native (time, lat, lon) GRID dims (never flattened to
+        # "point" -- see that function's own docstring), so its lon and
+        # lat coords are two INDEPENDENT 1-D axes of different lengths,
+        # not paired per-observation coordinates. Without this guard,
+        # those mismatched-length axis arrays get treated as if they were
+        # flattened per-observation points, corrupting all_lons/all_lats/
+        # all_platform_types/all_times with bogus "observations" tagged
+        # with era5's platform_type -- confirmed live: they never match a
+        # real SAR-interpolated location, so they always land in the
+        # diagnostics plot's gray "unmatched" tier with era5's marker but
+        # no legend entry ("the era5 model data is invisible"). ERA5's
+        # actually-matched points are already represented correctly
+        # elsewhere (the "matched" tier reads collocation_results.nc /
+        # matched_lookup directly, not this raw-datatree scan), so
+        # skipping gridded nodes here only removes the bogus unmatched
+        # noise -- it does not affect era5's matched-point rendering.
+        if "lon" in ds.coords and "lat" in ds.coords and "point" in ds.dims:
             lons = ds["lon"].values
             lats = ds["lat"].values
             times = ds.coords.get("time", None)

@@ -279,3 +279,42 @@ class TestWindTemplate:
         assert specs["scatterometer"]["aggregation_window_km"] == 12.5
 
 
+
+
+class TestEra5RejectedForCurrents:
+    def test_era5_validation_source_in_currents_recipe_raises(self, tmp_path):
+        import pytest
+
+        from sar_validation.core.recipe import Recipe
+
+        yaml_body = (
+            "name: t\nvariable: currents\n"
+            "validation_sources:\n- source_type: era5\n"
+        )
+        yaml_path = tmp_path / "r.yaml"
+        yaml_path.write_text(yaml_body)
+        with pytest.raises(ValueError, match="era5.*currents|currents.*era5"):
+            Recipe.from_yaml(yaml_path)
+
+    def test_era5_validation_source_in_wind_recipe_is_accepted(self, tmp_path):
+        from sar_validation.core.recipe import Recipe
+
+        yaml_body = (
+            "name: t\nvariable: wind\n"
+            "validation_sources:\n- source_type: era5\n"
+        )
+        yaml_path = tmp_path / "r.yaml"
+        yaml_path.write_text(yaml_body)
+        recipe = Recipe.from_yaml(yaml_path)
+        assert recipe.config.validation_sources[0].source_type == "era5"
+
+
+class TestEra5DefaultLayerTypeSpecs:
+    def test_era5_wind_and_waves_and_soil_moisture_have_defaults(self):
+        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+
+        for key in ("era5_wind", "era5_waves", "era5_soil_moisture"):
+            spec = DEFAULT_LAYER_TYPE_SPECS[key]
+            assert spec["method"] in ("individual", "cell-averaging")
+            assert spec["temporal_method"] in ("nearest", "hyperbolic")
+            assert spec["aggregation_window_km"] > 0

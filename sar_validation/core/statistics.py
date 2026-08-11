@@ -31,18 +31,12 @@ _BINS_RESIZED_MESSAGE = "The bins have been resized"
 #: Minimum sample size for a reported correlation coefficient to be
 #: treated as meaningful rather than a numerically-precise-looking
 #: artifact of too few points. Pearson r is mathematically degenerate
-#: for N=2 (any two points define a line, so r is always exactly +-1
-#: regardless of how well the series actually agree) and empirically
-#: still highly unstable through N=4. The Jammalamadaka-Sarma circular
-#: correlation used for circular variables (e.g. wind direction) has
-#: the identical degeneracy at N=2 and near-identical instability at
-#: N=3/4 -- confirmed empirically: independent random samples at
-#: N=3/4/5 give |r|>0.8 in ~40%/20%/13% of trials for both correlation
-#: types, essentially interchangeably. Below this threshold,
-#: correlation is reported as NaN instead of a spurious +-1 or a value
-#: with no real statistical meaning; every other metric (bias, std,
-#: rmse, scatter_index) is still computed and reported normally.
-MIN_N_FOR_CORRELATION = 5
+#: for N=2 and the same goes for the Jammalamadaka-Sarma circular
+#: correlation used for circular variables (e.g. wind direction). Below
+#: the minimum sample size threshold, correlation is reported as NaN;
+#: every other metric (bias, std, rmse, scatter_index) is still 
+#: computed and reported normally.
+MIN_N_FOR_CORRELATION = 10
 
 __all__ = [
     "compute_statistics",
@@ -987,6 +981,14 @@ _VAL_SOURCE_UNITS_FAMILY: dict[str, str] = {
     "amsr_ssm": "volumetric",
     "smap_ssm": "volumetric",
     "smos_ssm": "volumetric",
+    # ERA5-Land's swvl1 ("volume_fraction_of_water_in_soil_layer", units
+    # "m3 m-3" -- see datatree_converter.py's _ERA5_VARS) is volumetric,
+    # same family as ISMN/AMSR/SMAP/SMOS. Harmless no-op for the
+    # currently-shipped soil_moisture_era5.yaml (CLMS SSM, percent-
+    # saturation SAR units), but needed so a volumetric-SAR recipe (e.g.
+    # NISAR SME2's sarSSM, also "m3 m-3") combined with era5_soil_moisture
+    # doesn't silently drop it from the native-units statistics section.
+    "era5_soil_moisture": "volumetric",
 }
 
 

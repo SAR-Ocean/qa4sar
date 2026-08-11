@@ -30,12 +30,15 @@ relevant_code_for_toolbox/
 recipes/*.yaml
 !recipes/wind_example.yaml
 !recipes/wind_antimeridian.yaml
+!recipes/wind_era5.yaml
 !recipes/currents_uswestcoast.yaml
 !recipes/currents_useastcoast.yaml
 !recipes/waves_pacific.yaml
 !recipes/waves_atlantic.yaml
+!recipes/waves_era5.yaml
 !recipes/soil_moisture_nisar_norway.yaml
 !recipes/soil_moisture_example.yaml
+!recipes/soil_moisture_era5.yaml
 !recipes/wind_radarsat2_example.yaml
 
 # Jupyter notebooks checkpoints

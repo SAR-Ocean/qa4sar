@@ -205,7 +205,7 @@ class TestPlotScatter:
 
         from sar_validation.core.statistics import _circular_corrcoef_deg
 
-        sar_deg = np.array([10.0, 90.0, 180.0, 270.0, 359.0])
+        sar_deg = np.array([10, 50, 80, 110, 130, 180, 230, 270, 310, 359])
         val_deg = (sar_deg + 2.0) % 360.0
         n = len(sar_deg)
         ds = xr.Dataset({
@@ -384,6 +384,43 @@ class TestPlotScatter:
         visible_axes = [ax for ax in fig.axes if ax.get_visible()]
         assert len(visible_axes) >= 2
         import matplotlib.pyplot as plt
+        plt.close("all")
+
+    def test_small_multiples_splits_by_var_code_when_present(self):
+        """Waves' merged VHM0/VAVH/VGHS "SWH" pair (see
+        merge_wave_height_columns) carries a val_var_code column -- a
+        source reporting more than one code (e.g. "mooring" mixing a
+        VHM0-only and a VAVH-only station) must get one titled subplot
+        per code, not one subplot silently pooling both estimators."""
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.visualization import plot_scatter
+
+        rng = np.random.default_rng(0)
+        n = 20
+        sar = rng.uniform(0.5, 3.0, n * 2 + 2)
+        val = sar + rng.normal(0, 0.1, n * 2 + 2)
+        ds = xr.Dataset({
+            "sar_oswTotalHs": ("collocation", sar),
+            "val_SWH":        ("collocation", val),
+            "val_var_code":   ("collocation", ["VHM0"] * n + ["VAVH"] * n + ["VHM0", "VAVH"]),
+            "val_source":     ("collocation", ["era5_waves"] * n + ["altimeter"] * n
+                                               + ["mooring", "mooring"]),
+            # Two DISTINCT mooring stations (different val_id/position) --
+            # otherwise _deduplicate_obs's groupby(val_source, val_lat,
+            # val_lon, ...) collapses them into one observation.
+            "val_id":         ("collocation", [""] * (n * 2) + ["mo1", "mo2"]),
+            "val_lat":        ("collocation", np.concatenate([np.full(n * 2, 50.0), [51.0, 52.0]])),
+            "val_lon":        ("collocation", np.concatenate([np.full(n * 2, -10.0), [-11.0, -12.0]])),
+        })
+        fig = plot_scatter(ds, "oswTotalHs", "SWH", force_split=True)
+        titles = [ax.get_title() for ax in fig.axes if ax.get_visible()]
+        assert any("mooring [VHM0]" in t for t in titles)
+        assert any("mooring [VAVH]" in t for t in titles)
+        assert any("era5_waves [VHM0]" in t for t in titles)
+        assert any("altimeter [VAVH]" in t for t in titles)
         plt.close("all")
 
 
@@ -970,6 +1007,35 @@ class TestCanonicalSourceOrderStability:
         with pytest.raises(AssertionError, match="some_brand_new_layer_type"):
             viz_mod._canonical_source_order()
 
+    def test_era5_sources_appended_after_cds_ssm(self):
+        from sar_validation.core.visualization import _canonical_source_order
+
+        canonical = _canonical_source_order()
+        cds_ssm_idx = canonical.index("cds_ssm")
+        assert canonical[cds_ssm_idx + 1: cds_ssm_idx + 4] == [
+            "era5_wind", "era5_waves", "era5_soil_moisture",
+        ]
+
+    def test_every_source_marker_is_filled(self):
+        """An unfilled/stroke-only marker (e.g. "+", "x", "1"-"4", "|",
+        "_") renders via linewidth, not facecolor -- several call sites
+        (e.g. plot_collocation_diagnostics' non-waves matched-point
+        tiers) explicitly pass linewidths=0, which makes an unfilled
+        marker's matched points literally invisible regardless of color/
+        alpha/position. Confirmed live 2026-08-11: era5_soil_moisture's
+        "+" slot made 352 real, correctly-positioned matched points
+        render as zero visible pixels on soil_moisture_era5.yaml's
+        diagnostics plot. Every _SOURCE_MARKERS entry must stay one of
+        matplotlib's filled markers so this can't recur for a future
+        source appended to _CANONICAL_SOURCE_ORDER."""
+        from matplotlib.markers import MarkerStyle
+
+        from sar_validation.core.visualization import _SOURCE_MARKERS
+
+        filled = set(MarkerStyle.filled_markers)
+        not_filled = [m for m in _SOURCE_MARKERS if m not in filled]
+        assert not not_filled, f"unfilled marker(s) in _SOURCE_MARKERS: {not_filled}"
+
 
 class TestPlotGeographic:
     def test_distinct_sources_get_distinct_markers(self, geo_datatree_and_collocation, monkeypatch):
@@ -1052,6 +1118,60 @@ class TestPlotGeographic:
         assert 5 in recorded_sizes, f"layer_vs_layer's point_size=5 never used, got {recorded_sizes!r}"
         assert 15 in recorded_sizes, f"point_vs_layer's point_size=15 never used, got {recorded_sizes!r}"
 
+    def test_point_geometry_sar_scatter_sized_larger_than_validation_points(self, monkeypatch):
+        """WV-mode-style SAR data (1-D lon/lat, drawn via scatter rather
+        than pcolormesh) used to render at a fixed s=20 regardless of the
+        validation-point marker size layered on top -- confirmed against a
+        real waves report where pt_size=40 validation markers completely
+        hid the s=20 SAR points underneath. The SAR scatter must size
+        itself relative to this panel's own pt_size so it remains visible
+        as a halo around each validation dot."""
+        import matplotlib.axes
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        n = 4
+        sar_ds = xr.Dataset(
+            {"owiWindSpeed": ("point", np.array([6.0, 6.5, 7.0, 7.5]))},
+            coords={
+                "lon": ("point", np.array([-10.0, -9.5, -9.0, -8.5])),
+                "lat": ("point", np.array([50.0, 50.5, 51.0, 51.5])),
+                "time": pd.Timestamp("2026-07-02T12:00:00"),
+            },
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+
+        collocation_ds = xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", np.array([6.1, 6.4, 6.9, 7.3])),
+            "val_WSPD":         ("collocation", np.array([6.0, 6.5, 7.0, 7.5])),
+            "val_source":       ("collocation", ["mooring"] * n),
+            "sar_scene_name":   ("collocation", ["sceneA"] * n),
+            "val_lon":          ("collocation", np.array([-9.9, -9.4, -8.9, -8.4])),
+            "val_lat":          ("collocation", np.array([50.1, 50.6, 51.1, 51.6])),
+        })
+
+        recorded_sizes = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded_sizes.append(kwargs.get("s"))
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        fig = plot_geographic(
+            datatree, collocation_ds, "owiWindSpeed", "WSPD",
+            split_by=None, point_size=40,
+        )
+        plt.close("all")
+
+        assert fig is not None
+        assert 40 in recorded_sizes, f"validation point_size=40 never used, got {recorded_sizes!r}"
+        assert 90 in recorded_sizes, (
+            f"SAR scatter should use point_size + 50 = 90, got {recorded_sizes!r}"
+        )
+
     def test_gridded_scene_with_nan_geolocation_does_not_raise(
         self, geo_datatree_and_collocation,
     ):
@@ -1127,6 +1247,50 @@ class TestPlotGeographic:
         assert legend is not None
         labels = [t.get_text() for t in legend.get_texts()]
         assert "No data (NaN)" in labels
+
+    def test_legend_labels_include_var_code_for_merged_wave_height_pair(self):
+        """Waves' merged VHM0/VAVH/VGHS "SWH" pair (see
+        merge_wave_height_columns) carries a val_var_code column -- the
+        geographic legend must state which code each source used (e.g.
+        "era5_waves [VHM0]", "altimeter [VAVH]") since marker shape
+        already discriminates source and fill color already discriminates
+        value, leaving legend text as the only channel left for the code."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        n = 4
+        sar_ds = xr.Dataset(
+            {"oswTotalHs": ("point", np.array([1.4, 1.5, 1.6, 1.7]))},
+            coords={
+                "lon": ("point", np.array([-10.0, -9.5, -9.0, -8.5])),
+                "lat": ("point", np.array([50.0, 50.5, 51.0, 51.5])),
+                "time": pd.Timestamp("2026-08-01T00:00:00"),
+            },
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+
+        collocation_ds = xr.Dataset({
+            "sar_oswTotalHs": ("collocation", np.array([1.41, 1.52, 1.61, 1.72])),
+            "val_SWH":        ("collocation", np.array([1.40, 1.50, 1.60, 1.70])),
+            "val_var_code":   ("collocation", ["VHM0", "VHM0", "VAVH", "VAVH"]),
+            "val_source":     ("collocation", ["era5_waves", "era5_waves", "altimeter", "altimeter"]),
+            "sar_scene_name": ("collocation", ["sceneA"] * n),
+            "val_lon":        ("collocation", np.array([-9.9, -9.4, -8.9, -8.4])),
+            "val_lat":        ("collocation", np.array([50.1, 50.6, 51.1, 51.6])),
+        })
+
+        fig = plot_geographic(datatree, collocation_ds, "oswTotalHs", "SWH", split_by=None)
+        plt.close("all")
+
+        assert fig is not None
+        ax = [a for a in fig.axes if a.get_visible()][0]
+        legend = ax.get_legend()
+        assert legend is not None
+        labels = [t.get_text() for t in legend.get_texts()]
+        assert "era5_waves [VHM0]" in labels
+        assert "altimeter [VAVH]" in labels
 
 
 def _soil_moisture_domain_mismatch_scene(
@@ -2627,6 +2791,123 @@ class TestPlotGeographicTwoColumnByType:
         assert len(fig.axes) >= 2
         plt.close("all")
 
+    def test_model_vs_layer_gets_its_own_column_alongside_point_and_layer(self):
+        """Regression test: ERA5's collocation_type is "model_vs_layer" --
+        _build_scene_pair_figure's column set must be derived from what's
+        actually present in the data, not hardcoded to
+        ("point_vs_layer", "layer_vs_layer"), or ERA5 rows are silently
+        dropped from this panel with no error/warning."""
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        y, x = 4, 5
+        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.linspace(10.0, 60.0, y * x).reshape(y, x))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T12:00:00")},
+        )
+        n = 4
+        ismn_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", np.array([0.1, 0.15, 0.2, 0.25]))},
+            coords={"lon": ("point", np.array([-9.8, -9.6, -9.4, -9.2])),
+                    "lat": ("point", np.array([50.2, 50.4, 50.6, 50.8])),
+                    "time": ("point", pd.date_range("2026-07-10T12:00", periods=n, freq="5min"))},
+            attrs={"platform_type": "ismn"},
+        )
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds,
+            "validation/ismn": ismn_ds,
+        })
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", np.array([12.0, 18.0, 22.0, 48.0])),
+            "val_SOIL_MOISTURE": ("collocation", np.array([0.1, 0.15, 20.0, 50.0])),
+            "val_source":        ("collocation", ["ismn", "ismn", "era5", "era5"]),
+            "collocation_type":  ("collocation", ["point_vs_layer", "point_vs_layer",
+                                                    "model_vs_layer", "model_vs_layer"]),
+            "sar_scene_name":    ("collocation", ["sceneA"] * n),
+            "val_lon":           ("collocation", np.array([-9.8, -9.6, -9.0, -8.8])),
+            "val_lat":           ("collocation", np.array([50.2, 50.4, 51.0, 51.2])),
+            "val_id":            ("collocation", ["i0", "i1", "e0", "e1"]),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-10T12:00", periods=n, freq="5min")),
+        )
+
+        result = plot_geographic(
+            datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            split_by="collocation_type", two_column_by_type=True,
+        )
+
+        assert set(result.keys()) == {"sceneA"}
+        fig = result["sceneA"]
+        titles = [ax.get_title() for ax in fig.axes]
+        assert any("model_vs_layer" in t for t in titles)
+        assert any("point_vs_layer" in t for t in titles)
+        plt.close("all")
+
+    def test_scene_with_only_model_vs_layer_still_produces_a_figure(self):
+        """Pure-ERA5 recipes (e.g. soil_moisture_era5.yaml, whose only
+        validation source is era5 -> collocation_type "model_vs_layer")
+        must still get a figure -- before this fix, the hardcoded
+        ("point_vs_layer", "layer_vs_layer") tuple matched nothing, so
+        type_datasets stayed empty and _build_scene_pair_figure returned
+        None, dropping the scene from the output dict entirely."""
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        y, x = 4, 5
+        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.linspace(10.0, 60.0, y * x).reshape(y, x))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T12:00:00")},
+        )
+        n = 2
+        era5_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", np.array([0.2, 0.3]))},
+            coords={"lon": ("point", np.array([-9.0, -8.8])),
+                    "lat": ("point", np.array([51.0, 51.2])),
+                    "time": ("point", pd.date_range("2026-07-10T12:00", periods=n, freq="5min"))},
+            attrs={"platform_type": "era5_soil_moisture"},
+        )
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds,
+            "validation/era5": era5_ds,
+        })
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", np.array([22.0, 48.0])),
+            "val_SOIL_MOISTURE": ("collocation", np.array([20.0, 50.0])),
+            "val_source":        ("collocation", ["era5", "era5"]),
+            "collocation_type":  ("collocation", ["model_vs_layer", "model_vs_layer"]),
+            "sar_scene_name":    ("collocation", ["sceneA"] * n),
+            "val_lon":           ("collocation", np.array([-9.0, -8.8])),
+            "val_lat":           ("collocation", np.array([51.0, 51.2])),
+            "val_id":            ("collocation", ["e0", "e1"]),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-10T12:00", periods=n, freq="5min")),
+        )
+
+        result = plot_geographic(
+            datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            split_by="collocation_type", two_column_by_type=True,
+        )
+
+        assert set(result.keys()) == {"sceneA"}
+        assert result["sceneA"] is not None
+        plt.close("all")
+
     def test_two_column_figure_has_a_colorbar(self):
         """Regression test: _build_scene_pair_figure never called
         fig.colorbar() at all -- soil moisture's geographic layout
@@ -2704,6 +2985,76 @@ class TestPlotGeographicTwoColumnByType:
             split_by="collocation_type",
         )
         assert set(result.keys()) == {"point_vs_layer"}
+
+
+class TestExtractValidationDataForPlotSkipsGriddedNodes:
+    """_extract_validation_data_for_plot's process_node assumes every
+    validation node's lon/lat coords represent a flattened per-observation
+    "point" dimension -- true for every validation source EXCEPT ERA5's
+    model nodes, whose DataTreeConverter.from_era5 deliberately keeps
+    native (time, lat, lon) GRID dims. Without a guard, the independent
+    1-D lon-axis/lat-axis coordinate arrays (different lengths) get
+    treated as paired per-observation points, corrupting the accumulator
+    lists with mismatched-length "observations"."""
+
+    def _era5_gridded_ds(self):
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        n_time, n_lat, n_lon = 2, 3, 5  # deliberately different lat/lon lengths
+        return xr.Dataset(
+            {"SOIL_MOISTURE": (("time", "lat", "lon"), np.random.rand(n_time, n_lat, n_lon))},
+            coords={
+                "time": pd.date_range("2026-07-10T00:00", periods=n_time, freq="1h"),
+                "lat": np.linspace(50.0, 52.0, n_lat),
+                "lon": np.linspace(-10.0, -8.0, n_lon),
+            },
+            attrs={"data_type": "era5_soil_moisture", "platform_type": "era5_soil_moisture"},
+        )
+
+    def _ismn_point_ds(self):
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        n = 3
+        return xr.Dataset(
+            {"SOIL_MOISTURE": ("point", np.array([0.1, 0.15, 0.2]))},
+            coords={
+                "lon": ("point", np.array([-9.8, -9.6, -9.4])),
+                "lat": ("point", np.array([50.2, 50.4, 50.6])),
+                "time": ("point", pd.date_range("2026-07-10T12:00", periods=n, freq="5min")),
+            },
+            attrs={"platform_type": "ismn"},
+        )
+
+    def test_gridded_era5_node_contributes_no_bogus_observations(self):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import _extract_validation_data_for_plot
+
+        datatree = DataTreeConverter.to_datatree({
+            "validation/era5/era5": self._era5_gridded_ds(),
+        })
+        result = _extract_validation_data_for_plot(datatree)
+        # No point-flattened source present at all -> nothing accumulated.
+        assert result == {}
+
+    def test_gridded_era5_node_does_not_corrupt_point_source_alongside_it(self):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import _extract_validation_data_for_plot
+
+        datatree = DataTreeConverter.to_datatree({
+            "validation/ismn": self._ismn_point_ds(),
+            "validation/era5/era5": self._era5_gridded_ds(),
+        })
+        result = _extract_validation_data_for_plot(datatree)
+        # Only ismn's 3 real per-observation points are counted -- era5's
+        # gridded node must be excluded, not mixed in as mismatched-length
+        # bogus "observations".
+        assert len(result["lons"]) == 3
+        assert len(result["lats"]) == 3
+        assert set(result["sources"]) == {"ismn"}
 
 
 class TestDiagnosticsCategory:

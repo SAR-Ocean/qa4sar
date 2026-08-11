@@ -6,7 +6,12 @@ import pytest
 import xarray as xr
 
 from sar_validation import cli
-from sar_validation.core.recipe import Recipe, RecipeConfig, SARDataSpec
+from sar_validation.core.recipe import (
+    Recipe,
+    RecipeConfig,
+    SARDataSpec,
+    ValidationDataSource,
+)
 
 
 def _waves_recipe(swath_mode):
@@ -157,7 +162,10 @@ class TestLoadPrecomputedStats:
         must look them up the same way — not via the static
         infer_variable_pairs list, which used the wrong key
         (oswTotalHs_vs_VHM0) and silently found nothing for a mixed-mode
-        WV/SM recipe where only sar_oswTotalHs/val_VAVH exist."""
+        WV/SM recipe where only sar_oswTotalHs/val_VAVH exist. VAVH/VHM0
+        merge into one "SWH" pair (docs/design-choices.md §5.8), so the
+        key/filename is oswTotalHs_vs_SWH even though this fixture only
+        ever populates val_VAVH."""
         recipe = _waves_recipe(["WV", "SM"])
         collocation_ds = xr.Dataset({
             "sar_oswTotalHs": ("collocation", [1.4, 1.5]),
@@ -166,12 +174,12 @@ class TestLoadPrecomputedStats:
         })
 
         stats_ds = xr.Dataset({"bias": ("source", [0.02])}, coords={"source": ["altimeter"]})
-        stats_ds.to_netcdf(tmp_path / "validation_statistics_oswTotalHs_vs_VAVH.nc")
+        stats_ds.to_netcdf(tmp_path / "validation_statistics_oswTotalHs_vs_SWH.nc")
 
         result = cli._load_precomputed_stats(recipe, collocation_ds, tmp_path)
 
-        assert set(result.keys()) == {"oswTotalHs_vs_VAVH"}
-        assert float(result["oswTotalHs_vs_VAVH"]["bias"].values[0]) == 0.02
+        assert set(result.keys()) == {"oswTotalHs_vs_SWH"}
+        assert float(result["oswTotalHs_vs_SWH"]["bias"].values[0]) == 0.02
 
     def test_missing_stats_file_is_skipped(self, tmp_path):
         """A pair that filter_variable_pairs selects but has no saved .nc
@@ -197,11 +205,11 @@ class TestLoadPrecomputedStats:
         })
 
         stats_ds = xr.Dataset({"bias": ("source", [0.02])}, coords={"source": ["altimeter"]})
-        stats_ds.to_netcdf(tmp_path / "validation_statistics_oswTotalHs_vs_VAVH_individual.nc")
+        stats_ds.to_netcdf(tmp_path / "validation_statistics_oswTotalHs_vs_SWH_individual.nc")
 
         result = cli._load_precomputed_stats(recipe, collocation_ds, tmp_path, filename_suffix="_individual")
 
-        assert set(result.keys()) == {"oswTotalHs_vs_VAVH"}
+        assert set(result.keys()) == {"oswTotalHs_vs_SWH"}
 
 
 class TestComputeStatsWritesNativeUnitsForSoilMoisture:
@@ -555,6 +563,197 @@ class TestIsAlreadyDownloaded:
 
         assert _is_already_downloaded(tmp_path) is False
 
+    def test_true_when_era5_recipe_variable_matches_recorded(self, tmp_path):
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "variable": "wind",
+            "downloads": {"era5": {"status": "success"}},
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="wind_era5_test",
+            variable="wind",
+            validation_sources=[ValidationDataSource(source_type="era5")],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is True
+
+    def test_false_when_era5_recipe_variable_differs_from_recorded(self, tmp_path):
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "variable": "wind",
+            "downloads": {"era5": {"status": "success"}},
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="waves_era5_test",
+            variable="waves",
+            validation_sources=[ValidationDataSource(source_type="era5")],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is False
+
+    def test_true_when_recorded_variable_missing_legacy_metadata(self, tmp_path):
+        """Legacy/synthetic download_metadata.json without a top-level
+        "variable" key must keep the old trust-it behavior -- this is the
+        exact case that caused a live, unmocked network download during
+        Task 15 when a naive first version of the mismatch check ignored
+        the "recorded_variable is not None" guard."""
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "downloads": {"era5": {"status": "success"}},
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="wind_era5_test",
+            variable="wind",
+            validation_sources=[ValidationDataSource(source_type="era5")],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is True
+
+    def test_true_when_non_era5_recipe_variable_differs_from_recorded(self, tmp_path):
+        """A non-ERA5 recipe/source pair sharing a base_dir with a
+        differing recorded ``variable`` must behave exactly as it did
+        before commit 7fcba5b -- i.e. the top-level variable mismatch is
+        irrelevant to sources other than era5, matching
+        DataOrchestrator._already_succeeded's own
+        ``source_type == "era5"`` scoping. Without that scoping, this
+        recipe/base_dir pair would wrongly bypass "Step 1 skipped" and
+        re-dispatch every _HISTORICAL_FIRST_TYPES source unconditionally
+        (they have no _already_succeeded gate of their own in
+        download_all()'s step 2)."""
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "variable": "currents",
+            "downloads": {
+                "sar": {"status": "success"},
+                "adcp_historical": {"status": "success"},
+            },
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="currents_test",
+            variable="waves",
+            validation_sources=[ValidationDataSource(source_type="adcp_historical")],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is True
+
+    def test_false_when_recipe_requests_source_type_missing_from_recorded_downloads(self, tmp_path):
+        """C2 regression: recipes/wind_era5.yaml (validation_sources=[era5])
+        and recipes/wind_example.yaml (validation_sources=[mooring, ...,
+        scatterometer, ..., NOT era5]) share identical geographic/temporal
+        bounds and therefore the same auto-derived base_dir. Running
+        wind_example.yaml first records downloads with no "era5" key;
+        running wind_era5.yaml next must NOT be treated as
+        already-downloaded (the era5-variable-mismatch check alone misses
+        this, since era5 never appears in either set)."""
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "variable": "wind",
+            "downloads": {
+                "sar": {"status": "success"},
+                "scatterometer": {"status": "success"},
+            },
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="wind_era5_test",
+            variable="wind",
+            validation_sources=[ValidationDataSource(source_type="era5")],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is False
+
+    def test_false_when_recorded_downloads_lack_requested_scatterometer(self, tmp_path):
+        """Reverse of the case above: recorded downloads had era5 (not
+        scatterometer); the current recipe wants scatterometer -- must
+        also trigger re-download."""
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "variable": "wind",
+            "downloads": {
+                "sar": {"status": "success"},
+                "era5": {"status": "success"},
+            },
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="wind_example_test",
+            variable="wind",
+            validation_sources=[ValidationDataSource(source_type="scatterometer")],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is False
+
+    def test_true_when_recorded_and_requested_source_types_match_exactly(self, tmp_path):
+        """No-regression case: recorded downloads and the current recipe's
+        requested source_types match exactly -- the skip must still fire,
+        no wasted re-download for the common case."""
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "variable": "wind",
+            "downloads": {
+                "sar": {"status": "success"},
+                "scatterometer": {"status": "success"},
+                "altimeter": {"status": "success"},
+            },
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="wind_example_test",
+            variable="wind",
+            validation_sources=[
+                ValidationDataSource(source_type="scatterometer"),
+                ValidationDataSource(source_type="altimeter"),
+            ],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is True
+
+    def test_true_when_recorded_insitu_key_covers_individual_insitu_source_types(self, tmp_path):
+        """DataOrchestrator._download_insitu batches mooring/buoy/drifter/
+        ferrybox/tidal_gauge under a single "insitu" downloads key, not one
+        key per source_type -- a recipe requesting e.g. just "mooring" must
+        still match against a recorded "insitu" key (no false re-download
+        for the common in-situ case)."""
+        import json
+
+        from sar_validation.cli import _is_already_downloaded
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "errors": [],
+            "variable": "wind",
+            "downloads": {
+                "sar": {"status": "success"},
+                "insitu": {"status": "success", "source_types": ["mooring", "buoy"]},
+            },
+        }))
+        recipe = Recipe(RecipeConfig(
+            name="wind_insitu_test",
+            variable="wind",
+            validation_sources=[
+                ValidationDataSource(source_type="mooring"),
+                ValidationDataSource(source_type="buoy"),
+            ],
+        ))
+        assert _is_already_downloaded(tmp_path, recipe) is True
+
 
 class TestExecuteRecipeForcesConvertCollocateWhenDownloadActuallyRan:
     """Steps 2/3 (convert/collocate) must not skip regenerating
@@ -612,6 +811,41 @@ class TestExecuteRecipeForcesConvertCollocateWhenDownloadActuallyRan:
         mock_cls.return_value.download_all.assert_not_called()
 
 
+class TestBuildWindConfigEra5:
+    def test_includes_era5_alongside_observational_sources(self):
+        from sar_validation.cli import _build_wind_config
+
+        cfg = _build_wind_config()
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "era5" in source_types
+        # era5 has no download_kwargs/collocation_kwargs of its own here --
+        # ModelLayerCollocation's tuning comes from DEFAULT_LAYER_TYPE_SPECS's
+        # "era5_wind" entry (recipe.py), not a per-recipe override.
+        era5_source = next(s for s in cfg.validation_sources if s.source_type == "era5")
+        assert era5_source.download_kwargs == {}
+
+    def test_radarsat2_also_gets_era5(self):
+        """validation_sources isn't conditioned on sar_source elsewhere in
+        this template (mooring/buoy/etc. are shared by every source) --
+        era5 follows the same pattern."""
+        from sar_validation.cli import _build_wind_config
+
+        cfg = _build_wind_config(sar_source="radarsat2")
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "era5" in source_types
+
+
+class TestBuildWavesConfigEra5:
+    def test_includes_era5_alongside_observational_sources(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config()
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "era5" in source_types
+        era5_source = next(s for s in cfg.validation_sources if s.source_type == "era5")
+        assert era5_source.download_kwargs == {}
+
+
 class TestBuildSoilMoistureConfig:
     def test_recipe_shape(self):
         from sar_validation.cli import _build_soil_moisture_config
@@ -620,7 +854,7 @@ class TestBuildSoilMoistureConfig:
 
         assert cfg.sar_data.source == "sentinel1_clms_ssm"
         source_types = [s.source_type for s in cfg.validation_sources]
-        assert source_types == ["ismn", "ascat_ssm", "amsr_ssm", "smap_ssm", "smos_ssm", "cds_ssm"]
+        assert source_types == ["ismn", "ascat_ssm", "amsr_ssm", "smap_ssm", "smos_ssm", "cds_ssm", "era5"]
         for satellite_source in cfg.validation_sources[1:6]:
             assert satellite_source.download_kwargs == {} or satellite_source.source_type == "cds_ssm"
         # cds_ssm has product_type in download_kwargs
@@ -818,3 +1052,105 @@ class TestBuildWindConfigRadarsat2:
         main(["--create-recipe", "wind", "--sar-source", "radarsat2"])
         recipe = Recipe.from_yaml(tmp_path / "recipes" / "wind_validation.yaml")
         assert recipe.config.sar_data.source == "radarsat2"
+
+
+class TestExecuteRecipeStopsWhenNoSarData:
+    def test_real_run_stops_before_convert_when_sar_data_found_false(self, tmp_path, capsys):
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-no-sar", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        def fake_download_all(self):
+            self.metadata["sar_data_found"] = False
+            return True
+
+        with patch(
+            "sar_validation.core.orchestrator.DataOrchestrator.download_all",
+            fake_download_all,
+        ), patch("sar_validation.cli._convert_data") as mock_convert:
+            cli._execute_recipe(str(recipe_path), force_download=True, convert=True)
+
+        mock_convert.assert_not_called()
+        out = capsys.readouterr().out
+        assert "No SAR data found" in out
+
+    def test_dry_run_stops_before_dry_run_complete_message(self, tmp_path, capsys):
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-no-sar-dry", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        def fake_download_all(self):
+            self.metadata["sar_data_found"] = False
+            return True
+
+        with patch(
+            "sar_validation.core.orchestrator.DataOrchestrator.download_all",
+            fake_download_all,
+        ):
+            cli._execute_recipe(str(recipe_path), dry_run=True)
+
+        out = capsys.readouterr().out
+        assert "No SAR data found" in out
+        assert "Dry run complete" not in out
+
+    def test_real_run_proceeds_when_sar_data_found_true(self, tmp_path, capsys):
+        """Sanity check the gate doesn't fire on a normal successful run."""
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-has-sar", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        def fake_download_all(self):
+            self.metadata["sar_data_found"] = True
+            return True
+
+        with patch(
+            "sar_validation.core.orchestrator.DataOrchestrator.download_all",
+            fake_download_all,
+        ):
+            cli._execute_recipe(str(recipe_path), force_download=True)
+
+        out = capsys.readouterr().out
+        assert "No SAR data found" not in out
+        assert "All downloads completed" in out
+
+    def test_resume_shortcut_stops_when_cached_sar_found_count_is_zero(self, tmp_path, capsys):
+        import json
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "errors": [],
+            "notices": [],
+            "downloads": {"sar": {"status": "success", "found_count": 0, "files": []}},
+        }))
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-resume-no-sar", variable="wind", output_dir=str(run_dir),
+        )).to_yaml(recipe_path)
+
+        with patch("sar_validation.cli._convert_data") as mock_convert:
+            cli._execute_recipe(str(recipe_path), convert=True)
+
+        mock_convert.assert_not_called()
+        out = capsys.readouterr().out
+        assert "No SAR data found" in out

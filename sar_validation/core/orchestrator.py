@@ -153,6 +153,56 @@ def _padded_temporal_bounds(cfg, *source_types: str) -> "tuple[str, str]":
     return start, end
 
 
+def _sar_entry_found_data(
+    entry: Dict[str, Any],
+    sar_dir: Optional[Path] = None,
+    file_glob: Optional[str] = None,
+) -> bool:
+    """True if a recorded ``"sar"`` download-metadata entry represents at
+    least one product found for the window, a failed download attempt
+    (whose true "was there data" answer is unknown, so must not be
+    treated as empty), or the absence of any recorded entry at all (no
+    previous run to consult, so there's nothing to gate on).
+
+    Entries recorded before ``found_count`` existed can have an empty
+    ``"files"`` list even though real products were found and downloaded:
+    ``SARDownloader.download()`` (and its per-source siblings) only
+    appends *newly* downloaded files to the list it returns -- a product
+    that was already present on disk (skipped as a duplicate) is never
+    appended. So a fully successful old-schema run where every matched
+    product happened to already be cached ends up recording ``files: []``
+    despite real data being present -- confirmed live 2026-08-11: a
+    ``currents_useastcoast.yaml`` run's copied-over ``download_metadata.json``
+    (written before ``found_count`` existed, SAR genuinely downloaded but
+    every product already cached from an earlier run) was misread as "no
+    SAR data found," even though the SAR files were sitting right there in
+    ``S1_L2_OCN/``. For an entry with no ``found_count`` and an empty
+    ``"files"`` list, check *sar_dir* directly (matching *file_glob*, e.g.
+    ``SARSourceSpec.file_glob``) instead of trusting that ambiguous empty
+    list -- callers that can't supply *sar_dir*/*file_glob* keep the old
+    ``len(files)`` behaviour.
+
+    When the disk check runs, it also backfills ``entry["found_count"]``
+    and ``entry["files"]`` in place from what it actually found -- *entry*
+    is typically the same dict a caller is about to save as part of its
+    own metadata (e.g. ``download_all()``'s already-succeeded copy-forward
+    path), so this heals a stale old-schema entry into a self-consistent
+    one instead of leaving the gap to be silently re-read (and re-scanned)
+    on every future run."""
+    if not entry or entry.get("status") == "failed":
+        return True
+    if "found_count" in entry:
+        return entry["found_count"] > 0
+    if entry.get("files"):
+        return True
+    if sar_dir is not None and file_glob is not None and sar_dir.exists():
+        found_files = sorted(sar_dir.rglob(file_glob))
+        entry["found_count"] = len(found_files)
+        entry["files"] = [str(p) for p in found_files]
+        return len(found_files) > 0
+    return False
+
+
 class DataOrchestrator:
     """
     Orchestrate all downloads for a single validation run.
@@ -171,6 +221,7 @@ class DataOrchestrator:
         self.force_download = force_download
         self.base_dir = self._setup_base_dir()
         self._previous_downloads: Dict[str, Any] = self._load_previous_downloads()
+        self._previous_variable: Optional[str] = self._load_previous_variable()
         self.metadata: Dict[str, Any] = {
             "recipe_name": recipe.config.name,
             "variable":    recipe.config.variable,
@@ -267,6 +318,36 @@ class DataOrchestrator:
         except Exception:
             return {}
 
+    def _load_previous_variable(self) -> Optional[str]:
+        """Read the top-level ``variable`` field of a prior run's
+        ``download_metadata.json`` in ``self.base_dir``, if present.
+
+        Used by :meth:`_already_succeeded` to detect the case where two
+        recipes with identical geographic/temporal bounds (so they share
+        ``base_dir``) request *different* ``recipe.config.variable``
+        values -- e.g. ``wind_era5.yaml`` and ``waves_era5.yaml`` in
+        ``recipes/`` both cover the same bbox/window to reuse the SAR
+        download. ERA5's downloaded file name/content depends on
+        ``variable`` (``era5_<variable>_<day>.nc``, requesting a
+        completely different CDS dataset/variable set), unlike SAR (whose
+        L2 OCN product contains both wind- and wave-relevant OWI fields
+        regardless of which recipe downloaded it) -- so a stale
+        ``era5: {"status": "success"}`` recorded under one variable must
+        NOT be trusted for another. Confirmed live 2026-08-07: running
+        waves_era5.yaml right after wind_era5.yaml (same bbox/window)
+        skipped the ERA5 download entirely, leaving zero era5 data in the
+        DataTree for "waves".
+        """
+        meta_path = self.base_dir / "download_metadata.json"
+        if not meta_path.exists():
+            return None
+        try:
+            with open(meta_path) as f:
+                variable = json.load(f).get("variable")
+            return variable if isinstance(variable, str) else None
+        except Exception:
+            return None
+
     def _already_succeeded(self, source_type: str) -> bool:
         """True if *source_type* succeeded in the previous run recorded in
         ``self._previous_downloads`` and ``force_download`` isn't set."""
@@ -275,7 +356,28 @@ class DataOrchestrator:
         prev = self._previous_downloads.get(source_type)
         if prev is None:
             return False
+        if source_type == "era5" and self._previous_variable != self.recipe.config.variable:
+            return False
         return prev.get("status") == "success"
+
+    def _sar_dir_and_glob(self) -> tuple:
+        """(sar_dir, file_glob) for this recipe's SAR source -- passed to
+        _sar_entry_found_data so it can check disk directly for old-schema
+        metadata entries (see that function's docstring)."""
+        from .sar_sources import SAR_SOURCES
+
+        spec = SAR_SOURCES[self.recipe.config.sar_data.source]
+        return self.base_dir / spec.output_subdir, spec.file_glob
+
+    def previous_sar_data_found(self) -> bool:
+        """True if a previous run's recorded SAR entry (if any) found at
+        least one product for this window. Used by the CLI's "already
+        downloaded" resume shortcut, which reuses a prior run's cached
+        metadata without calling :meth:`download_all` again."""
+        sar_dir, file_glob = self._sar_dir_and_glob()
+        return _sar_entry_found_data(
+            self._previous_downloads.get("sar", {}), sar_dir=sar_dir, file_glob=file_glob,
+        )
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -300,6 +402,18 @@ class DataOrchestrator:
             logger.info("Skipping SAR download: already succeeded in a previous run.")
         elif not self._download_sar():
             ok = False
+
+        sar_entry = self.metadata["downloads"].get("sar", {})
+        sar_dir, file_glob = self._sar_dir_and_glob()
+        sar_data_found = _sar_entry_found_data(sar_entry, sar_dir=sar_dir, file_glob=file_glob)
+        self.metadata["sar_data_found"] = sar_data_found
+        if not sar_data_found:
+            msg = "No SAR data found for this window/region — skipping validation-data downloads."
+            logger.warning(msg)
+            self.metadata["notices"].append(msg)
+            if not self.dry_run:
+                self._save_metadata()
+            return ok
 
         # 2. Delayed-mode ("*_historical") sources first. hf_radar and the
         # NRT in-situ batch (below) consult file_count from these results
@@ -408,6 +522,10 @@ class DataOrchestrator:
                 **spec.extra_download_kwargs(cfg.sar_data),
             ),
             f"SAR ({cfg.sar_data.source})",
+            result_to_metadata=lambda result, dl: {
+                "files": [str(p) for p in (result or [])],
+                "found_count": getattr(dl, "found_count", len(result or [])),
+            },
         )
 
     def _download_insitu(
@@ -540,6 +658,7 @@ class DataOrchestrator:
             "smap_ssm":      self._download_smap_ssm,
             "smos_ssm":      self._download_smos_ssm,
             "cds_ssm":       self._download_cds_ssm,
+            "era5":          self._download_era5,
         }
         handler = handlers.get(source.source_type)
         if handler is None:
@@ -777,6 +896,28 @@ class DataOrchestrator:
                 start=pad_start, end=pad_end,
             ),
             f"C3S CDS SSM ({product_type})",
+        )
+
+    def _download_era5(self, source) -> bool:
+        from ..downloaders.era5_downloader import ERA5Downloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        out_dir = self.base_dir / "era5"
+
+        return self._run_download(
+            "era5", out_dir,
+            lambda: ERA5Downloader(
+                variable=cfg.variable,  # type: ignore[arg-type]
+                output_dir=out_dir, dry_run=self.dry_run,
+            ),
+            lambda: dict(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=pad_start, end=pad_end,
+            ),
+            f"ERA5 ({cfg.variable})",
         )
 
     def _download_scatterometer_ftp(self, source, satellite: str) -> bool:

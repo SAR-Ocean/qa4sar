@@ -780,6 +780,89 @@ class TestPerSourceDownloadGating:
         mock_smos.assert_called_once()
 
 
+class TestLoadPreviousVariableAndEra5Gating:
+    """_load_previous_variable()/_already_succeeded("era5") together detect
+    the case where two recipes with identical geographic/temporal bounds
+    (so they share base_dir) request different recipe.config.variable
+    values -- e.g. wind_era5.yaml vs waves_era5.yaml. Scoped to era5 only,
+    matching cli.py's _is_already_downloaded's own era5-only scoping (see
+    TestIsAlreadyDownloaded in test_cli.py)."""
+
+    def _era5_recipe(self, variable):
+        cfg = RecipeConfig(
+            name="t", variable=variable,
+            geographic_bounds=GeographicBounds(-10.0, 10.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[ValidationDataSource(source_type="era5")],
+        )
+        return Recipe(cfg)
+
+    def test_load_previous_variable_reads_top_level_field(self, tmp_path):
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind", "downloads": {}, "errors": [],
+        }))
+        recipe = self._era5_recipe("wind")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        assert orchestrator._load_previous_variable() == "wind"
+
+    def test_load_previous_variable_none_when_metadata_missing(self, tmp_path):
+        recipe = self._era5_recipe("wind")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        assert orchestrator._load_previous_variable() is None
+
+    def test_already_succeeded_era5_true_when_variable_matches(self, tmp_path):
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"era5": {"status": "success"}},
+            "errors": [],
+        }))
+        recipe = self._era5_recipe("wind")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        orchestrator._previous_downloads = orchestrator._load_previous_downloads()
+        orchestrator._previous_variable = orchestrator._load_previous_variable()
+        assert orchestrator._already_succeeded("era5") is True
+
+    def test_already_succeeded_era5_false_when_variable_differs(self, tmp_path):
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"era5": {"status": "success"}},
+            "errors": [],
+        }))
+        recipe = self._era5_recipe("waves")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        orchestrator._previous_downloads = orchestrator._load_previous_downloads()
+        orchestrator._previous_variable = orchestrator._load_previous_variable()
+        assert orchestrator._already_succeeded("era5") is False
+
+    def test_already_succeeded_non_era5_source_ignores_variable_mismatch(self, tmp_path):
+        """A non-era5 source_type recorded successfully must not be
+        affected by a top-level variable mismatch -- the mismatch check in
+        _already_succeeded is explicitly scoped to source_type == "era5"."""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success"}},
+            "errors": [],
+        }))
+        recipe = self._era5_recipe("waves")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        orchestrator._previous_downloads = orchestrator._load_previous_downloads()
+        orchestrator._previous_variable = orchestrator._load_previous_variable()
+        assert orchestrator._already_succeeded("sar") is True
+
+
 class TestAmsrCoverageCutoffNotice:
     def _recipe_with_amsr(self, end_date: str):
         cfg = RecipeConfig(
@@ -902,3 +985,324 @@ class TestAmsrCoverageCutoffNotice:
         assert orchestrator.metadata["downloads"]["amsr_ssm"]["status"] == "success"
         assert orchestrator.metadata["errors"] == []
 
+
+class TestDownloadEra5:
+    def _recipe(self, variable="wind"):
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+        cfg = RecipeConfig(
+            name="t", variable=variable,
+            geographic_bounds=GeographicBounds(-10.0, 10.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-07-12T18:00:00", "2026-07-12T23:00:00"),
+            validation_sources=[ValidationDataSource(source_type="era5")],
+        )
+        return Recipe(cfg)
+
+    def test_dispatches_to_download_era5(self, tmp_path, monkeypatch):
+        from sar_validation.core.orchestrator import DataOrchestrator
+
+        recipe = self._recipe()
+        orch = DataOrchestrator(recipe, dry_run=True)
+        called = {}
+
+        def fake_download_era5(self, source):
+            called["source_type"] = source.source_type
+            return True
+
+        monkeypatch.setattr(DataOrchestrator, "_download_era5", fake_download_era5)
+        result = orch._dispatch_source(recipe.config.validation_sources[0])
+        assert result is True
+        assert called["source_type"] == "era5"
+
+    def test_download_era5_builds_downloader_with_recipe_variable(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from sar_validation.core.orchestrator import DataOrchestrator
+
+        recipe = self._recipe(variable="waves")
+        orch = DataOrchestrator(recipe, dry_run=True)
+
+        fake_dl = MagicMock()
+        fake_dl.download.return_value = []
+        fake_cls = MagicMock(return_value=fake_dl)
+
+        # _download_era5 does a local `from ..downloaders.era5_downloader
+        # import ERA5Downloader` -- patch the name on that module so the
+        # local import picks up the fake at call time.
+        import sar_validation.downloaders.era5_downloader as dl_mod
+        monkeypatch.setattr(dl_mod, "ERA5Downloader", fake_cls)
+
+        ok = orch._download_era5(recipe.config.validation_sources[0])
+        assert ok is True
+        assert fake_cls.call_args.kwargs["variable"] == "waves"
+
+
+class TestSarEmptyStopsPipeline:
+    def _recipe_with_validation_source(self) -> Recipe:
+        cfg = RecipeConfig(
+            name="test", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            sar_data=SARDataSpec(source="sentinel1_l2_ocn"),
+            validation_sources=[ValidationDataSource(source_type="scatterometer")],
+        )
+        return Recipe(cfg)
+
+    def test_zero_sar_products_skips_validation_downloads(self, tmp_path):
+        recipe = self._recipe_with_validation_source()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
+        ) as mock_scat_cls:
+            mock_sar = MagicMock()
+            mock_sar.download.return_value = []
+            mock_sar.found_count = 0
+            mock_sar_cls.return_value = mock_sar
+
+            ok = orchestrator.download_all()
+
+        mock_scat_cls.assert_not_called()
+        assert ok is True
+        assert orchestrator.metadata["sar_data_found"] is False
+        assert any("No SAR data found" in n for n in orchestrator.metadata["notices"])
+
+    def test_nonzero_sar_products_still_downloads_validation_sources(self, tmp_path):
+        recipe = self._recipe_with_validation_source()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
+        ) as mock_scat_cls:
+            mock_sar = MagicMock()
+            mock_sar.download.return_value = [tmp_path / "scene.SAFE"]
+            mock_sar.found_count = 1
+            mock_sar_cls.return_value = mock_sar
+
+            mock_scat = MagicMock()
+            mock_scat.download.return_value = []
+            mock_scat_cls.return_value = mock_scat
+
+            orchestrator.download_all()
+
+        mock_scat_cls.assert_called_once()
+        assert orchestrator.metadata["sar_data_found"] is True
+
+    def test_dry_run_also_stops_when_zero_sar_products_found(self, tmp_path):
+        recipe = self._recipe_with_validation_source()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
+        ) as mock_scat_cls:
+            mock_sar = MagicMock()
+            mock_sar.download.return_value = []
+            mock_sar.found_count = 0
+            mock_sar_cls.return_value = mock_sar
+
+            orchestrator.download_all()
+
+        mock_scat_cls.assert_not_called()
+
+    def test_sar_failure_does_not_trigger_the_stop(self, tmp_path):
+        """A SAR download that raises must keep today's behavior (continue
+        to validation downloads, ok=False) -- zero-found and failed are
+        different outcomes."""
+        recipe = self._recipe_with_validation_source()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
+        ) as mock_scat_cls:
+            mock_sar = MagicMock()
+            mock_sar.download.side_effect = RuntimeError("boom")
+            mock_sar_cls.return_value = mock_sar
+
+            mock_scat = MagicMock()
+            mock_scat.download.return_value = []
+            mock_scat_cls.return_value = mock_scat
+
+            ok = orchestrator.download_all()
+
+        mock_scat_cls.assert_called_once()
+        assert ok is False
+        assert orchestrator.metadata["sar_data_found"] is True
+
+    def test_already_succeeded_cache_restore_also_triggers_the_gate(self, tmp_path):
+        """A previous run's cached SAR entry with found_count == 0 must
+        stop download_all() the same way a fresh zero-result SAR download
+        does -- not just skip re-downloading SAR itself. Exercises the
+        `_already_succeeded("sar")` branch specifically, which is a
+        different code path from `previous_sar_data_found()` below (that
+        one is read by cli.py's resume shortcut, which never calls
+        download_all() at all)."""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success", "found_count": 0, "files": []}},
+        }))
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        with patch(
+            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
+        ) as mock_scat_cls:
+            ok = orchestrator.download_all()
+
+        mock_scat_cls.assert_not_called()
+        assert ok is True
+        assert orchestrator.metadata["sar_data_found"] is False
+
+    def test_already_succeeded_cache_restore_checks_disk_for_old_schema_empty_files(self, tmp_path):
+        """Old-schema metadata (recorded before found_count existed) can
+        have status=success, files=[] even though real products were
+        downloaded -- SARDownloader.download() only appends *newly*
+        downloaded files to the list it returns; a product already on
+        disk (skipped as a duplicate) is never appended, so a fully
+        successful run where every match was already cached still ends
+        up with files=[]. Confirmed live 2026-08-11: a copied-over
+        currents_useastcoast.yaml download_metadata.json from before
+        found_count existed was misread as "no SAR data found" despite
+        the SAFE files sitting right there in S1_L2_OCN/. Real files on
+        disk matching the source's file_glob must override the
+        ambiguous empty list."""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success", "files": []}},
+        }))
+        (tmp_path / "S1_L2_OCN" / "S1A_IW_OCN__2SDV_X.SAFE").mkdir(parents=True)
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        with patch(
+            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
+        ) as mock_scat_cls:
+            ok = orchestrator.download_all()
+
+        mock_scat_cls.assert_called_once()
+        assert ok is True
+        assert orchestrator.metadata["sar_data_found"] is True
+
+    def test_disk_check_backfills_found_count_into_saved_metadata(self, tmp_path):
+        """The disk-check fallback must heal the stale old-schema entry
+        in place, not just read through it -- otherwise every future run
+        re-triggers the same disk scan forever instead of the metadata
+        ever becoming self-consistent. Requested explicitly: 'backfill
+        the found_count to make sure download_metadata.json stays as
+        consistent as possible.'"""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success", "files": []}},
+        }))
+        (tmp_path / "S1_L2_OCN" / "S1A_IW_OCN__2SDV_X.SAFE").mkdir(parents=True)
+        (tmp_path / "S1_L2_OCN" / "S1B_IW_OCN__2SDV_Y.SAFE").mkdir(parents=True)
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        with patch("sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"):
+            orchestrator.download_all()
+
+        sar_entry = orchestrator.metadata["downloads"]["sar"]
+        assert sar_entry["found_count"] == 2
+        assert len(sar_entry["files"]) == 2
+        assert all(str(tmp_path / "S1_L2_OCN") in f for f in sar_entry["files"])
+
+        # And the healed entry is what actually gets written to disk.
+        saved = json.loads((tmp_path / "download_metadata.json").read_text())
+        assert saved["downloads"]["sar"]["found_count"] == 2
+
+    def test_previous_sar_data_found_reads_cached_metadata(self, tmp_path):
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success", "found_count": 0, "files": []}},
+        }))
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        assert orchestrator.previous_sar_data_found() is False
+
+    def test_previous_sar_data_found_falls_back_to_files_len(self, tmp_path):
+        """Back-compat: metadata written before this feature has no
+        found_count key at all; falls back to len(files)."""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success", "files": ["a.SAFE"]}},
+        }))
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        assert orchestrator.previous_sar_data_found() is True
+
+    def test_previous_sar_data_found_checks_disk_when_found_count_missing_and_files_empty(
+        self, tmp_path,
+    ):
+        """Same old-schema gap as test_already_succeeded_cache_restore_
+        checks_disk_for_old_schema_empty_files above, but for the CLI
+        resume-shortcut code path (previous_sar_data_found), which never
+        calls download_all()."""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success", "files": []}},
+        }))
+        (tmp_path / "S1_L2_OCN" / "S1A_IW_OCN__2SDV_X.SAFE").mkdir(parents=True)
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        assert orchestrator.previous_sar_data_found() is True
+
+    def test_previous_sar_data_found_still_false_when_nothing_on_disk_either(self, tmp_path):
+        """Same old-schema entry, but genuinely no SAR products anywhere
+        on disk -- the new disk-check fallback must not fabricate a
+        match just because a directory was created."""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success", "files": []}},
+        }))
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        assert orchestrator.previous_sar_data_found() is False
+
+    def test_previous_sar_data_found_true_when_no_previous_run(self, tmp_path):
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        assert orchestrator.previous_sar_data_found() is True

@@ -1,0 +1,42 @@
+name: waves_era5
+description: 'Validate Sentinel-1 significant wave height (WV/SM modes)
+  against ERA5 reanalysis (significant height of combined wind waves and swell).'
+version: '1.0'
+variable: waves
+geographic_bounds:
+  min_lon: -70.0
+  max_lon: -20.0
+  min_lat: 0.0
+  max_lat: 40.0
+temporal_bounds:
+  start: '2026-07-12 07:00:00'
+  end: '2026-07-12 11:00:00'
+sar_data:
+  source: sentinel1_l2_ocn
+  swath_mode:
+  - WV
+  - SM
+  max_downloads: null
+validation_sources:
+- source_type: era5
+  download_kwargs: {}
+  collocation_kwargs: {}
+collocation:
+  point_vs_layer:
+    time_tolerance_minutes: 30
+    spatial_tolerance_km: 25
+    interpolation_method: nearest
+    aggregation_window_km: 5.0
+    validation_temporal_averaging_minutes: 30
+    distance_weighting: gaussian
+    gaussian_sigma_km: 2.0
+  sar_footprint_radius_km: 14.0
+  layer_vs_layer:
+    layer_type_specs:
+      era5_waves:
+        method: cell-averaging
+        temporal_method: hyperbolic
+        aggregation_window_km: 12.5
+        distance_weighting: equal
+    method: cell-averaging
+output_dir: null

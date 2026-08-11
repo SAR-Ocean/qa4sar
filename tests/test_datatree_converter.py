@@ -53,6 +53,7 @@ def _make_ocn_safe(
     nx: int = 4,
     seed: int = 0,
     land_rows: int = 0,
+    owi_land_rows: int = 0,
 ) -> Path:
     """
     Build a *.SAFE dir containing one '-ocn-' measurement NetCDF.
@@ -63,6 +64,12 @@ def _make_ocn_safe(
     land_rows=N -> the first N rows of the rvlAzSize axis are written with
         rvlLandFlag=1 (land) across every column/swath; the rest are 0.
         land_rows=0 (default) omits rvlLandFlag entirely, simulating a
+        product that doesn't carry it.
+    owi_land_rows=N -> the first N rows of the owiAzSize axis are written
+        with owiMask land-bit set (row 0 uses combo value 5 = land +
+        no_data, mirroring a real product's bitmask combinations; the rest
+        of the land rows use plain 1); the remaining rows are 0 (valid).
+        owi_land_rows=0 (default) omits owiMask entirely, simulating a
         product that doesn't carry it.
     """
     rng = np.random.default_rng(seed)
@@ -77,6 +84,12 @@ def _make_ocn_safe(
         data["owiWindDirection"] = (odims, rng.uniform(0, 360, (ny, nx)).astype("float32"))
         data["owiLon"] = (odims, rng.uniform(-20.0, -19.0, (ny, nx)).astype("float32"))
         data["owiLat"] = (odims, rng.uniform(50.0, 51.0, (ny, nx)).astype("float32"))
+        if owi_land_rows > 0:
+            owi_mask = np.zeros((ny, nx), dtype="int8")
+            owi_mask[:owi_land_rows, :] = 1
+            if owi_land_rows > 1:
+                owi_mask[0, :] = 5  # land + no_data combo, first row
+            data["owiMask"] = (odims, owi_mask)
 
     if rvl_swaths is not None:
         if wv:
@@ -258,6 +271,41 @@ class TestFromInsituCsv:
 
         ds = DataTreeConverter.from_insitu_csv(path, source_type="tidal_gauge")
         assert set(ds["platform_type"].values) == {"tidal_gauge"}
+
+    def test_wave_height_precedence_when_platform_reports_both_vhm0_and_vavh(self, tmp_path):
+        """A CMEMS in-situ platform can report both VHM0 (spectral Hm0) and
+        VAVH (time-domain H1/3) for the same observation -- confirmed live
+        2026-08-10 (mooring 6200442, VAVH=1.0/VHM0=1.1 in the same
+        collocation row). Left as-is, that single observation lands in BOTH
+        the oswTotalHs_vs_VAVH (paired with altimeter) and
+        oswTotalHs_vs_VHM0 (paired with era5) report sections --
+        double-counting one physical reading across two comparisons.
+        Only the highest-precedence column (VHM0 > VAVH > VGHS, matching
+        _variable_map.py's own wave_val_params order) should survive per
+        row; a platform reporting only one of them is untouched."""
+        df = pd.DataFrame({
+            "longitude": [-10.0, -9.0, -8.0],
+            "latitude":  [50.0, 51.0, 52.0],
+            "time":      pd.date_range("2026-01-01", periods=3, freq="h"),
+            "VHM0":      [1.1, np.nan, 2.2],
+            "VAVH":      [1.0, 3.0,    np.nan],
+            "platform_id": ["MO001", "MO002", "MO003"],
+            "platform_type": ["MO", "MO", "MO"],
+        })
+        path = tmp_path / "insitu_waves.csv"
+        df.to_csv(path, index=False)
+
+        ds = DataTreeConverter.from_insitu_csv(path, source_type="mooring")
+
+        # Row 0: both reported -- VHM0 (higher precedence) wins, VAVH nulled.
+        assert ds["VHM0"].values[0] == pytest.approx(1.1)
+        assert math.isnan(ds["VAVH"].values[0])
+        # Row 1: only VAVH reported -- untouched.
+        assert ds["VAVH"].values[1] == pytest.approx(3.0)
+        assert math.isnan(ds["VHM0"].values[1])
+        # Row 2: only VHM0 reported -- untouched.
+        assert ds["VHM0"].values[2] == pytest.approx(2.2)
+        assert math.isnan(ds["VAVH"].values[2])
 
 
 # ---------------------------------------------------------------------------
@@ -1606,6 +1654,97 @@ class TestIwSafeCurrentsNoOwiFallback:
 
 
 # ---------------------------------------------------------------------------
+# _extract_owi_grid_data (land masking via owiMask)
+# ---------------------------------------------------------------------------
+
+class TestOwiMaskLandFiltering:
+    def test_land_bit_masks_windspeed_and_direction(self, tmp_path):
+        safe = _make_ocn_safe(
+            tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=None, ny=5, nx=4, owi_land_rows=2,
+        )
+        raw = xr.open_dataset(
+            safe / "measurement"
+            / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+        raw_speed = raw["owiWindSpeed"].values.copy()
+        raw_dir = raw["owiWindDirection"].values.copy()
+        raw_mask = raw["owiMask"].values.copy()
+        raw.close()
+
+        ds = DataTreeConverter._extract_owi_grid_data(safe / "measurement", safe)
+        assert ds is not None
+
+        land_rows = 2
+        # Land-flagged rows (first 2, values 5 and 1) -> NaN in both
+        # owiWindSpeed and owiWindDirection.
+        assert np.isnan(ds["owiWindSpeed"].values[:land_rows, :]).all()
+        assert np.isnan(ds["owiWindDirection"].values[:land_rows, :]).all()
+        # Valid rows (owiMask == 0) are unchanged from the raw synthetic
+        # values.
+        np.testing.assert_array_equal(
+            ds["owiWindSpeed"].values[land_rows:, :], raw_speed[land_rows:, :]
+        )
+        np.testing.assert_array_equal(
+            ds["owiWindDirection"].values[land_rows:, :], raw_dir[land_rows:, :]
+        )
+        # owiMask itself passes through unmodified for downstream inspection.
+        np.testing.assert_array_equal(ds["owiMask"].values, raw_mask)
+
+        land_n = land_rows * 4  # nx
+        assert ds.attrs["owi_land_pixel_count"] == land_n
+        assert ds.attrs["owi_land_pixel_fraction"] == pytest.approx(land_n / (5 * 4))
+
+    def test_zero_land_pixels_no_masking(self, tmp_path):
+        # owi_land_rows=0 (default) -> no owiMask written at all -> nothing
+        # masked, matching the RVL land_rows=0 convention.
+        safe = _make_ocn_safe(tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=None, ny=5, nx=4)
+        ds = DataTreeConverter._extract_owi_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert np.isfinite(ds["owiWindSpeed"].values).all()
+        assert np.isfinite(ds["owiWindDirection"].values).all()
+        assert ds.attrs["owi_land_pixel_count"] == 0
+
+    def test_land_masking_is_logged(self, tmp_path, caplog):
+        safe = _make_ocn_safe(
+            tmp_path, "S1A_EW_OCN.SAFE", rvl_swaths=None, ny=5, nx=4, owi_land_rows=2,
+        )
+        with caplog.at_level("WARNING"):
+            ds = DataTreeConverter._extract_owi_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert any(
+            "land-flagged" in r.message and "owiMask" in r.message
+            for r in caplog.records
+        )
+
+    def test_ice_and_rfi_bits_not_filtered(self, tmp_path):
+        # Scope check: only the land bit (1) is filtered. Ice (2) and rfi
+        # (8) pixels must be left untouched (no follow-up implemented yet).
+        ny, nx = 3, 2
+        rng = np.random.default_rng(7)
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        owi_mask = np.array([[2, 2], [8, 8], [0, 0]], dtype="int8")
+        ds_raw = xr.Dataset(
+            {
+                "owiWindSpeed": (odims, rng.uniform(2, 15, (ny, nx)).astype("float32")),
+                "owiWindDirection": (odims, rng.uniform(0, 360, (ny, nx)).astype("float32")),
+                "owiLon": (odims, rng.uniform(-20.0, -19.0, (ny, nx)).astype("float32")),
+                "owiLat": (odims, rng.uniform(50.0, 51.0, (ny, nx)).astype("float32")),
+                "owiMask": (odims, owi_mask),
+            },
+            attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
+        )
+        ds_raw.to_netcdf(meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc")
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+        assert ds is not None
+        assert np.isfinite(ds["owiWindSpeed"].values).all()
+        assert np.isfinite(ds["owiWindDirection"].values).all()
+        assert ds.attrs["owi_land_pixel_count"] == 0
+
+
+# ---------------------------------------------------------------------------
 # from_sar_l2_ocn_safe (WV product type routing)
 # ---------------------------------------------------------------------------
 
@@ -2695,3 +2834,456 @@ class TestConvertDownloadedDataCdsSsm:
         (node,) = tree["validation/cds_ssm"].children.values()
         ds = node.to_dataset()
         assert ds["SOIL_MOISTURE"].attrs["units"] == "m3 m-3"
+
+
+class TestNormalizeEra5GribCoords:
+    """_normalize_era5_grib_coords (added in commit 7fcba5b) has no
+    dedicated test anywhere -- every from_era5 fixture in this file
+    already writes pre-normalized time/latitude/longitude names, so this
+    function's actual GRIB-bookkeeping-coordinate-stripping logic is
+    never exercised by any other test (I2). Real CDS netcdf-via-cfgrib
+    responses name the time dimension "valid_time" (not "time") and add
+    "number" (ensemble member) and "expver" (experiment version, shaped
+    (valid_time,) -- not scalar) bookkeeping coordinates."""
+
+    def test_valid_time_renamed_and_number_expver_dropped(self):
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import _normalize_era5_grib_coords
+
+        n_time, n_lat, n_lon = 3, 2, 2
+        valid_time = xr.date_range("2026-07-12T00:00:00", periods=n_time, freq="1h")
+        raw = xr.Dataset(
+            {
+                "u10": (("valid_time", "latitude", "longitude"), np.random.rand(n_time, n_lat, n_lon)),
+            },
+            coords={
+                "valid_time": valid_time,
+                "latitude": np.linspace(40.0, 41.0, n_lat),
+                "longitude": np.linspace(-10.0, -9.0, n_lon),
+                "number": 0,
+                # Real CDS files carry expver shaped (valid_time,), not
+                # scalar -- e.g. every hour tagged "0001" (final ERA5).
+                "expver": ("valid_time", ["0001"] * n_time),
+            },
+        )
+
+        result = _normalize_era5_grib_coords(raw)
+
+        assert "time" in result.dims and "time" in result.coords
+        assert "valid_time" not in result.dims and "valid_time" not in result.coords
+        assert "number" not in result.coords
+        assert "expver" not in result.coords
+        assert "lat" in result.coords and "lon" in result.coords
+        np.testing.assert_array_equal(result["time"].values, valid_time.values)
+
+    def test_noop_when_already_normalized(self):
+        """A file that already has time/lat/lon (e.g. this test suite's
+        own from_era5 fixtures, or a genuinely pre-normalized file) must
+        pass through unchanged -- no crash from a missing "latitude" etc."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import _normalize_era5_grib_coords
+
+        raw = xr.Dataset(
+            {"u10": (("time", "lat", "lon"), np.random.rand(2, 2, 2))},
+            coords={
+                "time": xr.date_range("2026-07-12T00:00:00", periods=2, freq="1h"),
+                "lat": [40.0, 41.0],
+                "lon": [-10.0, -9.0],
+            },
+        )
+
+        result = _normalize_era5_grib_coords(raw)
+
+        assert set(result.dims) == {"time", "lat", "lon"}
+        assert "number" not in result.coords and "expver" not in result.coords
+
+
+class TestFromEra5:
+    def _write_era5_nc(self, path, var_names, n_lat=4, n_lon=4, n_time=3, start_hour="2026-07-12T00:00:00"):
+        import numpy as np
+        import xarray as xr
+
+        lat = np.linspace(40.0, 41.5, n_lat)
+        lon = np.linspace(-10.0, -8.5, n_lon)
+        time = xr.date_range(start_hour, periods=n_time, freq="1h")
+        arrays = {
+            v: np.random.rand(n_time, n_lat, n_lon).astype("float32") for v in var_names
+        }
+        data_vars = {v: (("time", "latitude", "longitude"), arr) for v, arr in arrays.items()}
+        ds = xr.Dataset(data_vars, coords={"time": time, "latitude": lat, "longitude": lon})
+        ds.to_netcdf(path)
+        return arrays
+
+    def test_descending_latitude_axis_is_sorted_ascending(self, tmp_path):
+        """I1 regression: real CDS ERA5 responses always return latitude
+        DESCENDING (north -> south, e.g. 60.25, 60.00, ..., 34.75), not
+        ascending like every other fixture in this test class. This only
+        "worked" before because scipy>=1.10's RegularGridInterpolator
+        happens to tolerate descending axes -- from_era5 must establish a
+        genuinely ascending axis itself (via an explicit sortby), matching
+        build_spatial_interpolator's documented invariant regardless of
+        the installed scipy version."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        n_lat, n_lon, n_time = 4, 4, 3
+        lat = np.linspace(42.0, 40.0, n_lat)  # descending, CDS's real order
+        lon = np.linspace(-10.0, -8.5, n_lon)
+        time = xr.date_range("2026-07-12T00:00:00", periods=n_time, freq="1h")
+        ds_in = xr.Dataset(
+            {
+                "u10": (("time", "latitude", "longitude"), np.random.rand(n_time, n_lat, n_lon).astype("float32")),
+                "v10": (("time", "latitude", "longitude"), np.random.rand(n_time, n_lat, n_lon).astype("float32")),
+            },
+            coords={"time": time, "latitude": lat, "longitude": lon},
+        )
+        nc_path = tmp_path / "era5_wind_20260712.nc"
+        ds_in.to_netcdf(nc_path)
+
+        ds = DataTreeConverter.from_era5(nc_path, "wind")
+        assert ds is not None
+        assert np.all(np.diff(ds["lat"].values) > 0)
+        # Sorting lat must not scramble which u10 value belongs to which
+        # latitude -- the sorted lat=40.0 row must still carry the values
+        # originally written at lat=40.0 (the LAST row of the descending
+        # input fixture), not accidentally swapped with lat=42.0's row.
+        original_ds = xr.open_dataset(nc_path)
+        for lat_val in lat:
+            original_row = original_ds["u10"].sel(latitude=lat_val).values
+            sorted_row = ds["u10"].sel(lat=lat_val).values
+            np.testing.assert_allclose(sorted_row, original_row, rtol=1e-5)
+        original_ds.close()
+
+    def test_wind_returns_gridded_dataset_with_correct_data_type(self, tmp_path):
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_wind_20260712.nc"
+        arrays = self._write_era5_nc(nc_path, ["u10", "v10"])
+
+        ds = DataTreeConverter.from_era5(nc_path, "wind")
+        assert ds is not None
+        assert ds.attrs["data_type"] == "era5_wind"
+        assert set(ds.dims) == {"time", "lat", "lon"}
+        # u10/v10 are kept as raw components -- NOT renamed/derived into
+        # WSPD/WDIR here. WDIR is a circular quantity and this Dataset is
+        # exactly what gets bilinearly/hyperbolically interpolated at
+        # collocation time; deriving WDIR before that interpolation would
+        # break across the 0/360 seam (see C1 fix,
+        # model_collocation._derive_wind_wspd_wdir, which now does this
+        # derivation AFTER interpolation instead).
+        assert "u10" in ds.data_vars and "v10" in ds.data_vars
+        assert "WSPD" not in ds.data_vars and "WDIR" not in ds.data_vars
+        np.testing.assert_allclose(ds["u10"].values, arrays["u10"], rtol=1e-5)
+        np.testing.assert_allclose(ds["v10"].values, arrays["v10"], rtol=1e-5)
+        # CF attrs from _ERA5_VARS's wind entry must be preserved.
+        assert ds["u10"].attrs["standard_name"] == "eastward_wind"
+        assert ds["v10"].attrs["standard_name"] == "northward_wind"
+
+    def test_wind_lsm_present_becomes_lat_lon_coord_not_data_var(self, tmp_path):
+        """land_sea_mask ("lsm" on the wire) is a per-cell land-mask
+        LOOKUP, not a per-hour model quantity to interpolate/report at
+        collocation points -- it must not show up as a spurious extra
+        val_<name> statistics column downstream. Keeping it as a
+        coordinate (not a data_var) achieves that for free: every
+        downstream consumer that iterates `era5_ds.data_vars`
+        (_model_values_at_points, _collocate_cell_averaging_grid) already
+        skips coordinates automatically."""
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_wind_20260712.nc"
+        arrays = self._write_era5_nc(nc_path, ["u10", "v10", "lsm"], n_time=3)
+
+        ds = DataTreeConverter.from_era5(nc_path, "wind")
+        assert ds is not None
+        assert "lsm" not in ds.data_vars
+        assert "lsm" in ds.coords
+        # Time-invariant in reality (CDS just echoes it per-hour) -- kept
+        # collapsed to (lat, lon) only, matching the raw fixture's
+        # first-hour slice.
+        assert set(ds["lsm"].dims) == {"lat", "lon"}
+        np.testing.assert_allclose(ds["lsm"].values, arrays["lsm"][0])
+
+    def test_wind_without_lsm_still_works(self, tmp_path):
+        """Backward compatibility: a wind file with no lsm variable (e.g.
+        a fixture or an older cached download) must not crash, and the
+        Dataset simply has no lsm coord."""
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_wind_20260712.nc"
+        self._write_era5_nc(nc_path, ["u10", "v10"])
+
+        ds = DataTreeConverter.from_era5(nc_path, "wind")
+        assert ds is not None
+        assert "lsm" not in ds.coords
+        assert "lsm" not in ds.data_vars
+
+    def test_waves_lsm_not_extracted_even_if_present(self, tmp_path):
+        """lsm extraction is scoped to wind only -- waves never requests
+        it (see era5_downloader.py), but even if a stray lsm variable
+        showed up in a waves file, from_era5 must not extract it (only the
+        wind branch does)."""
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_waves_20260712.nc"
+        self._write_era5_nc(nc_path, ["swh", "lsm"])
+
+        ds = DataTreeConverter.from_era5(nc_path, "waves")
+        assert ds is not None
+        assert "lsm" not in ds.coords
+        assert "lsm" not in ds.data_vars
+
+    def test_wind_components_hand_checkable_case_passthrough(self, tmp_path):
+        """u10=0, v10=-1 is wind blowing FROM the north (northerly wind) --
+        from_era5 must pass these raw components through unchanged (no
+        WSPD/WDIR derivation at conversion time any more). The
+        corresponding WDIR=0/360 hand-check now lives in
+        test_model_collocation.py against `_derive_wind_wspd_wdir`, which
+        runs the derivation AFTER interpolation instead (see C1 fix)."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        lat = np.array([40.0])
+        lon = np.array([-10.0])
+        time = xr.date_range("2026-07-12T00:00:00", periods=1, freq="1h")
+        ds_in = xr.Dataset(
+            {
+                "u10": (("time", "latitude", "longitude"), np.zeros((1, 1, 1), dtype="float32")),
+                "v10": (("time", "latitude", "longitude"), -np.ones((1, 1, 1), dtype="float32")),
+            },
+            coords={"time": time, "latitude": lat, "longitude": lon},
+        )
+        nc_path = tmp_path / "era5_wind_20260712.nc"
+        ds_in.to_netcdf(nc_path)
+
+        ds = DataTreeConverter.from_era5(nc_path, "wind")
+        assert ds is not None
+        assert float(ds["u10"].values.ravel()[0]) == pytest.approx(0.0)
+        assert float(ds["v10"].values.ravel()[0]) == pytest.approx(-1.0)
+
+    def test_waves_returns_vhm0_variable(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_waves_20260712.nc"
+        self._write_era5_nc(nc_path, ["swh"])
+
+        ds = DataTreeConverter.from_era5(nc_path, "waves")
+        assert ds is not None
+        assert ds.attrs["data_type"] == "era5_waves"
+        assert "VHM0" in ds.data_vars
+        assert "swh" not in ds.data_vars
+
+    def test_soil_moisture_returns_soil_moisture_variable(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_soil_moisture_20260712.nc"
+        self._write_era5_nc(nc_path, ["swvl1"])
+
+        ds = DataTreeConverter.from_era5(nc_path, "soil_moisture")
+        assert ds is not None
+        assert ds.attrs["data_type"] == "era5_soil_moisture"
+        assert "SOIL_MOISTURE" in ds.data_vars
+        assert "swvl1" not in ds.data_vars
+
+    def test_multiple_daily_files_concatenated_along_time(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        day1 = tmp_path / "era5_wind_20260712.nc"
+        day2 = tmp_path / "era5_wind_20260713.nc"
+        self._write_era5_nc(day1, ["u10", "v10"], n_time=24, start_hour="2026-07-12T00:00:00")
+        self._write_era5_nc(day2, ["u10", "v10"], n_time=24, start_hour="2026-07-13T00:00:00")
+
+        ds = DataTreeConverter.from_era5([day1, day2], "wind")
+        assert ds is not None
+        assert ds.sizes["time"] == 48
+
+    def test_unknown_variable_returns_none(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_currents_20260712.nc"
+        self._write_era5_nc(nc_path, ["u10"])
+
+        assert DataTreeConverter.from_era5(nc_path, "currents") is None
+
+    def test_missing_file_returns_none(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        assert DataTreeConverter.from_era5(tmp_path / "nope.nc", "wind") is None
+
+    def test_missing_expected_variable_returns_none(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "era5_wind_20260712.nc"
+        self._write_era5_nc(nc_path, ["v10"])  # missing u10
+
+        assert DataTreeConverter.from_era5(nc_path, "wind") is None
+
+
+class TestConvertDownloadedDataEra5:
+    def test_era5_dir_discovered_and_combined_into_one_node(self, tmp_path):
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+        )
+
+        era5_dir = tmp_path / "era5"
+        era5_dir.mkdir()
+        lat = np.linspace(40.0, 41.5, 4)
+        lon = np.linspace(-10.0, -8.5, 4)
+        for day, stem in [("2026-07-12T00:00:00", "20260712"), ("2026-07-13T00:00:00", "20260713")]:
+            time = xr.date_range(day, periods=24, freq="1h")
+            ds = xr.Dataset(
+                {
+                    "u10": (("time", "latitude", "longitude"), np.random.rand(24, 4, 4).astype("float32")),
+                    "v10": (("time", "latitude", "longitude"), np.random.rand(24, 4, 4).astype("float32")),
+                },
+                coords={"time": time, "latitude": lat, "longitude": lon},
+            )
+            ds.to_netcdf(era5_dir / f"era5_wind_{stem}.nc")
+
+        recipe = Recipe(RecipeConfig(
+            name="t", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, -8.5, 40.0, 41.5),
+            temporal_bounds=TemporalBounds("2026-07-12", "2026-07-13"),
+        ))
+
+        tree = DataTreeConverter.convert_downloaded_data(tmp_path, recipe=recipe)
+        assert tree is not None
+        era5_ds = tree["validation/era5/era5"].to_dataset()
+        assert era5_ds.sizes["time"] == 48
+        assert era5_ds.attrs["data_type"] == "era5_wind"
+
+    def test_stale_files_from_other_variable_are_ignored(self, tmp_path):
+        """Reruns of a recipe with a different `variable` in the same output
+        dir must not have their leftover era5_<other>_*.nc files globbed in
+        alongside the current variable's files (see HF-radar stale-cache
+        incident for the same bug class)."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+        )
+
+        era5_dir = tmp_path / "era5"
+        era5_dir.mkdir()
+        lat = np.linspace(40.0, 41.5, 4)
+        lon = np.linspace(-10.0, -8.5, 4)
+
+        # Current variable: wind, single day, 24 hourly steps.
+        wind_time = xr.date_range("2026-07-12T00:00:00", periods=24, freq="1h")
+        wind_ds = xr.Dataset(
+            {
+                "u10": (("time", "latitude", "longitude"), np.random.rand(24, 4, 4).astype("float32")),
+                "v10": (("time", "latitude", "longitude"), np.random.rand(24, 4, 4).astype("float32")),
+            },
+            coords={"time": wind_time, "latitude": lat, "longitude": lon},
+        )
+        wind_ds.to_netcdf(era5_dir / "era5_wind_20260712.nc")
+
+        # Stale leftover from a previous run of a different recipe/variable
+        # (waves) that was never cleared out of the shared output dir.
+        waves_time = xr.date_range("2026-07-11T00:00:00", periods=24, freq="1h")
+        waves_ds = xr.Dataset(
+            {"swh": (("time", "latitude", "longitude"), np.random.rand(24, 4, 4).astype("float32"))},
+            coords={"time": waves_time, "latitude": lat, "longitude": lon},
+        )
+        waves_ds.to_netcdf(era5_dir / "era5_waves_20260711.nc")
+
+        recipe = Recipe(RecipeConfig(
+            name="t", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, -8.5, 40.0, 41.5),
+            temporal_bounds=TemporalBounds("2026-07-12", "2026-07-12"),
+        ))
+
+        tree = DataTreeConverter.convert_downloaded_data(tmp_path, recipe=recipe)
+        assert tree is not None
+        era5_ds = tree["validation/era5/era5"].to_dataset()
+
+        # Only the wind file's 24 timesteps should appear -- the stale waves
+        # file must be ignored, not concatenated in.
+        assert era5_ds.sizes["time"] == 24
+        assert era5_ds.attrs["data_type"] == "era5_wind"
+        assert "swh" not in era5_ds.data_vars
+        assert "VHM0" not in era5_ds.data_vars
+        assert "u10" in era5_ds.data_vars and not era5_ds["u10"].isnull().any()
+
+
+class TestFromEra5Antimeridian:
+    def _write_window_nc(self, path, lon_values, n_lat=3, n_time=3, start_hour="2026-07-12T00:00:00"):
+        import numpy as np
+        import xarray as xr
+
+        lat = np.linspace(40.0, 42.0, n_lat)
+        lon = np.array(lon_values)
+        time = xr.date_range(start_hour, periods=n_time, freq="1h")
+        u10 = np.random.rand(n_time, n_lat, len(lon)).astype("float32")
+        v10 = np.random.rand(n_time, n_lat, len(lon)).astype("float32")
+        ds = xr.Dataset(
+            {
+                "u10": (("time", "latitude", "longitude"), u10),
+                "v10": (("time", "latitude", "longitude"), v10),
+            },
+            coords={"time": time, "latitude": lat, "longitude": lon},
+        )
+        ds.to_netcdf(path)
+
+    def test_group_by_day_separates_window_pairs_from_single_files(self, tmp_path):
+        from sar_validation.core.datatree_converter import _group_era5_paths_by_day
+
+        paths = [
+            tmp_path / "era5_wind_20260712_w0.nc",
+            tmp_path / "era5_wind_20260712_w1.nc",
+            tmp_path / "era5_wind_20260713.nc",
+        ]
+        groups = _group_era5_paths_by_day(paths)
+        assert groups == {
+            "era5_wind_20260712": [paths[0], paths[1]],
+            "era5_wind_20260713": [paths[2]],
+        }
+
+    def test_stitch_helper_returns_none_if_window_missing(self, tmp_path):
+        from sar_validation.core.datatree_converter import _stitch_antimeridian_window_files
+
+        w0 = tmp_path / "era5_wind_20260712_w0.nc"
+        self._write_window_nc(w0, [175.0, 180.0])
+
+        assert _stitch_antimeridian_window_files([w0]) is None
+
+    def test_stitches_two_window_files_into_one_contiguous_lon_axis(self, tmp_path):
+        import numpy as np
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        east = tmp_path / "era5_wind_20260712_w0.nc"
+        west = tmp_path / "era5_wind_20260712_w1.nc"
+        self._write_window_nc(east, [175.0, 177.5, 180.0])
+        self._write_window_nc(west, [-180.0, -177.5, -175.0])
+
+        ds = DataTreeConverter.from_era5([east, west], "wind")
+        assert ds is not None
+        lon = sorted(ds["lon"].values.tolist())
+        # West window shifted by +360: [-180,-177.5,-175] -> [180,182.5,185]
+        assert np.allclose(lon, [175.0, 177.5, 180.0, 182.5, 185.0])
+        assert all(b > a for a, b in zip(lon, lon[1:]))  # strictly increasing after stitch

@@ -167,6 +167,7 @@ class SARDownloader:
             min_lat=min_lat, max_lat=max_lat,
             start=start, end=end, modes=modes, top=top,
         )
+        self.found_count = len(df)
 
         if df.empty:
             print("No Sentinel-1 L2_OCN products found.")

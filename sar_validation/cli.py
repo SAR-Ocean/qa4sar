@@ -37,6 +37,8 @@ if TYPE_CHECKING:
     # guard a type checker can't resolve ``xr`` in those annotations.
     import xarray as xr
 
+    from .core.recipe import Recipe
+
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
@@ -502,6 +504,10 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
             ValidationDataSource(source_type="scatterometer_hy2b"),
             ValidationDataSource(source_type="scatterometer_hy2c"),
             ValidationDataSource(source_type="scatterometer_oceansat3"),
+            # ERA5 reanalysis (Copernicus CDS) -- tuning comes from
+            # DEFAULT_LAYER_TYPE_SPECS's "era5_wind" entry (recipe.py), no
+            # per-recipe layer_vs_layer override needed.
+            ValidationDataSource(source_type="era5"),
         ],
         collocation=CollocationType(
             point_vs_layer=PointVsLayerCollocation(),
@@ -611,6 +617,10 @@ def _build_waves_config(limit: Optional[int] = None, sar_source: str = "sentinel
             ValidationDataSource(source_type="tidal_gauge"),
             ValidationDataSource(source_type="drifter"),
             ValidationDataSource(source_type="altimeter"),
+            # ERA5 reanalysis (Copernicus CDS) -- tuning comes from
+            # DEFAULT_LAYER_TYPE_SPECS's "era5_waves" entry (recipe.py), no
+            # per-recipe layer_vs_layer override needed.
+            ValidationDataSource(source_type="era5"),
         ],
         collocation=CollocationType(
             point_vs_layer=PointVsLayerCollocation(),
@@ -722,6 +732,10 @@ def _build_soil_moisture_config(limit: Optional[int] = None, sar_source: str = "
                 source_type="cds_ssm",
                 download_kwargs={"product_type": cds_product_type},
             ),
+            # ERA5-Land reanalysis (Copernicus CDS) -- tuning comes from
+            # DEFAULT_LAYER_TYPE_SPECS's "era5_soil_moisture" entry
+            # (recipe.py), no per-recipe layer_vs_layer override needed.
+            ValidationDataSource(source_type="era5"),
         ],
         collocation=CollocationType(
             point_vs_layer=PointVsLayerCollocation(
@@ -859,7 +873,13 @@ def _execute_recipe(
 
     # Skip download if data was already downloaded successfully and not forcing re-download
     download_step_ran = False
-    if not dry_run and not force_download and _is_already_downloaded(orchestrator.base_dir):
+    if not dry_run and not force_download and _is_already_downloaded(orchestrator.base_dir, recipe):
+        if not orchestrator.previous_sar_data_found():
+            print(
+                "\nNo SAR data found for this window — stopping before "
+                "validation downloads and further pipeline steps."
+            )
+            return
         logger.info(
             "Data already downloaded in %s — skipping Step 1.",
             orchestrator.base_dir,
@@ -869,6 +889,19 @@ def _execute_recipe(
     else:
         download_step_ran = True
         success = orchestrator.download_all()
+
+        if not orchestrator.metadata.get("sar_data_found", True):
+            if dry_run:
+                print(
+                    "\nNo SAR data found for this window — stopping dry run "
+                    "before validation sources."
+                )
+            else:
+                print(
+                    "\nNo SAR data found for this window — stopping before "
+                    "validation downloads and further pipeline steps."
+                )
+            return
 
         if dry_run:
             print("\nDry run complete — no data was downloaded.")
@@ -939,14 +972,75 @@ def _execute_recipe(
             print(f"  - {w}")
 
 
-def _is_already_downloaded(base_dir: Path) -> bool:
+def _is_already_downloaded(base_dir: Path, recipe: Optional["Recipe"] = None) -> bool:
     """Return True if *base_dir* has a download_metadata.json with no
     errors and no source still stuck "awaiting_manual_archive" (ISMN's
     status when the shared archive hasn't been placed yet -- 0 files were
     collected, but that's deliberately not an "error", so the top-level
     errors list alone can't tell "genuinely fully downloaded" apart from
-    "silently missing a source forever" without this extra check)."""
+    "silently missing a source forever" without this extra check).
+
+    Also returns False when *recipe* requests an ``era5`` validation source
+    and its ``variable`` differs from the recorded run's -- two recipes
+    with identical geographic/temporal bounds share ``base_dir`` (e.g.
+    ``wind_era5.yaml`` and ``waves_era5.yaml`` both cover the same bbox/
+    window to reuse the SAR download), but ERA5's downloaded file depends
+    on ``variable`` (``era5_<variable>_<day>.nc``, an entirely different
+    CDS dataset/variable set per variable) -- unlike SAR, whose L2 OCN
+    product already contains every OWI field regardless of which recipe
+    downloaded it. Without this check, Step 1 is skipped wholesale and the
+    new variable's ERA5 data is never fetched (confirmed live 2026-08-07:
+    waves_era5.yaml run right after wind_era5.yaml produced a DataTree with
+    zero era5 nodes). Falling through to ``orchestrator.download_all()``
+    here is safe/cheap: its own per-source ``_already_succeeded`` check
+    (see ``DataOrchestrator._load_previous_variable``) still skips
+    re-downloading SAR, only ERA5 actually re-dispatches.
+
+    This mismatch check is deliberately scoped to recipes that actually
+    request an ``era5`` source -- matching ``DataOrchestrator.
+    _already_succeeded``'s own ``source_type == "era5"`` scoping. Without
+    that scoping, ANY non-ERA5 recipe pair sharing a ``base_dir`` with a
+    differing ``variable`` (recorded once, globally, per run -- not
+    per-source) would have this fast path bypassed on every rerun, forcing
+    every ``_HISTORICAL_FIRST_TYPES`` source (hf_radar_historical,
+    adcp_historical, argo_historical, drifter_historical,
+    glider_historical) to redispatch unconditionally, since step 2 of
+    ``download_all()`` has no ``_already_succeeded`` gate of its own.
+
+    Also returns False when *recipe* requests a validation source_type
+    that is NOT present among the recorded run's ``downloads`` keys at
+    all -- e.g. ``recipes/wind_era5.yaml`` (validation_sources = [era5])
+    and ``recipes/wind_example.yaml`` (validation_sources = [mooring,
+    buoy, ..., scatterometer, ..., NOT era5]) share identical geographic/
+    temporal bounds and therefore the same auto-derived ``base_dir``.
+    Running ``wind_example.yaml`` first records ``downloads: {"sar":
+    ..., "scatterometer": ..., ...}`` with no ``"era5"`` key; running
+    ``wind_era5.yaml`` next would otherwise wrongly trust that recorded
+    run as "already downloaded" and skip the ERA5 download entirely,
+    silently producing a report with zero ERA5 data -- the same failure
+    mode as the era5-variable-mismatch case above, but triggered by a
+    difference in which source TYPES were requested rather than a
+    difference in era5's own ``variable``. This is a broader,
+    ADDITIONAL check on top of the era5-variable check (which still
+    catches its own narrower case: same source_type present in both, but
+    a different ``variable`` value -- a source_type-SET comparison alone
+    would miss that, since "era5" would appear in both sets).
+
+    ``DataOrchestrator._INSITU_TYPES`` (mooring/buoy/drifter/ferrybox/
+    tidal_gauge) are downloaded as one batched call and recorded under a
+    single ``"insitu"`` key (see ``DataOrchestrator._download_insitu``),
+    not one key per source_type -- normalized here via
+    ``_normalize_recorded_source_type`` before the set comparison so a
+    recipe requesting e.g. ``mooring`` alone isn't wrongly treated as
+    "not downloaded" just because the recorded key is ``"insitu"``, not
+    ``"mooring"``."""
     import json as _json
+
+    from .core.orchestrator import _INSITU_TYPES
+
+    def _normalize_recorded_source_type(source_type: str) -> str:
+        return "insitu" if source_type in _INSITU_TYPES else source_type
+
     meta_path = base_dir / "download_metadata.json"
     if not meta_path.exists():
         return False
@@ -956,6 +1050,27 @@ def _is_already_downloaded(base_dir: Path) -> bool:
         if meta.get("errors", ["placeholder"]) != []:
             return False
         downloads = meta.get("downloads", {})
+        recorded_variable = meta.get("variable")
+        # A real download_metadata.json (written by DataOrchestrator) always
+        # has "variable" set -- only a synthetic/legacy file could omit it,
+        # in which case there's nothing to contradict *recipe* and the old
+        # trust-it behavior applies (a minimal ``{"errors": [], ...}``
+        # fixture, as several tests use to force this shortcut without
+        # touching the network, must keep working).
+        recipe_has_era5 = recipe is not None and any(
+            s.source_type == "era5" for s in recipe.config.validation_sources
+        )
+        if recipe is not None and recipe_has_era5 and recorded_variable is not None \
+                and recorded_variable != recipe.config.variable:
+            return False
+        if recipe is not None and recipe.config.validation_sources:
+            requested_types = {
+                _normalize_recorded_source_type(s.source_type)
+                for s in recipe.config.validation_sources
+            }
+            recorded_types = set(downloads.keys())
+            if not requested_types <= recorded_types:
+                return False
         return all(
             entry.get("status") != "awaiting_manual_archive"
             for entry in downloads.values()

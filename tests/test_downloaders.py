@@ -1089,6 +1089,51 @@ class TestSARDownloaderForceDownload:
 
 
 # ---------------------------------------------------------------------------
+# SARDownloader — found_count
+# ---------------------------------------------------------------------------
+
+class TestSARDownloaderFoundCount:
+    def _record(self, id_="abc"):
+        return {
+            "Id": id_, "Name": "S1A_IW_OCN__2SDV_20260702T000000",
+            "ContentDate_Start": "2026-07-02T00:00:00Z",
+            "ContentDate_End": "2026-07-02T00:00:10Z",
+            "ContentLength_GB": 1.0, "Online": True,
+        }
+
+    def test_found_count_set_from_query_even_in_dry_run(self, tmp_path):
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
+
+        dl = SARDownloader(output_dir=tmp_path, dry_run=True)
+        fake_client = MagicMock()
+        fake_client.query_products.return_value = [self._record("a"), self._record("b")]
+        dl._client = fake_client
+
+        out = dl.download(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2026-07-02", end="2026-07-03",
+        )
+
+        assert out == []
+        assert dl.found_count == 2
+
+    def test_found_count_zero_when_no_products_match(self, tmp_path):
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
+
+        dl = SARDownloader(output_dir=tmp_path, dry_run=True)
+        fake_client = MagicMock()
+        fake_client.query_products.return_value = []
+        dl._client = fake_client
+
+        dl.download(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2026-07-02", end="2026-07-03",
+        )
+
+        assert dl.found_count == 0
+
+
+# ---------------------------------------------------------------------------
 # AltimeterDownloader — antimeridian crossing
 # ---------------------------------------------------------------------------
 
@@ -2389,6 +2434,7 @@ class TestOrchestratorDepthResolution:
         ) as mock_sar_cls:
             mock_cls.return_value.download.return_value = None
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             orchestrator.download_all()
 
         _, kwargs = mock_cls.call_args
@@ -2417,6 +2463,7 @@ class TestOrchestratorDepthResolution:
         ) as mock_sar_cls:
             mock_cls.return_value.download.return_value = None
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             orchestrator.download_all()
 
         _, kwargs = mock_cls.call_args
@@ -3294,6 +3341,7 @@ class TestOrchestratorHistoricalFirstDedup:
             "sar_validation.downloaders.hf_radar_downloader.HFRadarDownloader"
         ) as mock_nrt_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_hist_cls.return_value.download.return_value = [tmp_path / "one.nc"]
             ok = orchestrator.download_all()
 
@@ -3329,6 +3377,7 @@ class TestOrchestratorHistoricalFirstDedup:
             "sar_validation.downloaders.hf_radar_downloader.HFRadarDownloader"
         ) as mock_nrt_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_hist_cls.return_value.download.return_value = []
             mock_nrt_cls.return_value.download.return_value = []
             ok = orchestrator.download_all()
@@ -3356,6 +3405,7 @@ class TestOrchestratorHistoricalFirstDedup:
             "sar_validation.downloaders.hf_radar_downloader.HFRadarDownloader"
         ) as mock_nrt_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_nrt_cls.return_value.download.return_value = []
             ok = orchestrator.download_all()
 
@@ -3388,6 +3438,7 @@ class TestOrchestratorHistoricalFirstDedup:
             "sar_validation.downloaders.insitu_downloader.InSituDownloader"
         ) as mock_insitu_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_hist_cls.return_value.download.return_value = [tmp_path / "drifter.csv"]
             mock_insitu_cls.return_value.download.return_value = []
             ok = orchestrator.download_all()
@@ -3420,6 +3471,7 @@ class TestOrchestratorHistoricalFirstDedup:
             "sar_validation.downloaders.insitu_downloader.InSituDownloader"
         ) as mock_insitu_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_hist_cls.return_value.download.return_value = []
             mock_insitu_cls.return_value.download.return_value = []
             ok = orchestrator.download_all()
@@ -3454,6 +3506,7 @@ class TestOrchestratorHistoricalFirstDedup:
             "sar_validation.downloaders.insitu_downloader.InSituDownloader"
         ) as mock_insitu_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_hist_cls.return_value.download.return_value = [tmp_path / "drifter.csv"]
             ok = orchestrator.download_all()
 
@@ -3486,6 +3539,7 @@ class TestOrchestratorHistoricalFirstDedup:
             "sar_validation.downloaders.insitu_downloader.InSituDownloader"
         ) as mock_insitu_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_hist_cls.return_value.download.return_value = [tmp_path / "drifter.csv"]
             mock_insitu_cls.return_value.download.return_value = []
             orchestrator.download_all()
@@ -3540,6 +3594,7 @@ class TestOrchestratorAntimeridianDryRun:
             "sar_validation.downloaders.altimeter_downloader.AltimeterDownloader"
         ) as mock_alt_cls:
             mock_sar_cls.return_value.download.return_value = []
+            mock_sar_cls.return_value.found_count = 1
             mock_insitu_cls.return_value.download.return_value = []
             mock_alt_cls.return_value.download.return_value = []
             ok = orchestrator.download_all()
@@ -3812,6 +3867,59 @@ class TestEarthdataSoilMoistureDownloader:
             temporal=("2026-07-01T00:00:00", "2026-07-02T00:00:00"),
         )
         fake_earthaccess.download.assert_not_called()
+
+    def test_found_count_set_from_search_even_in_dry_run(self, tmp_path, monkeypatch):
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
+            EarthdataSoilMoistureDownloader,
+        )
+
+        dl = EarthdataSoilMoistureDownloader(
+            dataset="NISAR_L3_PR_SME2_BETA", output_dir=tmp_path, dry_run=True,
+        )
+        monkeypatch.setenv("EARTHDATA_USERNAME", "test_user")
+        monkeypatch.setenv("EARTHDATA_PASSWORD", "test_pass")
+
+        granule = MagicMock()
+        granule.data_links.return_value = ["https://example.com/NISAR_L3_PR_SME2_20260301.h5"]
+        granule.size.return_value = 42.5
+
+        fake_earthaccess = MagicMock()
+        fake_earthaccess.search_data.return_value = [granule]
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            out = dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        assert out == []
+        assert dl.found_count == 1
+
+    def test_found_count_zero_when_search_returns_nothing(self, tmp_path, monkeypatch):
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.earthdata_soil_moisture_downloader import (
+            EarthdataSoilMoistureDownloader,
+        )
+
+        dl = EarthdataSoilMoistureDownloader(
+            dataset="NSIDC-0451", output_dir=tmp_path, dry_run=True,
+        )
+        monkeypatch.setenv("EARTHDATA_USERNAME", "test_user")
+        monkeypatch.setenv("EARTHDATA_PASSWORD", "test_pass")
+
+        fake_earthaccess = MagicMock()
+        fake_earthaccess.search_data.return_value = []
+
+        with patch.dict("sys.modules", {"earthaccess": fake_earthaccess}):
+            dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        assert dl.found_count == 0
 
 # ---------------------------------------------------------------------------
 # HFRadarUSDownloader

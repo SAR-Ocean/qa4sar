@@ -138,3 +138,52 @@ class TestAnnotateCollocationDsCombinedInsituFallback:
         assert "val_units" not in result_ds
         assert result_ds["val_WSPD"].attrs.get("units") == "m s-1"
         assert result_ds["val_WSPD"].attrs.get("long_name") == "horizontal wind speed"
+
+
+class TestAnnotateCollocationDsEra5DerivedWindAttrs:
+    def test_era5_only_wind_recipe_gets_wspd_wdir_attrs(self):
+        """``from_era5`` (see ``datatree_converter._ERA5_VARS``) keeps only
+        ``u10``/``v10`` in the datatree -- WSPD/WDIR are derived from them
+        AFTER interpolation, inside
+        ``model_collocation._derive_wind_wspd_wdir``, so no datatree node
+        ever carries a "WSPD"/"WDIR" variable with attrs for this
+        function's datatree walk to find. For a recipe whose ONLY wind
+        validation source is era5_wind (no other source to borrow attrs
+        from), ``val_WSPD``/``val_WDIR`` must still end up with correct
+        CF attrs, not empty ones."""
+        era5_ds = xr.Dataset(
+            {
+                "u10": (("time", "lat", "lon"), np.zeros((1, 2, 2))),
+                "v10": (("time", "lat", "lon"), np.zeros((1, 2, 2))),
+            },
+            coords={
+                "lon": ("lon", np.array([-9.0, -8.5])),
+                "lat": ("lat", np.array([50.0, 50.5])),
+                "time": ("time", np.array(["2026-07-10T12:00"], dtype="datetime64[ns]")),
+            },
+            attrs={"platform_type": "era5_wind"},
+        )
+        era5_ds["u10"].attrs = {
+            "units": "m s-1", "standard_name": "eastward_wind",
+            "long_name": "ERA5 10m u-component of wind",
+        }
+        era5_ds["v10"].attrs = {
+            "units": "m s-1", "standard_name": "northward_wind",
+            "long_name": "ERA5 10m v-component of wind",
+        }
+        datatree = DataTreeConverter.to_datatree({"validation/era5_wind": era5_ds})
+        result_ds = xr.Dataset({
+            "val_WSPD": ("collocation", np.array([5.0, 6.0])),
+            "val_WDIR": ("collocation", np.array([10.0, 20.0])),
+            "val_source": ("collocation", ["era5_wind", "era5_wind"]),
+        })
+
+        annotate_collocation_ds(result_ds, datatree)
+
+        assert "val_units" not in result_ds
+        assert result_ds["val_WSPD"].attrs.get("units") == "m s-1"
+        assert result_ds["val_WSPD"].attrs.get("standard_name") == "wind_speed"
+        assert result_ds["val_WSPD"].attrs.get("long_name")
+        assert result_ds["val_WDIR"].attrs.get("units") == "degree"
+        assert result_ds["val_WDIR"].attrs.get("standard_name") == "wind_from_direction"
+        assert result_ds["val_WDIR"].attrs.get("long_name")

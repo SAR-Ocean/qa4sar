@@ -15,7 +15,7 @@ dependencies = [
     "xarray>=2024.1",
     "numpy",
     "pandas",
-    "scipy",           # scipy.spatial.cKDTree — collocation nearest-neighbour search
+    "scipy>=1.10",     # scipy.spatial.cKDTree (collocation NN search) + RegularGridInterpolator descending-axis support (model_collocation.py)
     "netCDF4",         # xarray netcdf4 engine — datatree read/write in cli.py
     "pyyaml",
     "requests",
@@ -29,7 +29,12 @@ dependencies = [
 plot = ["matplotlib", "cartopy", "cmocean", "plotly", "folium"]
 eumdac = ["eumdac"]
 gportal = ["paramiko"]
-soil_moisture = ["pytesmo", "ismn", "earthaccess", "ascat", "pdbufr", "cdsapi"]
+# ERA5 reanalysis validation (wind/waves/soil_moisture recipes) needs only
+# the CDS API client -- kept as its own small extra so a wind/waves-only
+# ERA5 user isn't pointed at soil_moisture's unrelated, much heavier
+# dependencies (pytesmo/ismn/earthaccess/ascat/pdbufr) just to get cdsapi.
+era5 = ["cdsapi"]
+soil_moisture = ["pytesmo", "ismn", "earthaccess", "ascat", "pdbufr", "sar-l2-validation-toolbox[era5]"]
 test = ["pytest", "pytest-cov"]
 dev = [
     "pytest",

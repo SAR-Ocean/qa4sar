@@ -17,6 +17,7 @@ import numpy as np
 __all__ = [
     "VARIABLE_PAIRS", "CIRCULAR_VAL_VARS", "infer_variable_pairs",
     "filter_variable_pairs", "circular_diff_deg",
+    "WAVE_HEIGHT_VAL_VARS", "WAVE_HEIGHT_MERGED_VAL_VAR", "merge_wave_height_columns",
 ]
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,92 @@ VARIABLE_PAIRS: dict[str, List[Tuple[str, str]]] = {
 # ---------------------------------------------------------------------------
 
 CIRCULAR_VAL_VARS: set[str] = {"WDIR"}
+
+# ---------------------------------------------------------------------------
+# Wave-height validation codes, merged into one combined comparison group
+# ---------------------------------------------------------------------------
+
+#: Wave-height validation codes that get merged into one combined "SWH"
+#: comparison group, in precedence order (matches from_insitu_csv's own
+#: per-row precedence -- see docs/design-choices.md §5.8). VHM0 (spectral
+#: Hm0, from ERA5/some in-situ platforms) and VAVH (time-domain H1/3, from
+#: altimeters/some in-situ platforms) are correlated-but-distinct
+#: estimators of the same physical quantity; keeping them in separate
+#: report sections doubled the waves report's length and produced
+#: guaranteed-all-NaN geographic panels for whichever collocation type
+#: doesn't use that section's variable (e.g. ERA5's model_vs_layer under a
+#: VAVH-only section). See docs/design-choices.md §5.8 for the full
+#: rationale and the from_insitu_csv precedence fix this builds on.
+WAVE_HEIGHT_VAL_VARS: Tuple[str, ...] = ("VHM0", "VAVH", "VGHS")
+
+#: Canonical merged val_var code standing in for any WAVE_HEIGHT_VAL_VARS
+#: member -- distinct from "VHM0" so a VAVH-only row's value is never
+#: reported under a column literally named "VHM0".
+WAVE_HEIGHT_MERGED_VAL_VAR = "SWH"
+
+
+def merge_wave_height_columns(collocation_ds) -> bool:
+    """
+    Combine ``val_VHM0``/``val_VAVH``/``val_VGHS`` into one
+    ``val_SWH`` column, in place, plus a ``val_var_code`` companion
+    recording which raw code each row's value came from.
+
+    Each row has at most one of these populated by construction --
+    ``from_insitu_csv`` already nulls all but the highest-precedence one
+    per row (see docs/design-choices.md §5.8) and every other converter
+    (``from_altimeter``, ``from_era5``) only ever produces exactly one of
+    them -- so this is a simple per-row coalesce in
+    :data:`WAVE_HEIGHT_VAL_VARS` precedence order, not a value-choosing
+    decision; a row where more than one is somehow still populated keeps
+    the highest-precedence one, same as ``from_insitu_csv``.
+
+    No-op (returns False) if none of :data:`WAVE_HEIGHT_VAL_VARS` are
+    present in *collocation_ds*, or ``val_SWH`` already exists (idempotent
+    -- safe to call more than once on the same Dataset, which
+    ``filter_variable_pairs`` does across its multiple call sites in
+    ``statistics.py``).
+
+    Returns
+    -------
+    bool
+        True if ``val_SWH``/``val_var_code`` were (just now, or already)
+        present.
+    """
+    merged_col = f"val_{WAVE_HEIGHT_MERGED_VAL_VAR}"
+    if merged_col in collocation_ds:
+        return True
+
+    present = [c for c in WAVE_HEIGHT_VAL_VARS if f"val_{c}" in collocation_ds]
+    if not present:
+        return False
+
+    n = collocation_ds.sizes.get("collocation", 0)
+    combined = np.full(n, np.nan)
+    var_code = np.full(n, "", dtype=object)
+    attrs: dict = {}
+    for code in present:
+        da = collocation_ds[f"val_{code}"]
+        col = np.asarray(da.values, dtype=float)
+        unclaimed = var_code == ""
+        mask = unclaimed & ~np.isnan(col)
+        combined[mask] = col[mask]
+        var_code[mask] = code
+        if not attrs and da.attrs:
+            attrs = dict(da.attrs)
+
+    collocation_ds[merged_col] = ("collocation", combined)
+    if attrs:
+        long_name = attrs.get("long_name", "significant wave height")
+        collocation_ds[merged_col].attrs = {
+            **attrs,
+            "long_name": f"{long_name} (combined {'/'.join(present)} — see val_var_code)",
+        }
+    collocation_ds["val_var_code"] = ("collocation", var_code)
+    collocation_ds["val_var_code"].attrs = {
+        "long_name": "originating wave-height validation code for this row "
+                      f"({'/'.join(WAVE_HEIGHT_VAL_VARS)})",
+    }
+    return True
 
 
 def circular_diff_deg(a, b):
@@ -96,7 +183,11 @@ def filter_variable_pairs(
     variables in the collocation dataset.
 
     For "waves" variable type, this function:
-    1. Detects which wave validation parameters are available (VHM0, VAVH, VGHS, etc.)
+    1. Merges every available wave-height validation parameter (VHM0,
+       VAVH, VGHS) into one combined ``val_SWH`` column, in place on
+       *collocation_ds* (see :func:`merge_wave_height_columns`), so a
+       recipe with e.g. both ERA5 (VHM0) and altimeter (VAVH) gets one
+       comparison group instead of a separate report section per code
     2. Picks the primary SAR wave variable by fallback (oswTotalHs, else
        oswHs, based on which column actually exists in collocation_ds), and
        additionally includes owiSignificantWaveHeight whenever that column
@@ -121,10 +212,12 @@ def filter_variable_pairs(
     variable = recipe.config.variable
     base_pairs = infer_variable_pairs(variable)
 
-    # For waves: expand to all available wave validation parameters
+    # For waves: merge every available wave-height validation parameter
+    # (VHM0/VAVH/VGHS) into one combined comparison group instead of a
+    # separate section per code -- see merge_wave_height_columns's
+    # docstring and docs/design-choices.md §5.8.
     if variable == "waves":
-        # Wave validation parameter candidates (in preferred order)
-        wave_val_params = ["VHM0", "VAVH", "VGHS"]
+        merge_wave_height_columns(collocation_ds)
 
         # Primary SAR wave-height variable: single-winner fallback driven by
         # which sar_<name> column actually exists in collocation_ds — NOT by
@@ -152,12 +245,7 @@ def filter_variable_pairs(
         if owi_col in collocation_ds and bool(collocation_ds[owi_col].notnull().any()):
             sar_vars.append("owiSignificantWaveHeight")
 
-        # Generate all combinations of the selected SAR variable(s) and
-        # available validation pairs
-        pairs = []
-        for sv in sar_vars:
-            for val_param in wave_val_params:
-                pairs.append((sv, val_param))
+        pairs = [(sv, WAVE_HEIGHT_MERGED_VAL_VAR) for sv in sar_vars]
     else:
         pairs = base_pairs.copy()
 

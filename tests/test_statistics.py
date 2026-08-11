@@ -866,8 +866,11 @@ class TestRunStatisticsSoilMoistureDispatch:
 
 @pytest.fixture
 def direction_collocation_ds():
-    """Direction pairs that straddle the 0°/360° wrap boundary."""
-    sar_deg = np.array([10.0, 90.0, 180.0, 270.0, 359.0])
+    """Direction pairs that straddle the 0°/360° wrap boundary.
+
+    Needs >= MIN_N_FOR_CORRELATION points so the correlation isn't gated to NaN.
+    """
+    sar_deg = np.array([10.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0, 350.0, 359.0])
     val_deg = (sar_deg + 2.0) % 360.0  # sar - val should wrap to ~-2° everywhere
 
     ds = xr.Dataset(
@@ -1072,6 +1075,44 @@ class TestRunStatisticsNativeUnits:
         assert results == {}
         assert not (tmp_path / "validation_statistics_sarSSM_vs_SOIL_MOISTURE_native_units.nc").exists()
 
+    def test_era5_soil_moisture_family_is_volumetric(self):
+        """I4: era5_soil_moisture (ERA5-Land's swvl1, units "m3 m-3") must
+        be registered in the same "volumetric" family as ISMN/AMSR/SMAP/
+        SMOS -- otherwise a volumetric-SAR recipe (e.g. NISAR SME2's
+        sarSSM, also "m3 m-3") combined with era5_soil_moisture would
+        silently drop it from the native-units statistics section."""
+        from sar_validation.core.statistics import _VAL_SOURCE_UNITS_FAMILY
+
+        assert _VAL_SOURCE_UNITS_FAMILY["era5_soil_moisture"] == "volumetric"
+
+    def test_era5_soil_moisture_included_alongside_other_volumetric_sources(self, tmp_path):
+        """Behavioral counterpart to the dict-level check above: a
+        volumetric-SAR collocation_ds (sar units "m3 m-3", matching a
+        NISAR-like source) must keep era5_soil_moisture rows in the
+        native-units results, same as ismn."""
+        from sar_validation.core.statistics import run_statistics_native_units
+
+        recipe = self._make_recipe(tmp_path)
+        collocation_ds = xr.Dataset(
+            {
+                "sar_sarSSM": (
+                    "collocation", np.array([0.10, 0.20, 0.15, 0.25]),
+                    {"units": "m3 m-3"},
+                ),
+                "val_SOIL_MOISTURE": ("collocation", np.array([0.12, 0.22, 0.14, 0.24])),
+                "val_source": (
+                    "collocation",
+                    np.array(["ismn", "ismn", "era5_soil_moisture", "era5_soil_moisture"]),
+                ),
+            },
+        )
+
+        results = run_statistics_native_units(collocation_ds, recipe, tmp_path)
+
+        assert "sarSSM_vs_SOIL_MOISTURE" in results
+        stats_ds = results["sarSSM_vs_SOIL_MOISTURE"]
+        assert set(stats_ds["source"].values.tolist()) == {"ismn", "era5_soil_moisture"}
+
     def test_non_soil_moisture_recipe_returns_empty(self, tmp_path):
         from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
         from sar_validation.core.statistics import run_statistics_native_units
@@ -1121,7 +1162,7 @@ class TestFilterVariablePairs:
             "val_source":     ("collocation", ["altimeter", "altimeter"]),
         })
         pairs = filter_variable_pairs(recipe, ds)
-        assert pairs == [("oswTotalHs", "VAVH")]
+        assert pairs == [("oswTotalHs", "SWH")]
 
     def test_falls_back_to_oswHs_when_oswTotalHs_absent(self):
         recipe = _waves_recipe(["WV", "SM"])
@@ -1131,7 +1172,7 @@ class TestFilterVariablePairs:
             "val_source": ("collocation", ["altimeter", "altimeter"]),
         })
         pairs = filter_variable_pairs(recipe, ds)
-        assert pairs == [("oswHs", "VAVH")]
+        assert pairs == [("oswHs", "SWH")]
 
     def test_owiSignificantWaveHeight_excluded_when_all_nan(self):
         """owiSignificantWaveHeight must NOT be selected when its column is
@@ -1144,7 +1185,7 @@ class TestFilterVariablePairs:
             "val_source":                   ("collocation", ["altimeter", "altimeter"]),
         })
         pairs = filter_variable_pairs(recipe, ds)
-        assert pairs == [("oswTotalHs", "VAVH")]
+        assert pairs == [("oswTotalHs", "SWH")]
 
     def test_owiSignificantWaveHeight_additive_when_it_has_data(self):
         """When owiSignificantWaveHeight has at least one real value, stats
@@ -1158,7 +1199,7 @@ class TestFilterVariablePairs:
             "val_source":                   ("collocation", ["altimeter", "altimeter"]),
         })
         pairs = filter_variable_pairs(recipe, ds)
-        assert set(pairs) == {("oswTotalHs", "VAVH"), ("owiSignificantWaveHeight", "VAVH")}
+        assert set(pairs) == {("oswTotalHs", "SWH"), ("owiSignificantWaveHeight", "SWH")}
 
     def test_does_not_double_count_oswTotalHs_and_oswHs(self):
         """oswTotalHs must win outright over oswHs — oswHs must not also
@@ -1171,20 +1212,42 @@ class TestFilterVariablePairs:
             "val_source":     ("collocation", ["altimeter", "altimeter"]),
         })
         pairs = filter_variable_pairs(recipe, ds)
-        assert pairs == [("oswTotalHs", "VAVH")]
+        assert pairs == [("oswTotalHs", "SWH")]
 
-    def test_multiple_val_vars_cross_single_sar_winner(self):
-        """Validation-side candidates are unaffected: every val_var that
-        exists still produces its own pair against the one winning sar_var."""
+    def test_multiple_val_vars_merge_into_one_swh_pair(self):
+        """VHM0 and VAVH (correlated-but-distinct wave-height estimators,
+        see docs/design-choices.md §5.8) must merge into ONE "SWH" pair
+        instead of each producing its own separate report section --
+        row 0 (altimeter) only ever reports VAVH, row 1 (buoy) only ever
+        reports VHM0, matching real converter output (from_altimeter never
+        writes VHM0; from_era5 never writes VAVH)."""
         recipe = _waves_recipe(["WV", "SM"])
         ds = xr.Dataset({
             "sar_oswTotalHs": ("collocation", [1.4, 1.5]),
-            "val_VAVH":       ("collocation", [1.42, 1.48]),
-            "val_VHM0":       ("collocation", [1.40, 1.50]),
+            "val_VAVH":       ("collocation", [1.42, np.nan]),
+            "val_VHM0":       ("collocation", [np.nan, 1.50]),
             "val_source":     ("collocation", ["altimeter", "buoy"]),
         })
         pairs = filter_variable_pairs(recipe, ds)
-        assert set(pairs) == {("oswTotalHs", "VAVH"), ("oswTotalHs", "VHM0")}
+        assert pairs == [("oswTotalHs", "SWH")]
+        assert ds["val_SWH"].values.tolist() == pytest.approx([1.42, 1.50])
+        assert ds["val_var_code"].values.tolist() == ["VAVH", "VHM0"]
+
+    def test_merge_prefers_vhm0_when_a_row_has_both(self):
+        """Defensive: even if some row still has both VHM0 and VAVH
+        populated (from_insitu_csv already prevents this for real in-situ
+        data), the merge must not crash and must apply the same VHM0 >
+        VAVH > VGHS precedence documented in docs/design-choices.md §5.8."""
+        recipe = _waves_recipe(["WV", "SM"])
+        ds = xr.Dataset({
+            "sar_oswTotalHs": ("collocation", [1.4]),
+            "val_VAVH":       ("collocation", [1.0]),
+            "val_VHM0":       ("collocation", [1.1]),
+            "val_source":     ("collocation", ["mooring"]),
+        })
+        filter_variable_pairs(recipe, ds)
+        assert ds["val_SWH"].values.tolist() == pytest.approx([1.1])
+        assert ds["val_var_code"].values.tolist() == ["VHM0"]
 
     def test_owiSignificantWaveHeight_alone_when_primary_absent(self):
         """When neither oswTotalHs nor oswHs exists, owiSignificantWaveHeight
@@ -1196,7 +1259,7 @@ class TestFilterVariablePairs:
             "val_source":                   ("collocation", ["altimeter", "altimeter"]),
         })
         pairs = filter_variable_pairs(recipe, ds)
-        assert pairs == [("owiSignificantWaveHeight", "VAVH")]
+        assert pairs == [("owiSignificantWaveHeight", "SWH")]
 
 
 class TestFilterVariablePairsSoilMoisture:

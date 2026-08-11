@@ -62,6 +62,13 @@ The mapping from recipe variable ("wind" / "currents" / "waves") to the
 compared pairs — e.g. `owiWindSpeed` vs `WSPD` — is the single source of
 truth for both statistics and plots.
 
+**Exception: ERA5 wind.** `from_era5` deliberately does NOT rename/derive
+`u10`/`v10` to `WSPD`/`WDIR` at conversion time — they stay as raw vector
+components through conversion and collocation-time spatial/temporal
+interpolation, and `WSPD`/`WDIR` are derived only afterwards, in
+`model_collocation.py`. This is the one source where the "renamed at
+conversion time" rule above doesn't hold. See §5.7 for why.
+
 > Code: `core/_variable_map.py` (`VARIABLE_PAIRS`),
 > `core/datatree_converter.py` (`from_scatterometer_nc`, `from_altimeter`
 > rename maps).
@@ -434,6 +441,250 @@ as a legacy fallback.
 > `LayerLayerCollocation`, `_collocate_wv_points`, `run_collocation`),
 > `core/recipe.py` (`DEFAULT_LAYER_TYPE_SPECS`, `CollocationType`),
 > `core/visualization.py` (`_deduplicate_obs`).
+
+### 5.7 ERA5 model validation
+
+ERA5 is collocated as a distinct third collocation type, `model_vs_layer`,
+implemented by `ModelLayerCollocation` in `model_collocation.py` — bilinear
+spatial + nearest-hour/hyperbolic temporal interpolation, ported from
+`relevant_code_for_toolbox/s1_ocn_nwp_coloc/collocate_nwp_to_sat.py`. This is
+a different match strategy from `point_vs_layer`/`layer_vs_layer`
+(§5.1–§5.6) because ERA5, unlike every other validation source, is a
+complete background field defined everywhere, not a real observation with
+coverage gaps.
+
+**Why this method does NOT replace the existing `layer_vs_layer` sources**
+
+Raised explicitly by the user during brainstorming ("check whether this
+method could also be suitable to take over some of the existing
+collocation methods") and investigated after the design was otherwise
+settled. Conclusion: no — and this reasoning is written up here since it
+documents a real design boundary someone could otherwise reasonably
+question again later:
+
+- **Scatterometer/altimeter are geometrically incompatible**: they're
+  swath (2-D curved) or along-track (1-D) products, not a regular lat/lon
+  grid. `RegularGridInterpolator` requires strictly monotonic 1-D lat/lon
+  axes — meaningless for a single track, and not applicable to a curved
+  swath without a lossy re-gridding preprocessing step of its own.
+- **Radiometer / `hf_radar_grid` / CDS satellite SSM are geometrically
+  compatible (regular grids) but still shouldn't switch**: unlike ERA5,
+  these are real observations with genuine coverage gaps (swath limits,
+  land/RFI/rain flags, radar range, QC drops), not a field defined
+  everywhere by construction. Bilinear interpolation across real gaps
+  either (a) returns NaN whenever any of the 4 surrounding cells is
+  missing — silently losing matches the current nearest-real-observation
+  approach would have found — or (b) if gap-handling isn't done
+  carefully, risks fabricating a value across a genuine data gap, which
+  is a real correctness regression for a tool whose entire job is
+  comparing SAR against real independent observations. The current
+  point-matching + aggregation-window/distance-weighting approach is
+  well-suited to sparse/gapped real data by construction: it only
+  produces a match where a real observation exists within tolerance, and
+  never invents one.
+- **Speed is not a differentiator**: building one `RegularGridInterpolator`
+  per time slice and querying it vectorized is roughly comparable in cost
+  to building the current unit-sphere KD-tree once and querying it — both
+  are effectively O(n log n) build / O(m log n) query at these data
+  sizes. Gap-handling logic needed to make bilinear interpolation safe for
+  real gridded observations would likely erase whatever small edge it
+  has.
+- The property that makes ERA5's method both feasible and correct is
+  specifically that a model field is *complete* — defined everywhere, no
+  missing-data concept. That's also why this same method is the right
+  tool again for any *future model* layer (e.g. the ORAS5 currents model
+  mentioned as a later addition), but not a general upgrade path for the
+  existing observational layer types.
+
+**Cell-averaging needs no spatial interpolation.** In `cell-averaging` mode
+the match point *is* the ERA5 grid's own native cell center, so the
+"bilinear-interpolated" ERA5 value at that point is just the value already
+sitting on the grid node — only the temporal interpolation (nearest-hour or
+hyperbolic) does real work. Actual spatial bilinear interpolation across
+grid cells is only exercised by `individual` mode (arbitrary SAR pixel/point
+locations that don't coincide with a grid node) and by WV-mode's
+`collocate_points` (sparse, non-grid vignette locations).
+
+**Antimeridian handling.** The reference script's longitude wrap-padding is
+deliberately not ported into `build_spatial_interpolator` (Task 5), since
+it's only correct for a global grid and ERA5 downloads here are regional.
+Instead, a crossing recipe bbox is split into two non-crossing download
+windows (`split_antimeridian_bbox`), stitched into one contiguous grid by
+the converter (shifting one window's longitude axis by +360°), with SAR
+query longitudes remapped to match at collocation time
+(`_normalize_query_lon`/`_wrap_lon_to_pm180` in `model_collocation.py`) —
+see Task 14.
+
+**Land-pixel filtering, on both sides of the SAR/ERA5 comparison.**
+
+- *SAR side (`owiMask`, all Sentinel-1 IW/EW wind recipes, not ERA5-
+  specific):* `_extract_owi_grid_data` NaNs out `owiWindSpeed`/
+  `owiWindDirection` wherever OWI's own `owiMask` bitmask carries the land
+  bit (bit 0; a CF flag_values bitmask, so e.g. mask value 5 = land +
+  no_data simultaneously). This applies to *every* Sentinel-1 OWI wind
+  conversion this toolbox does, regardless of which validation source the
+  recipe uses — not something added specifically for ERA5. Live-verified
+  to be a low-risk no-op against real Sentinel-1 products: ESA's own OCN
+  processor already NaNs `owiWindSpeed`/`owiWindDirection` over land
+  before this toolbox ever sees the file. It's kept anyway as a
+  defensive/correctness measure — relying on an upstream processor's
+  behavior with no independent check would be fragile if that ever
+  changes.
+- *ERA5 side (`land_sea_mask`/`lsm`, wind only):* ERA5's own `lsm` field
+  (requested only for the `wind` variable — see
+  `era5_downloader.py`'s `_CDS_VARIABLE_NAMES_BY_VARIABLE`) is used to
+  exclude ERA5 grid cells/query points that are themselves over land,
+  using the standard oceanographic/ECMWF `lsm > 0.5` threshold. In
+  `cell-averaging` mode a native ERA5 cell whose own center is land-
+  flagged is skipped entirely, even if valid ocean SAR pixels exist
+  nearby within the aggregation window (`_collocate_cell_averaging_grid`).
+  In `individual`/WV-mode (`_model_values_at_points`), `lsm` is itself
+  bilinearly interpolated to each query point, and any point whose
+  interpolated `lsm` exceeds 0.5 has every model variable masked to NaN
+  — a point close enough to a land grid cell that its bilinearly-
+  interpolated wind value is itself meaningfully blended with land-
+  physics wind is treated as too land-contaminated to be a valid ocean
+  wind match. The rationale is physical, not just cosmetic: ERA5's land
+  and sea near-surface wind fields use different surface-roughness/
+  friction physics, so a land grid point's "wind" isn't a comparable
+  quantity to SAR ocean wind retrieval regardless of proximity to the
+  coast. This side of the filtering is scoped to `wind` only — `waves`
+  already gets native NaN-over-land behavior from ERA5's own
+  ocean-wave-model output (no separate `lsm` request needed), and
+  `soil_moisture` uses the land-only `reanalysis-era5-land` dataset,
+  where an ocean/land mask would be nonsensical (the whole point of that
+  request is land).
+
+**`u10`/`v10` stay raw through conversion; `WSPD`/`WDIR` are derived only
+after interpolation.** Every other validation source is renamed to the
+canonical `WSPD`/`WDIR` codes at conversion time (§2). ERA5 wind is the
+one deliberate exception: `from_era5` keeps `u10`/`v10` as raw vector
+components, and `model_collocation.py`'s `_derive_wind_wspd_wdir` derives
+`WSPD`/`WDIR` from them only AFTER bilinear-spatial/hyperbolic-temporal
+interpolation has completed (called from `_model_values_at_points` and
+`_collocate_cell_averaging_grid`). This is necessary because `WDIR` is a
+circular quantity (§6) — 0° and 360° are the same direction — and cannot
+be correctly linearly or hyperbolically blended as an ordinary scalar the
+way `u10`/`v10` can. Deriving a direction first and then interpolating it
+as a plain number produces wrong results whenever the true direction
+crosses the 0°/360° seam (e.g. blending 359° and 1° naively yields ~180°,
+not ~0°). This was a real bug: an earlier version of `from_era5` derived
+`WSPD`/`WDIR` at conversion time, and the interpolation in
+`model_collocation.py` treated `WDIR` as an ordinary linear scalar,
+producing `val_WDIR` values as far out as -14.77°/376.77° (outside
+`[0, 360)`) against real CDS data. Fixed by moving the derivation
+downstream, past the point where interpolation happens (commit
+`0b196ee`). Because `WSPD`/`WDIR` never exist as a datatree-node variable
+for this source, `annotate_collocation_ds` (`core/_cf_metadata.py`)
+carries a small fixed CF-attrs fallback keyed on `("era5_wind", "WSPD"
+| "WDIR")` so era5-only wind recipes still get correct `units`/
+`standard_name` on the final `val_WSPD`/`val_WDIR` columns, matching what
+`from_era5` used to stamp directly before the derivation moved.
+
+> Code: `core/model_collocation.py` (`ModelLayerCollocation`,
+> `build_spatial_interpolator`, `collocate_points`,
+> `_derive_wind_wspd_wdir`), `core/datatree_converter.py` (`from_era5`),
+> `core/_cf_metadata.py` (`annotate_collocation_ds`,
+> `_DERIVED_VAL_VAR_ATTRS`), `core/collocation.py` (`run_collocation`
+> dispatch table).
+
+### 5.8 Wave-height precedence: VHM0 vs VAVH, when an in-situ platform reports both
+
+`VHM0` and `VAVH` are both "significant wave height" in meters, but from
+different algorithms, and are intentionally kept as separate `val_var`
+codes rather than merged into one (§2's "canonical variable naming"
+invariant does not apply here):
+
+- **VHM0** — *spectral* significant wave height (Hm0 = 4×√m0, from the
+  zeroth moment of the wave energy spectrum). This is what ERA5's `swh`
+  is renamed to at conversion time (`from_era5`, §5.7) and is the modern
+  standard most wave models and buoys report.
+- **VAVH** — significant wave height by the classical *time-domain*
+  definition (H1/3: mean height of the highest one-third of individual
+  waves, from zero-crossing analysis). This is what the altimeter
+  converters (`from_altimeter`) always produce.
+
+They're correlated but not identical — confirmed live 2026-08-10 against
+`recipes/waves_era5_and_satellites2.yaml`: mooring platform `6200442`
+reported `VAVH=1.0` and `VHM0=1.1` for the same reading. Copernicus Marine
+in-situ platforms (mooring/tidal_gauge/drifter/buoy) are the only sources
+that can report both in the same row — altimeter only ever produces
+`VAVH`, ERA5 only ever produces `VHM0` — since `insitu_downloader.py`
+requests the full `ALL_VARIABLES` set regardless of which codes a given
+platform actually carries, and the CMEMS long-format CSV pivots each
+reported code into its own column (`from_insitu_csv`).
+
+Left unhandled, that single mooring observation landed in **both**
+`oswTotalHs_vs_VAVH` (paired with altimeter) and `oswTotalHs_vs_VHM0`
+(paired with era5) — one physical match, double-counted across two
+report sections. The collocation-diagnostics plot showing altimeter and
+era5 markers together is unrelated and correct (it's a spatial coverage
+map across all sources, not per-variable) — the bug was specifically
+this one point contributing to two separate statistics groups.
+
+Fix: `from_insitu_csv` now keeps only the highest-precedence wave-height
+column per row (`VHM0 > VAVH > VGHS`, reusing the same precedence order
+`_variable_map.py`'s `wave_val_params` already establishes for SAR-side
+fallback) and nulls the rest, so each observation contributes to exactly
+one comparison.
+
+**Merged into one report section (2026-08-11).** VHM0 and VAVH originally
+still produced two entirely separate `filter_variable_pairs` entries
+(`oswTotalHs_vs_VHM0`, `oswTotalHs_vs_VAVH`), each running the *whole*
+report pipeline (geographic × every `collocation_type` present in the
+dataset, scatter, stats, residuals) a second time. Two problems, both
+raised directly by the user after reviewing a real report: (1) the report
+roughly doubled in length for no informational gain, since VHM0 and VAVH
+are the same physical quantity by different algorithms, not genuinely
+different things to compare separately; (2) a `collocation_type` unique to
+one variable's sources (e.g. era5's `model_vs_layer`, since ERA5 only ever
+populates VHM0) still got a geographic panel drawn under the *other*
+variable's pass, where every point is guaranteed NaN for that pass's
+column — pure waste, and confusing ("the ERA5 model gives only NaNs" was
+the user's exact complaint).
+
+Fix: `merge_wave_height_columns` (`_variable_map.py`) coalesces
+`val_VHM0`/`val_VAVH`/`val_VGHS` into one `val_SWH` column in place on
+`collocation_ds` (same `VHM0 > VAVH > VGHS` precedence — a no-op choice in
+practice, since a row has at most one populated after the `from_insitu_csv`
+fix above), plus a `val_var_code` companion column recording which raw
+code each row's value came from. `filter_variable_pairs` returns exactly
+one `(sar_var, "SWH")` pair for waves instead of one per code present, so
+the whole pipeline runs once. This did **not** require touching
+`plot_geographic`'s existing `collocation_type` splitting at all: since
+ERA5 (VHM0) is exclusively `model_vs_layer` and altimeter (VAVH) is
+exclusively `point_vs_layer`/`layer_vs_layer` for this variable, that
+split already puts them in separate panels within the same section —
+merging the *variable* pair, not the *collocation-type* split, was the
+actual fix. The one case needing new code is a `val_source` that mixes
+codes across rows (only possible for CMEMS in-situ platforms, e.g. a
+"mooring" group with one VHM0-only and one VAVH-only station): `plot_scatter`
+/`_plot_scatter_small_multiples`/`plot_geographic`'s legend/subplot-title
+building now groups by `(val_source, val_var_code)` instead of
+`val_source` alone whenever `val_var_code` is present, giving e.g.
+"mooring [VHM0]" and "mooring [VAVH]" as distinct, clearly labeled entries
+— satisfying "VHM0/VAVH can keep their own name, shown next to each
+other" without a source's two estimators silently pooling into one dot
+color. `plot_statistics`'s bar-chart / the stats CSV still group by
+`val_source` alone (not further split by code) — a deliberate, smaller
+scope than the plots: the real-data case this was built against has at
+most one mooring point total, so a bias/RMSE numeric split by code was
+judged not worth the added `statistics.py` complexity unless a real
+recipe surfaces a source with enough per-code volume to need it.
+
+Live-verified 2026-08-11 against `recipes/waves_era5_and_satellites2.yaml`
+(166 era5, 16 altimeter, 1 mooring match): `validation_report.pdf` went
+from 20 pages to 11, `validation_statistics_oswTotalHs_vs_VHM0.csv` +
+`..._VAVH.csv` became one `..._SWH.csv` with all three sources as rows,
+and every geographic/scatter panel's legend correctly reads
+`era5_waves [VHM0]`, `altimeter [VAVH]`, `mooring [VHM0]`.
+
+> Code: `core/datatree_converter.py` (`from_insitu_csv`'s wave-height
+> precedence block), `core/_variable_map.py` (`wave_val_params`,
+> `filter_variable_pairs`, `merge_wave_height_columns`,
+> `WAVE_HEIGHT_VAL_VARS`, `WAVE_HEIGHT_MERGED_VAL_VAR`),
+> `core/visualization.py` (`plot_scatter`, `_plot_scatter_small_multiples`,
+> `plot_geographic`'s `val_var_code`-aware legend/title grouping).
 
 ---
 
@@ -1263,6 +1514,72 @@ order as the CDF-matched section above it.
 
 > Code: `core/visualization.py` (`validation_report`'s per-pair loop and
 > native-units block).
+
+### 9.4 Geographic plot: SAR marker halo and validation-point edge width
+
+For point-geometry SAR data (WV mode — `plot_geographic`'s `arr.ndim == 1`
+branch, `_draw_scene_panel`), the SAR field is itself drawn as a scatter,
+underneath the validation points (`zorder=3` vs. the validation layer's
+`zorder=5`). It was originally a fixed `s=20` regardless of the
+validation markers drawn on top of it — confirmed against a real waves
+report where `pt_size=40` validation dots completely hid it: no SAR
+"halo" was visible at all around any matched point. Fixed in two rounds,
+both raised directly against real report output:
+
+1. Size the SAR scatter relative to *this panel's own* `pt_size`
+   (`pt_size + 30`) instead of a fixed constant, so it scales with
+   whatever validation marker size a given variable/collocation_type
+   combination uses (5/15/25/40, see §9.1).
+2. `+30` still weren't visible enough once the validation dots' own black
+   edge was also examined more closely — bumped to `pt_size + 50`, and
+   the validation-point edge width (`edgecolors="black", linewidths=0.4`,
+   all four validation-scatter call sites in `_draw_scene_panel`) bumped
+   to `linewidths=0.9` so the boundary between a validation dot and the
+   SAR halo behind it is actually distinguishable at report print size.
+
+> Code: `core/visualization.py` (`_draw_scene_panel`'s SAR-field scatter
+> and validation-point scatter calls).
+
+### 9.5 era5_soil_moisture's canonical marker/color were literally invisible
+
+`_SOURCE_MARKERS`/`_SOURCE_COLORS` assign each `_CANONICAL_SOURCE_ORDER`
+entry a fixed `(color, marker)` pair by list position (§9.1's sibling
+mechanism — see those lists' own module comments for the append-only
+rule). `era5_soil_moisture` is the 16th entry, and matplotlib's *filled*
+marker set (`matplotlib.markers.MarkerStyle.filled_markers`) has exactly
+15 distinct shapes — all already claimed by the first 15 entries — so its
+slot originally fell back to `"+"`, an *unfilled* (stroke-only) marker.
+
+That's fine wherever a caller lets matplotlib pick a default line width,
+but `plot_collocation_diagnostics`'s non-waves matched-point tiers
+(Tier 3/4) explicitly pass `linewidths=0.0` (§9.1: dense sources like
+ASCAT/SMAP/SMOS need a lower fixed alpha instead of an outline). An
+unfilled marker's entire visible representation *is* its stroke — with
+zero line width, `era5_soil_moisture`'s real, correctly-positioned,
+correctly-colored matched points rendered as literally zero visible
+pixels. `era5_wind`/`era5_waves` (indices 13/14, markers `"H"`/`"d"`)
+never hit this, since both are filled shapes — confirmed live 2026-08-11:
+`recipes/soil_moisture_era5.yaml` (352 era5 matches) and
+`recipes/soil_moisture_nisar_era5_2.yaml` (5208 era5 matches) both showed
+a legend entry and count for "Era5_Soil_Moisture matched" with zero
+markers actually visible anywhere on the map or in the legend swatch
+itself.
+
+Fix: `era5_soil_moisture`'s marker slot now reuses `"v"` (hf_radar's
+shape, index 4) instead of `"+"` — hf_radar is currents-only and
+era5_soil_moisture is soil_moisture-only, so the two can never appear in
+the same report despite sharing a shape; distinguished regardless by
+each keeping its own unique color. Separately, and reported directly
+against the same live-verified plots: `era5_soil_moisture`'s color
+(`"#dcbeff"`, pale lavender) was hard to pick out against a light
+land/ocean background at soil_moisture's reduced matched-layer alpha —
+changed to a bolder `"#800080"`.
+
+A regression test (`test_every_source_marker_is_filled`) asserts every
+`_SOURCE_MARKERS` entry is one of matplotlib's filled markers, so this
+can't recur silently for a future source appended to the canonical order.
+
+> Code: `core/visualization.py` (`_SOURCE_MARKERS`, `_SOURCE_COLORS`).
 
 ## 10. RADARSAT-2 (NOAA NCEI): a second SAR source, selected per recipe
 

@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -44,6 +44,147 @@ _ASCAT_REJECT_FLAGS = {
     "not_enough_good_sigma0_for_wind_retrieval",
     "distance_to_gmf_too_large",
 }
+
+#: ERA5 variable metadata per recipe variable -- raw CDS/NetCDF short
+#: names, the data_type tag stamped on the result, and CF-ish attrs. Kept
+#: gridded (never flattened to `point`, unlike every other validation
+#: source) since ModelLayerCollocation interpolates it directly onto SAR
+#: pixel locations at collocation time.
+_ERA5_VARS: dict[str, dict] = {
+    "wind": {
+        "raw": ["u10", "v10"],
+        "data_type": "era5_wind",
+        "cf": {
+            "u10": {"units": "m s-1", "standard_name": "eastward_wind", "long_name": "ERA5 10m u-component of wind"},
+            "v10": {"units": "m s-1", "standard_name": "northward_wind", "long_name": "ERA5 10m v-component of wind"},
+        },
+    },
+    "waves": {
+        "raw": ["swh"],
+        "data_type": "era5_waves",
+        "cf": {
+            "swh": {
+                "units": "m",
+                "standard_name": "sea_surface_wave_significant_height",
+                "long_name": "ERA5 significant height of combined wind waves and swell",
+            },
+        },
+    },
+    "soil_moisture": {
+        "raw": ["swvl1"],
+        "data_type": "era5_soil_moisture",
+        "cf": {
+            "swvl1": {
+                "units": "m3 m-3",
+                "standard_name": "volume_fraction_of_water_in_soil_layer",
+                "long_name": "ERA5-Land volumetric soil water layer 1 (0-7cm, H-TESSEL)",
+            },
+        },
+    },
+}
+
+#: Matches a window-suffixed ERA5 daily filename stem, e.g.
+#: "era5_wind_20260712_w0" -> stem="era5_wind_20260712", idx=0. Produced by
+#: ERA5Downloader.download() when a recipe bbox crosses the antimeridian.
+_ERA5_WINDOW_SUFFIX_RE = re.compile(r"^(?P<stem>.+)_w(?P<idx>\d+)$")
+
+
+def _normalize_era5_grib_coords(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Normalize an ERA5 daily NetCDF's coordinate names/extra coords to the
+    ``time``/``lat``/``lon`` convention the rest of this converter (and
+    ``sar_validation.core.model_collocation``) expects.
+
+    Live-verified 2026-08-07: the CDS API's ``"data_format": "netcdf"``
+    facet for ``reanalysis-era5-single-levels`` (and ``-land``) is actually
+    produced by converting the underlying GRIB message via ``cfgrib``,
+    which names the time dimension ``valid_time`` (not ``time``) and adds
+    two GRIB-bookkeeping coordinates that carry no useful information for a
+    deterministic reanalysis request: ``number`` (ensemble member, always
+    0) and ``expver`` (experiment version, e.g. preliminary ERA5T vs final
+    ERA5). Applied per-file (before any concatenation) so both the
+    single-file and antimeridian-stitched paths through :meth:`from_era5`
+    end up with a consistent ``time`` dim to concatenate/index on.
+    """
+    rename = {}
+    if "latitude" in ds.coords:
+        rename["latitude"] = "lat"
+    if "longitude" in ds.coords:
+        rename["longitude"] = "lon"
+    if "valid_time" in ds.coords and "time" not in ds.coords:
+        rename["valid_time"] = "time"
+    if rename:
+        ds = ds.rename(rename)
+    drop = [c for c in ("number", "expver") if c in ds.coords]
+    if drop:
+        ds = ds.drop_vars(drop)
+    return ds
+
+
+def _group_era5_paths_by_day(paths: List[Path]) -> Dict[str, List[Path]]:
+    """
+    Group ERA5 file paths by their day-stem, so a day's antimeridian-split
+    window pair (``..._w0.nc`` / ``..._w1.nc``) is grouped together for
+    stitching before concatenation across days, while an ordinary
+    non-split day's single file is its own group of one.
+    """
+    groups: Dict[str, List[Path]] = {}
+    for p in paths:
+        m = _ERA5_WINDOW_SUFFIX_RE.match(p.stem)
+        key = m.group("stem") if m else p.stem
+        groups.setdefault(key, []).append(p)
+    return groups
+
+
+def _stitch_antimeridian_window_files(paths: List[Path]) -> Optional[xr.Dataset]:
+    """
+    Combine the 2 antimeridian-split window files for one day (see
+    ``ERA5Downloader.download`` / ``split_antimeridian_bbox``) into a
+    single contiguous grid: window 1 (west, originally ``-180..max_lon``)
+    has its longitude axis shifted by +360 degrees so it becomes
+    numerically continuous with window 0 (east, ``min_lon..180``), then
+    the two are concatenated along the longitude dimension.
+
+    The combined lon axis may extend past 180 (e.g. up to 190) -- this is
+    fine, it's a coordinate array, not required to stay within +/-180; SAR
+    query longitudes are remapped to match at collocation time (see
+    ``model_collocation._normalize_query_lon``).
+
+    Both windows are requested inclusive of the shared antimeridian
+    boundary (``split_antimeridian_bbox`` returns ``[min_lon, 180]`` and
+    ``[-180, max_lon]``), so the east window's ``180.0`` and the west
+    window's shifted ``-180.0 -> 180.0`` commonly land on the exact same
+    grid cell -- the duplicate is dropped after concatenation so the
+    combined lon axis stays strictly increasing.
+
+    Returns ``None`` (closing any opened files first) if *paths* doesn't
+    contain exactly window indices ``{0, 1}``.
+    """
+    by_idx: Dict[int, xr.Dataset] = {}
+    for p in paths:
+        m = _ERA5_WINDOW_SUFFIX_RE.match(p.stem)
+        if not m:
+            logger.warning("Expected a window-suffixed ERA5 file, got %s", p.name)
+            for d in by_idx.values():
+                d.close()
+            return None
+        by_idx[int(m.group("idx"))] = xr.open_dataset(p)
+
+    if set(by_idx) != {0, 1}:
+        logger.warning("Expected exactly window indices {0, 1}, got %s", sorted(by_idx))
+        for d in by_idx.values():
+            d.close()
+        return None
+
+    east = by_idx[0]
+    west = by_idx[1]
+    lon_name = "longitude" if "longitude" in west.coords else "lon"
+    west = west.assign_coords({lon_name: west[lon_name] + 360.0})
+    combined = xr.concat([east, west], dim=lon_name)
+    combined = combined.drop_duplicates(lon_name, keep="first")
+    east.close()
+    west.close()
+    return combined
 
 
 def _subset_point_ds(
@@ -587,6 +728,27 @@ class DataTreeConverter:
                     continue  # column has real data — leave it untouched
                 df[col] = hcsp * trig(hcdt_rad)
                 logger.debug("Derived %s from HCSP+HCDT", col)
+
+        # A single in-situ platform can report more than one significant
+        # wave height estimate in the same row -- VHM0 (spectral Hm0) and
+        # VAVH (time-domain H1/3) are independently-computed, non-identical
+        # quantities (confirmed live 2026-08-10: mooring 6200442 reported
+        # VAVH=1.0 and VHM0=1.1 for the same reading), and CMEMS's
+        # long-format export pivots each into its own column above. Left
+        # as-is, that one physical observation would land in BOTH the
+        # VAVH-paired (altimeter) and VHM0-paired (ERA5) report sections --
+        # double-counting a single match across two comparisons. Keep only
+        # the highest-precedence column per row (VHM0 > VAVH > VGHS,
+        # matching _variable_map.py's own wave_val_params fallback order)
+        # and null the rest, so each observation contributes to exactly one
+        # comparison; a row reporting only one of them is untouched.
+        wave_height_cols = [c for c in ("VHM0", "VAVH", "VGHS") if c in df.columns]
+        if len(wave_height_cols) > 1:
+            claimed = pd.Series(False, index=df.index)
+            for col in wave_height_cols:
+                has_val = df[col].notna()
+                df.loc[claimed & has_val, col] = np.nan
+                claimed = claimed | has_val
 
         coord_cols = {"lon", "lat", "time", "platform_id", "platform_type"}
         data_cols  = [c for c in df.columns if c not in coord_cols]
@@ -1826,6 +1988,172 @@ class DataTreeConverter:
         return ds
 
     @staticmethod
+    def from_era5(
+        nc_paths: Union[str, Path, Sequence[Union[str, Path]]],
+        variable: str,
+    ) -> Optional[xr.Dataset]:
+        """
+        Open one or more ERA5 daily NetCDF files (as downloaded by
+        :class:`~sar_validation.downloaders.era5_downloader.ERA5Downloader`)
+        and return one combined, GRIDDED Dataset (dims: ``time``, ``lat``,
+        ``lon``) covering every requested day.
+
+        Unlike every other validation-source converter, the result is NOT
+        flattened to a ``point`` dimension -- the whole point of ERA5's
+        collocation method (bilinear spatial + nearest-hour/hyperbolic
+        temporal interpolation, see
+        ``sar_validation.core.model_collocation``) is to interpolate this
+        grid directly onto SAR pixel/point locations at collocation time.
+
+        Parameters
+        ----------
+        nc_paths : Path or list of Path
+            One or more ERA5 daily NetCDF files for the SAME *variable*.
+            Multiple files are concatenated along ``time`` so the hyperbolic
+            method can find bracketing hours across a day boundary.
+        variable : str
+            One of ``"wind"``, ``"waves"``, ``"soil_moisture"``.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type``/``platform_type`` set to
+            ``"era5_wind"``/``"era5_waves"``/``"era5_soil_moisture"``, or
+            None on failure.
+        """
+        if variable not in _ERA5_VARS:
+            logger.warning("from_era5: unknown variable %r (expected wind/waves/soil_moisture).", variable)
+            return None
+
+        paths = [Path(p) for p in ([nc_paths] if isinstance(nc_paths, (str, Path)) else nc_paths)]
+        existing = sorted(p for p in paths if p.exists())
+        if not existing:
+            logger.warning("from_era5: no files found among %s", paths)
+            return None
+
+        # xr.open_mfdataset requires the optional `dask` package, which
+        # isn't a dependency of this project -- open each daily file
+        # individually and concatenate along time instead, matching how
+        # the rest of this codebase (e.g. from_c3s_ssm) avoids that
+        # dependency.
+        try:
+            groups = _group_era5_paths_by_day(existing)
+            per_day: List[xr.Dataset] = []
+            for _, group_paths in sorted(groups.items()):
+                if len(group_paths) == 1:
+                    per_day.append(_normalize_era5_grib_coords(xr.open_dataset(group_paths[0])))
+                else:
+                    stitched = _stitch_antimeridian_window_files(group_paths)
+                    if stitched is None:
+                        for d in per_day:
+                            d.close()
+                        return None
+                    per_day.append(_normalize_era5_grib_coords(stitched))
+
+            raw = per_day[0] if len(per_day) == 1 else xr.concat(per_day, dim="time")
+            # CDS always returns ERA5 latitude descending (north -> south,
+            # e.g. 60.25, 60.00, ..., 34.75) -- model_collocation.py's
+            # build_spatial_interpolator (a scipy RegularGridInterpolator)
+            # requires a monotonic axis, and this toolbox relies on it
+            # actually being ASCENDING (see that function's docstring).
+            # scipy >= 1.10 also accepts descending axes transparently, so
+            # this worked "by luck" on newer scipy -- sortby establishes a
+            # genuinely ascending axis regardless of scipy version.
+            raw = raw.sortby("lat")
+            # ERA5 regional daily files are small (bbox-limited); load fully
+            # into memory now so the Dataset returned below doesn't hold
+            # lazy references into a file handle that's about to be closed.
+            raw = raw.load()
+            for d in per_day:
+                d.close()
+        except Exception as exc:
+            logger.warning("Could not open ERA5 file(s) %s: %s", paths, exc)
+            return None
+
+        # lat/lon/time already normalized per-file by _normalize_era5_grib_coords
+        # above (before concatenation, so "time" is guaranteed to be the
+        # concat dim regardless of which raw name the CDS response used).
+
+        spec = _ERA5_VARS[variable]
+        missing = [v for v in spec["raw"] if v not in raw.variables]
+        if missing:
+            logger.warning(
+                "from_era5: missing variable(s) %s in %s (available: %s).",
+                missing, paths, list(raw.variables),
+            )
+            raw.close()
+            return None
+
+        data_vars = {}
+        for var in spec["raw"]:
+            da = raw[var].astype("float32")
+            da.attrs.update(spec["cf"][var])
+            data_vars[var] = da
+
+        # Rename/derive to the canonical val_var codes _variable_map.py's
+        # VARIABLE_PAIRS (and therefore statistics.py/visualization.py)
+        # expect -- every OTHER wind/waves/soil_moisture validation source
+        # is renamed to these same codes at conversion time (see e.g.
+        # from_scatterometer_nc's WSPD/WDIR rename, from_radiometer_bytemap's
+        # WindSat rotation). ERA5's raw CDS short names (swh, swvl1) never
+        # matched them, so run_statistics() silently produced zero rows for
+        # every era5_waves/era5_soil_moisture source -- confirmed against a
+        # live CDS run 2026-08-07 (wind_era5.yaml: "no statistics produced").
+        #
+        # Wind is the one deliberate exception: u10/v10 are kept as raw
+        # components here, NOT renamed/derived into WSPD/WDIR. WDIR is a
+        # CIRCULAR quantity, and this Dataset is exactly what gets
+        # bilinearly-spatially / hyperbolically-temporally interpolated at
+        # collocation time (see model_collocation.py) -- interpolating an
+        # already-derived direction as an ordinary linear scalar produces
+        # wrong answers whenever the true value crosses the 0/360 seam
+        # (e.g. blending 359 and 1 degrees naively yields ~180, not ~0).
+        # model_collocation.py's `_derive_wind_wspd_wdir` instead derives
+        # WSPD/WDIR from the FINAL, already-interpolated u10/v10 values,
+        # after collocation -- so the eventual val_data/
+        # collocation_results.nc output still ends up with the same
+        # WSPD/WDIR columns every other wind validation source produces,
+        # just computed at the right time. This is the one exception to
+        # §2's "renamed at conversion time" invariant -- see
+        # docs/design-choices.md §2 ("Canonical variable naming") and §5.7
+        # ("ERA5 model validation").
+        if variable == "waves":
+            data_vars = {"VHM0": data_vars["swh"]}
+        elif variable == "soil_moisture":
+            data_vars = {"SOIL_MOISTURE": data_vars["swvl1"]}
+
+        # land_sea_mask ("lsm" on the wire, requested only for wind -- see
+        # era5_downloader.py's _CDS_VARIABLE_NAMES_BY_VARIABLE) is a
+        # per-cell land-mask LOOKUP, not a per-hour model quantity to
+        # interpolate/report at collocation points. It's kept as a
+        # non-dimension COORDINATE (not a data_var), which means every
+        # downstream consumer that iterates `era5_ds.data_vars`
+        # (_model_values_at_points, _collocate_cell_averaging_grid in
+        # sar_validation.core.model_collocation) already skips it
+        # automatically -- it never leaks into val_data as a spurious
+        # val_lsm statistics column. Collapsed from (time, lat, lon) to
+        # (lat, lon) since it's time-invariant in reality (the CDS API
+        # just echoes the same value at every requested hour).
+        lsm_2d = None
+        if variable == "wind" and "lsm" in raw.variables:
+            lsm_da = raw["lsm"].astype("float32")
+            if "time" in lsm_da.dims:
+                lsm_da = lsm_da.isel(time=0, drop=True)
+            lsm_2d = lsm_da
+
+        ds = xr.Dataset(
+            data_vars,
+            coords={"time": raw["time"], "lat": raw["lat"], "lon": raw["lon"]},
+        )
+        if lsm_2d is not None:
+            ds = ds.assign_coords(lsm=(("lat", "lon"), lsm_2d.values))
+        ds.attrs["data_type"] = spec["data_type"]
+        ds.attrs["platform_type"] = spec["data_type"]
+        ds.attrs["source"] = f"ERA5 reanalysis ({variable}, Copernicus CDS)"
+        raw.close()
+        return ds
+
+    @staticmethod
     def from_hf_radar_grid(
         nc_path: Union[str, Path],
         u_var: str = "water_u",
@@ -3061,6 +3389,29 @@ class DataTreeConverter:
                 else np.ones_like(owi_windspeed, dtype=np.int8)
             )
 
+            # Land-flag masking. owiMask is a CF bitmask (flag_values
+            # 0/1/2/4/8 = valid/land/ice/no_data/rfi) whose bits combine via
+            # bitwise OR (e.g. 5 = land + no_data simultaneously). Land
+            # pixels must not feed into wind validation, so owiWindSpeed and
+            # owiWindDirection (a direction without a valid speed is
+            # meaningless) are NaN'd out there. Only the land bit (1) is
+            # checked -- ice/no_data/rfi are intentionally left unfiltered.
+            owi_land_pixel_count = 0
+            owi_land_pixel_fraction = float("nan")
+            if "owiMask" in ds_raw:
+                land_mask = (owi_mask & 1) != 0
+                owi_land_pixel_count = int(np.sum(land_mask))
+                owi_land_pixel_fraction = owi_land_pixel_count / land_mask.size
+                if owi_land_pixel_count > 0:
+                    owi_windspeed = np.where(land_mask, np.nan, owi_windspeed)
+                    owi_winddir = np.where(land_mask, np.nan, owi_winddir)
+                    logger.warning(
+                        "scene %s: %d/%d OWI cells land-flagged (%.1f%%) via "
+                        "owiMask -- owiWindSpeed/owiWindDirection NaN'd out",
+                        safe_dir.name, owi_land_pixel_count, land_mask.size,
+                        100 * owi_land_pixel_fraction,
+                    )
+
             # Get acquisition time (scalar for grid)
             time_str = ds_raw.attrs.get("firstMeasurementTime")
             if time_str:
@@ -3109,6 +3460,8 @@ class DataTreeConverter:
             ds.attrs["safe_dir"] = safe_dir.name
             ds.attrs["measurement_type"] = "owi"
             ds.attrs["swath_mode"] = "IW/EW/SM"
+            ds.attrs["owi_land_pixel_count"] = owi_land_pixel_count
+            ds.attrs["owi_land_pixel_fraction"] = owi_land_pixel_fraction
 
             logger.info(
                 "Extracted OWI data from product %s (grid shape: %s)",
@@ -3257,6 +3610,7 @@ class DataTreeConverter:
         - ``smos_ssm/*.nc``             → ``validation/smos_ssm/<stem>`` nodes
         - ``cds_ssm/*.nc``              → ``validation/cds_ssm/<stem>`` nodes
         - ``altimeter/*.nc``           → ``validation/altimeter/<stem>`` nodes
+        - ``era5/*.nc``                 → single combined, GRIDDED ``validation/era5/era5`` node
 
         Parameters
         ----------
@@ -3581,6 +3935,28 @@ class DataTreeConverter:
                 if ds is not None:
                     datasets[f"validation/radiometer/{f.stem}"] = ds
                     logger.info("Converted radiometer: %s", f.name)
+
+        # ERA5 reanalysis (Copernicus CDS) -- kept as a single combined,
+        # GRIDDED node (not flattened to `point`, unlike every other
+        # validation source) since ModelLayerCollocation interpolates it
+        # directly onto SAR pixel locations at collocation time. Every
+        # daily file downloaded for this run is opened together so the
+        # hyperbolic method can find bracketing hours across a day
+        # boundary. Not passed through _filtered() -- that helper assumes
+        # a `point` dimension.
+        subdir = base_dir / "era5"
+        if subdir.exists():
+            era5_variable = recipe.config.variable if recipe is not None else None
+            era5_files = (
+                sorted(subdir.glob(f"era5_{era5_variable}_*.nc"))
+                if era5_variable is not None
+                else []
+            )
+            if era5_files and era5_variable in ("wind", "waves", "soil_moisture"):
+                ds = DataTreeConverter.from_era5(era5_files, era5_variable)
+                if ds is not None:
+                    datasets["validation/era5/era5"] = ds
+                    logger.info("Converted ERA5 (%s): %d file(s)", era5_variable, len(era5_files))
 
         if not datasets:
             logger.warning("No convertible data found in %s", base_dir)
