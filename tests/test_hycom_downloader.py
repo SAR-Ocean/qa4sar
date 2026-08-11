@@ -389,6 +389,35 @@ class TestDownloadSegmentLonConvention:
         finally:
             result.close()
 
+    def test_download_segment_logs_before_starting_the_network_fetch(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """A real OPeNDAP fetch can take a long time with zero output in
+        between -- without a log line before it starts, a slow segment is
+        indistinguishable from a hang (reported directly against a real
+        run). ``_download_segment`` must ``logger.info(...)`` which
+        dataset/segment it's about to request before the network calls
+        begin."""
+        import logging
+
+        from sar_validation.downloaders.hycom_downloader import HycomDownloader
+
+        seg_start, seg_end = datetime(2025, 1, 1), datetime(2025, 1, 2)
+        self._patch_open_dataset(monkeypatch, seg_start)
+
+        dl = HycomDownloader(output_dir=tmp_path)
+        with caplog.at_level(logging.INFO, logger="sar_validation.downloaders.hycom_downloader"):
+            nc_path = dl._download_segment(
+                "espc_d_v02", seg_start, seg_end,
+                -77.0, -68.0, 35.0, 44.0,
+            )
+
+        assert nc_path is not None and nc_path.exists()
+        assert any(
+            "espc_d_v02" in rec.message and "requesting HyCOM" in rec.message
+            for rec in caplog.records
+        ), f"no 'requesting HyCOM' notice logged; records were: {[r.message for r in caplog.records]}"
+
     def test_wrapping_bbox_straddling_zero_degrees_stitches_monotonic_lon(
         self, tmp_path, monkeypatch,
     ):

@@ -401,6 +401,17 @@ class HycomDownloader:
         buffered_start, buffered_end = self._buffered_bounds(seg_start, seg_end)
         urls = self._dodsc_urls(dataset_key, buffered_start, buffered_end)
 
+        # A real OPeNDAP fetch below (xr.open_dataset + .load()) can take a
+        # while over the network with zero output in between -- without
+        # this, a slow segment looks indistinguishable from a hang. Mirrors
+        # cds_soil_moisture_downloader._download_day's
+        # "requesting CDS ... SSM" notice before its own comparably slow
+        # network request.
+        logger.info(
+            "  %s: requesting HyCOM %s for [%s, %s] ...",
+            dataset_key, "/".join(sorted(urls)), buffered_start, buffered_end,
+        )
+
         opened: dict[str, xr.Dataset] = {}
         try:
             try:
