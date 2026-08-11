@@ -318,3 +318,41 @@ class TestEra5DefaultLayerTypeSpecs:
             assert spec["method"] in ("individual", "cell-averaging")
             assert spec["temporal_method"] in ("nearest", "hyperbolic")
             assert spec["aggregation_window_km"] > 0
+
+
+class TestHycomRejectedForNonCurrents:
+    def test_hycom_validation_source_in_wind_recipe_raises(self, tmp_path):
+        import pytest
+
+        from sar_validation.core.recipe import Recipe
+
+        yaml_body = (
+            "name: t\nvariable: wind\n"
+            "validation_sources:\n- source_type: hycom\n"
+        )
+        yaml_path = tmp_path / "r.yaml"
+        yaml_path.write_text(yaml_body)
+        with pytest.raises(ValueError, match="hycom.*currents|currents.*hycom"):
+            Recipe.from_yaml(yaml_path)
+
+    def test_hycom_validation_source_in_currents_recipe_is_accepted(self, tmp_path):
+        from sar_validation.core.recipe import Recipe
+
+        yaml_body = (
+            "name: t\nvariable: currents\n"
+            "validation_sources:\n- source_type: hycom\n"
+        )
+        yaml_path = tmp_path / "r.yaml"
+        yaml_path.write_text(yaml_body)
+        recipe = Recipe.from_yaml(yaml_path)
+        assert recipe.config.validation_sources[0].source_type == "hycom"
+
+
+class TestHycomDefaultLayerTypeSpec:
+    def test_hycom_key_present_with_expected_defaults(self):
+        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+
+        spec = DEFAULT_LAYER_TYPE_SPECS["hycom"]
+        assert spec["method"] == "cell-averaging"
+        assert spec["temporal_method"] == "hyperbolic"
+        assert spec["aggregation_window_km"] == pytest.approx(4.6, abs=0.2)

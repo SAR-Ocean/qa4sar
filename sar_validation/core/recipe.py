@@ -240,6 +240,16 @@ DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
         "time_tolerance_minutes": 720, "aggregation_window_km": 5.0,
         "distance_weighting": "equal", "method": "cell-averaging", "temporal_method": "hyperbolic",
     },
+    # HyCOM ocean-current model -- same ModelLayerCollocation machinery
+    # as era5_wind/era5_waves/era5_soil_moisture above. aggregation_window_km
+    # is ~half the native 1/12 deg grid spacing (~9.3 km at the equator),
+    # same "half native cell spacing" convention as ERA5's own entries, so
+    # cell-averaging's per-cell SAR aggregation windows don't overlap
+    # neighbouring HyCOM cells.
+    "hycom": {
+        "time_tolerance_minutes": 60, "aggregation_window_km": 4.6,
+        "distance_weighting": "equal", "method": "cell-averaging", "temporal_method": "hyperbolic",
+    },
 }
 
 
@@ -472,6 +482,15 @@ class Recipe:
                 "source_type 'era5' is not valid for a 'currents' recipe -- "
                 "ERA5 has no ocean-currents variable. Remove the era5 "
                 "validation source, or switch the recipe's variable."
+            )
+        if data.get("variable") != "currents" and any(
+            s.source_type == "hycom" for s in validation_sources
+        ):
+            raise ValueError(
+                "source_type 'hycom' is only valid for a 'currents' recipe -- "
+                "HyCOM has no wind/wave/soil-moisture variable. Remove the "
+                "hycom validation source, or switch the recipe's variable to "
+                "'currents'."
             )
 
         config = RecipeConfig(
