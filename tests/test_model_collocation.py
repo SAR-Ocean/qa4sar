@@ -731,3 +731,49 @@ class TestModelLayerCollocationAntimeridian:
         # Reported lon must stay in the SAR pixel's own standard
         # convention, not the grid's internal shifted axis.
         assert results[0].sar_lon == pytest.approx(-178.0)
+
+
+class TestDeriveCurrentsRadialProjection:
+    def test_noop_without_both_components(self):
+        from sar_validation.core.model_collocation import _derive_currents_radial_projection
+
+        values = {"EWCT": np.array([1.0])}
+        out = _derive_currents_radial_projection(values, np.array([90.0]))
+        assert out is values
+        assert "rvlRadVel_projection" not in out
+
+    def test_noop_without_heading(self):
+        from sar_validation.core.model_collocation import _derive_currents_radial_projection
+
+        values = {"EWCT": np.array([1.0]), "NSCT": np.array([0.0])}
+        out = _derive_currents_radial_projection(values, None)
+        assert out is values
+        assert "rvlRadVel_projection" not in out
+
+    def test_projection_matches_existing_collocation_py_formula(self):
+        from sar_validation.core.collocation import _project_currents_to_radial
+        from sar_validation.core.model_collocation import _derive_currents_radial_projection
+
+        ewct = np.array([1.5, -0.5])
+        nsct = np.array([0.3, 0.8])
+        heading = np.array([45.0, 200.0])
+
+        out = _derive_currents_radial_projection({"EWCT": ewct, "NSCT": nsct}, heading)
+
+        expected = _project_currents_to_radial(ewct, nsct, heading)
+        np.testing.assert_allclose(out["rvlRadVel_projection"], expected)
+
+    def test_ewct_nsct_are_kept_not_dropped(self):
+        from sar_validation.core.model_collocation import _derive_currents_radial_projection
+
+        ewct = np.array([1.0])
+        nsct = np.array([2.0])
+        out = _derive_currents_radial_projection({"EWCT": ewct, "NSCT": nsct}, np.array([0.0]))
+        assert "EWCT" in out and "NSCT" in out
+
+    def test_scalar_heading_and_values_also_work(self):
+        from sar_validation.core.model_collocation import _derive_currents_radial_projection
+
+        out = _derive_currents_radial_projection({"EWCT": 1.0, "NSCT": 0.5}, 30.0)
+        assert "rvlRadVel_projection" in out
+        assert isinstance(out["rvlRadVel_projection"], float)

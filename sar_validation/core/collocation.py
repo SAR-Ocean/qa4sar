@@ -122,6 +122,11 @@ def _project_currents_to_radial(ewct: float, nsct: float, heading_deg: float) ->
     is the quantity compared against the L2 OCN ``rvlRadVel`` product
     (``rvlRadVel_projection``).
 
+    Typed here for this module's own scalar-per-row usage; the arithmetic is
+    actually generic over numpy arrays too via broadcasting/duck-typing, and
+    ``model_collocation.py``'s vectorized ``_derive_currents_radial_projection``
+    also calls this with whole arrays at once.
+
     Reference: Martin, Gommenginger, Jacob & Staneva (2022), RSE 268:112758.
     """
     heading_rad = np.radians(heading_deg - 90.0)

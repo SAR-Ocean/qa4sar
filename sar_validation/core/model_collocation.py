@@ -13,7 +13,7 @@ sources (scatterometer/altimeter/radiometer/hf_radar_grid/satellite SSM).
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -136,6 +136,55 @@ def _derive_wind_wspd_wdir(values: Dict[str, np.ndarray]) -> Dict[str, np.ndarra
     out = {k: v for k, v in values.items() if k not in ("u10", "v10")}
     out["WSPD"] = wspd
     out["WDIR"] = wdir
+    return out
+
+
+def _derive_currents_radial_projection(
+    values: Dict[str, Any], heading_deg: Any,
+) -> Dict[str, Any]:
+    """
+    Add ``rvlRadVel_projection`` to *values* by projecting its ``EWCT``/
+    ``NSCT`` (eastward/northward current) components onto the SAR
+    line-of-sight, given the SAR platform heading *heading_deg* (degrees;
+    a scalar or an array matching every array in *values*).
+
+    *values* and *heading_deg* are typed ``Any`` (rather than a single
+    array/float type) because they genuinely hold different shapes
+    depending on the caller: whole numpy arrays at the
+    ``_collocate_individual_grid`` / ``collocate_points`` call sites
+    (projecting a full scene/points batch at once), or plain per-cell
+    scalars at the ``_collocate_cell_averaging_grid`` call site (called
+    once per already-aggregated cell) -- both flow through the same
+    reused ``_project_currents_to_radial`` formula unchanged (itself typed
+    ``float``-only for its own scalar-per-row call sites elsewhere in
+    ``collocation.py``; mypy can't express "array or scalar in, matching
+    shape out" without ``@overload``, which would be overkill here).
+
+    No-op (returns *values* unchanged) unless both ``"EWCT"`` and
+    ``"NSCT"`` are present, and *heading_deg* is not None -- a
+    self-describing gate mirroring :func:`_derive_wind_wspd_wdir`, since
+    only HyCOM-family currents Datasets ever carry these keys
+    (wind/waves/soil_moisture model Datasets are untouched).
+
+    Reuses the EXISTING ``_project_currents_to_radial`` formula from
+    ``collocation.py`` -- the same one every other currents validation
+    source (HF-radar, in-situ) already uses to derive this quantity, not
+    reimplemented here. Unlike :func:`_derive_wind_wspd_wdir`, ``EWCT``/
+    ``NSCT`` are KEPT in the output (not dropped) -- every other currents
+    validation source exposes both the raw vector components and the
+    projection.
+
+    Callers must supply *heading_deg* from the SAR side themselves (this
+    function has no access to it) -- see the call sites in
+    ``ModelLayerCollocation``'s three collocation paths.
+    """
+    if heading_deg is None or "EWCT" not in values or "NSCT" not in values:
+        return values
+    from .collocation import _project_currents_to_radial
+    out = dict(values)
+    out["rvlRadVel_projection"] = _project_currents_to_radial(
+        values["EWCT"], values["NSCT"], heading_deg,
+    )
     return out
 
 
@@ -366,6 +415,10 @@ class ModelLayerCollocation:
         """
         times_np = pd.to_datetime(sar_times).to_numpy()
         model_values = _model_values_at_points(sar_lons, sar_lats, times_np, era5_ds, self.temporal_method)
+        if "rvlHeading" in sar_point_vars:
+            model_values = _derive_currents_radial_projection(
+                model_values, sar_point_vars["rvlHeading"],
+            )
 
         results: List[CollocatedPoint] = []
         for i in range(len(sar_lons)):
@@ -412,6 +465,10 @@ class ModelLayerCollocation:
         times_flat = np.full(lons_flat.shape, np.datetime64(obs_time), dtype="datetime64[ns]")
 
         model_values = _model_values_at_points(lons_flat, lats_flat, times_flat, era5_ds, self.temporal_method)
+        if "rvlHeading" in sar_data:
+            model_values = _derive_currents_radial_projection(
+                model_values, sar_data["rvlHeading"][0].ravel(),
+            )
 
         results: List[CollocatedPoint] = []
         for flat_idx in range(lons_flat.size):
@@ -561,6 +618,9 @@ class ModelLayerCollocation:
                     weighting_method=self.distance_weighting,
                     sigma_km=self.gaussian_sigma_km,
                     agg_window_km=self.aggregation_window_km,
+                )
+                val_point = _derive_currents_radial_projection(
+                    val_point, sar_aggregated.get("rvlHeading"),
                 )
                 if not sar_aggregated:
                     continue
