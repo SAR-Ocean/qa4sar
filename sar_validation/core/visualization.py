@@ -2908,7 +2908,7 @@ def _plot_collocation_diagnostics_impl(
         ]
         cov_lats = [lat for _, lat in coverage_points]
         ax.scatter(
-            cov_lons, cov_lats, s=3, c="blue", alpha=0.4, marker=".",
+            cov_lons, cov_lats, s=5, c="blue", alpha=0.4, marker=".",
             transform=box_transform, zorder=1, label="SAR coverage (overpasses)",
         )
 
