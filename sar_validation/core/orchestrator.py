@@ -734,9 +734,11 @@ class DataOrchestrator:
         eumdac_dir = self.base_dir / "ascat_ssm"
         hsaf_dir   = self.base_dir / "hsaf_ssm"
 
-        # H-SAF's on-line H29 archive only ever holds a rolling last-60-
-        # days window (confirmed by the user directly; the FTP
-        # directory's own name, /h29/h29_cur_mon_nc/, is misleading).
+        # H-SAF's on-line archive (H122 default, H29 via
+        # download_kwargs.hsaf_product) only ever holds a rolling
+        # last-60-days window (confirmed by the user directly; the FTP
+        # directories' own names, e.g. /h29/h29_cur_mon_nc/, are
+        # misleading).
         # Anything before that, down to the EUMDAC cutoff, is a genuine
         # gap -- neither source can serve it (H-SAF's off-line/CDR
         # archive is out of scope, see design doc) -- and is surfaced as
@@ -768,9 +770,11 @@ class DataOrchestrator:
 
         if req_end >= hsaf_window_start:
             try:
+                hsaf_product = source.download_kwargs.get("hsaf_product", "h122")
                 hsaf_dl = HSAFDownloader(
                     output_dir=hsaf_dir, dry_run=self.dry_run,
                     force_download=self.force_download,
+                    product=hsaf_product,
                 )
                 files.extend(hsaf_dl.download(
                     min_lon=bounds.min_lon, max_lon=bounds.max_lon,

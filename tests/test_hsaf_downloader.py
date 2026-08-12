@@ -1,4 +1,4 @@
-"""Tests for HSAFDownloader (H-SAF ASCAT SSM NRT, 12.5km, FTP)."""
+"""Tests for HSAFDownloader (H-SAF ASCAT SSM NRT, H29 12.5km / H122 6.25km, FTP)."""
 
 from __future__ import annotations
 
@@ -9,46 +9,51 @@ import pytest
 
 from sar_validation.downloaders.hsaf_downloader import (
     HSAFDownloader,
-    _matches_h29_nc,
+    _matches_ascat_nc,
     _parse_sensing_start,
 )
 
 _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT = -70.0, -30.0, 50.0, 67.0
 
-_REAL_FILENAME = (
+_REAL_H29_FILENAME = (
     "W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPB-12.5km-H29_C_LIIB_"
     "20260609001514_20260608231200_20260608231459____.nc"
 )
 
-_METOPA_FILENAME = (
+_METOPA_H29_FILENAME = (
     "W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPA-12.5km-H29_C_LIIB_"
     "20260610001514_20260609231200_20260609231459____.nc"
 )
 
+_REAL_H122_FILENAME = (
+    "W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPB-6.25km-H122_C_LIIB_"
+    "20260609001515_20260608231200_20260608231459____.nc"
+)
 
-class TestMatchesH29Nc:
+
+class TestMatchesAscatNc:
     @pytest.mark.parametrize(
         "filename,expected",
         [
-            pytest.param(_REAL_FILENAME, True, id="real_metopb_file_matches"),
-            pytest.param(
-                (
-                    "W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPA-12.5km-H29_C_LIIB_"
-                    "20260609001514_20260608231200_20260608231459____.nc"
-                ),
-                True, id="metopa_file_matches",
-            ),
-            pytest.param(_REAL_FILENAME + ".md5", False, id="md5_sidecar_never_matches"),
+            pytest.param(_REAL_H29_FILENAME, True, id="real_h29_metopb_file_matches"),
+            pytest.param(_METOPA_H29_FILENAME, True, id="h29_metopa_file_matches"),
+            pytest.param(_REAL_H122_FILENAME, True, id="real_h122_metopb_file_matches"),
+            pytest.param(_REAL_H29_FILENAME + ".md5", False, id="md5_sidecar_never_matches"),
             pytest.param("readme.txt", False, id="unrelated_file_never_matches"),
         ],
     )
-    def test_matches_h29_nc(self, filename, expected):
-        assert _matches_h29_nc(filename) is expected
+    def test_matches_ascat_nc(self, filename, expected):
+        assert _matches_ascat_nc(filename) is expected
 
 
 class TestParseSensingStart:
-    def test_parses_real_filename(self):
-        assert _parse_sensing_start(_REAL_FILENAME) == datetime(
+    def test_parses_real_h29_filename(self):
+        assert _parse_sensing_start(_REAL_H29_FILENAME) == datetime(
+            2026, 6, 8, 23, 12, 0, tzinfo=timezone.utc
+        )
+
+    def test_parses_real_h122_filename(self):
+        assert _parse_sensing_start(_REAL_H122_FILENAME) == datetime(
             2026, 6, 8, 23, 12, 0, tzinfo=timezone.utc
         )
 
@@ -56,13 +61,66 @@ class TestParseSensingStart:
         assert _parse_sensing_start("readme.txt") is None
 
 
+class TestHSAFDownloaderProductSelection:
+    def test_unknown_product_raises_value_error(self, tmp_path):
+        with pytest.raises(ValueError, match="Unknown H-SAF product"):
+            HSAFDownloader(output_dir=tmp_path, product="h999")
+
+    def test_default_product_queries_h122_path(self, tmp_path):
+        """H122 is now the default (higher resolution than H29) -- see
+        spec §1b. Constructing HSAFDownloader with no explicit product
+        must query H122's FTP directory."""
+        fake_ftp = MagicMock()
+        fake_ftp.nlst.return_value = [_REAL_H122_FILENAME]
+        fake_ftp.retrbinary.side_effect = lambda cmd, cb: cb(b"fake nc bytes")
+
+        with patch("ftplib.FTP", return_value=fake_ftp), patch(
+            "sar_validation.downloaders.hsaf_downloader.authenticate_hsaf_ftp",
+            return_value=("user", "pass"),
+        ):
+            dl = HSAFDownloader(output_dir=tmp_path)
+            assert dl.product == "h122"
+            result = dl.download(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-06-08", end="2026-06-09",
+            )
+
+        fake_ftp.cwd.assert_called_once_with("/h122/h122_cur_mon_nc")
+        assert len(result) == 1
+        assert result[0].name == _REAL_H122_FILENAME
+
+    def test_explicit_h29_product_queries_h29_path(self, tmp_path):
+        """Recipes that need the legacy 12.5km product opt back in via
+        product="h29" (recipe-level: download_kwargs: {hsaf_product: h29})."""
+        fake_ftp = MagicMock()
+        fake_ftp.nlst.return_value = [_REAL_H29_FILENAME]
+        fake_ftp.retrbinary.side_effect = lambda cmd, cb: cb(b"fake nc bytes")
+
+        with patch("ftplib.FTP", return_value=fake_ftp), patch(
+            "sar_validation.downloaders.hsaf_downloader.authenticate_hsaf_ftp",
+            return_value=("user", "pass"),
+        ):
+            dl = HSAFDownloader(output_dir=tmp_path, product="h29")
+            result = dl.download(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-06-08", end="2026-06-09",
+            )
+
+        fake_ftp.cwd.assert_called_once_with("/h29/h29_cur_mon_nc")
+        assert len(result) == 1
+        assert result[0].name == _REAL_H29_FILENAME
+
+
 class TestHSAFDownloaderDownloadAll:
     def test_downloads_every_matching_file_in_window(self, tmp_path):
+        """Explicit product="h29" preserves this test's original intent
+        (verifying multi-file matching/sorting within one product's
+        listing) now that h122 is the constructor default."""
         fake_ftp = MagicMock()
         fake_ftp.nlst.return_value = [
-            _REAL_FILENAME,
-            _METOPA_FILENAME,
-            _REAL_FILENAME + ".md5",
+            _REAL_H29_FILENAME,
+            _METOPA_H29_FILENAME,
+            _REAL_H29_FILENAME + ".md5",
         ]
 
         def fake_retrbinary(cmd, callback):
@@ -74,15 +132,15 @@ class TestHSAFDownloaderDownloadAll:
             "sar_validation.downloaders.hsaf_downloader.authenticate_hsaf_ftp",
             return_value=("user", "pass"),
         ):
-            dl = HSAFDownloader(output_dir=tmp_path)
+            dl = HSAFDownloader(output_dir=tmp_path, product="h29")
             result = dl.download(
                 min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
                 start="2026-06-08", end="2026-06-09",
             )
 
         assert len(result) == 2
-        assert result[0].name == _METOPA_FILENAME
-        assert result[1].name == _REAL_FILENAME
+        assert result[0].name == _METOPA_H29_FILENAME
+        assert result[1].name == _REAL_H29_FILENAME
         fake_ftp.login.assert_called_once_with("user", "pass")
         fake_ftp.cwd.assert_called_once_with("/h29/h29_cur_mon_nc")
 
@@ -104,9 +162,9 @@ class TestHSAFDownloaderDownloadAll:
 
     def test_force_download_refetches_existing_file(self, tmp_path):
         fake_ftp = MagicMock()
-        fake_ftp.nlst.return_value = [_REAL_FILENAME]
+        fake_ftp.nlst.return_value = [_REAL_H122_FILENAME]
         fake_ftp.retrbinary.side_effect = lambda cmd, cb: cb(b"fake nc bytes")
-        existing = tmp_path / _REAL_FILENAME
+        existing = tmp_path / _REAL_H122_FILENAME
         existing.write_text("stale")
 
         with patch("ftplib.FTP", return_value=fake_ftp), patch(
@@ -124,7 +182,7 @@ class TestHSAFDownloaderDownloadAll:
 
     def test_dry_run_lists_matches_without_downloading(self, tmp_path, capsys):
         fake_ftp = MagicMock()
-        fake_ftp.nlst.return_value = [_REAL_FILENAME]
+        fake_ftp.nlst.return_value = [_REAL_H122_FILENAME]
 
         with patch("ftplib.FTP", return_value=fake_ftp), patch(
             "sar_validation.downloaders.hsaf_downloader.authenticate_hsaf_ftp",
@@ -138,4 +196,4 @@ class TestHSAFDownloaderDownloadAll:
 
         assert result == []
         assert not fake_ftp.retrbinary.called
-        assert _REAL_FILENAME in capsys.readouterr().out
+        assert _REAL_H122_FILENAME in capsys.readouterr().out
