@@ -201,7 +201,8 @@ class TestERA5DownloaderDayLoop:
             min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
             start="2026-07-12T18:00:00", end="2026-07-12T23:00:00",
         )
-        assert requested_days == [date(2026, 7, 12)]
+        # With 2h buffer: [16:00, 01:00+1day], so both days are visited and have hours needed
+        assert requested_days == [date(2026, 7, 12), date(2026, 7, 13)]
 
     def test_multi_day_window_requests_every_day(self, tmp_path, monkeypatch):
         from sar_validation.downloaders.era5_downloader import ERA5Downloader
@@ -217,7 +218,59 @@ class TestERA5DownloaderDayLoop:
             min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
             start="2026-07-12T00:00:00", end="2026-07-14T00:00:00",
         )
-        assert requested_days == [date(2026, 7, 12), date(2026, 7, 13), date(2026, 7, 14)]
+        # With 2h buffer: [22:00-1day, 02:00+1day], so 2026-07-11 and 2026-07-14 also visited
+        assert requested_days == [date(2026, 7, 11), date(2026, 7, 12), date(2026, 7, 13), date(2026, 7, 14)]
+
+    def test_previous_day_requested_when_tolerance_buffer_needs_it(self, tmp_path, monkeypatch):
+        """Regression: a SAR scene at 00:00 UTC on the recipe's literal
+        start date with a wide tolerance (e.g. soil moisture's 720 min /
+        ±12h) needs ERA5 hours from the *previous* calendar day -- but the
+        day-loop's bounds came from the literal, unpadded start/end
+        dates, so that day was never visited at all, silently dropping
+        every hour it would have contributed. Reproduces
+        recipes/soil_moisture_era5.yaml's first-day-has-no-overlap bug."""
+        from sar_validation.downloaders.era5_downloader import ERA5Downloader
+
+        requested_days: list[date] = []
+        monkeypatch.setattr(
+            ERA5Downloader, "_download_day",
+            lambda self, day, hours, *a: requested_days.append(day) or None,
+        )
+
+        dl = ERA5Downloader(
+            variable="soil_moisture", output_dir=tmp_path, time_tolerance_minutes=720,
+        )
+        dl.download(
+            min_lon=-5.0, max_lon=5.0, min_lat=45.0, max_lat=52.0,
+            start="2026-07-10T00:00:00", end="2026-07-10T01:00:00",
+        )
+
+        assert date(2026, 7, 9) in requested_days, (
+            "the day before the literal start date must be requested when "
+            "the ±12h tolerance buffer needs hours from it"
+        )
+        assert requested_days == [date(2026, 7, 9), date(2026, 7, 10)]
+
+    def test_next_day_requested_when_tolerance_buffer_needs_it(self, tmp_path, monkeypatch):
+        """Symmetric case on the end side."""
+        from sar_validation.downloaders.era5_downloader import ERA5Downloader
+
+        requested_days: list[date] = []
+        monkeypatch.setattr(
+            ERA5Downloader, "_download_day",
+            lambda self, day, hours, *a: requested_days.append(day) or None,
+        )
+
+        dl = ERA5Downloader(
+            variable="soil_moisture", output_dir=tmp_path, time_tolerance_minutes=720,
+        )
+        dl.download(
+            min_lon=-5.0, max_lon=5.0, min_lat=45.0, max_lat=52.0,
+            start="2026-07-12T23:00:00", end="2026-07-12T23:59:00",
+        )
+
+        assert date(2026, 7, 13) in requested_days
+        assert requested_days == [date(2026, 7, 12), date(2026, 7, 13)]
 
     def test_existing_day_file_is_skipped_and_returned(self, tmp_path, monkeypatch):
         from sar_validation.downloaders.era5_downloader import ERA5Downloader
@@ -236,7 +289,8 @@ class TestERA5DownloaderDayLoop:
             min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
             start="2026-07-12T18:00:00", end="2026-07-12T23:00:00",
         )
-        assert called == []
+        # 2026-07-12's file exists so it's not downloaded, but 2026-07-13 still needs downloading
+        assert called == [date(2026, 7, 13)]
         assert paths == [existing]
 
 
@@ -282,8 +336,13 @@ class TestERA5DownloaderAntimeridian:
             min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
             start="2026-07-12T00:00:00", end="2026-07-12T23:00:00",
         )
-        assert requested == [(-10.0, 10.0, None)]
-        assert paths == [tmp_path / "era5_wind_20260712.nc"]
+        # With 2h buffer: [22:00-1day, 01:00+1day], visits 2026-07-11, 2026-07-12, 2026-07-13
+        assert requested == [(-10.0, 10.0, None), (-10.0, 10.0, None), (-10.0, 10.0, None)]
+        assert paths == [
+            tmp_path / "era5_wind_20260711.nc",
+            tmp_path / "era5_wind_20260712.nc",
+            tmp_path / "era5_wind_20260713.nc",
+        ]
 
     def test_crossing_bbox_downloads_two_suffixed_files(self, tmp_path, monkeypatch):
         from sar_validation.downloaders.era5_downloader import ERA5Downloader
@@ -300,10 +359,19 @@ class TestERA5DownloaderAntimeridian:
             min_lon=170.0, max_lon=-170.0, min_lat=40.0, max_lat=55.0,
             start="2026-07-12T00:00:00", end="2026-07-12T23:00:00",
         )
-        assert requested == [(170.0, 180.0, 0), (-180.0, -170.0, 1)]
+        # With 2h buffer: [22:00-1day, 01:00+1day], visits 3 days × 2 antimeridian windows = 6 requests
+        assert requested == [
+            (170.0, 180.0, 0), (-180.0, -170.0, 1),  # 2026-07-11
+            (170.0, 180.0, 0), (-180.0, -170.0, 1),  # 2026-07-12
+            (170.0, 180.0, 0), (-180.0, -170.0, 1),  # 2026-07-13
+        ]
         assert paths == [
+            tmp_path / "era5_wind_20260711_w0.nc",
+            tmp_path / "era5_wind_20260711_w1.nc",
             tmp_path / "era5_wind_20260712_w0.nc",
             tmp_path / "era5_wind_20260712_w1.nc",
+            tmp_path / "era5_wind_20260713_w0.nc",
+            tmp_path / "era5_wind_20260713_w1.nc",
         ]
 
     def test_build_area_clips_padding_at_dateline(self, tmp_path):
