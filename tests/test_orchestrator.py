@@ -1610,3 +1610,72 @@ class TestDownloadAscatSsmWaterfall:
         orch._download_ascat_ssm(source)
 
         assert any("gap" in n.lower() or "coverage" in n.lower() for n in orch.metadata["notices"])
+
+    def test_overlap_range_both_succeed_is_not_a_failure(self, tmp_path, monkeypatch):
+        """A date range spanning both eras (before cutoff -> recent) attempts
+        both downloaders. When both succeed and return files, the run must
+        not be flagged as failed and no error should be recorded."""
+        import datetime as dt
+
+        today = dt.date.today().isoformat()
+        calls = []
+
+        def eumdac_download(self, **kw):
+            calls.append(("eumdac", kw))
+            return [tmp_path / "eumdac_file.nc"]
+
+        def hsaf_download(self, **kw):
+            calls.append(("hsaf", kw))
+            return [tmp_path / "hsaf_file.nc"]
+
+        monkeypatch.setattr(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader.download",
+            eumdac_download,
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.hsaf_downloader.HSAFDownloader.download",
+            hsaf_download,
+        )
+        orch = self._make_orchestrator(tmp_path, "2025-07-10", today, monkeypatch)
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_ascat_ssm(source)
+
+        assert {c[0] for c in calls} == {"eumdac", "hsaf"}
+        assert orch.metadata["downloads"]["ascat_ssm"]["status"] != "failed"
+        assert orch.metadata["errors"] == []
+
+    def test_overlap_range_one_branch_fails_is_partial_not_hard_failure(self, tmp_path, monkeypatch):
+        """Same overlap range, but the EUMDAC branch raises while H-SAF
+        succeeds and returns real data. This must be reported as a partial
+        failure (a notice), not a hard failure (an error + status=failed) --
+        the run still has real, usable data from the succeeding branch."""
+        import datetime as dt
+
+        today = dt.date.today().isoformat()
+
+        def eumdac_download(self, **kw):
+            raise RuntimeError("transient EUMDAC hiccup")
+
+        def hsaf_download(self, **kw):
+            return [tmp_path / "hsaf_file.nc"]
+
+        monkeypatch.setattr(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader.download",
+            eumdac_download,
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.hsaf_downloader.HSAFDownloader.download",
+            hsaf_download,
+        )
+        orch = self._make_orchestrator(tmp_path, "2025-07-10", today, monkeypatch)
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_ascat_ssm(source)
+
+        assert orch.metadata["downloads"]["ascat_ssm"]["status"] != "failed"
+        assert orch.metadata["errors"] == []
+        assert any(
+            "partial" in n.lower() or "one of the eumdac" in n.lower()
+            for n in orch.metadata["notices"]
+        )

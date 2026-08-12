@@ -749,6 +749,9 @@ class DataOrchestrator:
         req_start = pad_start[:10]
         req_end   = pad_end[:10]
 
+        eumdac_attempted = req_start <= _ASCAT_COVERAGE_CUTOFF
+        hsaf_attempted = req_end >= hsaf_window_start
+
         files: list = []
         eumdac_ok = True
         hsaf_ok = True
@@ -788,13 +791,39 @@ class DataOrchestrator:
         self._cleanup_if_empty(eumdac_dir)
         self._cleanup_if_empty(hsaf_dir)
 
-        ok = eumdac_ok and hsaf_ok
+        # A branch that wasn't even attempted (out of its date range) is
+        # not a failure -- only treat this as a hard failure if every
+        # branch that WAS attempted failed. If exactly one attempted
+        # branch failed while another attempted branch succeeded (e.g. a
+        # transient FTP hiccup on one side of an overlap-range request
+        # spanning both the EUMDAC and H-SAF eras), that's a partial
+        # failure: the run still has real, usable data from the
+        # succeeding branch, so it must not be reported as a hard
+        # "download failed" (which would wrongly red-flag the PDF report
+        # cover page and force an unnecessary full re-download next run
+        # via _already_succeeded). Surface it as a notice instead.
+        attempted_ok_flags = [
+            ok_flag for attempted, ok_flag in (
+                (eumdac_attempted, eumdac_ok), (hsaf_attempted, hsaf_ok),
+            ) if attempted
+        ]
+        hard_failure = bool(attempted_ok_flags) and not any(attempted_ok_flags)
+        partial_failure = not hard_failure and not all(attempted_ok_flags)
+
+        ok = not hard_failure
         self.metadata["downloads"]["ascat_ssm"] = {
             "status": "dry_run" if self.dry_run else ("success" if ok else "failed"),
             "files": [str(p) for p in files],
         }
-        if not ok:
+        if hard_failure:
             self.metadata["errors"].append("ASCAT SSM download failed (see log)")
+        elif partial_failure:
+            self.metadata["notices"].append(
+                "ASCAT: one of the EUMDAC/H-SAF branches failed for this "
+                "request's date range while the other succeeded -- see log "
+                "for details. Results may be incomplete for the failed "
+                "branch's portion of the range."
+            )
 
         if (
             ok and not files
