@@ -13,7 +13,7 @@ sources (scatterometer/altimeter/radiometer/hf_radar_grid/satellite SSM).
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -139,22 +139,110 @@ def _derive_wind_wspd_wdir(values: Dict[str, np.ndarray]) -> Dict[str, np.ndarra
     return out
 
 
+def _derive_currents_radial_projection(
+    values: Dict[str, Any], heading_deg: Any,
+) -> Dict[str, Any]:
+    """
+    Add ``rvlRadVel_projection`` to *values* by projecting its ``EWCT``/
+    ``NSCT`` (eastward/northward current) components onto the SAR
+    line-of-sight, given the SAR platform heading *heading_deg* (degrees;
+    a scalar or an array matching every array in *values*).
+
+    *values* and *heading_deg* are typed ``Any`` (rather than a single
+    array/float type) because they genuinely hold different shapes
+    depending on the caller: whole numpy arrays at the
+    ``_collocate_individual_grid`` / ``collocate_points`` call sites
+    (projecting a full scene/points batch at once), or plain per-cell
+    scalars at the ``_collocate_cell_averaging_grid`` call site (called
+    once per already-aggregated cell) -- both flow through the same
+    reused ``_project_currents_to_radial`` formula unchanged (itself typed
+    ``float``-only for its own scalar-per-row call sites elsewhere in
+    ``collocation.py``; mypy can't express "array or scalar in, matching
+    shape out" without ``@overload``, which would be overkill here).
+
+    No-op (returns *values* unchanged) unless both ``"EWCT"`` and
+    ``"NSCT"`` are present, and *heading_deg* is not None -- a
+    self-describing gate mirroring :func:`_derive_wind_wspd_wdir`, since
+    only HyCOM-family currents Datasets ever carry these keys
+    (wind/waves/soil_moisture model Datasets are untouched).
+
+    Reuses the EXISTING ``_project_currents_to_radial`` formula from
+    ``collocation.py`` -- the same one every other currents validation
+    source (HF-radar, in-situ) already uses to derive this quantity, not
+    reimplemented here. Unlike :func:`_derive_wind_wspd_wdir`, ``EWCT``/
+    ``NSCT`` are KEPT in the output (not dropped) -- every other currents
+    validation source exposes both the raw vector components and the
+    projection.
+
+    Callers must supply *heading_deg* from the SAR side themselves (this
+    function has no access to it) -- see the call sites in
+    ``ModelLayerCollocation``'s three collocation paths.
+    """
+    if heading_deg is None or "EWCT" not in values or "NSCT" not in values:
+        return values
+    from .collocation import _project_currents_to_radial
+    out = dict(values)
+    out["rvlRadVel_projection"] = _project_currents_to_radial(
+        values["EWCT"], values["NSCT"], heading_deg,
+    )
+    return out
+
+
 def _hyperbolic_interp(
     val1: np.ndarray, val2: np.ndarray, val3: np.ndarray, t_prime: Union[float, np.ndarray],
 ) -> np.ndarray:
     """
     KNMI quadratic temporal interpolation through three equally-spaced
-    (1-hour apart) values -- ported from
-    ``collocate_nwp_to_sat.py``'s ``_quadratic_interp``.
+    values -- ported from ``collocate_nwp_to_sat.py``'s
+    ``_quadratic_interp``. This function itself is spacing-agnostic: it
+    has no notion of hours or any other physical unit, only the
+    normalized offset *t_prime*. It is up to the CALLER to normalize
+    *t_prime* against the ACTUAL measured spacing between its three
+    bracket points -- 1h for ERA5's hourly granules, 3h for HyCOM's
+    3-hourly granules, or whatever else a future model source uses (see
+    ``_model_values_at_points`` and
+    ``ModelLayerCollocation._collocate_cell_averaging_grid``, and
+    :func:`_regular_bracket_gap`, which both callers use to derive that
+    spacing rather than assuming it).
 
     *val1*/*val2*/*val3* are the (already spatially-resolved) field values
-    at ``t2 - 1h`` / ``t2`` / ``t2 + 1h``. ``t_prime = (t_obs - t2) / 1h``,
+    at ``t2 - dt`` / ``t2`` / ``t2 + dt``, for whatever bracket spacing
+    ``dt`` the caller normalized against. ``t_prime = (t_obs - t2) / dt``,
     in ``[0, 1)``.
     """
     a = (val3 + val1 - 2.0 * val2) / 2.0
     b = (val3 - val1) / 2.0
     c = val2
     return a * t_prime**2 + b * t_prime + c
+
+
+def _regular_bracket_gap(
+    era5_times: np.ndarray, hour_idxs: List[int],
+) -> Optional[np.timedelta64]:
+    """
+    Return the spacing between the three bracket points
+    ``era5_times[hour_idxs]`` (``[idx2 - 1, idx2, idx2 + 1]``) used by
+    :func:`_hyperbolic_interp`'s callers to normalize ``t_prime`` -- or
+    ``None`` if the backward gap (``t2 - t1``) and forward gap
+    (``t3 - t2``) differ.
+
+    :func:`_hyperbolic_interp`'s quadratic formula assumes its three
+    samples are EQUALLY spaced; this codebase's ERA5 data (genuinely
+    hourly) and HyCOM data (genuinely 3-hourly, per THREDDS) both satisfy
+    that in the common case. But HyCOM's own documentation describes
+    occasional real data gaps, which could make the two gaps around a
+    given bracket center unequal -- there is then no single spacing unit
+    to normalize ``t_prime`` against that the quadratic formula's
+    assumption still holds for. Returning ``None`` here (so callers skip
+    the pass / leave the result NaN with a debug-level log) is preferred
+    over fabricating an answer using an arbitrary choice of one gap or
+    the other -- a silently wrong value is worse than a missing one.
+    """
+    forward = era5_times[hour_idxs[2]] - era5_times[hour_idxs[1]]
+    backward = era5_times[hour_idxs[1]] - era5_times[hour_idxs[0]]
+    if forward != backward:
+        return None
+    return forward
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +261,7 @@ def _model_values_at_points(
     Efficient for the common case where many points share the same (or
     very few distinct) observation times -- always true for a SAR scene,
     whose whole IW/EW grid shares one scalar acquisition time, or whose
-    WV-mode imagettes share only a handful of per-imagette times: each
+    WV-mode vignettes share only a handful of per-vignette times: each
     hour's spatial interpolator is built once and queried in one
     vectorized batch per group of points sharing that hour-bracket,
     instead of rebuilding an interpolator per point.
@@ -242,13 +330,24 @@ def _model_values_at_points(
                 continue  # no bracketing hour for this time group -- leave NaN
             hour_idxs = [idx2 - 1, idx2, idx2 + 1]
 
+        t_prime: Optional[float] = None
+        if temporal_method != "nearest":
+            t2 = era5_times[hour_idxs[1]]
+            gap = _regular_bracket_gap(era5_times, hour_idxs)
+            if gap is None:
+                logger.debug(
+                    "ModelLayerCollocation: irregular bracket spacing around %s "
+                    "(backward gap != forward gap) -- leaving this time group NaN "
+                    "instead of fabricating an interpolated value.", t2,
+                )
+                continue  # skip this whole time group -- leave NaN
+            t_prime = (t - t2) / gap
+
         for var in model_vars:
             values_at_hours = [_get_interp(var, h)(group_pts) for h in hour_idxs]
             if temporal_method == "nearest":
                 blended = values_at_hours[0]
             else:
-                t2 = era5_times[hour_idxs[1]]
-                t_prime = (t - t2) / np.timedelta64(1, "h")
                 blended = _hyperbolic_interp(
                     values_at_hours[0], values_at_hours[1], values_at_hours[2],
                     np.full(group_pts.shape[0], t_prime, dtype=float),
@@ -356,9 +455,9 @@ class ModelLayerCollocation:
         sar_scene_name: str = "",
     ) -> List[CollocatedPoint]:
         """
-        WV-mode (sparse imagette points) SAR scene, all arrays shape
+        WV-mode (sparse vignette points) SAR scene, all arrays shape
         ``(n_points,)``. Always interpolates ERA5 directly at each point
-        regardless of :attr:`method` -- WV imagettes are already sparse
+        regardless of :attr:`method` -- WV vignettes are already sparse
         SAR-anchor points (~200 km apart), so there is no dense SAR grid
         within one ERA5 cell to aggregate the way cell-averaging does for
         grid-mode scenes; interpolating ERA5 exactly at each point is the
@@ -366,6 +465,10 @@ class ModelLayerCollocation:
         """
         times_np = pd.to_datetime(sar_times).to_numpy()
         model_values = _model_values_at_points(sar_lons, sar_lats, times_np, era5_ds, self.temporal_method)
+        if "rvlHeading" in sar_point_vars:
+            model_values = _derive_currents_radial_projection(
+                model_values, sar_point_vars["rvlHeading"],
+            )
 
         results: List[CollocatedPoint] = []
         for i in range(len(sar_lons)):
@@ -412,6 +515,10 @@ class ModelLayerCollocation:
         times_flat = np.full(lons_flat.shape, np.datetime64(obs_time), dtype="datetime64[ns]")
 
         model_values = _model_values_at_points(lons_flat, lats_flat, times_flat, era5_ds, self.temporal_method)
+        if "rvlHeading" in sar_data:
+            model_values = _derive_currents_radial_projection(
+                model_values, sar_data["rvlHeading"][0].ravel(),
+            )
 
         results: List[CollocatedPoint] = []
         for flat_idx in range(lons_flat.size):
@@ -487,6 +594,18 @@ class ModelLayerCollocation:
                 return []
             hour_idxs = [idx2 - 1, idx2, idx2 + 1]
 
+        bracket_gap: Optional[np.timedelta64] = None
+        if self.temporal_method == "hyperbolic":
+            bracket_gap = _regular_bracket_gap(era5_times, hour_idxs)
+            if bracket_gap is None:
+                logger.warning(
+                    "ModelLayerCollocation: irregular bracket spacing around %s for "
+                    "scene '%s' (backward gap != forward gap) -- skipping "
+                    "cell-averaging pass instead of fabricating an interpolated value.",
+                    era5_times[hour_idxs[1]], sar_scene_name,
+                )
+                return []
+
         lat_ax = era5_ds["lat"].values
         lon_ax = era5_ds["lon"].values
         lon2d, lat2d = np.meshgrid(lon_ax, lat_ax)
@@ -508,7 +627,7 @@ class ModelLayerCollocation:
                 cell_values[var] = fields[0]
             else:
                 t2 = era5_times[hour_idxs[1]]
-                t_prime = float((obs_np - t2) / np.timedelta64(1, "h"))
+                t_prime = float((obs_np - t2) / bracket_gap)
                 cell_values[var] = _hyperbolic_interp(fields[0], fields[1], fields[2], t_prime)
 
         # Derive WSPD/WDIR from the now-FINAL, per-cell interpolated
@@ -561,6 +680,9 @@ class ModelLayerCollocation:
                     weighting_method=self.distance_weighting,
                     sigma_km=self.gaussian_sigma_km,
                     agg_window_km=self.aggregation_window_km,
+                )
+                val_point = _derive_currents_radial_projection(
+                    val_point, sar_aggregated.get("rvlHeading"),
                 )
                 if not sar_aggregated:
                     continue

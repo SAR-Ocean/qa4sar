@@ -60,7 +60,7 @@ def _make_ocn_safe(
 
     rvl_swaths=None -> no rvl* variables written.
     rvl_swaths=S (wv=False) -> 3-D rvl (rvlAzSize, rvlRaSize, rvlSwath=S).
-    wv=True -> 2-D 13x13 rvl (rvlAzSize, rvlRaSize), as in WV imagettes.
+    wv=True -> 2-D 13x13 rvl (rvlAzSize, rvlRaSize), as in WV vignettes.
     land_rows=N -> the first N rows of the rvlAzSize axis are written with
         rvlLandFlag=1 (land) across every column/swath; the rest are 0.
         land_rows=0 (default) omits rvlLandFlag entirely, simulating a
@@ -121,7 +121,7 @@ def _make_wv_rvl_safe(
     seed: int = 0,
 ) -> Path:
     """
-    Build a WV *.SAFE dir with one 13x13-imagette RVL measurement file per
+    Build a WV *.SAFE dir with one 13x13-vignette RVL measurement file per
     entry in land_rows_per_file. Entry i controls how many of that file's
     13 rvlAzSize rows are land-flagged (0 = no rvlLandFlag var at all for
     that file).
@@ -1759,7 +1759,7 @@ class TestWvSafeProductTypeRouting:
 
     def _make_wv_waves_safe(self, tmp_path, *, osw_hs, osw_total_hs=None):
         """
-        Build a WV SAFE whose imagette measurement file carries partitioned
+        Build a WV SAFE whose vignette measurement file carries partitioned
         ``oswHs`` and optionally an integrated ``oswTotalHs``.
 
         ``osw_hs`` is the per-partition Hs array (dims oswAzSize, oswRaSize,
@@ -3287,3 +3287,212 @@ class TestFromEra5Antimeridian:
         # West window shifted by +360: [-180,-177.5,-175] -> [180,182.5,185]
         assert np.allclose(lon, [175.0, 177.5, 180.0, 182.5, 185.0])
         assert all(b > a for a, b in zip(lon, lon[1:]))  # strictly increasing after stitch
+
+
+class TestFromHycom:
+    def _write_hycom_nc(self, path, n_lat=4, n_lon=4, n_time=3, start_hour="2025-01-01T00:00:00"):
+        import numpy as np
+        import xarray as xr
+
+        lat = np.linspace(40.0, 41.5, n_lat)
+        lon = np.linspace(-10.0, -8.5, n_lon)
+        time = xr.date_range(start_hour, periods=n_time, freq="3h")
+        ds = xr.Dataset(
+            {
+                "water_u": (("time", "lat", "lon"), np.random.rand(n_time, n_lat, n_lon).astype("float32")),
+                "water_v": (("time", "lat", "lon"), np.random.rand(n_time, n_lat, n_lon).astype("float32")),
+            },
+            coords={"time": time, "lat": lat, "lon": lon},
+        )
+        ds.to_netcdf(path)
+
+    def test_returns_gridded_dataset_with_correct_data_type(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "hycom_espc_d_v02_20250101T000000_20250102T000000.nc"
+        self._write_hycom_nc(nc_path)
+
+        ds = DataTreeConverter.from_hycom(nc_path)
+        assert ds is not None
+        assert ds.attrs["data_type"] == "hycom"
+        assert set(ds.dims) == {"time", "lat", "lon"}
+
+    def test_renames_water_u_water_v_to_ewct_nsct(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "hycom_espc_d_v02_20250101T000000_20250102T000000.nc"
+        self._write_hycom_nc(nc_path)
+
+        ds = DataTreeConverter.from_hycom(nc_path)
+        assert ds is not None
+        assert "EWCT" in ds.data_vars and "NSCT" in ds.data_vars
+        assert "water_u" not in ds.data_vars and "water_v" not in ds.data_vars
+
+    def test_multiple_segment_files_concatenated_along_time(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        seg1 = tmp_path / "hycom_gofs31_930_20241001T000000_20241005T000000.nc"
+        seg2 = tmp_path / "hycom_espc_d_v02_20241010T000000_20241015T000000.nc"
+        self._write_hycom_nc(seg1, n_time=8, start_hour="2024-10-01T00:00:00")
+        self._write_hycom_nc(seg2, n_time=8, start_hour="2024-10-10T00:00:00")
+
+        ds = DataTreeConverter.from_hycom([seg1, seg2])
+        assert ds is not None
+        assert ds.sizes["time"] == 16
+
+    def test_concatenated_time_is_monotonic_regardless_of_alphabetical_filename_order(
+        self, tmp_path,
+    ):
+        """Regression test: HyCOM segment filenames embed the dataset
+        key right after the ``hycom_`` prefix (``hycom_espc_d_v02_...``
+        vs ``hycom_gofs31_930_...``), so a plain alphabetical
+        ``sorted()`` of the file paths (as ``from_hycom`` and
+        ``convert_downloaded_data`` both do) puts the ESPC-D-V02 file
+        BEFORE the GOFS 3.1 file (``'e' < 'g'``) even though ESPC-D-V02
+        is always the chronologically LATER segment (it's only ever
+        used at/after ``_HYCOM_CUTOVER_DATE``). ``xr.concat`` does not
+        sort its inputs -- opening/concatenating in that alphabetical
+        (but chronologically backwards) order produces a time axis that
+        goes forward then jumps backward, which is non-monotonic. This
+        existing test class's own
+        ``test_multiple_segment_files_concatenated_along_time`` only
+        asserts the total concatenated COUNT, so it never caught this."""
+        import pandas as pd
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        seg_gofs = tmp_path / "hycom_gofs31_930_20241001T000000_20241005T000000.nc"
+        seg_espc = tmp_path / "hycom_espc_d_v02_20241010T000000_20241015T000000.nc"
+        self._write_hycom_nc(seg_gofs, n_time=8, start_hour="2024-10-01T00:00:00")
+        self._write_hycom_nc(seg_espc, n_time=8, start_hour="2024-10-10T00:00:00")
+
+        # Pass paths in already-chronological order -- from_hycom must
+        # not rely on caller order either, only on its own handling.
+        ds = DataTreeConverter.from_hycom([seg_gofs, seg_espc])
+        assert ds is not None
+        times = pd.to_datetime(ds["time"].values)
+        assert times.is_monotonic_increasing, (
+            f"from_hycom's concatenated time axis is not monotonic -- "
+            f"likely concatenated in alphabetical-by-filename (not "
+            f"chronological) order: {times}"
+        )
+
+    def test_missing_file_returns_none(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        assert DataTreeConverter.from_hycom(tmp_path / "nope.nc") is None
+
+    def test_missing_expected_variable_returns_none(self, tmp_path):
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        nc_path = tmp_path / "hycom_espc_d_v02_20250101T000000_20250102T000000.nc"
+        lat = np.linspace(40.0, 41.5, 4)
+        lon = np.linspace(-10.0, -8.5, 4)
+        time = xr.date_range("2025-01-01", periods=3, freq="3h")
+        ds = xr.Dataset(
+            {"water_u": (("time", "lat", "lon"), np.random.rand(3, 4, 4).astype("float32"))},
+            coords={"time": time, "lat": lat, "lon": lon},
+        )  # missing water_v
+        ds.to_netcdf(nc_path)
+
+        assert DataTreeConverter.from_hycom(nc_path) is None
+
+
+class TestConvertDownloadedDataHycom:
+    def test_hycom_dir_discovered_and_combined_into_one_node(self, tmp_path):
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+        )
+
+        hycom_dir = tmp_path / "hycom"
+        hycom_dir.mkdir()
+        lat = np.linspace(40.0, 41.5, 4)
+        lon = np.linspace(-10.0, -8.5, 4)
+        for stem, start_hour in [
+            ("hycom_gofs31_930_20240809T000000_20240810T000000.nc", "2024-08-09T00:00:00"),
+            ("hycom_espc_d_v02_20240810T000000_20240811T000000.nc", "2024-08-10T00:00:00"),
+        ]:
+            time = xr.date_range(start_hour, periods=8, freq="3h")
+            ds = xr.Dataset(
+                {
+                    "water_u": (("time", "lat", "lon"), np.random.rand(8, 4, 4).astype("float32")),
+                    "water_v": (("time", "lat", "lon"), np.random.rand(8, 4, 4).astype("float32")),
+                },
+                coords={"time": time, "lat": lat, "lon": lon},
+            )
+            ds.to_netcdf(hycom_dir / stem)
+
+        recipe = Recipe(RecipeConfig(
+            name="t", variable="currents",
+            geographic_bounds=GeographicBounds(-10.0, -8.5, 40.0, 41.5),
+            temporal_bounds=TemporalBounds("2024-08-09", "2024-08-11"),
+        ))
+
+        tree = DataTreeConverter.convert_downloaded_data(tmp_path, recipe=recipe)
+        assert tree is not None
+        hycom_ds = tree["validation/hycom/hycom"].to_dataset()
+        assert hycom_ds.sizes["time"] == 16
+        assert hycom_ds.attrs["data_type"] == "hycom"
+
+    def test_hycom_dir_ignored_for_non_currents_recipe(self, tmp_path):
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+        )
+
+        hycom_dir = tmp_path / "hycom"
+        hycom_dir.mkdir()
+        lat = np.linspace(40.0, 41.5, 4)
+        lon = np.linspace(-10.0, -8.5, 4)
+        time = xr.date_range("2024-08-10", periods=8, freq="3h")
+        ds = xr.Dataset(
+            {
+                "water_u": (("time", "lat", "lon"), np.random.rand(8, 4, 4).astype("float32")),
+                "water_v": (("time", "lat", "lon"), np.random.rand(8, 4, 4).astype("float32")),
+            },
+            coords={"time": time, "lat": lat, "lon": lon},
+        )
+        ds.to_netcdf(hycom_dir / "hycom_espc_d_v02_20240810T000000_20240811T000000.nc")
+
+        # Alongside hycom/, add an unrelated altimeter file (discovery for
+        # this source is unconditional -- not gated on recipe.variable) so
+        # the resulting tree is guaranteed non-None for a reason unrelated
+        # to hycom. That way the "hycom" exclusion assertion below always
+        # runs and actually proves hycom specifically was excluded, rather
+        # than merely observing that the whole tree came back empty.
+        # _make_altimeter_nc's fixture points sit at lat 50-51N, lon
+        # 352-353E (i.e. -8..-7 once normalised to -180..180) around
+        # 2026-07-08T18:00 -- unrelated to the hycom fixture's own bounds
+        # above, since the hycom gate only checks recipe.variable and
+        # never looks at bounds. The recipe's own bounds/tolerances must
+        # cover the altimeter fixture's domain so it survives the
+        # `_filtered()` recipe-domain crop and isn't itself dropped.
+        altimeter_dir = tmp_path / "altimeter"
+        altimeter_dir.mkdir()
+        _make_altimeter_nc(altimeter_dir)
+
+        recipe = Recipe(RecipeConfig(
+            name="t", variable="wind",
+            geographic_bounds=GeographicBounds(-9.0, -6.0, 49.0, 52.0),
+            temporal_bounds=TemporalBounds("2026-07-08", "2026-07-09"),
+        ))
+
+        tree = DataTreeConverter.convert_downloaded_data(tmp_path, recipe=recipe)
+        assert tree is not None
+        assert "hycom" not in getattr(tree.get("validation"), "children", {})

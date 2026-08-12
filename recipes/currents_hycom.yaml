@@ -1,24 +1,30 @@
-name: waves_era5
-description: 'Validate Sentinel-1 significant wave height (WV/SM modes)
-  against ERA5 reanalysis (significant height of combined wind waves and swell).'
+name: currents_hycom
+description: 'Validate Sentinel-1 WV mode ocean currents
+  against HyCOM model surface currents (ESPC-D-V02).'
 version: '1.0'
-variable: waves
+variable: currents
+variable_specs:
+  components:
+  - zonal
+  - meridional
 geographic_bounds:
-  min_lon: -70.0
-  max_lon: -20.0
-  min_lat: 0.0
-  max_lat: 40.0
+  min_lon: 0.5
+  max_lon: 6.0
+  min_lat: 58.0
+  max_lat: 62.5
 temporal_bounds:
-  start: '2026-07-12 07:00:00'
-  end: '2026-07-12 11:00:00'
+  start: '2026-07-21'
+  end: '2026-07-22'
 sar_data:
   source: sentinel1_l2_ocn
   swath_mode:
   - WV
+  - IW
+  - EW
   - SM
   max_downloads: null
 validation_sources:
-- source_type: era5
+- source_type: hycom
   download_kwargs: {}
   collocation_kwargs: {}
 collocation:
@@ -33,11 +39,11 @@ collocation:
   sar_footprint_radius_km: 14.0
   layer_vs_layer:
     layer_type_specs:
-      era5_waves:
-        time_tolerance_minutes: 120
+      hycom:
+        time_tolerance_minutes: 360
+        aggregation_window_km: 4.6
+        distance_weighting: equal
         method: cell-averaging
         temporal_method: hyperbolic
-        aggregation_window_km: 12.5
-        distance_weighting: equal
     method: cell-averaging
 output_dir: null

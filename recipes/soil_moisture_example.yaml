@@ -43,6 +43,9 @@ validation_sources:
   download_kwargs:
     product_type: active
   collocation_kwargs: {}
+- source_type: era5
+  download_kwargs: {}
+  collocation_kwargs: {}
 collocation:
   point_vs_layer:
     time_tolerance_minutes: 720
@@ -53,4 +56,13 @@ collocation:
     distance_weighting: equal
     gaussian_sigma_km: 2.0
   sar_footprint_radius_km: 14.0
+  layer_vs_layer:
+    layer_type_specs:
+      era5_soil_moisture:
+        time_tolerance_minutes: 720
+        aggregation_window_km: 5.0
+        distance_weighting: equal
+        method: cell-averaging
+        temporal_method: hyperbolic
+    method: cell-averaging
 output_dir: null

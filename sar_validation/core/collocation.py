@@ -122,6 +122,11 @@ def _project_currents_to_radial(ewct: float, nsct: float, heading_deg: float) ->
     is the quantity compared against the L2 OCN ``rvlRadVel`` product
     (``rvlRadVel_projection``).
 
+    Typed here for this module's own scalar-per-row usage; the arithmetic is
+    actually generic over numpy arrays too via broadcasting/duck-typing, and
+    ``model_collocation.py``'s vectorized ``_derive_currents_radial_projection``
+    also calls this with whole arrays at once.
+
     Reference: Martin, Gommenginger, Jacob & Staneva (2022), RSE 268:112758.
     """
     heading_rad = np.radians(heading_deg - 90.0)
@@ -296,6 +301,11 @@ LAYER_DATA_TYPES = {
     # visualization.py) includes era5's val_source labels for permanent
     # palette slots. See docs/design-choices.md.
     "era5_wind", "era5_waves", "era5_soil_moisture",
+    # HyCOM never reaches _detect_collocation_type in practice either (see
+    # the ERA5 comment above) -- this entry exists purely so
+    # _canonical_source_order()'s registered-set check (visualization.py)
+    # includes hycom's val_source label for a permanent palette slot.
+    "hycom",
 }
 # path-fragment fallbacks when attributes are absent
 LAYER_SOURCE_PATHS = {
@@ -303,6 +313,27 @@ LAYER_SOURCE_PATHS = {
     "hf_radar_grid", "hfr_noaa", "radiometer", "ascat_ssm", "amsr_ssm", "smap_ssm",
     "smos_ssm", "cds_ssm",
 }
+
+
+def _model_source_type(data_type: str) -> Optional[str]:
+    """
+    Map a gridded "model" validation Dataset's ``data_type`` attribute to
+    the ``source_type`` key used in the recipe's ``validation_sources``
+    (and therefore in ``source_type_overrides``) -- e.g. ``"era5_wind"``
+    -> ``"era5"``, ``"hycom"`` -> ``"hycom"``. Returns ``None`` if
+    *data_type* isn't a recognized model source.
+
+    ERA5 spans three ``data_type`` values (one recipe `source_type` per
+    three possible `variable`s: wind/waves/soil_moisture), all sharing
+    the recipe `source_type` literal ``"era5"`` -- hence the prefix
+    match. HyCOM only ever produces ``data_type="hycom"``, identical to
+    its own `source_type`, so it's an exact match, no stripping needed.
+    """
+    if data_type.startswith("era5_"):
+        return "era5"
+    if data_type == "hycom":
+        return "hycom"
+    return None
 
 
 def _detect_collocation_type(val_ds: "xr.Dataset", source_path: str) -> str:
@@ -1230,27 +1261,27 @@ def _collocate_wv_points(
     sar_scene_name: str = "",
 ) -> List[CollocatedPoint]:
     """
-    SAR-point-anchored collocation for sparse WV-mode OSW imagettes.
+    SAR-point-anchored collocation for sparse WV-mode OSW vignettes.
 
-    Each Sentinel-1 WV imagette is a single point representing a ~20×20 km
-    footprint, and consecutive imagettes are ~200 km apart. Rather than
-    requiring validation data within a few km of the imagette *centre* (as the
+    Each Sentinel-1 WV vignette is a single point representing a ~20×20 km
+    footprint, and consecutive vignettes are ~200 km apart. Rather than
+    requiring validation data within a few km of the vignette *centre* (as the
     grid-oriented matchers do when a WV point is faked into a 1×1 grid), this
     gathers every validation observation within ``footprint_radius_km`` and
-    ``time_tolerance_minutes`` of each imagette and aggregates them into a
+    ``time_tolerance_minutes`` of each vignette and aggregates them into a
     single match anchored on the SAR point.
 
     Parameters
     ----------
     sar_lons, sar_lats, sar_times : np.ndarray
-        Per-imagette coordinates/times for one SAR scene, shape ``(n_points,)``.
+        Per-vignette coordinates/times for one SAR scene, shape ``(n_points,)``.
     sar_point_vars : dict
         SAR variables as ``(n_points,)`` arrays (e.g. ``{"oswHs": ...}``).
     val_data : pd.DataFrame
         Validation observations with ``lon``, ``lat``, ``time`` and any number
         of variable columns.
     footprint_radius_km : float
-        Search radius around each imagette (≈ footprint half-diagonal).
+        Search radius around each vignette (≈ footprint half-diagonal).
     time_tolerance_minutes : float
         Maximum absolute time difference for a validation obs to contribute.
     distance_weighting : str
@@ -1263,7 +1294,7 @@ def _collocate_wv_points(
     Returns
     -------
     list[CollocatedPoint]
-        One match per imagette that had at least one contributing observation.
+        One match per vignette that had at least one contributing observation.
     """
     from scipy.spatial import cKDTree
 
@@ -1300,7 +1331,7 @@ def _collocate_wv_points(
         if not (np.isfinite(s_lon) and np.isfinite(s_lat)):
             continue
 
-        # SAR variables for this imagette (skip if all NaN)
+        # SAR variables for this vignette (skip if all NaN)
         sar_aggregated = {
             var: float(arr[i]) for var, arr in sar_point_vars.items()
             if np.isfinite(arr[i])
@@ -1347,7 +1378,7 @@ def _collocate_wv_points(
 
         # Project the in-situ current vector (EWCT/NSCT) onto the SAR radial
         # look direction so it can be compared against rvlRadVel — mirrors the
-        # grid collocation path. Here rvlHeading is a scalar per imagette point.
+        # grid collocation path. Here rvlHeading is a scalar per vignette point.
         if (
             "rvlRadVel" in sar_aggregated
             and "rvlHeading" in sar_aggregated
@@ -1390,7 +1421,7 @@ def _collocate_wv_points(
         )
 
     logger.info(
-        "WV-point collocation [%s]: %d match(es) from %d imagette(s) (source=%s)",
+        "WV-point collocation [%s]: %d match(es) from %d vignette(s) (source=%s)",
         collocation_type, len(collocations), len(sar_lons), val_source,
     )
     return collocations
@@ -1495,10 +1526,16 @@ def run_collocation(
     # Layer-vs-layer specs: start from the built-in defaults (so recipes that
     # declare no layer_vs_layer section at all still get sensible per-source
     # aggregation windows), then let any recipe-level overrides win per-key.
+    # Deep merge (not layer_vs_layer_specs.update(...), which replaces a
+    # key's whole dict) -- a recipe overriding only e.g.
+    # "time_tolerance_minutes" for one key (soil_moisture_nisar_norway.yaml
+    # does exactly this) must not silently lose that key's other defaults
+    # (aggregation_window_km, distance_weighting, ...) in the process.
     from .recipe import DEFAULT_LAYER_TYPE_SPECS
     layer_vs_layer_specs = dict(DEFAULT_LAYER_TYPE_SPECS)
     if coll_cfg.layer_vs_layer is not None:
-        layer_vs_layer_specs.update(coll_cfg.layer_vs_layer.layer_type_specs)
+        for key, spec in coll_cfg.layer_vs_layer.layer_type_specs.items():
+            layer_vs_layer_specs[key] = {**layer_vs_layer_specs.get(key, {}), **spec}
 
     recipe_layer_type_specs = (
         coll_cfg.layer_vs_layer.layer_type_specs if coll_cfg.layer_vs_layer is not None else {}
@@ -1548,22 +1585,23 @@ def run_collocation(
                         "colloc_kwargs": source_type_overrides.get(source_type, {}),
                     }
 
-    # Gridded "model" sources (currently only ERA5) -- kept as raw, native
+    # Gridded "model" sources (ERA5, HyCOM) -- kept as raw, native
     # (time, lat, lon) Datasets rather than flattened into `buckets`/
     # `val_dfs` like every other validation source, since
     # ModelLayerCollocation interpolates the field directly onto SAR pixel
     # locations at collocation time instead of matching against
-    # pre-existing rows. Detected by a "era5_" data_type prefix rather
-    # than a "point" dimension check.
+    # pre-existing rows. Detected via _model_source_type() rather than a
+    # "point" dimension check.
     model_sources: Dict[str, "xr.Dataset"] = {}
     model_source_metadata: Dict[str, Dict[str, Any]] = {}
     if "validation" in datatree.children:
         for name, node in datatree["validation"].children.items():
             ds = node.to_dataset()
-            if ds.attrs.get("data_type", "").startswith("era5_"):
+            model_source_type = _model_source_type(ds.attrs.get("data_type", ""))
+            if model_source_type is not None:
                 model_sources[name] = ds
                 model_source_metadata[name] = {
-                    "colloc_kwargs": source_type_overrides.get("era5", {}),
+                    "colloc_kwargs": source_type_overrides.get(model_source_type, {}),
                 }
             # One level deeper -- DataTreeConverter places ERA5 at
             # "validation/era5/era5" (same "may be nested one level
@@ -1573,11 +1611,12 @@ def run_collocation(
             # checked above, which itself carries no attrs of its own.
             for subname, subnode in node.children.items():
                 sub_ds = subnode.to_dataset()
-                if sub_ds.attrs.get("data_type", "").startswith("era5_"):
+                sub_model_source_type = _model_source_type(sub_ds.attrs.get("data_type", ""))
+                if sub_model_source_type is not None:
                     path = f"{name}/{subname}"
                     model_sources[path] = sub_ds
                     model_source_metadata[path] = {
-                        "colloc_kwargs": source_type_overrides.get("era5", {}),
+                        "colloc_kwargs": source_type_overrides.get(sub_model_source_type, {}),
                     }
 
     _merge_sibling_ssm_nodes(buckets, source_metadata, layer_vs_layer_specs)
@@ -1588,7 +1627,7 @@ def run_collocation(
         return None
 
     # ``ds["time"]`` is a scalar coordinate for grid-mode (IW/EW/SM) scenes
-    # but a (point,)-dimensioned array of per-imagette times for WV-mode
+    # but a (point,)-dimensioned array of per-vignette times for WV-mode
     # scenes -- np.atleast_1d normalises both to an iterable so every SAR
     # acquisition time is collected regardless of scene mode. Scenes with
     # no ``time`` coordinate at all, or individual NaT entries within one,
@@ -1708,10 +1747,10 @@ def run_collocation(
 
         if is_wv_mode:
             # =========== WV MODE (SAR-footprint-anchored) ===========
-            # Each imagette is a single point standing for a ~20×20 km
-            # footprint, and imagettes are ~200 km apart — far too sparse to
+            # Each vignette is a single point standing for a ~20×20 km
+            # footprint, and vignettes are ~200 km apart — far too sparse to
             # match by requiring validation data within a few km of the point
-            # centre. Instead, anchor on each imagette and aggregate every
+            # centre. Instead, anchor on each vignette and aggregate every
             # validation obs within the footprint radius (see
             # _collocate_wv_points).
             sar_lons = sar_ds["lon"].values   # (point,)
@@ -1729,7 +1768,7 @@ def run_collocation(
                 continue
 
             n_points = len(sar_lons)
-            logger.info("SAR node '%s' is WV mode with %d imagette point(s)", sar_name, n_points)
+            logger.info("SAR node '%s' is WV mode with %d vignette point(s)", sar_name, n_points)
 
             for ctype, sources in buckets.items():
                 if not sources:
@@ -1745,7 +1784,7 @@ def run_collocation(
 
                     if ctype == "layer_vs_layer":
                         # Altimeter/scatterometer: sampled as a layer at the
-                        # imagette with distance-weighted aggregation and the
+                        # vignette with distance-weighted aggregation and the
                         # layer's own time tolerance. Resolve the layer type
                         # exactly as the grid path does.
                         layer_type = _resolve_layer_type(val_ds, val_name, layer_vs_layer_specs)
@@ -1785,9 +1824,9 @@ def run_collocation(
                     )
 
             # ERA5 (or any future gridded "model" source) -- see
-            # docs/design-choices.md. WV imagettes are sparse SAR-anchor
+            # docs/design-choices.md. WV vignettes are sparse SAR-anchor
             # points, so ModelLayerCollocation.collocate_points always
-            # interpolates ERA5 directly at each imagette regardless of
+            # interpolates ERA5 directly at each vignette regardless of
             # the recipe's chosen method.
             for val_name, val_ds in model_sources.items():
                 per_source_kwargs = model_source_metadata.get(val_name, {}).get("colloc_kwargs", {})

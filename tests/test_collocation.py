@@ -979,7 +979,7 @@ class TestRunCollocationCurrentsFromDatatree:
 
     def test_wv_mode_multi_point_time_array_does_not_crash(self, tmp_path):
         """Regression test: a WV-mode SAR node's ``time`` coordinate is
-        ``("point",)``-dimensioned -- one timestamp per imagette, not a
+        ``("point",)``-dimensioned -- one timestamp per vignette, not a
         single scalar like grid-mode (IW/EW/SM) scenes. `run_collocation`
         builds ``sar_scene_times`` from every SAR node up front (for the
         ISMN pre-averaging step), and used to call
@@ -993,7 +993,7 @@ class TestRunCollocationCurrentsFromDatatree:
 
         from sar_validation.core.collocation import run_collocation
 
-        # Two WV imagettes at different acquisition times -- this is what
+        # Two WV vignettes at different acquisition times -- this is what
         # made the old scalar pd.Timestamp(...) call raise.
         sar = xr.Dataset(
             {
@@ -1012,7 +1012,7 @@ class TestRunCollocationCurrentsFromDatatree:
                    "measurement_type": "rvl"},
         )
         # A non-ISMN (mooring) in-situ source sitting on top of the first
-        # imagette only.
+        # vignette only.
         val = xr.Dataset(
             {
                 "EWCT": (("point",), np.array([0.4], dtype="float32")),
@@ -1909,3 +1909,160 @@ class TestRunCollocationEra5Wiring:
 
         era5_mask = result_ds["val_source"].values == "era5_wind"
         assert int(era5_mask.sum()) > 0
+
+
+class TestModelSourceType:
+    def test_era5_prefixed_data_types_map_to_era5(self):
+        from sar_validation.core.collocation import _model_source_type
+
+        assert _model_source_type("era5_wind") == "era5"
+        assert _model_source_type("era5_waves") == "era5"
+        assert _model_source_type("era5_soil_moisture") == "era5"
+
+    def test_hycom_maps_to_hycom(self):
+        from sar_validation.core.collocation import _model_source_type
+
+        assert _model_source_type("hycom") == "hycom"
+
+    def test_unrelated_data_type_returns_none(self):
+        from sar_validation.core.collocation import _model_source_type
+
+        assert _model_source_type("scatterometer") is None
+        assert _model_source_type("") is None
+
+
+class TestRunCollocationHycomModelSourceDispatch:
+    def _currents_recipe_with_hycom_override(self, method: str):
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+        return Recipe(RecipeConfig(
+            name="hycom_it", variable="currents",
+            geographic_bounds=GeographicBounds(-20.0, -19.0, 50.0, 51.0),
+            temporal_bounds=TemporalBounds("2026-06-20T18:00:00", "2026-06-20T23:00:00"),
+            validation_sources=[ValidationDataSource(
+                source_type="hycom",
+                collocation_kwargs={"method": method, "temporal_method": "nearest"},
+            )],
+        ))
+
+    def _tree(self):
+        import xarray as xr
+
+        # Same SAR grid shape as the existing HF-radar/in-situ currents
+        # integration test above (TestRunCollocationCurrentsFromDatatree),
+        # so results are directly comparable: constant heading=90 makes
+        # the projection hand-checkable (projection == EWCT).
+        ny, nx = 5, 5
+        lon2d, lat2d = np.meshgrid(
+            np.linspace(-20.0, -19.0, nx), np.linspace(50.0, 51.0, ny)
+        )
+        sar = xr.Dataset(
+            {
+                "rvlRadVel": (("y", "x"), np.full((ny, nx), 0.5, dtype="float32")),
+                "rvlHeading": (("y", "x"), np.full((ny, nx), 90.0, dtype="float32")),
+            },
+            coords={
+                "lon": (("y", "x"), lon2d),
+                "lat": (("y", "x"), lat2d),
+                "time": np.datetime64("2026-06-20T19:15:00", "ns"),
+            },
+            attrs={"data_type": "sar_l2_ocn", "swath_mode": "IW/EW/SM", "measurement_type": "rvl"},
+        )
+        # Gridded HyCOM node covering the whole SAR bbox, single hour-aligned
+        # timestamp (temporal_method="nearest" in the recipe override above,
+        # so no bracketing-hour data is needed).
+        hlon, hlat = np.meshgrid(np.linspace(-20.0, -19.0, 3), np.linspace(50.0, 51.0, 3))
+        hycom = xr.Dataset(
+            {
+                "EWCT": (("time", "lat", "lon"), np.full((1, 3, 3), 0.4, dtype="float32")),
+                "NSCT": (("time", "lat", "lon"), np.full((1, 3, 3), 0.3, dtype="float32")),
+            },
+            coords={
+                "time": [np.datetime64("2026-06-20T19:00:00", "ns")],
+                "lat": np.linspace(50.0, 51.0, 3),
+                "lon": np.linspace(-20.0, -19.0, 3),
+            },
+            attrs={"data_type": "hycom", "platform_type": "hycom"},
+        )
+        return xr.DataTree.from_dict({"/sar/scene1": sar, "/validation/hycom/hycom": hycom})
+
+    def test_hycom_individual_method_override_is_actually_applied(self, tmp_path):
+        from sar_validation.core.collocation import run_collocation
+
+        # Regression test for the era5-hardcoded model-source detection
+        # bug: before the fix, hycom's own collocation_kwargs override
+        # (method="individual") was silently ignored in favour of
+        # source_type_overrides.get("era5", {}) -- always falling back to
+        # DEFAULT_LAYER_TYPE_SPECS["hycom"]["method"] == "cell-averaging"
+        # regardless of what the recipe asked for. "individual" produces
+        # one match per valid SAR pixel (25, for this 5x5 grid);
+        # "cell-averaging" with the small default aggregation_window_km
+        # (4.6 km) against this coarse 3x3 HyCOM grid produces far fewer
+        # (likely 0) -- a stark, unambiguous signal either way.
+        recipe = self._currents_recipe_with_hycom_override("individual")
+        result = run_collocation(recipe, self._tree(), tmp_path)
+        assert result is not None
+        assert len(result["val_rvlRadVel_projection"]) > 5
+        # heading 90 -> projection == EWCT == 0.4 (hand-checkable, same as
+        # the existing mooring test above)
+        assert float(result["val_rvlRadVel_projection"].values[0]) == pytest.approx(0.4, abs=1e-5)
+
+    def test_partial_layer_type_spec_override_keeps_other_defaults(self, tmp_path, monkeypatch):
+        """Regression test: a recipe overriding only ONE field of a
+        layer_type_specs entry (e.g. time_tolerance_minutes, as
+        soil_moisture_nisar_norway.yaml's scatterometer_ssm/etc. entries
+        already do in practice) must not silently drop that entry's OTHER
+        DEFAULT_LAYER_TYPE_SPECS fields (aggregation_window_km here).
+        Before the fix, ``layer_vs_layer_specs.update(recipe_overrides)``
+        replaced "hycom"'s whole dict with the recipe's partial one,
+        losing DEFAULT_LAYER_TYPE_SPECS["hycom"]["aggregation_window_km"]
+        (4.6) in favour of ModelLayerCollocation's own generic constructor
+        default (12.5, tuned for ASCAT-like sources, not HyCOM's finer
+        native grid) -- hycom is a model source, dispatched to
+        ModelLayerCollocation, not LayerLayerCollocation."""
+        from sar_validation.core.collocation import run_collocation
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+        from sar_validation.core.recipe import (
+            CollocationType,
+            GeographicBounds,
+            LayerVsLayerCollocation,
+            PointVsLayerCollocation,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+
+        recipe = Recipe(RecipeConfig(
+            name="hycom_partial_override", variable="currents",
+            geographic_bounds=GeographicBounds(-20.0, -19.0, 50.0, 51.0),
+            temporal_bounds=TemporalBounds("2026-06-20T18:00:00", "2026-06-20T23:00:00"),
+            validation_sources=[ValidationDataSource(source_type="hycom")],
+            collocation=CollocationType(
+                point_vs_layer=PointVsLayerCollocation(),
+                layer_vs_layer=LayerVsLayerCollocation(
+                    # Only time_tolerance_minutes -- omits aggregation_window_km,
+                    # distance_weighting, method, temporal_method entirely.
+                    layer_type_specs={"hycom": {"time_tolerance_minutes": 999}},
+                ),
+            ),
+        ))
+
+        captured: dict = {}
+        original_init = ModelLayerCollocation.__init__
+
+        def spy_init(self, **kwargs):
+            captured.update(kwargs)
+            original_init(self, **kwargs)
+
+        monkeypatch.setattr(ModelLayerCollocation, "__init__", spy_init)
+        run_collocation(recipe, self._tree(), tmp_path)
+
+        assert captured["time_tolerance_minutes"] == 999  # recipe override still wins
+        assert captured["aggregation_window_km"] == pytest.approx(4.6, abs=0.01)
+        assert captured["distance_weighting"] == "equal"

@@ -1988,6 +1988,103 @@ class DataTreeConverter:
         return ds
 
     @staticmethod
+    def from_hycom(
+        nc_paths: Union[str, Path, Sequence[Union[str, Path]]],
+    ) -> Optional[xr.Dataset]:
+        """
+        Open one or more HyCOM segment NetCDF files (as downloaded by
+        :class:`~sar_validation.downloaders.hycom_downloader.HycomDownloader`)
+        and return one combined, GRIDDED Dataset (dims: ``time``, ``lat``,
+        ``lon``) covering every requested segment.
+
+        Unlike every other validation-source converter (except
+        :meth:`from_era5`), the result is NOT flattened to a ``point``
+        dimension -- ``ModelLayerCollocation`` interpolates this grid
+        directly onto SAR pixel/point locations at collocation time.
+
+        ``water_u``/``water_v`` are renamed to ``EWCT``/``NSCT`` here (not
+        left raw, unlike ERA5 wind's ``u10``/``v10``) -- these are just
+        renamed vector components, not a derived circular quantity, so
+        renaming at conversion time is safe. This matches
+        ``from_hf_radar_grid``'s existing ``water_u``/``water_v`` ->
+        ``EWCT``/``NSCT`` convention.
+
+        Parameters
+        ----------
+        nc_paths : Path or list of Path
+            One or more HyCOM segment NetCDF files. Multiple files (e.g.
+            a recipe window straddling the ESPC-D-V02/GOFS 3.1 cutover)
+            are concatenated along ``time``.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type``/``platform_type`` set to
+            ``"hycom"``, or None on failure.
+        """
+        paths = [Path(p) for p in ([nc_paths] if isinstance(nc_paths, (str, Path)) else nc_paths)]
+        existing = sorted(p for p in paths if p.exists())
+        if not existing:
+            logger.warning("from_hycom: no files found among %s", paths)
+            return None
+
+        try:
+            per_file = [xr.open_dataset(p) for p in existing]
+            raw = per_file[0] if len(per_file) == 1 else xr.concat(per_file, dim="time")
+            # `existing` is sorted ALPHABETICALLY by filename (above), not
+            # chronologically -- HyCOM segment filenames embed the dataset
+            # key right after the "hycom_" prefix ("hycom_espc_d_v02_..."
+            # vs "hycom_gofs31_930_..."), so a straddling-cutover window's
+            # ESPC-D-V02 file ('e' < 'g') sorts BEFORE its GOFS 3.1 file
+            # even though ESPC-D-V02 is always the chronologically LATER
+            # segment (only ever used at/after _HYCOM_CUTOVER_DATE -- see
+            # hycom_downloader.py). xr.concat does not sort its inputs, so
+            # without this the resulting time axis goes forward then jumps
+            # backward at the cutover -- non-monotonic, which
+            # model_collocation.py's np.searchsorted-based bracket search
+            # has no correct behaviour for. sortby (not just a pre-sorted
+            # `existing`) establishes the genuine invariant regardless of
+            # input order, mirroring from_era5's own `sortby("lat")` fix
+            # for CDS's descending latitude (see that method).
+            raw = raw.sortby("time")
+            raw = raw.load()
+            for d in per_file:
+                d.close()
+        except Exception as exc:
+            logger.warning("Could not open HyCOM file(s) %s: %s", paths, exc)
+            return None
+
+        missing = [v for v in ("water_u", "water_v") if v not in raw.variables]
+        if missing:
+            logger.warning(
+                "from_hycom: missing variable(s) %s in %s (available: %s).",
+                missing, paths, list(raw.variables),
+            )
+            raw.close()
+            return None
+
+        ewct = raw["water_u"].astype("float32")
+        ewct.attrs.update({
+            "units": "m s-1", "standard_name": "eastward_sea_water_velocity",
+            "long_name": "HyCOM eastward sea water velocity (surface)",
+        })
+        nsct = raw["water_v"].astype("float32")
+        nsct.attrs.update({
+            "units": "m s-1", "standard_name": "northward_sea_water_velocity",
+            "long_name": "HyCOM northward sea water velocity (surface)",
+        })
+
+        ds = xr.Dataset(
+            {"EWCT": ewct, "NSCT": nsct},
+            coords={"time": raw["time"], "lat": raw["lat"], "lon": raw["lon"]},
+        )
+        ds.attrs["data_type"] = "hycom"
+        ds.attrs["platform_type"] = "hycom"
+        ds.attrs["source"] = "HyCOM ocean model (surface currents)"
+        raw.close()
+        return ds
+
+    @staticmethod
     def from_era5(
         nc_paths: Union[str, Path, Sequence[Union[str, Path]]],
         variable: str,
@@ -2756,7 +2853,7 @@ class DataTreeConverter:
 
         # Detect mode from SAFE directory name
         if "WV" in safe_name:
-            # WV imagette OCN files carry oswTotalHs AND a 13x13 rvlRadVel grid.
+            # WV vignette OCN files carry oswTotalHs AND a 13x13 rvlRadVel grid.
             # Route currents to RVL extraction; wind/waves keep oswTotalHs.
             if product_type.lower() == "currents":
                 return DataTreeConverter._extract_rvl_from_wv_safe(safe_dir)
@@ -2773,7 +2870,7 @@ class DataTreeConverter:
         oswTotalHs (integrated total significant wave height) point measurements.
 
         The WV mode produces multiple measurement files (~16 per SAFE product),
-        each carrying a 1×1 imagette. This method extracts ``oswTotalHs`` (the
+        each carrying a 1×1 vignette. This method extracts ``oswTotalHs`` (the
         integrated total significant wave height, matching the validation
         ``VHM0``) from every .nc file — falling back to the mean of the valid
         ``oswHs`` partitions when a product lacks ``oswTotalHs`` — and creates a
@@ -3112,10 +3209,10 @@ class DataTreeConverter:
             file_names = []
             rvl_attrs: Dict[str, Dict] = {}
 
-            # Land-flag QA accumulated across every imagette file in this
+            # Land-flag QA accumulated across every vignette file in this
             # scene (see the grid branch above for the rationale — same
             # masking rule, same QA stats, just summed across files here
-            # since one WV scene is many small imagette files).
+            # since one WV scene is many small vignette files).
             land_pixel_count_total = 0
             total_classified_total = 0
             land_radvel_sum = 0.0
@@ -3611,6 +3708,7 @@ class DataTreeConverter:
         - ``cds_ssm/*.nc``              → ``validation/cds_ssm/<stem>`` nodes
         - ``altimeter/*.nc``           → ``validation/altimeter/<stem>`` nodes
         - ``era5/*.nc``                 → single combined, GRIDDED ``validation/era5/era5`` node
+        - ``hycom/*.nc``                → single combined, GRIDDED ``validation/hycom/hycom`` node
 
         Parameters
         ----------
@@ -3957,6 +4055,21 @@ class DataTreeConverter:
                 if ds is not None:
                     datasets["validation/era5/era5"] = ds
                     logger.info("Converted ERA5 (%s): %d file(s)", era5_variable, len(era5_files))
+
+        # HyCOM ocean model -- kept as a single combined, GRIDDED node
+        # (not flattened to `point`), same rationale as ERA5. Only
+        # relevant for currents recipes -- HyCOM has no wind/wave/soil-
+        # moisture variable. Not passed through _filtered() -- that
+        # helper assumes a `point` dimension.
+        subdir = base_dir / "hycom"
+        if subdir.exists():
+            hycom_variable = recipe.config.variable if recipe is not None else None
+            hycom_files = sorted(subdir.glob("hycom_*.nc")) if hycom_variable == "currents" else []
+            if hycom_files:
+                ds = DataTreeConverter.from_hycom(hycom_files)
+                if ds is not None:
+                    datasets["validation/hycom/hycom"] = ds
+                    logger.info("Converted HyCOM: %d file(s)", len(hycom_files))
 
         if not datasets:
             logger.warning("No convertible data found in %s", base_dir)

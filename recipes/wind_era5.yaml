@@ -38,6 +38,7 @@ collocation:
   layer_vs_layer:
     layer_type_specs:
       era5_wind:
+        time_tolerance_minutes: 120
         method: cell-averaging
         temporal_method: hyperbolic
         aggregation_window_km: 12.5

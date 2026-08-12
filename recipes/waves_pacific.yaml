@@ -34,6 +34,9 @@ validation_sources:
 - source_type: altimeter
   download_kwargs: {}
   collocation_kwargs: {}
+- source_type: era5
+  download_kwargs: {}
+  collocation_kwargs: {}
 collocation:
   point_vs_layer:
     time_tolerance_minutes: 30
@@ -46,6 +49,12 @@ collocation:
   sar_footprint_radius_km: 14.0
   layer_vs_layer:
     layer_type_specs:
+      era5_waves:
+        time_tolerance_minutes: 120
+        aggregation_window_km: 12.5
+        distance_weighting: equal
+        method: cell-averaging
+        temporal_method: hyperbolic
       altimeter_1hz:
         time_tolerance_minutes: 180
         aggregation_window_km: 7.0

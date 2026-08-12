@@ -686,6 +686,94 @@ and every geographic/scatter panel's legend correctly reads
 > `core/visualization.py` (`plot_scatter`, `_plot_scatter_small_multiples`,
 > `plot_geographic`'s `val_var_code`-aware legend/title grouping).
 
+### 5.9 HyCOM model validation
+
+HyCOM (hycom.org) ocean-model surface currents (`water_u`/`water_v`,
+renamed `EWCT`/`NSCT` at conversion time) are the second consumer of the
+generic `ModelLayerCollocation` machinery built for ERA5 (§5.7) --
+confirming that design's anticipation that a future ocean-currents model
+would reuse it directly. `ModelLayerCollocation` needed zero changes for
+HyCOM; the only addition was `_derive_currents_radial_projection` in
+`model_collocation.py`, mirroring `_derive_wind_wspd_wdir`'s self-gating
+call shape but computing the existing `EWCT`/`NSCT` -> `rvlRadVel_projection`
+line-of-sight projection (`_project_currents_to_radial`, already used by
+every other currents validation source) instead of a wind speed/direction
+derivation.
+
+**Depth**: always HyCOM's `depth=0.0` surface z-level, `method="nearest"`
+on the `.sel()` (never exact float equality). SAR, HF-radar, and this
+toolbox's in-situ currents sources (drifter, ferrybox, mooring, ADCP,
+Argo, glider) are all treated as near-surface measurements -- the
+existing `min_depth`/`max_depth` recipe fields (default +/-20 m) already
+filter in-situ sources to a near-surface band before collocation, so
+comparing all of them against HyCOM's z=0 level is the physically
+consistent choice. Matching each observation's own reported depth to
+HyCOM's nearest z-level (of 40 available) was considered and rejected as
+unnecessary complexity.
+
+**Model-version routing**: `source_type: "hycom"` auto-selects between
+two datasets by date -- ESPC-D-V02 (2024-08-10 -> present) and GOFS 3.1
+Analysis, `GLBy0.08/expt_93.0` (2018-12-04 -> 2024-09-04). A recipe
+window straddling the 2024-08-10 cutover downloads both, clipping each
+segment's (buffered) request AT the cutover instant -- GOFS 3.1's
+request never reaches or crosses it, ESPC-D-V02's never goes before it
+-- so the two segments' real OPeNDAP requests are disjoint by
+construction, regardless of what either live dataset actually contains.
+
+This clip is necessary because the two datasets genuinely overlap in
+real-world coverage (GOFS 3.1 `expt_93.0` continues to 2024-09-04, well
+past the 2024-08-10 cutover this toolbox uses to prefer ESPC-D-V02), and
+the download-window bracket buffer (`_BRACKET_BUFFER_HOURS = 6`, added
+so the hyperbolic interpolator always has room to find a bracket) would
+otherwise pull a straddling window's two segments across each other's
+boundary -- both requesting real, but *different* (independently-run),
+data for the same instants. Left unclipped, `xr.concat` neither sorts
+nor deduplicates its inputs, so the combined time axis could end up
+non-monotonic or carrying duplicate timestamps, and the collocation
+bracket-search (`np.searchsorted`, which assumes a clean sorted axis)
+has no defined behaviour for that -- which model's value actually gets
+used near the boundary would be arbitrary, not deterministic.
+
+**Known, accepted residual gap**: ESPC-D-V02's real first granule is
+`2024-08-10T12:00`, not midnight as the nominal cutover constant
+assumes (live-verified against `tds.hycom.org`) -- so the clip denies
+GOFS 3.1 access to data it actually still has that morning, while
+ESPC-D-V02 has nothing there yet either. The result is one fixed,
+non-recurring, 12-hour gap (`2024-08-10T00:00`-`12:00`) with no HyCOM
+bracket from either dataset. This is judged an acceptable, narrow,
+one-time trade (tied to a single historical date, never recurring) over
+a coverage-driven clip that would query the live dataset before
+deciding the boundary -- not worth the added network round-trip and
+inter-segment coupling for a gap this narrow. It is not silent: any
+scene landing in it surfaces through the same pre-existing
+missing-bracket NaN path (debug-logged) that any other unbracketed
+scene already uses, not a new failure mode.
+
+**Why HyCOM coverage starts 2018-12-04, not 2014-07-01**: HYCOM's own
+summary docs describe "GOFS 3.1 Analysis" as spanning 2014-07-01 to
+2024-09-04, but this is not one continuously queryable THREDDS dataset --
+it's fragmented across several `expt_9X.X` sub-experiments with shifting
+grid names (`GLBu0.08` -> `GLBv0.08` -> `GLBy0.08`), whose exact
+pre-2018-12-04 boundaries could not be confirmed against live THREDDS
+catalogs. Rather than hardcode an unverified dataset path or boundary
+date -- the exact mistake §8.11 (NISAR SME2) and §10 (RADARSAT-2) already
+document as a real, previously-made error in this codebase -- only the
+one continuously-verified GOFS 3.1 dataset (`expt_93.0`) is wired in.
+This is why `recipes/currents_arpas_historic.yaml` (dated 2018-03-05)
+does not have a `hycom` validation source: its window falls entirely
+before this toolbox's HyCOM coverage. GOFS 3.1's earlier sub-experiments,
+GOFS 3.1 Reanalysis (1994-2015), and GOFS 3.0 (2008-2018) are deferred as
+future work, the same way ERA5's design deferred ORAS5.
+
+**Why `ESPC-D-V02` and `GLBy0.08/expt_93.0` need different download code
+paths**: live-verified to have genuinely different wire shapes.
+`ESPC-D-V02` publishes separate, continuous `u3z`/`v3z` OPeNDAP datasets
+spanning its whole coverage range in one open each. `GLBy0.08/expt_93.0`
+publishes one *combined* `water_u`+`water_v` dataset **per calendar
+year**, so a multi-year recipe window against GOFS 3.1 opens/concatenates
+one dataset per touched year -- the same shape of problem ERA5 already
+solves for per-day CDS files.
+
 ---
 
 ## 6. Circular variables (wind direction)
@@ -1540,44 +1628,64 @@ both raised directly against real report output:
 > Code: `core/visualization.py` (`_draw_scene_panel`'s SAR-field scatter
 > and validation-point scatter calls).
 
-### 9.5 era5_soil_moisture's canonical marker/color were literally invisible
+### 9.5 hycom's (and era5_soil_moisture's) canonical marker were literally invisible
 
 `_SOURCE_MARKERS`/`_SOURCE_COLORS` assign each `_CANONICAL_SOURCE_ORDER`
 entry a fixed `(color, marker)` pair by list position (§9.1's sibling
 mechanism — see those lists' own module comments for the append-only
-rule). `era5_soil_moisture` is the 16th entry, and matplotlib's *filled*
-marker set (`matplotlib.markers.MarkerStyle.filled_markers`) has exactly
-15 distinct shapes — all already claimed by the first 15 entries — so its
-slot originally fell back to `"+"`, an *unfilled* (stroke-only) marker.
+rule). matplotlib's *filled* marker set
+(`matplotlib.markers.MarkerStyle.filled_markers`) has exactly 15 distinct
+shapes, all claimed by the first 15 entries, so both `era5_soil_moisture`
+(16th) and `hycom` (17th, the last entry) originally fell back to unfilled
+(stroke-only) markers — `"+"` and `"x"` respectively.
 
 That's fine wherever a caller lets matplotlib pick a default line width,
 but `plot_collocation_diagnostics`'s non-waves matched-point tiers
 (Tier 3/4) explicitly pass `linewidths=0.0` (§9.1: dense sources like
 ASCAT/SMAP/SMOS need a lower fixed alpha instead of an outline). An
 unfilled marker's entire visible representation *is* its stroke — with
-zero line width, `era5_soil_moisture`'s real, correctly-positioned,
+zero line width, both sources' real, correctly-positioned,
 correctly-colored matched points rendered as literally zero visible
 pixels. `era5_wind`/`era5_waves` (indices 13/14, markers `"H"`/`"d"`)
-never hit this, since both are filled shapes — confirmed live 2026-08-11:
-`recipes/soil_moisture_era5.yaml` (352 era5 matches) and
-`recipes/soil_moisture_nisar_era5_2.yaml` (5208 era5 matches) both showed
-a legend entry and count for "Era5_Soil_Moisture matched" with zero
-markers actually visible anywhere on the map or in the legend swatch
-itself.
+never hit this, since both are filled shapes.
 
-Fix: `era5_soil_moisture`'s marker slot now reuses `"v"` (hf_radar's
-shape, index 4) instead of `"+"` — hf_radar is currents-only and
-era5_soil_moisture is soil_moisture-only, so the two can never appear in
-the same report despite sharing a shape; distinguished regardless by
-each keeping its own unique color. Separately, and reported directly
-against the same live-verified plots: `era5_soil_moisture`'s color
-(`"#dcbeff"`, pale lavender) was hard to pick out against a light
-land/ocean background at soil_moisture's reduced matched-layer alpha —
-changed to a bolder `"#800080"`.
+Confirmed live 2026-08-11 for `hycom` against `recipes/
+currents_useastcoast.yaml` (2538 hycom matches): the diagnostics plot
+showed a legend entry and count for "Hycom matched (2538)" with nothing
+actually visible anywhere on the map or in the legend swatch. (The
+identical `era5_soil_moisture` case was independently caught and fixed
+the same day on a sibling branch, against `recipes/soil_moisture_era5.
+yaml` (352 matches)/`recipes/soil_moisture_nisar_era5_2.yaml` (5208
+matches); that branch's fix predates this branch's divergence, so this
+branch still carried the original unfilled `"+"` until it was ported
+over alongside the `hycom` fix below, to keep the new regression test —
+see below — passing here.)
 
-A regression test (`test_every_source_marker_is_filled`) asserts every
-`_SOURCE_MARKERS` entry is one of matplotlib's filled markers, so this
-can't recur silently for a future source appended to the canonical order.
+Fix: `hycom`'s marker slot now reuses `"H"` (era5_wind's shape, index 13)
+instead of `"x"`. Unlike `era5_soil_moisture`'s reuse of hf_radar's `"v"`
+(safe because the two are *conventionally* never used together — one is
+currents-only, the other soil_moisture-only), `hycom`'s reuse of an
+era5-family marker rests on a *stronger, code-enforced* guarantee:
+`Recipe._from_dict` (`core/recipe.py`) raises `ValueError` for a `hycom`
+source on any non-`currents` recipe, and separately for an `era5` source
+on any `currents` recipe — so `hycom` and `era5_wind` can never both
+appear in one *valid* recipe, let alone one report, not merely by
+convention. `era5_soil_moisture`'s marker slot now reuses `"v"` (ported
+from the sibling branch's identical fix), distinguished from `hycom` by
+each keeping its own unique color regardless of the shared shapes.
+
+Separately: `era5_soil_moisture`'s color (`"#dcbeff"`, pale lavender) was
+also ported from the sibling branch's fix — hard to pick out against a
+light land/ocean background at soil_moisture's reduced matched-layer
+alpha — changed to a bolder `"#800080"`. `hycom`'s own color (`"#bcf60c"`,
+lime) was checked independently against the same live
+`currents_useastcoast.yaml` plot and reads clearly at currents' full
+`alpha=1.0` Tier 3 opacity, so it was left unchanged.
+
+A regression test (`test_every_source_marker_is_filled`, in
+`TestHycomCanonicalSourceOrder`) asserts every `_SOURCE_MARKERS` entry is
+one of matplotlib's filled markers, so this can't recur silently for a
+future source appended to the canonical order.
 
 > Code: `core/visualization.py` (`_SOURCE_MARKERS`, `_SOURCE_COLORS`).
 

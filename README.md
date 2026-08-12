@@ -2,7 +2,7 @@
 
 A standalone Python package for validating Level 2 SAR products against multi-source in-situ and satellite observations.
 
-Supports validation of **wind** (speed + direction), **ocean currents**, **significant wave height**, and **soil moisture** -- against in-situ, satellite, and model (ERA5) sources.
+Supports validation of **wind** (speed + direction), **ocean currents**, **significant wave height**, and **soil moisture** -- against in-situ, satellite, and model (ERA5, HyCOM) sources.
 
 Supported SAR products:
 - Sentinel-1 L2_OCN (Level 2 Ocean): wind/waves/currents
@@ -81,6 +81,7 @@ sar_validation/
     ├── hf_radar_downloader.py                   # Near-real-time HF-radar surface currents via Copernicus Marine
     ├── hf_radar_historical_downloader.py        # Delayed-mode/historical HF-radar currents via Copernicus Marine
     ├── hf_radar_us_downloader.py                # US HF-radar waterfall selector: NOAA ERDDAP → NOAA THREDDS → Copernicus Marine
+    ├── hycom_downloader.py                      # HyCOM ocean model surface currents (water_u/water_v) via THREDDS OPeNDAP
     ├── insitu_currents_historical_downloader.py # Delayed-mode in-situ currents (ADCP/Argo/drifter/glider) via Copernicus Marine
     ├── insitu_downloader.py                      # Moorings/buoys/ferrybox via Copernicus Marine
     ├── ismn_downloader.py                        # ISMN local-archive soil-moisture station selector (no download API)
@@ -95,7 +96,6 @@ sar_validation/
     ├── cds_soil_moisture_downloader.py           # C3S CDS satellite soil moisture (ACTIVE/PASSIVE/COMBINED, 0.25°) via cdsapi
     └── smos_downloader.py                        # SMOS L2 soil moisture via ESA SMOS FTPS
 ```
-
 ---
 
 ## Quick Start
@@ -179,7 +179,7 @@ plt.show()
 | Sentinel-1 L2_OCN | wind / currents / waves | `sentinel1_l2_ocn_downloader` | Copernicus Dataspace (CDSE) | 2014-10-03 - present |
 | RADARSAT-2 | wind (speed only) | `radarsat2_wind_downloader` | NOAA NCEI THREDDS | 2014-05-02 - present |
 | Moorings / Buoys / Ferryboxes | wind / currents / waves | `insitu_downloader` | Copernicus Marine | varies by platform; max 2020-01-01 - present |
-| Delayed-mode in-situ currents (ADCP / Argo / drifter / glider) | ocean currents |   `insitu_currents_historical_downloader` | Copernicus Marine | varies by platform (6 - 24 months delay) |
+| Delayed-mode in-situ currents (ADCP / Argo / drifter / glider) | ocean currents |   `insitu_currents_historical_downloader` | Copernicus Marine | varies by platform (6 - 24 months latency) |
 | HF Radar (near-real-time) | ocean currents | `hf_radar_downloader` | Copernicus Marine | varies by radar; max 2020-01-01 - present |
 | HF Radar (delayed-mode/historical) | ocean currents | `hf_radar_historical_downloader` | Copernicus Marine | varies by platform |
 | HF Radar (US regions) | ocean currents | `hf_radar_us_downloader` | NOAA ERDDAP → NOAA THREDDS → Copernicus Marine (waterfall) | see HF Rader (NOAA HFRnet) |
@@ -197,28 +197,28 @@ plt.show()
 | SMOS (SM_OPER_MIR_SMUDP2) | soil moisture | `smos_downloader` | ESA SMOS FTPS | 2010 - present |
 | C3S CDS Soil Moisture (ACTIVE / PASSIVE / COMBINED) | soil moisture | `cds_soil_moisture_downloader` | Copernicus CDS | 1991 - present (ICDR: ~10-day latency) |
 | ISMN (International Soil Moisture Network) | soil moisture | `ismn_downloader` | Manual portal download (no API) | Varies by station |
+| ERA5 model | wind / waves / soil moisture | `era5_downloader` | Copernicus CDS | 1940 (ERA5) / 1950 (ERA5-Land) - present (~5 day latency) |
+| HYCOM model | currents | `hycom_downloader` | HYCOM | 2018-12-04 - present (~48 hour latency) |
 
 NISAR SME2 (`m3 m-3`, L-band, twice-daily per-overpass granules) is a second,
 beta/provisional SAR-side source for soil moisture, selectable per recipe via
 `sar-validate --create-recipe soil_moisture --sar-source nisar_sme2` (or
-`source: nisar_sme2` in the recipe YAML) — see `docs/design-choices.md`
-§8.11 for how units and collocation defaults adapt automatically.
+`source: nisar_sme2` in the recipe YAML).
 
 RADARSAT-2 (C-band, 0.5 km, NOAA NCEI) is a second SAR-side source for
 wind, selectable via `sar-validate --create-recipe wind --sar-source
 radarsat2` (or `source: radarsat2` in the recipe YAML). It provides
-**wind speed only** — the product's `input_dir` field is the NWP model
-direction fed into the retrieval, not an independent SAR measurement, so
-no wind-direction comparison is produced for this source. Coverage is
-global but concentrated over Alaska/the North Pacific — see
-`docs/design-choices.md` §10.
+**wind speed only**. Coverage is global but concentrated over 
+Alaska/the North Pacific.
 
 ### Collocation types
 
-| Type | Example | Status |
-|------|---------|--------|
-| Point vs. Layer | mooring/buoy/ferrybox/drifter vs. SAR | ✅ implemented |
-| Layer vs. Layer | scatterometer (ASCAT) / altimeter / radiometer (AMSR2) vs. SAR | ✅ implemented |
+| Type | Example |
+|------|---------|
+| Point vs. Point | mooring / buoy / ferrybox / drifter / tidal gauge vs. SAR WV-mode vignettes | 
+| Point vs. Layer | mooring / buoy / ferrybox / drifter / tidal gauge vs. SAR | 
+| Layer vs. Layer | scatterometer / altimeter / radiometer (flattened) vs. SAR | 
+| Model vs. Layer | ERA5 / HYCOM (gridded) vs. SAR |
 
 ---
 
@@ -337,7 +337,7 @@ Register at: https://eoiam-idp.eo.esa.int/
 The `smos_downloader` uses these credentials to download SMOS L2 soil moisture products
 from the ESA SMOS FTPS archive.
 
-### Copernicus CDS — for C3S satellite soil moisture downloads
+### Copernicus CDS — for C3S satellite soil moisture downloads and the ERA5 model
 
 `cds_soil_moisture_downloader` downloads via the
 [`cdsapi`](https://cds.climate.copernicus.eu/how-to-api) library, which reads
@@ -388,4 +388,4 @@ python -m mypy -p sar_validation
 
 ## Documentation
 
-- [Design choices](docs/design-choices.md) — toolbox overview and the rationale behind conventions: wind-direction rotation, collocation aggregation windows and tolerances, WV footprint handling, circular statistics, datatree filtering and CF metadata
+- [Design choices](docs/design-choices.md) — toolbox overview and the rationale behind conventions such as wind-direction rotation, collocation aggregation windows and tolerances, WV footprint handling, circular statistics, datatree filtering and CF metadata
