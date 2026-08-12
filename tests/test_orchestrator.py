@@ -1172,6 +1172,70 @@ class TestSarEmptyStopsPipeline:
         assert ok is True
         assert orchestrator.metadata["sar_data_found"] is False
 
+    def test_already_succeeded_cache_restore_checks_disk_for_old_schema_empty_files(self, tmp_path):
+        """Old-schema metadata (recorded before found_count existed) can
+        have status=success, files=[] even though real products were
+        downloaded -- SARDownloader.download() only appends *newly*
+        downloaded files to the list it returns; a product already on
+        disk (skipped as a duplicate) is never appended, so a fully
+        successful run where every match was already cached still ends
+        up with files=[]. Confirmed live 2026-08-11: a copied-over
+        currents_useastcoast.yaml download_metadata.json from before
+        found_count existed was misread as "no SAR data found" despite
+        the SAFE files sitting right there in S1_L2_OCN/. Real files on
+        disk matching the source's file_glob must override the
+        ambiguous empty list."""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success", "files": []}},
+        }))
+        (tmp_path / "S1_L2_OCN" / "S1A_IW_OCN__2SDV_X.SAFE").mkdir(parents=True)
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        with patch(
+            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
+        ) as mock_scat_cls:
+            ok = orchestrator.download_all()
+
+        mock_scat_cls.assert_called_once()
+        assert ok is True
+        assert orchestrator.metadata["sar_data_found"] is True
+
+    def test_disk_check_backfills_found_count_into_saved_metadata(self, tmp_path):
+        """The disk-check fallback must heal the stale old-schema entry
+        in place, not just read through it -- otherwise every future run
+        re-triggers the same disk scan forever instead of the metadata
+        ever becoming self-consistent. Requested explicitly: 'backfill
+        the found_count to make sure download_metadata.json stays as
+        consistent as possible.'"""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success", "files": []}},
+        }))
+        (tmp_path / "S1_L2_OCN" / "S1A_IW_OCN__2SDV_X.SAFE").mkdir(parents=True)
+        (tmp_path / "S1_L2_OCN" / "S1B_IW_OCN__2SDV_Y.SAFE").mkdir(parents=True)
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        with patch("sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"):
+            orchestrator.download_all()
+
+        sar_entry = orchestrator.metadata["downloads"]["sar"]
+        assert sar_entry["found_count"] == 2
+        assert len(sar_entry["files"]) == 2
+        assert all(str(tmp_path / "S1_L2_OCN") in f for f in sar_entry["files"])
+
+        # And the healed entry is what actually gets written to disk.
+        saved = json.loads((tmp_path / "download_metadata.json").read_text())
+        assert saved["downloads"]["sar"]["found_count"] == 2
+
     def test_previous_sar_data_found_reads_cached_metadata(self, tmp_path):
         import json
 
@@ -1199,6 +1263,42 @@ class TestSarEmptyStopsPipeline:
         orchestrator = DataOrchestrator(recipe, dry_run=False)
 
         assert orchestrator.previous_sar_data_found() is True
+
+    def test_previous_sar_data_found_checks_disk_when_found_count_missing_and_files_empty(
+        self, tmp_path,
+    ):
+        """Same old-schema gap as test_already_succeeded_cache_restore_
+        checks_disk_for_old_schema_empty_files above, but for the CLI
+        resume-shortcut code path (previous_sar_data_found), which never
+        calls download_all()."""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success", "files": []}},
+        }))
+        (tmp_path / "S1_L2_OCN" / "S1A_IW_OCN__2SDV_X.SAFE").mkdir(parents=True)
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        assert orchestrator.previous_sar_data_found() is True
+
+    def test_previous_sar_data_found_still_false_when_nothing_on_disk_either(self, tmp_path):
+        """Same old-schema entry, but genuinely no SAR products anywhere
+        on disk -- the new disk-check fallback must not fabricate a
+        match just because a directory was created."""
+        import json
+
+        (tmp_path / "download_metadata.json").write_text(json.dumps({
+            "variable": "wind",
+            "downloads": {"sar": {"status": "success", "files": []}},
+        }))
+        recipe = self._recipe_with_validation_source()
+        recipe.config.output_dir = str(tmp_path)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+
+        assert orchestrator.previous_sar_data_found() is False
 
     def test_previous_sar_data_found_true_when_no_previous_run(self, tmp_path):
         recipe = self._recipe_with_validation_source()

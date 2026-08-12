@@ -177,7 +177,10 @@ _SOURCE_COLORS = [
 #   by each keeping its own unique color. Ported from the identical,
 #   already live-verified fix on a sibling branch (that branch's fix
 #   predates this one's divergence, so this branch still had the original
-#   unfilled "+" until now).
+#   unfilled "+" until now) -- confirmed live 2026-08-11 there against 352
+#   real matches on recipes/soil_moisture_era5.yaml (5208 on
+#   recipes/soil_moisture_nisar_era5_2.yaml) rendering as zero visible
+#   pixels pre-fix.
 # - hycom's slot (17th, the final entry) was "x" -- reused "H" (era5_wind's
 #   shape, index 13) instead (confirmed live 2026-08-11: hycom's 2538
 #   real, correctly-positioned, correctly-colored matched points on

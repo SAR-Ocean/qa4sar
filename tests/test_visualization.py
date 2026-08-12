@@ -1016,6 +1016,26 @@ class TestCanonicalSourceOrderStability:
             "era5_wind", "era5_waves", "era5_soil_moisture",
         ]
 
+    def test_every_source_marker_is_filled(self):
+        """An unfilled/stroke-only marker (e.g. "+", "x", "1"-"4", "|",
+        "_") renders via linewidth, not facecolor -- several call sites
+        (e.g. plot_collocation_diagnostics' non-waves matched-point
+        tiers) explicitly pass linewidths=0, which makes an unfilled
+        marker's matched points literally invisible regardless of color/
+        alpha/position. Confirmed live 2026-08-11: era5_soil_moisture's
+        "+" slot made 352 real, correctly-positioned matched points
+        render as zero visible pixels on soil_moisture_era5.yaml's
+        diagnostics plot. Every _SOURCE_MARKERS entry must stay one of
+        matplotlib's filled markers so this can't recur for a future
+        source appended to _CANONICAL_SOURCE_ORDER."""
+        from matplotlib.markers import MarkerStyle
+
+        from sar_validation.core.visualization import _SOURCE_MARKERS
+
+        filled = set(MarkerStyle.filled_markers)
+        not_filled = [m for m in _SOURCE_MARKERS if m not in filled]
+        assert not not_filled, f"unfilled marker(s) in _SOURCE_MARKERS: {not_filled}"
+
 
 class TestPlotGeographic:
     def test_distinct_sources_get_distinct_markers(self, geo_datatree_and_collocation, monkeypatch):

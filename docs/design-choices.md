@@ -1655,10 +1655,11 @@ showed a legend entry and count for "Hycom matched (2538)" with nothing
 actually visible anywhere on the map or in the legend swatch. (The
 identical `era5_soil_moisture` case was independently caught and fixed
 the same day on a sibling branch, against `recipes/soil_moisture_era5.
-yaml`/`recipes/soil_moisture_nisar_era5_2.yaml`; that branch's fix
-predates this branch's divergence, so this branch still carried the
-original unfilled `"+"` until it was ported over alongside the `hycom`
-fix below, to keep the new regression test — see below — passing here.)
+yaml` (352 matches)/`recipes/soil_moisture_nisar_era5_2.yaml` (5208
+matches); that branch's fix predates this branch's divergence, so this
+branch still carried the original unfilled `"+"` until it was ported
+over alongside the `hycom` fix below, to keep the new regression test —
+see below — passing here.)
 
 Fix: `hycom`'s marker slot now reuses `"H"` (era5_wind's shape, index 13)
 instead of `"x"`. Unlike `era5_soil_moisture`'s reuse of hf_radar's `"v"`
