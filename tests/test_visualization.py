@@ -2309,7 +2309,7 @@ class TestPlotGeographicPanelAspect:
 
     def test_short_wide_scene_padded_to_min_aspect(self):
         """Regression test: a scene with very few, tightly-clustered
-        imagettes (small latitude span relative to its longitude span) used
+        vignettes (small latitude span relative to its longitude span) used
         to autoscale to a short, wide box, visually inconsistent next to the
         tall/portrait panels typical of WV-mode satellite tracks in the same
         report. The rendered panel must never be shorter than it is wide."""
@@ -3349,6 +3349,118 @@ class TestPlotCollocationDiagnostics:
         assert out_path is not None
         matched_markers = [m for m in recorded_markers if m is not None]
         assert len(set(matched_markers)) >= 2
+
+
+class TestPlotCollocationDiagnosticsLegendPlacement:
+    def test_legend_avoids_corner_where_matched_points_are_dense(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression test for the currents_useastcoast report: a fixed
+        loc="upper right" legend visually collided with matched data
+        whenever the SAR scene (and therefore the dense matched-point
+        cluster) happened to sit in the NE corner of a much larger
+        recipe bbox -- see collocation_diagnostics_currents_useastcoast.png.
+
+        Mirrors that real layout: sparse "mooring" points scattered
+        across the whole bbox (unmatched -- gray, low-density everywhere)
+        plus a dense cluster of "drifter" points confined to the NE
+        corner and actually collocated (matched -- opaque, high-density
+        exactly where the old fixed corner was). The legend must not
+        land on top of the dense cluster."""
+        import matplotlib.axes
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, ValidationDataSource
+
+        rng = np.random.default_rng(0)
+
+        # SAR scene confined to the NE corner of the (much larger) recipe
+        # bbox, like a single scene against a continent-scale request.
+        y, x = 10, 10
+        lon2d, lat2d = np.meshgrid(np.linspace(0.0, 2.0, x), np.linspace(42.0, 44.0, y))
+        sar_ds = xr.Dataset(
+            {"sarUVEL": (("y", "x"), np.full((y, x), 0.3))},
+            coords={
+                "lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                "time": pd.Timestamp("2026-07-10T12:00:00"),
+            },
+        )
+
+        # Sparse, unmatched, scattered across the FULL bbox -- pulls the
+        # auto-zoom extent out to (close to) the full recipe bbox instead
+        # of tightly hugging the NE cluster, exactly like the real report's
+        # widely-scattered gray "unmatched" background.
+        n_sparse = 20
+        sparse_ds = xr.Dataset(
+            {"CURRENT_SPEED": ("point", rng.uniform(0.1, 0.3, n_sparse))},
+            coords={
+                "lon": ("point", rng.uniform(-11.0, 2.0, n_sparse)),
+                "lat": ("point", rng.uniform(30.0, 44.0, n_sparse)),
+                "time": ("point", [pd.Timestamp("2026-01-01T00:00:00")] * n_sparse),
+            },
+            attrs={"platform_type": "mooring"},
+        )
+
+        # Dense, matched, confined to the NE corner where the SAR scene is.
+        n_dense = 150
+        dense_ds = xr.Dataset(
+            {"CURRENT_SPEED": ("point", rng.uniform(0.1, 0.5, n_dense))},
+            coords={
+                "lon": ("point", rng.uniform(0.2, 1.8, n_dense)),
+                "lat": ("point", rng.uniform(42.2, 43.8, n_dense)),
+                "time": ("point", pd.date_range("2026-07-10T12:05", periods=n_dense, freq="1min")),
+            },
+            attrs={"platform_type": "drifter"},
+        )
+
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneA": sar_ds,
+            "validation/mooring": sparse_ds,
+            "validation/drifter": dense_ds,
+        })
+        collocation_ds = xr.Dataset({
+            "sar_sarUVEL": ("collocation", np.full(n_dense, 0.3)),
+            "val_CURRENT_SPEED": ("collocation", dense_ds["CURRENT_SPEED"].values),
+            "val_source": ("collocation", np.array(["drifter"] * n_dense)),
+            "sar_scene_name": ("collocation", np.array(["sceneA"] * n_dense)),
+            "val_lon": ("collocation", dense_ds["lon"].values),
+            "val_lat": ("collocation", dense_ds["lat"].values),
+            "temporal_distance_minutes": ("collocation", np.full(n_dense, 5.0)),
+        })
+
+        # Much larger than the NE data cluster, like the real
+        # currents_useastcoast recipe -- leaves the other three corners
+        # genuinely empty of anything but sparse background points.
+        recipe = Recipe(config=RecipeConfig(
+            name="test_legend_corner", variable="currents",
+            geographic_bounds=GeographicBounds(-11.0, 2.0, 30.0, 44.0),
+            validation_sources=[
+                ValidationDataSource(source_type="mooring"),
+                ValidationDataSource(source_type="drifter"),
+            ],
+        ))
+
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        recorded_locs = []
+        original_legend = matplotlib.axes.Axes.legend
+
+        def recording_legend(self, *args, **kwargs):
+            recorded_locs.append(kwargs.get("loc"))
+            return original_legend(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "legend", recording_legend)
+        out_path = plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
+        plt.close("all")
+
+        assert out_path is not None
+        assert recorded_locs, "expected the collocation-diagnostics plot to add a legend"
+        assert recorded_locs[-1] != "upper right", (
+            f"matched points are densely packed into the NE corner but the "
+            f"legend was still hardcoded to 'upper right', overlapping the "
+            f"data -- got loc={recorded_locs[-1]!r}"
+        )
 
 
 def _small_soil_moisture_scene(lon_center, lat_center, time):

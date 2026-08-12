@@ -61,6 +61,44 @@ def _source_marker_handles(items, *, markersize: float = 6, markeredgecolor: str
     ]
 
 
+def _sparse_legend_corner(ax, transform, *lonlat_arrays) -> str:
+    """Pick the matplotlib legend ``loc`` corner with the fewest already-
+    plotted points, as a cheap stand-in for ``loc="best"``.
+    Falls back to "upper right" if there's nothing to bin against.
+    """
+    lons = [np.asarray(lo) for lo, la in lonlat_arrays if len(lo)]
+    lats = [np.asarray(la) for lo, la in lonlat_arrays if len(la)]
+    if not lons:
+        return "upper right"
+    lon = np.concatenate(lons)
+    lat = np.concatenate(lats)
+
+    mpl_transform = (
+        transform._as_mpl_transform(ax)
+        if transform is not None and hasattr(transform, "_as_mpl_transform")
+        else ax.transData
+    )
+    frac = (mpl_transform + ax.transAxes.inverted()).transform(np.column_stack([lon, lat]))
+    visible = (
+        np.isfinite(frac).all(axis=1)
+        & (frac[:, 0] >= 0.0) & (frac[:, 0] <= 1.0)
+        & (frac[:, 1] >= 0.0) & (frac[:, 1] <= 1.0)
+    )
+    frac = frac[visible]
+    if frac.size == 0:
+        return "upper right"
+
+    right = frac[:, 0] >= 0.5
+    top = frac[:, 1] >= 0.5
+    counts = {
+        "upper right": int(np.sum(right & top)),
+        "upper left": int(np.sum(~right & top)),
+        "lower right": int(np.sum(right & ~top)),
+        "lower left": int(np.sum(~right & ~top)),
+    }
+    return min(counts, key=lambda corner: counts[corner])
+
+
 def _draw_colorbar(
     fig, right_margin: float, sar_sm, val_sm, single_colorbar: bool,
     collocation_ds, sar_var: str, val_var: Optional[str], sar_field_transform,
@@ -102,51 +140,7 @@ __all__ = [
 ]
 
 # Colour palette used for validation sources (cycles if more sources than
-# colours). Deliberately avoids any grayscale/achromatic entry (mid-gray
-# like tab10's "#7f7f7f", but also pure black/white) — plot_collocation_diagnostics
-# uses gray (#808080) to mean "unmatched", so a source landing on a
-# near-gray OR colorless palette entry reads as "grayish" regardless of
-# exact lightness once alpha-blended (e.g. wind's reduced matched-layer
-# alpha=0.65 turns solid black into a mid-gray blend, visually
-# indistinguishable in hue from the faint unmatched gray even though the
-# two differ in lightness) — this is what made scatterometer's matched
-# points look gray once it landed on the (then-)black slot below. Must
-# have at least as many entries as _canonical_source_order() returns
-# (currently 17): a shorter palette wraps and silently reassigns two
-# unrelated sources (e.g. tidal gauge landing back on altimeter's blue
-# circle) — see the "matched tidal gauge and altimeter look identical" bug
-# this comment documents. Slots are assigned by *list position* in
-# _CANONICAL_SOURCE_ORDER below, which is append-only (see that list's own
-# comment) — so adding a new source can no longer shift any existing
-# source's color the way alphabetical sorting used to (this broke the
-# palette 3 times before the order was made append-only: see git history
-# around radiometer_ssm/scatterometer_ssm and cds_ssm being added).
-#
-# radiometer's slot (index 7) was originally the pale cyan "#17becf" --
-# changed to the darker teal "#469990" because that pale cyan was hard to
-# distinguish against plot_collocation_diagnostics' mid-gray (#808080)
-# "unmatched" pattern once small marker sizes/anti-aliasing softened it.
-#
-# The three entries before last (olive/cyan/purple) were appended for
-# era5_wind/era5_waves/era5_soil_moisture joining _CANONICAL_SOURCE_ORDER,
-# and the final entry (lime) for hycom -- same append-only rule applies
-# here as there, to avoid the exact wrap collision this comment already
-# warns about.
-#
-# era5_soil_moisture's slot was originally the pale lavender "#dcbeff" --
-# changed to the bolder "#800080" because that pale lavender was hard to
-# pick out against a light land/ocean background at the reduced alpha/
-# marker size soil_moisture's matched-layer tier uses (see
-# matched_layer_alpha in _plot_collocation_diagnostics_impl); ported from
-# the identical, already live-verified fix on a sibling branch (see
-# _SOURCE_MARKERS below) rather than re-verified independently here.
-#
-# hycom's lime color was live-verified 2026-08-11 against a real
-# currents_useastcoast.yaml diagnostics plot (2538 matches, full
-# alpha=1.0 for currents' Tier 3 layer matches) and reads clearly against
-# both the ocean background and the dense blue in-situ layer next to it,
-# so it did not need changing -- only its marker shape was the problem
-# (see _SOURCE_MARKERS below).
+# colours). 
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#469990",
@@ -156,48 +150,6 @@ _SOURCE_COLORS = [
     "#bcf60c",
 ]
 
-# Marker shapes paired 1:1 with _SOURCE_COLORS by index, used wherever
-# validation sources need to stay identifiable independently of color (e.g.
-# when color is taken by a continuous value like wind speed or temporal
-# offset instead of by source). Every entry must be one of matplotlib's
-# *filled* markers (matplotlib.markers.MarkerStyle.filled_markers) -- an
-# unfilled/stroke-only marker (e.g. "+", "x", "1"-"4", "|", "_") renders
-# via linewidth, not facecolor, and several call sites (e.g.
-# plot_collocation_diagnostics' non-waves matched-point tiers) explicitly
-# pass linewidths=0 -- confirmed live: an unfilled marker's matched points
-# render as literally zero visible pixels regardless of how correct their
-# position/color is. matplotlib's filled-marker set has exactly 15
-# distinct shapes, already all in use by the first 15 slots below, so the
-# last two slots must each reuse an earlier shape:
-#
-# - era5_soil_moisture's slot (16th) was "+" -- reused "v" (hf_radar's
-#   shape, index 4) instead. hf_radar is currents-only and
-#   era5_soil_moisture is soil_moisture-only, so the two can never appear
-#   in the same report despite sharing a shape; distinguished regardless
-#   by each keeping its own unique color. Ported from the identical,
-#   already live-verified fix on a sibling branch (that branch's fix
-#   predates this one's divergence, so this branch still had the original
-#   unfilled "+" until now) -- confirmed live 2026-08-11 there against 352
-#   real matches on recipes/soil_moisture_era5.yaml (5208 on
-#   recipes/soil_moisture_nisar_era5_2.yaml) rendering as zero visible
-#   pixels pre-fix.
-# - hycom's slot (17th, the final entry) was "x" -- reused "H" (era5_wind's
-#   shape, index 13) instead (confirmed live 2026-08-11: hycom's 2538
-#   real, correctly-positioned, correctly-colored matched points on
-#   currents_useastcoast.yaml's diagnostics plot rendered as zero visible
-#   pixels with "x"). This reuse is on an even stronger footing than
-#   era5_soil_moisture/hf_radar's (which relies on the two conventionally
-#   never being used together): hycom and every era5_* source are
-#   mutually exclusive by CODE, not just convention -- Recipe._from_dict
-#   (core/recipe.py) raises ValueError for a "hycom" source on any
-#   non-currents recipe, and separately for an "era5" source on any
-#   currents recipe, so hycom and era5_wind can never both appear in one
-#   valid recipe, let alone one report.
-#
-# test_every_source_marker_is_filled (tests/test_visualization.py) is a
-# regression test asserting every entry below is one of matplotlib's
-# filled markers, so this can't recur silently for a future source
-# appended to _CANONICAL_SOURCE_ORDER.
 _SOURCE_MARKERS = [
     "o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<", ">",
     "H", "d", "v",
@@ -206,15 +158,6 @@ _SOURCE_MARKERS = [
 
 # Fixed, append-only reference order for known validation source/platform
 # types. Each name's *list position* is its permanent color/marker slot
-# (see _source_style_map) — this used to be computed as
-# ``sorted(LAYER_DATA_TYPES | _INSITU_TYPES)``, which silently reshuffled
-# every alphabetically-later source's color whenever a new source name was
-# added anywhere in those two sets (happened 3 times: radiometer_ssm,
-# scatterometer_ssm, cds_ssm). A new source type must be appended at the
-# END of this list, never inserted alphabetically — _canonical_source_order
-# raises loudly if this list ever drifts out of sync with
-# LAYER_DATA_TYPES | _INSITU_TYPES, so a forgotten entry fails a test
-# instead of silently reassigning colors.
 _CANONICAL_SOURCE_ORDER = [
     "altimeter", "buoy", "drifter", "ferrybox", "hf_radar", "hf_radar_grid",
     "mooring", "radiometer", "radiometer_ssm", "scatterometer",
@@ -236,15 +179,14 @@ def _source_color_map(sources: List[str]) -> Dict[str, str]:
 def _canonical_source_order() -> List[str]:
     """
     Fixed, append-only reference order for known validation source/platform
-    types — see ``_CANONICAL_SOURCE_ORDER``'s module-level comment for why
-    this must never be a sort.
+    types.
 
     Validates that ``_CANONICAL_SOURCE_ORDER`` still has exactly the same
     *members* as the two canonical sets maintained elsewhere in the
     codebase (``LAYER_DATA_TYPES`` in collocation.py and ``_INSITU_TYPES``
     in orchestrator.py), so a new source type added to either set without
-    also being appended to ``_CANONICAL_SOURCE_ORDER`` fails loudly here
-    instead of silently reshuffling every other source's color.
+    also being appended to ``_CANONICAL_SOURCE_ORDER`` fails here instead 
+    of silently reshuffling every other source's color.
     """
     from .collocation import LAYER_DATA_TYPES  # noqa: PLC0415
     from .orchestrator import _INSITU_TYPES  # noqa: PLC0415
@@ -348,8 +290,8 @@ def _set_lonlat_ticks(ax, gl):
     logic is expensive to recompute across many subplots. Only valid for
     rectangular projections (PlateCarree/Mercator), which is all this
     module uses. Note: cartopy's GeoAxes ships with axis visibility disabled
-    by default (ax.xaxis.get_visible() == False), so we must re-enable it
-    for the formatted ticks to be rendered to canvas.
+    by default (ax.xaxis.get_visible() == False), so re-enabled for the 
+    formatted ticks to be rendered to canvas.
 
     ``gl`` is the Gridliner returned by the ``ax.gridlines(...)`` call that
     drew the (unlabeled) grid lines for this axes. Grid *lines* are placed by
@@ -411,7 +353,7 @@ def _pad_extent_to_min_aspect(ax, min_aspect: float = 1.0, bounds=None) -> None:
 
     Keeps every scene panel in a report portrait-or-square: without this,
     a scene with a small latitude span (e.g. a handful of closely-spaced
-    imagettes) renders as a short, wide strip next to otherwise-portrait
+    vignettes) renders as a short, wide strip next to otherwise-portrait
     satellite-track panels in the same figure.
 
     Parameters
@@ -459,12 +401,7 @@ def _fill_nan_nearest(a: np.ndarray) -> np.ndarray:
 def _downsample_grid(arr: np.ndarray, lon2d: np.ndarray, lat2d: np.ndarray, max_dim: int):
     """Stride-decimate a gridded SAR field (and its lon/lat) for display.
 
-    cartopy's ``pcolormesh`` runs every cell through a non-affine CRS
-    transform plus antimeridian-wrap interpolation; on a full-resolution
-    scene (e.g. CLMS SSM's 4144x6832 = 28M cells) this dominates report
-    generation time (~15s per panel measured, vs ~0.2s at ~440K cells) for
-    resolution far beyond what a ~150dpi printed page can show. Purely a
-    rendering-time decimation -- statistics and every other output still
+    A rendering-time decimation -- statistics and every other output still
     use the full-resolution ``collocation_results.nc``/``datatree.nc``.
     """
     ny, nx = arr.shape
@@ -1281,7 +1218,7 @@ def plot_geographic(
 
     # Per-scene antimeridian detection: a scene "crosses" when its raw
     # (unshifted, [-180, 180]) lon coordinate spans more than 180 degrees —
-    # e.g. an imagette with points at 179E and 179W. Such a scene must get
+    # e.g. an vignette with points at 179E and 179W. Such a scene must get
     # its own central_longitude=180 axes, otherwise a *shared*
     # central_longitude=0 projection autoscales it to a full [-180, 180]
     # world map with the swath split across both edges (this is a distinct
@@ -1506,10 +1443,17 @@ def plot_geographic(
                 # (including the whole-Europe SAR background field) through
                 # cartopy's non-affine projection transform once per candidate
                 # position — observed to hang for minutes with multi-GB memory
-                # growth on a real recipe. A fixed corner is effectively free.
+                # growth on a real recipe. Picking the sparsest corner
+                # ourselves (_sparse_legend_corner) is effectively free by
+                # comparison and, unlike a fixed corner, doesn't collide with
+                # a dense point cluster that happens to sit in that corner.
                 if handles:
-                    ax.legend(handles=handles, fontsize=6,
-                              loc="upper right", framealpha=0.7)
+                    loc = _sparse_legend_corner(
+                        ax, transform,
+                        (valid_pts["val_lon"].to_numpy(), valid_pts["val_lat"].to_numpy()),
+                        (nan_pts["val_lon"].to_numpy(), nan_pts["val_lat"].to_numpy()),
+                    )
+                    ax.legend(handles=handles, fontsize=6, loc=loc, framealpha=0.7)
             elif "val_source" in df_pts.columns:
                 for src, grp in df_pts.groupby("val_source"):
                     color, marker = source_style.get(str(src), ("#ff0000", "o"))
@@ -1517,7 +1461,10 @@ def plot_geographic(
                                s=pt_size, c=color, marker=marker,
                                edgecolors="black", linewidths=0.9,
                                label=str(src), rasterized=True, **kw_sc)
-                ax.legend(fontsize=6, loc="upper right", framealpha=0.7)
+                loc = _sparse_legend_corner(
+                    ax, transform, (df_pts["val_lon"].to_numpy(), df_pts["val_lat"].to_numpy()),
+                )
+                ax.legend(fontsize=6, loc=loc, framealpha=0.7)
             else:
                 ax.scatter(df_pts["val_lon"], df_pts["val_lat"],
                            s=pt_size, c="#ff7f0e",
@@ -2541,7 +2488,7 @@ def _plot_collocation_diagnostics_impl(
         return None
 
     scene_bounds = []            # bounding boxes for grid-mode (IW/EW) scenes
-    footprint_points: list[tuple[float, float]] = []  # (lon, lat) per sparse WV-mode imagette
+    footprint_points: list[tuple[float, float]] = []  # (lon, lat) per sparse WV-mode vignette
     # (lon, lat) of actual valid-data pixels for overpass-mosaic products
     # (soil_moisture) — see is_overpass_mosaic below.
     coverage_points: list[tuple[float, float]] = []
@@ -2550,7 +2497,7 @@ def _plot_collocation_diagnostics_impl(
     # match any SAR acquisition, before we get to spatial matching at all.
     scene_time_windows: List[Tuple["pd.Timestamp", "pd.Timestamp"]] = []
     scene_names = list(sar_node.children.keys())
-    # Footprint radius each sparse WV imagette actually matches within, so the
+    # Footprint radius each sparse WV vignette actually matches within, so the
     # plot's circles line up with what the collocation step considered.
     footprint_radius_km = getattr(
         recipe.config.collocation, "sar_footprint_radius_km", 14.0
@@ -2573,7 +2520,7 @@ def _plot_collocation_diagnostics_impl(
         lons = scene_ds["lon"].values
         lats = scene_ds["lat"].values
 
-        # WV/point-mode scenes are sparse imagettes, not a filled grid — draw
+        # WV/point-mode scenes are sparse vignettes, not a filled grid — draw
         # them as per-footprint circles instead of one misleading bounding box.
         is_wv_scene = (
             ("point" in scene_ds.dims and "y" not in scene_ds.dims)
@@ -2874,9 +2821,9 @@ def _plot_collocation_diagnostics_impl(
     box_transform = proj if crosses_dateline else transform
 
     # ── SAR coverage (zorder=1): Grid scenes → bounding box; sparse WV
-    # imagettes → one footprint circle each (radius = the collocation footprint
+    # vignettes → one footprint circle each (radius = the collocation footprint
     # radius), so it's visually clear that matches are only possible near each
-    # imagette, not across the whole bounding rectangle. ──────────────────────
+    # vignette, not across the whole bounding rectangle. ──────────────────────
     for i, sb in enumerate(scene_bounds):
         lons_box = [sb["lon_min"], sb["lon_max"], sb["lon_max"], sb["lon_min"], sb["lon_min"]]
         lats_box = [sb["lat_min"], sb["lat_min"], sb["lat_max"], sb["lat_max"], sb["lat_min"]]
@@ -3073,8 +3020,18 @@ def _plot_collocation_diagnostics_impl(
     labels.append(explanation.get_label())
     # loc="best" is prohibitively expensive on a GeoAxes covering the full
     # recipe bbox with thousands of collocated points — see the identical
-    # fix (and its rationale) in _draw_scene_panel above.
-    ax.legend(handles=handles, labels=labels, loc="upper right", fontsize=8, framealpha=0.9)
+    # fix (and its rationale) in _draw_scene_panel above. Picking the
+    # sparsest corner ourselves (_sparse_legend_corner) is cheap and
+    # avoids the legend sitting on top of a dense cluster whenever the
+    # data isn't actually spread toward the NE (e.g. a single scene's
+    # matched points bunched in one corner of a much larger recipe bbox).
+    point_lonlat = [
+        (np.asarray(cat["matched_lon"]), np.asarray(cat["matched_lat"])) for cat in categories
+    ] + [
+        (np.asarray(cat["unmatched_lon"]), np.asarray(cat["unmatched_lat"])) for cat in categories
+    ]
+    legend_loc = _sparse_legend_corner(ax, transform, *point_lonlat)
+    ax.legend(handles=handles, labels=labels, loc=legend_loc, fontsize=8, framealpha=0.9)
 
     # ── Save figure ─────────────────────────────────────────────────────
     fig.tight_layout()
