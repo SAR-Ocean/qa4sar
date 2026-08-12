@@ -2,22 +2,14 @@
 Download HyCOM ocean-current model data (water_u/water_v, surface level)
 via THREDDS OPeNDAP.
 
-Two HyCOM datasets are wired in, auto-selected by date -- see
-docs/superpowers/specs/2026-08-10-hycom-currents-validation-design.md:
-
 - ESPC-D-V02 (2024-08-10 -> present): one continuous OPeNDAP dataset per
   component, https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/u3z (+ v3z).
 - GOFS 3.1 Analysis, GLBy0.08/expt_93.0 (2018-12-04 -> 2024-09-04): one
   COMBINED water_u+water_v dataset PER CALENDAR YEAR,
   https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z/{year}.
 
-HyCOM coverage in this toolbox starts 2018-12-04 -- GOFS 3.1 Analysis is
-fragmented across several expt_9X.X sub-experiments with unconfirmed
-pre-2018-12-04 boundaries; rather than guess at an unverified dataset
-path (the exact mistake docs/design-choices.md sections 8.11/10 already
-warn against), only the one continuously-verified dataset (expt_93.0) is
-wired in. A recipe window ending before 2018-12-04 is a clear error, not
-a silent no-op.
+HyCOM coverage in this toolbox starts 2018-12-04. A recipe window ending 
+before 2018-12-04 is a clear error, not a silent no-op.
 
 Depth is always the surface level (depth=0.0, nearest-match) -- SAR,
 HF-radar, and this toolbox's in-situ currents sources are all treated as
@@ -57,7 +49,7 @@ __all__ = ["HycomDownloader", "_resolve_hycom_segments", "main"]
 
 #: First date this toolbox has verified HyCOM coverage for -- the start of
 #: GLBy0.08/expt_93.0, the one continuously-verified GOFS 3.1 Analysis
-#: dataset. See module docstring.
+#: dataset.
 _HYCOM_MIN_DATE = datetime(2018, 12, 4)
 
 #: ESPC-D-V02 is preferred from this date onward (it's the more current
@@ -70,30 +62,23 @@ _HYCOM_CUTOVER_DATE = datetime(2024, 8, 10)
 #: extrapolate at a SAR scene's edges -- one native grid cell (1/12 deg).
 _GRID_PAD_DEG = 1.0 / 12.0
 
-#: Live-verified 2026-08-11: both real HyCOM THREDDS datasets (GOFS 3.1
-#: expt_93.0 and ESPC-D-V02) carry a ``tau`` (forecast lead-time) data
-#: variable whose ``units`` attribute is the CF-noncompliant string
-#: "hours since analysis" -- "analysis" is not a parseable reference
-#: date, so xarray's default ``decode_times=True`` raises
-#: "unable to decode time units 'hours since analysis'" on a plain
-#: ``xr.open_dataset(url)``, breaking every real network call this
-#: downloader makes (dry-run probe and actual download alike). This was
-#: never caught by the mocked unit tests since they never exercise real
-#: CF decoding. ``tau`` is never consumed downstream (only
-#: water_u/water_v/time/lat/lon/depth are used), so it's simplest to
-#: exclude it from the open entirely rather than special-case its decode.
+#: Both real HyCOM THREDDS datasets (GOFS 3.1 / expt_93.0 and ESPC-D-V02) 
+#: carry a ``tau`` (forecast lead-time) data variable whose ``units`` 
+#: attribute is the CF-noncompliant string "hours since analysis". As 
+#: ``tau`` is never consumed downstream (only water_u/water_v/time/lat
+#: /lon/depth are used), it is excluded.
 _DROP_VARS = ["tau"]
 
 #: HyCOM granule cadence (hours) -- both real datasets (ESPC-D-V02 and
 #: GOFS 3.1 Analysis / expt_93.0) emit one synoptic snapshot every 3
-#: hours (00, 03, 06, ... UTC), unlike ERA5's hourly cadence.
+#: hours (00, 03, 06, ... UTC)
 _CADENCE_HOURS = 3
 
 #: Margin (hours), on top of whatever [seg_start, seg_end] window this
 #: downloader is handed, added on BOTH sides before building the actual
 #: OPeNDAP ``time=slice(...)`` request -- mirrors
 #: ``era5_downloader._HOUR_BUFFER``, sized to HyCOM's 3-hourly (not
-#: ERA5's 1-hourly) cadence, and applied by THIS downloader itself since
+#: ERA5's 1-hourly) cadence, and applied by this downloader itself since
 #: the generic orchestrator/recipe-level padding
 #: (``DEFAULT_LAYER_TYPE_SPECS["hycom"]["time_tolerance_minutes"]``) is
 #: not read by ``ModelLayerCollocation`` and is not sized for
@@ -173,44 +158,6 @@ def _select_hycom_lon_window(
     *east* (this toolbox's standard -180..180 convention, already padded
     by :data:`_GRID_PAD_DEG`) into HyCOM's REAL native 0-360 ``lon``
     convention first.
-
-    Live-confirmed 2026-08-11: both real HyCOM THREDDS datasets
-    (``ESPC-D-V02`` and ``GLBy0.08/expt_93.0``) carry a ``lon`` coordinate
-    ranging 0.0 .. 359.92, NOT -180..180. Selecting directly with the raw
-    (possibly negative) recipe bounds against that axis either matches
-    NOTHING (a bbox fully in the negative range, e.g. US East Coast --
-    silent zero-length ``lon`` dimension) or silently drops part of the
-    intended coverage (a bbox straddling 0 deg longitude).
-
-    *west*/*east* are converted via Python's ``%`` operator, which
-    returns a non-negative result for a positive divisor (e.g.
-    ``-77.08 % 360 == 282.92``).
-
-    Two cases:
-
-    - Non-wrapping (``west_360 <= east_360``, the common case, e.g. US
-      East Coast: 282.92 <= 292.08): a single ``.sel(lon=slice(...))``
-      works correctly against the native axis.
-    - Wrapping (``west_360 > east_360``, e.g. a bbox straddling 0 deg,
-      like -10..10 -> 350..10): the target range spans HyCOM's own
-      0/360 seam. Select two segments -- ``[west_360, 360]`` and
-      ``[0, east_360]`` -- and shift the SECOND segment's ``lon``
-      coordinate by +360 before concatenating, so the combined axis
-      stays monotonically increasing (e.g. 350...359.92, then
-      360...370.08, never wrapping back down to 0). This mirrors
-      ``DataTreeConverter._stitch_antimeridian_window_files``'s existing
-      ERA5 antimeridian handling (see ``datatree_converter.py``), just
-      triggered by a different root condition -- a globally 0-360-native
-      dataset, not an explicitly antimeridian-crossing recipe bbox.
-
-    After either case, the EXISTING ``_normalize_query_lon`` machinery in
-    ``model_collocation.py`` (which already shifts negative SAR-pixel
-    query longitudes by +360 whenever the grid's ``lon`` axis extends
-    past 180) correctly interpolates against the resulting axis with no
-    further changes needed there -- ``from_hycom`` passes the downloaded
-    ``lon`` coordinate through unchanged, so this function's native-
-    convention axis (possibly extending past 360 in the wrapping case)
-    is exactly what ``model_collocation._model_values_at_points`` sees.
     """
     import xarray as xr
 
@@ -328,14 +275,7 @@ class HycomDownloader:
         dataset_key: str, seg_start: datetime, seg_end: datetime, clip_at_cutover: bool = False,
     ) -> tuple[datetime, datetime]:
         """Widen [*seg_start*, *seg_end*] by :data:`_BRACKET_BUFFER_HOURS`
-        on both sides for the actual OPeNDAP request -- see that
-        constant's docstring for the worst-case bracket derivation. The
-        buffered start is clamped at :data:`_HYCOM_MIN_DATE` so a segment
-        already clamped there by :func:`_resolve_hycom_segments` never
-        has its real request pushed further back before real HyCOM
-        coverage begins (harmless either way since a ``.sel(time=slice)``
-        past the coordinate's actual start just truncates, but clamping
-        keeps the requested bounds meaningful).
+        on both sides for the actual OPeNDAP request.
 
         Note: the *nc_path* filename (see :meth:`_nc_path_for_segment`)
         deliberately stays keyed on the UNBUFFERED *seg_start*/*seg_end*
@@ -363,40 +303,6 @@ class HycomDownloader:
         coin flip over which model's value is actually used for a scene
         near the boundary, silently violating this toolbox's stated
         ESPC-D-V02-preferred-at/after-cutover rule.
-
-        Both real datasets share the same 3-hourly cadence grid, and this
-        clip costs NOTHING for the common case of a scene comfortably
-        away from the cutover -- the buffer's original purpose (room at
-        the OUTER edges of the whole recipe window) is untouched, since
-        this clip only ever trims the INNER edge facing the other
-        segment.
-
-        Live-verified 2026-08-12, however: ESPC-D-V02's own real first
-        granule is ``2024-08-10T12:00:00`` -- 12 HOURS AFTER the nominal
-        ``_HYCOM_CUTOVER_DATE`` (2024-08-10T00:00:00) this module treats
-        as the preference boundary -- while GOFS 3.1 expt_93.0 genuinely
-        has real granules at 00:00/03:00/06:00/09:00 that same morning
-        (confirmed against the live THREDDS server). So this clip trades
-        away a small amount of REAL bracket availability for scenes
-        landing in that exact ``[00:00, 12:00)`` window on 2024-08-10
-        specifically: pre-fix, GOFS 3.1's own (non-preferred but real)
-        data would have filled that morning gap; post-fix, this clip
-        denies GOFS 3.1 access to it too (since it's at/after the
-        nominal cutover) and ESPC-D-V02 genuinely has nothing there yet
-        either, so those specific scenes get NO bracket from either
-        dataset. This is judged an acceptable, narrow, ONE-TIME (not
-        recurring -- it's tied to a single fixed historical date, unlike
-        e.g. HF-radar's ongoing density gap) trade for eliminating the
-        far worse ambiguous-duplicate-timestamp bug above -- and it is
-        NOT a silent gap: it surfaces exactly like every other missing-
-        bracket case in ``model_collocation._model_values_at_points``
-        (``idx2 < 1 or idx2 + 1 >= len(era5_times)`` -> leave NaN, debug-
-        logged), the same existing mechanism ERA5's own irregular-
-        bracket-spacing case already relies on -- no new special-casing
-        needed. A coverage-driven (query-the-live-dataset) clip instead
-        of this nominal-date one would close this narrow gap too, but
-        was judged not worth the added network round-trip and coupling
-        between segments for a gap this narrow and non-recurring.
         """
         buffered_start = max(
             seg_start - timedelta(hours=_BRACKET_BUFFER_HOURS), _HYCOM_MIN_DATE,
@@ -414,7 +320,7 @@ class HycomDownloader:
         Map of ``{label: dodsC url}`` to open for this segment.
 
         ``espc_d_v02`` -> one continuous dataset per component (``"u"``,
-        ``"v"`` labels). ``gofs31_930`` -> one COMBINED water_u+water_v
+        ``"v"`` labels). ``gofs31_930`` -> one combined water_u+water_v
         dataset per calendar year touched by [*seg_start*, *seg_end*]
         (``"uv_<year>"`` labels) -- see module docstring for why these two
         datasets have different shapes on the wire.
@@ -430,22 +336,11 @@ class HycomDownloader:
     def _probe_coverage(
         self, dataset_key: str, seg_start: datetime, seg_end: datetime, clip_at_cutover: bool = False,
     ) -> None:
-        """Lazily open each URL for this segment and report which
-        requested days actually have granules in the live dataset's
-        ``time`` coordinate -- no full u/v grid load. Analogous to
-        ``noaa_hfradar_thredds_downloader.py``'s ``catalog.xml`` probe.
-
-        Takes no ``lon``/``lat`` bounds and does no spatial filtering at
-        all (only ``remote.time.values`` is read) -- unlike
-        :func:`_select_hycom_lon_window`'s 0-360-conversion fix in
-        :meth:`_download_segment`, there is nothing here that needs the
-        same conversion; this was traced, not assumed.
-
-        Reports coverage over the SAME :meth:`_buffered_bounds`-widened
-        window a real (non-dry-run) download would actually request, so
-        dry-run output doesn't misleadingly under-report what a real run
-        fetches. *clip_at_cutover* mirrors :meth:`_download_segment`'s
-        own parameter -- see :meth:`_buffered_bounds` for why.
+        """Open each URL for this segment and report which requested
+        days have granules in the live dataset's ``time`` coordinate 
+        (`_buffered_bounds`-widened window) -- no full u/v grid load. 
+        Analogous to ``noaa_hfradar_thredds_downloader.py``'s 
+        ``catalog.xml`` probe. Used for the ``--dry-run`` CLI option.
         """
         import numpy as np
         import xarray as xr
@@ -483,12 +378,6 @@ class HycomDownloader:
     ) -> Optional[Path]:
         """Download one dataset-segment's water_u/water_v subset, combine
         into one NetCDF. Returns the NC path, or ``None`` on failure.
-
-        *clip_at_cutover*: see :meth:`_buffered_bounds` -- set by
-        :meth:`download` only when the recipe window straddles
-        :data:`_HYCOM_CUTOVER_DATE`, so this segment's buffered request
-        never overlaps in real-world time with the OTHER segment's own
-        buffered request.
         """
         import xarray as xr
 
