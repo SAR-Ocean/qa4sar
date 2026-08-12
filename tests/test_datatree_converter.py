@@ -2133,6 +2133,69 @@ class TestFromASCATSsm:
         assert ds is None
 
 
+class TestFromHsafSsm:
+    """H-SAF H29 NRT files are flat (obs,) arrays with pre-resolved
+    lat/lon/time (no WARP5 grid-point-ID lookup needed) -- verified
+    against a real downloaded file, see hsaf_downloader.py's docstring."""
+
+    @staticmethod
+    def _write_fake_h29_file(path, n=6, n_valid=3):
+        import numpy as np
+        import xarray as xr
+
+        lon = np.linspace(-58.0, -56.0, n)
+        lat = np.linspace(51.0, 51.5, n)
+        time = pd.date_range("2026-06-08T23:09:00", periods=n, freq="30s")
+        sm = np.full(n, np.nan)
+        sm[:n_valid] = np.linspace(10.0, 40.0, n_valid)
+
+        ds = xr.Dataset(
+            {
+                "surface_soil_moisture": ("obs", sm),
+                "location_id": ("obs", np.arange(n, dtype=np.float64)),
+            },
+            coords={
+                "latitude": ("obs", lat),
+                "longitude": ("obs", lon),
+                "time": ("obs", time),
+            },
+        )
+        ds["surface_soil_moisture"].attrs = {
+            "long_name": "surface soil moisture",
+            "units": "percent saturation",
+        }
+        ds.to_netcdf(path)
+
+    def test_reads_flat_obs_array_and_drops_nan(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        path = tmp_path / "W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPB-12.5km-H29_C_LIIB_x.nc"
+        self._write_fake_h29_file(path, n=6, n_valid=3)
+
+        result = DataTreeConverter.from_hsaf_ssm(path)
+
+        assert result is not None
+        assert result.sizes["point"] == 3
+        assert result.attrs["platform_type"] == "ascat_ssm"
+        assert result.attrs["data_type"] == "scatterometer_ssm"
+        assert result["SOIL_MOISTURE"].attrs["units"] == "%"
+        assert float(result["SOIL_MOISTURE"].values.max()) <= 100.0
+        assert float(result["SOIL_MOISTURE"].values.min()) >= 0.0
+
+    def test_all_nan_file_returns_none(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        path = tmp_path / "all_nan.nc"
+        self._write_fake_h29_file(path, n=4, n_valid=0)
+
+        assert DataTreeConverter.from_hsaf_ssm(path) is None
+
+    def test_missing_file_returns_none(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        assert DataTreeConverter.from_hsaf_ssm(tmp_path / "does_not_exist.nc") is None
+
+
 class TestFromAmsrSsm:
     def test_converts_synthetic_h5_file(self, tmp_path):
         import h5py

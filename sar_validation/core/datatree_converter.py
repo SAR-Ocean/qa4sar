@@ -1369,6 +1369,76 @@ class DataTreeConverter:
         )
 
     @staticmethod
+    def from_hsaf_ssm(path: Union[str, Path]) -> Optional[xr.Dataset]:
+        """
+        Open an H-SAF ASCAT Surface Soil Moisture NRT (H29) product.
+
+        Unlike the EUMDAC/SOMO12 path (from_ascat_ssm, via the ``ascat``
+        package's WARP5-grid-aware reader), H29 files ship a flat
+        ``(obs,)`` array with ``latitude``/``longitude``/``time`` already
+        resolved to real per-observation coordinates -- CONFIRMED against
+        a real downloaded file (see hsaf_downloader.py's module
+        docstring): no grid-point-ID lookup is needed, so this reads the
+        file directly with xarray rather than routing through ``ascat``.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to the downloaded H-SAF H29 product file.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="scatterometer_ssm"``, or None on failure.
+        """
+        path = Path(path)
+        if not path.exists():
+            logger.warning("H-SAF SSM file not found: %s", path)
+            return None
+
+        try:
+            data = xr.open_dataset(path)
+        except Exception as exc:
+            logger.warning("Could not read H-SAF SSM file %s: %s", path, exc)
+            return None
+
+        if "surface_soil_moisture" not in data:
+            logger.warning("No 'surface_soil_moisture' field in %s.", path.name)
+            return None
+        if not ("longitude" in data and "latitude" in data and "time" in data):
+            logger.warning(
+                "Missing longitude/latitude/time field(s) in %s (available: %s).",
+                path.name,
+                list(data.coords) + list(data.data_vars),
+            )
+            return None
+
+        lon = ((data["longitude"].values.ravel() + 180) % 360) - 180
+        lat = data["latitude"].values.ravel()
+        time_vals = pd.to_datetime(data["time"].values.ravel())
+        sm = data["surface_soil_moisture"].values.ravel().astype(float)
+
+        valid = ~np.isnan(sm)
+        if not valid.any():
+            logger.warning("from_hsaf_ssm: all cells NaN in %s.", path.name)
+            return None
+
+        var_attrs = {
+            "SOIL_MOISTURE": {
+                "units": "%",
+                "standard_name": "soil_moisture_saturation",
+                "long_name": "ASCAT surface soil moisture (~0-5cm, C-band)",
+            }
+        }
+        return DataTreeConverter._build_ssm_point_dataset(
+            sm[valid], lon[valid], lat[valid], time_vals.values[valid],
+            data_type="scatterometer_ssm", var_attrs=var_attrs,
+            platform_type="ascat_ssm",
+            source="H-SAF ASCAT Surface Soil Moisture NRT 12.5km (H29)",
+            sensing_depth_cm="0-5", band="C", filename=path.name,
+        )
+
+    @staticmethod
     def from_amsr_ssm(path: Union[str, Path]) -> Optional[xr.Dataset]:
         """
         Open an AMSR-E/AMSR2 soil-moisture product and return a
@@ -3887,6 +3957,17 @@ class DataTreeConverter:
                 if ds is not None:
                     datasets[f"validation/ascat_ssm/{f.stem}"] = ds
                     logger.info("Converted ASCAT SSM: %s", f.name)
+
+        # H-SAF ASCAT SSM NRT (H29) -- flat obs-array netCDF files, always
+        # ".nc" (see hsaf_downloader.py; H-SAF's own BUFR variant is never
+        # requested by that downloader).
+        subdir = base_dir / "hsaf_ssm"
+        if subdir.exists():
+            for f in sorted(subdir.glob("*.nc")):
+                ds = _filtered(DataTreeConverter.from_hsaf_ssm(f), f.name)
+                if ds is not None:
+                    datasets[f"validation/hsaf_ssm/{f.stem}"] = ds
+                    logger.info("Converted H-SAF SSM: %s", f.name)
 
         # AMSR-E/AMSR2 Daily Global Land Parameters (NSIDC-0451, HDF5, ``.h5``)
         # or AU_Land_NRT_R02/AU_Land (HDF-EOS5 swath, conventionally ``.he5``).
