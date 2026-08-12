@@ -3857,29 +3857,38 @@ def validation_report(
                     geo_point_size = 5 if (n_points / n_scenes) > 300 else 15
             else:
                 geo_point_size = 40
+            is_soil_moisture_two_column = (variable == "soil_moisture")
+            _geo_scene_index = [0]
+
+            def _write_geo_figure(group, fig_geo, index):
+                if cdf_matched_suffix:
+                    fig_geo = _mark_cdf_matched(
+                        fig_geo, description=_CDF_MATCHED_DESCRIPTION if index == 0 else None,
+                    )
+                figs.append(fig_geo)
+                title = f"{sar_var} vs {val_var} — geographic [{group}]{cdf_matched_suffix}"
+                if base_dir is not None:
+                    _write_page(title, _finalize_figure_for_report(fig_geo, None))
+
+            def _on_geo_figure(scene_name, fig_geo):
+                _write_geo_figure(scene_name, fig_geo, _geo_scene_index[0])
+                _geo_scene_index[0] += 1
+
             geo_result = plot_geographic(
                 datatree, cdf_geo_pair_ds, sar_var, val_var, scenes=matched_scenes,
                 point_size=geo_point_size,
                 geographic_bounds=(
                     recipe.config.geographic_bounds if geo_clamp_bounds else None
                 ),
-                two_column_by_type=(variable == "soil_moisture"),
+                two_column_by_type=is_soil_moisture_two_column,
+                on_figure=_on_geo_figure if is_soil_moisture_two_column else None,
             )
-            if isinstance(geo_result, dict):
-                # plot_geographic can return one Figure *per SAR scene*
-                # (two_column_by_type=True, soil_moisture's own mode) --
-                # the section-opening description belongs on the very
-                # first page of the section, not repeated on every scene.
+            if is_soil_moisture_two_column:
+                pass  # each scene's figure was already written+closed via _on_geo_figure
+            elif isinstance(geo_result, dict):
                 for i, (group, fig_geo) in enumerate(geo_result.items()):
                     if fig_geo is not None:
-                        if cdf_matched_suffix:
-                            fig_geo = _mark_cdf_matched(
-                                fig_geo, description=_CDF_MATCHED_DESCRIPTION if i == 0 else None,
-                            )
-                        figs.append(fig_geo)
-                        title = f"{sar_var} vs {val_var} — geographic [{group}]{cdf_matched_suffix}"
-                        if base_dir is not None:
-                            _write_page(title, _finalize_figure_for_report(fig_geo, None))
+                        _write_geo_figure(group, fig_geo, i)
             elif geo_result is not None:
                 if cdf_matched_suffix:
                     geo_result = _mark_cdf_matched(geo_result, description=_CDF_MATCHED_DESCRIPTION)
@@ -4152,14 +4161,13 @@ def validation_report(
         # When base_dir is not None, each fig here was already closed inside
         # _finalize_figure_for_report. _write_page's page Figures are separate
         # lightweight image-page objects, not these same objects — so this
-        # loop is a safe, idempotent no-op double-close. Closing here
-        # deregisters them from pyplot's global figure manager to avoid
-        # accumulating figures across pairs and across the two
-        # collocation-method passes triggered by
-        # --layer-vs-layer-collocation-method both.
-        if base_dir is not None:
-            for fig in figs:
-                plt.close(fig)
+        # loop is a safe, idempotent no-op double-close in that case. When
+        # base_dir IS None (no report written to disk), this is the only
+        # place these figures ever get closed -- previously guarded by
+        # `if base_dir is not None`, which meant every figure built during
+        # a base_dir=None call leaked for the life of the process.
+        for fig in figs:
+            plt.close(fig)
 
     # Combined PDF — saved alongside the validation_statistics_*.nc files.
     # Only opened (via _open_pdf, above) if at least one page was actually

@@ -4672,6 +4672,49 @@ class TestValidationReportClosesPageFigures:
         assert plt.get_fignums() == []
 
 
+class TestValidationReportGeoFigureStreaming:
+    """validation_report's soil-moisture geo section must not hold every
+    NISAR scene's figure open simultaneously -- confirms the on_figure
+    wiring from plot_geographic actually gets used end-to-end, not just
+    in plot_geographic's own isolated unit tests (Task B1)."""
+
+    def test_many_scene_soil_moisture_report_never_exceeds_a_few_open_figures(
+        self, tmp_path, monkeypatch,
+    ):
+        import matplotlib
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
+
+        peak_open = [0]
+        original_figure = matplotlib.pyplot.figure
+
+        def tracking_figure(*a, **kw):
+            fig = original_figure(*a, **kw)
+            peak_open[0] = max(peak_open[0], len(plt.get_fignums()))
+            return fig
+
+        monkeypatch.setattr(matplotlib.pyplot, "figure", tracking_figure)
+
+        datatree, collocation_ds = (
+            TestPlotGeographicOnFigureCallback._build_multi_scene_datatree_and_collocation(25)
+        )
+        recipe = Recipe(config=RecipeConfig(name="soil_moisture_test", variable="soil_moisture"))
+
+        plt.close("all")
+        # validation_report's real signature: (collocation_ds, datatree,
+        # recipe, stats_ds_map=None, out_dir=None, ...) -- stats_ds_map is
+        # optional (skips the stats/table section, unrelated to this test).
+        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        assert peak_open[0] < 20, (
+            f"more than 20 figures were simultaneously open at some point "
+            f"(peak {peak_open[0]}) -- the NISAR many-scene leak regressed"
+        )
+        assert plt.get_fignums() == [], "figures must be closed once the report is written"
+
+
 class TestDropNonDirectionalSources:
     def _ds(self):
         return xr.Dataset({
