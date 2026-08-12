@@ -508,7 +508,7 @@ class TestModelLayerCollocationIndividualPoints:
 
         # method="cell-averaging" globally, but WV points still use direct
         # interpolation -- there's no dense SAR grid to aggregate within one
-        # ERA5 cell for sparse imagette points.
+        # ERA5 cell for sparse vignette points.
         colloc = ModelLayerCollocation(method="cell-averaging", temporal_method="nearest")
         results = colloc.collocate_points(
             sar_point_vars=sar_point_vars, sar_lons=sar_lons, sar_lats=sar_lats,

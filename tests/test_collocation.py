@@ -979,7 +979,7 @@ class TestRunCollocationCurrentsFromDatatree:
 
     def test_wv_mode_multi_point_time_array_does_not_crash(self, tmp_path):
         """Regression test: a WV-mode SAR node's ``time`` coordinate is
-        ``("point",)``-dimensioned -- one timestamp per imagette, not a
+        ``("point",)``-dimensioned -- one timestamp per vignette, not a
         single scalar like grid-mode (IW/EW/SM) scenes. `run_collocation`
         builds ``sar_scene_times`` from every SAR node up front (for the
         ISMN pre-averaging step), and used to call
@@ -993,7 +993,7 @@ class TestRunCollocationCurrentsFromDatatree:
 
         from sar_validation.core.collocation import run_collocation
 
-        # Two WV imagettes at different acquisition times -- this is what
+        # Two WV vignettes at different acquisition times -- this is what
         # made the old scalar pd.Timestamp(...) call raise.
         sar = xr.Dataset(
             {
@@ -1012,7 +1012,7 @@ class TestRunCollocationCurrentsFromDatatree:
                    "measurement_type": "rvl"},
         )
         # A non-ISMN (mooring) in-situ source sitting on top of the first
-        # imagette only.
+        # vignette only.
         val = xr.Dataset(
             {
                 "EWCT": (("point",), np.array([0.4], dtype="float32")),

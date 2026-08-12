@@ -1261,27 +1261,27 @@ def _collocate_wv_points(
     sar_scene_name: str = "",
 ) -> List[CollocatedPoint]:
     """
-    SAR-point-anchored collocation for sparse WV-mode OSW imagettes.
+    SAR-point-anchored collocation for sparse WV-mode OSW vignettes.
 
-    Each Sentinel-1 WV imagette is a single point representing a ~20×20 km
-    footprint, and consecutive imagettes are ~200 km apart. Rather than
-    requiring validation data within a few km of the imagette *centre* (as the
+    Each Sentinel-1 WV vignette is a single point representing a ~20×20 km
+    footprint, and consecutive vignettes are ~200 km apart. Rather than
+    requiring validation data within a few km of the vignette *centre* (as the
     grid-oriented matchers do when a WV point is faked into a 1×1 grid), this
     gathers every validation observation within ``footprint_radius_km`` and
-    ``time_tolerance_minutes`` of each imagette and aggregates them into a
+    ``time_tolerance_minutes`` of each vignette and aggregates them into a
     single match anchored on the SAR point.
 
     Parameters
     ----------
     sar_lons, sar_lats, sar_times : np.ndarray
-        Per-imagette coordinates/times for one SAR scene, shape ``(n_points,)``.
+        Per-vignette coordinates/times for one SAR scene, shape ``(n_points,)``.
     sar_point_vars : dict
         SAR variables as ``(n_points,)`` arrays (e.g. ``{"oswHs": ...}``).
     val_data : pd.DataFrame
         Validation observations with ``lon``, ``lat``, ``time`` and any number
         of variable columns.
     footprint_radius_km : float
-        Search radius around each imagette (≈ footprint half-diagonal).
+        Search radius around each vignette (≈ footprint half-diagonal).
     time_tolerance_minutes : float
         Maximum absolute time difference for a validation obs to contribute.
     distance_weighting : str
@@ -1294,7 +1294,7 @@ def _collocate_wv_points(
     Returns
     -------
     list[CollocatedPoint]
-        One match per imagette that had at least one contributing observation.
+        One match per vignette that had at least one contributing observation.
     """
     from scipy.spatial import cKDTree
 
@@ -1331,7 +1331,7 @@ def _collocate_wv_points(
         if not (np.isfinite(s_lon) and np.isfinite(s_lat)):
             continue
 
-        # SAR variables for this imagette (skip if all NaN)
+        # SAR variables for this vignette (skip if all NaN)
         sar_aggregated = {
             var: float(arr[i]) for var, arr in sar_point_vars.items()
             if np.isfinite(arr[i])
@@ -1378,7 +1378,7 @@ def _collocate_wv_points(
 
         # Project the in-situ current vector (EWCT/NSCT) onto the SAR radial
         # look direction so it can be compared against rvlRadVel — mirrors the
-        # grid collocation path. Here rvlHeading is a scalar per imagette point.
+        # grid collocation path. Here rvlHeading is a scalar per vignette point.
         if (
             "rvlRadVel" in sar_aggregated
             and "rvlHeading" in sar_aggregated
@@ -1421,7 +1421,7 @@ def _collocate_wv_points(
         )
 
     logger.info(
-        "WV-point collocation [%s]: %d match(es) from %d imagette(s) (source=%s)",
+        "WV-point collocation [%s]: %d match(es) from %d vignette(s) (source=%s)",
         collocation_type, len(collocations), len(sar_lons), val_source,
     )
     return collocations
@@ -1621,7 +1621,7 @@ def run_collocation(
         return None
 
     # ``ds["time"]`` is a scalar coordinate for grid-mode (IW/EW/SM) scenes
-    # but a (point,)-dimensioned array of per-imagette times for WV-mode
+    # but a (point,)-dimensioned array of per-vignette times for WV-mode
     # scenes -- np.atleast_1d normalises both to an iterable so every SAR
     # acquisition time is collected regardless of scene mode. Scenes with
     # no ``time`` coordinate at all, or individual NaT entries within one,
@@ -1741,10 +1741,10 @@ def run_collocation(
 
         if is_wv_mode:
             # =========== WV MODE (SAR-footprint-anchored) ===========
-            # Each imagette is a single point standing for a ~20×20 km
-            # footprint, and imagettes are ~200 km apart — far too sparse to
+            # Each vignette is a single point standing for a ~20×20 km
+            # footprint, and vignettes are ~200 km apart — far too sparse to
             # match by requiring validation data within a few km of the point
-            # centre. Instead, anchor on each imagette and aggregate every
+            # centre. Instead, anchor on each vignette and aggregate every
             # validation obs within the footprint radius (see
             # _collocate_wv_points).
             sar_lons = sar_ds["lon"].values   # (point,)
@@ -1762,7 +1762,7 @@ def run_collocation(
                 continue
 
             n_points = len(sar_lons)
-            logger.info("SAR node '%s' is WV mode with %d imagette point(s)", sar_name, n_points)
+            logger.info("SAR node '%s' is WV mode with %d vignette point(s)", sar_name, n_points)
 
             for ctype, sources in buckets.items():
                 if not sources:
@@ -1778,7 +1778,7 @@ def run_collocation(
 
                     if ctype == "layer_vs_layer":
                         # Altimeter/scatterometer: sampled as a layer at the
-                        # imagette with distance-weighted aggregation and the
+                        # vignette with distance-weighted aggregation and the
                         # layer's own time tolerance. Resolve the layer type
                         # exactly as the grid path does.
                         layer_type = _resolve_layer_type(val_ds, val_name, layer_vs_layer_specs)
@@ -1818,9 +1818,9 @@ def run_collocation(
                     )
 
             # ERA5 (or any future gridded "model" source) -- see
-            # docs/design-choices.md. WV imagettes are sparse SAR-anchor
+            # docs/design-choices.md. WV vignettes are sparse SAR-anchor
             # points, so ModelLayerCollocation.collocate_points always
-            # interpolates ERA5 directly at each imagette regardless of
+            # interpolates ERA5 directly at each vignette regardless of
             # the recipe's chosen method.
             for val_name, val_ds in model_sources.items():
                 per_source_kwargs = model_source_metadata.get(val_name, {}).get("colloc_kwargs", {})

@@ -215,7 +215,7 @@ Alaska/the North Pacific.
 
 | Type | Example |
 |------|---------|
-| Point vs. Point | mooring / buoy / ferrybox / drifter / tidal gauge vs. SAR wave vignettes | 
+| Point vs. Point | mooring / buoy / ferrybox / drifter / tidal gauge vs. SAR WV-mode vignettes | 
 | Point vs. Layer | mooring / buoy / ferrybox / drifter / tidal gauge vs. SAR | 
 | Layer vs. Layer | scatterometer / altimeter / radiometer (flattened) vs. SAR | 
 | Model vs. Layer | ERA5 / HYCOM (gridded) vs. SAR |

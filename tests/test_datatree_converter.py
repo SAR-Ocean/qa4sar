@@ -60,7 +60,7 @@ def _make_ocn_safe(
 
     rvl_swaths=None -> no rvl* variables written.
     rvl_swaths=S (wv=False) -> 3-D rvl (rvlAzSize, rvlRaSize, rvlSwath=S).
-    wv=True -> 2-D 13x13 rvl (rvlAzSize, rvlRaSize), as in WV imagettes.
+    wv=True -> 2-D 13x13 rvl (rvlAzSize, rvlRaSize), as in WV vignettes.
     land_rows=N -> the first N rows of the rvlAzSize axis are written with
         rvlLandFlag=1 (land) across every column/swath; the rest are 0.
         land_rows=0 (default) omits rvlLandFlag entirely, simulating a
@@ -121,7 +121,7 @@ def _make_wv_rvl_safe(
     seed: int = 0,
 ) -> Path:
     """
-    Build a WV *.SAFE dir with one 13x13-imagette RVL measurement file per
+    Build a WV *.SAFE dir with one 13x13-vignette RVL measurement file per
     entry in land_rows_per_file. Entry i controls how many of that file's
     13 rvlAzSize rows are land-flagged (0 = no rvlLandFlag var at all for
     that file).
@@ -1759,7 +1759,7 @@ class TestWvSafeProductTypeRouting:
 
     def _make_wv_waves_safe(self, tmp_path, *, osw_hs, osw_total_hs=None):
         """
-        Build a WV SAFE whose imagette measurement file carries partitioned
+        Build a WV SAFE whose vignette measurement file carries partitioned
         ``oswHs`` and optionally an integrated ``oswTotalHs``.
 
         ``osw_hs`` is the per-partition Hs array (dims oswAzSize, oswRaSize,

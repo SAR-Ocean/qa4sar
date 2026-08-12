@@ -299,8 +299,8 @@ class CollocationType:
     point_vs_layer: PointVsLayerCollocation = field(default_factory=PointVsLayerCollocation)
     layer_vs_layer: Optional[LayerVsLayerCollocation] = None
 
-    #: Search radius (km) around each sparse SAR WV-mode OSW imagette point
-    #: used to gather validation observations. A WV imagette covers ~20×20 km,
+    #: Search radius (km) around each sparse SAR WV-mode OSW vignette point
+    #: used to gather validation observations. A WV vignette covers ~20×20 km,
     #: so 14 km ≈ its center-to-corner distance (fully covers the footprint).
     #: Only affects WV/point-mode SAR; IW/EW grid collocation is unaffected.
     sar_footprint_radius_km: float = 14.0

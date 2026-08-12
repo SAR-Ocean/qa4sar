@@ -2853,7 +2853,7 @@ class DataTreeConverter:
 
         # Detect mode from SAFE directory name
         if "WV" in safe_name:
-            # WV imagette OCN files carry oswTotalHs AND a 13x13 rvlRadVel grid.
+            # WV vignette OCN files carry oswTotalHs AND a 13x13 rvlRadVel grid.
             # Route currents to RVL extraction; wind/waves keep oswTotalHs.
             if product_type.lower() == "currents":
                 return DataTreeConverter._extract_rvl_from_wv_safe(safe_dir)
@@ -2870,7 +2870,7 @@ class DataTreeConverter:
         oswTotalHs (integrated total significant wave height) point measurements.
 
         The WV mode produces multiple measurement files (~16 per SAFE product),
-        each carrying a 1×1 imagette. This method extracts ``oswTotalHs`` (the
+        each carrying a 1×1 vignette. This method extracts ``oswTotalHs`` (the
         integrated total significant wave height, matching the validation
         ``VHM0``) from every .nc file — falling back to the mean of the valid
         ``oswHs`` partitions when a product lacks ``oswTotalHs`` — and creates a
@@ -3209,10 +3209,10 @@ class DataTreeConverter:
             file_names = []
             rvl_attrs: Dict[str, Dict] = {}
 
-            # Land-flag QA accumulated across every imagette file in this
+            # Land-flag QA accumulated across every vignette file in this
             # scene (see the grid branch above for the rationale — same
             # masking rule, same QA stats, just summed across files here
-            # since one WV scene is many small imagette files).
+            # since one WV scene is many small vignette files).
             land_pixel_count_total = 0
             total_classified_total = 0
             land_radvel_sum = 0.0

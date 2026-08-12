@@ -261,7 +261,7 @@ def _model_values_at_points(
     Efficient for the common case where many points share the same (or
     very few distinct) observation times -- always true for a SAR scene,
     whose whole IW/EW grid shares one scalar acquisition time, or whose
-    WV-mode imagettes share only a handful of per-imagette times: each
+    WV-mode vignettes share only a handful of per-vignette times: each
     hour's spatial interpolator is built once and queried in one
     vectorized batch per group of points sharing that hour-bracket,
     instead of rebuilding an interpolator per point.
@@ -455,9 +455,9 @@ class ModelLayerCollocation:
         sar_scene_name: str = "",
     ) -> List[CollocatedPoint]:
         """
-        WV-mode (sparse imagette points) SAR scene, all arrays shape
+        WV-mode (sparse vignette points) SAR scene, all arrays shape
         ``(n_points,)``. Always interpolates ERA5 directly at each point
-        regardless of :attr:`method` -- WV imagettes are already sparse
+        regardless of :attr:`method` -- WV vignettes are already sparse
         SAR-anchor points (~200 km apart), so there is no dense SAR grid
         within one ERA5 cell to aggregate the way cell-averaging does for
         grid-mode scenes; interpolating ERA5 exactly at each point is the
