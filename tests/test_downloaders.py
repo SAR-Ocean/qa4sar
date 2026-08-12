@@ -311,6 +311,12 @@ def _call_osi_saf_ftp(username=None, password=None, allow_prompt=True):
     return authenticate_osi_saf_ftp(username, password)
 
 
+def _call_hsaf_ftp(username=None, password=None, allow_prompt=True):
+    from sar_validation.downloaders.base import authenticate_hsaf_ftp
+
+    return authenticate_hsaf_ftp(username, password)
+
+
 def _call_gportal(username=None, password=None, allow_prompt=True):
     from sar_validation.downloaders.base import authenticate_gportal
 
@@ -349,6 +355,13 @@ CREDENTIAL_RESOLUTION_CASES = [
         ".eumetsat_osi_saf_wind_credentials", _json_legacy_content,
         "OSI-SAF FTP credentials not found", False,
         id="osi_saf_ftp",
+    ),
+    pytest.param(
+        "hsaf_ftp", _call_hsaf_ftp,
+        "HSAF_FTP_USERNAME", "HSAF_FTP_PASSWORD", "sar-validation-hsaf",
+        ".hsaf_ftp_credentials", _json_legacy_content,
+        "H-SAF FTP credentials not found", False,
+        id="hsaf_ftp",
     ),
     pytest.param(
         "gportal", _call_gportal,

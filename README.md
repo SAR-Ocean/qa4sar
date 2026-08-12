@@ -278,6 +278,18 @@ you can delete the old file afterwards.
 
 Register at: https://osi-saf.eumetsat.int/register
 
+### H-SAF FTP — for ASCAT soil moisture NRT downloads
+
+Store credentials in your OS keyring:
+
+```bash
+sar-validate --set-credential hsaf
+```
+
+Or use environment variables: `HSAF_FTP_USERNAME` / `HSAF_FTP_PASSWORD`.
+
+Register at: https://hsaf.meteoam.it/User/Register
+
 ### JAXA G-Portal — for AMSR2 soil moisture downloads (SFTP fallback)
 
 Store credentials in your OS keyring:
