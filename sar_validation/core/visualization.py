@@ -31,7 +31,7 @@ import logging
 import math
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import xarray as xr
@@ -857,6 +857,7 @@ def plot_geographic(
     interactive: bool = False,
     geographic_bounds: Optional["GeographicBounds"] = None,
     two_column_by_type: bool = False,
+    on_figure: Optional[Callable[[str, "Figure"], None]] = None,
     skip_domain_harmonization: bool = False,
 ):
     """
@@ -942,6 +943,17 @@ def plot_geographic(
         has one type present. Returns dict[scene_name, Figure] in this
         mode instead of dict[collocation_type, Figure]. Ignored (no-op)
         unless split_by == "collocation_type".
+    on_figure : callable(scene_name, Figure), optional
+        Only used when two_column_by_type is True. If given, each scene's
+        Figure is handed to this callback immediately after being built,
+        instead of being accumulated in the returned dict -- the caller
+        becomes responsible for the figure's lifecycle (writing + closing
+        it). Fixes a real bug: without this, a many-scene recipe (e.g.
+        NISAR's per-orbit granules) could have every scene's Figure open
+        simultaneously before this function ever returns, well past
+        matplotlib's 20-open-figure warning threshold. When on_figure is
+        given, the returned dict contains no entries for the scenes
+        handed to it.
     skip_domain_harmonization : bool
         When True, force ``domains_differ`` to False unconditionally,
         skipping the whole SAR-vs-validation units-mismatch detection and
@@ -1682,7 +1694,10 @@ def plot_geographic(
         for scene_name in scene_names:
             fig = _build_scene_pair_figure(scene_name)
             if fig is not None:
-                scene_figures[scene_name] = fig
+                if on_figure is not None:
+                    on_figure(scene_name, fig)
+                else:
+                    scene_figures[scene_name] = fig
         return scene_figures
 
     if group_values is None:

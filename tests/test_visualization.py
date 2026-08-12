@@ -2987,6 +2987,124 @@ class TestPlotGeographicTwoColumnByType:
         assert set(result.keys()) == {"point_vs_layer"}
 
 
+class TestPlotGeographicOnFigureCallback:
+    """The NISAR too-many-open-figures bug: two_column_by_type built every
+    scene's Figure before returning any of them, so a many-scene recipe
+    (e.g. NISAR's per-orbit granules) could have >20 simultaneously open
+    before the caller ever got a chance to close one. on_figure lets the
+    caller consume (and close) each scene's figure immediately."""
+
+    @staticmethod
+    def _build_multi_scene_datatree_and_collocation(n_scenes):
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        sar_nodes = {}
+        rows = []
+        for i in range(n_scenes):
+            y, x = 3, 3
+            lon2d, lat2d = np.meshgrid(
+                np.linspace(-10.0 + i, -9.0 + i, x), np.linspace(50.0, 51.0, y)
+            )
+            sar_nodes[f"sar/scene{i}"] = xr.Dataset(
+                {"sarSSM": (("y", "x"), np.linspace(10.0, 60.0, y * x).reshape(y, x))},
+                coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                        "time": pd.Timestamp("2026-07-10T12:00:00")},
+            )
+            rows.append(i)
+
+        n = len(rows)
+        ismn_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", np.linspace(0.1, 0.3, n))},
+            coords={"lon": ("point", np.linspace(-9.8, -9.0, n)),
+                    "lat": ("point", np.linspace(50.2, 50.8, n)),
+                    "time": ("point", pd.date_range("2026-07-10T12:00", periods=n, freq="5min"))},
+            attrs={"platform_type": "ismn"},
+        )
+        datatree = DataTreeConverter.to_datatree({**sar_nodes, "validation/ismn": ismn_ds})
+
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", np.linspace(12.0, 48.0, n)),
+            "val_SOIL_MOISTURE": ("collocation", np.linspace(0.1, 0.3, n)),
+            "val_source":        ("collocation", ["ismn"] * n),
+            "collocation_type":  ("collocation", ["point_vs_layer"] * n),
+            "sar_scene_name":    ("collocation", [f"scene{i}" for i in rows]),
+            "val_lon":           ("collocation", np.linspace(-9.8, -9.0, n)),
+            "val_lat":           ("collocation", np.linspace(50.2, 50.8, n)),
+            "val_id":            ("collocation", [f"i{i}" for i in rows]),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-10T12:00", periods=n, freq="5min")),
+        )
+        return datatree, collocation_ds
+
+    def test_on_figure_called_once_per_scene_and_dict_stays_empty(self):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = self._build_multi_scene_datatree_and_collocation(5)
+        handed_off = []
+
+        def on_figure(scene_name, fig):
+            handed_off.append(scene_name)
+            plt.close(fig)
+
+        result = plot_geographic(
+            datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            split_by="collocation_type", two_column_by_type=True,
+            on_figure=on_figure,
+        )
+
+        assert sorted(handed_off) == [f"scene{i}" for i in range(5)]
+        assert result == {}
+
+    def test_no_more_than_one_figure_open_at_a_time_with_callback(self):
+        """The actual leak regression: without on_figure, all N scene
+        figures exist simultaneously before plot_geographic returns. With
+        it, at most one should ever be open (closed by the callback)
+        before the next scene's figure is built."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = self._build_multi_scene_datatree_and_collocation(6)
+        max_open_during_build = [0]
+
+        def on_figure(scene_name, fig):
+            max_open_during_build[0] = max(max_open_during_build[0], len(plt.get_fignums()))
+            plt.close(fig)
+
+        plt.close("all")
+        plot_geographic(
+            datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            split_by="collocation_type", two_column_by_type=True,
+            on_figure=on_figure,
+        )
+
+        assert max_open_during_build[0] == 1
+
+    def test_without_callback_behavior_is_unchanged(self):
+        """Backward compatibility: omitting on_figure still returns the
+        full dict, exactly as every existing caller/test expects."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = self._build_multi_scene_datatree_and_collocation(3)
+
+        result = plot_geographic(
+            datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            split_by="collocation_type", two_column_by_type=True,
+        )
+
+        assert sorted(result.keys()) == ["scene0", "scene1", "scene2"]
+        plt.close("all")
+
+
 class TestExtractValidationDataForPlotSkipsGriddedNodes:
     """_extract_validation_data_for_plot's process_node assumes every
     validation node's lon/lat coords represent a flattened per-observation
