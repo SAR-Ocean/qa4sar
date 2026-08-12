@@ -38,6 +38,12 @@ collocation:
     gaussian_sigma_km: 2.0
   sar_footprint_radius_km: 14.0
   layer_vs_layer:
-    layer_type_specs: {}
+    layer_type_specs:
+      hycom:
+        time_tolerance_minutes: 360
+        aggregation_window_km: 4.6
+        distance_weighting: equal
+        method: cell-averaging
+        temporal_method: hyperbolic
     method: cell-averaging
 output_dir: null

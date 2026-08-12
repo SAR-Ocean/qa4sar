@@ -1526,10 +1526,16 @@ def run_collocation(
     # Layer-vs-layer specs: start from the built-in defaults (so recipes that
     # declare no layer_vs_layer section at all still get sensible per-source
     # aggregation windows), then let any recipe-level overrides win per-key.
+    # Deep merge (not layer_vs_layer_specs.update(...), which replaces a
+    # key's whole dict) -- a recipe overriding only e.g.
+    # "time_tolerance_minutes" for one key (soil_moisture_nisar_norway.yaml
+    # does exactly this) must not silently lose that key's other defaults
+    # (aggregation_window_km, distance_weighting, ...) in the process.
     from .recipe import DEFAULT_LAYER_TYPE_SPECS
     layer_vs_layer_specs = dict(DEFAULT_LAYER_TYPE_SPECS)
     if coll_cfg.layer_vs_layer is not None:
-        layer_vs_layer_specs.update(coll_cfg.layer_vs_layer.layer_type_specs)
+        for key, spec in coll_cfg.layer_vs_layer.layer_type_specs.items():
+            layer_vs_layer_specs[key] = {**layer_vs_layer_specs.get(key, {}), **spec}
 
     recipe_layer_type_specs = (
         coll_cfg.layer_vs_layer.layer_type_specs if coll_cfg.layer_vs_layer is not None else {}

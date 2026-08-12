@@ -938,14 +938,33 @@ class TestBuildSoilMoistureConfigNisarSme2:
         for key in ("scatterometer_ssm", "radiometer_ssm", "amsr_ssm", "smap_ssm", "smos_ssm"):
             assert specs[key]["time_tolerance_minutes"] == 360
 
-    def test_sentinel1_clms_ssm_source_unaffected_no_layer_type_specs(self):
+    def test_sentinel1_clms_ssm_source_unaffected_no_ssm_sensor_overrides(self):
+        """No per-sensor 360-min override (that's NISAR-only, see the test
+        above) -- but layer_vs_layer itself is no longer None: it always
+        carries an "era5_soil_moisture" entry now (see
+        test_era5_soil_moisture_layer_type_spec_always_present below)."""
         from sar_validation.cli import _build_soil_moisture_config
 
         cfg = _build_soil_moisture_config(sar_source="sentinel1_clms_ssm")
-        assert cfg.collocation.layer_vs_layer is None
+        specs = cfg.collocation.layer_vs_layer.layer_type_specs
+        for key in ("scatterometer_ssm", "radiometer_ssm", "amsr_ssm", "smap_ssm", "smos_ssm", "cds_ssm"):
+            assert key not in specs
         pvl = cfg.collocation.point_vs_layer
         assert pvl.time_tolerance_minutes == 720
         assert pvl.aggregation_window_km == 1.0
+
+    def test_era5_soil_moisture_layer_type_spec_always_present(self):
+        """The model_vs_layer collocation type (era5_soil_moisture) must
+        be explicit in every newly-created soil_moisture recipe, including
+        time_tolerance_minutes -- previously this recipe's YAML gave no
+        indication of what tolerance era5 downloads actually used,
+        silently inheriting a code-level default the recipe never showed."""
+        from sar_validation.cli import _build_soil_moisture_config
+
+        for sar_source in ("sentinel1_clms_ssm", "nisar_sme2"):
+            cfg = _build_soil_moisture_config(sar_source=sar_source)
+            spec = cfg.collocation.layer_vs_layer.layer_type_specs["era5_soil_moisture"]
+            assert spec["time_tolerance_minutes"] == 720
 
 
 class TestSetCredentialCli:

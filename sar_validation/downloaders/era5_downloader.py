@@ -86,10 +86,15 @@ _GRID_PAD_DEG_BY_VARIABLE: dict[Era5Variable, float] = {
     "soil_moisture": 0.1,
 }
 
-#: Margin (hours) added on both sides of the recipe's own padded temporal
+#: Default margin (hours) added on both sides of the requested temporal
 #: window before it's clipped to a calendar day, giving the hyperbolic
 #: method room to find 3 consecutive bracketing hours even at the window's
-#: edges.
+#: edges (2x ERA5's 1-hourly cadence -- mirrors hycom_downloader.py's
+#: _BRACKET_BUFFER_HOURS derivation). Used only as
+#: :meth:`ERA5Downloader.__init__`'s ``time_tolerance_minutes`` default;
+#: a recipe-driven run passes the orchestrator's own resolved
+#: ``DEFAULT_LAYER_TYPE_SPECS["era5_<variable>"]["time_tolerance_minutes"]``
+#: instead.
 _HOUR_BUFFER = 2
 
 
@@ -97,7 +102,7 @@ def _hours_needed_for_day(
     day: date,
     window_start: datetime,
     window_end: datetime,
-    buffer_hours: int = _HOUR_BUFFER,
+    buffer_hours: float = _HOUR_BUFFER,
 ) -> list[int]:
     """
     Return the sorted list of hour-of-day integers (0-23) needed for *day*
@@ -137,9 +142,19 @@ class ERA5Downloader:
         Directory to save downloaded NetCDF files.
     dry_run : bool
         If True, log what would be downloaded without calling the CDS API.
+    time_tolerance_minutes : float
+        Hour-buffer margin (see :func:`_hours_needed_for_day`) used when
+        widening the requested window before it's clipped to a calendar
+        day. Defaults to :data:`_HOUR_BUFFER` converted to minutes; a
+        recipe-driven run passes the orchestrator's own resolved value
+        (``DEFAULT_LAYER_TYPE_SPECS["era5_<variable>"]["time_tolerance_minutes"]``,
+        or a recipe override) instead.
     """
 
-    def __init__(self, variable: Era5Variable, output_dir: Path, dry_run: bool = False) -> None:
+    def __init__(
+        self, variable: Era5Variable, output_dir: Path, dry_run: bool = False,
+        time_tolerance_minutes: float = _HOUR_BUFFER * 60,
+    ) -> None:
         if variable not in _CDS_DATASET_BY_VARIABLE:
             raise ValueError(
                 f"variable must be one of {sorted(_CDS_DATASET_BY_VARIABLE)}; got {variable!r}"
@@ -147,6 +162,7 @@ class ERA5Downloader:
         self.variable = variable
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
+        self.time_tolerance_minutes = time_tolerance_minutes
 
     # ------------------------------------------------------------------
     # Public interface
@@ -196,7 +212,9 @@ class ERA5Downloader:
         day = window_start.date()
         end_day = window_end.date()
         while day <= end_day:
-            hours = _hours_needed_for_day(day, window_start, window_end)
+            hours = _hours_needed_for_day(
+                day, window_start, window_end, buffer_hours=self.time_tolerance_minutes / 60.0,
+            )
             if not hours:
                 day += timedelta(days=1)
                 continue

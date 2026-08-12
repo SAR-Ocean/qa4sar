@@ -111,12 +111,19 @@ def _resolve_temporal_padding_minutes(cfg, *source_types: str) -> float:
     range's edges (see the collocation-diagnostics plot's day-1/day-3 vs.
     day-2 asymmetry this was written to fix).
     """
-    from .recipe import DEFAULT_LAYER_TYPE_SPECS
+    from .recipe import DEFAULT_LAYER_TYPE_SPECS, min_safe_model_time_tolerance_minutes
 
     coll_cfg = cfg.collocation
     layer_specs = dict(DEFAULT_LAYER_TYPE_SPECS)
     if coll_cfg.layer_vs_layer is not None:
-        layer_specs.update(coll_cfg.layer_vs_layer.layer_type_specs)
+        # Per-key deep merge (not layer_specs.update(...), which would
+        # replace a key's whole dict) -- a recipe overriding only e.g.
+        # "method" for "era5_wind" must not silently lose the default's
+        # "time_tolerance_minutes" in the process. Mirrors
+        # datatree_converter.py's _build_subset_kwargs, which already does
+        # this correctly.
+        for key, spec in coll_cfg.layer_vs_layer.layer_type_specs.items():
+            layer_specs[key] = {**layer_specs.get(key, {}), **spec}
     pvl = coll_cfg.point_vs_layer
     fallback = max(pvl.time_tolerance_minutes, pvl.validation_temporal_averaging_minutes)
 
@@ -128,11 +135,34 @@ def _resolve_temporal_padding_minutes(cfg, *source_types: str) -> float:
 
     tolerances = []
     for st in source_types:
+        # "era5" (the ValidationDataSource.source_type actually used in
+        # every recipe/template) has no DEFAULT_LAYER_TYPE_SPECS entry of
+        # its own -- only the variable-specific "era5_wind"/"era5_waves"/
+        # "era5_soil_moisture" keys do (matching the data_type each
+        # DataTreeConverter.from_era5 node is actually stamped with; see
+        # visualization.py's own tolerance lookup, which reads that
+        # per-node data_type and so doesn't need this alias). Without this,
+        # every era5 download silently fell back to the generic
+        # point_vs_layer tolerance (30 min) instead of its own
+        # (bracket-safe) value.
+        key = "era5_" + cfg.variable if st == "era5" else _TOLERANCE_LOOKUP_ALIASES.get(st, st)
         if st in source_overrides:
-            tolerances.append(float(source_overrides[st]))
-            continue
-        key = _TOLERANCE_LOOKUP_ALIASES.get(st, st)
-        tolerances.append(float(layer_specs[key]["time_tolerance_minutes"]) if key in layer_specs else fallback)
+            resolved = float(source_overrides[st])
+        elif key in layer_specs:
+            resolved = float(layer_specs[key]["time_tolerance_minutes"])
+        else:
+            resolved = fallback
+        min_safe = min_safe_model_time_tolerance_minutes(key)
+        if min_safe is not None and resolved < min_safe:
+            logger.warning(
+                "%s: time_tolerance_minutes=%s is below the %s-minute minimum "
+                "that guarantees ModelLayerCollocation always finds a "
+                "bracketing pair of granules for %r (cadence-derived, see "
+                "recipe.MODEL_CADENCE_HOURS) -- SAR scenes near the edges of "
+                "the requested window may end up with no matched model data.",
+                cfg.name, resolved, min_safe, key,
+            )
+        tolerances.append(resolved)
     return max(tolerances) if tolerances else fallback
 
 
@@ -904,7 +934,13 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        temp   = cfg.temporal_bounds
+        # ERA5Downloader now does its OWN bracket-margin widening (see its
+        # time_tolerance_minutes parameter), driven by this same resolved
+        # value -- so the literal recipe window is passed here, not a
+        # separately (and previously redundantly, since the downloader
+        # used to also apply its own fixed _HOUR_BUFFER on top) padded one.
+        tolerance = _resolve_temporal_padding_minutes(cfg, source.source_type)
         out_dir = self.base_dir / "era5"
 
         return self._run_download(
@@ -912,11 +948,12 @@ class DataOrchestrator:
             lambda: ERA5Downloader(
                 variable=cfg.variable,  # type: ignore[arg-type]
                 output_dir=out_dir, dry_run=self.dry_run,
+                time_tolerance_minutes=tolerance,
             ),
             lambda: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
+                start=temp.start, end=temp.end,
             ),
             f"ERA5 ({cfg.variable})",
         )
@@ -926,16 +963,22 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        temp   = cfg.temporal_bounds
+        # HycomDownloader now does its OWN bracket-margin widening (see its
+        # time_tolerance_minutes parameter), driven by this same resolved
+        # value -- see the identical rationale in _download_era5 above.
+        tolerance = _resolve_temporal_padding_minutes(cfg, source.source_type)
         out_dir = self.base_dir / "hycom"
 
         return self._run_download(
             "hycom", out_dir,
-            lambda: HycomDownloader(output_dir=out_dir, dry_run=self.dry_run),
+            lambda: HycomDownloader(
+                output_dir=out_dir, dry_run=self.dry_run, time_tolerance_minutes=tolerance,
+            ),
             lambda: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
+                start=temp.start, end=temp.end,
             ),
             "HyCOM",
         )

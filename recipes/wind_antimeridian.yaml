@@ -1,9 +1,11 @@
 name: wind_antimeridian
 description: 'Validate Sentinel-1 IW/EW mode wind speed and direction
 
-  against moorings, buoys, ASCAT scatterometer, 1 Hz altimeter,
+  against moorings, buoys, ASCAT scatterometer, HY-2B/HY-2C/
 
-  and RSS radiometer (AMSR2) ocean winds.'
+  Oceansat-3 scatterometer, 1 Hz altimeter, and RSS radiometer
+
+  (AMSR2) ocean winds.'
 version: '1.0'
 variable: wind
 variable_specs:
@@ -49,6 +51,18 @@ validation_sources:
 - source_type: radiometer
   download_kwargs: {}
   collocation_kwargs: {}
+- source_type: scatterometer_hy2b
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: scatterometer_hy2c
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: scatterometer_oceansat3
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: era5
+  download_kwargs: {}
+  collocation_kwargs: {}
 collocation:
   point_vs_layer:
     time_tolerance_minutes: 30
@@ -61,9 +75,27 @@ collocation:
   sar_footprint_radius_km: 14.0
   layer_vs_layer:
     layer_type_specs:
+      era5_wind:
+        time_tolerance_minutes: 120
+        aggregation_window_km: 12.5
+        distance_weighting: equal
+        method: cell-averaging
+        temporal_method: hyperbolic
       scatterometer:
         time_tolerance_minutes: 180
         aggregation_window_km: 12.5
+        distance_weighting: equal
+      scatterometer_hy2b:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      scatterometer_hy2c:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
+        distance_weighting: equal
+      scatterometer_oceansat3:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 25.0
         distance_weighting: equal
       altimeter_1hz:
         time_tolerance_minutes: 180

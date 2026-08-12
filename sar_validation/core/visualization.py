@@ -2609,7 +2609,10 @@ def _plot_collocation_diagnostics_impl(
     }
     layer_vs_layer_specs = dict(DEFAULT_LAYER_TYPE_SPECS)
     if coll_cfg.layer_vs_layer is not None:
-        layer_vs_layer_specs.update(coll_cfg.layer_vs_layer.layer_type_specs)
+        # Deep merge, not .update(...) -- see collocation.py's identical
+        # fix for why a per-key wholesale replace is wrong here too.
+        for key, spec in coll_cfg.layer_vs_layer.layer_type_specs.items():
+            layer_vs_layer_specs[key] = {**layer_vs_layer_specs.get(key, {}), **spec}
     # Collapse altimeter_1hz/altimeter_5hz down to one "altimeter" key (the
     # plot doesn't distinguish frequency), taking the max of the two so a
     # point isn't hidden just because it misses the stricter of the pair.

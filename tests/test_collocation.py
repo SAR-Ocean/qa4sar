@@ -2011,3 +2011,58 @@ class TestRunCollocationHycomModelSourceDispatch:
         # heading 90 -> projection == EWCT == 0.4 (hand-checkable, same as
         # the existing mooring test above)
         assert float(result["val_rvlRadVel_projection"].values[0]) == pytest.approx(0.4, abs=1e-5)
+
+    def test_partial_layer_type_spec_override_keeps_other_defaults(self, tmp_path, monkeypatch):
+        """Regression test: a recipe overriding only ONE field of a
+        layer_type_specs entry (e.g. time_tolerance_minutes, as
+        soil_moisture_nisar_norway.yaml's scatterometer_ssm/etc. entries
+        already do in practice) must not silently drop that entry's OTHER
+        DEFAULT_LAYER_TYPE_SPECS fields (aggregation_window_km here).
+        Before the fix, ``layer_vs_layer_specs.update(recipe_overrides)``
+        replaced "hycom"'s whole dict with the recipe's partial one,
+        losing DEFAULT_LAYER_TYPE_SPECS["hycom"]["aggregation_window_km"]
+        (4.6) in favour of ModelLayerCollocation's own generic constructor
+        default (12.5, tuned for ASCAT-like sources, not HyCOM's finer
+        native grid) -- hycom is a model source, dispatched to
+        ModelLayerCollocation, not LayerLayerCollocation."""
+        from sar_validation.core.collocation import run_collocation
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+        from sar_validation.core.recipe import (
+            CollocationType,
+            GeographicBounds,
+            LayerVsLayerCollocation,
+            PointVsLayerCollocation,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+
+        recipe = Recipe(RecipeConfig(
+            name="hycom_partial_override", variable="currents",
+            geographic_bounds=GeographicBounds(-20.0, -19.0, 50.0, 51.0),
+            temporal_bounds=TemporalBounds("2026-06-20T18:00:00", "2026-06-20T23:00:00"),
+            validation_sources=[ValidationDataSource(source_type="hycom")],
+            collocation=CollocationType(
+                point_vs_layer=PointVsLayerCollocation(),
+                layer_vs_layer=LayerVsLayerCollocation(
+                    # Only time_tolerance_minutes -- omits aggregation_window_km,
+                    # distance_weighting, method, temporal_method entirely.
+                    layer_type_specs={"hycom": {"time_tolerance_minutes": 999}},
+                ),
+            ),
+        ))
+
+        captured: dict = {}
+        original_init = ModelLayerCollocation.__init__
+
+        def spy_init(self, **kwargs):
+            captured.update(kwargs)
+            original_init(self, **kwargs)
+
+        monkeypatch.setattr(ModelLayerCollocation, "__init__", spy_init)
+        run_collocation(recipe, self._tree(), tmp_path)
+
+        assert captured["time_tolerance_minutes"] == 999  # recipe override still wins
+        assert captured["aggregation_window_km"] == pytest.approx(4.6, abs=0.01)
+        assert captured["distance_weighting"] == "equal"

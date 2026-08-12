@@ -37,6 +37,18 @@ validation_sources:
 - source_type: mooring
   download_kwargs: {}
   collocation_kwargs: {}
+- source_type: adcp_historical
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: argo_historical
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: drifter_historical
+  download_kwargs: {}
+  collocation_kwargs: {}
+- source_type: glider_historical
+  download_kwargs: {}
+  collocation_kwargs: {}
 - source_type: hycom
   download_kwargs: {}
   collocation_kwargs: {}
@@ -57,5 +69,11 @@ collocation:
         aggregation_window_km: 6.0
         distance_weighting: equal
         dedup_nearest_in_time: true
+      hycom:
+        time_tolerance_minutes: 360
+        aggregation_window_km: 4.6
+        distance_weighting: equal
+        method: cell-averaging
+        temporal_method: hyperbolic
     method: cell-averaging
 output_dir: null

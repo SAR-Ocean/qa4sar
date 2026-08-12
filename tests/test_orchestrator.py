@@ -378,6 +378,144 @@ class TestDownloadTemporalPadding:
         assert call_kwargs["end"] == "2026-02-03"
 
 
+class TestModelSourceTemporalPadding:
+    """era5/hycom (model_vs_layer, via ModelLayerCollocation) previously
+    silently ignored their own DEFAULT_LAYER_TYPE_SPECS-tuned tolerance at
+    download time -- "era5" (the ValidationDataSource.source_type every
+    recipe actually uses) has no DEFAULT_LAYER_TYPE_SPECS entry of its
+    own (only "era5_wind"/"era5_waves"/"era5_soil_moisture" do), so it
+    fell through to the generic 30-min point_vs_layer fallback."""
+
+    def test_era5_resolves_to_its_own_variable_specific_default(self):
+        from sar_validation.core.orchestrator import _resolve_temporal_padding_minutes
+
+        for variable, expected in (("wind", 120.0), ("waves", 120.0), ("soil_moisture", 720.0)):
+            cfg = RecipeConfig(
+                name="test", variable=variable,
+                geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+                temporal_bounds=TemporalBounds("2026-02-01", "2026-02-03"),
+                validation_sources=[ValidationDataSource(source_type="era5")],
+            )
+            assert _resolve_temporal_padding_minutes(cfg, "era5") == expected
+
+    def test_hycom_resolves_to_its_own_default(self):
+        from sar_validation.core.orchestrator import _resolve_temporal_padding_minutes
+
+        cfg = RecipeConfig(
+            name="test", variable="currents",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-02-01", "2026-02-03"),
+            validation_sources=[ValidationDataSource(source_type="hycom")],
+        )
+        assert _resolve_temporal_padding_minutes(cfg, "hycom") == 360.0
+
+    def test_partial_era5_wind_override_keeps_default_time_tolerance(self):
+        """A recipe overriding only e.g. "method" for "era5_wind" (as
+        every wind_era5-style recipe does) must not lose the default's
+        time_tolerance_minutes -- regression test for the
+        layer_specs.update(...) shallow-merge bug."""
+        from sar_validation.core.orchestrator import _resolve_temporal_padding_minutes
+        from sar_validation.core.recipe import CollocationType, LayerVsLayerCollocation
+
+        cfg = RecipeConfig(
+            name="test", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-02-01", "2026-02-03"),
+            validation_sources=[ValidationDataSource(source_type="era5")],
+            collocation=CollocationType(
+                layer_vs_layer=LayerVsLayerCollocation(
+                    layer_type_specs={"era5_wind": {"method": "cell-averaging"}},
+                ),
+            ),
+        )
+        assert _resolve_temporal_padding_minutes(cfg, "era5") == 120.0
+
+    def test_warns_when_hycom_override_is_below_the_bracket_safe_minimum(self, caplog):
+        import logging
+
+        from sar_validation.core.orchestrator import _resolve_temporal_padding_minutes
+        from sar_validation.core.recipe import CollocationType, LayerVsLayerCollocation
+
+        cfg = RecipeConfig(
+            name="test", variable="currents",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-02-01", "2026-02-03"),
+            validation_sources=[ValidationDataSource(source_type="hycom")],
+            collocation=CollocationType(
+                layer_vs_layer=LayerVsLayerCollocation(
+                    layer_type_specs={"hycom": {"time_tolerance_minutes": 90}},
+                ),
+            ),
+        )
+        with caplog.at_level(logging.WARNING):
+            resolved = _resolve_temporal_padding_minutes(cfg, "hycom")
+        assert resolved == 90.0  # the recipe's explicit choice is still honored
+        assert any("below the 360-minute minimum" in r.message for r in caplog.records)
+
+    def test_no_warning_when_default_is_used(self, caplog):
+        import logging
+
+        from sar_validation.core.orchestrator import _resolve_temporal_padding_minutes
+
+        cfg = RecipeConfig(
+            name="test", variable="currents",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-02-01", "2026-02-03"),
+            validation_sources=[ValidationDataSource(source_type="hycom")],
+        )
+        with caplog.at_level(logging.WARNING):
+            _resolve_temporal_padding_minutes(cfg, "hycom")
+        assert not caplog.records
+
+    def _model_recipe(self, source_type: str, variable: str = "currents") -> Recipe:
+        cfg = RecipeConfig(
+            name="test", variable=variable,
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-02-01", "2026-02-03"),
+            sar_data=SARDataSpec(source="sentinel1_l2_ocn"),
+            validation_sources=[ValidationDataSource(source_type=source_type)],
+        )
+        return Recipe(cfg)
+
+    def test_hycom_download_receives_resolved_time_tolerance_and_unpadded_bounds(self, tmp_path):
+        """HycomDownloader now does its OWN bracket-margin widening (see
+        its time_tolerance_minutes parameter) -- the orchestrator must
+        pass the resolved value through, and the literal (unpadded)
+        recipe window, not a separately (and now redundantly) padded one."""
+        recipe = self._model_recipe("hycom")
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+
+        with patch("sar_validation.downloaders.hycom_downloader.HycomDownloader") as mock_cls:
+            mock_instance = MagicMock()
+            mock_instance.download.return_value = []
+            mock_cls.return_value = mock_instance
+
+            orchestrator._dispatch_source(recipe.config.validation_sources[0])
+
+        assert mock_cls.call_args.kwargs["time_tolerance_minutes"] == 360.0
+        call_kwargs = mock_instance.download.call_args.kwargs
+        assert call_kwargs["start"] == "2026-02-01"
+        assert call_kwargs["end"] == "2026-02-03"
+
+    def test_era5_download_receives_resolved_time_tolerance_and_unpadded_bounds(self, tmp_path):
+        recipe = self._model_recipe("era5", variable="wind")
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+
+        with patch("sar_validation.downloaders.era5_downloader.ERA5Downloader") as mock_cls:
+            mock_instance = MagicMock()
+            mock_instance.download.return_value = []
+            mock_cls.return_value = mock_instance
+
+            orchestrator._dispatch_source(recipe.config.validation_sources[0])
+
+        assert mock_cls.call_args.kwargs["time_tolerance_minutes"] == 120.0
+        call_kwargs = mock_instance.download.call_args.kwargs
+        assert call_kwargs["start"] == "2026-02-01"
+        assert call_kwargs["end"] == "2026-02-03"
+
+
 class TestIsmnDownloadStatusReporting:
     """No ISMN archive collected must not be reported as 'success' -- that
     misled Lotte into thinking a run had worked when the ISMN step had

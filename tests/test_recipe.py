@@ -466,3 +466,37 @@ class TestHycomDefaultLayerTypeSpec:
         assert spec["method"] == "cell-averaging"
         assert spec["temporal_method"] == "hyperbolic"
         assert spec["aggregation_window_km"] == pytest.approx(4.6, abs=0.2)
+
+
+class TestModelTimeToleranceMinimums:
+    """time_tolerance_minutes for a model_vs_layer source (era5/hycom) is
+    what a downloader now uses to size its bracket-fetch margin (see
+    hycom_downloader.HycomDownloader/era5_downloader.ERA5Downloader's
+    time_tolerance_minutes parameter) -- it must be at least 2x the
+    source's own granule cadence, or a SAR scene near the edge of the
+    requested window can end up with no bracketing model data at all."""
+
+    def test_hycom_default_meets_its_own_minimum(self):
+        from sar_validation.core.recipe import (
+            DEFAULT_LAYER_TYPE_SPECS,
+            min_safe_model_time_tolerance_minutes,
+        )
+
+        assert min_safe_model_time_tolerance_minutes("hycom") == 360  # 2 * 3h cadence
+        assert DEFAULT_LAYER_TYPE_SPECS["hycom"]["time_tolerance_minutes"] >= 360
+
+    @pytest.mark.parametrize("key", ["era5_wind", "era5_waves", "era5_soil_moisture"])
+    def test_era5_defaults_meet_their_own_minimum(self, key):
+        from sar_validation.core.recipe import (
+            DEFAULT_LAYER_TYPE_SPECS,
+            min_safe_model_time_tolerance_minutes,
+        )
+
+        assert min_safe_model_time_tolerance_minutes(key) == 120  # 2 * 1h cadence
+        assert DEFAULT_LAYER_TYPE_SPECS[key]["time_tolerance_minutes"] >= 120
+
+    def test_non_model_key_returns_none(self):
+        from sar_validation.core.recipe import min_safe_model_time_tolerance_minutes
+
+        assert min_safe_model_time_tolerance_minutes("scatterometer") is None
+        assert min_safe_model_time_tolerance_minutes("hf_radar_grid") is None

@@ -74,15 +74,16 @@ _DROP_VARS = ["tau"]
 #: hours (00, 03, 06, ... UTC)
 _CADENCE_HOURS = 3
 
-#: Margin (hours), on top of whatever [seg_start, seg_end] window this
-#: downloader is handed, added on BOTH sides before building the actual
-#: OPeNDAP ``time=slice(...)`` request -- mirrors
+#: Default margin (hours), on top of whatever [seg_start, seg_end] window
+#: this downloader is handed, added on BOTH sides before building the
+#: actual OPeNDAP ``time=slice(...)`` request -- mirrors
 #: ``era5_downloader._HOUR_BUFFER``, sized to HyCOM's 3-hourly (not
-#: ERA5's 1-hourly) cadence, and applied by this downloader itself since
-#: the generic orchestrator/recipe-level padding
-#: (``DEFAULT_LAYER_TYPE_SPECS["hycom"]["time_tolerance_minutes"]``) is
-#: not read by ``ModelLayerCollocation`` and is not sized for
-#: bracket-finding at all.
+#: ERA5's 1-hourly) cadence. Used only as :meth:`HycomDownloader.__init__`'s
+#: ``time_tolerance_minutes`` default (for direct/library callers that
+#: don't pass one); a recipe-driven run passes the orchestrator's own
+#: resolved ``DEFAULT_LAYER_TYPE_SPECS["hycom"]["time_tolerance_minutes"]``
+#: (or a recipe override) instead, so the actual bracket margin is driven
+#: by that single value everywhere, not duplicated here.
 #:
 #: Derivation (traced against ``ModelLayerCollocation._model_values_at_
 #: points``'s ``floor_hour``/``searchsorted``/``idx2`` logic, not just
@@ -189,11 +190,22 @@ class HycomDownloader:
         If True, probe each resolved dataset's ``time`` coordinate only
         (cheap -- no full u/v grid load) and report real day-level
         coverage without downloading.
+    time_tolerance_minutes : float
+        Bracket margin used when widening a segment's request for the
+        actual OPeNDAP fetch (see :meth:`_buffered_bounds`). Defaults to
+        :data:`_BRACKET_BUFFER_HOURS` converted to minutes; a
+        recipe-driven run passes the orchestrator's own resolved value
+        (``DEFAULT_LAYER_TYPE_SPECS["hycom"]["time_tolerance_minutes"]``,
+        or a recipe override) instead.
     """
 
-    def __init__(self, output_dir: Path, dry_run: bool = False) -> None:
+    def __init__(
+        self, output_dir: Path, dry_run: bool = False,
+        time_tolerance_minutes: float = _BRACKET_BUFFER_HOURS * 60,
+    ) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
+        self.time_tolerance_minutes = time_tolerance_minutes
 
     # ------------------------------------------------------------------
     # Public interface
@@ -270,12 +282,11 @@ class HycomDownloader:
             f"hycom_{dataset_key}_{seg_start:%Y%m%dT%H%M%S}_{seg_end:%Y%m%dT%H%M%S}.nc"
         )
 
-    @staticmethod
     def _buffered_bounds(
-        dataset_key: str, seg_start: datetime, seg_end: datetime, clip_at_cutover: bool = False,
+        self, dataset_key: str, seg_start: datetime, seg_end: datetime, clip_at_cutover: bool = False,
     ) -> tuple[datetime, datetime]:
-        """Widen [*seg_start*, *seg_end*] by :data:`_BRACKET_BUFFER_HOURS`
-        on both sides for the actual OPeNDAP request.
+        """Widen [*seg_start*, *seg_end*] by ``self.time_tolerance_minutes``
+        (in hours) on both sides for the actual OPeNDAP request.
 
         Note: the *nc_path* filename (see :meth:`_nc_path_for_segment`)
         deliberately stays keyed on the UNBUFFERED *seg_start*/*seg_end*
@@ -304,10 +315,9 @@ class HycomDownloader:
         near the boundary, silently violating this toolbox's stated
         ESPC-D-V02-preferred-at/after-cutover rule.
         """
-        buffered_start = max(
-            seg_start - timedelta(hours=_BRACKET_BUFFER_HOURS), _HYCOM_MIN_DATE,
-        )
-        buffered_end = seg_end + timedelta(hours=_BRACKET_BUFFER_HOURS)
+        buffer = timedelta(minutes=self.time_tolerance_minutes)
+        buffered_start = max(seg_start - buffer, _HYCOM_MIN_DATE)
+        buffered_end = seg_end + buffer
         if clip_at_cutover:
             if dataset_key == "gofs31_930":
                 buffered_end = min(buffered_end, _HYCOM_CUTOVER_DATE - _CUTOVER_CLIP_EPSILON)

@@ -223,19 +223,31 @@ DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
     # 27.75 km for wind/waves, 0.1 deg / 11.1 km for land soil moisture),
     # matching the convention already used for scatterometer/altimeter
     # above, so cell-averaging's per-cell SAR aggregation windows don't
-    # overlap neighbouring ERA5 cells. time_tolerance_minutes is a nominal
-    # value only used as a merged_kwargs fallback -- the actual match is
+    # overlap neighbouring ERA5 cells. The actual per-point match is
     # always at the SAR scene's own exact time (temporal_distance_minutes
-    # is always 0 for era5 results), so this key is not read by
-    # ModelLayerCollocation.
+    # is always 0 for era5 results; ModelLayerCollocation itself never
+    # reads time_tolerance_minutes) -- but ERA5Downloader/HycomDownloader
+    # DO read it (via orchestrator._resolve_temporal_padding_minutes) to
+    # size how far past the requested window they fetch granules, so a
+    # bracketing timestamp is always available for interpolation even for
+    # a SAR scene right at the window's edge. It must therefore be at
+    # least ``2 * cadence_hours * 60`` minutes -- see
+    # ``MODEL_CADENCE_HOURS``/``min_safe_model_time_tolerance_minutes``
+    # below and each downloader's own worked derivation (e.g.
+    # hycom_downloader.py's ``_BRACKET_BUFFER_HOURS`` docstring) for why
+    # half that isn't enough. A recipe declaring less is allowed but logs
+    # a warning (orchestrator._resolve_temporal_padding_minutes).
     "era5_wind": {
-        "time_tolerance_minutes": 60, "aggregation_window_km": 12.5,
+        "time_tolerance_minutes": 120, "aggregation_window_km": 12.5,
         "distance_weighting": "equal", "method": "cell-averaging", "temporal_method": "hyperbolic",
     },
     "era5_waves": {
-        "time_tolerance_minutes": 60, "aggregation_window_km": 12.5,
+        "time_tolerance_minutes": 120, "aggregation_window_km": 12.5,
         "distance_weighting": "equal", "method": "cell-averaging", "temporal_method": "hyperbolic",
     },
+    # 720 min (12h) is a deliberate choice (soil moisture changes slowly
+    # relative to a roughly-daily overpass, see design-choices.md §8.7),
+    # already well above the 120 min bracket-safety minimum below.
     "era5_soil_moisture": {
         "time_tolerance_minutes": 720, "aggregation_window_km": 5.0,
         "distance_weighting": "equal", "method": "cell-averaging", "temporal_method": "hyperbolic",
@@ -245,12 +257,42 @@ DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
     # is ~half the native 1/12 deg grid spacing (~9.3 km at the equator),
     # same "half native cell spacing" convention as ERA5's own entries, so
     # cell-averaging's per-cell SAR aggregation windows don't overlap
-    # neighbouring HyCOM cells.
+    # neighbouring HyCOM cells. time_tolerance_minutes is 360 (6h) -- see
+    # MODEL_CADENCE_HOURS below (HyCOM's 3-hourly cadence needs 2x, not
+    # 1x, to guarantee bracket coverage at the requested window's edges).
     "hycom": {
-        "time_tolerance_minutes": 60, "aggregation_window_km": 4.6,
+        "time_tolerance_minutes": 360, "aggregation_window_km": 4.6,
         "distance_weighting": "equal", "method": "cell-averaging", "temporal_method": "hyperbolic",
     },
 }
+
+#: Model-layer granule cadence (hours) for each ``DEFAULT_LAYER_TYPE_SPECS``
+#: key that uses ``ModelLayerCollocation`` (bracket-based temporal
+#: interpolation, not a KD-tree tolerance search). Used to derive the
+#: minimum ``time_tolerance_minutes`` that guarantees a downloader fetches
+#: enough of a margin to always find a bracketing pair of granules, even
+#: for a SAR scene right at the edge of the requested window.
+MODEL_CADENCE_HOURS: Dict[str, int] = {
+    "hycom": 3,
+    "era5_wind": 1,
+    "era5_waves": 1,
+    "era5_soil_moisture": 1,
+}
+
+
+def min_safe_model_time_tolerance_minutes(key: str) -> Optional[float]:
+    """Minimum ``time_tolerance_minutes`` for *key* that still guarantees
+    ``ModelLayerCollocation`` always finds a bracketing pair of granules,
+    or ``None`` if *key* isn't a model-layer type at all.
+
+    ``2 * cadence`` (not ``1 * cadence``/half): for an observation time T
+    right at the requested window's edge, the earliest granule the
+    bracket search can need is up to just-under ``2 * cadence`` before T
+    (see e.g. hycom_downloader.py's ``_BRACKET_BUFFER_HOURS`` docstring
+    for the worked proof, which this mirrors).
+    """
+    cadence = MODEL_CADENCE_HOURS.get(key)
+    return None if cadence is None else 2 * cadence * 60
 
 
 @dataclass

@@ -596,6 +596,31 @@ class TestBracketBuffer:
         assert time_slice.start <= seg_start - timedelta(hours=_BRACKET_BUFFER_HOURS)
         assert time_slice.stop >= seg_end + timedelta(hours=_BRACKET_BUFFER_HOURS)
 
+    def test_time_tolerance_minutes_constructor_arg_drives_the_buffer(self, tmp_path, monkeypatch):
+        """The bracket margin is now driven by time_tolerance_minutes
+        (recipe-resolved by the orchestrator, see
+        orchestrator._resolve_temporal_padding_minutes), not the fixed
+        _BRACKET_BUFFER_HOURS constant -- a caller passing an explicit
+        value must see the actual OPeNDAP request widen/narrow to match,
+        not just the same fixed default every time."""
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import HycomDownloader
+
+        sel_calls: list = []
+        fake_open_dataset, fake_merge = self._make_fake_dataset_classes(sel_calls)
+        monkeypatch.setattr(xr, "open_dataset", fake_open_dataset)
+        monkeypatch.setattr(xr, "merge", fake_merge)
+
+        dl = HycomDownloader(output_dir=tmp_path, time_tolerance_minutes=600)  # 10h, not the 6h default
+        seg_start = datetime(2026, 7, 14, 10, 30, 0)
+        seg_end = datetime(2026, 7, 14, 10, 50, 0)
+        dl._download_segment("espc_d_v02", seg_start, seg_end, -77.0, -68.0, 35.0, 44.0)
+
+        time_slice = [kw for kw in sel_calls if "time" in kw][0]["time"]
+        assert time_slice.start == seg_start - timedelta(hours=10)
+        assert time_slice.stop == seg_end + timedelta(hours=10)
+
     def test_buffered_start_clamped_at_hycom_min_date(self, tmp_path, monkeypatch):
         """A segment already clamped to _HYCOM_MIN_DATE by
         _resolve_hycom_segments must not have its actual OPeNDAP request

@@ -240,6 +240,32 @@ class TestERA5DownloaderDayLoop:
         assert paths == [existing]
 
 
+class TestERA5DownloaderTimeToleranceMinutes:
+    """The hour-buffer margin is now driven by time_tolerance_minutes
+    (recipe-resolved by the orchestrator, see
+    orchestrator._resolve_temporal_padding_minutes), not the fixed
+    _HOUR_BUFFER constant -- mirrors HycomDownloader's identical fix."""
+
+    def test_time_tolerance_minutes_constructor_arg_drives_the_hour_buffer(self, tmp_path, monkeypatch):
+        from sar_validation.downloaders.era5_downloader import ERA5Downloader
+
+        captured_hours: list = []
+        monkeypatch.setattr(
+            ERA5Downloader, "_download_day",
+            lambda self, day, hours, *a: captured_hours.append(hours) or None,
+        )
+
+        # 5h buffer (not the 2h default) on a window starting at 18:00 ->
+        # hour 13 must now be included (18 - 5 = 13), which the 2h default
+        # would exclude.
+        dl = ERA5Downloader(variable="wind", output_dir=tmp_path, time_tolerance_minutes=300)
+        dl.download(
+            min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+            start="2026-07-12T18:00:00", end="2026-07-12T18:30:00",
+        )
+        assert captured_hours == [list(range(13, 24))]
+
+
 class TestERA5DownloaderAntimeridian:
     def test_non_crossing_bbox_downloads_single_unsuffixed_file(self, tmp_path, monkeypatch):
         from sar_validation.downloaders.era5_downloader import ERA5Downloader

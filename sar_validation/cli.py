@@ -437,6 +437,19 @@ def _build_currents_config(
                         "distance_weighting": "equal",
                         "dedup_nearest_in_time": True,
                     },
+                    # HyCOM ocean model -- tuning mirrors
+                    # DEFAULT_LAYER_TYPE_SPECS's "hycom" entry (recipe.py).
+                    # time_tolerance_minutes=360 (6h = 2x HyCOM's 3-hourly
+                    # cadence) is the minimum that guarantees
+                    # ModelLayerCollocation always finds a bracketing pair
+                    # of granules -- see recipe.MODEL_CADENCE_HOURS.
+                    "hycom": {
+                        "time_tolerance_minutes": 360,
+                        "aggregation_window_km": 4.6,
+                        "distance_weighting": "equal",
+                        "method": "cell-averaging",
+                        "temporal_method": "hyperbolic",
+                    },
                 }
             ),
         ),
@@ -509,15 +522,26 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
             ValidationDataSource(source_type="scatterometer_hy2b"),
             ValidationDataSource(source_type="scatterometer_hy2c"),
             ValidationDataSource(source_type="scatterometer_oceansat3"),
-            # ERA5 reanalysis (Copernicus CDS) -- tuning comes from
-            # DEFAULT_LAYER_TYPE_SPECS's "era5_wind" entry (recipe.py), no
-            # per-recipe layer_vs_layer override needed.
+            # ERA5 reanalysis (Copernicus CDS).
             ValidationDataSource(source_type="era5"),
         ],
         collocation=CollocationType(
             point_vs_layer=PointVsLayerCollocation(),
             layer_vs_layer=LayerVsLayerCollocation(
                 layer_type_specs={
+                    # tuning mirrors DEFAULT_LAYER_TYPE_SPECS's "era5_wind"
+                    # entry (recipe.py). time_tolerance_minutes=120 (2h =
+                    # 2x ERA5's 1-hourly cadence) is the minimum that
+                    # guarantees ModelLayerCollocation always finds a
+                    # bracketing pair of granules -- see
+                    # recipe.MODEL_CADENCE_HOURS.
+                    "era5_wind": {
+                        "time_tolerance_minutes": 120,
+                        "aggregation_window_km": 12.5,
+                        "distance_weighting": "equal",
+                        "method": "cell-averaging",
+                        "temporal_method": "hyperbolic",
+                    },
                     "scatterometer": {
                         "time_tolerance_minutes": 180,
                         "aggregation_window_km": 12.5,
@@ -622,15 +646,23 @@ def _build_waves_config(limit: Optional[int] = None, sar_source: str = "sentinel
             ValidationDataSource(source_type="tidal_gauge"),
             ValidationDataSource(source_type="drifter"),
             ValidationDataSource(source_type="altimeter"),
-            # ERA5 reanalysis (Copernicus CDS) -- tuning comes from
-            # DEFAULT_LAYER_TYPE_SPECS's "era5_waves" entry (recipe.py), no
-            # per-recipe layer_vs_layer override needed.
+            # ERA5 reanalysis (Copernicus CDS).
             ValidationDataSource(source_type="era5"),
         ],
         collocation=CollocationType(
             point_vs_layer=PointVsLayerCollocation(),
             layer_vs_layer=LayerVsLayerCollocation(
                 layer_type_specs={
+                    # tuning mirrors DEFAULT_LAYER_TYPE_SPECS's "era5_waves"
+                    # entry (recipe.py) -- see the identical rationale in
+                    # _build_wind_config's "era5_wind" entry above.
+                    "era5_waves": {
+                        "time_tolerance_minutes": 120,
+                        "aggregation_window_km": 12.5,
+                        "distance_weighting": "equal",
+                        "method": "cell-averaging",
+                        "temporal_method": "hyperbolic",
+                    },
                     "altimeter_1hz": {
                         "time_tolerance_minutes": 180,
                         "aggregation_window_km": 7.0,
@@ -684,22 +716,36 @@ def _build_soil_moisture_config(limit: Optional[int] = None, sar_source: str = "
     agg_km = spec.default_aggregation_window_km
     spatial_km = spec.default_spatial_tolerance_km
 
-    layer_vs_layer = None
+    # era5_soil_moisture is always present (unlike the ssm-sensor overrides
+    # below, which only apply for a non-default sar_source): tuning mirrors
+    # DEFAULT_LAYER_TYPE_SPECS's own entry (recipe.py). 720 min (12h)
+    # already exceeds the 120 min bracket-safety minimum (2x ERA5's
+    # 1-hourly cadence -- see recipe.MODEL_CADENCE_HOURS), so no
+    # cadence-driven bump is needed here the way hycom/era5_wind/
+    # era5_waves needed one.
+    layer_type_specs = {
+        "era5_soil_moisture": {
+            "time_tolerance_minutes": 720,
+            "aggregation_window_km": 5.0,
+            "distance_weighting": "equal",
+            "method": "cell-averaging",
+            "temporal_method": "hyperbolic",
+        },
+    }
     if sar_source != "sentinel1_clms_ssm":
         # Sentinel-1 CLMS SSM's ±12h default already matches
         # DEFAULT_LAYER_TYPE_SPECS's own fallback (recipe.py) -- no
         # per-recipe override needed. Any other source (e.g. NISAR's ±6h)
         # must set an explicit layer_type_specs override, since the global
         # fallback stays 720 for every recipe that doesn't override it.
-        layer_vs_layer = LayerVsLayerCollocation(
-            layer_type_specs={
-                key: {"time_tolerance_minutes": time_tol}
-                for key in (
-                    "scatterometer_ssm", "radiometer_ssm",
-                    "amsr_ssm", "smap_ssm", "smos_ssm", "cds_ssm",
-                )
-            }
-        )
+        layer_type_specs.update({
+            key: {"time_tolerance_minutes": time_tol}
+            for key in (
+                "scatterometer_ssm", "radiometer_ssm",
+                "amsr_ssm", "smap_ssm", "smos_ssm", "cds_ssm",
+            )
+        })
+    layer_vs_layer = LayerVsLayerCollocation(layer_type_specs=layer_type_specs)
 
     # C3S CDS product type: active (%) pairs with Sentinel-1 CLMS (%);
     # passive (m3 m-3) pairs with NISAR SME2.
