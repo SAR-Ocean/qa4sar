@@ -235,10 +235,13 @@ class TestDownloadIsmnDispatch:
 
 class TestDownloadAscatSsmDispatch:
     def test_ascat_ssm_source_type_dispatches_to_ascat_ssm_downloader(self, tmp_path):
+        # Dates comfortably inside the EUMDAC coverage window (<=
+        # _ASCAT_COVERAGE_CUTOFF = 2025-07-15) so the waterfall routes to
+        # ASCATSoilMoistureDownloader, not HSAFDownloader.
         cfg = RecipeConfig(
             name="test", variable="soil_moisture",
             geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
-            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            temporal_bounds=TemporalBounds("2025-06-01", "2025-06-02"),
             validation_sources=[ValidationDataSource(source_type="ascat_ssm")],
         )
         recipe = Recipe(cfg)
@@ -336,8 +339,26 @@ class TestDownloadTemporalPadding:
 
     def test_ascat_ssm_download_receives_padded_bounds(self, tmp_path):
         """The actual downloader call must see the padded start/end, not
-        the recipe's literal requested range."""
-        cfg = self._recipe().config
+        the recipe's literal requested range.
+
+        Uses its own config (not the shared self._recipe() helper, whose
+        2026 dates now fall in the EUMDAC/H-SAF coverage gap) with dates
+        comfortably inside the EUMDAC coverage window so the waterfall
+        routes to ASCATSoilMoistureDownloader, matching what this test
+        mocks."""
+        from sar_validation.core.recipe import CollocationType
+
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2025-06-01", "2025-06-03"),
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
+            validation_sources=[
+                ValidationDataSource(source_type="ascat_ssm"),
+                ValidationDataSource(source_type="ismn"),
+            ],
+            collocation=CollocationType(),
+        )
         recipe = Recipe(cfg)
         orchestrator = DataOrchestrator(recipe, dry_run=True)
         orchestrator.base_dir = tmp_path
@@ -352,8 +373,8 @@ class TestDownloadTemporalPadding:
             orchestrator._dispatch_source(cfg.validation_sources[0])
 
         call_kwargs = mock_instance.download.call_args.kwargs
-        assert call_kwargs["start"] == "2026-01-31T12:00:00"
-        assert call_kwargs["end"] == "2026-02-03T12:00:00"
+        assert call_kwargs["start"] == "2025-05-31T12:00:00"
+        assert call_kwargs["end"] == "2025-06-03T12:00:00"
 
     def test_sar_download_is_not_padded(self, tmp_path):
         """SAR scenes define the reference times other sources are padded
@@ -1501,3 +1522,91 @@ class TestDownloadHycom:
         call_kwargs = fake_dl.download.call_args.kwargs
         assert call_kwargs["min_lon"] == -10.0
         assert call_kwargs["max_lon"] == 10.0
+
+
+class TestDownloadAscatSsmWaterfall:
+    """_download_ascat_ssm now splits [start, end] across two downloaders:
+    ASCATSoilMoistureDownloader (EUMDAC/SOMO12) for dates <=
+    _ASCAT_COVERAGE_CUTOFF, HSAFDownloader (H-SAF H29 NRT) for the rolling
+    last-60-days on-line archive. A gap between the two is a warning, not
+    a silent drop -- see design-choices.md and this feature's spec doc."""
+
+    def _make_orchestrator(self, tmp_path, start, end, monkeypatch):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            SARDataSpec,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+
+        config = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(min_lon=-10, max_lon=10, min_lat=40, max_lat=55),
+            temporal_bounds=TemporalBounds(start=start, end=end),
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
+            validation_sources=[ValidationDataSource(source_type="ascat_ssm")],
+            output_dir=str(tmp_path),
+        )
+        recipe = Recipe(config=config)
+        # DataOrchestrator's constructor takes no base_dir kwarg -- it
+        # derives self.base_dir from recipe.config.output_dir (set above)
+        # via _setup_base_dir().
+        return DataOrchestrator(recipe, dry_run=True)
+
+    def test_range_entirely_before_cutoff_only_calls_eumdac(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader.download",
+            lambda self, **kw: calls.append(("eumdac", kw)) or [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.hsaf_downloader.HSAFDownloader.download",
+            lambda self, **kw: calls.append(("hsaf", kw)) or [],
+        )
+        orch = self._make_orchestrator(tmp_path, "2024-01-01", "2024-01-02", monkeypatch)
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_ascat_ssm(source)
+
+        assert [c[0] for c in calls] == ["eumdac"]
+
+    def test_range_after_cutoff_only_calls_hsaf(self, tmp_path, monkeypatch):
+        import datetime as dt
+
+        today = dt.date.today()
+        start = (today - dt.timedelta(days=30)).isoformat()
+        end = today.isoformat()
+        calls = []
+        monkeypatch.setattr(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader.download",
+            lambda self, **kw: calls.append(("eumdac", kw)) or [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.hsaf_downloader.HSAFDownloader.download",
+            lambda self, **kw: calls.append(("hsaf", kw)) or [],
+        )
+        orch = self._make_orchestrator(tmp_path, start, end, monkeypatch)
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_ascat_ssm(source)
+
+        assert [c[0] for c in calls] == ["hsaf"]
+
+    def test_gap_between_cutoff_and_hsaf_window_produces_notice(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader.download",
+            lambda self, **kw: [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.hsaf_downloader.HSAFDownloader.download",
+            lambda self, **kw: [],
+        )
+        orch = self._make_orchestrator(tmp_path, "2025-09-01", "2025-09-02", monkeypatch)
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_ascat_ssm(source)
+
+        assert any("gap" in n.lower() or "coverage" in n.lower() for n in orch.metadata["notices"])

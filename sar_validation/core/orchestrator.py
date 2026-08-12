@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -726,28 +726,92 @@ class DataOrchestrator:
 
     def _download_ascat_ssm(self, source) -> bool:
         from ..downloaders.ascat_soil_moisture_downloader import ASCATSoilMoistureDownloader
+        from ..downloaders.hsaf_downloader import HSAFDownloader
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
         pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
-        out_dir = self.base_dir / "ascat_ssm"
+        eumdac_dir = self.base_dir / "ascat_ssm"
+        hsaf_dir   = self.base_dir / "hsaf_ssm"
 
-        ok = self._run_download(
-            "ascat_ssm", out_dir,
-            lambda: ASCATSoilMoistureDownloader(
-                output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
-            ),
-            lambda: dict(
-                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
-                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
-            ),
-            "ASCAT SSM",
-        )
+        # H-SAF's on-line H29 archive only ever holds a rolling last-60-
+        # days window (confirmed by the user directly; the FTP
+        # directory's own name, /h29/h29_cur_mon_nc/, is misleading).
+        # Anything before that, down to the EUMDAC cutoff, is a genuine
+        # gap -- neither source can serve it (H-SAF's off-line/CDR
+        # archive is out of scope, see design doc) -- and is surfaced as
+        # a notice, not silently dropped.
+        today = datetime.now(timezone.utc).date()
+        hsaf_window_start = (today - timedelta(days=60)).isoformat()
+
+        req_start = pad_start[:10]
+        req_end   = pad_end[:10]
+
+        files: list = []
+        eumdac_ok = True
+        hsaf_ok = True
+
+        if req_start <= _ASCAT_COVERAGE_CUTOFF:
+            try:
+                eumdac_dl = ASCATSoilMoistureDownloader(
+                    output_dir=eumdac_dir, dry_run=self.dry_run,
+                    force_download=self.force_download,
+                )
+                files.extend(eumdac_dl.download(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=pad_start, end=pad_end,
+                ) or [])
+            except Exception as exc:
+                eumdac_ok = False
+                logger.error("ASCAT SSM (EUMDAC) download failed: %s", exc)
+
+        if req_end >= hsaf_window_start:
+            try:
+                hsaf_dl = HSAFDownloader(
+                    output_dir=hsaf_dir, dry_run=self.dry_run,
+                    force_download=self.force_download,
+                )
+                files.extend(hsaf_dl.download(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=pad_start, end=pad_end,
+                ) or [])
+            except Exception as exc:
+                hsaf_ok = False
+                logger.error("ASCAT SSM (H-SAF) download failed: %s", exc)
+
+        self._cleanup_if_empty(eumdac_dir)
+        self._cleanup_if_empty(hsaf_dir)
+
+        ok = eumdac_ok and hsaf_ok
+        self.metadata["downloads"]["ascat_ssm"] = {
+            "status": "dry_run" if self.dry_run else ("success" if ok else "failed"),
+            "files": [str(p) for p in files],
+        }
+        if not ok:
+            self.metadata["errors"].append("ASCAT SSM download failed (see log)")
+
         if (
-            ok and not self.dry_run
-            and not self.metadata["downloads"].get("ascat_ssm", {}).get("files")
-            and cfg.temporal_bounds.end > _ASCAT_COVERAGE_CUTOFF
+            ok and not files
+            and req_start > _ASCAT_COVERAGE_CUTOFF and req_end < hsaf_window_start
+        ):
+            # Unlike the generic "0 products found" notice below, this one
+            # is a structural fact about the requested range -- neither
+            # downloader branch above is even entered for a genuine gap
+            # range -- so it fires regardless of dry_run, not just on real
+            # runs that actually searched and came up empty.
+            self.metadata["notices"].append(
+                f"ASCAT: requested range [{req_start}, {req_end}] falls entirely in "
+                f"the gap between the EUMDAC coverage cutoff ({_ASCAT_COVERAGE_CUTOFF}) "
+                f"and H-SAF's rolling last-60-days on-line archive ({hsaf_window_start}) — "
+                f"0 products found (expected, not an error). H-SAF's off-line/CDR "
+                f"archive covers this gap but requires a manually-placed order, not "
+                f"automated by this toolbox."
+            )
+        elif (
+            ok and not self.dry_run and not files
+            and req_end > _ASCAT_COVERAGE_CUTOFF
         ):
             self.metadata["notices"].append(
                 f"ASCAT: requested range ends {cfg.temporal_bounds.end}, after this "
