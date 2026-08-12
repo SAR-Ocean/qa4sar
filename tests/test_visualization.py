@@ -4123,6 +4123,55 @@ class TestPlotCollocationDiagnosticsSoilMoistureOverpassCoverage:
         assert "SAR scene bounds" in recorded_labels
 
 
+class TestPlotCollocationDiagnosticsCoverageUsesBboxReference:
+    """_plot_collocation_diagnostics_impl must pass recipe.config.geographic_bounds
+    through to _downsampled_valid_pixel_coords -- otherwise Task D1's bbox-aware
+    density fix never actually applies to the real diagnostics plot."""
+
+    def test_coverage_points_call_receives_recipe_bbox(self, tmp_path, monkeypatch):
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import Recipe
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        y, x = 50, 50
+        lon2d, lat2d = np.meshgrid(np.linspace(-20.0, 20.0, x), np.linspace(30.0, 70.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.linspace(10.0, 60.0, y * x).reshape(y, x))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T12:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+
+        from sar_validation.core.recipe import GeographicBounds, RecipeConfig, TemporalBounds
+
+        recipe = Recipe(config=RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(min_lon=-5.0, max_lon=5.0, min_lat=45.0, max_lat=52.0),
+            temporal_bounds=TemporalBounds(start="2026-07-10", end="2026-07-11"),
+        ))
+
+        captured_bounds = []
+        from sar_validation.core import visualization as viz_mod
+        original = viz_mod._downsampled_valid_pixel_coords
+
+        def spy(*args, **kwargs):
+            captured_bounds.append(kwargs.get("geographic_bounds"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(viz_mod, "_downsampled_valid_pixel_coords", spy)
+
+        plot_collocation_diagnostics(datatree, None, recipe, tmp_path)
+
+        assert len(captured_bounds) >= 1
+        assert captured_bounds[0] is not None
+        assert captured_bounds[0].min_lon == -5.0
+        assert captured_bounds[0].max_lon == 5.0
+
+
 class TestPlotCollocationDiagnosticsRefinement:
     """Test 4-tier rendering with gray unmatched points."""
 

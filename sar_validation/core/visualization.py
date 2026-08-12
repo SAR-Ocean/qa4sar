@@ -2595,7 +2595,10 @@ def _plot_collocation_diagnostics_impl(
                 data_valid = np.isfinite(scene_ds[data_vars[0]].values)
                 if data_valid.shape == lons.shape:
                     coverage_points.extend(
-                        _downsampled_valid_pixel_coords(data_valid, lons, lats)
+                        _downsampled_valid_pixel_coords(
+                            data_valid, lons, lats,
+                            geographic_bounds=recipe.config.geographic_bounds,
+                        )
                     )
                 else:
                     scene_bounds.append({
