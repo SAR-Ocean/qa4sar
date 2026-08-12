@@ -713,9 +713,41 @@ unnecessary complexity.
 
 **Model-version routing**: `source_type: "hycom"` auto-selects between
 two datasets by date -- ESPC-D-V02 (2024-08-10 -> present) and GOFS 3.1
-Analysis, `GLBy0.08/expt_93.0` (2018-12-04 -> 2024-09-04) -- covering
-2018-12-04 to present with no gap. A recipe window straddling the
-2024-08-10 cutover downloads and concatenates both.
+Analysis, `GLBy0.08/expt_93.0` (2018-12-04 -> 2024-09-04). A recipe
+window straddling the 2024-08-10 cutover downloads both, clipping each
+segment's (buffered) request AT the cutover instant -- GOFS 3.1's
+request never reaches or crosses it, ESPC-D-V02's never goes before it
+-- so the two segments' real OPeNDAP requests are disjoint by
+construction, regardless of what either live dataset actually contains.
+
+This clip is necessary because the two datasets genuinely overlap in
+real-world coverage (GOFS 3.1 `expt_93.0` continues to 2024-09-04, well
+past the 2024-08-10 cutover this toolbox uses to prefer ESPC-D-V02), and
+the download-window bracket buffer (`_BRACKET_BUFFER_HOURS = 6`, added
+so the hyperbolic interpolator always has room to find a bracket) would
+otherwise pull a straddling window's two segments across each other's
+boundary -- both requesting real, but *different* (independently-run),
+data for the same instants. Left unclipped, `xr.concat` neither sorts
+nor deduplicates its inputs, so the combined time axis could end up
+non-monotonic or carrying duplicate timestamps, and the collocation
+bracket-search (`np.searchsorted`, which assumes a clean sorted axis)
+has no defined behaviour for that -- which model's value actually gets
+used near the boundary would be arbitrary, not deterministic.
+
+**Known, accepted residual gap**: ESPC-D-V02's real first granule is
+`2024-08-10T12:00`, not midnight as the nominal cutover constant
+assumes (live-verified against `tds.hycom.org`) -- so the clip denies
+GOFS 3.1 access to data it actually still has that morning, while
+ESPC-D-V02 has nothing there yet either. The result is one fixed,
+non-recurring, 12-hour gap (`2024-08-10T00:00`-`12:00`) with no HyCOM
+bracket from either dataset. This is judged an acceptable, narrow,
+one-time trade (tied to a single historical date, never recurring) over
+a coverage-driven clip that would query the live dataset before
+deciding the boundary -- not worth the added network round-trip and
+inter-segment coupling for a gap this narrow. It is not silent: any
+scene landing in it surfaces through the same pre-existing
+missing-bracket NaN path (debug-logged) that any other unbracketed
+scene already uses, not a new failure mode.
 
 **Why HyCOM coverage starts 2018-12-04, not 2014-07-01**: HYCOM's own
 summary docs describe "GOFS 3.1 Analysis" as spanning 2014-07-01 to
