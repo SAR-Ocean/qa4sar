@@ -1052,6 +1052,30 @@ def _apply_hf_radar_resolution_override(
     merged_kwargs["aggregation_window_km"] = hfr_resolution_km
 
 
+def _apply_ascat_resolution_override(
+    layer_type: str, val_ds: "xr.Dataset", merged_kwargs: dict, recipe_layer_type_specs: dict,
+) -> None:
+    """Override merged_kwargs["aggregation_window_km"] with the node's own
+    ascat_resolution_km (stamped by from_ascat_ssm/from_hsaf_ssm from the
+    file's own filename -- H-SAF's H29 is 12.5km, H122 is 6.25km, and
+    EUMDAC/SOMO12 filenames never encode a resolution so they fall back to
+    12.5) -- unless the recipe explicitly set aggregation_window_km for
+    this layer_type itself, which always wins. A no-op for any layer_type
+    other than "scatterometer_ssm", or when the node has no
+    ascat_resolution_km attr. Structurally identical to
+    _apply_hf_radar_resolution_override -- see design-choices.md §1a of
+    this feature's spec for why a second, separate function rather than
+    generalizing the existing one."""
+    if layer_type != "scatterometer_ssm":
+        return
+    ascat_resolution_km = val_ds.attrs.get("ascat_resolution_km")
+    if ascat_resolution_km is None:
+        return
+    if "aggregation_window_km" in recipe_layer_type_specs.get(layer_type, {}):
+        return
+    merged_kwargs["aggregation_window_km"] = ascat_resolution_km
+
+
 #: layer_vs_layer types that receive pre-collocation ±time_tolerance
 #: temporal averaging (soil-moisture satellite sources) instead of the
 #: default "keep every reading" behaviour -- see run_collocation and
@@ -1713,6 +1737,13 @@ def run_collocation(
                         lon_vals = df["lon"].to_numpy(dtype=float)
                         lat_vals = df["lat"].to_numpy(dtype=float)
                         agg_km = spec.get("aggregation_window_km", 25.0)
+                        if (
+                            layer_type == "scatterometer_ssm"
+                            and "aggregation_window_km" not in recipe_layer_type_specs.get(layer_type, {})
+                        ):
+                            ascat_resolution_km = val_ds.attrs.get("ascat_resolution_km")
+                            if ascat_resolution_km is not None:
+                                agg_km = ascat_resolution_km
                         lat_step = agg_km / 111.0
                         mean_lat = float(np.nanmean(lat_vals)) if lat_vals.size else 0.0
                         lon_step = agg_km / (111.0 * max(np.cos(np.radians(mean_lat)), 1e-6))
@@ -1901,6 +1932,9 @@ def run_collocation(
                                 layer_type, layer_vs_layer_specs[layer_type],
                             )
                         _apply_hf_radar_resolution_override(
+                            layer_type, val_ds, merged_kwargs, recipe_layer_type_specs,
+                        )
+                        _apply_ascat_resolution_override(
                             layer_type, val_ds, merged_kwargs, recipe_layer_type_specs,
                         )
 

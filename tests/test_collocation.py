@@ -685,6 +685,67 @@ class TestApplyHfRadarResolutionOverride:
         assert merged_kwargs["aggregation_window_km"] == expected_aggregation_window_km
 
 
+class TestApplyAscatResolutionOverride:
+    @pytest.mark.parametrize(
+        "layer_type,val_ds_attrs,merged_kwargs,recipe_layer_type_specs,expected_aggregation_window_km",
+        [
+            pytest.param(
+                "scatterometer_ssm",
+                {"ascat_resolution_km": 6.25},
+                {"aggregation_window_km": 12.5, "time_tolerance_minutes": 720},
+                {},
+                6.25,
+                id="overrides_when_no_recipe_override_and_attr_present",
+            ),
+            pytest.param(
+                "scatterometer_ssm",
+                {"ascat_resolution_km": 6.25},
+                {"aggregation_window_km": 12.5},
+                {"scatterometer_ssm": {"aggregation_window_km": 20.0}},
+                12.5,  # unchanged -- recipe pinned it
+                id="recipe_explicit_override_wins",
+            ),
+            pytest.param(
+                "scatterometer_ssm",
+                {"ascat_resolution_km": 6.25},
+                {"aggregation_window_km": 12.5},
+                {"scatterometer_ssm": {"time_tolerance_minutes": 360}},  # no aggregation_window_km
+                6.25,
+                id="recipe_partial_override_without_aggregation_window_km_still_derives",
+            ),
+            pytest.param(
+                "scatterometer_ssm",
+                {},
+                {"aggregation_window_km": 12.5},
+                {},
+                12.5,
+                id="missing_attr_leaves_merged_kwargs_untouched",
+            ),
+            pytest.param(
+                "hf_radar_grid",
+                {"ascat_resolution_km": 6.25},
+                {"aggregation_window_km": 1.0},
+                {},
+                1.0,
+                id="non_scatterometer_ssm_layer_type_untouched",
+            ),
+        ],
+    )
+    def test_apply_ascat_resolution_override(
+        self, layer_type, val_ds_attrs, merged_kwargs, recipe_layer_type_specs,
+        expected_aggregation_window_km,
+    ):
+        import xarray as xr
+
+        from sar_validation.core.collocation import _apply_ascat_resolution_override
+
+        val_ds = xr.Dataset(attrs=val_ds_attrs)
+        _apply_ascat_resolution_override(
+            layer_type, val_ds, merged_kwargs, recipe_layer_type_specs,
+        )
+        assert merged_kwargs["aggregation_window_km"] == expected_aggregation_window_km
+
+
 # ---------------------------------------------------------------------------
 # Former stub tests (now verify classes are functional)
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -2194,6 +2195,95 @@ class TestFromHsafSsm:
         from sar_validation.core.datatree_converter import DataTreeConverter
 
         assert DataTreeConverter.from_hsaf_ssm(tmp_path / "does_not_exist.nc") is None
+
+
+class TestAscatResolutionParsing:
+    """H-SAF's H29 (12.5km) and H122 (6.25km) filenames both embed their
+    resolution (e.g. "-12.5km-"/"-6.25km-"); EUMDAC/SOMO12 filenames never
+    do. The parsed resolution is stamped as ds.attrs["ascat_resolution_km"]
+    so collocation can size its aggregation window per file instead of a
+    flat per-source-type default. See design doc §1a."""
+
+    def test_h29_filename_parses_12_5(self):
+        from sar_validation.core.datatree_converter import _parse_ascat_resolution_km
+
+        filename = (
+            "W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPB-12.5km-H29_C_LIIB_"
+            "20260609001514_20260608231200_20260608231459____.nc"
+        )
+        assert _parse_ascat_resolution_km(filename) == 12.5
+
+    def test_h122_filename_parses_6_25(self):
+        from sar_validation.core.datatree_converter import _parse_ascat_resolution_km
+
+        filename = (
+            "W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPB-6.25km-H122_C_LIIB_"
+            "20260609001411_20260608230900_20260608231159____.nc"
+        )
+        assert _parse_ascat_resolution_km(filename) == 6.25
+
+    def test_somo12_filename_with_no_resolution_falls_back_to_12_5(self):
+        from sar_validation.core.datatree_converter import _parse_ascat_resolution_km
+
+        # Real SOMO12/EUMDAC filenames never embed resolution -- see
+        # ascat_soil_moisture_downloader.py's module docstring example.
+        filename = "ASCA_SMR_02_M01_20240102204500Z_20240102204500Z_N_O_20240102213456Z.nat"
+        assert _parse_ascat_resolution_km(filename) == 12.5
+
+    def test_from_hsaf_ssm_stamps_ascat_resolution_km_from_filename(self, tmp_path):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        # Reuse TestFromHsafSsm's fake-file writer for a real H122-shaped filename.
+        from tests.test_datatree_converter import TestFromHsafSsm
+
+        path = tmp_path / (
+            "W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPB-6.25km-H122_C_LIIB_x.nc"
+        )
+        TestFromHsafSsm._write_fake_h29_file(path, n=6, n_valid=3)
+
+        result = DataTreeConverter.from_hsaf_ssm(path)
+
+        assert result is not None
+        assert result.attrs["ascat_resolution_km"] == 6.25
+
+    def test_from_ascat_ssm_falls_back_to_12_5_when_filename_lacks_resolution(self, tmp_path, monkeypatch):
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        fake_ascat_module = type(sys)("ascat")
+        fake_eumetsat_module = type(sys)("ascat.eumetsat")
+        fake_level2_module = type(sys)("ascat.eumetsat.level2")
+
+        class _FakeAscatL2File:
+            def __init__(self, path):
+                self.path = path
+
+            def read(self, generic=True, to_xarray=True):
+                n = 4
+                ds = xr.Dataset(
+                    {"sm": ("obs", np.array([10.0, 20.0, np.nan, 40.0]))},
+                    coords={
+                        "lon": ("obs", np.linspace(-10.0, -9.0, n)),
+                        "lat": ("obs", np.linspace(50.0, 51.0, n)),
+                        "time": ("obs", np.array(["2026-06-01"] * n, dtype="datetime64[ns]")),
+                    },
+                )
+                return ds, {}
+
+        fake_level2_module.AscatL2File = _FakeAscatL2File
+        monkeypatch.setitem(sys.modules, "ascat", fake_ascat_module)
+        monkeypatch.setitem(sys.modules, "ascat.eumetsat", fake_eumetsat_module)
+        monkeypatch.setitem(sys.modules, "ascat.eumetsat.level2", fake_level2_module)
+
+        path = tmp_path / "ASCA_SMR_02_M01_20240102204500Z_20240102204500Z_N_O_20240102213456Z.nat"
+        path.write_text("fake")
+
+        result = DataTreeConverter.from_ascat_ssm(path)
+
+        assert result is not None
+        assert result.attrs["ascat_resolution_km"] == 12.5
 
 
 class TestFromAmsrSsm:

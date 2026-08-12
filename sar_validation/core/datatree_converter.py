@@ -337,6 +337,26 @@ def _parse_ssm_timestamp(filename: str) -> np.datetime64:
     )
 
 
+_ASCAT_RESOLUTION_RE = re.compile(r"-(\d+\.?\d*)km-")
+
+
+def _parse_ascat_resolution_km(filename: str) -> float:
+    """Parse the spatial-sampling resolution (km) embedded in an ASCAT SSM
+    filename -- H-SAF's H29 ("-12.5km-") and H122 ("-6.25km-") filenames
+    both embed it; EUMDAC/SOMO12 filenames never do (confirmed against
+    ascat_soil_moisture_downloader.py's real filename example), so this
+    falls back to 12.5 (SOMO12's own, and H29's, shared resolution) when
+    no match is found.
+    """
+    m = _ASCAT_RESOLUTION_RE.search(filename)
+    if not m:
+        return 12.5
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return 12.5
+
+
 class DataTreeConverter:
     """Convert various data formats to standardised xarray objects."""
 
@@ -1265,6 +1285,7 @@ class DataTreeConverter:
         *, data_type: str, var_attrs: dict, platform_type: str, source: str,
         sensing_depth_cm: str, band: str, filename: str,
         sensor: Optional[str] = None, native_grid_deg: Optional[float] = None,
+        ascat_resolution_km: Optional[float] = None,
     ) -> xr.Dataset:
         """Build the flat-point SOIL_MOISTURE Dataset + attrs shared by every
         ``from_*_ssm`` parser. Caller is responsible for pre-filtering
@@ -1289,6 +1310,8 @@ class DataTreeConverter:
         ds.attrs["filename"]         = filename
         if native_grid_deg is not None:
             ds.attrs["native_grid_deg"] = native_grid_deg
+        if ascat_resolution_km is not None:
+            ds.attrs["ascat_resolution_km"] = ascat_resolution_km
         return ds
 
     @staticmethod
@@ -1366,6 +1389,7 @@ class DataTreeConverter:
             platform_type="ascat_ssm",
             source="ASCAT Soil Moisture 12.5km Swath Grid (EO:EUM:DAT:METOP:SOMO12)",
             sensing_depth_cm="0-5", band="C", filename=path.name,
+            ascat_resolution_km=_parse_ascat_resolution_km(path.name),
         )
 
     @staticmethod
@@ -1436,6 +1460,7 @@ class DataTreeConverter:
             platform_type="ascat_ssm",
             source="H-SAF ASCAT Surface Soil Moisture NRT 12.5km (H29)",
             sensing_depth_cm="0-5", band="C", filename=path.name,
+            ascat_resolution_km=_parse_ascat_resolution_km(path.name),
         )
 
     @staticmethod
