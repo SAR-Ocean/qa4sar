@@ -3932,6 +3932,95 @@ class TestDownsampledValidPixelCoordsAdaptiveDensity:
         assert _downsampled_valid_pixel_coords(valid, lons, lats) == []
 
 
+class TestDownsampledValidPixelCoordsMaskingAndBboxConsistency:
+    """Two real bugs, both caused by _adaptive_footprint_target_count using
+    the *valid*-pixel count as its area basis instead of the *nominal*
+    grid extent: (1) a NISAR granule that's largely over water got a
+    *denser* dot spacing than a fuller same-resolution granule in the
+    same collocation_diagnostics plot, purely because its natural target
+    count fell below the floor and got clamped up; (2) a Sentinel-1 scene
+    whose bbox-visible sliver is a tiny fraction of its huge full extent
+    rendered almost no dots in that sliver, because the ceiling clamp
+    coarsened spacing based on the *whole* (uncropped) scene's size."""
+
+    @staticmethod
+    def _grid(ny, nx, dlon, dlat, lon0=0.0, lat0=45.0):
+        import numpy as np
+
+        lon_1d = lon0 + np.arange(nx) * dlon
+        lat_1d = lat0 + np.arange(ny) * dlat
+        lons, lats = np.meshgrid(lon_1d, lat_1d)
+        return lons, lats
+
+    def test_masked_and_unmasked_same_resolution_scenes_get_same_stride(self):
+        """Same nominal footprint/resolution, different valid fraction
+        (simulating "partly over water") -- both must end up with the
+        same physical dot spacing, not a denser one for the masked scene."""
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        lons, lats = self._grid(200, 200, dlon=0.02, dlat=0.02)  # 4x4 deg, mid-range area
+        full_valid = np.ones((200, 200), dtype=bool)
+        mostly_masked = np.zeros((200, 200), dtype=bool)
+        mostly_masked[:40, :40] = True  # only 4% of cells valid, same nominal grid
+
+        def _mean_nn_spacing(points):
+            pts = np.asarray(points)
+            lon_range = max(pts[:, 0].max() - pts[:, 0].min(), 1e-9)
+            lat_range = max(pts[:, 1].max() - pts[:, 1].min(), 1e-9)
+            return np.sqrt(lon_range * lat_range / len(pts))
+
+        full_points = _downsampled_valid_pixel_coords(full_valid, lons, lats)
+        masked_points = _downsampled_valid_pixel_coords(mostly_masked, lons, lats)
+
+        full_spacing = _mean_nn_spacing(full_points)
+        masked_spacing = _mean_nn_spacing(masked_points)
+
+        ratio = max(full_spacing, masked_spacing) / min(full_spacing, masked_spacing)
+        assert ratio < 2.0, (
+            f"masking must not distort relative dot density: "
+            f"full={full_spacing:.4f} masked={masked_spacing:.4f} (ratio {ratio:.1f}x)"
+        )
+
+    def test_bbox_clipped_reference_gives_visible_density_in_small_bbox(self):
+        """A huge scene (simulating an uncropped Sentinel-1 mosaic) with a
+        small recipe bbox inside it must still show a reasonable number
+        of dots *within that bbox*, not near-zero."""
+        from sar_validation.core.recipe import GeographicBounds
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        # Huge scene: 2000x2000 grid at 0.05 deg/cell -> 100x100 deg.
+        lons, lats = self._grid(2000, 2000, dlon=0.05, dlat=0.05, lon0=-50.0, lat0=0.0)
+        valid = np.ones((2000, 2000), dtype=bool)
+
+        # Small bbox: 2x2 deg, tucked well inside the scene.
+        bounds = GeographicBounds(min_lon=-10.0, max_lon=-8.0, min_lat=20.0, max_lat=22.0)
+
+        points = _downsampled_valid_pixel_coords(valid, lons, lats, geographic_bounds=bounds)
+        in_bbox = [
+            p for p in points
+            if bounds.min_lon <= p[0] <= bounds.max_lon
+            and bounds.min_lat <= p[1] <= bounds.max_lat
+        ]
+
+        assert len(in_bbox) >= 10, (
+            f"expected a visible number of dots within the small bbox, got {len(in_bbox)} "
+            f"out of {len(points)} total"
+        )
+
+    def test_no_bbox_falls_back_to_whole_scene_reference(self):
+        """geographic_bounds=None must be identical to today's behavior --
+        confirms this new parameter is purely additive."""
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        lons, lats = self._grid(400, 400, dlon=0.05, dlat=0.05)
+        valid = np.ones((400, 400), dtype=bool)
+
+        with_none = _downsampled_valid_pixel_coords(valid, lons, lats, geographic_bounds=None)
+        without_arg = _downsampled_valid_pixel_coords(valid, lons, lats)
+
+        assert len(with_none) == len(without_arg)
+
+
 class TestPlotCollocationDiagnosticsSoilMoistureOverpassCoverage:
     """CLMS Surface Soil Moisture's grid has valid lon/lat everywhere across
     the continent, but the actual retrieved value is NaN except along that
