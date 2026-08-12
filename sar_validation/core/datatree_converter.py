@@ -2031,6 +2031,22 @@ class DataTreeConverter:
         try:
             per_file = [xr.open_dataset(p) for p in existing]
             raw = per_file[0] if len(per_file) == 1 else xr.concat(per_file, dim="time")
+            # `existing` is sorted ALPHABETICALLY by filename (above), not
+            # chronologically -- HyCOM segment filenames embed the dataset
+            # key right after the "hycom_" prefix ("hycom_espc_d_v02_..."
+            # vs "hycom_gofs31_930_..."), so a straddling-cutover window's
+            # ESPC-D-V02 file ('e' < 'g') sorts BEFORE its GOFS 3.1 file
+            # even though ESPC-D-V02 is always the chronologically LATER
+            # segment (only ever used at/after _HYCOM_CUTOVER_DATE -- see
+            # hycom_downloader.py). xr.concat does not sort its inputs, so
+            # without this the resulting time axis goes forward then jumps
+            # backward at the cutover -- non-monotonic, which
+            # model_collocation.py's np.searchsorted-based bracket search
+            # has no correct behaviour for. sortby (not just a pre-sorted
+            # `existing`) establishes the genuine invariant regardless of
+            # input order, mirroring from_era5's own `sortby("lat")` fix
+            # for CDS's descending latitude (see that method).
+            raw = raw.sortby("time")
             raw = raw.load()
             for d in per_file:
                 d.close()

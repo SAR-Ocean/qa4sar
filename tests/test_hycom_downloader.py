@@ -659,6 +659,185 @@ class TestBracketBuffer:
         assert "1 granule(s)" in caplog.text
 
 
+class TestCutoverBoundaryNoOverlap:
+    """Regression tests for the ESPC-D-V02/GOFS 3.1 cutover-boundary
+    overlap bug: for a recipe window straddling ``_HYCOM_CUTOVER_DATE``,
+    ``_resolve_hycom_segments`` splits into two segments whose OWN
+    ``[seg_start, seg_end]`` already touch at the cutover instant, and
+    ``_buffered_bounds`` widens each segment's REAL OPeNDAP request by
+    ``_BRACKET_BUFFER_HOURS`` on both sides -- pre-fix, this let the
+    ``gofs31_930`` segment's request reach PAST the cutover and the
+    ``espc_d_v02`` segment's request reach BEFORE it, so both datasets'
+    real (but different, independently-run) data for the SAME real-world
+    instants got downloaded -- ``DataTreeConverter.from_hycom``'s
+    ``xr.concat(..., dim="time")`` then produced duplicate, non-monotonic
+    timestamps that ``model_collocation.py``'s ``np.searchsorted``-based
+    bracket search has no defined/correct behaviour for.
+
+    Unlike ``TestBracketBuffer`` (which only ever exercises ONE segment
+    in isolation) and ``test_straddling_window_downloads_both_segments``
+    (which mocks ``_download_segment`` away entirely, so it never
+    exercises real time-slicing or buffering at all), these tests run
+    the REAL ``_download_segment`` for BOTH segments of a genuinely
+    straddling window, with REAL (sentinel-valued) source data available
+    on BOTH sides of the cutover in BOTH source datasets -- proving the
+    fix actively clips the request rather than merely relying on the
+    (real) source datasets happening to lack data there.
+    """
+
+    _LON_STEP = 0.5
+
+    @classmethod
+    def _grid(cls):
+        import numpy as np
+
+        lon = np.round(np.arange(0.0, 360.0, cls._LON_STEP), 4)
+        lat = np.round(np.arange(20.0, 70.0, 0.5), 4)
+        depth = np.array([0.0, 10.0])
+        return lon, lat, depth
+
+    @classmethod
+    def _make_dataset(cls, time_index, value, var_names):
+        import numpy as np
+        import xarray as xr
+
+        lon, lat, depth = cls._grid()
+        shape = (len(time_index), len(depth), len(lat), len(lon))
+        data = {
+            v: (("time", "depth", "lat", "lon"), np.full(shape, value))
+            for v in var_names
+        }
+        return xr.Dataset(
+            data, coords={"time": time_index, "depth": depth, "lat": lat, "lon": lon},
+        )
+
+    def _patch_open_dataset(self, monkeypatch, full_time):
+        import xarray as xr
+
+        gofs_ds = self._make_dataset(full_time, -100.0, ["water_u", "water_v"])
+        espc_u_ds = self._make_dataset(full_time, 100.0, ["water_u"])
+        espc_v_ds = self._make_dataset(full_time, 200.0, ["water_v"])
+
+        real_open_dataset = xr.open_dataset
+
+        def fake_open_dataset(url, *a, **kw):
+            if url == "https://tds.hycom.org/thredds/dodsC/GLBy0.08/expt_93.0/uv3z/2024":
+                return gofs_ds
+            if url == "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/u3z":
+                return espc_u_ds
+            if url == "https://tds.hycom.org/thredds/dodsC/ESPC-D-V02/v3z":
+                return espc_v_ds
+            return real_open_dataset(url, *a, **kw)
+
+        monkeypatch.setattr(xr, "open_dataset", fake_open_dataset)
+        return real_open_dataset
+
+    def test_straddling_window_segments_dont_overlap_in_real_downloaded_time(
+        self, tmp_path, monkeypatch,
+    ):
+        import pandas as pd
+
+        from sar_validation.downloaders.hycom_downloader import (
+            _HYCOM_CUTOVER_DATE,
+            HycomDownloader,
+        )
+
+        full_time = pd.date_range("2024-08-08T00:00:00", "2024-08-11T00:00:00", freq="3h")
+        real_open_dataset = self._patch_open_dataset(monkeypatch, full_time)
+
+        dl = HycomDownloader(output_dir=tmp_path)
+        paths = dl.download(
+            min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+            start="2024-08-09T22:00:00", end="2024-08-10T02:00:00",
+        )
+        assert len(paths) == 2
+        gofs_path = next(p for p in paths if "gofs31_930" in p.name)
+        espc_path = next(p for p in paths if "espc_d_v02" in p.name)
+
+        gofs_result = real_open_dataset(gofs_path)
+        espc_result = real_open_dataset(espc_path)
+        try:
+            gofs_times = pd.to_datetime(gofs_result["time"].values)
+            espc_times = pd.to_datetime(espc_result["time"].values)
+
+            assert len(gofs_times) > 0 and len(espc_times) > 0
+            assert gofs_times.max() < _HYCOM_CUTOVER_DATE, (
+                f"gofs31_930's buffered request reached the cutover or "
+                f"beyond ({gofs_times.max()}) -- it must never overlap "
+                f"with espc_d_v02's own preferred date range."
+            )
+            assert espc_times.min() >= _HYCOM_CUTOVER_DATE, (
+                f"espc_d_v02's buffered request reached before the "
+                f"cutover ({espc_times.min()}) -- it must never overlap "
+                f"with gofs31_930's own preferred date range."
+            )
+            assert set(gofs_times) & set(espc_times) == set(), (
+                "gofs31_930 and espc_d_v02 downloaded overlapping "
+                "real-world timestamps -- xr.concat at from_hycom time "
+                "would produce ambiguous duplicate timestamps."
+            )
+
+            # The two segments' granule sets must still be CONTIGUOUS on
+            # the shared 3-hourly cadence grid across the cutover --
+            # clipping must not open a bracket-finding gap at the
+            # boundary (both real datasets are cadence-aligned and meet
+            # exactly at the cutover instant).
+            combined_times = sorted(set(gofs_times) | set(espc_times))
+            gaps = [b - a for a, b in zip(combined_times, combined_times[1:])]
+            assert all(g == pd.Timedelta(hours=3) for g in gaps), (
+                f"combined granule series is not evenly 3-hourly across "
+                f"the cutover boundary -- clipping introduced a real "
+                f"bracket-finding gap: {combined_times}"
+            )
+        finally:
+            gofs_result.close()
+            espc_result.close()
+
+    def test_straddling_window_from_hycom_produces_unique_monotonic_time_honoring_preference(
+        self, tmp_path, monkeypatch,
+    ):
+        """End-to-end: DataTreeConverter.from_hycom's concatenation of
+        the two now-disjoint segment files must produce a strictly
+        monotonic, duplicate-free time axis, with ESPC-D-V02's sentinel
+        value used at/after the cutover and GOFS 3.1's before it -- the
+        toolbox's stated dataset preference actually reaching the
+        collocation-ready data model_collocation.py consumes."""
+        import numpy as np
+        import pandas as pd
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.downloaders.hycom_downloader import (
+            _HYCOM_CUTOVER_DATE,
+            HycomDownloader,
+        )
+
+        full_time = pd.date_range("2024-08-08T00:00:00", "2024-08-11T00:00:00", freq="3h")
+        self._patch_open_dataset(monkeypatch, full_time)
+
+        dl = HycomDownloader(output_dir=tmp_path)
+        paths = dl.download(
+            min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+            start="2024-08-09T22:00:00", end="2024-08-10T02:00:00",
+        )
+
+        combined = DataTreeConverter.from_hycom(paths)
+        assert combined is not None
+        times = pd.to_datetime(combined["time"].values)
+        assert times.is_unique, f"duplicate timestamps reached from_hycom's output: {times}"
+        assert times.is_monotonic_increasing, (
+            f"non-monotonic time axis reached from_hycom's output -- "
+            f"np.searchsorted-based bracket search in model_collocation.py "
+            f"has no correct behaviour for this: {times}"
+        )
+
+        before = combined.sel(time=slice(None, _HYCOM_CUTOVER_DATE - pd.Timedelta(seconds=1)))
+        at_after = combined.sel(time=slice(_HYCOM_CUTOVER_DATE, None))
+        assert before.sizes["time"] > 0 and at_after.sizes["time"] > 0
+        np.testing.assert_allclose(before["EWCT"].values, -100.0)
+        np.testing.assert_allclose(at_after["EWCT"].values, 100.0)
+        np.testing.assert_allclose(at_after["NSCT"].values, 200.0)
+
+
 class TestDownloadSegmentResourceCleanup:
     def test_all_opened_datasets_are_closed_when_a_later_step_fails(self, tmp_path, monkeypatch):
         """A failure in xr.merge (i.e. *after* every open_dataset call has

@@ -119,6 +119,19 @@ _CADENCE_HOURS = 3
 #: strictly needs ``1 * cadence`` -- simple, safe, harmless extra data).
 _BRACKET_BUFFER_HOURS = 2 * _CADENCE_HOURS
 
+#: Tiny margin subtracted from :data:`_HYCOM_CUTOVER_DATE` when clipping
+#: the ``gofs31_930`` segment's buffered request (see
+#: :meth:`HycomDownloader._buffered_bounds`) so its ``.sel(time=slice
+#: (..., stop))`` excludes the cutover instant itself -- a plain
+#: ``stop = _HYCOM_CUTOVER_DATE`` would still match a granule landing
+#: exactly ON the cutover (a real possibility since granules fall on
+#: cadence-hour boundaries and the cutover is midnight), which is
+#: reserved for ``espc_d_v02`` (see module docstring: "ESPC-D-V02 is
+#: preferred from this date onward"). Far smaller than
+#: :data:`_CADENCE_HOURS` (3h = 10800s), so it can never accidentally
+#: exclude/include the wrong granule.
+_CUTOVER_CLIP_EPSILON = timedelta(seconds=1)
+
 
 def _resolve_hycom_segments(
     window_start: datetime, window_end: datetime,
@@ -268,6 +281,15 @@ class HycomDownloader:
         window_start = datetime.fromisoformat(normalize_datetime(start))
         window_end = datetime.fromisoformat(normalize_datetime(end))
         segments = _resolve_hycom_segments(window_start, window_end)
+        # Two segments only ever happens for a window straddling
+        # _HYCOM_CUTOVER_DATE (see _resolve_hycom_segments) -- only THEN
+        # do the two segments' buffered requests risk overlapping each
+        # other in real-world time, so only then must _buffered_bounds
+        # clip at the cutover (see its docstring). A single-segment
+        # window must NOT be clipped -- there is no other segment/file
+        # to conflict with, so clipping would just needlessly shrink the
+        # bracket buffer near the cutover for no benefit.
+        clip_at_cutover = len(segments) == 2
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -280,11 +302,12 @@ class HycomDownloader:
                 continue
 
             if self.dry_run:
-                self._probe_coverage(dataset_key, seg_start, seg_end)
+                self._probe_coverage(dataset_key, seg_start, seg_end, clip_at_cutover)
                 continue
 
             result = self._download_segment(
                 dataset_key, seg_start, seg_end, min_lon, max_lon, min_lat, max_lat,
+                clip_at_cutover,
             )
             if result is not None:
                 downloaded.append(result)
@@ -301,7 +324,9 @@ class HycomDownloader:
         )
 
     @staticmethod
-    def _buffered_bounds(seg_start: datetime, seg_end: datetime) -> tuple[datetime, datetime]:
+    def _buffered_bounds(
+        dataset_key: str, seg_start: datetime, seg_end: datetime, clip_at_cutover: bool = False,
+    ) -> tuple[datetime, datetime]:
         """Widen [*seg_start*, *seg_end*] by :data:`_BRACKET_BUFFER_HOURS`
         on both sides for the actual OPeNDAP request -- see that
         constant's docstring for the worst-case bracket derivation. The
@@ -315,11 +340,73 @@ class HycomDownloader:
         Note: the *nc_path* filename (see :meth:`_nc_path_for_segment`)
         deliberately stays keyed on the UNBUFFERED *seg_start*/*seg_end*
         -- only the actual network request widens.
+
+        *clip_at_cutover* (set by :meth:`download` only when a window
+        straddles :data:`_HYCOM_CUTOVER_DATE`, i.e. two segments are both
+        in play for this call) additionally clips the widened bounds so
+        they never cross INTO the other dataset's own preferred date
+        range: ``gofs31_930``'s buffered ``stop`` never reaches
+        :data:`_HYCOM_CUTOVER_DATE` or beyond, and ``espc_d_v02``'s
+        buffered ``start`` never goes before it.
+
+        Without this, for a straddling window the ``gofs31_930``
+        segment's buffered request (widened forward) and the
+        ``espc_d_v02`` segment's buffered request (widened backward)
+        genuinely overlap in real-world time -- both real HyCOM datasets
+        (GOFS 3.1 Analysis / expt_93.0, verified through 2024-09-04, and
+        ESPC-D-V02) carry real, but DIFFERENT, independently-run model
+        data for the same dates in that overlap window, so
+        ``DataTreeConverter.from_hycom``'s ``xr.concat(..., dim="time")``
+        would produce duplicate, non-monotonic timestamps that
+        ``model_collocation.py``'s ``np.searchsorted``-based bracket
+        search has no defined/correct behaviour for -- effectively a
+        coin flip over which model's value is actually used for a scene
+        near the boundary, silently violating this toolbox's stated
+        ESPC-D-V02-preferred-at/after-cutover rule.
+
+        Both real datasets share the same 3-hourly cadence grid, and this
+        clip costs NOTHING for the common case of a scene comfortably
+        away from the cutover -- the buffer's original purpose (room at
+        the OUTER edges of the whole recipe window) is untouched, since
+        this clip only ever trims the INNER edge facing the other
+        segment.
+
+        Live-verified 2026-08-12, however: ESPC-D-V02's own real first
+        granule is ``2024-08-10T12:00:00`` -- 12 HOURS AFTER the nominal
+        ``_HYCOM_CUTOVER_DATE`` (2024-08-10T00:00:00) this module treats
+        as the preference boundary -- while GOFS 3.1 expt_93.0 genuinely
+        has real granules at 00:00/03:00/06:00/09:00 that same morning
+        (confirmed against the live THREDDS server). So this clip trades
+        away a small amount of REAL bracket availability for scenes
+        landing in that exact ``[00:00, 12:00)`` window on 2024-08-10
+        specifically: pre-fix, GOFS 3.1's own (non-preferred but real)
+        data would have filled that morning gap; post-fix, this clip
+        denies GOFS 3.1 access to it too (since it's at/after the
+        nominal cutover) and ESPC-D-V02 genuinely has nothing there yet
+        either, so those specific scenes get NO bracket from either
+        dataset. This is judged an acceptable, narrow, ONE-TIME (not
+        recurring -- it's tied to a single fixed historical date, unlike
+        e.g. HF-radar's ongoing density gap) trade for eliminating the
+        far worse ambiguous-duplicate-timestamp bug above -- and it is
+        NOT a silent gap: it surfaces exactly like every other missing-
+        bracket case in ``model_collocation._model_values_at_points``
+        (``idx2 < 1 or idx2 + 1 >= len(era5_times)`` -> leave NaN, debug-
+        logged), the same existing mechanism ERA5's own irregular-
+        bracket-spacing case already relies on -- no new special-casing
+        needed. A coverage-driven (query-the-live-dataset) clip instead
+        of this nominal-date one would close this narrow gap too, but
+        was judged not worth the added network round-trip and coupling
+        between segments for a gap this narrow and non-recurring.
         """
         buffered_start = max(
             seg_start - timedelta(hours=_BRACKET_BUFFER_HOURS), _HYCOM_MIN_DATE,
         )
         buffered_end = seg_end + timedelta(hours=_BRACKET_BUFFER_HOURS)
+        if clip_at_cutover:
+            if dataset_key == "gofs31_930":
+                buffered_end = min(buffered_end, _HYCOM_CUTOVER_DATE - _CUTOVER_CLIP_EPSILON)
+            elif dataset_key == "espc_d_v02":
+                buffered_start = max(buffered_start, _HYCOM_CUTOVER_DATE)
         return buffered_start, buffered_end
 
     def _dodsc_urls(self, dataset_key: str, seg_start: datetime, seg_end: datetime) -> dict[str, str]:
@@ -340,7 +427,9 @@ class HycomDownloader:
         years = range(seg_start.year, seg_end.year + 1)
         return {f"uv_{year}": f"{base}/{year}" for year in years}
 
-    def _probe_coverage(self, dataset_key: str, seg_start: datetime, seg_end: datetime) -> None:
+    def _probe_coverage(
+        self, dataset_key: str, seg_start: datetime, seg_end: datetime, clip_at_cutover: bool = False,
+    ) -> None:
         """Lazily open each URL for this segment and report which
         requested days actually have granules in the live dataset's
         ``time`` coordinate -- no full u/v grid load. Analogous to
@@ -355,12 +444,15 @@ class HycomDownloader:
         Reports coverage over the SAME :meth:`_buffered_bounds`-widened
         window a real (non-dry-run) download would actually request, so
         dry-run output doesn't misleadingly under-report what a real run
-        fetches.
+        fetches. *clip_at_cutover* mirrors :meth:`_download_segment`'s
+        own parameter -- see :meth:`_buffered_bounds` for why.
         """
         import numpy as np
         import xarray as xr
 
-        buffered_start, buffered_end = self._buffered_bounds(seg_start, seg_end)
+        buffered_start, buffered_end = self._buffered_bounds(
+            dataset_key, seg_start, seg_end, clip_at_cutover,
+        )
 
         for label, url in self._dodsc_urls(dataset_key, buffered_start, buffered_end).items():
             try:
@@ -387,9 +479,17 @@ class HycomDownloader:
         max_lon: float,
         min_lat: float,
         max_lat: float,
+        clip_at_cutover: bool = False,
     ) -> Optional[Path]:
         """Download one dataset-segment's water_u/water_v subset, combine
-        into one NetCDF. Returns the NC path, or ``None`` on failure."""
+        into one NetCDF. Returns the NC path, or ``None`` on failure.
+
+        *clip_at_cutover*: see :meth:`_buffered_bounds` -- set by
+        :meth:`download` only when the recipe window straddles
+        :data:`_HYCOM_CUTOVER_DATE`, so this segment's buffered request
+        never overlaps in real-world time with the OTHER segment's own
+        buffered request.
+        """
         import xarray as xr
 
         west = min_lon - _GRID_PAD_DEG
@@ -398,7 +498,9 @@ class HycomDownloader:
         north = max_lat + _GRID_PAD_DEG
 
         nc_path = self._nc_path_for_segment(dataset_key, seg_start, seg_end)
-        buffered_start, buffered_end = self._buffered_bounds(seg_start, seg_end)
+        buffered_start, buffered_end = self._buffered_bounds(
+            dataset_key, seg_start, seg_end, clip_at_cutover,
+        )
         urls = self._dodsc_urls(dataset_key, buffered_start, buffered_end)
 
         # A real OPeNDAP fetch below (xr.open_dataset + .load()) can take a

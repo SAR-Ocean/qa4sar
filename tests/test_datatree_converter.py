@@ -3340,6 +3340,43 @@ class TestFromHycom:
         assert ds is not None
         assert ds.sizes["time"] == 16
 
+    def test_concatenated_time_is_monotonic_regardless_of_alphabetical_filename_order(
+        self, tmp_path,
+    ):
+        """Regression test: HyCOM segment filenames embed the dataset
+        key right after the ``hycom_`` prefix (``hycom_espc_d_v02_...``
+        vs ``hycom_gofs31_930_...``), so a plain alphabetical
+        ``sorted()`` of the file paths (as ``from_hycom`` and
+        ``convert_downloaded_data`` both do) puts the ESPC-D-V02 file
+        BEFORE the GOFS 3.1 file (``'e' < 'g'``) even though ESPC-D-V02
+        is always the chronologically LATER segment (it's only ever
+        used at/after ``_HYCOM_CUTOVER_DATE``). ``xr.concat`` does not
+        sort its inputs -- opening/concatenating in that alphabetical
+        (but chronologically backwards) order produces a time axis that
+        goes forward then jumps backward, which is non-monotonic. This
+        existing test class's own
+        ``test_multiple_segment_files_concatenated_along_time`` only
+        asserts the total concatenated COUNT, so it never caught this."""
+        import pandas as pd
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        seg_gofs = tmp_path / "hycom_gofs31_930_20241001T000000_20241005T000000.nc"
+        seg_espc = tmp_path / "hycom_espc_d_v02_20241010T000000_20241015T000000.nc"
+        self._write_hycom_nc(seg_gofs, n_time=8, start_hour="2024-10-01T00:00:00")
+        self._write_hycom_nc(seg_espc, n_time=8, start_hour="2024-10-10T00:00:00")
+
+        # Pass paths in already-chronological order -- from_hycom must
+        # not rely on caller order either, only on its own handling.
+        ds = DataTreeConverter.from_hycom([seg_gofs, seg_espc])
+        assert ds is not None
+        times = pd.to_datetime(ds["time"].values)
+        assert times.is_monotonic_increasing, (
+            f"from_hycom's concatenated time axis is not monotonic -- "
+            f"likely concatenated in alphabetical-by-filename (not "
+            f"chronological) order: {times}"
+        )
+
     def test_missing_file_returns_none(self, tmp_path):
         from sar_validation.core.datatree_converter import DataTreeConverter
 
