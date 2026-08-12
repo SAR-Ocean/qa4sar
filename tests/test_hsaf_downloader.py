@@ -20,6 +20,11 @@ _REAL_FILENAME = (
     "20260609001514_20260608231200_20260608231459____.nc"
 )
 
+_METOPA_FILENAME = (
+    "W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPA-12.5km-H29_C_LIIB_"
+    "20260610001514_20260609231200_20260609231459____.nc"
+)
+
 
 class TestMatchesH29Nc:
     @pytest.mark.parametrize(
@@ -27,8 +32,10 @@ class TestMatchesH29Nc:
         [
             pytest.param(_REAL_FILENAME, True, id="real_metopb_file_matches"),
             pytest.param(
-                "W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPA-12.5km-H29_C_LIIB_"
-                "20260609001514_20260608231200_20260608231459____.nc",
+                (
+                    "W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPA-12.5km-H29_C_LIIB_"
+                    "20260609001514_20260608231200_20260608231459____.nc"
+                ),
                 True, id="metopa_file_matches",
             ),
             pytest.param(_REAL_FILENAME + ".md5", False, id="md5_sidecar_never_matches"),
@@ -54,8 +61,7 @@ class TestHSAFDownloaderDownloadAll:
         fake_ftp = MagicMock()
         fake_ftp.nlst.return_value = [
             _REAL_FILENAME,
-            "W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPA-12.5km-H29_C_LIIB_"
-            "20260610001514_20260609231200_20260609231459____.nc",
+            _METOPA_FILENAME,
             _REAL_FILENAME + ".md5",
         ]
 
@@ -75,7 +81,7 @@ class TestHSAFDownloaderDownloadAll:
             )
 
         assert len(result) == 2
-        assert result[0].name == "W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPA-12.5km-H29_C_LIIB_20260610001514_20260609231200_20260609231459____.nc"
+        assert result[0].name == _METOPA_FILENAME
         assert result[1].name == _REAL_FILENAME
         fake_ftp.login.assert_called_once_with("user", "pass")
         fake_ftp.cwd.assert_called_once_with("/h29/h29_cur_mon_nc")
