@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
 import pytest
 
 from sar_validation.core.orchestrator import DataOrchestrator
@@ -74,7 +75,9 @@ class TestRunDownload:
                 return [out_dir / "f.nc"]
 
         ok = orch._run_download(
-            "test_key", out_dir, lambda: FakeDl(), lambda: {}, "Test",
+            "test_key", out_dir, lambda: FakeDl(),
+            [("2026-01-01T00:00:00", "2026-01-02T00:00:00")],
+            lambda start, end: {}, "Test",
         )
         assert ok is True
         assert orch.metadata["downloads"]["test_key"]["status"] == "dry_run"
@@ -89,7 +92,9 @@ class TestRunDownload:
                 raise RuntimeError("boom")
 
         ok = orch._run_download(
-            "test_key", out_dir, lambda: FailingDl(), lambda: {}, "Test",
+            "test_key", out_dir, lambda: FailingDl(),
+            [("2026-01-01T00:00:00", "2026-01-02T00:00:00")],
+            lambda start, end: {}, "Test",
         )
         assert ok is False
         assert orch.metadata["downloads"]["test_key"]["status"] == "failed"
@@ -104,7 +109,10 @@ class TestRunDownload:
                 return [1, 2, 3]
 
         ok = orch._run_download(
-            "test_key", out_dir, lambda: FakeDl(), lambda: {}, "Test",
+            "test_key", out_dir, lambda: FakeDl(),
+            [("2026-01-01T00:00:00", "2026-01-02T00:00:00")],
+            lambda start, end: {},
+            "Test",
             result_to_metadata=lambda result, dl: {"file_count": len(result)},
         )
         assert ok is True
@@ -123,15 +131,50 @@ class TestRunDownload:
             def download(self, **kwargs):
                 return []
 
-        def build_kwargs():
+        def build_kwargs(start, end):
             raise ValueError("bad kwargs")
 
         ok = orch._run_download(
-            "test_key", out_dir, lambda: FakeDl(), build_kwargs, "Test",
+            "test_key", out_dir, lambda: FakeDl(),
+            [("2026-01-01T00:00:00", "2026-01-02T00:00:00")],
+            build_kwargs, "Test",
         )
         assert ok is False
         assert orch.metadata["downloads"]["test_key"]["status"] == "failed"
         assert "Test download failed: bad kwargs" in orch.metadata["downloads"]["test_key"]["error"]
+
+    def test_multiple_windows_are_merged_into_one_result(self, tmp_path):
+        """A caller passing more than one window (the SAR-scene-clustering
+        case) must call .download() once per window and concatenate every
+        window's results -- proving _run_download is the single place that
+        does this merging, not something every _download_* method has to
+        reimplement."""
+        orch = DataOrchestrator(_recipe("sentinel1_l2_ocn"), dry_run=True)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "a.nc").touch()
+        (out_dir / "b.nc").touch()
+
+        calls = []
+
+        class FakeDl:
+            def download(self, start, end):
+                calls.append((start, end))
+                return [out_dir / f"{'a' if start == '2026-01-01T00:00:00' else 'b'}.nc"]
+
+        windows = [
+            ("2026-01-01T00:00:00", "2026-01-02T00:00:00"),
+            ("2026-01-10T00:00:00", "2026-01-11T00:00:00"),
+        ]
+        ok = orch._run_download(
+            "test_key", out_dir, lambda: FakeDl(), windows,
+            lambda start, end: {"start": start, "end": end}, "Test",
+        )
+        assert ok is True
+        assert calls == windows
+        assert orch.metadata["downloads"]["test_key"]["files"] == [
+            str(out_dir / "a.nc"), str(out_dir / "b.nc"),
+        ]
 
 
 class TestDownloadSarSourceBranch:
@@ -329,13 +372,112 @@ class TestDownloadTemporalPadding:
         )
         assert _resolve_temporal_padding_minutes(cfg, "ascat_ssm") == 45.0
 
-    def test_padded_temporal_bounds_pads_symmetrically(self):
-        from sar_validation.core.orchestrator import _padded_temporal_bounds
+    def test_padded_temporal_bounds_pads_symmetrically(self, tmp_path):
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
 
-        cfg = self._recipe().config
-        start, end = _padded_temporal_bounds(cfg, "ascat_ssm")
-        assert start == "2026-01-31T12:00:00"
-        assert end == "2026-02-03T12:00:00"
+        windows = orchestrator._padded_temporal_bounds("ascat_ssm")
+
+        assert windows == [("2026-01-31T12:00:00", "2026-02-03T12:00:00")]
+
+    def test_single_sar_scene_narrows_to_one_window(self, tmp_path):
+        """Recipe's nominal window is 2026-02-01..2026-02-03, padded +-12h
+        (ascat_ssm's 720min tolerance) to 2026-01-31T12:00..2026-02-03T12:00.
+        A single SAR scene at 2026-02-02T00:00, also padded +-12h, narrows
+        that to one window, 2026-02-01T12:00..2026-02-02T12:00 -- entirely
+        inside the nominal padded window."""
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+        orchestrator._sar_scene_times = [pd.Timestamp("2026-02-02T00:00:00")]
+
+        windows = orchestrator._padded_temporal_bounds("ascat_ssm")
+
+        assert windows == [("2026-02-01T12:00:00", "2026-02-02T12:00:00")]
+
+    def test_two_close_sar_scenes_merge_into_one_window(self, tmp_path):
+        """Two scenes 6h apart, with a 12h (720min) tolerance/pad: their
+        padded windows (+-12h each) clearly overlap (gap 6h < 2*pad=24h),
+        so they merge into a single cluster/window covering both, not two
+        separate ones."""
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+        orchestrator._sar_scene_times = [
+            pd.Timestamp("2026-02-02T00:00:00"), pd.Timestamp("2026-02-02T06:00:00"),
+        ]
+
+        windows = orchestrator._padded_temporal_bounds("ascat_ssm")
+
+        assert windows == [("2026-02-01T12:00:00", "2026-02-02T18:00:00")]
+
+    def test_two_far_apart_sar_scenes_produce_two_disjoint_windows(self, tmp_path):
+        """This is the 'temporal gap' case: two scenes on the same
+        3-day recipe (2026-02-01..2026-02-03, so both padded scene
+        windows stay inside the nominal range), but 36h apart -- more
+        than 2*pad=24h, so their +-12h padded windows do NOT overlap.
+        Must produce two separate, disjoint windows, not one span
+        covering the gap in between."""
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+        orchestrator._sar_scene_times = [
+            pd.Timestamp("2026-02-01T06:00:00"), pd.Timestamp("2026-02-02T18:00:00"),
+        ]
+
+        windows = orchestrator._padded_temporal_bounds("ascat_ssm")
+
+        assert windows == [
+            ("2026-01-31T18:00:00", "2026-02-01T18:00:00"),
+            ("2026-02-02T06:00:00", "2026-02-03T06:00:00"),
+        ]
+
+    def test_three_scenes_two_clusters(self, tmp_path):
+        """Scenes A and B are close (merge into one cluster); scene C is
+        far from both (its own cluster) -- proves clustering isn't
+        limited to pairs and handles an out-of-order-relative-to-cluster-
+        count mix correctly."""
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+        orchestrator._sar_scene_times = [
+            pd.Timestamp("2026-02-01T00:00:00"),  # A
+            pd.Timestamp("2026-02-01T04:00:00"),  # B (4h after A -- merges)
+            pd.Timestamp("2026-02-02T20:00:00"),  # C (~40h after B -- own cluster)
+        ]
+
+        windows = orchestrator._padded_temporal_bounds("ascat_ssm")
+
+        assert len(windows) == 2
+        assert windows[0] == ("2026-01-31T12:00:00", "2026-02-01T16:00:00")
+        assert windows[1] == ("2026-02-02T08:00:00", "2026-02-03T08:00:00")
+
+    def test_sar_scene_range_never_exceeds_nominal_window(self, tmp_path):
+        """A SAR-scene-derived window wider than the nominal padded window
+        (e.g. bogus/corrupt scene times) must still be clamped to the
+        nominal padded window, never wider -- narrowing must never
+        accidentally widen."""
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+        orchestrator._sar_scene_times = [
+            pd.Timestamp("2026-01-01T00:00:00"), pd.Timestamp("2026-03-01T00:00:00"),
+        ]
+
+        windows = orchestrator._padded_temporal_bounds("ascat_ssm")
+
+        assert windows == [("2026-01-31T12:00:00", "2026-02-03T12:00:00")]
+
+    def test_falls_back_to_one_window_when_sar_scene_times_is_none(self, tmp_path):
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+        assert orchestrator._sar_scene_times is None
+
+        windows = orchestrator._padded_temporal_bounds("ascat_ssm")
+
+        assert windows == [("2026-01-31T12:00:00", "2026-02-03T12:00:00")]
 
     def test_ascat_ssm_download_receives_padded_bounds(self, tmp_path):
         """The actual downloader call must see the padded start/end, not

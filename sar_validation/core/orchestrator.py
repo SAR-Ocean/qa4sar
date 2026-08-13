@@ -17,7 +17,9 @@ import logging
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
 
 from ..downloaders.base import build_output_dir
 from .recipe import Recipe
@@ -166,23 +168,6 @@ def _resolve_temporal_padding_minutes(cfg, *source_types: str) -> float:
     return max(tolerances) if tolerances else fallback
 
 
-def _padded_temporal_bounds(cfg, *source_types: str) -> "tuple[str, str]":
-    """(start, end) ISO strings, padded symmetrically by
-    :func:`_resolve_temporal_padding_minutes` on each side of
-    ``cfg.temporal_bounds`` -- for passing to a downloader's own
-    ``start``/``end`` arguments. Does not mutate ``cfg.temporal_bounds``
-    itself, since other logic (output folder naming, coverage-cutoff
-    comparisons, metadata) must keep using the literal requested range.
-    """
-    import pandas as pd
-
-    pad = pd.Timedelta(minutes=_resolve_temporal_padding_minutes(cfg, *source_types))
-    temp = cfg.temporal_bounds
-    start = (pd.Timestamp(temp.start) - pad).isoformat()
-    end = (pd.Timestamp(temp.end) + pad).isoformat()
-    return start, end
-
-
 def _sar_entry_found_data(
     entry: Dict[str, Any],
     sar_dir: Optional[Path] = None,
@@ -268,6 +253,16 @@ class DataOrchestrator:
             "notices":   [],
         }
 
+        # Populated by _compute_sar_scene_times() (see download_all()) from
+        # the real downloaded SAR files' own embedded timestamps, sorted
+        # ascending -- consumed by _padded_temporal_bounds to narrow every
+        # validation source's download window to what the actual SAR
+        # scene(s) need, not the recipe's full nominal temporal_bounds.
+        # None until then, and stays None on any extraction failure -- this
+        # is purely an optimization, never allowed to change what a
+        # download would do in its absence.
+        self._sar_scene_times: Optional[List[pd.Timestamp]] = None
+
     # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------
@@ -298,29 +293,42 @@ class DataOrchestrator:
             shutil.rmtree(out_dir)
 
     def _run_download(
-        self, key: str, out_dir: Path, build_dl, build_kwargs, error_label: str,
+        self, key: str, out_dir: Path, build_dl, windows, build_kwargs, error_label: str,
         *, result_to_metadata=None,
     ) -> bool:
-        """Shared skeleton for the simple ``_download_*`` handlers: build the
-        downloader, call ``.download()``, clean up an empty output dir, and
-        record success/failure metadata under *key*.
+        """Shared skeleton for the simple ``_download_*`` handlers: build
+        the downloader once, call ``.download()`` once per window in
+        *windows* (concatenating results across windows -- a
+        single-element windows list, the common case when SAR-scene
+        clustering isn't in effect, makes exactly one call, identical to
+        today's behavior), clean up an empty output dir, and record
+        success/failure metadata under *key*.
 
         *build_dl* is a zero-arg callable returning the constructed
-        downloader. *build_kwargs* is a zero-arg callable returning the
-        ``download()`` keyword-argument dict. *result_to_metadata*, if
-        given, maps ``(download_result, downloader) -> dict`` merged into
-        the success entry; default is ``{"files": [str(p) for p in result]}``.
+        downloader (built once, reused across every window). *windows* is
+        a list of ``(start, end)`` ISO-string pairs, e.g. from
+        ``self._padded_temporal_bounds(...)``, or a literal single-element
+        list for a caller that doesn't window (e.g. SAR itself).
+        *build_kwargs* is a ``(start, end) -> dict`` callable returning
+        that window's ``download()`` keyword-argument dict (every other
+        kwarg, e.g. bbox, stays the same across windows -- only
+        start/end vary). *result_to_metadata*, if given, maps
+        ``(merged_result, downloader) -> dict`` merged into the success
+        entry; default is ``{"files": [str(p) for p in merged_result]}``.
         """
         try:
             dl = build_dl()
-            download_kwargs = build_kwargs()
-            result = dl.download(**download_kwargs)
+            merged_result: list = []
+            for start, end in windows:
+                download_kwargs = build_kwargs(start, end)
+                result = dl.download(**download_kwargs)
+                merged_result.extend(result or [])
             self._cleanup_if_empty(out_dir)
             entry: Dict[str, Any] = {"status": "dry_run" if self.dry_run else "success"}
             if result_to_metadata is not None:
-                entry.update(result_to_metadata(result, dl))
+                entry.update(result_to_metadata(merged_result, dl))
             else:
-                entry["files"] = [str(p) for p in (result or [])]
+                entry["files"] = [str(p) for p in merged_result]
             self.metadata["downloads"][key] = entry
             return True
         except Exception as exc:
@@ -408,6 +416,57 @@ class DataOrchestrator:
         return _sar_entry_found_data(
             self._previous_downloads.get("sar", {}), sar_dir=sar_dir, file_glob=file_glob,
         )
+
+    def _padded_temporal_bounds(self, *source_types: str) -> List[Tuple[str, str]]:
+        """List of (start, end) ISO-string windows, padded symmetrically by
+        :func:`_resolve_temporal_padding_minutes` on each side of
+        ``cfg.temporal_bounds`` -- for passing to a downloader's own
+        ``start``/``end`` arguments, once per window. Does not mutate
+        ``cfg.temporal_bounds`` itself, since other logic (output folder
+        naming, coverage-cutoff comparisons, metadata) must keep using the
+        literal requested range.
+
+        When ``self._sar_scene_times`` has been populated (see
+        ``_compute_sar_scene_times``, called from ``download_all`` once
+        real SAR files are on disk), the single nominal-padded window is
+        replaced by one *or more* narrower windows, clustered around the
+        real SAR scene(s): consecutive (sorted) scene times separated by
+        more than ``2 * pad`` start a new cluster -- that's exactly the
+        point at which their own ``+-pad`` windows stop overlapping, so a
+        genuine gap with nothing to collocate against sits between them.
+        Each cluster's own [min, max] is padded by the same ``pad`` and
+        clamped to the nominal padded window on both ends. The result can
+        only ever be a subset of the nominal-padded window's own span --
+        never wider -- and falls back to exactly today's single-window
+        behavior (a one-element list) whenever scene times aren't
+        available. See the design doc's Part 1.
+        """
+        cfg = self.recipe.config
+        pad = pd.Timedelta(minutes=_resolve_temporal_padding_minutes(cfg, *source_types))
+        temp = cfg.temporal_bounds
+        nominal_pad_start = pd.Timestamp(temp.start) - pad
+        nominal_pad_end   = pd.Timestamp(temp.end) + pad
+
+        if not self._sar_scene_times:
+            return [(nominal_pad_start.isoformat(), nominal_pad_end.isoformat())]
+
+        clusters: list[list[pd.Timestamp]] = [[self._sar_scene_times[0]]]
+        for t in self._sar_scene_times[1:]:
+            if t - clusters[-1][-1] > 2 * pad:
+                clusters.append([t])
+            else:
+                clusters[-1].append(t)
+
+        windows: list[tuple[str, str]] = []
+        for cluster in clusters:
+            cluster_pad_start = cluster[0] - pad
+            cluster_pad_end   = cluster[-1] + pad
+            start_ts = max(nominal_pad_start, cluster_pad_start)
+            end_ts   = min(nominal_pad_end, cluster_pad_end)
+            if start_ts <= end_ts:
+                windows.append((start_ts.isoformat(), end_ts.isoformat()))
+
+        return windows or [(nominal_pad_start.isoformat(), nominal_pad_end.isoformat())]
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -545,10 +604,11 @@ class DataOrchestrator:
         return self._run_download(
             "sar", out_dir,
             lambda: spec.build_downloader(out_dir, self.dry_run, self.force_download),
-            lambda: dict(
+            [(temp.start, temp.end)],
+            lambda start, end: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=temp.start,      end=temp.end,
+                start=start,            end=end,
                 **spec.extra_download_kwargs(cfg.sar_data),
             ),
             f"SAR ({cfg.sar_data.source})",
@@ -568,7 +628,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, *source_types)
+        windows = self._padded_temporal_bounds(*source_types)
 
         out_dir = self.base_dir / "copernicus_insitu"
 
@@ -580,12 +640,13 @@ class DataOrchestrator:
                 max_depth=max_depth,
                 force_download=self.force_download,
             )
-            dl.download(
-                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
-                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start,        end=pad_end,
-                source_types=source_types,
-            )
+            for start, end in windows:
+                dl.download(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=start,            end=end,
+                    source_types=source_types,
+                )
             self._cleanup_if_empty(out_dir)
             self.metadata["downloads"]["insitu"] = {
                 "status":       "dry_run" if self.dry_run else "success",
@@ -707,7 +768,7 @@ class DataOrchestrator:
         # Fixed literal, not source.source_type: this handler is only ever
         # dispatched for source_type "scatterometer" (see _dispatch_source),
         # and some existing tests call it directly with source=None.
-        pad_start, pad_end = _padded_temporal_bounds(cfg, "scatterometer")
+        windows = self._padded_temporal_bounds("scatterometer")
         out_dir = self.base_dir / "osi_saf_winds"
 
         return self._run_download(
@@ -715,10 +776,11 @@ class DataOrchestrator:
             lambda: ScatterometerDownloader(
                 output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
             ),
-            lambda: dict(
+            windows,
+            lambda start, end: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
+                start=start, end=end,
             ),
             "Scatterometer",
             result_to_metadata=lambda result, dl: {},
@@ -730,7 +792,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        windows = self._padded_temporal_bounds(source.source_type)
         eumdac_dir = self.base_dir / "ascat_ssm"
         hsaf_dir   = self.base_dir / "hsaf_ascat_ssm"
 
@@ -746,8 +808,13 @@ class DataOrchestrator:
         today = datetime.now(timezone.utc).date()
         hsaf_window_start = (today - timedelta(days=60)).isoformat()
 
-        req_start = pad_start[:10]
-        req_end   = pad_end[:10]
+        # windows is sorted ascending -- these are the overall requested
+        # span's start/end dates, used for the same branch-level
+        # attempted/coverage-cutoff logic as before Task 1. The per-window
+        # date checks below additionally skip any individual window that
+        # falls entirely outside a branch's own coverage.
+        req_start = windows[0][0][:10]
+        req_end   = windows[-1][1][:10]
 
         eumdac_attempted = req_start <= _ASCAT_COVERAGE_CUTOFF
         hsaf_attempted = req_end >= hsaf_window_start
@@ -756,22 +823,25 @@ class DataOrchestrator:
         eumdac_ok = True
         hsaf_ok = True
 
-        if req_start <= _ASCAT_COVERAGE_CUTOFF:
+        if eumdac_attempted:
             try:
                 eumdac_dl = ASCATSoilMoistureDownloader(
                     output_dir=eumdac_dir, dry_run=self.dry_run,
                     force_download=self.force_download,
                 )
-                files.extend(eumdac_dl.download(
-                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
-                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                    start=pad_start, end=pad_end,
-                ) or [])
+                for start, end in windows:
+                    if start[:10] > _ASCAT_COVERAGE_CUTOFF:
+                        continue
+                    files.extend(eumdac_dl.download(
+                        min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                        min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                        start=start, end=end,
+                    ) or [])
             except Exception as exc:
                 eumdac_ok = False
                 logger.error("ASCAT SSM (EUMDAC) download failed: %s", exc)
 
-        if req_end >= hsaf_window_start:
+        if hsaf_attempted:
             try:
                 hsaf_product = source.download_kwargs.get("hsaf_product", "h122")
                 hsaf_dl = HSAFDownloader(
@@ -779,11 +849,14 @@ class DataOrchestrator:
                     force_download=self.force_download,
                     product=hsaf_product,
                 )
-                files.extend(hsaf_dl.download(
-                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
-                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                    start=pad_start, end=pad_end,
-                ) or [])
+                for start, end in windows:
+                    if end[:10] < hsaf_window_start:
+                        continue
+                    files.extend(hsaf_dl.download(
+                        min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                        min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                        start=start, end=end,
+                    ) or [])
             except Exception as exc:
                 hsaf_ok = False
                 logger.error("ASCAT SSM (H-SAF) download failed: %s", exc)
@@ -860,18 +933,20 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        windows = self._padded_temporal_bounds(source.source_type)
         out_dir = self.base_dir / out_subdir
 
         try:
             dl = EarthdataSoilMoistureDownloader(
                 dataset=dataset, version=version, output_dir=out_dir, dry_run=self.dry_run,
             )
-            paths = dl.download(
-                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
-                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
-            )
+            paths: list = []
+            for start, end in windows:
+                paths.extend(dl.download(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=start, end=end,
+                ) or [])
             self._cleanup_if_empty(out_dir)
             self.metadata["downloads"][out_subdir] = {
                 "status": "dry_run" if self.dry_run else "success",
@@ -916,7 +991,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, "amsr_ssm")
+        windows = self._padded_temporal_bounds("amsr_ssm")
         out_dir = self.base_dir / "amsr_ssm"
 
         try:
@@ -924,11 +999,13 @@ class DataOrchestrator:
                 output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
                 allow_prompt=False,
             )
-            paths = dl.download(
-                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
-                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
-            )
+            paths: list = []
+            for start, end in windows:
+                paths.extend(dl.download(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=start, end=end,
+                ) or [])
             self._cleanup_if_empty(out_dir)
             entry = self.metadata["downloads"].setdefault("amsr_ssm", {})
             entry["files"] = [str(p) for p in paths]
@@ -989,16 +1066,17 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        windows = self._padded_temporal_bounds(source.source_type)
         out_dir = self.base_dir / "smos_ssm"
 
         return self._run_download(
             "smos_ssm", out_dir,
             lambda: SMOSDownloader(output_dir=out_dir, dry_run=self.dry_run),
-            lambda: dict(
+            windows,
+            lambda start, end: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
+                start=start, end=end,
             ),
             "SMOS SSM",
         )
@@ -1008,7 +1086,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        windows = self._padded_temporal_bounds(source.source_type)
         out_dir = self.base_dir / "cds_ssm"
         product_type = source.download_kwargs.get("product_type", "active")
 
@@ -1018,10 +1096,11 @@ class DataOrchestrator:
                 product_type=product_type,
                 output_dir=out_dir, dry_run=self.dry_run,
             ),
-            lambda: dict(
+            windows,
+            lambda start, end: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
+                start=start, end=end,
             ),
             f"C3S CDS SSM ({product_type})",
         )
@@ -1047,10 +1126,11 @@ class DataOrchestrator:
                 output_dir=out_dir, dry_run=self.dry_run,
                 time_tolerance_minutes=tolerance,
             ),
-            lambda: dict(
+            [(temp.start, temp.end)],
+            lambda start, end: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=temp.start, end=temp.end,
+                start=start, end=end,
             ),
             f"ERA5 ({cfg.variable})",
         )
@@ -1072,10 +1152,11 @@ class DataOrchestrator:
             lambda: HycomDownloader(
                 output_dir=out_dir, dry_run=self.dry_run, time_tolerance_minutes=tolerance,
             ),
-            lambda: dict(
+            [(temp.start, temp.end)],
+            lambda start, end: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=temp.start, end=temp.end,
+                start=start, end=end,
             ),
             "HyCOM",
         )
@@ -1085,7 +1166,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        windows = self._padded_temporal_bounds(source.source_type)
         out_dir = self.base_dir / f"scatterometer_{satellite}"
 
         return self._run_download(
@@ -1094,10 +1175,11 @@ class DataOrchestrator:
                 satellite=satellite,
                 output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
             ),
-            lambda: dict(
+            windows,
+            lambda start, end: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
+                start=start, end=end,
             ),
             f"{satellite} FTP scatterometer",
             result_to_metadata=lambda result, dl: {},
@@ -1117,7 +1199,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, "hf_radar_grid")
+        windows = self._padded_temporal_bounds("hf_radar_grid")
         out_dir = self.base_dir / "hf_radar"
 
         return self._run_download(
@@ -1129,10 +1211,11 @@ class DataOrchestrator:
                 max_depth=source.resolved_max_depth,
                 force_download=self.force_download,
             ),
-            lambda: dict(
+            windows,
+            lambda start, end: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
+                start=start, end=end,
             ),
             "HF radar",
             result_to_metadata=lambda result, dl: {"file_count": len(result or [])},
@@ -1146,7 +1229,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, "hf_radar_grid")
+        windows = self._padded_temporal_bounds("hf_radar_grid")
         out_dir = self.base_dir / "hfr_noaa"
         # Resolution is an optional per-source override, forwarded via the
         # established ValidationDataSource.download_kwargs channel.
@@ -1158,10 +1241,11 @@ class DataOrchestrator:
                 output_dir=out_dir, dry_run=self.dry_run,
                 resolution_km=resolution_km, force_download=self.force_download,
             ),
-            lambda: dict(
+            windows,
+            lambda start, end: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
+                start=start, end=end,
             ),
             "NOAA HF-radar",
             result_to_metadata=lambda result, dl: {},
@@ -1172,7 +1256,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, "hf_radar_grid")
+        windows = self._padded_temporal_bounds("hf_radar_grid")
         out_dir = self.base_dir / "hf_radar_historical"
 
         return self._run_download(
@@ -1180,10 +1264,11 @@ class DataOrchestrator:
             lambda: HFRadarHistoricalDownloader(
                 output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
             ),
-            lambda: dict(
+            windows,
+            lambda start, end: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
+                start=start, end=end,
             ),
             "HF radar historical",
             result_to_metadata=lambda result, dl: {"file_count": len(result or [])},
@@ -1194,7 +1279,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, "hf_radar_grid")
+        windows = self._padded_temporal_bounds("hf_radar_grid")
         # Resolution is an optional per-source override, forwarded via the
         # established ValidationDataSource.download_kwargs channel. None
         # (the recipe didn't set it) lets HFRadarUSDownloader auto-pick the
@@ -1209,11 +1294,13 @@ class DataOrchestrator:
                 resolution_km=resolution_km,
                 force_download=self.force_download,
             )
-            downloaded = dl.download(
-                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
-                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
-            ) or []
+            downloaded: list = []
+            for start, end in windows:
+                downloaded.extend(dl.download(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=start, end=end,
+                ) or [])
             for subdir in ("hfr_noaa", "hf_radar", "hf_radar_historical"):
                 self._cleanup_if_empty(self.base_dir / subdir)
             self.metadata["downloads"]["hf_radar_us"] = {
@@ -1237,7 +1324,7 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        windows = self._padded_temporal_bounds(source.source_type)
         out_dir = self.base_dir / f"{instrument}_historical"
 
         return self._run_download(
@@ -1250,10 +1337,11 @@ class DataOrchestrator:
                 max_depth=source.resolved_max_depth,
                 force_download=self.force_download,
             ),
-            lambda: dict(
+            windows,
+            lambda start, end: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
+                start=start, end=end,
             ),
             f"{instrument} delayed-mode currents",
             result_to_metadata=lambda result, dl: {"file_count": len(result or [])},
@@ -1289,7 +1377,7 @@ class DataOrchestrator:
         # source_type -- pass both so the padding lookup finds their
         # (equal, 180min) tolerance regardless of which frequency this
         # recipe's variable actually requests.
-        pad_start, pad_end = _padded_temporal_bounds(cfg, "altimeter_1hz", "altimeter_5hz")
+        windows = self._padded_temporal_bounds("altimeter_1hz", "altimeter_5hz")
         out_dir = self.base_dir / "altimeter"
         kwargs = {
             "frequencies": self._ALTIMETER_FREQUENCIES_BY_VARIABLE.get(
@@ -1303,10 +1391,11 @@ class DataOrchestrator:
             lambda: AltimeterDownloader(
                 output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
             ),
-            lambda: dict(
+            windows,
+            lambda start, end: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
+                start=start, end=end,
                 **kwargs,
             ),
             "Altimeter",
@@ -1317,17 +1406,18 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        windows = self._padded_temporal_bounds(source.source_type)
         out_dir = self.base_dir / "radiometer"
         kwargs = dict(source.download_kwargs)   # e.g. {"sensors": ["amsr2"]}
 
         return self._run_download(
             "radiometer", out_dir,
             lambda: RadiometerDownloader(output_dir=out_dir, dry_run=self.dry_run),
-            lambda: dict(
+            windows,
+            lambda start, end: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                 min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
+                start=start, end=end,
                 **kwargs,
             ),
             "Radiometer",
@@ -1338,19 +1428,21 @@ class DataOrchestrator:
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
+        windows = self._padded_temporal_bounds(source.source_type)
         out_dir = self.base_dir / "ismn"
 
         try:
             dl = ISMNDownloader(output_dir=out_dir, dry_run=self.dry_run)
-            paths = dl.download(
-                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
-                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=pad_start, end=pad_end,
-                min_depth=source.resolved_min_depth,
-                max_depth=source.resolved_max_depth,
-                archive_path=source.download_kwargs.get("ismn_archive_path"),
-            )
+            paths: list = []
+            for start, end in windows:
+                paths.extend(dl.download(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=start, end=end,
+                    min_depth=source.resolved_min_depth,
+                    max_depth=source.resolved_max_depth,
+                    archive_path=source.download_kwargs.get("ismn_archive_path"),
+                ) or [])
             self._cleanup_if_empty(out_dir)
             if self.dry_run:
                 status = "dry_run"
