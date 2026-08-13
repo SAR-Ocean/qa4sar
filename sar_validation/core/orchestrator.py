@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 from ..downloaders.base import build_output_dir
@@ -505,6 +506,40 @@ class DataOrchestrator:
 
         return windows or [(nominal_pad_start.isoformat(), nominal_pad_end.isoformat())]
 
+    def _compute_sar_scene_times(self) -> None:
+        """Populate self._sar_scene_times (sorted ascending) from the
+        just-downloaded SAR files' real embedded timestamps, reusing each
+        source's own .convert callable (see sar_sources.py's SAR_SOURCES
+        registry) -- never new parsing code, and works identically for
+        every SAR source type (sentinel1_l2_ocn, sentinel1_clms_ssm,
+        nisar_sme2, radarsat2, or any future entry), since SAR_SOURCES is
+        keyed dynamically by cfg.sar_data.source. Left as None (falls
+        back to today's nominal-window-only padding, see
+        _padded_temporal_bounds) on ANY failure -- this is purely an
+        optimization, never allowed to block download_all() or narrow a
+        window incorrectly.
+        """
+        from .sar_sources import SAR_SOURCES
+
+        cfg = self.recipe.config
+        spec = SAR_SOURCES[cfg.sar_data.source]
+        product_type = cfg.variable
+        files = self.metadata["downloads"].get("sar", {}).get("files", [])
+
+        times: list = []
+        for f in files:
+            try:
+                ds = spec.convert(Path(f), product_type)
+                if ds is None or "time" not in ds.coords:
+                    continue
+                raw = ds.coords["time"].values
+                times.extend(pd.to_datetime(np.atleast_1d(raw)).tolist())
+            except Exception as exc:
+                logger.debug("Could not extract scene time from %s: %s", f, exc)
+
+        if times:
+            self._sar_scene_times = sorted(times)
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -540,6 +575,8 @@ class DataOrchestrator:
             if not self.dry_run:
                 self._save_metadata()
             return ok
+
+        self._compute_sar_scene_times()
 
         # 2. Delayed-mode ("*_historical") sources first. hf_radar and the
         # NRT in-situ batch (below) consult file_count from these results

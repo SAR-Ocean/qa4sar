@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
+import xarray as xr
 
 from sar_validation.core.orchestrator import DataOrchestrator
 from sar_validation.core.recipe import (
@@ -574,6 +575,210 @@ class TestDownloadTemporalPadding:
         call_kwargs = mock_instance.download.call_args.kwargs
         assert call_kwargs["start"] == "2026-02-01"
         assert call_kwargs["end"] == "2026-02-03"
+
+
+class TestComputeSarSceneTimes:
+    """self._sar_scene_times is populated (sorted) from the real SAR
+    files' embedded timestamps via each source's own .convert callable
+    (never new parsing code) -- proving genericity across SAR source
+    types, per spec Part 1 'Applies to every SAR source and every
+    recipe type.'"""
+
+    def test_single_scene(self, tmp_path):
+        import dataclasses
+
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        recipe = _recipe("sentinel1_clms_ssm")
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        scene_file = tmp_path / "scene.tif"
+        scene_file.touch()
+        orch.metadata["downloads"]["sar"] = {"files": [str(scene_file)]}
+
+        fake_ds = xr.Dataset(coords={"time": pd.Timestamp("2026-01-01T06:00:00")})
+        real_spec = SAR_SOURCES["sentinel1_clms_ssm"]
+        fake_spec = dataclasses.replace(real_spec, convert=lambda path, pt: fake_ds)
+
+        with patch.dict(
+            "sar_validation.core.sar_sources.SAR_SOURCES",
+            {"sentinel1_clms_ssm": fake_spec},
+        ):
+            orch._compute_sar_scene_times()
+
+        assert orch._sar_scene_times == [pd.Timestamp("2026-01-01T06:00:00")]
+
+    def test_multiple_scenes_are_sorted_regardless_of_file_order(self, tmp_path):
+        import dataclasses
+
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        recipe = _recipe("sentinel1_clms_ssm")
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        f1, f2, f3 = (tmp_path / n for n in ("a.tif", "b.tif", "c.tif"))
+        for f in (f1, f2, f3):
+            f.touch()
+        # Deliberately listed out of chronological order (f3's time is
+        # earliest) -- _compute_sar_scene_times must sort, not just
+        # preserve the files list's own order.
+        orch.metadata["downloads"]["sar"] = {"files": [str(f1), str(f2), str(f3)]}
+
+        scene_times = {
+            str(f1): pd.Timestamp("2026-01-02T00:00:00"),
+            str(f2): pd.Timestamp("2026-01-03T00:00:00"),
+            str(f3): pd.Timestamp("2026-01-01T00:00:00"),
+        }
+        real_spec = SAR_SOURCES["sentinel1_clms_ssm"]
+        fake_spec = dataclasses.replace(
+            real_spec,
+            convert=lambda path, pt: xr.Dataset(coords={"time": scene_times[str(path)]}),
+        )
+
+        with patch.dict(
+            "sar_validation.core.sar_sources.SAR_SOURCES",
+            {"sentinel1_clms_ssm": fake_spec},
+        ):
+            orch._compute_sar_scene_times()
+
+        assert orch._sar_scene_times == [
+            pd.Timestamp("2026-01-01T00:00:00"),
+            pd.Timestamp("2026-01-02T00:00:00"),
+            pd.Timestamp("2026-01-03T00:00:00"),
+        ]
+
+    def test_converter_exception_leaves_times_none(self, tmp_path):
+        import dataclasses
+
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        recipe = _recipe("sentinel1_clms_ssm")
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        scene_file = tmp_path / "scene.tif"
+        scene_file.touch()
+        orch.metadata["downloads"]["sar"] = {"files": [str(scene_file)]}
+
+        def _raise(path, pt):
+            raise RuntimeError("corrupt file")
+
+        real_spec = SAR_SOURCES["sentinel1_clms_ssm"]
+        fake_spec = dataclasses.replace(real_spec, convert=_raise)
+
+        with patch.dict(
+            "sar_validation.core.sar_sources.SAR_SOURCES",
+            {"sentinel1_clms_ssm": fake_spec},
+        ):
+            orch._compute_sar_scene_times()  # must not raise
+
+        assert orch._sar_scene_times is None
+
+    def test_no_files_leaves_times_none(self, tmp_path):
+        recipe = _recipe("sentinel1_clms_ssm")
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        orch.metadata["downloads"]["sar"] = {"files": []}
+
+        orch._compute_sar_scene_times()
+
+        assert orch._sar_scene_times is None
+
+    def test_end_to_end_narrows_ascat_ssm_download_window(self, tmp_path):
+        """Proves the full wiring: download_all()'s SAR-scene-times step
+        actually narrows a real _download_* method's window, not just
+        the unit-level _padded_temporal_bounds arithmetic in isolation."""
+        import dataclasses
+
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        recipe = _recipe("sentinel1_clms_ssm")
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        scene_file = tmp_path / "scene.tif"
+        scene_file.touch()
+        orch.metadata["downloads"]["sar"] = {"files": [str(scene_file)]}
+
+        real_spec = SAR_SOURCES["sentinel1_clms_ssm"]
+        fake_spec = dataclasses.replace(
+            real_spec,
+            convert=lambda path, pt: xr.Dataset(
+                coords={"time": pd.Timestamp("2026-01-01T06:00:00")},
+            ),
+        )
+
+        with patch.dict(
+            "sar_validation.core.sar_sources.SAR_SOURCES",
+            {"sentinel1_clms_ssm": fake_spec},
+        ):
+            orch._compute_sar_scene_times()
+            windows = orch._padded_temporal_bounds("ascat_ssm")
+
+        # _recipe("sentinel1_clms_ssm")'s temporal_bounds is 2026-01-01..
+        # 2026-01-02 (see the module-level _recipe helper); ascat_ssm's
+        # tolerance (via "scatterometer_ssm") is 720min (12h). A single
+        # scene at 2026-01-01T06:00 padded +-12h narrows below the
+        # nominal window's own +-12h-padded bounds.
+        assert windows == [("2025-12-31T18:00:00", "2026-01-01T18:00:00")]
+
+    def test_end_to_end_two_gapped_scenes_produce_two_download_windows(self, tmp_path):
+        """The scenario this task exists for: two SAR scenes with a real
+        gap between them (further apart than 2x the collocation
+        tolerance) must produce TWO separate download windows through
+        the full real wiring (files on disk -> _compute_sar_scene_times
+        -> _padded_temporal_bounds), not one span covering the gap."""
+        import dataclasses
+
+        from sar_validation.core.recipe import (
+            CollocationType,
+            GeographicBounds,
+            RecipeConfig,
+            SARDataSpec,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        # A 10-day window wide enough to hold two well-separated scenes.
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-10"),
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
+            validation_sources=[ValidationDataSource(source_type="ascat_ssm")],
+            collocation=CollocationType(),
+        )
+        recipe = Recipe(cfg)
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        f1, f2 = tmp_path / "day1.tif", tmp_path / "day8.tif"
+        f1.touch()
+        f2.touch()
+        orch.metadata["downloads"]["sar"] = {"files": [str(f1), str(f2)]}
+
+        scene_times = {
+            str(f1): pd.Timestamp("2026-01-02T00:00:00"),
+            str(f2): pd.Timestamp("2026-01-09T00:00:00"),
+        }
+        real_spec = SAR_SOURCES["sentinel1_clms_ssm"]
+        fake_spec = dataclasses.replace(
+            real_spec,
+            convert=lambda path, pt: xr.Dataset(coords={"time": scene_times[str(path)]}),
+        )
+
+        with patch.dict(
+            "sar_validation.core.sar_sources.SAR_SOURCES",
+            {"sentinel1_clms_ssm": fake_spec},
+        ):
+            orch._compute_sar_scene_times()
+            windows = orch._padded_temporal_bounds("ascat_ssm")
+
+        # 7-day gap between scenes, tolerance is 12h (2*pad=24h) -- nowhere
+        # close to overlapping, so this must be two disjoint windows, each
+        # only +-12h around its own scene, NOT one 2026-01-01..2026-01-10
+        # span covering the whole 7-day gap in between.
+        assert len(windows) == 2
+        assert windows[0] == ("2026-01-01T12:00:00", "2026-01-02T12:00:00")
+        assert windows[1] == ("2026-01-08T12:00:00", "2026-01-09T12:00:00")
 
 
 class TestModelSourceTemporalPadding:
