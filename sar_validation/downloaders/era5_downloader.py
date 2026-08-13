@@ -209,8 +209,9 @@ class ERA5Downloader:
         multi_window = len(windows) > 1
 
         downloaded: list[Path] = []
-        day = window_start.date()
-        end_day = window_end.date()
+        buffer = timedelta(hours=self.time_tolerance_minutes / 60.0)
+        day = (window_start - buffer).date()
+        end_day = (window_end + buffer).date()
         while day <= end_day:
             hours = _hours_needed_for_day(
                 day, window_start, window_end, buffer_hours=self.time_tolerance_minutes / 60.0,

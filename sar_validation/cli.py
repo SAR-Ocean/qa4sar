@@ -12,7 +12,7 @@ Usage
   # Create a recipe template (wind | currents | waves | soil_moisture)
   sar-validate --create-recipe wind
 
-  # Store credentials in the OS keyring (eumdac | osi_saf | gportal | smos)
+  # Store credentials in the OS keyring (eumdac | osi_saf | gportal | smos | hsaf | space_track)
   sar-validate --set-credential eumdac
 
   # Dry-run (see what would be downloaded)
@@ -106,9 +106,9 @@ Examples:
     parser.add_argument(
         "--set-credential",
         metavar="SERVICE",
-        choices=["eumdac", "osi_saf", "gportal", "smos", "earthdata"],
+        choices=["eumdac", "osi_saf", "gportal", "smos", "earthdata", "hsaf", "space_track"],
         help="Prompt for a username/password and store them in the OS keyring "
-             "for SERVICE (eumdac | osi_saf | gportal | smos | earthdata)",
+             "for SERVICE (eumdac | osi_saf | gportal | smos | earthdata | hsaf | space_track)",
     )
     parser.add_argument(
         "--limit",
@@ -289,7 +289,7 @@ Examples:
 def _set_credential(name: str) -> None:
     """Prompt for a username/password and store them in the OS keyring.
 
-    Backs ``sar-validate --set-credential {eumdac,osi_saf,gportal,smos,earthdata}``.
+    Backs ``sar-validate --set-credential {eumdac,osi_saf,gportal,smos,earthdata,hsaf,space_track}``.
     """
     import getpass
 

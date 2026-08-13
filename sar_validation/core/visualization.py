@@ -31,7 +31,7 @@ import logging
 import math
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import xarray as xr
@@ -857,6 +857,7 @@ def plot_geographic(
     interactive: bool = False,
     geographic_bounds: Optional["GeographicBounds"] = None,
     two_column_by_type: bool = False,
+    on_figure: Optional[Callable[[str, "Figure"], None]] = None,
     skip_domain_harmonization: bool = False,
 ):
     """
@@ -942,6 +943,17 @@ def plot_geographic(
         has one type present. Returns dict[scene_name, Figure] in this
         mode instead of dict[collocation_type, Figure]. Ignored (no-op)
         unless split_by == "collocation_type".
+    on_figure : callable(scene_name, Figure), optional
+        Only used when two_column_by_type is True. If given, each scene's
+        Figure is handed to this callback immediately after being built,
+        instead of being accumulated in the returned dict -- the caller
+        becomes responsible for the figure's lifecycle (writing + closing
+        it). Fixes a real bug: without this, a many-scene recipe (e.g.
+        NISAR's per-orbit granules) could have every scene's Figure open
+        simultaneously before this function ever returns, well past
+        matplotlib's 20-open-figure warning threshold. When on_figure is
+        given, the returned dict contains no entries for the scenes
+        handed to it.
     skip_domain_harmonization : bool
         When True, force ``domains_differ`` to False unconditionally,
         skipping the whole SAR-vs-validation units-mismatch detection and
@@ -1682,7 +1694,10 @@ def plot_geographic(
         for scene_name in scene_names:
             fig = _build_scene_pair_figure(scene_name)
             if fig is not None:
-                scene_figures[scene_name] = fig
+                if on_figure is not None:
+                    on_figure(scene_name, fig)
+                else:
+                    scene_figures[scene_name] = fig
         return scene_figures
 
     if group_values is None:
@@ -2183,14 +2198,15 @@ def plot_temporal_offset(
 #: in the collocation-diagnostics plot. Calibrated against a real
 #: Sentinel-1 CLMS SSM daily mosaic's actual valid-pixel area (~503 deg^2)
 #: so that source keeps its historical ~3000-dot look; deriving each
-#: scene's own target dot count from its actual valid-pixel area (see
-#: _adaptive_footprint_target_count), rather than a single flat count for
-#: every scene, keeps this same visual spacing regardless of scene size.
-#: Without this, a small NISAR SME2 per-orbit granule (confirmed against
-#: real converted data: ~217x smaller valid-pixel area than a real
-#: Sentinel-1 scene) got the same ~3000 dots as the huge Sentinel-1
-#: mosaic, crammed ~18x closer together -- reading as a solid blob
-#: instead of discernible points.
+#: scene's own sampling stride from a nominal (not valid-masked) cell
+#: count (see :func:`_reference_cell_count` and
+#: :func:`_adaptive_footprint_stride`), rather than a single flat count
+#: for every scene, keeps this same visual spacing regardless of scene
+#: size or masked/water fraction. Without this, a small NISAR SME2
+#: per-orbit granule (confirmed against real converted data: ~217x
+#: smaller valid-pixel area than a real Sentinel-1 scene) got the same
+#: ~3000 dots as the huge Sentinel-1 mosaic, crammed ~18x closer
+#: together -- reading as a solid blob instead of discernible points.
 _FOOTPRINT_DOT_SPACING_DEG = 0.4
 #: Floor so a tiny scene still shows enough dots for its footprint shape
 #: to be recognizable, and ceiling matching the historical flat default
@@ -2199,30 +2215,60 @@ _FOOTPRINT_MIN_DOTS = 150
 _FOOTPRINT_MAX_DOTS = 3000
 
 
-def _adaptive_footprint_target_count(
-    lons: np.ndarray, lats: np.ndarray, total_valid: int,
+def _reference_cell_count(
+    lons: np.ndarray, lats: np.ndarray,
+    geographic_bounds: Optional["GeographicBounds"] = None,
+) -> int:
+    """Nominal grid-cell count used as the area basis for
+    :func:`_adaptive_footprint_stride` -- deliberately NOT gated by data
+    validity (a masked/water-covered cell still counts, so a mostly-
+    masked scene isn't treated as physically smaller than a fully-valid
+    one of the same footprint/resolution), and clipped to
+    *geographic_bounds* (the recipe's bbox) when given, rather than the
+    scene's full extent -- so a scene whose bbox-visible sliver is a
+    small fraction of its huge full extent (SAR grids are stored
+    uncropped, see design-choices.md §4.1) gets a density target sized
+    to what's actually visible, not the whole scene.
+    """
+    if geographic_bounds is None:
+        return int(lons.size)
+    in_bounds = (
+        (lons >= geographic_bounds.min_lon) & (lons <= geographic_bounds.max_lon)
+        & (lats >= geographic_bounds.min_lat) & (lats <= geographic_bounds.max_lat)
+    )
+    return int(in_bounds.sum())
+
+
+def _adaptive_footprint_stride(
+    lons: np.ndarray, lats: np.ndarray, reference_cells: int,
 ) -> int:
     """
-    Derive a target dot count from the grid's own native cell size
-    (measured directly off *lons*/*lats*) and *total_valid*'s actual
-    valid-pixel area, clamped to [:data:`_FOOTPRINT_MIN_DOTS`,
-    :data:`_FOOTPRINT_MAX_DOTS`] -- see :data:`_FOOTPRINT_DOT_SPACING_DEG`
-    for why. Falls back to :data:`_FOOTPRINT_MAX_DOTS` (today's flat
-    behavior) if the grid is degenerate (a single row or column, so no
-    cell size can be measured).
+    Sampling stride (in grid cells) that gives every scene the same
+    physical dot spacing (:data:`_FOOTPRINT_DOT_SPACING_DEG`) regardless
+    of its valid/masked fraction, clamped so a *reference_cells*-sized
+    area still shows between :data:`_FOOTPRINT_MIN_DOTS` and
+    :data:`_FOOTPRINT_MAX_DOTS` dots. *reference_cells* is a nominal
+    (not valid-masked) count -- see :func:`_reference_cell_count`.
+
+    Falls back to a stride of 1 (no thinning) if the grid is degenerate
+    (a single row/column, so no cell size can be measured) or
+    *reference_cells* is 0.
     """
     dlon = abs(float(lons[0, 1] - lons[0, 0])) if lons.shape[1] > 1 else 0.0
     dlat = abs(float(lats[1, 0] - lats[0, 0])) if lats.shape[0] > 1 else 0.0
-    if dlon <= 0 or dlat <= 0:
-        return _FOOTPRINT_MAX_DOTS
-    area_deg2 = total_valid * dlon * dlat
-    count = int(area_deg2 / (_FOOTPRINT_DOT_SPACING_DEG ** 2))
-    return max(_FOOTPRINT_MIN_DOTS, min(_FOOTPRINT_MAX_DOTS, count))
+    if dlon <= 0 or dlat <= 0 or reference_cells <= 0:
+        return 1
+    direct_stride = _FOOTPRINT_DOT_SPACING_DEG / math.sqrt(dlon * dlat)
+    ceiling_stride = math.sqrt(reference_cells / _FOOTPRINT_MAX_DOTS)
+    floor_stride = math.sqrt(reference_cells / _FOOTPRINT_MIN_DOTS)
+    stride = max(ceiling_stride, min(direct_stride, floor_stride))
+    return max(1, int(round(stride)))
 
 
 def _downsampled_valid_pixel_coords(
     valid_mask: np.ndarray, lons: np.ndarray, lats: np.ndarray,
     target_count: Optional[int] = None,
+    geographic_bounds: Optional["GeographicBounds"] = None,
 ) -> list:
     """
     Return (lon, lat) centers of a strided subsample of *valid_mask*'s True
@@ -2233,20 +2279,23 @@ def _downsampled_valid_pixel_coords(
     tracing the actual overpass-swath shape instead of a bounding rectangle
     over the grid's full nominal extent.
 
-    *target_count*, if not given, is derived from the scene's own
-    valid-pixel area via :func:`_adaptive_footprint_target_count` instead
-    of defaulting to a flat count -- so a small scene (e.g. a NISAR SME2
-    per-orbit granule) is thinned to fewer, more widely-spaced dots than a
-    large one (e.g. Sentinel-1 CLMS SSM's continental daily mosaic),
-    keeping the resulting dot-to-dot spacing roughly consistent across
-    wildly different scene sizes rather than the dot count.
+    *target_count*, if not given, is derived from a fixed physical dot
+    spacing and the scene's own native cell size (see
+    :func:`_adaptive_footprint_stride`), clamped using a *nominal* (not
+    valid-masked) cell count -- optionally clipped to *geographic_bounds*
+    -- rather than a flat count for every scene. This keeps dot spacing
+    consistent both across scenes of different sizes/masked-fractions
+    within one plot, and within the portion of a scene that's actually
+    visible when only part of it falls inside the recipe's bbox.
     """
     total = int(valid_mask.sum())
     if total == 0:
         return []
     if target_count is None:
-        target_count = _adaptive_footprint_target_count(lons, lats, total)
-    stride = max(1, int(np.sqrt(total / target_count)))
+        reference_cells = _reference_cell_count(lons, lats, geographic_bounds)
+        stride = _adaptive_footprint_stride(lons, lats, reference_cells)
+    else:
+        stride = max(1, int(np.sqrt(total / target_count)))
     strided_mask = valid_mask[::stride, ::stride]
     ys, xs = np.where(strided_mask)
     lon_sub = lons[::stride, ::stride][ys, xs]
@@ -2546,7 +2595,10 @@ def _plot_collocation_diagnostics_impl(
                 data_valid = np.isfinite(scene_ds[data_vars[0]].values)
                 if data_valid.shape == lons.shape:
                     coverage_points.extend(
-                        _downsampled_valid_pixel_coords(data_valid, lons, lats)
+                        _downsampled_valid_pixel_coords(
+                            data_valid, lons, lats,
+                            geographic_bounds=recipe.config.geographic_bounds,
+                        )
                     )
                 else:
                     scene_bounds.append({
@@ -2582,12 +2634,18 @@ def _plot_collocation_diagnostics_impl(
     # point to mark unmatched. Still plot the SAR coverage rather than
     # bailing out, so a recipe with real SAR data but no validation data
     # yet still gets the diagnostic (and not a silently-missing plot).
+    #
+    # This also fires (harmlessly) whenever every validation source is
+    # grid-shaped (e.g. a recipe whose only source is ERA5 -- its node
+    # keeps native (time, lat, lon) dims, never flattened to "point", see
+    # _extract_validation_data_for_plot's own docstring) -- there's
+    # nothing misleading to warn about there: matched points still render
+    # correctly via the separate collocation_results.nc-driven "matched"
+    # tier below, this only empties the raw-datatree "unmatched" overlay,
+    # which is meaningless for gridded data anyway. Not logged, since it's
+    # an expected, already-correctly-handled case, not a real problem.
     all_val_data = _extract_validation_data_for_plot(datatree)
     if not all_val_data:
-        logger.warning(
-            "plot_collocation_diagnostics: No validation data found in "
-            "DataTree -- plotting SAR coverage only."
-        )
         all_val_lons = np.array([])
         all_val_lats = np.array([])
         all_val_times = np.array([])
@@ -2856,7 +2914,7 @@ def _plot_collocation_diagnostics_impl(
         ]
         cov_lats = [lat for _, lat in coverage_points]
         ax.scatter(
-            cov_lons, cov_lats, s=3, c="blue", alpha=0.4, marker=".",
+            cov_lons, cov_lats, s=5, c="blue", alpha=0.4, marker=".",
             transform=box_transform, zorder=1, label="SAR coverage (overpasses)",
         )
 
@@ -3842,29 +3900,38 @@ def validation_report(
                     geo_point_size = 5 if (n_points / n_scenes) > 300 else 15
             else:
                 geo_point_size = 40
+            is_soil_moisture_two_column = (variable == "soil_moisture")
+            _geo_scene_index = [0]
+
+            def _write_geo_figure(group, fig_geo, index):
+                if cdf_matched_suffix:
+                    fig_geo = _mark_cdf_matched(
+                        fig_geo, description=_CDF_MATCHED_DESCRIPTION if index == 0 else None,
+                    )
+                figs.append(fig_geo)
+                title = f"{sar_var} vs {val_var} — geographic [{group}]{cdf_matched_suffix}"
+                if base_dir is not None:
+                    _write_page(title, _finalize_figure_for_report(fig_geo, None))
+
+            def _on_geo_figure(scene_name, fig_geo):
+                _write_geo_figure(scene_name, fig_geo, _geo_scene_index[0])
+                _geo_scene_index[0] += 1
+
             geo_result = plot_geographic(
                 datatree, cdf_geo_pair_ds, sar_var, val_var, scenes=matched_scenes,
                 point_size=geo_point_size,
                 geographic_bounds=(
                     recipe.config.geographic_bounds if geo_clamp_bounds else None
                 ),
-                two_column_by_type=(variable == "soil_moisture"),
+                two_column_by_type=is_soil_moisture_two_column,
+                on_figure=_on_geo_figure if is_soil_moisture_two_column else None,
             )
-            if isinstance(geo_result, dict):
-                # plot_geographic can return one Figure *per SAR scene*
-                # (two_column_by_type=True, soil_moisture's own mode) --
-                # the section-opening description belongs on the very
-                # first page of the section, not repeated on every scene.
+            if is_soil_moisture_two_column:
+                pass  # each scene's figure was already written+closed via _on_geo_figure
+            elif isinstance(geo_result, dict):
                 for i, (group, fig_geo) in enumerate(geo_result.items()):
                     if fig_geo is not None:
-                        if cdf_matched_suffix:
-                            fig_geo = _mark_cdf_matched(
-                                fig_geo, description=_CDF_MATCHED_DESCRIPTION if i == 0 else None,
-                            )
-                        figs.append(fig_geo)
-                        title = f"{sar_var} vs {val_var} — geographic [{group}]{cdf_matched_suffix}"
-                        if base_dir is not None:
-                            _write_page(title, _finalize_figure_for_report(fig_geo, None))
+                        _write_geo_figure(group, fig_geo, i)
             elif geo_result is not None:
                 if cdf_matched_suffix:
                     geo_result = _mark_cdf_matched(geo_result, description=_CDF_MATCHED_DESCRIPTION)
@@ -4137,14 +4204,13 @@ def validation_report(
         # When base_dir is not None, each fig here was already closed inside
         # _finalize_figure_for_report. _write_page's page Figures are separate
         # lightweight image-page objects, not these same objects — so this
-        # loop is a safe, idempotent no-op double-close. Closing here
-        # deregisters them from pyplot's global figure manager to avoid
-        # accumulating figures across pairs and across the two
-        # collocation-method passes triggered by
-        # --layer-vs-layer-collocation-method both.
-        if base_dir is not None:
-            for fig in figs:
-                plt.close(fig)
+        # loop is a safe, idempotent no-op double-close in that case. When
+        # base_dir IS None (no report written to disk), this is the only
+        # place these figures ever get closed -- previously guarded by
+        # `if base_dir is not None`, which meant every figure built during
+        # a base_dir=None call leaked for the life of the process.
+        for fig in figs:
+            plt.close(fig)
 
     # Combined PDF — saved alongside the validation_statistics_*.nc files.
     # Only opened (via _open_pdf, above) if at least one page was actually

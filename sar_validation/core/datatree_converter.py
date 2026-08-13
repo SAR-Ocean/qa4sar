@@ -337,6 +337,26 @@ def _parse_ssm_timestamp(filename: str) -> np.datetime64:
     )
 
 
+_ASCAT_RESOLUTION_RE = re.compile(r"-(\d+\.?\d*)km-")
+
+
+def _parse_ascat_resolution_km(filename: str) -> float:
+    """Parse the spatial-sampling resolution (km) embedded in an ASCAT SSM
+    filename -- H-SAF's H29 ("-12.5km-") and H122 ("-6.25km-") filenames
+    both embed it; EUMDAC/SOMO12 filenames never do (confirmed against
+    ascat_soil_moisture_downloader.py's real filename example), so this
+    falls back to 12.5 (SOMO12's own, and H29's, shared resolution) when
+    no match is found.
+    """
+    m = _ASCAT_RESOLUTION_RE.search(filename)
+    if not m:
+        return 12.5
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return 12.5
+
+
 class DataTreeConverter:
     """Convert various data formats to standardised xarray objects."""
 
@@ -1265,6 +1285,7 @@ class DataTreeConverter:
         *, data_type: str, var_attrs: dict, platform_type: str, source: str,
         sensing_depth_cm: str, band: str, filename: str,
         sensor: Optional[str] = None, native_grid_deg: Optional[float] = None,
+        ascat_resolution_km: Optional[float] = None,
     ) -> xr.Dataset:
         """Build the flat-point SOIL_MOISTURE Dataset + attrs shared by every
         ``from_*_ssm`` parser. Caller is responsible for pre-filtering
@@ -1289,6 +1310,8 @@ class DataTreeConverter:
         ds.attrs["filename"]         = filename
         if native_grid_deg is not None:
             ds.attrs["native_grid_deg"] = native_grid_deg
+        if ascat_resolution_km is not None:
+            ds.attrs["ascat_resolution_km"] = ascat_resolution_km
         return ds
 
     @staticmethod
@@ -1366,6 +1389,78 @@ class DataTreeConverter:
             platform_type="ascat_ssm",
             source="ASCAT Soil Moisture 12.5km Swath Grid (EO:EUM:DAT:METOP:SOMO12)",
             sensing_depth_cm="0-5", band="C", filename=path.name,
+            ascat_resolution_km=_parse_ascat_resolution_km(path.name),
+        )
+
+    @staticmethod
+    def from_hsaf_ssm(path: Union[str, Path]) -> Optional[xr.Dataset]:
+        """
+        Open an H-SAF ASCAT Surface Soil Moisture NRT (H29) product.
+
+        Unlike the EUMDAC/SOMO12 path (from_ascat_ssm, via the ``ascat``
+        package's WARP5-grid-aware reader), H29 files ship a flat
+        ``(obs,)`` array with ``latitude``/``longitude``/``time`` already
+        resolved to real per-observation coordinates -- CONFIRMED against
+        a real downloaded file (see hsaf_downloader.py's module
+        docstring): no grid-point-ID lookup is needed, so this reads the
+        file directly with xarray rather than routing through ``ascat``.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to the downloaded H-SAF H29 product file.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="scatterometer_ssm"``, or None on failure.
+        """
+        path = Path(path)
+        if not path.exists():
+            logger.warning("H-SAF SSM file not found: %s", path)
+            return None
+
+        try:
+            data = xr.open_dataset(path)
+        except Exception as exc:
+            logger.warning("Could not read H-SAF SSM file %s: %s", path, exc)
+            return None
+
+        if "surface_soil_moisture" not in data:
+            logger.warning("No 'surface_soil_moisture' field in %s.", path.name)
+            return None
+        if not ("longitude" in data and "latitude" in data and "time" in data):
+            logger.warning(
+                "Missing longitude/latitude/time field(s) in %s (available: %s).",
+                path.name,
+                list(data.coords) + list(data.data_vars),
+            )
+            return None
+
+        lon = ((data["longitude"].values.ravel() + 180) % 360) - 180
+        lat = data["latitude"].values.ravel()
+        time_vals = pd.to_datetime(data["time"].values.ravel())
+        sm = data["surface_soil_moisture"].values.ravel().astype(float)
+
+        valid = ~np.isnan(sm)
+        if not valid.any():
+            logger.warning("from_hsaf_ssm: all cells NaN in %s.", path.name)
+            return None
+
+        var_attrs = {
+            "SOIL_MOISTURE": {
+                "units": "%",
+                "standard_name": "soil_moisture_saturation",
+                "long_name": "ASCAT surface soil moisture (~0-5cm, C-band)",
+            }
+        }
+        return DataTreeConverter._build_ssm_point_dataset(
+            sm[valid], lon[valid], lat[valid], time_vals.values[valid],
+            data_type="scatterometer_ssm", var_attrs=var_attrs,
+            platform_type="ascat_ssm",
+            source="H-SAF ASCAT Surface Soil Moisture NRT 12.5km (H29)",
+            sensing_depth_cm="0-5", band="C", filename=path.name,
+            ascat_resolution_km=_parse_ascat_resolution_km(path.name),
         )
 
     @staticmethod
@@ -3887,6 +3982,20 @@ class DataTreeConverter:
                 if ds is not None:
                     datasets[f"validation/ascat_ssm/{f.stem}"] = ds
                     logger.info("Converted ASCAT SSM: %s", f.name)
+
+        # H-SAF ASCAT SSM NRT (H29/H122) -- flat obs-array netCDF files,
+        # always ".nc" (see hsaf_downloader.py; H-SAF's own BUFR variant is
+        # never requested by that downloader). Directory/node path say
+        # "hsaf_ascat_ssm", not "hsaf_ssm", since H-SAF also distributes
+        # non-ASCAT products (precipitation, snow) -- the more specific
+        # name avoids ambiguity about which H-SAF product this is.
+        subdir = base_dir / "hsaf_ascat_ssm"
+        if subdir.exists():
+            for f in sorted(subdir.glob("*.nc")):
+                ds = _filtered(DataTreeConverter.from_hsaf_ssm(f), f.name)
+                if ds is not None:
+                    datasets[f"validation/hsaf_ascat_ssm/{f.stem}"] = ds
+                    logger.info("Converted H-SAF SSM: %s", f.name)
 
         # AMSR-E/AMSR2 Daily Global Land Parameters (NSIDC-0451, HDF5, ``.h5``)
         # or AU_Land_NRT_R02/AU_Land (HDF-EOS5 swath, conventionally ``.he5``).
