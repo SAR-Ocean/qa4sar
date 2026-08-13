@@ -90,6 +90,34 @@ def _parse_sensing_start(filename: str) -> Optional[datetime]:
         return None
 
 
+_SATELLITE_RE = re.compile(r"SSM-ASCAT-(METOP[ABC])-")
+
+
+def _parse_satellite(filename: str) -> Optional[str]:
+    """Extract the embedded satellite name from an H29/H122 filename,
+    normalized to orbit_coverage.py's SATELLITE_ORBIT_SPECS key format
+    (e.g. "METOPB" -> "metop-b"), or None if unparseable."""
+    m = _SATELLITE_RE.search(filename)
+    if not m:
+        return None
+    raw = m.group(1)
+    return f"metop-{raw[-1].lower()}"
+
+
+_SENSING_END_RE = re.compile(r"H\d+_C_LIIB_\d{14}_\d{14}_(\d{14})____\.nc$")
+
+
+def _parse_sensing_end(filename: str) -> Optional[datetime]:
+    """Extract the embedded sensing-end timestamp from an H29/H122 filename."""
+    m = _SENSING_END_RE.search(filename)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def _parse_iso_dt(s: str) -> datetime:
     """Convert an ISO datetime string (from normalize_datetime) to a UTC-aware datetime."""
     return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=timezone.utc)
@@ -118,6 +146,13 @@ class HSAFDownloader:
         H-SAF FTP credentials. If omitted, resolved via authenticate_hsaf_ftp().
     product : str
         "h122" (default, 6.25km) or "h29" (12.5km, legacy resolution).
+    orbit_prefilter : bool
+        When True (default), drop files whose embedded satellite/sensing
+        window shows no predicted orbit overlap with the requested bbox
+        (see orbit_coverage.orbit_overlaps_bbox) before downloading them.
+        Fails open per-file -- an unparseable filename, unregistered
+        satellite, or any prediction failure keeps the file, never drops
+        it.
     """
 
     def __init__(
@@ -128,6 +163,7 @@ class HSAFDownloader:
         username: Optional[str] = None,
         password: Optional[str] = None,
         product: str = "h122",
+        orbit_prefilter: bool = True,
     ) -> None:
         if product not in _PRODUCT_PATHS:
             raise ValueError(
@@ -139,6 +175,7 @@ class HSAFDownloader:
         self._username = username
         self._password = password
         self.product = product
+        self.orbit_prefilter = orbit_prefilter
 
     def download(
         self,
@@ -185,6 +222,9 @@ class HSAFDownloader:
                     continue
                 matches.append(name)
 
+            if self.orbit_prefilter:
+                matches = self._filter_by_orbit_overlap(matches, min_lon, max_lon, min_lat, max_lat)
+
             print(f"Found {len(matches)} H-SAF {self.product.upper()} file(s) in window.")
             if not matches:
                 return []
@@ -209,6 +249,34 @@ class HSAFDownloader:
 
         print(f"Downloaded {len(downloaded)} H-SAF {self.product.upper()} file(s).")
         return downloaded
+
+    def _filter_by_orbit_overlap(
+        self, matches: list[str], min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    ) -> list[str]:
+        """Drop filenames whose embedded satellite/sensing-window orbit
+        prediction shows no overlap with the requested bbox (+ margin) --
+        see orbit_coverage.orbit_overlaps_bbox. Fails open per-file: an
+        unparseable filename, unregistered satellite, or any prediction
+        failure keeps the file (matching today's behavior), never drops it.
+        """
+        from ..core.orbit_coverage import orbit_overlaps_bbox
+
+        kept = []
+        dropped = 0
+        for name in matches:
+            satellite = _parse_satellite(name)
+            start = _parse_sensing_start(name)
+            end = _parse_sensing_end(name)
+            if satellite is None or start is None or end is None:
+                kept.append(name)
+                continue
+            if orbit_overlaps_bbox(satellite, start, end, min_lon, max_lon, min_lat, max_lat):
+                kept.append(name)
+            else:
+                dropped += 1
+        if dropped:
+            print(f"Orbit pre-filter: skipped {dropped} file(s) with no predicted overlap.")
+        return kept
 
     def _fetch_one(self, ftp, name: str) -> Optional[Path]:
         final_path = self.output_dir / name
@@ -245,6 +313,10 @@ def _parse_args(argv=None):
     p.add_argument("--password", default=None)
     p.add_argument("--output-dir", default=None)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--no-orbit-prefilter", dest="orbit_prefilter", action="store_false", default=True,
+        help="Disable the orbit-based geographic pre-filter (default: enabled).",
+    )
     return p.parse_args(argv)
 
 
@@ -279,6 +351,7 @@ def main(argv=None):
         username=args.username,
         password=args.password,
         product=args.product,
+        orbit_prefilter=args.orbit_prefilter,
     )
     dl.download(
         min_lon=min_lon, max_lon=max_lon,
