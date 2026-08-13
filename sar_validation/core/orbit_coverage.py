@@ -150,10 +150,17 @@ def _query_nearest_candidate(
     session: requests.Session, norad_id: int, target_time: datetime, before: bool,
 ) -> Optional[Dict[str, str]]:
     """One gp_history record: the single nearest-EPOCH candidate strictly
-    before (before=True) or on/after (before=False) target_time, or None
-    if the historical archive has nothing on that side."""
+    before (before=True) or strictly after (before=False) target_time, or
+    None if the historical archive has nothing on that side.
+
+    Uses a plain "<"/">" (not ">=") -- Space-Track's query parser rejects
+    the "=" character in a predicate value with an HTTP 400 ("The URI you
+    submitted has disallowed characters"), confirmed live against the
+    real API. This loses only the negligible edge case of a TLE epoch
+    landing on the exact microsecond of target_time.
+    """
     target_str = target_time.strftime("%Y-%m-%d %H:%M:%S")
-    operator = "<" if before else ">="
+    operator = "<" if before else ">"
     direction = "desc" if before else "asc"
     url = (
         f"{_SPACE_TRACK_QUERY_BASE}/NORAD_CAT_ID/{norad_id}"
