@@ -318,16 +318,21 @@ class DataOrchestrator:
         entry; default is ``{"files": [str(p) for p in merged_result]}``.
 
         A failure partway through *windows* (network error, bad kwargs,
-        etc.) does not discard whatever earlier windows already produced.
-        If *no* window produced anything before the failure, this is a
-        hard failure -- identical to today's single-window behavior:
-        ``{"status": "failed", "error": ...}``, return ``False``. If at
-        least one earlier window already succeeded, the partial
-        ``merged_result`` is recorded as a normal success entry (so the
-        files already on disk stay tracked in metadata) plus a notice
-        describing the partial failure, and this returns ``True`` -- see
+        etc.) does not discard whatever earlier windows already produced
+        -- the partial ``merged_result`` is still recorded under *key*
+        (so files already on disk stay tracked in metadata) -- but the
+        run as a whole is always recorded as a FAILURE when any window
+        fails, whether or not earlier windows already succeeded:
+        ``{"status": "failed", "error": ..., "files": [...]}``, an error
+        appended to ``self.metadata["errors"]``, and ``False`` returned.
+        This is deliberate, not an oversight: ``cli.py``'s
+        ``_is_already_downloaded`` gates purely on
+        ``metadata["errors"]`` being empty, so a partial failure must
+        stay visible as an error or the next run would silently skip
+        re-downloading the failed window's data forever. See
         ``_download_ascat_ssm``'s own partial/hard-failure split for the
-        same philosophy applied to its two named EUMDAC/H-SAF branches.
+        same "preserve partial results, still fail the run" philosophy
+        applied to its two named EUMDAC/H-SAF branches.
         """
         try:
             dl = build_dl()
@@ -349,31 +354,25 @@ class DataOrchestrator:
                 failure_exc = exc
                 break
 
-        if failure_exc is not None and not merged_result:
+        if failure_exc is not None:
             msg = f"{error_label} download failed: {failure_exc}"
             logger.error(msg)
             self.metadata["errors"].append(msg)
-            self.metadata["downloads"][key] = {"status": "failed", "error": msg}
+            entry: Dict[str, Any] = {"status": "failed", "error": msg}
+            if result_to_metadata is not None:
+                entry.update(result_to_metadata(merged_result, dl))
+            else:
+                entry["files"] = [str(p) for p in merged_result]
+            self.metadata["downloads"][key] = entry
             return False
 
         self._cleanup_if_empty(out_dir)
-        entry: Dict[str, Any] = {"status": "dry_run" if self.dry_run else "success"}
+        entry = {"status": "dry_run" if self.dry_run else "success"}
         if result_to_metadata is not None:
             entry.update(result_to_metadata(merged_result, dl))
         else:
             entry["files"] = [str(p) for p in merged_result]
         self.metadata["downloads"][key] = entry
-
-        if failure_exc is not None:
-            msg = (
-                f"{error_label}: a later download window failed after "
-                f"earlier window(s) already succeeded -- {failure_exc}. "
-                f"Results may be incomplete for the failed window's "
-                f"portion of the requested range."
-            )
-            logger.error(msg)
-            self.metadata["notices"].append(msg)
-
         return True
 
     def _load_previous_downloads(self) -> Dict[str, Any]:
@@ -484,27 +483,51 @@ class DataOrchestrator:
         temp = cfg.temporal_bounds
         nominal_pad_start = pd.Timestamp(temp.start) - pad
         nominal_pad_end   = pd.Timestamp(temp.end) + pad
+        nominal_window = [(nominal_pad_start.isoformat(), nominal_pad_end.isoformat())]
 
         if not self._sar_scene_times:
-            return [(nominal_pad_start.isoformat(), nominal_pad_end.isoformat())]
+            return nominal_window
 
-        clusters: list[list[pd.Timestamp]] = [[self._sar_scene_times[0]]]
-        for t in self._sar_scene_times[1:]:
-            if t - clusters[-1][-1] > 2 * pad:
-                clusters.append([t])
-            else:
-                clusters[-1].append(t)
+        try:
+            # Defensive copy, sorted locally -- this method's correctness
+            # must not depend on _compute_sar_scene_times having already
+            # sorted self._sar_scene_times (a load-bearing cross-method
+            # contract otherwise, see also _download_ascat_ssm's
+            # windows[0][0]/windows[-1][1] extraction). Does not mutate
+            # self._sar_scene_times itself.
+            scene_times = sorted(self._sar_scene_times)
 
-        windows: list[tuple[str, str]] = []
-        for cluster in clusters:
-            cluster_pad_start = cluster[0] - pad
-            cluster_pad_end   = cluster[-1] + pad
-            start_ts = max(nominal_pad_start, cluster_pad_start)
-            end_ts   = min(nominal_pad_end, cluster_pad_end)
-            if start_ts <= end_ts:
-                windows.append((start_ts.isoformat(), end_ts.isoformat()))
+            clusters: list[list[pd.Timestamp]] = [[scene_times[0]]]
+            for t in scene_times[1:]:
+                if t - clusters[-1][-1] > 2 * pad:
+                    clusters.append([t])
+                else:
+                    clusters[-1].append(t)
 
-        return windows or [(nominal_pad_start.isoformat(), nominal_pad_end.isoformat())]
+            windows: list[tuple[str, str]] = []
+            for cluster in clusters:
+                cluster_pad_start = cluster[0] - pad
+                cluster_pad_end   = cluster[-1] + pad
+                start_ts = max(nominal_pad_start, cluster_pad_start)
+                end_ts   = min(nominal_pad_end, cluster_pad_end)
+                if start_ts <= end_ts:
+                    windows.append((start_ts.isoformat(), end_ts.isoformat()))
+
+            return windows or nominal_window
+        except Exception:
+            # _compute_sar_scene_times' own docstring promises "never
+            # allowed to block download_all()" -- that contract must hold
+            # here too, at the point self._sar_scene_times is actually
+            # read, not just at the point it's populated. Any unexpected
+            # failure in the clustering above (e.g. a scene time that
+            # somehow escaped normalization) falls back to exactly the
+            # same nominal window used when no scene times are available.
+            logger.warning(
+                "_padded_temporal_bounds: clustering around SAR scene times "
+                "failed, falling back to the nominal padded window.",
+                exc_info=True,
+            )
+            return nominal_window
 
     def _compute_sar_scene_times(self) -> None:
         """Populate self._sar_scene_times (sorted ascending) from the
@@ -521,24 +544,52 @@ class DataOrchestrator:
         """
         from .sar_sources import SAR_SOURCES
 
-        cfg = self.recipe.config
-        spec = SAR_SOURCES[cfg.sar_data.source]
-        product_type = cfg.variable
-        files = self.metadata["downloads"].get("sar", {}).get("files", [])
+        try:
+            cfg = self.recipe.config
+            spec = SAR_SOURCES[cfg.sar_data.source]
+            product_type = cfg.variable
+            files = self.metadata["downloads"].get("sar", {}).get("files", [])
 
-        times: list = []
-        for f in files:
-            try:
-                ds = spec.convert(Path(f), product_type)
-                if ds is None or "time" not in ds.coords:
-                    continue
-                raw = ds.coords["time"].values
-                times.extend(pd.to_datetime(np.atleast_1d(raw)).tolist())
-            except Exception as exc:
-                logger.debug("Could not extract scene time from %s: %s", f, exc)
+            times: list = []
+            for f in files:
+                try:
+                    ds = spec.convert(Path(f), product_type)
+                    if ds is None or "time" not in ds.coords:
+                        continue
+                    raw = ds.coords["time"].values
+                    idx = pd.to_datetime(np.atleast_1d(raw))
+                    if getattr(idx, "tz", None) is not None:
+                        # Some SAR sources (e.g. NISAR SME2's
+                        # from_nisar_sme2, which parses an ISO string with
+                        # a UTC designator via pd.to_datetime) produce a
+                        # tz-AWARE index -- normalize to tz-naive here, at
+                        # population time, matching _domain_filter's
+                        # established pattern in datatree_converter.py, so
+                        # every entry in self._sar_scene_times is
+                        # comparable against the rest of this module's
+                        # (tz-naive) timestamps.
+                        idx = idx.tz_localize(None)
+                    times.extend(idx.tolist())
+                except Exception as exc:
+                    logger.debug("Could not extract scene time from %s: %s", f, exc)
 
-        if times:
-            self._sar_scene_times = sorted(times)
+            if times:
+                self._sar_scene_times = sorted(times)
+        except Exception:
+            # This method's own contract (see docstring) is "never
+            # allowed to block download_all() or narrow a window
+            # incorrectly" -- true for the per-file convert() failures
+            # above, but the final sorted(times) call (and anything else
+            # in this method) was previously NOT protected by any
+            # try/except. Any unexpected failure here must leave
+            # self._sar_scene_times as None (today's documented "scene
+            # times unavailable" fallback), not propagate and kill the
+            # whole run.
+            logger.warning(
+                "_compute_sar_scene_times failed unexpectedly -- falling "
+                "back to the nominal temporal window.", exc_info=True,
+            )
+            self._sar_scene_times = None
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -1014,25 +1065,50 @@ class DataOrchestrator:
             dl = EarthdataSoilMoistureDownloader(
                 dataset=dataset, version=version, output_dir=out_dir, dry_run=self.dry_run,
             )
-            paths: list = []
-            for start, end in windows:
-                paths.extend(dl.download(
-                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
-                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                    start=start, end=end,
-                ) or [])
-            self._cleanup_if_empty(out_dir)
-            self.metadata["downloads"][out_subdir] = {
-                "status": "dry_run" if self.dry_run else "success",
-                "files":  [str(p) for p in paths],
-            }
-            return True
         except Exception as exc:
             msg = f"{dataset} download failed: {exc}"
             logger.error(msg)
             self.metadata["errors"].append(msg)
             self.metadata["downloads"][out_subdir] = {"status": "failed", "error": msg}
             return False
+
+        # Declared outside the per-window try (see _download_ascat_ssm's
+        # own "files" accumulator for the same pattern this mirrors) so a
+        # later window's exception can't discard an earlier window's
+        # already-collected results.
+        paths: list = []
+        failure_exc: Optional[Exception] = None
+        for start, end in windows:
+            try:
+                paths.extend(dl.download(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=start, end=end,
+                ) or [])
+            except Exception as exc:
+                failure_exc = exc
+                break
+
+        if failure_exc is not None:
+            # Preserve whatever earlier windows already produced, but
+            # still record this run as a FAILURE (not a partial success)
+            # so cli.py's _is_already_downloaded (which gates purely on
+            # metadata["errors"] being empty) retries the failed window's
+            # data next run instead of silently treating this as clean.
+            msg = f"{dataset} download failed: {failure_exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"][out_subdir] = {
+                "status": "failed", "error": msg, "files": [str(p) for p in paths],
+            }
+            return False
+
+        self._cleanup_if_empty(out_dir)
+        self.metadata["downloads"][out_subdir] = {
+            "status": "dry_run" if self.dry_run else "success",
+            "files":  [str(p) for p in paths],
+        }
+        return True
 
     def _download_amsr_ssm(self, source) -> bool:
         temp = self.recipe.config.temporal_bounds
@@ -1368,28 +1444,56 @@ class DataOrchestrator:
                 resolution_km=resolution_km,
                 force_download=self.force_download,
             )
-            downloaded: list = []
-            for start, end in windows:
-                downloaded.extend(dl.download(
-                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
-                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                    start=start, end=end,
-                ) or [])
-            for subdir in ("hfr_noaa", "hf_radar", "hf_radar_historical"):
-                self._cleanup_if_empty(self.base_dir / subdir)
-            self.metadata["downloads"]["hf_radar_us"] = {
-                "status": "dry_run" if self.dry_run else "success",
-                "file_count": len(downloaded),
-                "backend": dl.resolved_backend,
-                "attempted_backends": dl.attempted_backends,
-            }
-            return True
         except Exception as exc:
             msg = f"US HF-radar download failed: {exc}"
             logger.error(msg)
             self.metadata["errors"].append(msg)
             self.metadata["downloads"]["hf_radar_us"] = {"status": "failed", "error": msg}
             return False
+
+        # Declared outside the per-window try (see _download_ascat_ssm's
+        # own "files" accumulator for the same pattern this mirrors) so a
+        # later window's exception can't discard an earlier window's
+        # already-collected results.
+        downloaded: list = []
+        failure_exc: Optional[Exception] = None
+        for start, end in windows:
+            try:
+                downloaded.extend(dl.download(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=start, end=end,
+                ) or [])
+            except Exception as exc:
+                failure_exc = exc
+                break
+
+        if failure_exc is not None:
+            # Preserve whatever earlier windows already produced, but
+            # still record this run as a FAILURE (not a partial success)
+            # so cli.py's _is_already_downloaded (which gates purely on
+            # metadata["errors"] being empty) retries the failed window's
+            # data next run instead of silently treating this as clean.
+            msg = f"US HF-radar download failed: {failure_exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"]["hf_radar_us"] = {
+                "status": "failed", "error": msg,
+                "file_count": len(downloaded),
+                "backend": dl.resolved_backend,
+                "attempted_backends": dl.attempted_backends,
+            }
+            return False
+
+        for subdir in ("hfr_noaa", "hf_radar", "hf_radar_historical"):
+            self._cleanup_if_empty(self.base_dir / subdir)
+        self.metadata["downloads"]["hf_radar_us"] = {
+            "status": "dry_run" if self.dry_run else "success",
+            "file_count": len(downloaded),
+            "backend": dl.resolved_backend,
+            "attempted_backends": dl.attempted_backends,
+        }
+        return True
 
     def _download_currents_historical(self, source, instrument: str) -> bool:
         from ..downloaders.insitu_currents_historical_downloader import (
@@ -1507,8 +1611,21 @@ class DataOrchestrator:
 
         try:
             dl = ISMNDownloader(output_dir=out_dir, dry_run=self.dry_run)
-            paths: list = []
-            for start, end in windows:
+        except Exception as exc:
+            msg = f"ISMN selection failed: {exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"]["ismn"] = {"status": "failed", "error": msg}
+            return False
+
+        # Declared outside the per-window try (see _download_ascat_ssm's
+        # own "files" accumulator for the same pattern this mirrors) so a
+        # later window's exception can't discard an earlier window's
+        # already-collected results.
+        paths: list = []
+        failure_exc: Optional[Exception] = None
+        for start, end in windows:
+            try:
                 paths.extend(dl.download(
                     min_lon=bounds.min_lon, max_lon=bounds.max_lon,
                     min_lat=bounds.min_lat, max_lat=bounds.max_lat,
@@ -1517,28 +1634,40 @@ class DataOrchestrator:
                     max_depth=source.resolved_max_depth,
                     archive_path=source.download_kwargs.get("ismn_archive_path"),
                 ) or [])
-            self._cleanup_if_empty(out_dir)
-            if self.dry_run:
-                status = "dry_run"
-            elif paths:
-                status = "success"
-            else:
-                # Not a failure -- the manually-downloaded archive just
-                # isn't there yet (see ISMNDownloader's printed portal
-                # instructions). Reporting "success" here would hide that
-                # zero files were actually collected.
-                status = "awaiting_manual_archive"
-            self.metadata["downloads"]["ismn"] = {
-                "status": status,
-                "files":  [str(p) for p in paths],
-            }
-            return True
-        except Exception as exc:
-            msg = f"ISMN selection failed: {exc}"
+            except Exception as exc:
+                failure_exc = exc
+                break
+
+        if failure_exc is not None:
+            # Preserve whatever earlier windows already produced, but
+            # still record this run as a FAILURE (not a partial success)
+            # so cli.py's _is_already_downloaded (which gates purely on
+            # metadata["errors"] being empty) retries the failed window's
+            # data next run instead of silently treating this as clean.
+            msg = f"ISMN selection failed: {failure_exc}"
             logger.error(msg)
             self.metadata["errors"].append(msg)
-            self.metadata["downloads"]["ismn"] = {"status": "failed", "error": msg}
+            self.metadata["downloads"]["ismn"] = {
+                "status": "failed", "error": msg, "files": [str(p) for p in paths],
+            }
             return False
+
+        self._cleanup_if_empty(out_dir)
+        if self.dry_run:
+            status = "dry_run"
+        elif paths:
+            status = "success"
+        else:
+            # Not a failure -- the manually-downloaded archive just
+            # isn't there yet (see ISMNDownloader's printed portal
+            # instructions). Reporting "success" here would hide that
+            # zero files were actually collected.
+            status = "awaiting_manual_archive"
+        self.metadata["downloads"]["ismn"] = {
+            "status": status,
+            "files":  [str(p) for p in paths],
+        }
+        return True
 
     # ------------------------------------------------------------------
     # Metadata
