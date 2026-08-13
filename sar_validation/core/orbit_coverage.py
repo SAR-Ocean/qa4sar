@@ -19,13 +19,36 @@ See docs/superpowers/specs/2026-08-13-sar-scene-aware-download-narrowing-and-orb
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 
-__all__ = ["SatelliteOrbitSpec", "SATELLITE_ORBIT_SPECS", "TleFetchError"]
+import pandas as pd
+import requests
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["SatelliteOrbitSpec", "SATELLITE_ORBIT_SPECS", "TleFetchError", "get_tle"]
 
 _EARTH_RADIUS_KM = 6371.0
+
+#: A cached TLE is keyed to a fixed historical (satellite, date) pair, so
+#: once fetched it is immutable -- no max-age eviction needed (unlike a
+#: "current TLE" cache would need). See get_tle().
+_MAX_ACCEPTABLE_EPOCH_GAP_DAYS = 10.0
+
+_SPACE_TRACK_LOGIN_URL = "https://www.space-track.org/ajaxauth/login"
+_SPACE_TRACK_QUERY_BASE = "https://www.space-track.org/basicspacedata/query/class/gp_history"
+
+#: Matches this codebase's existing repo-relative shared-cache convention
+#: (see hf_radar_historical_downloader.py's _ARCHIVE_CACHE_DIR,
+#: ismn_downloader.py's _SHARED_ARCHIVE_CACHE_DIR) rather than a
+#: per-user home-directory cache.
+_DEFAULT_TLE_CACHE_DIR = Path("data") / "_archive_cache" / "tle"
 
 
 @dataclass(frozen=True)
@@ -102,3 +125,126 @@ def _destination_point(
     )
     lon2 = (math.degrees(lambda2) + 540.0) % 360.0 - 180.0  # normalize to [-180, 180)
     return math.degrees(phi2), lon2
+
+
+def _cache_path(cache_dir: Path, satellite: str, day) -> Path:
+    return cache_dir / satellite / f"{day.isoformat()}.json"
+
+
+def _space_track_session(username: str, password: str) -> requests.Session:
+    session = requests.Session()
+    resp = session.post(
+        _SPACE_TRACK_LOGIN_URL, data={"identity": username, "password": password}, timeout=30,
+    )
+    resp.raise_for_status()
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict) and payload.get("Login") == "Failed":
+        raise TleFetchError("Space-Track authentication failed -- check username/password.")
+    return session
+
+
+def _query_nearest_candidate(
+    session: requests.Session, norad_id: int, target_time: datetime, before: bool,
+) -> Optional[Dict[str, str]]:
+    """One gp_history record: the single nearest-EPOCH candidate strictly
+    before (before=True) or on/after (before=False) target_time, or None
+    if the historical archive has nothing on that side."""
+    target_str = target_time.strftime("%Y-%m-%d %H:%M:%S")
+    operator = "<" if before else ">="
+    direction = "desc" if before else "asc"
+    url = (
+        f"{_SPACE_TRACK_QUERY_BASE}/NORAD_CAT_ID/{norad_id}"
+        f"/EPOCH/{operator}{target_str}/orderby/EPOCH {direction}/limit/1/format/json"
+    )
+    resp = session.get(url, timeout=30)
+    resp.raise_for_status()
+    records = resp.json()
+    if not records:
+        return None
+    return records[0]
+
+
+def _epoch_gap_seconds(candidate: Dict[str, str], target_time: datetime) -> float:
+    epoch = pd.Timestamp(candidate["EPOCH"]).to_pydatetime()
+    if epoch.tzinfo is not None:
+        epoch = epoch.astimezone(timezone.utc).replace(tzinfo=None)
+    return abs((epoch - target_time).total_seconds())
+
+
+def get_tle(
+    satellite: str, target_time: datetime, cache_dir: Optional[Path] = None,
+) -> "tuple[str, str]":
+    """(line1, line2) for *satellite*, nearest in epoch to *target_time*.
+
+    Cached on disk keyed by (satellite, target_time.date()) -- since the
+    result is "the historical TLE nearest this fixed past date", it never
+    changes once fetched, so the cache entry is permanent (many files
+    from the same day share one cache read, and one pair of Space-Track
+    queries on a cache miss, which matters given H-SAF's ~3-minute file
+    cadence and Space-Track's API rate limits).
+
+    On a cache miss: authenticates to Space-Track (credentials via
+    authenticate_space_track(), see downloaders/base.py), queries the
+    gp_history class for the NORAD ID nearest target_time (both before
+    and after, since target_time is always in the past for this design's
+    use case), and picks whichever candidate has the smaller
+    |epoch - target_time|.
+
+    Raises TleFetchError (not a bare requests/auth exception) on any
+    failure -- unregistered satellite, missing credentials, network/auth
+    error, empty result, or a found candidate whose epoch is still more
+    than _MAX_ACCEPTABLE_EPOCH_GAP_DAYS away from target_time (a
+    defensive backstop for sparse tracking periods) -- so callers have
+    one exception type to catch and always fail open.
+    """
+    if satellite not in SATELLITE_ORBIT_SPECS:
+        raise TleFetchError(f"Unknown satellite {satellite!r} -- not in SATELLITE_ORBIT_SPECS.")
+
+    if target_time.tzinfo is not None:
+        target_time = target_time.astimezone(timezone.utc).replace(tzinfo=None)
+
+    cache_dir = cache_dir or _DEFAULT_TLE_CACHE_DIR
+    day = target_time.date()
+    path = _cache_path(cache_dir, satellite, day)
+    if path.exists():
+        try:
+            cached = json.loads(path.read_text())
+            return cached["line1"], cached["line2"]
+        except Exception:
+            pass  # corrupted cache entry -- fall through and re-fetch
+
+    norad_id = SATELLITE_ORBIT_SPECS[satellite].norad_id
+    try:
+        from ..downloaders.base import authenticate_space_track
+
+        username, password = authenticate_space_track()
+        session = _space_track_session(username, password)
+        before = _query_nearest_candidate(session, norad_id, target_time, before=True)
+        after = _query_nearest_candidate(session, norad_id, target_time, before=False)
+    except TleFetchError:
+        raise
+    except Exception as exc:
+        raise TleFetchError(f"Space-Track query failed for {satellite}: {exc}") from exc
+
+    candidates = [c for c in (before, after) if c is not None]
+    if not candidates:
+        raise TleFetchError(
+            f"No historical TLE found for {satellite} near {target_time.isoformat()}."
+        )
+
+    best = min(candidates, key=lambda c: _epoch_gap_seconds(c, target_time))
+    gap_days = _epoch_gap_seconds(best, target_time) / 86400.0
+    if gap_days > _MAX_ACCEPTABLE_EPOCH_GAP_DAYS:
+        raise TleFetchError(
+            f"Nearest historical TLE for {satellite} is {gap_days:.1f} days from "
+            f"{target_time.isoformat()}, beyond the {_MAX_ACCEPTABLE_EPOCH_GAP_DAYS}-day "
+            f"acceptable propagation gap."
+        )
+
+    line1, line2 = best["TLE_LINE1"], best["TLE_LINE2"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"line1": line1, "line2": line2}))
+    return line1, line2
