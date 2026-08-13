@@ -3983,15 +3983,18 @@ class DataTreeConverter:
                     datasets[f"validation/ascat_ssm/{f.stem}"] = ds
                     logger.info("Converted ASCAT SSM: %s", f.name)
 
-        # H-SAF ASCAT SSM NRT (H29) -- flat obs-array netCDF files, always
-        # ".nc" (see hsaf_downloader.py; H-SAF's own BUFR variant is never
-        # requested by that downloader).
-        subdir = base_dir / "hsaf_ssm"
+        # H-SAF ASCAT SSM NRT (H29/H122) -- flat obs-array netCDF files,
+        # always ".nc" (see hsaf_downloader.py; H-SAF's own BUFR variant is
+        # never requested by that downloader). Directory/node path say
+        # "hsaf_ascat_ssm", not "hsaf_ssm", since H-SAF also distributes
+        # non-ASCAT products (precipitation, snow) -- the more specific
+        # name avoids ambiguity about which H-SAF product this is.
+        subdir = base_dir / "hsaf_ascat_ssm"
         if subdir.exists():
             for f in sorted(subdir.glob("*.nc")):
                 ds = _filtered(DataTreeConverter.from_hsaf_ssm(f), f.name)
                 if ds is not None:
-                    datasets[f"validation/hsaf_ssm/{f.stem}"] = ds
+                    datasets[f"validation/hsaf_ascat_ssm/{f.stem}"] = ds
                     logger.info("Converted H-SAF SSM: %s", f.name)
 
         # AMSR-E/AMSR2 Daily Global Land Parameters (NSIDC-0451, HDF5, ``.h5``)

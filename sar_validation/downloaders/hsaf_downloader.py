@@ -31,10 +31,10 @@ as scatterometer_ftp_downloader.py.
 Library usage::
 
     from sar_validation.downloaders.hsaf_downloader import HSAFDownloader
-    dl = HSAFDownloader(output_dir=Path("data/run1/hsaf_ssm"))  # H122 by default
+    dl = HSAFDownloader(output_dir=Path("data/run1/hsaf_ascat_ssm"))  # H122 by default
     dl.download(min_lon=-70, max_lon=-30, min_lat=50, max_lat=67,
                 start="2026-06-08", end="2026-06-09")
-    dl29 = HSAFDownloader(output_dir=Path("data/run1/hsaf_ssm"), product="h29")
+    dl29 = HSAFDownloader(output_dir=Path("data/run1/hsaf_ascat_ssm"), product="h29")
 
 CLI usage::
 
@@ -270,7 +270,7 @@ def main(argv=None):
         start, end = args.start, args.end
 
     output_dir = Path(args.output_dir) if args.output_dir else (
-        build_output_dir(start, end, min_lon, max_lon, min_lat, max_lat) / "hsaf_ssm"
+        build_output_dir(start, end, min_lon, max_lon, min_lat, max_lat) / "hsaf_ascat_ssm"
     )
 
     dl = HSAFDownloader(

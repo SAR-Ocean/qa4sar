@@ -732,7 +732,7 @@ class DataOrchestrator:
         bounds = cfg.geographic_bounds
         pad_start, pad_end = _padded_temporal_bounds(cfg, source.source_type)
         eumdac_dir = self.base_dir / "ascat_ssm"
-        hsaf_dir   = self.base_dir / "hsaf_ssm"
+        hsaf_dir   = self.base_dir / "hsaf_ascat_ssm"
 
         # H-SAF's on-line archive (H122 default, H29 via
         # download_kwargs.hsaf_product) only ever holds a rolling
