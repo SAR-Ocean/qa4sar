@@ -34,7 +34,7 @@ gportal = ["paramiko"]
 # ERA5 user isn't pointed at soil_moisture's unrelated, much heavier
 # dependencies (pytesmo/ismn/earthaccess/ascat/pdbufr) just to get cdsapi.
 era5 = ["cdsapi"]
-soil_moisture = ["pytesmo", "ismn", "earthaccess", "ascat", "pdbufr", "sar-l2-validation-toolbox[era5]"]
+soil_moisture = ["pytesmo", "ismn", "earthaccess", "ascat", "pdbufr", "pyorbital", "sar-l2-validation-toolbox[era5]"]
 test = ["pytest", "pytest-cov"]
 dev = [
     "pytest",
