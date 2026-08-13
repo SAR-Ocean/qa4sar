@@ -176,6 +176,41 @@ class TestRunDownload:
             str(out_dir / "a.nc"), str(out_dir / "b.nc"),
         ]
 
+    def test_partial_failure_preserves_earlier_window_results(self, tmp_path):
+        """If an earlier window's .download() already succeeded and wrote a
+        real file before a later window raises, that earlier result must
+        not be discarded -- the run should be recorded as a (partial)
+        success with the first window's file present, plus a notice
+        describing the partial failure, rather than overwriting the entry
+        with a bare {"status": "failed"} that drops the on-disk file from
+        metadata entirely."""
+        orch = DataOrchestrator(_recipe("sentinel1_l2_ocn"), dry_run=True)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "a.nc").touch()
+
+        class PartiallyFailingDl:
+            def __init__(self):
+                self.calls = 0
+
+            def download(self, start, end):
+                self.calls += 1
+                if self.calls == 1:
+                    return [out_dir / "a.nc"]
+                raise RuntimeError("boom")
+
+        windows = [
+            ("2026-01-01T00:00:00", "2026-01-02T00:00:00"),
+            ("2026-01-10T00:00:00", "2026-01-11T00:00:00"),
+        ]
+        ok = orch._run_download(
+            "test_key", out_dir, lambda: PartiallyFailingDl(), windows,
+            lambda start, end: {"start": start, "end": end}, "Test",
+        )
+        assert ok is True
+        assert orch.metadata["downloads"]["test_key"]["files"] == [str(out_dir / "a.nc")]
+        assert len(orch.metadata["notices"]) == 1
+
 
 class TestDownloadSarSourceBranch:
     @pytest.mark.parametrize(

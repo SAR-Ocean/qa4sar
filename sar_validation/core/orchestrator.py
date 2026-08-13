@@ -315,28 +315,65 @@ class DataOrchestrator:
         start/end vary). *result_to_metadata*, if given, maps
         ``(merged_result, downloader) -> dict`` merged into the success
         entry; default is ``{"files": [str(p) for p in merged_result]}``.
+
+        A failure partway through *windows* (network error, bad kwargs,
+        etc.) does not discard whatever earlier windows already produced.
+        If *no* window produced anything before the failure, this is a
+        hard failure -- identical to today's single-window behavior:
+        ``{"status": "failed", "error": ...}``, return ``False``. If at
+        least one earlier window already succeeded, the partial
+        ``merged_result`` is recorded as a normal success entry (so the
+        files already on disk stay tracked in metadata) plus a notice
+        describing the partial failure, and this returns ``True`` -- see
+        ``_download_ascat_ssm``'s own partial/hard-failure split for the
+        same philosophy applied to its two named EUMDAC/H-SAF branches.
         """
         try:
             dl = build_dl()
-            merged_result: list = []
-            for start, end in windows:
-                download_kwargs = build_kwargs(start, end)
-                result = dl.download(**download_kwargs)
-                merged_result.extend(result or [])
-            self._cleanup_if_empty(out_dir)
-            entry: Dict[str, Any] = {"status": "dry_run" if self.dry_run else "success"}
-            if result_to_metadata is not None:
-                entry.update(result_to_metadata(merged_result, dl))
-            else:
-                entry["files"] = [str(p) for p in merged_result]
-            self.metadata["downloads"][key] = entry
-            return True
         except Exception as exc:
             msg = f"{error_label} download failed: {exc}"
             logger.error(msg)
             self.metadata["errors"].append(msg)
             self.metadata["downloads"][key] = {"status": "failed", "error": msg}
             return False
+
+        merged_result: list = []
+        failure_exc: Optional[Exception] = None
+        for start, end in windows:
+            try:
+                download_kwargs = build_kwargs(start, end)
+                result = dl.download(**download_kwargs)
+                merged_result.extend(result or [])
+            except Exception as exc:
+                failure_exc = exc
+                break
+
+        if failure_exc is not None and not merged_result:
+            msg = f"{error_label} download failed: {failure_exc}"
+            logger.error(msg)
+            self.metadata["errors"].append(msg)
+            self.metadata["downloads"][key] = {"status": "failed", "error": msg}
+            return False
+
+        self._cleanup_if_empty(out_dir)
+        entry: Dict[str, Any] = {"status": "dry_run" if self.dry_run else "success"}
+        if result_to_metadata is not None:
+            entry.update(result_to_metadata(merged_result, dl))
+        else:
+            entry["files"] = [str(p) for p in merged_result]
+        self.metadata["downloads"][key] = entry
+
+        if failure_exc is not None:
+            msg = (
+                f"{error_label}: a later download window failed after "
+                f"earlier window(s) already succeeded -- {failure_exc}. "
+                f"Results may be incomplete for the failed window's "
+                f"portion of the requested range."
+            )
+            logger.error(msg)
+            self.metadata["notices"].append(msg)
+
+        return True
 
     def _load_previous_downloads(self) -> Dict[str, Any]:
         """Read the ``downloads`` section of a prior run's
