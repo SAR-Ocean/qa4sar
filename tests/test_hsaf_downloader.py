@@ -66,7 +66,7 @@ class TestParseSensingStart:
 class TestHSAFDownloaderProductSelection:
     def test_unknown_product_raises_value_error(self, tmp_path):
         with pytest.raises(ValueError, match="Unknown H-SAF product"):
-            HSAFDownloader(output_dir=tmp_path, product="h999")
+            HSAFDownloader(output_dir=tmp_path, product="h999", orbit_prefilter=False)
 
     def test_default_product_queries_h122_path(self, tmp_path):
         """H122 is now the default (higher resolution than H29) -- see
@@ -80,7 +80,7 @@ class TestHSAFDownloaderProductSelection:
             "sar_validation.downloaders.hsaf_downloader.authenticate_hsaf_ftp",
             return_value=("user", "pass"),
         ):
-            dl = HSAFDownloader(output_dir=tmp_path)
+            dl = HSAFDownloader(output_dir=tmp_path, orbit_prefilter=False)
             assert dl.product == "h122"
             result = dl.download(
                 min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
@@ -102,7 +102,7 @@ class TestHSAFDownloaderProductSelection:
             "sar_validation.downloaders.hsaf_downloader.authenticate_hsaf_ftp",
             return_value=("user", "pass"),
         ):
-            dl = HSAFDownloader(output_dir=tmp_path, product="h29")
+            dl = HSAFDownloader(output_dir=tmp_path, product="h29", orbit_prefilter=False)
             result = dl.download(
                 min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
                 start="2026-06-08", end="2026-06-09",
@@ -134,7 +134,7 @@ class TestHSAFDownloaderDownloadAll:
             "sar_validation.downloaders.hsaf_downloader.authenticate_hsaf_ftp",
             return_value=("user", "pass"),
         ):
-            dl = HSAFDownloader(output_dir=tmp_path, product="h29")
+            dl = HSAFDownloader(output_dir=tmp_path, product="h29", orbit_prefilter=False)
             result = dl.download(
                 min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
                 start="2026-06-08", end="2026-06-09",
@@ -154,7 +154,7 @@ class TestHSAFDownloaderDownloadAll:
             "sar_validation.downloaders.hsaf_downloader.authenticate_hsaf_ftp",
             return_value=("user", "pass"),
         ):
-            dl = HSAFDownloader(output_dir=tmp_path)
+            dl = HSAFDownloader(output_dir=tmp_path, orbit_prefilter=False)
             result = dl.download(
                 min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
                 start="2026-06-08", end="2026-06-09",
@@ -173,7 +173,7 @@ class TestHSAFDownloaderDownloadAll:
             "sar_validation.downloaders.hsaf_downloader.authenticate_hsaf_ftp",
             return_value=("user", "pass"),
         ):
-            dl = HSAFDownloader(output_dir=tmp_path, force_download=True)
+            dl = HSAFDownloader(output_dir=tmp_path, force_download=True, orbit_prefilter=False)
             result = dl.download(
                 min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
                 start="2026-06-08", end="2026-06-09",
@@ -190,7 +190,7 @@ class TestHSAFDownloaderDownloadAll:
             "sar_validation.downloaders.hsaf_downloader.authenticate_hsaf_ftp",
             return_value=("user", "pass"),
         ):
-            dl = HSAFDownloader(output_dir=tmp_path, dry_run=True)
+            dl = HSAFDownloader(output_dir=tmp_path, dry_run=True, orbit_prefilter=False)
             result = dl.download(
                 min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
                 start="2026-06-08", end="2026-06-09",
