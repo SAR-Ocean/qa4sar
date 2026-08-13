@@ -317,6 +317,12 @@ def _call_hsaf_ftp(username=None, password=None, allow_prompt=True):
     return authenticate_hsaf_ftp(username, password)
 
 
+def _call_space_track(username=None, password=None, allow_prompt=True):
+    from sar_validation.downloaders.base import authenticate_space_track
+
+    return authenticate_space_track(username, password)
+
+
 def _call_gportal(username=None, password=None, allow_prompt=True):
     from sar_validation.downloaders.base import authenticate_gportal
 
@@ -362,6 +368,13 @@ CREDENTIAL_RESOLUTION_CASES = [
         ".hsaf_ftp_credentials", _json_legacy_content,
         "H-SAF FTP credentials not found", False,
         id="hsaf_ftp",
+    ),
+    pytest.param(
+        "space_track", _call_space_track,
+        "SPACE_TRACK_USERNAME", "SPACE_TRACK_PASSWORD", "sar-validation-space-track",
+        ".space_track_credentials", _json_legacy_content,
+        "Space-Track credentials not found", False,
+        id="space_track",
     ),
     pytest.param(
         "gportal", _call_gportal,

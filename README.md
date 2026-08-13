@@ -62,6 +62,7 @@ sar_validation/
 ├── core/
 │   ├── recipe.py           # Recipe dataclasses (YAML ↔ Python)
 │   ├── orchestrator.py     # Orchestrates step 1 (download all sources)
+│   ├── orbit_coverage.py   # Orbit-based geographic pre-filter (Space-Track TLE + SGP4 propagation) used by the H-SAF downloader
 │   ├── datatree_converter.py  # Step 2: convert to xarray.DataTree
 │   ├── collocation.py      # Step 3: collocation algorithms
 │   ├── statistics.py       # Step 4: compute bias, RMSE, correlation, scatter index
@@ -291,6 +292,21 @@ sar-validate --set-credential hsaf
 Or use environment variables: `HSAF_FTP_USERNAME` / `HSAF_FTP_PASSWORD`.
 
 Register at: https://hsaf.meteoam.it/User/Register
+
+### Space-Track.org — for the ASCAT orbit-based download pre-filter
+
+Store credentials in your OS keyring:
+
+```bash
+sar-validate --set-credential space_track
+```
+
+Or use environment variables: `SPACE_TRACK_USERNAME` / `SPACE_TRACK_PASSWORD`.
+
+Used to look up historical TLEs (satellite orbital elements) so H-SAF
+ASCAT downloads can skip files whose orbit never passed near the
+recipe's bbox, before downloading them — see `orbit_coverage.py`. Free
+registration at: https://www.space-track.org/auth/createAccount
 
 ### JAXA G-Portal — for AMSR2 soil moisture downloads (SFTP fallback)
 

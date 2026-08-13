@@ -7,6 +7,7 @@ Provides:
 - authenticate_eumdac    — Read EUMDAC credentials from env / OS keyring
 - authenticate_osi_saf_ftp — Read OSI-SAF wind FTP credentials from env / OS keyring
 - authenticate_hsaf_ftp  — Read H-SAF FTP credentials from env / OS keyring
+- authenticate_space_track — Read Space-Track.org credentials from env / OS keyring
 - authenticate_gportal   — Read JAXA G-Portal credentials from env / OS keyring / prompt
 - authenticate_smos_ftp  — Read SMOS Online Dissemination FTPS credentials from env / OS keyring
 - authenticate_earthdata — Resolve NASA Earthdata Login credentials from env /
@@ -44,6 +45,7 @@ __all__ = [
     "authenticate_eumdac",
     "authenticate_osi_saf_ftp",
     "authenticate_hsaf_ftp",
+    "authenticate_space_track",
     "authenticate_gportal",
     "authenticate_smos_ftp",
     "authenticate_earthdata",
@@ -69,6 +71,7 @@ _KEYRING_SERVICES = {
     "smos": "sar-validation-smos",
     "earthdata": "sar-validation-earthdata",
     "hsaf": "sar-validation-hsaf",
+    "space_track": "sar-validation-space-track",
 }
 
 
@@ -706,6 +709,51 @@ def authenticate_hsaf_ftp(
         "  3. Pass --username / --password on the command line\n"
         "Register at: https://hsaf.meteoam.it/User/Register"
     )
+
+
+def authenticate_space_track(
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+) -> Tuple[str, str]:
+    """
+    Resolve Space-Track.org credentials (used by orbit_coverage.get_tle
+    to look up historical TLEs for the orbit-based geographic pre-filter).
+
+    Priority order:
+      1. Explicit arguments
+      2. Environment variables  SPACE_TRACK_USERNAME / SPACE_TRACK_PASSWORD
+      3. OS keyring (service "sar-validation-space-track"; see
+         set_credential / ``sar-validate --set-credential space_track``).
+
+    Raises RuntimeError if no credentials are found.
+    """
+    if username and password:
+        return username, password
+
+    username = username or os.environ.get("SPACE_TRACK_USERNAME")
+    password = password or os.environ.get("SPACE_TRACK_PASSWORD")
+    if username and password:
+        return username, password
+
+    cred_file = Path.home() / ".space_track_credentials"
+    kr_username, kr_password = _resolve_from_keyring_or_legacy_file(
+        "space_track", cred_file, _parse_json_legacy_file
+    )
+    username = username or kr_username
+    password = password or kr_password
+    if username and password:
+        return username, password
+
+    raise RuntimeError(
+        "Space-Track credentials not found.\n"
+        "Options:\n"
+        "  1. Run `sar-validate --set-credential space_track` to store credentials "
+        "in your OS keyring\n"
+        "  2. Set SPACE_TRACK_USERNAME / SPACE_TRACK_PASSWORD environment variables\n"
+        "  3. Pass --username / --password on the command line\n"
+        "Register at: https://www.space-track.org/auth/createAccount"
+    )
+
 
 def authenticate_gportal(
     username: Optional[str] = None,
