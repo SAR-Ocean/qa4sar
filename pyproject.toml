@@ -54,6 +54,7 @@ dev = [
     "pdbufr",
     "paramiko",
     "cdsapi",
+    "pyorbital",
 ]
 
 [project.scripts]
