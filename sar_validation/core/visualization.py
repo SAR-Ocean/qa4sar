@@ -2634,12 +2634,18 @@ def _plot_collocation_diagnostics_impl(
     # point to mark unmatched. Still plot the SAR coverage rather than
     # bailing out, so a recipe with real SAR data but no validation data
     # yet still gets the diagnostic (and not a silently-missing plot).
+    #
+    # This also fires (harmlessly) whenever every validation source is
+    # grid-shaped (e.g. a recipe whose only source is ERA5 -- its node
+    # keeps native (time, lat, lon) dims, never flattened to "point", see
+    # _extract_validation_data_for_plot's own docstring) -- there's
+    # nothing misleading to warn about there: matched points still render
+    # correctly via the separate collocation_results.nc-driven "matched"
+    # tier below, this only empties the raw-datatree "unmatched" overlay,
+    # which is meaningless for gridded data anyway. Not logged, since it's
+    # an expected, already-correctly-handled case, not a real problem.
     all_val_data = _extract_validation_data_for_plot(datatree)
     if not all_val_data:
-        logger.warning(
-            "plot_collocation_diagnostics: No validation data found in "
-            "DataTree -- plotting SAR coverage only."
-        )
         all_val_lons = np.array([])
         all_val_lats = np.array([])
         all_val_times = np.array([])
