@@ -23,7 +23,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -32,7 +32,13 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["SatelliteOrbitSpec", "SATELLITE_ORBIT_SPECS", "TleFetchError", "get_tle"]
+__all__ = [
+    "SatelliteOrbitSpec",
+    "SATELLITE_ORBIT_SPECS",
+    "TleFetchError",
+    "get_tle",
+    "orbit_overlaps_bbox",
+]
 
 _EARTH_RADIUS_KM = 6371.0
 
@@ -255,3 +261,107 @@ def get_tle(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"line1": line1, "line2": line2}))
     return line1, line2
+
+
+def _point_in_bbox(
+    lat: float, lon: float, min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+) -> bool:
+    from ..downloaders.base import split_antimeridian_bbox
+
+    if not (min_lat <= lat <= max_lat):
+        return False
+    return any(lo <= lon <= hi for lo, hi in split_antimeridian_bbox(min_lon, max_lon))
+
+
+def orbit_overlaps_bbox(
+    satellite: str,
+    sensing_start: datetime,
+    sensing_end: datetime,
+    min_lon: float,
+    max_lon: float,
+    min_lat: float,
+    max_lat: float,
+    margin_km: float = 100.0,
+    sample_interval_s: float = 15.0,
+    cache_dir: Optional[Path] = None,
+) -> bool:
+    """True if *satellite*'s predicted ground track/swath during
+    [sensing_start, sensing_end] comes within margin_km of the given
+    bbox. Fails open (returns True -- never filters when uncertain) if
+    *satellite* isn't in SATELLITE_ORBIT_SPECS, the TLE can't be fetched
+    (TleFetchError), or orbit propagation raises for any reason -- this
+    is a download-time optimization, never a substitute for the real
+    domain-cropping that happens downstream, so it must never risk a
+    false negative.
+
+    Algorithm: fetch the TLE nearest sensing_start via get_tle(satellite,
+    sensing_start, cache_dir). Sample the sub-satellite point every
+    sample_interval_s across [sensing_start, sensing_end] via
+    Orbital.get_lonlatalt. At each sample, derive the instantaneous
+    heading via _bearing_deg against the adjacent sample (next sample if
+    available, else the previous one). At each sample, sweep both
+    perpendicular sides of that heading (bearing +/- 90) at increasing
+    distances up to swath_half_width_km + margin_km via
+    _destination_point, and check whether the sub-satellite point OR any
+    swept point falls within the bbox (antimeridian-aware). Returns True
+    on the first match found (short-circuits).
+    """
+    spec = SATELLITE_ORBIT_SPECS.get(satellite)
+    if spec is None:
+        return True
+
+    try:
+        from pyorbital.orbital import Orbital
+
+        line1, line2 = get_tle(satellite, sensing_start, cache_dir=cache_dir)
+        orb = Orbital(satellite.upper(), line1=line1, line2=line2)
+
+        samples = []
+        t = sensing_start
+        step = timedelta(seconds=sample_interval_s)
+        while t <= sensing_end:
+            lon, lat, _alt = orb.get_lonlatalt(t)
+            samples.append((t, lat, lon))
+            t = t + step
+        if not samples or samples[-1][0] < sensing_end:
+            lon, lat, _alt = orb.get_lonlatalt(sensing_end)
+            samples.append((sensing_end, lat, lon))
+
+        max_offset_km = spec.swath_half_width_km + margin_km
+        # Sweep every ~50km out to max_offset_km, not just a couple of
+        # fixed rings -- a bbox exactly between two widely-spaced sample
+        # rings would otherwise be silently missed even though it's well
+        # inside the real corridor. Recipe bboxes in this codebase are
+        # routinely thousands of km wide (see e.g. recipes/soil_moisture_
+        # hsaf_ascat.yaml's -10..30 lon span), so a 50km cross-track grid
+        # is dense relative to any bbox this filter is actually run
+        # against -- cheap to compute (pure arithmetic, no propagation),
+        # so there's no reason to sample coarser.
+        _CROSS_TRACK_STEP_KM = 50.0
+        n_steps = max(1, math.ceil(max_offset_km / _CROSS_TRACK_STEP_KM))
+        sweep_distances_km = [max_offset_km * (i / n_steps) for i in range(1, n_steps + 1)]
+
+        for i, (_t, lat, lon) in enumerate(samples):
+            if _point_in_bbox(lat, lon, min_lon, max_lon, min_lat, max_lat):
+                return True
+            if i + 1 < len(samples):
+                _next_t, next_lat, next_lon = samples[i + 1]
+                heading = _bearing_deg(lat, lon, next_lat, next_lon)
+            elif i > 0:
+                _prev_t, prev_lat, prev_lon = samples[i - 1]
+                heading = _bearing_deg(prev_lat, prev_lon, lat, lon)
+            else:
+                continue
+            for side_bearing in (heading + 90.0, heading - 90.0):
+                for dist in sweep_distances_km:
+                    swept_lat, swept_lon = _destination_point(lat, lon, side_bearing, dist)
+                    if _point_in_bbox(swept_lat, swept_lon, min_lon, max_lon, min_lat, max_lat):
+                        return True
+        return False
+    except TleFetchError:
+        return True
+    except Exception:
+        logger.debug(
+            "orbit_overlaps_bbox: propagation failed for %s, failing open.", satellite, exc_info=True,
+        )
+        return True

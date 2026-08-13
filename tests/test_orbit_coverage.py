@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -142,3 +142,102 @@ class TestGetTle:
     def test_unregistered_satellite_raises_before_any_network_call(self, tmp_path):
         with pytest.raises(orbit_coverage.TleFetchError, match="Unknown satellite"):
             orbit_coverage.get_tle("metop-a", datetime(2026, 6, 8), cache_dir=tmp_path)
+
+
+_METOP_B_TLE = (
+    "1 38771U 12049A   26224.57256041  .00000038  00000+0  37173-4 0  9993",
+    "2 38771  98.6465 274.9355 0002624 156.2537 203.8762 14.21452520721277",
+)
+_METOP_B_TLE_EPOCH = datetime(2026, 8, 12, 13, 44, 29, 219424)
+
+
+class TestOrbitOverlapsBbox:
+    def _patch_tle(self, monkeypatch):
+        monkeypatch.setattr(
+            orbit_coverage, "get_tle", lambda satellite, target_time, cache_dir=None: _METOP_B_TLE,
+        )
+
+    def test_bbox_on_real_ground_track_overlaps(self, monkeypatch):
+        """A bbox placed directly around a real, live-computed ground-track
+        point (lat=5.297, lon=106.611 at TLE epoch + 90s) must overlap."""
+        self._patch_tle(monkeypatch)
+        start = _METOP_B_TLE_EPOCH + timedelta(seconds=60)
+        end = _METOP_B_TLE_EPOCH + timedelta(seconds=120)
+
+        assert orbit_coverage.orbit_overlaps_bbox(
+            "metop-b", start, end,
+            min_lon=106.0, max_lon=107.0, min_lat=5.0, max_lat=5.6,
+        ) is True
+
+    def test_bbox_on_opposite_side_of_globe_does_not_overlap(self, monkeypatch):
+        self._patch_tle(monkeypatch)
+        start = _METOP_B_TLE_EPOCH + timedelta(seconds=60)
+        end = _METOP_B_TLE_EPOCH + timedelta(seconds=120)
+
+        # Antipode of (lat~5.3, lon~106.6) is roughly (lat~-5.3, lon~-73.4).
+        assert orbit_coverage.orbit_overlaps_bbox(
+            "metop-b", start, end,
+            min_lon=-75.0, max_lon=-72.0, min_lat=-7.0, max_lat=-4.0,
+        ) is False
+
+    def test_off_track_swath_point_overlaps_but_naive_same_lon_offset_would_have_missed_it(
+        self, monkeypatch,
+    ):
+        """A real point 400km off the ground track (well inside
+        swath_half_width_km=600) at the real computed heading must
+        overlap -- proving the heading-aware sweep, not just the
+        ground-track center line, drives the result. The bbox is placed
+        where the REAL swath edge is (lon~110.14), not where a naive
+        same-longitude offset would incorrectly place it (lon~106.61,
+        ~3.5 degrees / ~390km away) -- a naive implementation would
+        report no overlap for this bbox."""
+        self._patch_tle(monkeypatch)
+        start = _METOP_B_TLE_EPOCH + timedelta(seconds=60)
+        end = _METOP_B_TLE_EPOCH + timedelta(seconds=120)
+
+        assert orbit_coverage.orbit_overlaps_bbox(
+            "metop-b", start, end,
+            min_lon=109.8, max_lon=110.5, min_lat=5.8, max_lat=6.3,
+            margin_km=50.0,
+        ) is True
+
+    def test_far_beyond_swath_and_margin_does_not_overlap(self, monkeypatch):
+        """A bbox 2000km off-track (well beyond swath_half_width_km=600 +
+        even a generous margin) must not overlap."""
+        self._patch_tle(monkeypatch)
+        start = _METOP_B_TLE_EPOCH + timedelta(seconds=60)
+        end = _METOP_B_TLE_EPOCH + timedelta(seconds=120)
+
+        assert orbit_coverage.orbit_overlaps_bbox(
+            "metop-b", start, end,
+            min_lon=130.0, max_lon=133.0, min_lat=5.0, max_lat=6.0,
+            margin_km=100.0,
+        ) is False
+
+    def test_unregistered_satellite_fails_open(self):
+        assert orbit_coverage.orbit_overlaps_bbox(
+            "metop-a", _METOP_B_TLE_EPOCH, _METOP_B_TLE_EPOCH + timedelta(minutes=3),
+            min_lon=0.0, max_lon=1.0, min_lat=0.0, max_lat=1.0,
+        ) is True
+
+    def test_tle_fetch_error_fails_open(self, monkeypatch):
+        def _raise(*a, **k):
+            raise orbit_coverage.TleFetchError("no TLE available")
+        monkeypatch.setattr(orbit_coverage, "get_tle", _raise)
+
+        assert orbit_coverage.orbit_overlaps_bbox(
+            "metop-b", _METOP_B_TLE_EPOCH, _METOP_B_TLE_EPOCH + timedelta(minutes=3),
+            min_lon=0.0, max_lon=1.0, min_lat=0.0, max_lat=1.0,
+        ) is True
+
+    def test_unexpected_propagation_error_fails_open(self, monkeypatch):
+        self._patch_tle(monkeypatch)
+        monkeypatch.setattr(
+            "pyorbital.orbital.Orbital.get_lonlatalt",
+            lambda self, t: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        assert orbit_coverage.orbit_overlaps_bbox(
+            "metop-b", _METOP_B_TLE_EPOCH, _METOP_B_TLE_EPOCH + timedelta(minutes=3),
+            min_lon=0.0, max_lon=1.0, min_lat=0.0, max_lat=1.0,
+        ) is True
