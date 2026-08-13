@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timedelta
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -16,6 +17,21 @@ from sar_validation.core.orbit_coverage import (
 )
 
 _ONE_DEGREE_KM = math.radians(1.0) * 6371.0  # exact distance for a 1-degree great-circle step
+
+
+@pytest.fixture(autouse=True)
+def _reset_space_track_module_state():
+    """orbit_coverage caches an authenticated requests.Session and a
+    circuit-breaker flag at MODULE level (see get_tle) so they persist
+    across calls within the same process -- exactly the point of Fix 5.
+    But that means they'd otherwise also leak across unrelated tests
+    (and even unrelated test files) within the same pytest session.
+    Reset both before and after every test in this module."""
+    orbit_coverage._cached_space_track_session = None
+    orbit_coverage._space_track_unavailable = False
+    yield
+    orbit_coverage._cached_space_track_session = None
+    orbit_coverage._space_track_unavailable = False
 
 
 class TestSatelliteOrbitSpecs:
@@ -143,6 +159,55 @@ class TestGetTle:
         with pytest.raises(orbit_coverage.TleFetchError, match="Unknown satellite"):
             orbit_coverage.get_tle("metop-a", datetime(2026, 6, 8), cache_dir=tmp_path)
 
+    def test_two_cache_misses_reuse_one_session_not_two(self, monkeypatch, tmp_path):
+        """H-SAF's motivating scenario can involve hundreds of files (and
+        so hundreds of cache misses) per run -- _space_track_session (a
+        real login POST) must only be called once per process, not once
+        per cache miss."""
+        self._patch_auth_and_session(monkeypatch)
+        session_mock = MagicMock(wraps=lambda username, password: object())
+        monkeypatch.setattr(orbit_coverage, "_space_track_session", session_mock)
+        candidate = {"EPOCH": "2026-06-08T11:00:00.000000", "TLE_LINE1": "1 X", "TLE_LINE2": "2 X"}
+        monkeypatch.setattr(
+            orbit_coverage, "_query_nearest_candidate",
+            lambda session, norad_id, tt, before: (candidate if before else None),
+        )
+
+        orbit_coverage.get_tle(self.SATELLITE, datetime(2026, 6, 8, 12), cache_dir=tmp_path)
+        orbit_coverage.get_tle(self.SATELLITE, datetime(2026, 6, 9, 12), cache_dir=tmp_path)
+
+        assert session_mock.call_count == 1
+
+    def test_session_establishment_failure_trips_circuit_breaker(self, monkeypatch, tmp_path):
+        """After the first get_tle call fails while establishing a
+        session/connection (not a per-request "no TLE for this date"
+        outcome), every subsequent call in this process must fail
+        immediately (TleFetchError, fail open for callers) WITHOUT
+        attempting any further network I/O -- not re-authenticate, not
+        re-query -- so a Space-Track outage doesn't block for the full
+        request timeout on every remaining file in the run."""
+        monkeypatch.setattr(
+            "sar_validation.downloaders.base.authenticate_space_track",
+            lambda *a, **k: ("user", "pass"),
+        )
+        session_mock = MagicMock(side_effect=RuntimeError("connection refused"))
+        monkeypatch.setattr(orbit_coverage, "_space_track_session", session_mock)
+        query_mock = MagicMock()
+        monkeypatch.setattr(orbit_coverage, "_query_nearest_candidate", query_mock)
+
+        with pytest.raises(orbit_coverage.TleFetchError):
+            orbit_coverage.get_tle(self.SATELLITE, datetime(2026, 6, 8, 12), cache_dir=tmp_path)
+        assert session_mock.call_count == 1
+        assert query_mock.call_count == 0
+
+        # A fresh cache miss (different date) -- would normally attempt a
+        # new session/query, but the circuit breaker must short-circuit
+        # it before any network I/O is attempted.
+        with pytest.raises(orbit_coverage.TleFetchError):
+            orbit_coverage.get_tle(self.SATELLITE, datetime(2026, 6, 9, 12), cache_dir=tmp_path)
+        assert session_mock.call_count == 1
+        assert query_mock.call_count == 0
+
 
 _METOP_B_TLE = (
     "1 38771U 12049A   26224.57256041  .00000038  00000+0  37173-4 0  9993",
@@ -228,6 +293,22 @@ class TestOrbitOverlapsBbox:
         assert orbit_coverage.orbit_overlaps_bbox(
             "metop-b", _METOP_B_TLE_EPOCH, _METOP_B_TLE_EPOCH + timedelta(minutes=3),
             min_lon=0.0, max_lon=1.0, min_lat=0.0, max_lat=1.0,
+        ) is True
+
+    def test_degenerate_zero_duration_window_fails_open(self, monkeypatch):
+        """sensing_start == sensing_end is a degenerate window with only
+        one ground-track sample -- no adjacent sample exists to derive a
+        heading from, so the cross-track sweep can't be predicted. This
+        module's entire contract is "never risk a false negative": the
+        inability to predict a heading must fail OPEN (return True), not
+        silently drop the file by falling through to `return False`. Uses
+        a bbox nowhere near the satellite's real ground track to prove
+        this is fail-open behavior, not a coincidental real overlap."""
+        self._patch_tle(monkeypatch)
+
+        assert orbit_coverage.orbit_overlaps_bbox(
+            "metop-b", _METOP_B_TLE_EPOCH, _METOP_B_TLE_EPOCH,
+            min_lon=-170.0, max_lon=-160.0, min_lat=-60.0, max_lat=-50.0,
         ) is True
 
     def test_unexpected_propagation_error_fails_open(self, monkeypatch):

@@ -56,6 +56,26 @@ _SPACE_TRACK_QUERY_BASE = "https://www.space-track.org/basicspacedata/query/clas
 #: per-user home-directory cache.
 _DEFAULT_TLE_CACHE_DIR = Path("data") / "_archive_cache" / "tle"
 
+#: Authenticated Space-Track session, cached at module level and reused
+#: across every get_tle() call within this process instead of
+#: re-authenticating (a real login POST) on every single on-disk cache
+#: miss -- H-SAF's motivating scenario can mean hundreds of files (so
+#: hundreds of cache misses) per run.
+_cached_space_track_session: Optional[requests.Session] = None
+
+#: Simple circuit breaker, scoped to the lifetime of this Python process
+#: (module-level; deliberately no expiry/reset/persistence -- see the
+#: design brief's bounded-scope instruction). Set the first time get_tle
+#: hits an exception while authenticating or establishing/using a
+#: Space-Track session -- NOT for a normal "no TLE found for this
+#: specific date" per-request outcome (handled separately below via the
+#: empty-``candidates`` check, which is expected on a per-request basis
+#: and must not trip this). Once set, every subsequent get_tle call
+#: fails open immediately (TleFetchError) without attempting any further
+#: network I/O, so a Space-Track outage doesn't block for the full
+#: request timeout on every remaining file in the run.
+_space_track_unavailable: bool = False
+
 
 @dataclass(frozen=True)
 class SatelliteOrbitSpec:
@@ -229,17 +249,33 @@ def get_tle(
         except Exception:
             pass  # corrupted cache entry -- fall through and re-fetch
 
+    global _cached_space_track_session, _space_track_unavailable
+
+    if _space_track_unavailable:
+        raise TleFetchError(
+            "Space-Track was marked unavailable earlier in this process "
+            "(a previous authentication/connection attempt failed) -- "
+            "not retrying."
+        )
+
     norad_id = SATELLITE_ORBIT_SPECS[satellite].norad_id
     try:
-        from ..downloaders.base import authenticate_space_track
+        if _cached_space_track_session is None:
+            from ..downloaders.base import authenticate_space_track
 
-        username, password = authenticate_space_track()
-        session = _space_track_session(username, password)
-        before = _query_nearest_candidate(session, norad_id, target_time, before=True)
-        after = _query_nearest_candidate(session, norad_id, target_time, before=False)
+            username, password = authenticate_space_track()
+            _cached_space_track_session = _space_track_session(username, password)
+        before = _query_nearest_candidate(
+            _cached_space_track_session, norad_id, target_time, before=True,
+        )
+        after = _query_nearest_candidate(
+            _cached_space_track_session, norad_id, target_time, before=False,
+        )
     except TleFetchError:
+        _space_track_unavailable = True
         raise
     except Exception as exc:
+        _space_track_unavailable = True
         raise TleFetchError(f"Space-Track query failed for {satellite}: {exc}") from exc
 
     candidates = [c for c in (before, after) if c is not None]
@@ -351,7 +387,14 @@ def orbit_overlaps_bbox(
                 _prev_t, prev_lat, prev_lon = samples[i - 1]
                 heading = _bearing_deg(prev_lat, prev_lon, lat, lon)
             else:
-                continue
+                # Only one ground-track sample exists (a degenerate
+                # sensing_start == sensing_end window) -- no adjacent
+                # sample to derive a heading from, so the cross-track
+                # sweep can't be predicted. This module's whole contract
+                # is "never risk a false negative": failing to predict
+                # correctly must fail OPEN, not silently drop the file by
+                # falling through to `return False` below.
+                return True
             for side_bearing in (heading + 90.0, heading - 90.0):
                 for dist in sweep_distances_km:
                     swept_lat, swept_lon = _destination_point(lat, lon, side_bearing, dist)
