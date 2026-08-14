@@ -60,11 +60,12 @@ dev = [
 sar-validate = "sar_validation.cli:main"
 
 [tool.setuptools.packages.find]
-where = "src"
+where = ["src"]
 include = ["sar_validation*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 filterwarnings = [
     # cartopy 0.25's tick formatter reads Matplotlib's Formatter.locs,
     # deprecated in mpl 3.11 and removed in 3.13 (~3000 hits per CI run on

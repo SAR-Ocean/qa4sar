@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+title: "SAR Level 2 Validation Toolbox"
+version: 0.1.0
+date-released: 2026-08-14
+authors:
+  - family-names: "Doe"
+    given-names: "Project"
+    affiliation: "CANVAS / METNO"
+    orcid: ""
+urls:
+  - name: repository
+    url: "https://github.com/your-org/qa4sar"

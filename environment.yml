@@ -1,4 +1,4 @@
-name: sar_validation
+#name: sar_validation
 channels:
   - conda-forge
 dependencies:

@@ -1,0 +1,15 @@
+# Replace the placeholders below with actual GitHub usernames or teams.
+# Lines starting with '#' are comments and ignored by GitHub.
+
+# Default owners for the whole repository
+* @your-github-username
+
+# Owners for source code
+/src/ @your-github-username
+
+# Owners for documentation and CI
+/docs/ @your-github-username
+.github/workflows/ @your-github-username
+
+# Optional: add team references if your org uses teams
+# /src/ @org/team-name

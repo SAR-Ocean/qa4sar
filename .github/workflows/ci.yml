@@ -2,43 +2,80 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main, master, guideliness]
   pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
+
       - name: Cache Natural Earth data
-        uses: actions/cache@v6
+        uses: actions/cache@v4
         with:
           path: ~/.local/share/cartopy
-          key: cartopy-natural-earth-10m-v1
-      - name: Install package with dev extras
-        # matplotlib pinned <3.13: cartopy 0.25's tick formatter uses
-        # Formatter.locs, deprecated in mpl 3.11 and removed in 3.13.
-        # Remove the pin (and the matching filterwarnings ignore in
-        # pyproject.toml) once cartopy ships a fix.
-        run: pip install -e .[dev] "matplotlib<3.13"
-      - name: Pre-fetch Natural Earth coastline data
-        # The 10m land + coastline shapefiles _land_coastline_features()
-        # needs; instant no-op when the cache above was hit. Keeping this a
-        # dedicated step (rather than letting pytest download lazily) makes
-        # cold-cache download time visible in the job timeline.
+          key: cartopy-natural-earth-10m-v1-${{ runner.os }}-${{ matrix.python-version }}
+
+      - name: Install package and dev dependencies
         run: |
-          python -c "
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]' "matplotlib<3.13"
+
+      - name: Pre-fetch Natural Earth coastline data
+        # The 10m land + coastline shapefiles used by several recipes are
+        # downloaded lazily by cartopy. Pre-fetching them keeps CI output
+        # reproducible and makes cache misses visible in the job timeline.
+        run: |
+          python - <<'PY'
           import cartopy.io.shapereader as shpreader
           for name in ('land', 'coastline'):
               shpreader.natural_earth(resolution='10m', category='physical', name=name)
-          "
+          PY
+
       - name: Lint
         run: ruff check .
+
       - name: Type check
         run: python -m mypy -p sar_validation
+
       - name: Test
-        run: pytest
+        run: pytest -q
+
+  codeql:
+    name: CodeQL analysis
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      security-events: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: python
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v2
+
+      - name: Run CodeQL analysis
+        uses: github/codeql-action/analyze@v2
