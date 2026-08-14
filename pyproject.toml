@@ -7,22 +7,22 @@ name = "sar-l2-validation-toolbox"
 version = "0.1.0"
 description = "SAR Level 2 Ocean Data Validation Toolbox for wind, currents, and waves"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 license = { text = "MIT" }
 keywords = ["SAR", "Sentinel-1", "ocean", "validation", "remote sensing"]
 
 dependencies = [
-    "xarray>=2024.1",
-    "numpy",
-    "pandas",
-    "scipy>=1.10",     # scipy.spatial.cKDTree (collocation NN search) + RegularGridInterpolator descending-axis support (model_collocation.py)
-    "netCDF4",         # xarray netcdf4 engine — datatree read/write in cli.py
-    "pyyaml",
-    "requests",
-    "keyring",         # OS keyring credential storage — authenticate_* helpers in downloaders/base.py
-    "copernicusmarine>=2.0",
-    "rioxarray",       # GeoTIFF ingestion — Sentinel-1 CLMS Surface Soil Moisture
-    "rasterio",        # rioxarray's raster I/O backend
+    "xarray==2026.7.0",
+    "numpy==2.5.2",
+    "pandas==3.0.5",
+    "scipy==1.18.0",
+    "netCDF4==1.7.4",
+    "pyyaml==6.0.3",
+    "requests==2.34.2",
+    "keyring==25.7.0",
+    "copernicusmarine==2.4.1",
+    "rioxarray==0.23.0",
+    "rasterio==1.5.1",
 ]
 
 [project.optional-dependencies]
