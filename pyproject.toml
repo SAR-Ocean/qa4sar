@@ -60,6 +60,7 @@ dev = [
 sar-validate = "sar_validation.cli:main"
 
 [tool.setuptools.packages.find]
+where = "src"
 include = ["sar_validation*"]
 
 [tool.pytest.ini_options]
