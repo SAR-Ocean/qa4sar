@@ -509,7 +509,6 @@ def plot_scatter(
     val_var: str,
     *,
     by_source: bool = True,
-    color_by: str = "source",
     interactive: bool = False,
     ax=None,
     split_when_imbalanced: bool = True,
@@ -527,15 +526,7 @@ def plot_scatter(
     val_var : str
         Validation variable name *without* ``val_`` prefix (e.g. ``"WSPD"``).
     by_source : bool
-        Whether per-source legend labels are shown (``color_by="source"``)
-        or the per-source marker-shape legend is shown
-        (``color_by="temporal_offset"``).
-    color_by : str
-        ``"source"`` (default) colours points by ``val_source``.
-        ``"temporal_offset"`` colours points by ``temporal_distance_minutes``
-        (continuous colormap + colorbar) instead, with marker shape still
-        varying by source — falls back to ``"source"`` with a warning if
-        ``temporal_distance_minutes`` is not present in *collocation_ds*.
+        Whether per-source legend labels are shown.
     interactive : bool
         Return a plotly Figure instead of matplotlib.
     ax : matplotlib.axes.Axes, optional
@@ -593,32 +584,11 @@ def plot_scatter(
         counts = df["val_source"].value_counts()
         dominant_share = float(counts.max()) / float(counts.sum())
 
-    # Resolved here (rather than only below, in the single-shared-axes
-    # path) so the split branch immediately below can forward the caller's
-    # actual color_by intent into small multiples instead of silently
-    # dropping it -- previously, whenever imbalance/force_split triggered
-    # a split, color_by="temporal_offset" was ignored entirely and
-    # _plot_scatter_small_multiples always rendered the plain by-source
-    # view, producing a page that duplicated the main scatter instead of
-    # showing temporal-offset coloring. Guarded by `not interactive`
-    # because the interactive/plotly branch below ignores color_by
-    # entirely already and must not emit this warning for it.
-    color_by_offset = color_by == "temporal_offset"
-    if not interactive and color_by_offset and "temporal_distance_minutes" not in df.columns:
-        warnings.warn(
-            "color_by='temporal_offset' requested but collocation_ds has no "
-            "'temporal_distance_minutes' column; falling back to color_by='source'."
-        )
-        color_by_offset = False
-
     if (
         not interactive and ax is None and split_when_imbalanced
         and len(sources_for_split) >= 2 and (dominant_share > 0.7 or force_split)
     ):
-        return _plot_scatter_small_multiples(
-            df, sar_col, val_col, sar_var, val_var, collocation_ds,
-            color_by="temporal_offset" if color_by_offset else "source",
-        )
+        return _plot_scatter_small_multiples(df, sar_col, val_col, sar_var, val_var, collocation_ds)
 
     if interactive:
         _require("plotly")
@@ -660,35 +630,19 @@ def plot_scatter(
         if has_var_code else [(src, None) for src in sorted(sources)]
     )
 
-    offset_sm = None
-    offset_vmin = offset_vmax = None
-    if color_by_offset:
-        offset_vmin = float(df["temporal_distance_minutes"].min())
-        offset_vmax = float(df["temporal_distance_minutes"].max())
     for src, var_code in groups:
         sub = (
             df[(df["val_source"] == src) & (df["val_var_code"] == var_code)]
             if var_code is not None else df[df["val_source"] == src]
         )
         marker = style[src][1]
-        if color_by_offset:
-            offset_sm = ax.scatter(
-                sub[val_col], sub[sar_col], s=18, alpha=0.7,
-                c=sub["temporal_distance_minutes"], cmap="plasma",
-                vmin=offset_vmin, vmax=offset_vmax,
-                marker=marker, rasterized=True,
-            )
-        else:
-            label = (f"{src} [{var_code}]" if var_code is not None else src) if by_source else None
-            ax.scatter(sub[val_col], sub[sar_col], s=18, alpha=0.6,
-                       color=style[src][0], marker=marker, label=label, rasterized=True)
+        label = (f"{src} [{var_code}]" if var_code is not None else src) if by_source else None
+        ax.scatter(sub[val_col], sub[sar_col], s=18, alpha=0.6,
+                   color=style[src][0], marker=marker, label=label, rasterized=True)
 
     all_vals = np.concatenate([df[val_col].values, df[sar_col].values])
     vmin, vmax = _pad_degenerate_range(float(np.nanmin(all_vals)), float(np.nanmax(all_vals)))
-    line11 = ax.plot([vmin, vmax], [vmin, vmax], "k--", linewidth=1, label="1:1")[0]
-
-    if color_by_offset and offset_sm is not None:
-        fig.colorbar(offset_sm, ax=ax, label="Temporal offset (min)", shrink=0.8)
+    ax.plot([vmin, vmax], [vmin, vmax], "k--", linewidth=1, label="1:1")
 
     # Annotate with N, bias, RMSE
     from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg  # noqa: PLC0415
@@ -734,35 +688,18 @@ def plot_scatter(
     ax.set_aspect("equal", "box")
     ax.grid(True, linewidth=0.4)
 
-    if color_by_offset:
-        if by_source:
-            handles = _source_marker_handles(
-                ((src, style[src][1]) for src in sorted(sources)), markersize=6,
-            )
-            handles.append(line11)
-            ax.legend(handles=handles, fontsize=7, framealpha=0.7)
-    elif by_source:
+    if by_source:
         ax.legend(fontsize=7, framealpha=0.7)
 
     fig.tight_layout()
     return fig
 
 
-def _plot_scatter_small_multiples(
-    df, sar_col, val_col, sar_var, val_var, collocation_ds, *, color_by: str = "source",
-):
+def _plot_scatter_small_multiples(df, sar_col, val_col, sar_var, val_var, collocation_ds):
     """One scatter subplot per val_source -- used by plot_scatter when one
     source's point count dominates enough to visually bury the others in
     a single shared axes (see split_when_imbalanced), or when force_split
     requests a split regardless of imbalance.
-
-    color_by mirrors plot_scatter's own parameter: ``"source"`` (default)
-    colors each subplot with that source's stable color; ``"temporal_offset"``
-    colors by temporal_distance_minutes instead, sharing one color scale
-    (and one colorbar) across every subplot so offsets stay comparable
-    source to source -- previously this parameter was silently dropped
-    whenever a split was triggered, producing a duplicate of the plain
-    by-source view under a "colored by temporal offset" title.
 
     When *df* carries a ``val_var_code`` column (waves' merged VHM0/VAVH/
     VGHS "SWH" pair -- see merge_wave_height_columns), splitting is by
@@ -786,13 +723,6 @@ def _plot_scatter_small_multiples(
     nrows = math.ceil(len(groups) / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 6 * nrows), squeeze=False)
 
-    color_by_offset = color_by == "temporal_offset" and "temporal_distance_minutes" in df.columns
-    offset_vmin = offset_vmax = None
-    last_offset_sm = None
-    if color_by_offset:
-        offset_vmin = float(df["temporal_distance_minutes"].min())
-        offset_vmax = float(df["temporal_distance_minutes"].max())
-
     for idx, (src, var_code) in enumerate(groups):
         r, c = divmod(idx, ncols)
         sub_ax = axes[r][c]
@@ -800,15 +730,8 @@ def _plot_scatter_small_multiples(
             df[(df["val_source"] == src) & (df["val_var_code"] == var_code)]
             if var_code is not None else df[df["val_source"] == src]
         )
-        if color_by_offset:
-            last_offset_sm = sub_ax.scatter(
-                sub[val_col], sub[sar_col], s=18, alpha=0.7,
-                c=sub["temporal_distance_minutes"], cmap="plasma",
-                vmin=offset_vmin, vmax=offset_vmax, rasterized=True,
-            )
-        else:
-            sub_ax.scatter(sub[val_col], sub[sar_col], s=18, alpha=0.6,
-                            color=color_map[src], rasterized=True)
+        sub_ax.scatter(sub[val_col], sub[sar_col], s=18, alpha=0.6,
+                        color=color_map[src], rasterized=True)
         sub_ax.set_xlabel(_labeled_var(collocation_ds, val_col, val_var, val_source=src))
         sub_ax.set_ylabel(_labeled_var(collocation_ds, sar_col, sar_var))
         title = f"{src} (N={len(sub)})" if var_code is None else f"{src} [{var_code}] (N={len(sub)})"
@@ -819,17 +742,11 @@ def _plot_scatter_small_multiples(
         sub_vmin, sub_vmax = _pad_degenerate_range(float(np.nanmin(sub_vals)), float(np.nanmax(sub_vals)))
         sub_ax.plot([sub_vmin, sub_vmax], [sub_vmin, sub_vmax], "k--", linewidth=1, label="1:1")
 
-    visible_axes = [axes[idx // ncols][idx % ncols] for idx in range(len(groups))]
     for idx in range(len(groups), nrows * ncols):
         axes[idx // ncols][idx % ncols].set_visible(False)
 
     fig.suptitle(f"{sar_var} vs {val_var}")
-    # tight_layout before the colorbar -- fig.colorbar(ax=<list>) creates a
-    # standalone Axes outside the subplot grid, which tight_layout can't
-    # account for (and warns about) if it already exists.
     fig.tight_layout()
-    if color_by_offset and last_offset_sm is not None:
-        fig.colorbar(last_offset_sm, ax=visible_axes, label="Temporal offset (min)", shrink=0.6)
     return fig
 
 

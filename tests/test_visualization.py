@@ -424,112 +424,6 @@ class TestPlotScatter:
         plt.close("all")
 
 
-class TestPlotScatterColorByTemporalOffset:
-    def test_returns_figure_with_colorbar(self, collocation_ds):
-        import matplotlib.pyplot as plt
-        fig = plot_scatter(collocation_ds, "owiWindSpeed", "WSPD", color_by="temporal_offset")
-        assert fig is not None
-        assert len(fig.axes) >= 2  # main axes + colorbar axes
-        plt.close(fig)
-
-    def test_split_small_multiples_still_colors_by_temporal_offset(self):
-        """Regression test: previously, whenever the >70%-imbalance split
-        (or force_split) triggered, color_by='temporal_offset' was
-        silently dropped -- _plot_scatter_small_multiples always rendered
-        the plain by-source view, so the report's 'colored by temporal
-        offset' page became an exact duplicate of the main scatter page
-        under a misleading title. Each split subplot must now actually be
-        colored by temporal_distance_minutes, with a shared colorbar."""
-        import numpy as np
-        import xarray as xr
-
-        from sar_validation.core.visualization import plot_scatter
-
-        rng = np.random.default_rng(0)
-        n_ascat, n_smap = 700, 30
-        n = n_ascat + n_smap
-        sar = np.concatenate([rng.uniform(0, 100, n_ascat), rng.uniform(0, 100, n_smap)])
-        val = sar + rng.normal(0, 2, n)
-        offset = rng.uniform(0, 600, n)
-        ds = xr.Dataset({
-            "sar_sarSSM":        ("collocation", sar),
-            "val_SOIL_MOISTURE": ("collocation", val),
-            "val_source":        ("collocation", ["ascat_ssm"] * n_ascat + ["smap_ssm"] * n_smap),
-            "val_lat":           ("collocation", rng.uniform(50, 60, n)),
-            "val_lon":           ("collocation", rng.uniform(-10, 5, n)),
-            "temporal_distance_minutes": ("collocation", offset),
-        })
-        fig = plot_scatter(ds, "sarSSM", "SOIL_MOISTURE", color_by="temporal_offset")
-        visible_axes = [ax for ax in fig.axes if ax.get_visible()]
-        # 2 source subplots + 1 shared colorbar axes.
-        assert len(visible_axes) == 3
-
-        # Source subplots carry a "<src> (N=...)" title; the colorbar axes
-        # (matplotlib label "<colorbar>") has none -- a more reliable
-        # discriminator than ax.collections, since the colorbar's own
-        # gradient is itself drawn via a QuadMesh in `.collections`.
-        scatter_axes = [ax for ax in visible_axes if ax.get_title()]
-        assert len(scatter_axes) == 2
-        for ax in scatter_axes:
-            offsets_used = ax.collections[0].get_array()
-            assert offsets_used is not None and len(offsets_used) > 0, (
-                "split subplot's scatter has no per-point color array -- "
-                "color_by='temporal_offset' was dropped, not applied"
-            )
-        import matplotlib.pyplot as plt
-        plt.close("all")
-
-    def test_uses_distinct_markers_per_source(self, collocation_ds, monkeypatch):
-        import matplotlib.axes
-        import matplotlib.pyplot as plt
-
-        recorded_markers = []
-        original_scatter = matplotlib.axes.Axes.scatter
-
-        def recording_scatter(self, *args, **kwargs):
-            recorded_markers.append(kwargs.get("marker"))
-            return original_scatter(self, *args, **kwargs)
-
-        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
-        fig = plot_scatter(collocation_ds, "owiWindSpeed", "WSPD", color_by="temporal_offset")
-        plt.close(fig)
-
-        assert len(set(recorded_markers)) == 2
-
-    def test_missing_temporal_column_falls_back_to_source(self):
-        n = 5
-        ds = xr.Dataset({
-            "sar_owiWindSpeed": ("collocation", [8.0, 7.0, 6.0, 9.0, 10.0]),
-            "val_WSPD":         ("collocation", [7.5, 7.2, 6.1, 8.9, 9.8]),
-            "val_source":       ("collocation", ["buoy"] * n),
-        })
-        import matplotlib.pyplot as plt
-        with pytest.warns(UserWarning, match="temporal_distance_minutes"):
-            fig = plot_scatter(ds, "owiWindSpeed", "WSPD", color_by="temporal_offset")
-        assert fig is not None
-        plt.close(fig)
-
-    def test_shares_one_color_scale_across_sources(self, collocation_ds, monkeypatch):
-        import matplotlib.axes
-        import matplotlib.pyplot as plt
-
-        recorded_clims = []
-        original_scatter = matplotlib.axes.Axes.scatter
-
-        def recording_scatter(self, *args, **kwargs):
-            pc = original_scatter(self, *args, **kwargs)
-            if kwargs.get("c") is not None:
-                recorded_clims.append(pc.get_clim())
-            return pc
-
-        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
-        fig = plot_scatter(collocation_ds, "owiWindSpeed", "WSPD", color_by="temporal_offset")
-        plt.close(fig)
-
-        assert len(recorded_clims) == 2
-        assert recorded_clims[0] == recorded_clims[1]
-
-
 class TestLabeledVarMixedUnits:
     def test_uses_val_units_for_specific_source(self):
         import xarray as xr
@@ -4886,10 +4780,6 @@ class TestValidationReportWindDirectionFilter:
             "sar_scene_name":       ("collocation", ["sceneA"] * 4),
             "val_lon":              ("collocation", [-9.5, -9.4, -9.3, -9.2]),
             "val_lat":              ("collocation", [50.5, 50.6, 50.7, 50.8]),
-            # Present so color_by="temporal_offset" and plot_temporal_offset
-            # don't fall back / bail with "missing" warnings unrelated to
-            # what this test is checking (every other fixture in this file
-            # that exercises those code paths includes this column too).
             "temporal_distance_minutes": ("collocation", [10.0, 20.0, 15.0, 25.0]),
         })
 
@@ -4897,8 +4787,8 @@ class TestValidationReportWindDirectionFilter:
         # plot_scatter and plot_geographic so we observe the *dataset each
         # one receives* for each (sar_var, val_var) pair, not a downstream
         # rendering side-effect. (A scatter/label-based spy is unreliable
-        # here — plot_scatter and plot_temporal_offset each do their own
-        # dropna() on the val_ column before ever calling ax.scatter, which
+        # here — plot_scatter does its own dropna() on the val_ column
+        # before ever calling ax.scatter, which
         # would independently strip altimeter's all-NaN WDIR rows even if
         # validation_report's pair_ds filtering were never wired up at all —
         # see Fix Round 2 report for the falsification that proved this.)
@@ -5525,11 +5415,6 @@ class TestValidationReportRvlLandQaPage:
             "sar_scene_name":            ("collocation", ["sceneA"] * 4),
             "val_lon":                   ("collocation", [-9.5, -9.4, -9.3, -9.2]),
             "val_lat":                   ("collocation", [50.5, 50.6, 50.7, 50.8]),
-            # Present (unlike a minimal fixture omitting it) so that
-            # plot_scatter(color_by="temporal_offset") and
-            # plot_temporal_offset() don't emit "missing
-            # temporal_distance_minutes" warnings/None-returns — keeps this
-            # test's output pristine and its baseline page count stable.
             "temporal_distance_minutes": ("collocation", [10.0, 20.0, 15.0, 25.0]),
         })
 
