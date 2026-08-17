@@ -7,7 +7,7 @@ name = "sar-l2-validation-toolbox"
 version = "0.1.0"
 description = "SAR Level 2 Ocean Data Validation Toolbox for wind, currents, and waves"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 keywords = ["SAR", "Sentinel-1", "ocean", "validation", "remote sensing"]
 
