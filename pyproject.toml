@@ -92,6 +92,7 @@ select = ["E", "F", "I"]
 
 [tool.mypy]
 python_version = "3.12"
+mypy_path = ["src"]
 # Only type-check this project's own code. Third-party scientific libs
 # (xarray, zarr, copernicusmarine, eumdac, cartopy, …) are followed for
 # imports but their own errors are suppressed — "silent" stops mypy choking
