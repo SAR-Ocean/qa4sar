@@ -1,7 +1,7 @@
 """
 Visualization — step 5b of the validation pipeline.
 
-Five public plot functions:
+Four public plot functions:
 
 * :func:`plot_scatter`      — SAR vs. validation variable scatter plot
 * :func:`plot_geographic`   — SAR field + collocated points, one subplot per SAR scene
@@ -14,7 +14,7 @@ Plus fallback and convenience wrappers:
   validation points (one category per validation source actually present),
   always generated as part of the collocation step (step 3), including when
   there are zero collocated pairs.
-* :func:`validation_report` — runs all five plots, infers variable pairs from the recipe,
+* :func:`validation_report` — runs all four plots, infers variable pairs from the recipe,
   embeds plots in ``validation_report<suffix>.pdf``, and saves the collocation-diagnostics PNG to ``<out_dir>/plots/``
 
 All functions accept an ``interactive=False`` keyword argument.  When
