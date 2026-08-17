@@ -103,6 +103,30 @@ class SatelliteOrbitSpec:
 SATELLITE_ORBIT_SPECS: Dict[str, SatelliteOrbitSpec] = {
     "metop-b": SatelliteOrbitSpec(norad_id=38771, swath_half_width_km=600.0),
     "metop-c": SatelliteOrbitSpec(norad_id=43689, swath_half_width_km=600.0),
+    # HY-2B/HY-2C HSCAT (Ku-band rotating pencil-beam scatterometer).
+    # NORAD IDs live-confirmed via ILRS/N2YO, 2026-08-17. Swath width
+    # is reported anywhere from ~1300km (EUMETSAT NWP SAF monitoring
+    # page) to ~1800km (KNMI's OSI-SAF HY-2 winds Product User Manual,
+    # which gives the widest documented figure) -- the wider figure is
+    # used here (half of it per side), consistent with this module's
+    # fail-toward-inclusion principle (see the METOP-B/C comment
+    # above, and the module docstring's "never risk a false negative").
+    "hy2b": SatelliteOrbitSpec(norad_id=43655, swath_half_width_km=900.0),
+    "hy2c": SatelliteOrbitSpec(norad_id=46469, swath_half_width_km=900.0),
+    # Oceansat-3/EOS-06 OSCAT-3 (Ku-band conical-scan scatterometer).
+    # NORAD ID live-confirmed via eoPortal/WMO OSCAR, 2026-08-17. Swath
+    # width 1440km (WMO OSCAR OSCAT-3 instrument page), half per side.
+    "oceansat3": SatelliteOrbitSpec(norad_id=54361, swath_half_width_km=720.0),
+    # GCOM-W1 "Shizuku" -- AMSR2's host satellite (conical scanner).
+    # NORAD ID live-confirmed via JAXA/Wikidata, 2026-08-17. Swath
+    # width reported as ~1450km nominal / >1600km effective (JAXA
+    # GCOM-W1 documentation); the wider effective figure is used here,
+    # half per side.
+    "gcom-w1": SatelliteOrbitSpec(norad_id=38337, swath_half_width_km=800.0),
+    # SMOS (MIRAS interferometric radiometer, hexagonal FOV). NORAD ID
+    # live-confirmed via N2YO/CEOS, 2026-08-17. Swath width ~1050km
+    # (ESA eoPortal / CEOS instrument database), half per side.
+    "smos": SatelliteOrbitSpec(norad_id=36036, swath_half_width_km=525.0),
 }
 
 
