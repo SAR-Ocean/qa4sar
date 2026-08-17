@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from sar_validation.core.recipe import (
@@ -500,3 +502,27 @@ class TestModelTimeToleranceMinimums:
 
         assert min_safe_model_time_tolerance_minutes("scatterometer") is None
         assert min_safe_model_time_tolerance_minutes("hf_radar_grid") is None
+
+
+# ---------------------------------------------------------------------------
+# Existing waves recipes declare explicit altimeter frequency
+# ---------------------------------------------------------------------------
+
+class TestExistingWavesRecipesHaveExplicitAltimeterFrequency:
+    """Regression test: every checked-in waves recipe with an altimeter
+    source must declare its frequencies explicitly (docs/design-choices.md
+    §3.3), not rely on DataOrchestrator's fallback default."""
+
+    @pytest.mark.parametrize(
+        "recipe_filename",
+        [
+            "waves_atlantic.yaml",
+            "waves_pacific.yaml",
+        ],
+    )
+    def test_altimeter_source_declares_1hz(self, recipe_filename):
+        recipe = Recipe.from_yaml(Path("recipes") / recipe_filename)
+        alt_source = next(
+            s for s in recipe.config.validation_sources if s.source_type == "altimeter"
+        )
+        assert alt_source.download_kwargs == {"frequencies": ["1hz"]}

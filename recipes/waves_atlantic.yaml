@@ -32,7 +32,9 @@ validation_sources:
   download_kwargs: {}
   collocation_kwargs: {}
 - source_type: altimeter
-  download_kwargs: {}
+  download_kwargs:
+    frequencies:
+    - 1hz
   collocation_kwargs: {}
 - source_type: era5
   download_kwargs: {}
