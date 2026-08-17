@@ -115,8 +115,20 @@ CMEMS along-track altimetry comes at 1 Hz (~7 km along-track spacing, carries
 distinct layer types** (`altimeter_1hz` / `altimeter_5hz`) because the
 collocation aggregation window must match the sensor's footprint spacing —
 a single window would be wrong for at least one of them (§5.2). The frequency
-is detected from the file content (5 Hz files do not carry `WIND_SPEED`). 
-Wind recipes download only 1 Hz (as 5 Hz has no wind); wave recipes download both.
+is detected from the file content (5 Hz files do not carry `WIND_SPEED`).
+Wind recipes download only 1 Hz (as 5 Hz has no wind).
+
+Wave recipes default to 1 Hz only, as of 2026-08. Downloading both
+frequencies by default meant a 5 Hz point and its nearest 1 Hz point often
+fall within the same SAR pixel's collocation window — effectively
+double-sampling that pixel with two altimeter observations of differing
+resolution and noise characteristics, skewing wave-height validation
+statistics toward it. `--altimeter-freq {1hz,5hz,both}` at
+`--create-recipe waves` time opts into a different source (rejected as an
+error for every other `--create-recipe` category); the choice is written
+explicitly into the generated recipe's altimeter `download_kwargs`, e.g.
+`{"frequencies": ["5hz"]}`, so it's visible and independently editable per
+recipe rather than an implicit toolbox-wide default.
 
 ### 3.4 Radiometer products are pre-gridded to 0.25° bins
 
