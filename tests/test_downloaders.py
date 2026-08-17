@@ -697,6 +697,24 @@ class TestSetCredential:
 # SMOSDownloader
 # ---------------------------------------------------------------------------
 
+class TestSmosParseSensingWindow:
+    def test_parses_real_naming_convention(self):
+        from sar_validation.downloaders.smos_downloader import _parse_sensing_window
+
+        result = _parse_sensing_window(
+            "SM_OPER_MIR_SMNRT2_20260701T001234_20260701T010546_600_001_1.nc"
+        )
+        assert result == (
+            datetime(2026, 7, 1, 0, 12, 34, tzinfo=timezone.utc),
+            datetime(2026, 7, 1, 1, 5, 46, tzinfo=timezone.utc),
+        )
+
+    def test_unparseable_filename_returns_none(self):
+        from sar_validation.downloaders.smos_downloader import _parse_sensing_window
+
+        assert _parse_sensing_window("SM_1.nc") is None
+
+
 class TestSMOSDownloader:
     def test_dry_run_prints_params_without_network(self, tmp_path, capsys):
         from sar_validation.downloaders.smos_downloader import SMOSDownloader
@@ -782,6 +800,128 @@ class TestSMOSDownloader:
             )
 
         assert result == [tmp_path / "SM_1.nc"]
+
+
+class TestSMOSDownloaderOrbitPrefilter:
+    def test_default_orbit_prefilter_is_enabled(self, tmp_path):
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        dl = SMOSDownloader(output_dir=tmp_path, username="u", password="p")
+        assert dl.orbit_prefilter is True
+
+    def test_dropped_files_are_excluded_from_download(self, tmp_path):
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        dl._login = MagicMock()
+        dl._list_products_for_day = MagicMock(return_value=[
+            {
+                "filename": "SM_OPER_MIR_SMNRT2_20260701T001234_20260701T010546_600_001_1.nc",
+                "download_href": "/oads/access/login?r=x&d=SM_1.nc",
+            },
+        ])
+        fake_session = MagicMock()
+
+        with patch(
+            "sar_validation.downloaders.smos_downloader.requests.Session",
+            return_value=fake_session,
+        ), patch(
+            "sar_validation.core.orbit_coverage.orbit_overlaps_bbox", return_value=False,
+        ):
+            result = dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-01",
+            )
+
+        assert result == []
+        fake_session.get.assert_not_called()
+
+    def test_orbit_prefilter_false_reproduces_todays_behavior(self, tmp_path):
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        dl = SMOSDownloader(
+            output_dir=tmp_path, dry_run=False, username="u", password="p", orbit_prefilter=False,
+        )
+        dl._login = MagicMock()
+        dl._list_products_for_day = MagicMock(return_value=[
+            {
+                "filename": "SM_OPER_MIR_SMNRT2_20260701T001234_20260701T010546_600_001_1.nc",
+                "download_href": "/oads/access/login?r=x&d=SM_1.nc",
+            },
+        ])
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(status_code=200, content=b"data")
+
+        with patch(
+            "sar_validation.downloaders.smos_downloader.requests.Session",
+            return_value=fake_session,
+        ), patch("sar_validation.core.orbit_coverage.orbit_overlaps_bbox") as mock_overlap:
+            result = dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-01",
+            )
+
+        assert not mock_overlap.called
+        assert len(result) == 1
+
+    def test_real_start_stop_used_when_filename_matches(self, tmp_path):
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        dl._login = MagicMock()
+        dl._list_products_for_day = MagicMock(return_value=[
+            {
+                "filename": "SM_OPER_MIR_SMNRT2_20260701T001234_20260701T010546_600_001_1.nc",
+                "download_href": "/oads/access/login?r=x&d=SM_1.nc",
+            },
+        ])
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(status_code=200, content=b"data")
+
+        with patch(
+            "sar_validation.downloaders.smos_downloader.requests.Session",
+            return_value=fake_session,
+        ), patch(
+            "sar_validation.core.orbit_coverage.orbit_overlaps_bbox", return_value=True,
+        ) as mock_overlap:
+            dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-01",
+            )
+
+        assert mock_overlap.call_count == 1
+        satellite, start, end = mock_overlap.call_args[0][0:3]
+        assert satellite == "smos"
+        assert start == datetime(2026, 7, 1, 0, 12, 34, tzinfo=timezone.utc)
+        assert end == datetime(2026, 7, 1, 1, 5, 46, tzinfo=timezone.utc)
+
+    def test_whole_day_window_used_when_filename_unparseable(self, tmp_path):
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        dl._login = MagicMock()
+        dl._list_products_for_day = MagicMock(return_value=[
+            {"filename": "SM_1.nc", "download_href": "/oads/access/login?r=x&d=SM_1.nc"},
+        ])
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(status_code=200, content=b"data")
+
+        with patch(
+            "sar_validation.downloaders.smos_downloader.requests.Session",
+            return_value=fake_session,
+        ), patch(
+            "sar_validation.core.orbit_coverage.orbit_overlaps_bbox", return_value=True,
+        ) as mock_overlap:
+            dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-01",
+            )
+
+        assert mock_overlap.call_count == 1
+        satellite, start, end = mock_overlap.call_args[0][0:3]
+        assert satellite == "smos"
+        assert start == datetime(2026, 7, 1, 0, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2026, 7, 1, 23, 59, 59, tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------

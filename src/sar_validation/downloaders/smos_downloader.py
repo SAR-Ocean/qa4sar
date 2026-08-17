@@ -32,7 +32,7 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin
@@ -48,6 +48,30 @@ OADS_TREE_URL = f"{OADS_BASE_URL}/collection/NRT_Open/tree"
 OADS_LOGIN_URL = f"{OADS_BASE_URL}/login"
 #: OADS "Type" tree-form value for the NRT L2 Soil Moisture product.
 OADS_PRODUCT_TYPE = "MIR_SMNRT2"
+
+#: Standard ESA SMOS filename convention:
+#: SM_OPER_MIR_SMUDP2_<start>_<stop>_<orbit>_<counter>_<version>.zip
+#: (operational) or the NRT variant SM_OPER_MIR_SMNRT2_... -- both carry
+#: real start/stop sensing timestamps in YYYYMMDDTHHMMSS format. If a
+#: real OADS filename doesn't match this (unconfirmed against a live
+#: listing as of this writing), _filter_by_orbit_overlap falls back to
+#: a whole-day window instead -- see that method.
+_SENSING_WINDOW_RE = re.compile(r"MIR_SM(?:UDP2|NRT2)_(\d{8}T\d{6})_(\d{8}T\d{6})_")
+
+
+def _parse_sensing_window(filename: str) -> "Optional[tuple[datetime, datetime]]":
+    """Extract the embedded (start, stop) sensing timestamps from a
+    standard SMOS filename, or None if the filename doesn't match the
+    expected convention."""
+    m = _SENSING_WINDOW_RE.search(filename)
+    if not m:
+        return None
+    try:
+        start = datetime.strptime(m.group(1), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+        stop = datetime.strptime(m.group(2), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+        return start, stop
+    except ValueError:
+        return None
 
 
 class SMOSDownloader:
@@ -72,11 +96,13 @@ class SMOSDownloader:
         dry_run: bool = False,
         username: Optional[str] = None,
         password: Optional[str] = None,
+        orbit_prefilter: bool = True,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
         self._username = username
         self._password = password
+        self.orbit_prefilter = orbit_prefilter
 
     def _list_products_for_day(self, session: "requests.Session", day) -> list:
         """
@@ -242,6 +268,36 @@ class SMOSDownloader:
         acs_resp = session.post(acs_action_url, data=acs_data, timeout=60)
         acs_resp.raise_for_status()
 
+    def _filter_by_orbit_overlap(
+        self, products: list, day, min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    ) -> list:
+        """Drop products whose sensing window shows no predicted orbit
+        overlap with the requested bbox -- see
+        orbit_coverage.orbit_overlaps_bbox. Uses each filename's real
+        embedded start/stop timestamps when parseable (see
+        _parse_sensing_window); falls back to the whole day [00:00:00Z,
+        23:59:59Z] otherwise -- a real, expected fallback (not a
+        defensive "can't happen" branch), since the real OADS filename
+        format hasn't been directly confirmed by this codebase yet."""
+        from ..core.orbit_coverage import orbit_overlaps_bbox
+
+        kept = []
+        dropped = 0
+        for product in products:
+            window = _parse_sensing_window(product["filename"])
+            if window is not None:
+                start, end = window
+            else:
+                start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+                end = start + timedelta(hours=23, minutes=59, seconds=59)
+            if orbit_overlaps_bbox("smos", start, end, min_lon, max_lon, min_lat, max_lat):
+                kept.append(product)
+            else:
+                dropped += 1
+        if dropped:
+            print(f"Orbit pre-filter: skipped {dropped} file(s) with no predicted overlap.")
+        return kept
+
     def download(
         self,
         min_lon: float,
@@ -287,6 +343,10 @@ class SMOSDownloader:
         downloaded: list[Path] = []
         while day <= last:
             products = self._list_products_for_day(session, day)
+            if self.orbit_prefilter:
+                products = self._filter_by_orbit_overlap(
+                    products, day, min_lon, max_lon, min_lat, max_lat,
+                )
             for product in products:
                 fname = product["filename"]
                 if not fname.endswith((".nc", ".tgz")):
@@ -328,6 +388,10 @@ def _parse_args(argv=None):
     p.add_argument("--password", default=None)
     p.add_argument("--output-dir", default=None)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--no-orbit-prefilter", dest="orbit_prefilter", action="store_false", default=True,
+        help="Disable the orbit-based geographic pre-filter (default: enabled).",
+    )
     return p.parse_args(argv)
 
 
@@ -361,6 +425,7 @@ def main(argv=None):
         dry_run=args.dry_run,
         username=args.username,
         password=args.password,
+        orbit_prefilter=args.orbit_prefilter,
     )
     dl.download(
         min_lon=min_lon, max_lon=max_lon,
