@@ -228,6 +228,24 @@ class TestAltimeterFreqCliFlag:
         with pytest.raises(SystemExit):
             main(["--create-recipe", "waves", "--altimeter-freq", "10hz"])
 
+    def test_rejected_when_combined_with_recipe_flag(self, tmp_path, monkeypatch, capsys):
+        """--altimeter-freq only makes sense at recipe-creation time
+        (--create-recipe waves); combining it with --recipe (executing an
+        *existing* recipe file) must be rejected the same way as combining
+        it with a non-waves --create-recipe category. args.create_recipe is
+        None here, so the guard's `!= "waves"` check fires regardless of
+        whether the recipe file exists -- parser.error() must run before
+        the file is ever touched."""
+        from sar_validation.cli import main
+
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit):
+            main(["--recipe", "some_recipe.yaml", "--altimeter-freq", "5hz"])
+        captured = capsys.readouterr()
+        assert "waves" in (captured.out + captured.err) or "--recipe" in (
+            captured.out + captured.err
+        )
+
 
 class TestLoadPrecomputedStats:
     def test_finds_files_saved_under_filter_variable_pairs_keys(self, tmp_path):

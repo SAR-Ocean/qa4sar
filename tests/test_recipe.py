@@ -521,7 +521,8 @@ class TestExistingWavesRecipesHaveExplicitAltimeterFrequency:
         ],
     )
     def test_altimeter_source_declares_1hz(self, recipe_filename):
-        recipe = Recipe.from_yaml(Path("recipes") / recipe_filename)
+        recipes_dir = Path(__file__).resolve().parent.parent / "recipes"
+        recipe = Recipe.from_yaml(recipes_dir / recipe_filename)
         alt_source = next(
             s for s in recipe.config.validation_sources if s.source_type == "altimeter"
         )

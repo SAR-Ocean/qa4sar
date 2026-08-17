@@ -1566,7 +1566,7 @@ class DataOrchestrator:
         out_dir = self.base_dir / "altimeter"
         kwargs = {
             "frequencies": self._ALTIMETER_FREQUENCIES_BY_VARIABLE.get(
-                cfg.variable, ["1hz", "5hz"]
+                cfg.variable, ["1hz"]
             ),
         }
         kwargs.update(source.download_kwargs)   # recipe-level override wins
