@@ -1643,7 +1643,7 @@ class TestPlotGeographicPointLevelDomainHarmonization:
 class TestValidationReportSoilMoistureGeographicUsesRawData:
     """Regression test: validation_report() replaces pair_ds's sar_<var>
     column with its CDF-matched (rescaled) values before calling the
-    point-based plots (scatter/residuals/temporal offset), which is
+    point-based plots (scatter/residuals), which is
     correct for those. But plot_geographic must NOT receive that already
     -rescaled column — its internal fit_sar_to_val_transform needs the
     raw (sar, val) correspondence to fit a transform for the whole SAR
