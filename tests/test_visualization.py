@@ -772,50 +772,6 @@ class TestPlotResiduals:
         plt.close(fig)
 
 
-class TestPlotTemporalOffset:
-    def test_returns_figure(self, collocation_ds):
-        import matplotlib.pyplot as plt
-
-        from sar_validation.core.visualization import plot_temporal_offset
-        fig = plot_temporal_offset(collocation_ds, "owiWindSpeed", "WSPD")
-        assert fig is not None
-        plt.close(fig)
-
-    def test_missing_temporal_column_returns_none(self):
-        import warnings
-
-        from sar_validation.core.visualization import plot_temporal_offset
-        n = 5
-        ds = xr.Dataset({
-            "sar_owiWindSpeed": ("collocation", [8.0, 7.0, 6.0, 9.0, 10.0]),
-            "val_WSPD":         ("collocation", [7.5, 7.2, 6.1, 8.9, 9.8]),
-            "val_source":       ("collocation", ["buoy"] * n),
-        })
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            result = plot_temporal_offset(ds, "owiWindSpeed", "WSPD")
-        assert result is None
-
-    def test_distinct_sources_get_distinct_markers(self, collocation_ds, monkeypatch):
-        import matplotlib.axes
-        import matplotlib.pyplot as plt
-
-        from sar_validation.core.visualization import plot_temporal_offset
-
-        recorded_markers = []
-        original_scatter = matplotlib.axes.Axes.scatter
-
-        def recording_scatter(self, *args, **kwargs):
-            recorded_markers.append(kwargs.get("marker"))
-            return original_scatter(self, *args, **kwargs)
-
-        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
-        fig = plot_temporal_offset(collocation_ds, "owiWindSpeed", "WSPD")
-        plt.close(fig)
-
-        assert len(set(recorded_markers)) == 2
-
-
 class TestPlotStatistics:
     def test_returns_figure(self, collocation_ds):
         import matplotlib.pyplot as plt
@@ -4655,21 +4611,40 @@ class TestPlotCollocationDiagnosticsTicks:
 
 
 class TestValidationReport:
-    def test_includes_temporal_offset_plots(self, geo_datatree_and_collocation, tmp_path):
+    def test_report_omits_temporal_offset_pages(
+        self, geo_datatree_and_collocation, tmp_path, monkeypatch,
+    ):
+        """Regression guard: the report used to render two extra pages per
+        pair driven by temporal_distance_minutes (a dedicated 'residual vs.
+        temporal offset' scatter, and the main scatter re-colored by
+        offset) -- both removed as uninformative (model sources always
+        report zero offset by construction; see design-choices.md §5.7).
+        plot_scatter must now be called exactly once per pair instead of
+        twice, and plot_temporal_offset must no longer exist at all."""
         import matplotlib.pyplot as plt
 
+        import sar_validation.core.visualization as viz
         from sar_validation.core.recipe import Recipe, RecipeConfig
-        from sar_validation.core.visualization import validation_report
+
+        assert not hasattr(viz, "plot_temporal_offset")
 
         datatree, collocation_ds = geo_datatree_and_collocation
-        recipe = Recipe(config=RecipeConfig(name="test", variable="wind"))
+        scatter_calls = []
+        original_scatter = viz.plot_scatter
 
-        figures = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        def scatter_spy(*args, **kwargs):
+            scatter_calls.append(kwargs)
+            return original_scatter(*args, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_scatter", scatter_spy)
+        recipe = Recipe(config=RecipeConfig(name="test", variable="wind"))
+        figures = viz.validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+        plt.close("all")
 
         key = "owiWindSpeed_vs_WSPD"
         assert key in figures
         assert (tmp_path / "validation_report.pdf").exists()
-        plt.close("all")
+        assert len(scatter_calls) == 1
 
     def test_geographic_plot_rendered_before_scatter_plot(
         self, geo_datatree_and_collocation, tmp_path, monkeypatch,

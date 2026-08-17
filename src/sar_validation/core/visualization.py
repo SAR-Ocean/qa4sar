@@ -7,8 +7,6 @@ Five public plot functions:
 * :func:`plot_geographic`   — SAR field + collocated points, one subplot per SAR scene
 * :func:`plot_statistics`   — bar chart of bias / RMSE / correlation per source
 * :func:`plot_residuals`    — histogram / KDE of (SAR − validation) residuals
-* :func:`plot_temporal_offset` — |SAR − validation| residual magnitude vs.
-  temporal collocation offset
 
 Plus fallback and convenience wrappers:
 
@@ -134,7 +132,6 @@ __all__ = [
     "plot_geographic",
     "plot_statistics",
     "plot_residuals",
-    "plot_temporal_offset",
     "plot_collocation_diagnostics",
     "validation_report",
 ]
@@ -2055,143 +2052,7 @@ def plot_residuals(
 
 
 # ---------------------------------------------------------------------------
-# 4a. Temporal offset vs. residual
-# ---------------------------------------------------------------------------
-
-def plot_temporal_offset(
-    collocation_ds,
-    sar_var: str,
-    val_var: str,
-    *,
-    by_source: bool = True,
-    interactive: bool = False,
-    ax=None,
-):
-    """
-    Scatter of |SAR - validation| residual magnitude vs. temporal collocation
-    offset (minutes between the SAR acquisition and the validation
-    observation) — pairs matched further apart in time are expected to agree
-    less well, which helps explain a lower-than-expected correlation
-    coefficient in the scatter plot.
-
-    Parameters
-    ----------
-    collocation_ds : xr.Dataset
-        Step-3 collocations (``collocation_results.nc``).
-    sar_var : str
-        SAR variable name without ``sar_`` prefix.
-    val_var : str
-        Validation variable name without ``val_`` prefix.
-    by_source : bool
-        Colour/marker points by ``val_source``.
-    interactive : bool
-        Return a plotly Figure instead of matplotlib.
-    ax : matplotlib.axes.Axes, optional
-        Axes to draw into (static only).
-
-    Returns
-    -------
-    matplotlib.figure.Figure or plotly.graph_objects.Figure
-    """
-    sar_col = f"sar_{sar_var}"
-    val_col = f"val_{val_var}"
-
-    missing = [c for c in (sar_col, val_col, "temporal_distance_minutes") if c not in collocation_ds]
-    if missing:
-        warnings.warn(f"No valid data for {sar_col} vs {val_col} (missing {missing}).")
-        return None
-
-    _units_for_label = _val_units_for_source(collocation_ds)
-    if _units_for_label is not None:
-        residual_label = f"|{sar_var} − {val_var}| ({_units_for_label})"
-    elif "val_units" in collocation_ds:
-        residual_label = f"|{sar_var} − {val_var}| (units vary by source)"
-    else:
-        val_units = collocation_ds[val_col].attrs.get("units")
-        residual_label = f"|{sar_var} − {val_var}|" + (f" ({val_units})" if val_units else "")
-
-    extra_cols = [c for c in ("val_id", "val_lat", "val_lon") if c in collocation_ds]
-    base_cols = [sar_col, val_col, "val_source", "temporal_distance_minutes"] + extra_cols
-    df_raw = collocation_ds[base_cols].to_dataframe()
-    if "val_time" in collocation_ds.coords:
-        df_raw["val_time"] = collocation_ds["val_time"].values
-    df_raw = df_raw.dropna(subset=[sar_col, val_col, "temporal_distance_minutes"])
-
-    if df_raw.empty:
-        warnings.warn(f"No valid data for {sar_col} vs {val_col}.")
-        return None
-
-    df = _deduplicate_obs(df_raw, sar_col, val_col)
-
-    from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg  # noqa: PLC0415
-
-    if val_var in CIRCULAR_VAL_VARS:
-        residual = circular_diff_deg(df[sar_col].values, df[val_col].values)
-    else:
-        residual = df[sar_col].values - df[val_col].values
-    df["abs_residual"] = np.abs(residual)
-
-    if interactive:
-        _require("plotly")
-        import plotly.express as px  # noqa: PLC0415
-
-        fig = px.scatter(
-            df, x="temporal_distance_minutes", y="abs_residual",
-            color="val_source" if by_source else None,
-            labels={
-                "temporal_distance_minutes": "Temporal offset (min)",
-                "abs_residual": residual_label,
-                "val_source": "Source",
-            },
-            title=f"{residual_label} vs. temporal offset",
-        )
-        return fig
-
-    import matplotlib.pyplot as plt  # noqa: PLC0415
-
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 4))
-    else:
-        fig = ax.get_figure()
-
-    if by_source:
-        sources = sorted(df["val_source"].unique())
-        style = _source_style_map(sources)
-        for src in sources:
-            sub = df[df["val_source"] == src]
-            color, marker = style[src]
-            ax.scatter(sub["temporal_distance_minutes"], sub["abs_residual"],
-                       s=18, alpha=0.6, color=color, marker=marker, label=src,
-                       rasterized=True)
-        ax.legend(fontsize=7, framealpha=0.7)
-    else:
-        ax.scatter(df["temporal_distance_minutes"], df["abs_residual"],
-                   s=18, alpha=0.6, color="#1f77b4", rasterized=True)
-
-    from .statistics import MIN_N_FOR_CORRELATION  # noqa: PLC0415
-
-    n = len(df)
-    if (
-        n >= MIN_N_FOR_CORRELATION
-        and np.std(df["temporal_distance_minutes"].values) > 0 and np.std(df["abs_residual"].values) > 0
-    ):
-        corr = float(np.corrcoef(df["temporal_distance_minutes"].values, df["abs_residual"].values)[0, 1])
-    else:
-        corr = float("nan")
-    ax.text(0.04, 0.96, f"N={n}\nr={corr:.3f}", transform=ax.transAxes,
-            va="top", ha="left", fontsize=8,
-            bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.7))
-
-    ax.set_xlabel("Temporal offset (min)")
-    ax.set_ylabel(residual_label)
-    ax.set_title(f"{sar_var} vs {val_var} — residual magnitude vs. temporal offset")
-    ax.grid(True, linewidth=0.4)
-    fig.tight_layout()
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# 4b. Collocation diagnostics plot
+# 4a. Collocation diagnostics plot
 # ---------------------------------------------------------------------------
 
 #: Target real-world spacing (degrees) between plotted SAR-footprint dots
@@ -3995,34 +3856,6 @@ def validation_report(
             title = f"{sar_var} vs {val_var} — residuals{cdf_matched_suffix}"
             if base_dir is not None:
                 _write_page(title, _finalize_figure_for_report(fig_res, None))
-
-        # Scatter colored by temporal offset, and temporal offset vs.
-        # residual magnitude — both meaningless for soil_moisture, whose
-        # ISMN/satellite values are pre-averaged over a ±12h window around
-        # each SAR overpass (validation_temporal_averaging_minutes /
-        # §8.6-§8.7 in design-choices.md) rather than matched to a single
-        # raw timestamp, so per-pair temporal offset no longer explains
-        # anything about the residual.
-        if variable != "soil_moisture":
-            # Scatter colored by temporal offset — same SAR-vs-validation
-            # comparison as above, but colored by how far apart in time each
-            # pair was matched, to help explain a lower-than-expected r.
-            fig_scatter_offset = plot_scatter(
-                pair_ds, sar_var, val_var, color_by="temporal_offset", force_split=force_split,
-            )
-            if fig_scatter_offset is not None:
-                figs.append(fig_scatter_offset)
-                title = f"{sar_var} vs {val_var} — scatter (colored by temporal offset)"
-                if base_dir is not None:
-                    _write_page(title, _finalize_figure_for_report(fig_scatter_offset, None))
-
-            # Temporal offset vs. residual magnitude
-            fig_offset = plot_temporal_offset(pair_ds, sar_var, val_var)
-            if fig_offset is not None:
-                figs.append(fig_offset)
-                title = f"{sar_var} vs {val_var} — residual vs. temporal offset"
-                if base_dir is not None:
-                    _write_page(title, _finalize_figure_for_report(fig_offset, None))
 
         # Native-units section: same plot functions, applied to the raw
         # (non-rescaled) geo_pair_ds restricted to val_source groups whose
