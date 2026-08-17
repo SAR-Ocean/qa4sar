@@ -734,7 +734,9 @@ class TestSMOSDownloader:
     def test_download_logs_in_lists_and_fetches_products(self, tmp_path):
         from sar_validation.downloaders.smos_downloader import SMOSDownloader
 
-        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        dl = SMOSDownloader(
+            output_dir=tmp_path, dry_run=False, username="u", password="p", orbit_prefilter=False,
+        )
         dl._login = MagicMock()
         dl._list_products_for_day = MagicMock(return_value=[
             {"filename": "SM_1.nc", "download_href": "/oads/access/login?r=x&d=SM_1.nc"},
@@ -761,7 +763,9 @@ class TestSMOSDownloader:
         from sar_validation.downloaders.smos_downloader import SMOSDownloader
 
         (tmp_path / "SM_1.nc").write_bytes(b"already here")
-        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        dl = SMOSDownloader(
+            output_dir=tmp_path, dry_run=False, username="u", password="p", orbit_prefilter=False,
+        )
         dl._login = MagicMock()
         dl._list_products_for_day = MagicMock(return_value=[
             {"filename": "SM_1.nc", "download_href": "/oads/access/login?r=x&d=SM_1.nc"},
@@ -783,7 +787,9 @@ class TestSMOSDownloader:
     def test_only_nc_and_tgz_filenames_are_downloaded(self, tmp_path):
         from sar_validation.downloaders.smos_downloader import SMOSDownloader
 
-        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        dl = SMOSDownloader(
+            output_dir=tmp_path, dry_run=False, username="u", password="p", orbit_prefilter=False,
+        )
         dl._login = MagicMock()
         dl._list_products_for_day = MagicMock(return_value=[
             {"filename": "SM_1.nc", "download_href": "/oads/access/login?r=x&d=SM_1.nc"},
@@ -924,6 +930,44 @@ class TestSMOSDownloaderOrbitPrefilter:
         assert satellite == "smos"
         assert start == datetime(2026, 7, 1, 0, 0, 0, tzinfo=timezone.utc)
         assert end == datetime(2026, 7, 1, 23, 59, 59, tzinfo=timezone.utc)
+
+    def test_tle_fetch_error_keeps_file_fail_open(self, tmp_path):
+        """A mocked TleFetchError must keep the file (fail-open), matching
+        H-SAF's equivalent test. This downloader already has a
+        whole-day-fallback test (above) covering *filename* parse
+        failure; this test covers the different, currently-untested
+        *prediction* failure path. This exercises the real, unmocked
+        orbit_overlaps_bbox by making the TLE fetch it depends on fail:
+        patching get_tle (not orbit_overlaps_bbox itself) lets
+        orbit_overlaps_bbox's own documented `except TleFetchError:
+        return True` fail-open path run for real."""
+        from sar_validation.core.orbit_coverage import TleFetchError
+        from sar_validation.downloaders.smos_downloader import SMOSDownloader
+
+        dl = SMOSDownloader(output_dir=tmp_path, dry_run=False, username="u", password="p")
+        dl._login = MagicMock()
+        dl._list_products_for_day = MagicMock(return_value=[
+            {
+                "filename": "W_XX-ESA,SMOS,NRTNN_C_LEMM_20260102131619_20260102103700_20260102123603_o_v300_l2sm.nc",
+                "download_href": "/oads/access/login?r=x&d=SM_1.nc",
+            },
+        ])
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(status_code=200, content=b"data")
+
+        with patch(
+            "sar_validation.downloaders.smos_downloader.requests.Session",
+            return_value=fake_session,
+        ), patch(
+            "sar_validation.core.orbit_coverage.get_tle",
+            side_effect=TleFetchError("no TLE available"),
+        ):
+            result = dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2026-07-01", end="2026-07-01",
+            )
+
+        assert len(result) == 1
 
 
 # ---------------------------------------------------------------------------

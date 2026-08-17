@@ -7,7 +7,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from sar_validation.core.orbit_coverage import TleFetchError
 from sar_validation.downloaders.scatterometer_ftp_downloader import (
+    _ASSUMED_PASS_DURATION_BY_SATELLITE,
     ScatterometerFTPDownloader,
     _matches_25km,
     _parse_filename_timestamp,
@@ -412,4 +414,54 @@ class TestScatterometerFTPDownloaderOrbitPrefilter:
         satellite, sensing_start, sensing_end = call_args[0][0], call_args[0][1], call_args[0][2]
         assert satellite == "oceansat3"
         assert sensing_start == datetime(2026, 7, 18, 4, 36, 6, tzinfo=timezone.utc)
-        assert sensing_end == sensing_start + timedelta(minutes=100)
+        assert sensing_end == sensing_start + _ASSUMED_PASS_DURATION_BY_SATELLITE["oceansat3"]
+
+    def test_assumed_pass_duration_covers_real_measured_cadence(self):
+        """Real per-file cadence measured from live-downloaded files
+        (revolution-counter deltas): HY-2B/HY-2C ~104.4 min/file,
+        Oceansat-3 ~49.8 min/file (two half-orbit files per revolution).
+        The assumed padding must exceed these real spans with a safety
+        margin, or the orbit pre-filter risks a false negative -- this
+        is what the original 100-minute-for-everyone bug got wrong."""
+        assert _ASSUMED_PASS_DURATION_BY_SATELLITE["hy2b"] >= timedelta(minutes=105)
+        assert _ASSUMED_PASS_DURATION_BY_SATELLITE["hy2c"] >= timedelta(minutes=105)
+        assert _ASSUMED_PASS_DURATION_BY_SATELLITE["oceansat3"] >= timedelta(minutes=50)
+        # Oceansat-3's real per-file span (~49.8 min) is roughly half of
+        # HY-2B/HY-2C's (~104.4 min) because it ships two half-orbit files
+        # per revolution instead of one -- the assumed durations should
+        # reflect that, not use a single one-size-fits-all value.
+        assert _ASSUMED_PASS_DURATION_BY_SATELLITE["oceansat3"] < _ASSUMED_PASS_DURATION_BY_SATELLITE["hy2b"]
+
+    def test_tle_fetch_error_keeps_file_fail_open(self, tmp_path):
+        """A mocked TleFetchError must keep the file (fail-open), matching
+        H-SAF's equivalent test. This downloader has no per-file
+        satellite-name parse step to fail (self.satellite is fixed at
+        construction, validated in __init__), and its single embedded
+        timestamp is shared between the date-window match (in download())
+        and the orbit-window computation (in _filter_by_orbit_overlap) --
+        an entry only reaches the orbit filter once that timestamp has
+        already parsed successfully, so a parse-failure test isn't a valid
+        failure surface here (mirroring GPortalAMSR2Downloader's analogous
+        `assert match is not None` invariant). Instead this exercises the
+        *real*, unmocked orbit_overlaps_bbox by making the TLE fetch it
+        depends on fail: patching get_tle (not orbit_overlaps_bbox itself)
+        lets orbit_overlaps_bbox's own documented `except TleFetchError:
+        return True` fail-open path run for real."""
+        fake_ftp = MagicMock()
+        fake_ftp.nlst.return_value = [self._OCEANSAT3_FILE]
+        fake_ftp.retrbinary.side_effect = lambda cmd, cb: cb(b"fake nc bytes")
+
+        with patch("ftplib.FTP", return_value=fake_ftp), patch(
+            "sar_validation.downloaders.scatterometer_ftp_downloader.authenticate_osi_saf_ftp",
+            return_value=("user", "pass"),
+        ), patch(
+            "sar_validation.core.orbit_coverage.get_tle",
+            side_effect=TleFetchError("no TLE available"),
+        ):
+            dl = ScatterometerFTPDownloader(satellite="oceansat3", output_dir=tmp_path)
+            result = dl.download(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-18", end="2026-07-19",
+            )
+
+        assert len(result) == 1

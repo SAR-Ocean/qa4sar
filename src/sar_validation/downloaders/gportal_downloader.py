@@ -433,7 +433,16 @@ class GPortalAMSR2Downloader:
         [00:00:00Z, 23:59:59Z] is used as the sensing window -- expected
         to rarely filter anything out, since AMSR2's near-global daily
         coverage means most days overlap most bboxes. Kept for
-        consistency with the other two orbit-prefiltered sources."""
+        consistency with the other two orbit-prefiltered sources.
+
+        _FILENAME_DATE_RE is just an 8-digit run, not a real-date check --
+        a string like "20260231" is lexicographically inside a requested
+        date range and passes the earlier start_date <= ... <= end_date
+        filter, but isn't a real calendar date, so strptime is wrapped in
+        its own try/except: on a ValueError, keep the file without
+        applying the orbit filter to it (matching this module's own
+        fail-open philosophy) rather than letting the exception propagate
+        and abort the whole AMSR2 download over a single bad filename."""
         from datetime import datetime, timedelta, timezone
 
         from ..core.orbit_coverage import orbit_overlaps_bbox
@@ -443,7 +452,11 @@ class GPortalAMSR2Downloader:
         for dir_path, name in matches:
             match = _FILENAME_DATE_RE.search(name)
             assert match is not None  # matches was already filtered to only entries where this matched
-            day_start = datetime.strptime(match.group(1), "%Y%m%d").replace(tzinfo=timezone.utc)
+            try:
+                day_start = datetime.strptime(match.group(1), "%Y%m%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                kept.append((dir_path, name))
+                continue
             day_end = day_start + timedelta(hours=23, minutes=59, seconds=59)
             if orbit_overlaps_bbox("gcom-w1", day_start, day_end, min_lon, max_lon, min_lat, max_lat):
                 kept.append((dir_path, name))

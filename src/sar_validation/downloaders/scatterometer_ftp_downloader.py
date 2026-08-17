@@ -62,18 +62,50 @@ _MAX_AGE_DAYS = 3
 
 _TIMESTAMP_RE = re.compile(r"(\d{8})_(\d{6})")
 
-#: One file per orbit revolution (confirmed by the incrementing
-#: revolution-counter token in real filenames, e.g. "_19234_") -- pad
-#: each file's single embedded timestamp by one orbital period so the
-#: sampled arc passed to orbit_overlaps_bbox covers the file's real
+#: Per-satellite assumed sensing span for one FTP file, used to pad each
+#: file's single embedded timestamp into a [start, start+duration] window
+#: so the sampled arc passed to orbit_overlaps_bbox covers the file's real
 #: acquisition span, not a degenerate single instant (which would fail
 #: open and silently disable filtering -- see orbit_coverage.py's
-#: orbit_overlaps_bbox docstring). ~100 minutes approximates one LEO
-#: orbital period at these satellites' sun-synchronous altitudes;
-#: conservatively long, not short, per the fail-toward-inclusion
-#: principle -- verify against real filename timestamp deltas or
-#: OSI-SAF's Product User Manual and widen if real data disagrees.
-_ASSUMED_PASS_DURATION = timedelta(minutes=100)
+#: orbit_overlaps_bbox docstring).
+#:
+#: Measured directly from live-downloaded files in this repo's data/
+#: directory by taking the timestamp delta between consecutive files
+#: whose revolution-counter token increments by exactly 1 (i.e. the
+#: genuine per-file sensing span, not an artifact of gaps in what was
+#: downloaded):
+#:
+#: - HY-2B: consecutive-revolution files 2026-08-16 "_045301..._39253" ->
+#:   "_063734..._39254" -> "_082200..._39255" give deltas of ~104m33s,
+#:   ~104m26s -- one file per orbit revolution, real span ~104.4 min.
+#: - HY-2C: consecutive-revolution files 2026-08-16 "_070246..._29758" ->
+#:   "_084652..._29759" -> "_103058..._29760" -> "_121459..._29761" ->
+#:   "_135909..._29762" give deltas of ~104m06s, ~104m06s, ~104m01s,
+#:   ~104m10s -- also one file per orbit revolution, real span ~104.4 min.
+#: - Oceansat-3: revolution-counter tokens repeat in pairs
+#:   ("_19649", "_19649", "_19650", "_19650", "_19651", ...) -- unlike
+#:   HY-2B/HY-2C, Oceansat-3 ships *two half-orbit files per revolution*,
+#:   not one file per revolution. Consecutive files 2026-08-16
+#:   "_211942..._19649" -> "_220936..._19649" -> "_225916..._19650" ->
+#:   "_234907..._19650" -> "_003850..._19651" give deltas of ~49m54s,
+#:   ~49m40s, ~49m51s, ~49m43s -- real span ~49.8 min.
+#:
+#: HY-2B/HY-2C and Oceansat-3 need different values because they differ
+#: in *instrument/file cadence* (one file per revolution vs. two
+#: half-orbit files per revolution), not because their orbital periods
+#: differ -- all three are sun-synchronous LEO satellites with broadly
+#: similar ~100 min orbital periods.
+#:
+#: Each value below adds a conservative safety margin over the measured
+#: real span (per the fail-toward-inclusion principle: err toward a
+#: conservatively long assumed duration rather than risk a false
+#: negative). Re-verify against real filename timestamp deltas or the
+#: OSI-SAF Product User Manual and widen further if real data disagrees.
+_ASSUMED_PASS_DURATION_BY_SATELLITE: dict[str, timedelta] = {
+    "hy2b": timedelta(minutes=110),
+    "hy2c": timedelta(minutes=110),
+    "oceansat3": timedelta(minutes=55),
+}
 
 
 def _matches_25km(filename: str) -> bool:
@@ -157,9 +189,12 @@ class ScatterometerFTPDownloader:
         timestamp falls in [start, end].
 
         No server-side bbox filtering exists on this FTP (full-orbit swaths
-        only) — bbox is accepted for interface consistency with every other
-        downloader but not used to filter here; domain cropping happens
-        downstream in DataTreeConverter.convert_downloaded_data's
+        only), so bbox is instead used client-side by the orbit-based
+        pre-filter (see _filter_by_orbit_overlap): when orbit_prefilter is
+        True (the default), files whose predicted orbit track shows no
+        overlap with bbox are dropped before downloading. Whatever survives
+        (or everything, if orbit_prefilter=False) still gets downstream
+        domain cropping in DataTreeConverter.convert_downloaded_data's
         recipe-domain filter, same as the EUMDAC scatterometer path.
         """
         end_dt = _parse_iso_dt(normalize_datetime(end))
@@ -272,7 +307,7 @@ class ScatterometerFTPDownloader:
         for name in matches:
             start = _parse_filename_timestamp(name)
             assert start is not None  # matches was already filtered to only parseable timestamps
-            end = start + _ASSUMED_PASS_DURATION
+            end = start + _ASSUMED_PASS_DURATION_BY_SATELLITE[self.satellite]
             if orbit_overlaps_bbox(self.satellite, start, end, min_lon, max_lon, min_lat, max_lat):
                 kept.append(name)
             else:
