@@ -865,6 +865,64 @@ class TestBuildWavesConfigEra5:
         assert era5_source.download_kwargs == {}
 
 
+class TestBuildWavesConfigAltimeterFrequency:
+    def test_default_is_1hz_only(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config()
+        alt_source = next(s for s in cfg.validation_sources if s.source_type == "altimeter")
+        assert alt_source.download_kwargs == {"frequencies": ["1hz"]}
+        specs = cfg.collocation.layer_vs_layer.layer_type_specs
+        assert "altimeter_1hz" in specs
+        assert "altimeter_5hz" not in specs
+
+    def test_none_is_treated_as_1hz(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config(altimeter_freq=None)
+        alt_source = next(s for s in cfg.validation_sources if s.source_type == "altimeter")
+        assert alt_source.download_kwargs == {"frequencies": ["1hz"]}
+
+    def test_explicit_1hz(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config(altimeter_freq="1hz")
+        alt_source = next(s for s in cfg.validation_sources if s.source_type == "altimeter")
+        assert alt_source.download_kwargs == {"frequencies": ["1hz"]}
+        specs = cfg.collocation.layer_vs_layer.layer_type_specs
+        assert "altimeter_1hz" in specs
+        assert "altimeter_5hz" not in specs
+
+    def test_5hz(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config(altimeter_freq="5hz")
+        alt_source = next(s for s in cfg.validation_sources if s.source_type == "altimeter")
+        assert alt_source.download_kwargs == {"frequencies": ["5hz"]}
+        specs = cfg.collocation.layer_vs_layer.layer_type_specs
+        assert "altimeter_5hz" in specs
+        assert "altimeter_1hz" not in specs
+
+    def test_both(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config(altimeter_freq="both")
+        alt_source = next(s for s in cfg.validation_sources if s.source_type == "altimeter")
+        assert alt_source.download_kwargs == {"frequencies": ["1hz", "5hz"]}
+        specs = cfg.collocation.layer_vs_layer.layer_type_specs
+        assert "altimeter_1hz" in specs
+        assert "altimeter_5hz" in specs
+
+    def test_era5_layer_type_spec_still_present_regardless_of_frequency(self):
+        # Guard against the layer_type_specs trim accidentally dropping the
+        # unrelated era5_waves entry alongside the altimeter ones.
+        from sar_validation.cli import _build_waves_config
+
+        for freq in ("1hz", "5hz", "both"):
+            cfg = _build_waves_config(altimeter_freq=freq)
+            assert "era5_waves" in cfg.collocation.layer_vs_layer.layer_type_specs
+
+
 class TestBuildSoilMoistureConfig:
     def test_recipe_shape(self):
         from sar_validation.cli import _build_soil_moisture_config

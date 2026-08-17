@@ -612,12 +612,23 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
     )
 
 
-def _build_waves_config(limit: Optional[int] = None, sar_source: str = "sentinel1_l2_ocn"):
+def _build_waves_config(
+    limit: Optional[int] = None,
+    sar_source: str = "sentinel1_l2_ocn",
+    altimeter_freq: Optional[str] = None,
+):
     """Build the 'waves' recipe template's RecipeConfig.
 
     Extracted from ``_create_recipe`` so the template content is
     unit-testable independent of the CLI's file-writing side effects,
     mirroring ``_build_wind_config``/``_build_currents_config``.
+
+    ``altimeter_freq`` selects which along-track altimeter frequency the
+    generated recipe validates against: "1hz" (default), "5hz", or "both".
+    1 Hz and 5 Hz sample the same ground track at different point spacing
+    (~7km vs ~1.4km) — mixing both by default over-samples SAR pixels near
+    the ground track, skewing validation statistics toward them (see
+    docs/design-choices.md §3.3). ``None`` is treated as "1hz".
     """
     from .core.sar_sources import resolve_sar_source
     sar_source = resolve_sar_source(sar_source, "waves")
@@ -630,6 +641,30 @@ def _build_waves_config(limit: Optional[int] = None, sar_source: str = "sentinel
         SARDataSpec,
         ValidationDataSource,
     )
+
+    _ALTIMETER_FREQ_LISTS = {
+        "1hz": ["1hz"],
+        "5hz": ["5hz"],
+        "both": ["1hz", "5hz"],
+    }
+    altimeter_freqs = _ALTIMETER_FREQ_LISTS[altimeter_freq or "1hz"]
+
+    _ALTIMETER_LAYER_SPECS = {
+        "altimeter_1hz": {
+            "time_tolerance_minutes": 180,
+            "aggregation_window_km": 7.0,
+            "distance_weighting": "equal",
+        },
+        "altimeter_5hz": {
+            "time_tolerance_minutes": 180,
+            "aggregation_window_km": 1.4,
+            "distance_weighting": "equal",
+        },
+    }
+    altimeter_layer_specs = {
+        f"altimeter_{freq}": _ALTIMETER_LAYER_SPECS[f"altimeter_{freq}"]
+        for freq in altimeter_freqs
+    }
 
     return RecipeConfig(
         name="Wave Height Validation",
@@ -645,7 +680,10 @@ def _build_waves_config(limit: Optional[int] = None, sar_source: str = "sentinel
             ValidationDataSource(source_type="mooring"),
             ValidationDataSource(source_type="tidal_gauge"),
             ValidationDataSource(source_type="drifter"),
-            ValidationDataSource(source_type="altimeter"),
+            ValidationDataSource(
+                source_type="altimeter",
+                download_kwargs={"frequencies": altimeter_freqs},
+            ),
             # ERA5 reanalysis (Copernicus CDS).
             ValidationDataSource(source_type="era5"),
         ],
@@ -663,16 +701,7 @@ def _build_waves_config(limit: Optional[int] = None, sar_source: str = "sentinel
                         "method": "cell-averaging",
                         "temporal_method": "hyperbolic",
                     },
-                    "altimeter_1hz": {
-                        "time_tolerance_minutes": 180,
-                        "aggregation_window_km": 7.0,
-                        "distance_weighting": "equal",
-                    },
-                    "altimeter_5hz": {
-                        "time_tolerance_minutes": 180,
-                        "aggregation_window_km": 1.4,
-                        "distance_weighting": "equal",
-                    },
+                    **altimeter_layer_specs,
                 }
             ),
         ),
