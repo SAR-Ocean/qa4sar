@@ -699,14 +699,16 @@ class TestSetCredential:
 
 class TestSmosParseSensingWindow:
     def test_parses_real_naming_convention(self):
+        """Filename is a real one downloaded live from smos-diss.eo.esa.int
+        via recipes/soil_moisture_example.yaml, 2026-08-17 -- not a guess."""
         from sar_validation.downloaders.smos_downloader import _parse_sensing_window
 
         result = _parse_sensing_window(
-            "SM_OPER_MIR_SMNRT2_20260701T001234_20260701T010546_600_001_1.nc"
+            "W_XX-ESA,SMOS,NRTNN_C_LEMM_20260102131619_20260102103700_20260102123603_o_v300_l2sm.nc"
         )
         assert result == (
-            datetime(2026, 7, 1, 0, 12, 34, tzinfo=timezone.utc),
-            datetime(2026, 7, 1, 1, 5, 46, tzinfo=timezone.utc),
+            datetime(2026, 1, 2, 10, 37, 0, tzinfo=timezone.utc),
+            datetime(2026, 1, 2, 12, 36, 3, tzinfo=timezone.utc),
         )
 
     def test_unparseable_filename_returns_none(self):
@@ -816,7 +818,7 @@ class TestSMOSDownloaderOrbitPrefilter:
         dl._login = MagicMock()
         dl._list_products_for_day = MagicMock(return_value=[
             {
-                "filename": "SM_OPER_MIR_SMNRT2_20260701T001234_20260701T010546_600_001_1.nc",
+                "filename": "W_XX-ESA,SMOS,NRTNN_C_LEMM_20260102131619_20260102103700_20260102123603_o_v300_l2sm.nc",
                 "download_href": "/oads/access/login?r=x&d=SM_1.nc",
             },
         ])
@@ -845,7 +847,7 @@ class TestSMOSDownloaderOrbitPrefilter:
         dl._login = MagicMock()
         dl._list_products_for_day = MagicMock(return_value=[
             {
-                "filename": "SM_OPER_MIR_SMNRT2_20260701T001234_20260701T010546_600_001_1.nc",
+                "filename": "W_XX-ESA,SMOS,NRTNN_C_LEMM_20260102131619_20260102103700_20260102123603_o_v300_l2sm.nc",
                 "download_href": "/oads/access/login?r=x&d=SM_1.nc",
             },
         ])
@@ -871,7 +873,7 @@ class TestSMOSDownloaderOrbitPrefilter:
         dl._login = MagicMock()
         dl._list_products_for_day = MagicMock(return_value=[
             {
-                "filename": "SM_OPER_MIR_SMNRT2_20260701T001234_20260701T010546_600_001_1.nc",
+                "filename": "W_XX-ESA,SMOS,NRTNN_C_LEMM_20260102131619_20260102103700_20260102123603_o_v300_l2sm.nc",
                 "download_href": "/oads/access/login?r=x&d=SM_1.nc",
             },
         ])
@@ -892,8 +894,8 @@ class TestSMOSDownloaderOrbitPrefilter:
         assert mock_overlap.call_count == 1
         satellite, start, end = mock_overlap.call_args[0][0:3]
         assert satellite == "smos"
-        assert start == datetime(2026, 7, 1, 0, 12, 34, tzinfo=timezone.utc)
-        assert end == datetime(2026, 7, 1, 1, 5, 46, tzinfo=timezone.utc)
+        assert start == datetime(2026, 1, 2, 10, 37, 0, tzinfo=timezone.utc)
+        assert end == datetime(2026, 1, 2, 12, 36, 3, tzinfo=timezone.utc)
 
     def test_whole_day_window_used_when_filename_unparseable(self, tmp_path):
         from sar_validation.downloaders.smos_downloader import SMOSDownloader

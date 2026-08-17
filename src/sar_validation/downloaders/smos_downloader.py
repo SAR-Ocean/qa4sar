@@ -49,26 +49,42 @@ OADS_LOGIN_URL = f"{OADS_BASE_URL}/login"
 #: OADS "Type" tree-form value for the NRT L2 Soil Moisture product.
 OADS_PRODUCT_TYPE = "MIR_SMNRT2"
 
-#: Standard ESA SMOS filename convention:
-#: SM_OPER_MIR_SMUDP2_<start>_<stop>_<orbit>_<counter>_<version>.zip
-#: (operational) or the NRT variant SM_OPER_MIR_SMNRT2_... -- both carry
-#: real start/stop sensing timestamps in YYYYMMDDTHHMMSS format. If a
-#: real OADS filename doesn't match this (unconfirmed against a live
-#: listing as of this writing), _filter_by_orbit_overlap falls back to
-#: a whole-day window instead -- see that method.
-_SENSING_WINDOW_RE = re.compile(r"MIR_SM(?:UDP2|NRT2)_(\d{8}T\d{6})_(\d{8}T\d{6})_")
+#: Real OADS NRT filename convention (live-confirmed 2026-08-17 against
+#: files actually downloaded from smos-diss.eo.esa.int for
+#: recipes/soil_moisture_example.yaml, e.g.
+#: "W_XX-ESA,SMOS,NRTNN_C_LEMM_20260102131619_20260102103700_20260102123603_o_v300_l2sm.nc")
+#: -- a WMO/EUMETCast-style name, the same "<created>_<sensing_start>_
+#: <sensing_end>" three-timestamp shape hsaf_downloader.py's H29/H122
+#: filenames use (there: "W_IT-HSAF-ROME,...,H29_C_LIIB_<created>_
+#: <start>_<end>____.nc"), just under ESA's own originator/product code
+#: ("W_XX-ESA,SMOS,NRTNN_C_LEMM_...") instead of H-SAF's. Confirmed by
+#: timestamp ordering across every real sample seen: start < end <
+#: created (created is a processing timestamp, always latest). The
+#: 4-letter production-center code ("LEMM" in every sample observed so
+#: far) is matched generically ([A-Z]{4}), not hardcoded, since only the
+#: NRT product type has been directly observed -- other SMOS product
+#: types this downloader doesn't currently fetch may use a different
+#: code. Does NOT match the standard ESA product-naming-convention guess
+#: this regex originally assumed ("SM_OPER_MIR_SMUDP2_<start>_<stop>_...",
+#: no plain-14-digit/no-"T"-separator, no <created> prefix) -- that
+#: assumption was live-verified wrong; real filenames never matched it,
+#: so every file silently fell back to the whole-day window until this
+#: fix. If a filename still doesn't match this pattern,
+#: _filter_by_orbit_overlap falls back to a whole-day window -- see that
+#: method.
+_SENSING_WINDOW_RE = re.compile(r"_C_[A-Z]{4}_\d{14}_(\d{14})_(\d{14})_")
 
 
 def _parse_sensing_window(filename: str) -> "Optional[tuple[datetime, datetime]]":
-    """Extract the embedded (start, stop) sensing timestamps from a
-    standard SMOS filename, or None if the filename doesn't match the
+    """Extract the embedded (start, stop) sensing timestamps from a real
+    OADS SMOS filename, or None if the filename doesn't match the
     expected convention."""
     m = _SENSING_WINDOW_RE.search(filename)
     if not m:
         return None
     try:
-        start = datetime.strptime(m.group(1), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
-        stop = datetime.strptime(m.group(2), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+        start = datetime.strptime(m.group(1), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        stop = datetime.strptime(m.group(2), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
         return start, stop
     except ValueError:
         return None
