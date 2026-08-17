@@ -1,27 +1,36 @@
-name: sar_validation
+name: newsct
 channels:
   - conda-forge
 dependencies:
-  - python>=3.10
-  - xarray>=2024.1
-  - numpy
-  - pandas
-  - pyyaml
-  - requests
-  - copernicusmarine>=2.0
-  - eumdac
-  - scipy
-  - netcdf4
-  - ipykernel
-  # plotting (optional but recommended)
-  - matplotlib
-  - cartopy
-  - cmocean
-  - plotly
-  - folium
-  # testing
-  - pytest
-  - pytest-cov
+  - python=3.14.6
+  - xarray=2026.7.0
+  - numpy=2.5.2
+  - pandas=3.0.5
+  - pyyaml=6.0.3
+  - requests=2.34.2
+  - copernicusmarine=2.4.1
+  - eumdac=3.1.1
+  - scipy=1.18.0
+  - netcdf4=1.7.4
+  - ipykernel=7.3.0
+  - matplotlib=3.11.1
+  - cartopy=0.25.0
+  - cmocean=4.0.3
+  - plotly=6.9.0
+  - folium=0.20.0
+  - pytest=9.1.1
+  - pytest-cov=7.1.0
+  - rasterio=1.5.1
+  - rioxarray=0.23.0
+  - pyproj=3.7.2
+  - pyresample=1.35.0
+  - pytesmo=0.18.1
+  - ismn=1.5.4
+  - earthaccess=0.18.0
+  - ascat=2.7.0
+  - pdbufr=0.14.2
+  - eccodes=2.47.0
   - pip
   - pip:
     - -e .
+    - -e git+https://github.com/isce-framework/nisarqa.git@9093d7fe76a16d060545eda0559f6a9d967a0987#egg=nisarqa
