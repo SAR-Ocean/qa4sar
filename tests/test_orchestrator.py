@@ -580,6 +580,14 @@ class TestDownloadTemporalPadding:
         assert call_kwargs["end"] == "2026-02-03"
 
 
+class TestAltimeterFrequenciesByVariable:
+    def test_waves_fallback_default_is_1hz_only(self):
+        assert DataOrchestrator._ALTIMETER_FREQUENCIES_BY_VARIABLE["waves"] == ["1hz"]
+
+    def test_wind_fallback_default_is_unchanged(self):
+        assert DataOrchestrator._ALTIMETER_FREQUENCIES_BY_VARIABLE["wind"] == ["1hz"]
+
+
 class TestComputeSarSceneTimes:
     """self._sar_scene_times is populated (sorted) from the real SAR
     files' embedded timestamps via each source's own .convert callable
