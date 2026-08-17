@@ -453,6 +453,19 @@ a different match strategy from `point_vs_layer`/`layer_vs_layer`
 complete background field defined everywhere, not a real observation with
 coverage gaps.
 
+**Reported temporal offset is always zero for model sources.** Every
+collocated point produced by `ModelLayerCollocation` (`collocate_points`,
+`_collocate_individual_grid`, `_collocate_cell_averaging_grid` in
+`model_collocation.py`) sets `val_time` to the SAR acquisition time itself
+and hardcodes `temporal_distance_minutes=0.0`, regardless of the model's
+native time resolution (ERA5's hourly steps, HyCOM's 3-hourly steps —
+§5.9). This isn't a bug: unlike the point-matching sources in §5.1–§5.6,
+which nearest-match a SAR observation to the closest *real,
+separately-timed* validation observation and report the true gap between
+them, model collocation always temporally *interpolates* (nearest-hour or
+hyperbolic) the model field onto the exact SAR time before comparison — so
+there is no discrete-timestep gap left to report.
+
 **Why this method does NOT replace the existing `layer_vs_layer` sources**
 
 Raised explicitly by the user during brainstorming ("check whether this
@@ -700,6 +713,9 @@ line-of-sight projection (`_project_currents_to_radial`, already used by
 every other currents validation source) instead of a wind speed/direction
 derivation.
 
+**Reported temporal offset** is likewise always `0.0` for HyCOM points, for
+the same reason as ERA5 — see §5.7.
+
 **Depth**: always HyCOM's `depth=0.0` surface z-level, `method="nearest"`
 on the `.sel()` (never exact float equality). SAR, HF-radar, and this
 toolbox's in-situ currents sources (drifter, ferrybox, mooring, ADCP,
@@ -921,9 +937,8 @@ one implementation) to return a copy of the collocation Dataset with
 `sar_<var>`'s values replaced by their rescaled equivalent — units/long_name
 attrs copied from the validation column, since the values now live in that
 domain. `validation_report` calls this once per pair, only when
-`recipe.config.variable == "soil_moisture"`, before `plot_scatter`,
-`plot_residuals`, and `plot_temporal_offset` run, so those point-based plots
-compare like with like.
+`recipe.config.variable == "soil_moisture"`, before `plot_scatter` and
+`plot_residuals` run, so those point-based plots compare like with like.
 
 `plot_geographic` is the deliberate exception: it keeps the **pre-rescale**
 collocation Dataset (`geo_pair_ds` in `validation_report`'s loop), not the
@@ -943,8 +958,7 @@ the fit's training domain no longer matches what it's applied to (confirmed
 against real data: predicted values above 300 for a variable that should
 span roughly 0-1). This is why `validation_report` threads two separate
 dataset variables through its per-pair loop — the rescaled one for
-scatter/residuals/temporal-offset, the original raw one for
-`plot_geographic`.
+scatter/residuals, the original raw one for `plot_geographic`.
 
 When there isn't enough collocated data to fit a transform (fewer than two
 valid pairs, or the underlying CDF-matching degenerates), `plot_geographic`
@@ -1312,10 +1326,9 @@ overlapping mess at ASCAT's ~45% share, well under the 70% trigger.
 this whenever `_harmonize_percent_domain_sources` actually converted a
 source for the current pair (non-empty `converted_sources`) — i.e. whenever
 the CDF-matched section's sources no longer share their original native
-domain — regardless of `dominant_share`. Applies to both the main
-CDF-matched scatter and its "colored by temporal offset" twin (same
-`force_split` value passed to both calls). A true no-op for every
-non-soil-moisture recipe, since harmonization itself never runs for them.
+domain — regardless of `dominant_share`. Applies to the CDF-matched
+scatter page. A true no-op for every non-soil-moisture recipe, since
+harmonization itself never runs for them.
 
 > Code: `core/visualization.py` (`plot_scatter`'s `force_split` param,
 > `validation_report`'s `harmonized_sources` check).
@@ -1582,9 +1595,7 @@ sources are present (`split_when_imbalanced`, default on) — matching
 `plot_residuals`' existing by-source small-multiples layout — or whenever
 the caller explicitly requests it regardless of share via `force_split`
 (soil moisture's harmonized-domain case, §8.10). Each subplot keeps its own
-1:1 reference line, scaled to that source's own data range, and — when
-`color_by="temporal_offset"` — its own per-point coloring, sharing one
-color scale/colorbar across every subplot.
+1:1 reference line, scaled to that source's own data range.
 
 > Code: `core/visualization.py` (`plot_scatter`, `_plot_scatter_small_multiples`).
 
