@@ -2987,6 +2987,124 @@ class TestPlotGeographicTwoColumnByType:
         assert set(result.keys()) == {"point_vs_layer"}
 
 
+class TestPlotGeographicOnFigureCallback:
+    """The NISAR too-many-open-figures bug: two_column_by_type built every
+    scene's Figure before returning any of them, so a many-scene recipe
+    (e.g. NISAR's per-orbit granules) could have >20 simultaneously open
+    before the caller ever got a chance to close one. on_figure lets the
+    caller consume (and close) each scene's figure immediately."""
+
+    @staticmethod
+    def _build_multi_scene_datatree_and_collocation(n_scenes):
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        sar_nodes = {}
+        rows = []
+        for i in range(n_scenes):
+            y, x = 3, 3
+            lon2d, lat2d = np.meshgrid(
+                np.linspace(-10.0 + i, -9.0 + i, x), np.linspace(50.0, 51.0, y)
+            )
+            sar_nodes[f"sar/scene{i}"] = xr.Dataset(
+                {"sarSSM": (("y", "x"), np.linspace(10.0, 60.0, y * x).reshape(y, x))},
+                coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                        "time": pd.Timestamp("2026-07-10T12:00:00")},
+            )
+            rows.append(i)
+
+        n = len(rows)
+        ismn_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", np.linspace(0.1, 0.3, n))},
+            coords={"lon": ("point", np.linspace(-9.8, -9.0, n)),
+                    "lat": ("point", np.linspace(50.2, 50.8, n)),
+                    "time": ("point", pd.date_range("2026-07-10T12:00", periods=n, freq="5min"))},
+            attrs={"platform_type": "ismn"},
+        )
+        datatree = DataTreeConverter.to_datatree({**sar_nodes, "validation/ismn": ismn_ds})
+
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":        ("collocation", np.linspace(12.0, 48.0, n)),
+            "val_SOIL_MOISTURE": ("collocation", np.linspace(0.1, 0.3, n)),
+            "val_source":        ("collocation", ["ismn"] * n),
+            "collocation_type":  ("collocation", ["point_vs_layer"] * n),
+            "sar_scene_name":    ("collocation", [f"scene{i}" for i in rows]),
+            "val_lon":           ("collocation", np.linspace(-9.8, -9.0, n)),
+            "val_lat":           ("collocation", np.linspace(50.2, 50.8, n)),
+            "val_id":            ("collocation", [f"i{i}" for i in rows]),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-10T12:00", periods=n, freq="5min")),
+        )
+        return datatree, collocation_ds
+
+    def test_on_figure_called_once_per_scene_and_dict_stays_empty(self):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = self._build_multi_scene_datatree_and_collocation(5)
+        handed_off = []
+
+        def on_figure(scene_name, fig):
+            handed_off.append(scene_name)
+            plt.close(fig)
+
+        result = plot_geographic(
+            datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            split_by="collocation_type", two_column_by_type=True,
+            on_figure=on_figure,
+        )
+
+        assert sorted(handed_off) == [f"scene{i}" for i in range(5)]
+        assert result == {}
+
+    def test_no_more_than_one_figure_open_at_a_time_with_callback(self):
+        """The actual leak regression: without on_figure, all N scene
+        figures exist simultaneously before plot_geographic returns. With
+        it, at most one should ever be open (closed by the callback)
+        before the next scene's figure is built."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = self._build_multi_scene_datatree_and_collocation(6)
+        max_open_during_build = [0]
+
+        def on_figure(scene_name, fig):
+            max_open_during_build[0] = max(max_open_during_build[0], len(plt.get_fignums()))
+            plt.close(fig)
+
+        plt.close("all")
+        plot_geographic(
+            datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            split_by="collocation_type", two_column_by_type=True,
+            on_figure=on_figure,
+        )
+
+        assert max_open_during_build[0] == 1
+
+    def test_without_callback_behavior_is_unchanged(self):
+        """Backward compatibility: omitting on_figure still returns the
+        full dict, exactly as every existing caller/test expects."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = self._build_multi_scene_datatree_and_collocation(3)
+
+        result = plot_geographic(
+            datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE",
+            split_by="collocation_type", two_column_by_type=True,
+        )
+
+        assert sorted(result.keys()) == ["scene0", "scene1", "scene2"]
+        plt.close("all")
+
+
 class TestExtractValidationDataForPlotSkipsGriddedNodes:
     """_extract_validation_data_for_plot's process_node assumes every
     validation node's lon/lat coords represent a flattened per-observation
@@ -3814,6 +3932,95 @@ class TestDownsampledValidPixelCoordsAdaptiveDensity:
         assert _downsampled_valid_pixel_coords(valid, lons, lats) == []
 
 
+class TestDownsampledValidPixelCoordsMaskingAndBboxConsistency:
+    """Two real bugs, both caused by _adaptive_footprint_target_count using
+    the *valid*-pixel count as its area basis instead of the *nominal*
+    grid extent: (1) a NISAR granule that's largely over water got a
+    *denser* dot spacing than a fuller same-resolution granule in the
+    same collocation_diagnostics plot, purely because its natural target
+    count fell below the floor and got clamped up; (2) a Sentinel-1 scene
+    whose bbox-visible sliver is a tiny fraction of its huge full extent
+    rendered almost no dots in that sliver, because the ceiling clamp
+    coarsened spacing based on the *whole* (uncropped) scene's size."""
+
+    @staticmethod
+    def _grid(ny, nx, dlon, dlat, lon0=0.0, lat0=45.0):
+        import numpy as np
+
+        lon_1d = lon0 + np.arange(nx) * dlon
+        lat_1d = lat0 + np.arange(ny) * dlat
+        lons, lats = np.meshgrid(lon_1d, lat_1d)
+        return lons, lats
+
+    def test_masked_and_unmasked_same_resolution_scenes_get_same_stride(self):
+        """Same nominal footprint/resolution, different valid fraction
+        (simulating "partly over water") -- both must end up with the
+        same physical dot spacing, not a denser one for the masked scene."""
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        lons, lats = self._grid(200, 200, dlon=0.02, dlat=0.02)  # 4x4 deg, mid-range area
+        full_valid = np.ones((200, 200), dtype=bool)
+        mostly_masked = np.zeros((200, 200), dtype=bool)
+        mostly_masked[:40, :40] = True  # only 4% of cells valid, same nominal grid
+
+        def _mean_nn_spacing(points):
+            pts = np.asarray(points)
+            lon_range = max(pts[:, 0].max() - pts[:, 0].min(), 1e-9)
+            lat_range = max(pts[:, 1].max() - pts[:, 1].min(), 1e-9)
+            return np.sqrt(lon_range * lat_range / len(pts))
+
+        full_points = _downsampled_valid_pixel_coords(full_valid, lons, lats)
+        masked_points = _downsampled_valid_pixel_coords(mostly_masked, lons, lats)
+
+        full_spacing = _mean_nn_spacing(full_points)
+        masked_spacing = _mean_nn_spacing(masked_points)
+
+        ratio = max(full_spacing, masked_spacing) / min(full_spacing, masked_spacing)
+        assert ratio < 2.0, (
+            f"masking must not distort relative dot density: "
+            f"full={full_spacing:.4f} masked={masked_spacing:.4f} (ratio {ratio:.1f}x)"
+        )
+
+    def test_bbox_clipped_reference_gives_visible_density_in_small_bbox(self):
+        """A huge scene (simulating an uncropped Sentinel-1 mosaic) with a
+        small recipe bbox inside it must still show a reasonable number
+        of dots *within that bbox*, not near-zero."""
+        from sar_validation.core.recipe import GeographicBounds
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        # Huge scene: 2000x2000 grid at 0.05 deg/cell -> 100x100 deg.
+        lons, lats = self._grid(2000, 2000, dlon=0.05, dlat=0.05, lon0=-50.0, lat0=0.0)
+        valid = np.ones((2000, 2000), dtype=bool)
+
+        # Small bbox: 2x2 deg, tucked well inside the scene.
+        bounds = GeographicBounds(min_lon=-10.0, max_lon=-8.0, min_lat=20.0, max_lat=22.0)
+
+        points = _downsampled_valid_pixel_coords(valid, lons, lats, geographic_bounds=bounds)
+        in_bbox = [
+            p for p in points
+            if bounds.min_lon <= p[0] <= bounds.max_lon
+            and bounds.min_lat <= p[1] <= bounds.max_lat
+        ]
+
+        assert len(in_bbox) >= 10, (
+            f"expected a visible number of dots within the small bbox, got {len(in_bbox)} "
+            f"out of {len(points)} total"
+        )
+
+    def test_no_bbox_falls_back_to_whole_scene_reference(self):
+        """geographic_bounds=None must be identical to today's behavior --
+        confirms this new parameter is purely additive."""
+        from sar_validation.core.visualization import _downsampled_valid_pixel_coords
+
+        lons, lats = self._grid(400, 400, dlon=0.05, dlat=0.05)
+        valid = np.ones((400, 400), dtype=bool)
+
+        with_none = _downsampled_valid_pixel_coords(valid, lons, lats, geographic_bounds=None)
+        without_arg = _downsampled_valid_pixel_coords(valid, lons, lats)
+
+        assert len(with_none) == len(without_arg)
+
+
 class TestPlotCollocationDiagnosticsSoilMoistureOverpassCoverage:
     """CLMS Surface Soil Moisture's grid has valid lon/lat everywhere across
     the continent, but the actual retrieved value is NaN except along that
@@ -3914,6 +4121,55 @@ class TestPlotCollocationDiagnosticsSoilMoistureOverpassCoverage:
         plot_collocation_diagnostics(datatree, collocation_ds, diagnostics_recipe, tmp_path)
 
         assert "SAR scene bounds" in recorded_labels
+
+
+class TestPlotCollocationDiagnosticsCoverageUsesBboxReference:
+    """_plot_collocation_diagnostics_impl must pass recipe.config.geographic_bounds
+    through to _downsampled_valid_pixel_coords -- otherwise Task D1's bbox-aware
+    density fix never actually applies to the real diagnostics plot."""
+
+    def test_coverage_points_call_receives_recipe_bbox(self, tmp_path, monkeypatch):
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import Recipe
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        y, x = 50, 50
+        lon2d, lat2d = np.meshgrid(np.linspace(-20.0, 20.0, x), np.linspace(30.0, 70.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.linspace(10.0, 60.0, y * x).reshape(y, x))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T12:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+
+        from sar_validation.core.recipe import GeographicBounds, RecipeConfig, TemporalBounds
+
+        recipe = Recipe(config=RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(min_lon=-5.0, max_lon=5.0, min_lat=45.0, max_lat=52.0),
+            temporal_bounds=TemporalBounds(start="2026-07-10", end="2026-07-11"),
+        ))
+
+        captured_bounds = []
+        from sar_validation.core import visualization as viz_mod
+        original = viz_mod._downsampled_valid_pixel_coords
+
+        def spy(*args, **kwargs):
+            captured_bounds.append(kwargs.get("geographic_bounds"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(viz_mod, "_downsampled_valid_pixel_coords", spy)
+
+        plot_collocation_diagnostics(datatree, None, recipe, tmp_path)
+
+        assert len(captured_bounds) >= 1
+        assert captured_bounds[0] is not None
+        assert captured_bounds[0].min_lon == -5.0
+        assert captured_bounds[0].max_lon == 5.0
 
 
 class TestPlotCollocationDiagnosticsRefinement:
@@ -4552,6 +4808,49 @@ class TestValidationReportClosesPageFigures:
         validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
 
         assert plt.get_fignums() == []
+
+
+class TestValidationReportGeoFigureStreaming:
+    """validation_report's soil-moisture geo section must not hold every
+    NISAR scene's figure open simultaneously -- confirms the on_figure
+    wiring from plot_geographic actually gets used end-to-end, not just
+    in plot_geographic's own isolated unit tests (Task B1)."""
+
+    def test_many_scene_soil_moisture_report_never_exceeds_a_few_open_figures(
+        self, tmp_path, monkeypatch,
+    ):
+        import matplotlib
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
+
+        peak_open = [0]
+        original_figure = matplotlib.pyplot.figure
+
+        def tracking_figure(*a, **kw):
+            fig = original_figure(*a, **kw)
+            peak_open[0] = max(peak_open[0], len(plt.get_fignums()))
+            return fig
+
+        monkeypatch.setattr(matplotlib.pyplot, "figure", tracking_figure)
+
+        datatree, collocation_ds = (
+            TestPlotGeographicOnFigureCallback._build_multi_scene_datatree_and_collocation(25)
+        )
+        recipe = Recipe(config=RecipeConfig(name="soil_moisture_test", variable="soil_moisture"))
+
+        plt.close("all")
+        # validation_report's real signature: (collocation_ds, datatree,
+        # recipe, stats_ds_map=None, out_dir=None, ...) -- stats_ds_map is
+        # optional (skips the stats/table section, unrelated to this test).
+        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        assert peak_open[0] < 20, (
+            f"more than 20 figures were simultaneously open at some point "
+            f"(peak {peak_open[0]}) -- the NISAR many-scene leak regressed"
+        )
+        assert plt.get_fignums() == [], "figures must be closed once the report is written"
 
 
 class TestDropNonDirectionalSources:

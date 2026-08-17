@@ -7,7 +7,7 @@ name = "sar-l2-validation-toolbox"
 version = "0.1.0"
 description = "SAR Level 2 Ocean Data Validation Toolbox for wind, currents, and waves"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 keywords = ["SAR", "Sentinel-1", "ocean", "validation", "remote sensing"]
 
@@ -34,7 +34,7 @@ gportal = ["paramiko"]
 # ERA5 user isn't pointed at soil_moisture's unrelated, much heavier
 # dependencies (pytesmo/ismn/earthaccess/ascat/pdbufr) just to get cdsapi.
 era5 = ["cdsapi"]
-soil_moisture = ["pytesmo", "ismn", "earthaccess", "ascat", "pdbufr", "sar-l2-validation-toolbox[era5]"]
+soil_moisture = ["pytesmo", "ismn", "earthaccess", "ascat", "pdbufr", "pyorbital", "sar-l2-validation-toolbox[era5]"]
 test = ["pytest", "pytest-cov"]
 dev = [
     "pytest",
@@ -54,6 +54,7 @@ dev = [
     "pdbufr",
     "paramiko",
     "cdsapi",
+    "pyorbital",
 ]
 
 [project.scripts]

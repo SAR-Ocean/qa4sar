@@ -62,6 +62,7 @@ sar_validation/
 ├── core/
 │   ├── recipe.py           # Recipe dataclasses (YAML ↔ Python)
 │   ├── orchestrator.py     # Orchestrates step 1 (download all sources)
+│   ├── orbit_coverage.py   # Orbit-based geographic pre-filter (Space-Track TLE + SGP4 propagation) used by the H-SAF downloader
 │   ├── datatree_converter.py  # Step 2: convert to xarray.DataTree
 │   ├── collocation.py      # Step 3: collocation algorithms
 │   ├── statistics.py       # Step 4: compute bias, RMSE, correlation, scatter index
@@ -75,6 +76,7 @@ sar_validation/
     ├── _rss_bytemap.py                          # Decoder for RSS binary bytemap (.gz) radiometer products
     ├── altimeter_downloader.py                  # Along-track SWH/wind altimetry via Copernicus Marine
     ├── ascat_soil_moisture_downloader.py        # ASCAT (MetOp) soil moisture (SOMO12) via EUMETSAT EUMDAC (discontinued after 2025-07-15)
+    ├── hsaf_downloader.py                        # ASCAT (MetOp) soil moisture NRT (H122 6.25km default, H29 12.5km opt-in) via H-SAF FTP, rolling last 60 days
     ├── earthdata_soil_moisture_downloader.py    # AMSR-E/2, SMAP, and NISAR SME2 soil moisture via NASA Earthdata
     ├── era5_downloader.py                       # ERA5 reanalysis (wind/waves/soil_moisture) via Copernicus CDS
     ├── gportal_downloader.py                    # AMSR2 soil moisture via JAXA G-Portal (SFTP)
@@ -189,7 +191,8 @@ plt.show()
 | HY-2B / HY-2C / Oceansat-3 | wind | `scatterometer_ftp_downloader` | OSI-SAF FTP | last 3 days |
 | Radiometer — AMSR2 (NetCDF); GMI, SSMIS F16/F17/F18, WindSat (binary bytemaps) | wind (+ direction from WindSat) | `radiometer_downloader` | RSS `data.remss.com` (public HTTPS) | AMSR2/GMI/SSMIS F16/F17/F18: 2012-07-02/2014-03-04/2003-10-26/2006-11-04/2009-10-18 - present |
 | Sentinel-1 CLMS Surface Soil Moisture | soil moisture | `sentinel1_soil_moisture_downloader` | Copernicus Dataspace (CDSE) | 2014 - present (Europe only) |
-| ASCAT Soil Moisture (SOMO12) | soil moisture | `ascat_soil_moisture_downloader` | EUMETSAT EUMDAC | 2007 - 2025-07-15 (⚠️ discontinued) |
+| ASCAT Soil Moisture (SOMO12) | soil moisture | `ascat_soil_moisture_downloader` | EUMETSAT EUMDAC | 2007 - 2025-07-15 |
+| ASCAT Soil Moisture NRT (H122/H29) | soil moisture | `hsaf_downloader` | H-SAF FTP | rolling last 60 days (⚠️ gap between 2025-07-15 and 60 days ago is not covered); H122 (6.25km) by default, H29 (12.5km) via `download_kwargs: {hsaf_product: h29}` |
 | AMSR-E/AMSR2 (NSIDC-0451 / AU_Land) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata | AMSR-E: 2002 - 2011; AMSR2: 2012 - 2025-09-01 ⚠️ frozen |
 | AMSR2 (JAXA G-Portal) | soil moisture | `gportal_downloader` | JAXA G-Portal (SFTP) | 2012 - present |
 | SMAP (SPL2SMP_E) | soil moisture | `earthdata_soil_moisture_downloader` | NASA Earthdata | 2015 - present |
@@ -277,6 +280,33 @@ the OS keyring automatically on first use (with a one-time console notice);
 you can delete the old file afterwards.
 
 Register at: https://osi-saf.eumetsat.int/register
+
+### H-SAF FTP — for ASCAT soil moisture NRT downloads
+
+Store credentials in your OS keyring:
+
+```bash
+sar-validate --set-credential hsaf
+```
+
+Or use environment variables: `HSAF_FTP_USERNAME` / `HSAF_FTP_PASSWORD`.
+
+Register at: https://hsaf.meteoam.it/User/Register
+
+### Space-Track.org — for the ASCAT orbit-based download pre-filter
+
+Store credentials in your OS keyring:
+
+```bash
+sar-validate --set-credential space_track
+```
+
+Or use environment variables: `SPACE_TRACK_USERNAME` / `SPACE_TRACK_PASSWORD`.
+
+Used to look up historical TLEs (satellite orbital elements) so H-SAF
+ASCAT downloads can skip files whose orbit never passed near the
+recipe's bbox, before downloading them — see `orbit_coverage.py`. Free
+registration at: https://www.space-track.org/auth/createAccount
 
 ### JAXA G-Portal — for AMSR2 soil moisture downloads (SFTP fallback)
 

@@ -311,6 +311,18 @@ def _call_osi_saf_ftp(username=None, password=None, allow_prompt=True):
     return authenticate_osi_saf_ftp(username, password)
 
 
+def _call_hsaf_ftp(username=None, password=None, allow_prompt=True):
+    from sar_validation.downloaders.base import authenticate_hsaf_ftp
+
+    return authenticate_hsaf_ftp(username, password)
+
+
+def _call_space_track(username=None, password=None, allow_prompt=True):
+    from sar_validation.downloaders.base import authenticate_space_track
+
+    return authenticate_space_track(username, password)
+
+
 def _call_gportal(username=None, password=None, allow_prompt=True):
     from sar_validation.downloaders.base import authenticate_gportal
 
@@ -349,6 +361,20 @@ CREDENTIAL_RESOLUTION_CASES = [
         ".eumetsat_osi_saf_wind_credentials", _json_legacy_content,
         "OSI-SAF FTP credentials not found", False,
         id="osi_saf_ftp",
+    ),
+    pytest.param(
+        "hsaf_ftp", _call_hsaf_ftp,
+        "HSAF_FTP_USERNAME", "HSAF_FTP_PASSWORD", "sar-validation-hsaf",
+        ".hsaf_ftp_credentials", _json_legacy_content,
+        "H-SAF FTP credentials not found", False,
+        id="hsaf_ftp",
+    ),
+    pytest.param(
+        "space_track", _call_space_track,
+        "SPACE_TRACK_USERNAME", "SPACE_TRACK_PASSWORD", "sar-validation-space-track",
+        ".space_track_credentials", _json_legacy_content,
+        "Space-Track credentials not found", False,
+        id="space_track",
     ),
     pytest.param(
         "gportal", _call_gportal,
@@ -3254,18 +3280,34 @@ class TestOrchestratorAscatCoverageCutoffNotice:
     ending after that date returning 0 products is expected, not an error,
     and should say so (mirroring the equivalent AMSR2 coverage-cutoff
     notice) rather than silently logging "Found 0 ASCAT SSM products."
-    with no explanation."""
+    with no explanation.
+
+    Since the H-SAF NRT waterfall (Task A4), EUMDAC is no longer even
+    queried for dates past its cutoff -- HSAFDownloader serves the rolling
+    last-60-days window instead -- so these tests use recent dates and
+    mock HSAFDownloader, not ASCATSoilMoistureDownloader."""
 
     def test_notice_when_zero_files_past_cutoff(self, tmp_path):
         from sar_validation.core.orchestrator import DataOrchestrator
-        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+        from sar_validation.core.recipe import (
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
 
-        recipe = Recipe(RecipeConfig(name="test", variable="soil_moisture"))
+        today = datetime.now(timezone.utc).date()
+        start = (today - timedelta(days=5)).isoformat()
+        end = today.isoformat()
+        recipe = Recipe(RecipeConfig(
+            name="test", variable="soil_moisture",
+            temporal_bounds=TemporalBounds(start, end),
+        ))
         orchestrator = DataOrchestrator(recipe, dry_run=False)
         source = ValidationDataSource(source_type="ascat_ssm")
 
         with patch(
-            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader"
+            "sar_validation.downloaders.hsaf_downloader.HSAFDownloader"
         ) as mock_cls:
             mock_cls.return_value.download.return_value = []
             orchestrator._dispatch_source(source)
@@ -3276,14 +3318,25 @@ class TestOrchestratorAscatCoverageCutoffNotice:
 
     def test_no_notice_when_files_found(self, tmp_path):
         from sar_validation.core.orchestrator import DataOrchestrator
-        from sar_validation.core.recipe import Recipe, RecipeConfig, ValidationDataSource
+        from sar_validation.core.recipe import (
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
 
-        recipe = Recipe(RecipeConfig(name="test", variable="soil_moisture"))
+        today = datetime.now(timezone.utc).date()
+        start = (today - timedelta(days=5)).isoformat()
+        end = today.isoformat()
+        recipe = Recipe(RecipeConfig(
+            name="test", variable="soil_moisture",
+            temporal_bounds=TemporalBounds(start, end),
+        ))
         orchestrator = DataOrchestrator(recipe, dry_run=False)
         source = ValidationDataSource(source_type="ascat_ssm")
 
         with patch(
-            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader"
+            "sar_validation.downloaders.hsaf_downloader.HSAFDownloader"
         ) as mock_cls:
             mock_cls.return_value.download.return_value = [tmp_path / "ascat_file.nc"]
             orchestrator._dispatch_source(source)

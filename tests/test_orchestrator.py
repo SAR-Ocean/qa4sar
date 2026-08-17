@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
 import pytest
+import xarray as xr
 
 from sar_validation.core.orchestrator import DataOrchestrator
 from sar_validation.core.recipe import (
@@ -74,7 +76,9 @@ class TestRunDownload:
                 return [out_dir / "f.nc"]
 
         ok = orch._run_download(
-            "test_key", out_dir, lambda: FakeDl(), lambda: {}, "Test",
+            "test_key", out_dir, lambda: FakeDl(),
+            [("2026-01-01T00:00:00", "2026-01-02T00:00:00")],
+            lambda start, end: {}, "Test",
         )
         assert ok is True
         assert orch.metadata["downloads"]["test_key"]["status"] == "dry_run"
@@ -89,7 +93,9 @@ class TestRunDownload:
                 raise RuntimeError("boom")
 
         ok = orch._run_download(
-            "test_key", out_dir, lambda: FailingDl(), lambda: {}, "Test",
+            "test_key", out_dir, lambda: FailingDl(),
+            [("2026-01-01T00:00:00", "2026-01-02T00:00:00")],
+            lambda start, end: {}, "Test",
         )
         assert ok is False
         assert orch.metadata["downloads"]["test_key"]["status"] == "failed"
@@ -104,7 +110,10 @@ class TestRunDownload:
                 return [1, 2, 3]
 
         ok = orch._run_download(
-            "test_key", out_dir, lambda: FakeDl(), lambda: {}, "Test",
+            "test_key", out_dir, lambda: FakeDl(),
+            [("2026-01-01T00:00:00", "2026-01-02T00:00:00")],
+            lambda start, end: {},
+            "Test",
             result_to_metadata=lambda result, dl: {"file_count": len(result)},
         )
         assert ok is True
@@ -123,15 +132,88 @@ class TestRunDownload:
             def download(self, **kwargs):
                 return []
 
-        def build_kwargs():
+        def build_kwargs(start, end):
             raise ValueError("bad kwargs")
 
         ok = orch._run_download(
-            "test_key", out_dir, lambda: FakeDl(), build_kwargs, "Test",
+            "test_key", out_dir, lambda: FakeDl(),
+            [("2026-01-01T00:00:00", "2026-01-02T00:00:00")],
+            build_kwargs, "Test",
         )
         assert ok is False
         assert orch.metadata["downloads"]["test_key"]["status"] == "failed"
         assert "Test download failed: bad kwargs" in orch.metadata["downloads"]["test_key"]["error"]
+
+    def test_multiple_windows_are_merged_into_one_result(self, tmp_path):
+        """A caller passing more than one window (the SAR-scene-clustering
+        case) must call .download() once per window and concatenate every
+        window's results -- proving _run_download is the single place that
+        does this merging, not something every _download_* method has to
+        reimplement."""
+        orch = DataOrchestrator(_recipe("sentinel1_l2_ocn"), dry_run=True)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "a.nc").touch()
+        (out_dir / "b.nc").touch()
+
+        calls = []
+
+        class FakeDl:
+            def download(self, start, end):
+                calls.append((start, end))
+                return [out_dir / f"{'a' if start == '2026-01-01T00:00:00' else 'b'}.nc"]
+
+        windows = [
+            ("2026-01-01T00:00:00", "2026-01-02T00:00:00"),
+            ("2026-01-10T00:00:00", "2026-01-11T00:00:00"),
+        ]
+        ok = orch._run_download(
+            "test_key", out_dir, lambda: FakeDl(), windows,
+            lambda start, end: {"start": start, "end": end}, "Test",
+        )
+        assert ok is True
+        assert calls == windows
+        assert orch.metadata["downloads"]["test_key"]["files"] == [
+            str(out_dir / "a.nc"), str(out_dir / "b.nc"),
+        ]
+
+    def test_partial_failure_is_recorded_as_failure_with_partial_results_preserved(self, tmp_path):
+        """If an earlier window's .download() already succeeded and wrote a
+        real file before a later window raises, that earlier result must
+        not be discarded -- the file must still be tracked in metadata --
+        but the run as a whole must still be recorded as a FAILURE
+        (status="failed", an error appended, return False) so that the
+        next run's _is_already_downloaded check (cli.py, which gates
+        purely on metadata["errors"] being empty) retries the failed
+        window's data instead of silently treating this as a clean,
+        complete run forever."""
+        orch = DataOrchestrator(_recipe("sentinel1_l2_ocn"), dry_run=True)
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "a.nc").touch()
+
+        class PartiallyFailingDl:
+            def __init__(self):
+                self.calls = 0
+
+            def download(self, start, end):
+                self.calls += 1
+                if self.calls == 1:
+                    return [out_dir / "a.nc"]
+                raise RuntimeError("boom")
+
+        windows = [
+            ("2026-01-01T00:00:00", "2026-01-02T00:00:00"),
+            ("2026-01-10T00:00:00", "2026-01-11T00:00:00"),
+        ]
+        ok = orch._run_download(
+            "test_key", out_dir, lambda: PartiallyFailingDl(), windows,
+            lambda start, end: {"start": start, "end": end}, "Test",
+        )
+        assert ok is False
+        assert orch.metadata["downloads"]["test_key"]["status"] == "failed"
+        assert orch.metadata["downloads"]["test_key"]["files"] == [str(out_dir / "a.nc")]
+        assert any("boom" in e for e in orch.metadata["errors"])
 
 
 class TestDownloadSarSourceBranch:
@@ -235,10 +317,13 @@ class TestDownloadIsmnDispatch:
 
 class TestDownloadAscatSsmDispatch:
     def test_ascat_ssm_source_type_dispatches_to_ascat_ssm_downloader(self, tmp_path):
+        # Dates comfortably inside the EUMDAC coverage window (<=
+        # _ASCAT_COVERAGE_CUTOFF = 2025-07-15) so the waterfall routes to
+        # ASCATSoilMoistureDownloader, not HSAFDownloader.
         cfg = RecipeConfig(
             name="test", variable="soil_moisture",
             geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
-            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            temporal_bounds=TemporalBounds("2025-06-01", "2025-06-02"),
             validation_sources=[ValidationDataSource(source_type="ascat_ssm")],
         )
         recipe = Recipe(cfg)
@@ -326,18 +411,135 @@ class TestDownloadTemporalPadding:
         )
         assert _resolve_temporal_padding_minutes(cfg, "ascat_ssm") == 45.0
 
-    def test_padded_temporal_bounds_pads_symmetrically(self):
-        from sar_validation.core.orchestrator import _padded_temporal_bounds
+    def test_padded_temporal_bounds_pads_symmetrically(self, tmp_path):
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
 
-        cfg = self._recipe().config
-        start, end = _padded_temporal_bounds(cfg, "ascat_ssm")
-        assert start == "2026-01-31T12:00:00"
-        assert end == "2026-02-03T12:00:00"
+        windows = orchestrator._padded_temporal_bounds("ascat_ssm")
+
+        assert windows == [("2026-01-31T12:00:00", "2026-02-03T12:00:00")]
+
+    def test_single_sar_scene_narrows_to_one_window(self, tmp_path):
+        """Recipe's nominal window is 2026-02-01..2026-02-03, padded +-12h
+        (ascat_ssm's 720min tolerance) to 2026-01-31T12:00..2026-02-03T12:00.
+        A single SAR scene at 2026-02-02T00:00, also padded +-12h, narrows
+        that to one window, 2026-02-01T12:00..2026-02-02T12:00 -- entirely
+        inside the nominal padded window."""
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+        orchestrator._sar_scene_times = [pd.Timestamp("2026-02-02T00:00:00")]
+
+        windows = orchestrator._padded_temporal_bounds("ascat_ssm")
+
+        assert windows == [("2026-02-01T12:00:00", "2026-02-02T12:00:00")]
+
+    def test_two_close_sar_scenes_merge_into_one_window(self, tmp_path):
+        """Two scenes 6h apart, with a 12h (720min) tolerance/pad: their
+        padded windows (+-12h each) clearly overlap (gap 6h < 2*pad=24h),
+        so they merge into a single cluster/window covering both, not two
+        separate ones."""
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+        orchestrator._sar_scene_times = [
+            pd.Timestamp("2026-02-02T00:00:00"), pd.Timestamp("2026-02-02T06:00:00"),
+        ]
+
+        windows = orchestrator._padded_temporal_bounds("ascat_ssm")
+
+        assert windows == [("2026-02-01T12:00:00", "2026-02-02T18:00:00")]
+
+    def test_two_far_apart_sar_scenes_produce_two_disjoint_windows(self, tmp_path):
+        """This is the 'temporal gap' case: two scenes on the same
+        3-day recipe (2026-02-01..2026-02-03, so both padded scene
+        windows stay inside the nominal range), but 36h apart -- more
+        than 2*pad=24h, so their +-12h padded windows do NOT overlap.
+        Must produce two separate, disjoint windows, not one span
+        covering the gap in between."""
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+        orchestrator._sar_scene_times = [
+            pd.Timestamp("2026-02-01T06:00:00"), pd.Timestamp("2026-02-02T18:00:00"),
+        ]
+
+        windows = orchestrator._padded_temporal_bounds("ascat_ssm")
+
+        assert windows == [
+            ("2026-01-31T18:00:00", "2026-02-01T18:00:00"),
+            ("2026-02-02T06:00:00", "2026-02-03T06:00:00"),
+        ]
+
+    def test_three_scenes_two_clusters(self, tmp_path):
+        """Scenes A and B are close (merge into one cluster); scene C is
+        far from both (its own cluster) -- proves clustering isn't
+        limited to pairs and handles an out-of-order-relative-to-cluster-
+        count mix correctly."""
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+        orchestrator._sar_scene_times = [
+            pd.Timestamp("2026-02-01T00:00:00"),  # A
+            pd.Timestamp("2026-02-01T04:00:00"),  # B (4h after A -- merges)
+            pd.Timestamp("2026-02-02T20:00:00"),  # C (~40h after B -- own cluster)
+        ]
+
+        windows = orchestrator._padded_temporal_bounds("ascat_ssm")
+
+        assert len(windows) == 2
+        assert windows[0] == ("2026-01-31T12:00:00", "2026-02-01T16:00:00")
+        assert windows[1] == ("2026-02-02T08:00:00", "2026-02-03T08:00:00")
+
+    def test_sar_scene_range_never_exceeds_nominal_window(self, tmp_path):
+        """A SAR-scene-derived window wider than the nominal padded window
+        (e.g. bogus/corrupt scene times) must still be clamped to the
+        nominal padded window, never wider -- narrowing must never
+        accidentally widen."""
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+        orchestrator._sar_scene_times = [
+            pd.Timestamp("2026-01-01T00:00:00"), pd.Timestamp("2026-03-01T00:00:00"),
+        ]
+
+        windows = orchestrator._padded_temporal_bounds("ascat_ssm")
+
+        assert windows == [("2026-01-31T12:00:00", "2026-02-03T12:00:00")]
+
+    def test_falls_back_to_one_window_when_sar_scene_times_is_none(self, tmp_path):
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+        assert orchestrator._sar_scene_times is None
+
+        windows = orchestrator._padded_temporal_bounds("ascat_ssm")
+
+        assert windows == [("2026-01-31T12:00:00", "2026-02-03T12:00:00")]
 
     def test_ascat_ssm_download_receives_padded_bounds(self, tmp_path):
         """The actual downloader call must see the padded start/end, not
-        the recipe's literal requested range."""
-        cfg = self._recipe().config
+        the recipe's literal requested range.
+
+        Uses its own config (not the shared self._recipe() helper, whose
+        2026 dates now fall in the EUMDAC/H-SAF coverage gap) with dates
+        comfortably inside the EUMDAC coverage window so the waterfall
+        routes to ASCATSoilMoistureDownloader, matching what this test
+        mocks."""
+        from sar_validation.core.recipe import CollocationType
+
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2025-06-01", "2025-06-03"),
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
+            validation_sources=[
+                ValidationDataSource(source_type="ascat_ssm"),
+                ValidationDataSource(source_type="ismn"),
+            ],
+            collocation=CollocationType(),
+        )
         recipe = Recipe(cfg)
         orchestrator = DataOrchestrator(recipe, dry_run=True)
         orchestrator.base_dir = tmp_path
@@ -352,8 +554,8 @@ class TestDownloadTemporalPadding:
             orchestrator._dispatch_source(cfg.validation_sources[0])
 
         call_kwargs = mock_instance.download.call_args.kwargs
-        assert call_kwargs["start"] == "2026-01-31T12:00:00"
-        assert call_kwargs["end"] == "2026-02-03T12:00:00"
+        assert call_kwargs["start"] == "2025-05-31T12:00:00"
+        assert call_kwargs["end"] == "2025-06-03T12:00:00"
 
     def test_sar_download_is_not_padded(self, tmp_path):
         """SAR scenes define the reference times other sources are padded
@@ -376,6 +578,379 @@ class TestDownloadTemporalPadding:
         call_kwargs = mock_instance.download.call_args.kwargs
         assert call_kwargs["start"] == "2026-02-01"
         assert call_kwargs["end"] == "2026-02-03"
+
+
+class TestComputeSarSceneTimes:
+    """self._sar_scene_times is populated (sorted) from the real SAR
+    files' embedded timestamps via each source's own .convert callable
+    (never new parsing code) -- proving genericity across SAR source
+    types, per spec Part 1 'Applies to every SAR source and every
+    recipe type.'"""
+
+    def test_single_scene(self, tmp_path):
+        import dataclasses
+
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        recipe = _recipe("sentinel1_clms_ssm")
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        scene_file = tmp_path / "scene.tif"
+        scene_file.touch()
+        orch.metadata["downloads"]["sar"] = {"files": [str(scene_file)]}
+
+        fake_ds = xr.Dataset(coords={"time": pd.Timestamp("2026-01-01T06:00:00")})
+        real_spec = SAR_SOURCES["sentinel1_clms_ssm"]
+        fake_spec = dataclasses.replace(real_spec, convert=lambda path, pt: fake_ds)
+
+        with patch.dict(
+            "sar_validation.core.sar_sources.SAR_SOURCES",
+            {"sentinel1_clms_ssm": fake_spec},
+        ):
+            orch._compute_sar_scene_times()
+
+        assert orch._sar_scene_times == [pd.Timestamp("2026-01-01T06:00:00")]
+
+    def test_multiple_scenes_are_sorted_regardless_of_file_order(self, tmp_path):
+        import dataclasses
+
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        recipe = _recipe("sentinel1_clms_ssm")
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        f1, f2, f3 = (tmp_path / n for n in ("a.tif", "b.tif", "c.tif"))
+        for f in (f1, f2, f3):
+            f.touch()
+        # Deliberately listed out of chronological order (f3's time is
+        # earliest) -- _compute_sar_scene_times must sort, not just
+        # preserve the files list's own order.
+        orch.metadata["downloads"]["sar"] = {"files": [str(f1), str(f2), str(f3)]}
+
+        scene_times = {
+            str(f1): pd.Timestamp("2026-01-02T00:00:00"),
+            str(f2): pd.Timestamp("2026-01-03T00:00:00"),
+            str(f3): pd.Timestamp("2026-01-01T00:00:00"),
+        }
+        real_spec = SAR_SOURCES["sentinel1_clms_ssm"]
+        fake_spec = dataclasses.replace(
+            real_spec,
+            convert=lambda path, pt: xr.Dataset(coords={"time": scene_times[str(path)]}),
+        )
+
+        with patch.dict(
+            "sar_validation.core.sar_sources.SAR_SOURCES",
+            {"sentinel1_clms_ssm": fake_spec},
+        ):
+            orch._compute_sar_scene_times()
+
+        assert orch._sar_scene_times == [
+            pd.Timestamp("2026-01-01T00:00:00"),
+            pd.Timestamp("2026-01-02T00:00:00"),
+            pd.Timestamp("2026-01-03T00:00:00"),
+        ]
+
+    def test_converter_exception_leaves_times_none(self, tmp_path):
+        import dataclasses
+
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        recipe = _recipe("sentinel1_clms_ssm")
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        scene_file = tmp_path / "scene.tif"
+        scene_file.touch()
+        orch.metadata["downloads"]["sar"] = {"files": [str(scene_file)]}
+
+        def _raise(path, pt):
+            raise RuntimeError("corrupt file")
+
+        real_spec = SAR_SOURCES["sentinel1_clms_ssm"]
+        fake_spec = dataclasses.replace(real_spec, convert=_raise)
+
+        with patch.dict(
+            "sar_validation.core.sar_sources.SAR_SOURCES",
+            {"sentinel1_clms_ssm": fake_spec},
+        ):
+            orch._compute_sar_scene_times()  # must not raise
+
+        assert orch._sar_scene_times is None
+
+    def test_no_files_leaves_times_none(self, tmp_path):
+        recipe = _recipe("sentinel1_clms_ssm")
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        orch.metadata["downloads"]["sar"] = {"files": []}
+
+        orch._compute_sar_scene_times()
+
+        assert orch._sar_scene_times is None
+
+    def test_tz_aware_scene_time_does_not_raise_and_is_normalized(self, tmp_path):
+        """NISAR SME2's from_nisar_sme2 (datatree_converter.py) parses its
+        zeroDopplerStartTime via pd.to_datetime on an ISO string with a UTC
+        designator, which produces a tz-AWARE Timestamp -- mixing that with
+        the rest of this module's tz-naive comparisons must not raise, and
+        the stored self._sar_scene_times must end up tz-naive (matching
+        _domain_filter's established normalization pattern in
+        datatree_converter.py)."""
+        import dataclasses
+
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        recipe = _recipe("sentinel1_clms_ssm")
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        scene_file = tmp_path / "scene.h5"
+        scene_file.touch()
+        orch.metadata["downloads"]["sar"] = {"files": [str(scene_file)]}
+
+        tz_aware_time = pd.Timestamp("2026-01-01T06:00:00", tz="UTC")
+        real_spec = SAR_SOURCES["sentinel1_clms_ssm"]
+        fake_spec = dataclasses.replace(
+            real_spec,
+            convert=lambda path, pt: xr.Dataset(coords={"time": tz_aware_time}),
+        )
+
+        with patch.dict(
+            "sar_validation.core.sar_sources.SAR_SOURCES",
+            {"sentinel1_clms_ssm": fake_spec},
+        ):
+            orch._compute_sar_scene_times()  # must not raise
+
+        assert orch._sar_scene_times is not None
+        assert len(orch._sar_scene_times) == 1
+        assert orch._sar_scene_times[0].tz is None
+        assert orch._sar_scene_times[0] == pd.Timestamp("2026-01-01T06:00:00")
+
+        # And the downstream consumer must not crash / must correctly
+        # narrow the window either -- this is the whole point of
+        # normalizing at population time. Same expected window as
+        # test_end_to_end_narrows_ascat_ssm_download_window's tz-naive
+        # equivalent scene time -- proving the tz-aware path produces the
+        # identical, correctly-narrowed result, not a crash.
+        windows = orch._padded_temporal_bounds("ascat_ssm")
+        assert windows == [("2025-12-31T18:00:00", "2026-01-01T18:00:00")]
+
+    def test_end_to_end_narrows_ascat_ssm_download_window(self, tmp_path):
+        """Proves the full wiring: download_all()'s SAR-scene-times step
+        actually narrows a real _download_* method's window, not just
+        the unit-level _padded_temporal_bounds arithmetic in isolation."""
+        import dataclasses
+
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        recipe = _recipe("sentinel1_clms_ssm")
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        scene_file = tmp_path / "scene.tif"
+        scene_file.touch()
+        orch.metadata["downloads"]["sar"] = {"files": [str(scene_file)]}
+
+        real_spec = SAR_SOURCES["sentinel1_clms_ssm"]
+        fake_spec = dataclasses.replace(
+            real_spec,
+            convert=lambda path, pt: xr.Dataset(
+                coords={"time": pd.Timestamp("2026-01-01T06:00:00")},
+            ),
+        )
+
+        with patch.dict(
+            "sar_validation.core.sar_sources.SAR_SOURCES",
+            {"sentinel1_clms_ssm": fake_spec},
+        ):
+            orch._compute_sar_scene_times()
+            windows = orch._padded_temporal_bounds("ascat_ssm")
+
+        # _recipe("sentinel1_clms_ssm")'s temporal_bounds is 2026-01-01..
+        # 2026-01-02 (see the module-level _recipe helper); ascat_ssm's
+        # tolerance (via "scatterometer_ssm") is 720min (12h). A single
+        # scene at 2026-01-01T06:00 padded +-12h narrows below the
+        # nominal window's own +-12h-padded bounds.
+        assert windows == [("2025-12-31T18:00:00", "2026-01-01T18:00:00")]
+
+    def test_end_to_end_two_gapped_scenes_produce_two_download_windows(self, tmp_path):
+        """The scenario this task exists for: two SAR scenes with a real
+        gap between them (further apart than 2x the collocation
+        tolerance) must produce TWO separate download windows through
+        the full real wiring (files on disk -> _compute_sar_scene_times
+        -> _padded_temporal_bounds), not one span covering the gap."""
+        import dataclasses
+
+        from sar_validation.core.recipe import (
+            CollocationType,
+            GeographicBounds,
+            RecipeConfig,
+            SARDataSpec,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        # A 10-day window wide enough to hold two well-separated scenes.
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-10"),
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
+            validation_sources=[ValidationDataSource(source_type="ascat_ssm")],
+            collocation=CollocationType(),
+        )
+        recipe = Recipe(cfg)
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        f1, f2 = tmp_path / "day1.tif", tmp_path / "day8.tif"
+        f1.touch()
+        f2.touch()
+        orch.metadata["downloads"]["sar"] = {"files": [str(f1), str(f2)]}
+
+        scene_times = {
+            str(f1): pd.Timestamp("2026-01-02T00:00:00"),
+            str(f2): pd.Timestamp("2026-01-09T00:00:00"),
+        }
+        real_spec = SAR_SOURCES["sentinel1_clms_ssm"]
+        fake_spec = dataclasses.replace(
+            real_spec,
+            convert=lambda path, pt: xr.Dataset(coords={"time": scene_times[str(path)]}),
+        )
+
+        with patch.dict(
+            "sar_validation.core.sar_sources.SAR_SOURCES",
+            {"sentinel1_clms_ssm": fake_spec},
+        ):
+            orch._compute_sar_scene_times()
+            windows = orch._padded_temporal_bounds("ascat_ssm")
+
+        # 7-day gap between scenes, tolerance is 12h (2*pad=24h) -- nowhere
+        # close to overlapping, so this must be two disjoint windows, each
+        # only +-12h around its own scene, NOT one 2026-01-01..2026-01-10
+        # span covering the whole 7-day gap in between.
+        assert len(windows) == 2
+        assert windows[0] == ("2026-01-01T12:00:00", "2026-01-02T12:00:00")
+        assert windows[1] == ("2026-01-08T12:00:00", "2026-01-09T12:00:00")
+
+    def test_end_to_end_dispatch_receives_narrowed_window(self, tmp_path):
+        """Unlike the two tests above, which stop at calling
+        _padded_temporal_bounds() directly, this actually calls a real
+        _download_* method (via _dispatch_source, mocking
+        ASCATSoilMoistureDownloader the same way
+        TestDownloadTemporalPadding.test_ascat_ssm_download_receives_padded_bounds
+        does) and asserts the mocked downloader's .download() itself
+        received the narrowed start/end -- proving the full wiring works
+        end-to-end, not just the unit-level arithmetic in isolation. Uses
+        dates comfortably inside the EUMDAC coverage window (see that
+        sibling test's own docstring for why 2026 dates don't work here)."""
+        import dataclasses
+
+        from sar_validation.core.recipe import CollocationType
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2025-06-01", "2025-06-03"),
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
+            validation_sources=[ValidationDataSource(source_type="ascat_ssm")],
+            collocation=CollocationType(),
+        )
+        recipe = Recipe(cfg)
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        scene_file = tmp_path / "scene.tif"
+        scene_file.touch()
+        orch.metadata["downloads"]["sar"] = {"files": [str(scene_file)]}
+
+        real_spec = SAR_SOURCES["sentinel1_clms_ssm"]
+        fake_spec = dataclasses.replace(
+            real_spec,
+            convert=lambda path, pt: xr.Dataset(
+                coords={"time": pd.Timestamp("2025-06-01T18:00:00")},
+            ),
+        )
+
+        with patch.dict(
+            "sar_validation.core.sar_sources.SAR_SOURCES",
+            {"sentinel1_clms_ssm": fake_spec},
+        ):
+            orch._compute_sar_scene_times()
+
+        with patch(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader"
+        ) as mock_cls:
+            mock_instance = MagicMock()
+            mock_instance.download.return_value = []
+            mock_cls.return_value = mock_instance
+
+            orch._dispatch_source(cfg.validation_sources[0])
+
+        call_kwargs = mock_instance.download.call_args.kwargs
+        # Narrowed around the single scene (+-12h ascat_ssm tolerance),
+        # not the nominal ("2025-05-31T12:00:00", "2025-06-03T12:00:00")
+        # padded window this same recipe would otherwise produce.
+        assert call_kwargs["start"] == "2025-06-01T06:00:00"
+        assert call_kwargs["end"] == "2025-06-02T06:00:00"
+
+    def test_end_to_end_tz_aware_scene_time_dispatch_does_not_crash(self, tmp_path):
+        """The level-appropriate regression test for Fix 2's tz-aware
+        crash: goes through the exact same real-dispatch path as
+        test_end_to_end_dispatch_receives_narrowed_window above (the gap
+        this whole class's tests originally had, per code review -- a
+        real _download_* invocation with populated tz-aware scene times
+        would have raised the tz-naive/tz-aware TypeError this task's
+        Fix 2 addresses), but with a genuinely tz-AWARE fake scene time
+        (mirroring NISAR SME2's from_nisar_sme2, see
+        TestComputeSarSceneTimes.test_tz_aware_scene_time_does_not_raise_and_is_normalized
+        for the unit-level version of this same regression)."""
+        import dataclasses
+
+        from sar_validation.core.recipe import CollocationType
+        from sar_validation.core.sar_sources import SAR_SOURCES
+
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2025-06-01", "2025-06-03"),
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
+            validation_sources=[ValidationDataSource(source_type="ascat_ssm")],
+            collocation=CollocationType(),
+        )
+        recipe = Recipe(cfg)
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        scene_file = tmp_path / "scene.h5"
+        scene_file.touch()
+        orch.metadata["downloads"]["sar"] = {"files": [str(scene_file)]}
+
+        real_spec = SAR_SOURCES["sentinel1_clms_ssm"]
+        fake_spec = dataclasses.replace(
+            real_spec,
+            convert=lambda path, pt: xr.Dataset(
+                coords={"time": pd.Timestamp("2025-06-01T18:00:00", tz="UTC")},
+            ),
+        )
+
+        with patch.dict(
+            "sar_validation.core.sar_sources.SAR_SOURCES",
+            {"sentinel1_clms_ssm": fake_spec},
+        ):
+            orch._compute_sar_scene_times()  # must not raise
+
+        with patch(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader"
+        ) as mock_cls:
+            mock_instance = MagicMock()
+            mock_instance.download.return_value = []
+            mock_cls.return_value = mock_instance
+
+            ok = orch._dispatch_source(cfg.validation_sources[0])  # must not raise
+
+        assert ok is True
+        call_kwargs = mock_instance.download.call_args.kwargs
+        # Identical narrowed window to the tz-naive equivalent test above
+        # -- proving the tz-aware path produces the same correct result
+        # through the real dispatch path, not a crash.
+        assert call_kwargs["start"] == "2025-06-01T06:00:00"
+        assert call_kwargs["end"] == "2025-06-02T06:00:00"
 
 
 class TestModelSourceTemporalPadding:
@@ -561,6 +1136,148 @@ class TestIsmnDownloadStatusReporting:
         assert orchestrator.metadata["downloads"]["ismn"]["status"] == expected_status
         if not dry_run:
             assert ok is True
+
+
+class TestBespokeHandlersPartialWindowFailure:
+    """_download_ismn, _download_earthdata_ssm, and _download_hf_radar_us
+    each loop over one-or-more windows using their own hand-written
+    try/except (they don't go through the shared _run_download skeleton).
+    Each must apply the same policy _run_download itself uses: preserve
+    whatever earlier windows already produced (don't discard it just
+    because a LATER window fails), but still record the run as a FAILURE
+    (status="failed", an error appended, return False) so a retry
+    actually happens next run -- mirroring _download_ascat_ssm's own
+    already-correct "accumulator declared outside any try block"
+    pattern."""
+
+    def test_ismn_mid_loop_failure_preserves_earlier_window_files(self, tmp_path, monkeypatch):
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[
+                ValidationDataSource(source_type="ismn", min_depth=0.0, max_depth=0.05),
+            ],
+        )
+        recipe = Recipe(cfg)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        monkeypatch.setattr(
+            orchestrator, "_padded_temporal_bounds",
+            lambda *a, **k: [
+                ("2026-01-01T00:00:00", "2026-01-01T12:00:00"),
+                ("2026-01-01T12:00:00", "2026-01-02T00:00:00"),
+            ],
+        )
+        first_file = tmp_path / "station_a.csv"
+
+        class PartiallyFailingDl:
+            def __init__(self, **kwargs):
+                self.calls = 0
+
+            def download(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return [first_file]
+                raise RuntimeError("boom")
+
+        with patch(
+            "sar_validation.downloaders.ismn_downloader.ISMNDownloader",
+            new=PartiallyFailingDl,
+        ):
+            ok = orchestrator._download_ismn(cfg.validation_sources[0])
+
+        assert ok is False
+        assert orchestrator.metadata["downloads"]["ismn"]["status"] == "failed"
+        assert orchestrator.metadata["downloads"]["ismn"]["files"] == [str(first_file)]
+        assert any("boom" in e for e in orchestrator.metadata["errors"])
+
+    def test_earthdata_ssm_mid_loop_failure_preserves_earlier_window_files(self, tmp_path, monkeypatch):
+        cfg = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[ValidationDataSource(source_type="smap_ssm")],
+        )
+        recipe = Recipe(cfg)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        monkeypatch.setattr(
+            orchestrator, "_padded_temporal_bounds",
+            lambda *a, **k: [
+                ("2026-01-01T00:00:00", "2026-01-01T12:00:00"),
+                ("2026-01-01T12:00:00", "2026-01-02T00:00:00"),
+            ],
+        )
+        first_file = tmp_path / "smap_a.h5"
+
+        class PartiallyFailingDl:
+            def __init__(self, **kwargs):
+                self.calls = 0
+
+            def download(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return [first_file]
+                raise RuntimeError("boom")
+
+        with patch(
+            "sar_validation.downloaders.earthdata_soil_moisture_downloader.EarthdataSoilMoistureDownloader",
+            new=PartiallyFailingDl,
+        ):
+            ok = orchestrator._download_smap_ssm(cfg.validation_sources[0])
+
+        assert ok is False
+        assert orchestrator.metadata["downloads"]["smap_ssm"]["status"] == "failed"
+        assert orchestrator.metadata["downloads"]["smap_ssm"]["files"] == [str(first_file)]
+        assert any("boom" in e for e in orchestrator.metadata["errors"])
+
+    def test_hf_radar_us_mid_loop_failure_preserves_earlier_window_file_count(self, tmp_path, monkeypatch):
+        cfg = RecipeConfig(
+            name="test", variable="currents",
+            geographic_bounds=GeographicBounds(-80.0, -70.0, 30.0, 40.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            sar_data=SARDataSpec(source="sentinel1_l2_ocn"),
+            validation_sources=[ValidationDataSource(source_type="hf_radar_us")],
+        )
+        recipe = Recipe(cfg)
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+        monkeypatch.setattr(
+            orchestrator, "_padded_temporal_bounds",
+            lambda *a, **k: [
+                ("2026-01-01T00:00:00", "2026-01-01T12:00:00"),
+                ("2026-01-01T12:00:00", "2026-01-02T00:00:00"),
+            ],
+        )
+
+        class PartiallyFailingDl:
+            resolved_backend = None
+            attempted_backends: list = []
+
+            def __init__(self, **kwargs):
+                self.calls = 0
+                self.resolved_backend = None
+                self.attempted_backends = []
+
+            def download(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    self.resolved_backend = "erddap"
+                    self.attempted_backends = ["erddap"]
+                    return [tmp_path / "a.nc"]
+                raise RuntimeError("boom")
+
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarUSDownloader",
+            new=PartiallyFailingDl,
+        ):
+            ok = orchestrator._download_hf_radar_us(cfg.validation_sources[0])
+
+        assert ok is False
+        assert orchestrator.metadata["downloads"]["hf_radar_us"]["status"] == "failed"
+        assert orchestrator.metadata["downloads"]["hf_radar_us"]["file_count"] == 1
+        assert any("boom" in e for e in orchestrator.metadata["errors"])
 
 
 class TestScatterometerHandlerCleansUpEmptyOutputDir:
@@ -1501,3 +2218,160 @@ class TestDownloadHycom:
         call_kwargs = fake_dl.download.call_args.kwargs
         assert call_kwargs["min_lon"] == -10.0
         assert call_kwargs["max_lon"] == 10.0
+
+
+class TestDownloadAscatSsmWaterfall:
+    """_download_ascat_ssm now splits [start, end] across two downloaders:
+    ASCATSoilMoistureDownloader (EUMDAC/SOMO12) for dates <=
+    _ASCAT_COVERAGE_CUTOFF, HSAFDownloader (H-SAF H29 NRT) for the rolling
+    last-60-days on-line archive. A gap between the two is a warning, not
+    a silent drop -- see design-choices.md and this feature's spec doc."""
+
+    def _make_orchestrator(self, tmp_path, start, end, monkeypatch):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            SARDataSpec,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+
+        config = RecipeConfig(
+            name="test", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(min_lon=-10, max_lon=10, min_lat=40, max_lat=55),
+            temporal_bounds=TemporalBounds(start=start, end=end),
+            sar_data=SARDataSpec(source="sentinel1_clms_ssm"),
+            validation_sources=[ValidationDataSource(source_type="ascat_ssm")],
+            output_dir=str(tmp_path),
+        )
+        recipe = Recipe(config=config)
+        # DataOrchestrator's constructor takes no base_dir kwarg -- it
+        # derives self.base_dir from recipe.config.output_dir (set above)
+        # via _setup_base_dir().
+        return DataOrchestrator(recipe, dry_run=True)
+
+    def test_range_entirely_before_cutoff_only_calls_eumdac(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader.download",
+            lambda self, **kw: calls.append(("eumdac", kw)) or [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.hsaf_downloader.HSAFDownloader.download",
+            lambda self, **kw: calls.append(("hsaf", kw)) or [],
+        )
+        orch = self._make_orchestrator(tmp_path, "2024-01-01", "2024-01-02", monkeypatch)
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_ascat_ssm(source)
+
+        assert [c[0] for c in calls] == ["eumdac"]
+
+    def test_range_after_cutoff_only_calls_hsaf(self, tmp_path, monkeypatch):
+        import datetime as dt
+
+        today = dt.date.today()
+        start = (today - dt.timedelta(days=30)).isoformat()
+        end = today.isoformat()
+        calls = []
+        monkeypatch.setattr(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader.download",
+            lambda self, **kw: calls.append(("eumdac", kw)) or [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.hsaf_downloader.HSAFDownloader.download",
+            lambda self, **kw: calls.append(("hsaf", kw)) or [],
+        )
+        orch = self._make_orchestrator(tmp_path, start, end, monkeypatch)
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_ascat_ssm(source)
+
+        assert [c[0] for c in calls] == ["hsaf"]
+
+    def test_gap_between_cutoff_and_hsaf_window_produces_notice(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader.download",
+            lambda self, **kw: [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.hsaf_downloader.HSAFDownloader.download",
+            lambda self, **kw: [],
+        )
+        orch = self._make_orchestrator(tmp_path, "2025-09-01", "2025-09-02", monkeypatch)
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_ascat_ssm(source)
+
+        assert any("gap" in n.lower() or "coverage" in n.lower() for n in orch.metadata["notices"])
+
+    def test_overlap_range_both_succeed_is_not_a_failure(self, tmp_path, monkeypatch):
+        """A date range spanning both eras (before cutoff -> recent) attempts
+        both downloaders. When both succeed and return files, the run must
+        not be flagged as failed and no error should be recorded."""
+        import datetime as dt
+
+        today = dt.date.today().isoformat()
+        calls = []
+
+        def eumdac_download(self, **kw):
+            calls.append(("eumdac", kw))
+            return [tmp_path / "eumdac_file.nc"]
+
+        def hsaf_download(self, **kw):
+            calls.append(("hsaf", kw))
+            return [tmp_path / "hsaf_file.nc"]
+
+        monkeypatch.setattr(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader.download",
+            eumdac_download,
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.hsaf_downloader.HSAFDownloader.download",
+            hsaf_download,
+        )
+        orch = self._make_orchestrator(tmp_path, "2025-07-10", today, monkeypatch)
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_ascat_ssm(source)
+
+        assert {c[0] for c in calls} == {"eumdac", "hsaf"}
+        assert orch.metadata["downloads"]["ascat_ssm"]["status"] != "failed"
+        assert orch.metadata["errors"] == []
+
+    def test_overlap_range_one_branch_fails_is_partial_not_hard_failure(self, tmp_path, monkeypatch):
+        """Same overlap range, but the EUMDAC branch raises while H-SAF
+        succeeds and returns real data. This must be reported as a partial
+        failure (a notice), not a hard failure (an error + status=failed) --
+        the run still has real, usable data from the succeeding branch."""
+        import datetime as dt
+
+        today = dt.date.today().isoformat()
+
+        def eumdac_download(self, **kw):
+            raise RuntimeError("transient EUMDAC hiccup")
+
+        def hsaf_download(self, **kw):
+            return [tmp_path / "hsaf_file.nc"]
+
+        monkeypatch.setattr(
+            "sar_validation.downloaders.ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader.download",
+            eumdac_download,
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.hsaf_downloader.HSAFDownloader.download",
+            hsaf_download,
+        )
+        orch = self._make_orchestrator(tmp_path, "2025-07-10", today, monkeypatch)
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_ascat_ssm(source)
+
+        assert orch.metadata["downloads"]["ascat_ssm"]["status"] != "failed"
+        assert orch.metadata["errors"] == []
+        assert any(
+            "partial" in n.lower() or "one of the eumdac" in n.lower()
+            for n in orch.metadata["notices"]
+        )
