@@ -174,6 +174,61 @@ class TestHfradarResolutionCliFlag:
         assert hf_source.download_kwargs == {"resolution_km": "finest"}
 
 
+class TestAltimeterFreqCliFlag:
+    @pytest.mark.parametrize("category", ["wind", "currents", "soil_moisture"])
+    def test_rejected_for_non_waves_template(self, category, tmp_path, monkeypatch, capsys):
+        from sar_validation.cli import main
+
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit):
+            main(["--create-recipe", category, "--altimeter-freq", "5hz"])
+        captured = capsys.readouterr()
+        assert "waves" in (captured.out + captured.err)
+
+    def test_accepted_for_waves_template_and_written_to_yaml(self, tmp_path, monkeypatch):
+        from sar_validation.cli import main
+        from sar_validation.core.recipe import Recipe
+
+        monkeypatch.chdir(tmp_path)
+        main(["--create-recipe", "waves", "--altimeter-freq", "5hz"])
+        recipe = Recipe.from_yaml(tmp_path / "recipes" / "waves_validation.yaml")
+        alt_source = next(
+            s for s in recipe.config.validation_sources if s.source_type == "altimeter"
+        )
+        assert alt_source.download_kwargs == {"frequencies": ["5hz"]}
+
+    def test_omitted_flag_defaults_waves_recipe_to_1hz(self, tmp_path, monkeypatch):
+        from sar_validation.cli import main
+        from sar_validation.core.recipe import Recipe
+
+        monkeypatch.chdir(tmp_path)
+        main(["--create-recipe", "waves"])
+        recipe = Recipe.from_yaml(tmp_path / "recipes" / "waves_validation.yaml")
+        alt_source = next(
+            s for s in recipe.config.validation_sources if s.source_type == "altimeter"
+        )
+        assert alt_source.download_kwargs == {"frequencies": ["1hz"]}
+
+    def test_both_value_written_to_yaml(self, tmp_path, monkeypatch):
+        from sar_validation.cli import main
+        from sar_validation.core.recipe import Recipe
+
+        monkeypatch.chdir(tmp_path)
+        main(["--create-recipe", "waves", "--altimeter-freq", "both"])
+        recipe = Recipe.from_yaml(tmp_path / "recipes" / "waves_validation.yaml")
+        alt_source = next(
+            s for s in recipe.config.validation_sources if s.source_type == "altimeter"
+        )
+        assert alt_source.download_kwargs == {"frequencies": ["1hz", "5hz"]}
+
+    def test_invalid_value_rejected_by_argparse(self, tmp_path, monkeypatch, capsys):
+        from sar_validation.cli import main
+
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit):
+            main(["--create-recipe", "waves", "--altimeter-freq", "10hz"])
+
+
 class TestLoadPrecomputedStats:
     def test_finds_files_saved_under_filter_variable_pairs_keys(self, tmp_path):
         """Regression test: run_statistics saves files keyed by

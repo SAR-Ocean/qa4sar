@@ -68,6 +68,7 @@ Available SAR sources (--sar-source): {', '.join(AVAILABLE_SATELLITES)}
 Examples:
   sar-validate --list-recipes
   sar-validate --create-recipe wind
+  sar-validate --create-recipe waves --altimeter-freq 5hz
   sar-validate --set-credential eumdac
   sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65
   sar-validate --create-recipe wind --start 2026-03-01 --end 2026-03-31
@@ -179,6 +180,15 @@ Examples:
              "resolution available for the recipe's region.",
     )
     parser.add_argument(
+        "--altimeter-freq",
+        choices=["1hz", "5hz", "both"],
+        default=None,
+        help="Along-track altimeter frequency for --create-recipe waves "
+             "(default: 1hz). Only valid with --create-recipe waves -- 5 Hz "
+             "has no WIND_SPEED, so wind recipes always use 1hz regardless "
+             "of this flag.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what will be downloaded without actually downloading",
@@ -241,6 +251,9 @@ Examples:
     if args.hfradar_resolution is not None and args.create_recipe != "currents":
         parser.error("--hfradar-resolution is only valid with --create-recipe currents")
 
+    if args.altimeter_freq is not None and args.create_recipe != "waves":
+        parser.error("--altimeter-freq is only valid with --create-recipe waves")
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
@@ -263,6 +276,7 @@ Examples:
             recipe_name=args.recipe_name,
             sar_source=args.sar_source,
             hfradar_resolution=args.hfradar_resolution,
+            altimeter_freq=args.altimeter_freq,
         )
     elif args.recipe:
         _execute_recipe(
@@ -842,6 +856,7 @@ def _create_recipe(
     recipe_name: Optional[str] = None,
     sar_source: Optional[str] = None,
     hfradar_resolution: Optional[str] = None,
+    altimeter_freq: Optional[str] = None,
 ) -> None:
     from .core.recipe import (
         GeographicBounds,
@@ -873,7 +888,7 @@ def _create_recipe(
                 min_lon, max_lon, min_lat, max_lat,
             ),
             "soil_moisture": _build_soil_moisture_config(limit, _source_for("soil_moisture")),
-            "waves": _build_waves_config(limit, _source_for("waves")),
+            "waves": _build_waves_config(limit, _source_for("waves"), altimeter_freq),
         }
     except ValueError as exc:
         print(str(exc))
