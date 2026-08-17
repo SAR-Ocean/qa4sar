@@ -62,6 +62,19 @@ _MAX_AGE_DAYS = 3
 
 _TIMESTAMP_RE = re.compile(r"(\d{8})_(\d{6})")
 
+#: One file per orbit revolution (confirmed by the incrementing
+#: revolution-counter token in real filenames, e.g. "_19234_") -- pad
+#: each file's single embedded timestamp by one orbital period so the
+#: sampled arc passed to orbit_overlaps_bbox covers the file's real
+#: acquisition span, not a degenerate single instant (which would fail
+#: open and silently disable filtering -- see orbit_coverage.py's
+#: orbit_overlaps_bbox docstring). ~100 minutes approximates one LEO
+#: orbital period at these satellites' sun-synchronous altitudes;
+#: conservatively long, not short, per the fail-toward-inclusion
+#: principle -- verify against real filename timestamp deltas or
+#: OSI-SAF's Product User Manual and widen if real data disagrees.
+_ASSUMED_PASS_DURATION = timedelta(minutes=100)
+
 
 def _matches_25km(filename: str) -> bool:
     """True if filename is a 25 km wind-vector product file (not its .md5 sidecar)."""
@@ -116,6 +129,7 @@ class ScatterometerFTPDownloader:
         force_download: bool = False,
         username: Optional[str] = None,
         password: Optional[str] = None,
+        orbit_prefilter: bool = True,
     ) -> None:
         if satellite not in _SATELLITE_PATHS:
             raise ValueError(
@@ -127,6 +141,7 @@ class ScatterometerFTPDownloader:
         self.force_download = force_download
         self._username = username
         self._password = password
+        self.orbit_prefilter = orbit_prefilter
 
     def download(
         self,
@@ -213,6 +228,9 @@ class ScatterometerFTPDownloader:
                     continue
                 matches.append(name)
 
+            if self.orbit_prefilter:
+                matches = self._filter_by_orbit_overlap(matches, min_lon, max_lon, min_lat, max_lat)
+
             print(f"Found {len(matches)} {self.satellite} 25 km file(s) in window.")
             if not matches:
                 return []
@@ -237,6 +255,31 @@ class ScatterometerFTPDownloader:
 
         print(f"Downloaded {len(downloaded)} {self.satellite} file(s).")
         return downloaded
+
+    def _filter_by_orbit_overlap(
+        self, matches: list[str], min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    ) -> list[str]:
+        """Drop filenames whose padded sensing window shows no predicted
+        orbit overlap with the requested bbox -- see
+        orbit_coverage.orbit_overlaps_bbox. Fails open per-file: any
+        prediction failure inside orbit_overlaps_bbox itself already
+        returns True (never raises), so this method never needs its own
+        try/except."""
+        from ..core.orbit_coverage import orbit_overlaps_bbox
+
+        kept = []
+        dropped = 0
+        for name in matches:
+            start = _parse_filename_timestamp(name)
+            assert start is not None  # matches was already filtered to only parseable timestamps
+            end = start + _ASSUMED_PASS_DURATION
+            if orbit_overlaps_bbox(self.satellite, start, end, min_lon, max_lon, min_lat, max_lat):
+                kept.append(name)
+            else:
+                dropped += 1
+        if dropped:
+            print(f"Orbit pre-filter: skipped {dropped} file(s) with no predicted overlap.")
+        return kept
 
     def _fetch_one(self, ftp, name: str) -> Optional[Path]:
         is_gz = name.endswith(".gz")
@@ -281,6 +324,10 @@ def _parse_args(argv=None):
     p.add_argument("--password", default=None)
     p.add_argument("--output-dir", default=None)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--no-orbit-prefilter", dest="orbit_prefilter", action="store_false", default=True,
+        help="Disable the orbit-based geographic pre-filter (default: enabled).",
+    )
     return p.parse_args(argv)
 
 
@@ -316,6 +363,7 @@ def main(argv=None):
         dry_run=args.dry_run,
         username=args.username,
         password=args.password,
+        orbit_prefilter=args.orbit_prefilter,
     )
     dl.download(
         min_lon=min_lon, max_lon=max_lon,
