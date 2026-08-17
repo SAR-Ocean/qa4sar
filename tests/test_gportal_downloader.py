@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -431,3 +432,67 @@ class TestGPortalAMSR2DownloaderResourceCleanup:
 
             # Even though connect() failed, transport.close() should have been called
             mock_transport.close.assert_called_once()
+
+
+class TestGPortalAMSR2DownloaderOrbitPrefilter:
+    def _mock_sftp(self, listing_by_path: dict[str, list[str]]):
+        sftp = MagicMock()
+        sftp.listdir.side_effect = lambda path: listing_by_path.get(path, [])
+        sftp.get.side_effect = lambda remote, local: Path(local).write_bytes(b"data")
+        return sftp
+
+    _LISTING = {
+        "standard": ["GCOM-W"],
+        "standard/GCOM-W": ["GCOM-W.AMSR2"],
+        "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+        "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
+        "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2026"],
+        "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026": ["07"],
+        "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/07": [
+            "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",
+        ],
+    }
+
+    def _run(self, tmp_path, orbit_prefilter=True, overlap_return=True):
+        sftp = self._mock_sftp(self._LISTING)
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=orbit_prefilter,
+        )
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
+             patch("socket.create_connection", return_value=MagicMock()), \
+             patch(
+                 "sar_validation.core.orbit_coverage.orbit_overlaps_bbox",
+                 return_value=overlap_return,
+             ) as mock_overlap:
+            mock_transport_cls.return_value = MagicMock()
+            downloaded = dl.download(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-01", end="2026-07-01",
+            )
+        return downloaded, mock_overlap
+
+    def test_default_orbit_prefilter_is_enabled(self, tmp_path):
+        dl = GPortalAMSR2Downloader(output_dir=tmp_path)
+        assert dl.orbit_prefilter is True
+
+    def test_dropped_files_are_excluded_from_download(self, tmp_path):
+        downloaded, _ = self._run(tmp_path, orbit_prefilter=True, overlap_return=False)
+        assert downloaded == []
+
+    def test_orbit_prefilter_false_reproduces_todays_behavior(self, tmp_path):
+        downloaded, mock_overlap = self._run(tmp_path, orbit_prefilter=False)
+        assert not mock_overlap.called
+        assert len(downloaded) == 1
+
+    def test_orbit_overlaps_bbox_receives_whole_day_window(self, tmp_path):
+        """AMSR2 filenames only embed a date, not a time -- the whole day
+        must be used as the sensing window, not a degenerate single
+        instant."""
+        _downloaded, mock_overlap = self._run(tmp_path, orbit_prefilter=True, overlap_return=True)
+
+        assert mock_overlap.call_count == 1
+        satellite, start, end = mock_overlap.call_args[0][0:3]
+        assert satellite == "gcom-w1"
+        assert start == datetime(2026, 7, 1, 0, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2026, 7, 1, 23, 59, 59, tzinfo=timezone.utc)
