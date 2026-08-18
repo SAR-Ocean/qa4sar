@@ -30,6 +30,7 @@ from ..downloaders.base import (
     months_touched,
     normalize_datetime,
     prefer_ipv4_dns,
+    split_antimeridian_bbox,
 )
 from . import orbit_coverage
 from .datatree_converter import DataTreeConverter
@@ -237,35 +238,33 @@ def _list_radarsat2_candidates_dry(cfg) -> "list[tuple[str, datetime]]":
     catalog.xml fetch per touched (year, month), 404 == "no catalog for
     this month, skip", any other HTTP error re-raised).
 
-    Unlike RADARSAT2WindDownloader.download(), this does not pre-split
-    an antimeridian-crossing bbox via split_antimeridian_bbox -- Task
-    3's sibling _query_sentinel1_ocn_dry doesn't replicate that kind of
-    request-splitting either (CDSE's own query_products handles it), so
-    this keeps the same pattern here for consistency. A caller with a
-    genuinely antimeridian-crossing cfg.geographic_bounds would need
-    _list_radarsat2_granules's own bbox handling to cope; that helper
-    accepts min_lon > max_lon only via the padded-wraparound check in
-    _lon_within_padded_bbox, not a general antimeridian split -- a
-    known simplification of this dry-search path."""
+    Like RADARSAT2WindDownloader.download(), an antimeridian-crossing
+    cfg.geographic_bounds (min_lon > max_lon, per GeographicBounds'
+    convention) is pre-split via split_antimeridian_bbox into one or two
+    non-crossing windows, each searched independently (its own
+    months-touched catalog.xml loop) with the results concatenated --
+    _query_sentinel1_ocn_dry's sibling doesn't need this since CDSE's own
+    query_products handles antimeridian-crossing bboxes server-side."""
     bounds = cfg.geographic_bounds
     start_dt = datetime.fromisoformat(normalize_datetime(cfg.temporal_bounds.start))
     end_dt = datetime.fromisoformat(normalize_datetime(cfg.temporal_bounds.end))
 
     candidates: "list[tuple[str, datetime]]" = []
-    for year, month in months_touched(start_dt, end_dt):
-        catalog_url = f"{_rs2.THREDDS_BASE}/catalog/sar-winds/radarsat2/{year}/{month:02d}/catalog.xml"
-        try:
-            with prefer_ipv4_dns(), urllib.request.urlopen(catalog_url, timeout=15) as resp:
-                text = resp.read().decode()
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                continue
-            raise
-        for ts, url_path, _lon, _lat in _rs2._list_radarsat2_granules(
-            text, start_dt, end_dt,
-            bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat,
-        ):
-            candidates.append((url_path, ts))
+    for win_min_lon, win_max_lon in split_antimeridian_bbox(bounds.min_lon, bounds.max_lon):
+        for year, month in months_touched(start_dt, end_dt):
+            catalog_url = f"{_rs2.THREDDS_BASE}/catalog/sar-winds/radarsat2/{year}/{month:02d}/catalog.xml"
+            try:
+                with prefer_ipv4_dns(), urllib.request.urlopen(catalog_url, timeout=15) as resp:
+                    text = resp.read().decode()
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    continue
+                raise
+            for ts, url_path, _lon, _lat in _rs2._list_radarsat2_granules(
+                text, start_dt, end_dt,
+                win_min_lon, win_max_lon, bounds.min_lat, bounds.max_lat,
+            ):
+                candidates.append((url_path, ts))
     return candidates
 
 

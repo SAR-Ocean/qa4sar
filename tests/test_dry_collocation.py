@@ -320,6 +320,68 @@ class TestDiscoverRadarsat2FootprintsDry:
         assert fp.bbox == (-70.0, -60.0, 40.0, 50.0)
 
 
+class TestListRadarsat2CandidatesDry:
+    def test_antimeridian_crossing_bbox_searches_both_sides(self, monkeypatch):
+        """An antimeridian-crossing cfg.geographic_bounds (min_lon >
+        max_lon, per GeographicBounds' own convention) must be split into
+        two non-crossing windows -- mirroring
+        RADARSAT2WindDownloader.download()'s own split_antimeridian_bbox
+        handling -- with candidates from both sides of the split kept, not
+        just whichever side happens to satisfy a naive min_lon/max_lon
+        comparison."""
+        from sar_validation.core import dry_collocation
+
+        # 172E/172W (not 175E/175W) deliberately -- both sit far enough
+        # from the +-180 edge that they don't also get swept in by
+        # _lon_within_padded_bbox's own antimeridian-wraparound pad
+        # allowance (default pad is 5 degrees), so each candidate matches
+        # exactly one of the two split windows, not both.
+        catalog_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<catalog xmlns="http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0">\n'
+            '  <dataset name="SAR-Wind-HH-10N-172E_v3r0_rsat2_'
+            's202608010100000_e202608010101160_c202608010200000.nc"\n'
+            '           urlPath="sar-winds/radarsat2/2026/08/SAR-Wind-HH-10N-172E_v3r0_rsat2_'
+            's202608010100000_e202608010101160_c202608010200000.nc" />\n'
+            '  <dataset name="SAR-Wind-HH-10N-172W_v3r0_rsat2_'
+            's202608020100000_e202608020101160_c202608020200000.nc"\n'
+            '           urlPath="sar-winds/radarsat2/2026/08/SAR-Wind-HH-10N-172W_v3r0_rsat2_'
+            's202608020100000_e202608020101160_c202608020200000.nc" />\n'
+            '</catalog>\n'
+        )
+
+        class _FakeResp:
+            def __init__(self, text):
+                self._text = text
+
+            def read(self):
+                return self._text.encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(url, timeout=None):
+            return _FakeResp(catalog_xml)
+
+        monkeypatch.setattr(dry_collocation.urllib.request, "urlopen", fake_urlopen)
+
+        class _FakeCfg:
+            # min_lon > max_lon signals a bbox wrapping the antimeridian
+            # -- covers 170E through 170W via the Pacific.
+            geographic_bounds = SimpleNamespace(min_lon=170.0, max_lon=-170.0, min_lat=0.0, max_lat=20.0)
+            temporal_bounds = SimpleNamespace(start="2026-08-01", end="2026-08-03")
+
+        candidates = dry_collocation._list_radarsat2_candidates_dry(_FakeCfg())
+
+        url_paths = [url_path for url_path, _ts in candidates]
+        assert any("172E" in p for p in url_paths)
+        assert any("172W" in p for p in url_paths)
+        assert len(candidates) == 2
+
+
 class TestSearchNisarSme2Dry:
     def test_both_candidates_searched_and_merged(self, monkeypatch):
         """NISAR SME2's underlying CMR collection changed mid-mission with
