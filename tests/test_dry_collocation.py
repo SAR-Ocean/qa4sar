@@ -827,8 +827,8 @@ class TestTopLevelDispatchers:
 
 class TestPredictSourceDispatch:
     def test_unregistered_source_type_returns_unknown_not_an_exception(self):
-        """predict_source must never raise for the caller (Plan 4's
-        report loop iterates every configured source) -- an
+        """predict_source must never raise for the caller (the report
+        loop iterates every configured source) -- an
         unrecognized source_type is itself an "unknown" verdict, not a
         crash."""
         from sar_validation.core.dry_collocation import predict_source
