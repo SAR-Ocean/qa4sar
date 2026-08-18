@@ -537,3 +537,56 @@ def _clms_ssm_footprint_from_downloaded(tif_path: "Path") -> "Optional[SarFootpr
         sensing_end=sensing,
         source_file=str(tif_path),
     )
+
+
+#: One dry-search discovery entry per SAR_SOURCES key (core/sar_sources.py).
+#: "sentinel1_l2_ocn" combines both the non-WV and WV-mode discovery
+#: functions since a recipe's Sentinel-1 OCN data can include either or
+#: both -- their results are concatenated into one list.
+_DRY_DISCOVERY_BY_SOURCE = {
+    "sentinel1_l2_ocn": lambda cfg: (
+        _discover_sentinel1_ocn_footprints_dry(cfg) + _discover_sentinel1_wv_footprints_dry(cfg)
+    ),
+    "sentinel1_clms_ssm": _discover_clms_ssm_footprints_dry,
+    "nisar_sme2": _discover_nisar_sme2_footprints_dry,
+    "radarsat2": _discover_radarsat2_footprints_dry,
+}
+
+
+def discover_sar_footprints_dry(sar_data_spec, cfg) -> "list[SarFootprint]":
+    """Dispatch to the right SAR source's dry-search discovery function,
+    keyed by sar_data_spec.source (same key SAR_SOURCES in
+    core/sar_sources.py uses)."""
+    discover_fn = _DRY_DISCOVERY_BY_SOURCE.get(sar_data_spec.source)
+    if discover_fn is None:
+        raise ValueError(
+            f"discover_sar_footprints_dry: unknown SAR source {sar_data_spec.source!r} "
+            f"-- expected one of {sorted(_DRY_DISCOVERY_BY_SOURCE)}."
+        )
+    return discover_fn(cfg)
+
+
+def sar_footprints_from_downloaded(sar_files, sar_source_spec) -> "list[SarFootprint]":
+    """Footprints from already-downloaded, already-converted SAR files --
+    used by a real run's inline (non-dry) prediction path. sar_source_spec
+    is the matching entry from SAR_SOURCES (core/sar_sources.py).
+
+    Only "sentinel1_clms_ssm" is wired here so far -- the other three
+    SAR_SOURCES keys (Sentinel-1 OCN, RADARSAT-2, NISAR SME2) raise
+    NotImplementedError below. This is a deliberately deferred gap, not
+    an oversight: wiring their from-downloaded paths is left to whichever
+    later plan first needs it, since nothing in this plan's own tests
+    exercises it for those three sources."""
+    if sar_source_spec.key == "sentinel1_clms_ssm":
+        footprints = []
+        for path in sar_files:
+            fp = _clms_ssm_footprint_from_downloaded(path)
+            if fp is not None:
+                footprints.append(fp)
+        return footprints
+    raise NotImplementedError(
+        f"sar_footprints_from_downloaded: {sar_source_spec.key!r} not yet wired -- "
+        f"non-CLMS-SSM sources reuse SAR_SOURCES[...].convert(...) directly the same "
+        f"way _compute_sar_scene_times does; add that dispatch branch here when wiring "
+        f"the corresponding source into a later plan."
+    )

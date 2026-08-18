@@ -721,3 +721,43 @@ class TestClmsSsmFootprints:
         fp = dry_collocation._clms_ssm_footprint_from_downloaded("fake.tif")
 
         assert fp is None
+
+
+class TestTopLevelDispatchers:
+    def test_discover_sar_footprints_dry_dispatches_on_source_key(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        sentinel = object()
+        monkeypatch.setattr(dry_collocation, "_discover_sentinel1_ocn_footprints_dry", lambda cfg: [sentinel])
+        monkeypatch.setattr(dry_collocation, "_discover_sentinel1_wv_footprints_dry", lambda cfg: [])
+
+        class _FakeSarDataSpec:
+            source = "sentinel1_l2_ocn"
+
+        result = dry_collocation.discover_sar_footprints_dry(_FakeSarDataSpec(), cfg=object())
+
+        assert result == [sentinel]
+
+    def test_discover_sar_footprints_dry_unknown_source_raises(self):
+        from sar_validation.core import dry_collocation
+
+        class _FakeSarDataSpec:
+            source = "not_a_real_source"
+
+        with pytest.raises(ValueError, match="not_a_real_source"):
+            dry_collocation.discover_sar_footprints_dry(_FakeSarDataSpec(), cfg=object())
+
+    def test_sar_footprints_from_downloaded_clms_ssm(self, tmp_path, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        fp = object()
+        monkeypatch.setattr(dry_collocation, "_clms_ssm_footprint_from_downloaded", lambda p: fp)
+
+        class _FakeSarSourceSpec:
+            key = "sentinel1_clms_ssm"
+
+        result = dry_collocation.sar_footprints_from_downloaded(
+            [tmp_path / "a.tif"], _FakeSarSourceSpec(),
+        )
+
+        assert result == [fp]
