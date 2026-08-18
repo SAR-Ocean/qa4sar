@@ -122,20 +122,17 @@ def _vignette_points_and_bbox_from_geofootprint(
     bounds,
     fallback_bbox_fn: "Callable[[], tuple[float, float, float, float]]",
 ) -> "tuple[list[tuple[float, float]], tuple[float, float, float, float]]":
-    """(points, bbox) from a CDSE WV-mode GeoFootprint. CONFIRMED LIVE
-    2026-08-18 (curl against the real CDSE OData API): CDSE catalogs an
-    entire WV pass as ONE product, not one vignette per catalog entry --
+    """(points, bbox) from a CDSE WV-mode GeoFootprint. CDSE catalogs an
+    entire WV pass as one product, not one vignette per catalog entry --
     GeoFootprint's type is "MultiPolygon" and its "coordinates" list
-    already holds one small ~20-30km quad ring per vignette (125-145 per
-    product in three live samples inspected), directly in the catalog
-    search response. No manifest.safe fetch via CDSE's
+    already holds one small ~20-30km quad ring per vignette, directly in
+    the catalog search response. No manifest.safe fetch via CDSE's
     /Products({id})/Nodes(...) endpoint is needed. Each
     ``coordinates[i]`` entry is always ``[exterior_ring]`` -- a
     single-element list holding that vignette's one ring of [lon, lat]
-    pairs (no interior holes, no flatter variant) -- CONFIRMED against a
-    live payload, so the ring is read via a fixed ``polygon_entry[0]``
-    descent, mirroring _polygon_and_bbox_from_geofootprint's
-    ``coordinates[0]`` pattern.
+    pairs (no interior holes, no flatter variant) -- so the ring is read
+    via a fixed ``polygon_entry[0]`` descent, mirroring
+    _polygon_and_bbox_from_geofootprint's ``coordinates[0]`` pattern.
 
     Each ring's centroid becomes one point: the mean of its deduped
     unique [lon, lat] vertices (GeoJSON rings repeat their first vertex
@@ -144,8 +141,8 @@ def _vignette_points_and_bbox_from_geofootprint(
 
     A WV product's overall catalog envelope only guarantees it TOUCHES
     the recipe's requested bbox (see query_products) -- real WV products
-    can span very large geographic extents (confirmed live: one real
-    product spanned ~700km along-track, 145 vignettes) over open ocean,
+    can span very large geographic extents (a single product can span
+    hundreds of km along-track with 100+ vignettes) over open ocean,
     so most of a product's vignettes are typically geographically
     irrelevant to a realistically-sized recipe bbox. Each centroid is
     therefore filtered against *bounds* (a GeographicBounds-shaped object
@@ -190,15 +187,14 @@ def _vignette_points_and_bbox_from_geofootprint(
 
 def _discover_sentinel1_wv_footprints_dry(cfg) -> "list[SarFootprint]":
     """WV-mode Sentinel-1 footprints from a dry CDSE catalog search --
-    see _vignette_points_and_bbox_from_geofootprint for the confirmed-live
-    finding that CDSE catalogs an entire WV pass (many vignettes) as one
-    product, with per-vignette geometry already in the catalog response,
-    and for why each vignette centroid is filtered against
-    cfg.geographic_bounds before being kept (a WV product's own catalog
-    envelope only guarantees it touches the recipe's requested bbox, not
-    that most -- or any -- of its individual vignettes fall inside it).
-    Non-WV granules are excluded here -- see
-    _discover_sentinel1_ocn_footprints_dry (Task 3)."""
+    see _vignette_points_and_bbox_from_geofootprint for why CDSE catalogs
+    an entire WV pass (many vignettes) as one product, with per-vignette
+    geometry already in the catalog response, and for why each vignette
+    centroid is filtered against cfg.geographic_bounds before being kept
+    (a WV product's own catalog envelope only guarantees it touches the
+    recipe's requested bbox, not that most -- or any -- of its individual
+    vignettes fall inside it). Non-WV granules are excluded here -- see
+    _discover_sentinel1_ocn_footprints_dry."""
     records = _query_sentinel1_ocn_dry(cfg)
     footprints = []
     for record in records:
@@ -340,22 +336,18 @@ def _discover_nisar_sme2_footprints_dry(cfg) -> "list[SarFootprint]":
     """NISAR SME2 footprints from a dry earthaccess/CMR search across both
     beta/provisional candidates -- see _search_nisar_sme2_dry.
 
-    CONFIRMED LIVE 2026-08-18 (real query against
-    https://cmr.earthdata.nasa.gov/search/granules.umm_json?short_name=NISAR_L3_SME2_BETA_V1&version=1):
-    this collection's granules DO publish GPolygons with real vertex
-    geometry (unlike RADARSAT-2's NCML, Task 5, which is bbox-only), so
-    that path is the primary one here, mirroring Task 3's
-    _polygon_and_bbox_from_geofootprint convention of dropping a ring's
-    repeated closing vertex when present (CMR's own GPolygons close their
-    ring the same way GeoJSON does -- confirmed in the same live sample).
-    A BoundingRectangles-only fallback is still kept for defensiveness (a
-    different/future NISAR collection, or an edge-case granule, might lack
-    GPolygons), with the recipe's own requested bbox as the final
+    This collection's granules publish GPolygons with real vertex
+    geometry (unlike RADARSAT-2's NCML, which is bbox-only), so that path
+    is the primary one here, dropping a ring's repeated closing vertex
+    when present (CMR's GPolygons close their ring the same way GeoJSON
+    does). A BoundingRectangles-only fallback is kept for defensiveness
+    (a different/future NISAR collection, or an edge-case granule, might
+    lack GPolygons), with the recipe's own requested bbox as the final
     fallback for that tier -- the same "degrade, don't drop" convention
-    used throughout this module. Unlike CDSE's optional GeoFootprint
-    (Task 3/4), CMR's UMM-G schema guarantees every granule carries
-    TemporalExtent and SpatialExtent.HorizontalSpatialDomain.Geometry, so
-    those outer lookups are not defensively wrapped -- only the
+    used throughout this module. Unlike CDSE's optional GeoFootprint,
+    CMR's UMM-G schema guarantees every granule carries TemporalExtent
+    and SpatialExtent.HorizontalSpatialDomain.Geometry, so those outer
+    lookups are not defensively wrapped -- only the
     GPolygons-vs-BoundingRectangles choice within Geometry is genuinely
     either/or and needs the fallback chain."""
     footprints = []
@@ -401,7 +393,7 @@ def _discover_nisar_sme2_footprints_dry(cfg) -> "list[SarFootprint]":
 def _discover_sentinel1_ocn_footprints_dry(cfg) -> "list[SarFootprint]":
     """Non-WV (IW/EW/SM) Sentinel-1 OCN footprints from a dry CDSE
     catalog search. WV-mode granules are excluded here -- see
-    _discover_sentinel1_wv_footprints_dry (Task 4)."""
+    _discover_sentinel1_wv_footprints_dry."""
     records = _query_sentinel1_ocn_dry(cfg)
     footprints = []
     for record in records:

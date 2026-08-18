@@ -71,9 +71,9 @@ class TestDiscoverSentinel1OcnFootprintsDry:
         assert fp.source_file == fake_records[0]["Name"]
 
     def test_wv_granule_is_excluded_from_non_wv_discovery(self, monkeypatch):
-        """WV-mode granules are handled by Task 4's separate function, not
-        this one -- a WV Name (mode token 'WV') must be filtered out
-        here, not turned into a (wrong) kind="polygon" footprint."""
+        """WV-mode granules are handled by a separate function, not this
+        one -- a WV Name (mode token 'WV') must be filtered out here, not
+        turned into a (wrong) kind="polygon" footprint."""
         from sar_validation.core import dry_collocation
 
         fake_records = [
@@ -125,13 +125,11 @@ class TestDiscoverSentinel1OcnFootprintsDry:
 
 
 class TestDiscoverSentinel1WvFootprintsDry:
-    """CONFIRMED LIVE 2026-08-18 (curl against the real CDSE OData API):
-    CDSE catalogs an entire WV pass as ONE product, not one vignette per
-    catalog entry. Each WV product's GeoFootprint is a "MultiPolygon"
+    """CDSE catalogs an entire WV pass as one product, not one vignette
+    per catalog entry. Each WV product's GeoFootprint is a "MultiPolygon"
     whose "coordinates" list already holds one small quad ring per
-    vignette (125-145 per product in three real samples inspected) --
-    directly in the catalog search response, no manifest.safe fetch
-    needed. These tests use a synthetic 3-vignette MultiPolygon."""
+    vignette, directly in the catalog search response -- no manifest.safe
+    fetch needed. These tests use a synthetic 3-vignette MultiPolygon."""
 
     _WV_MULTIPOLYGON = {
         "type": "MultiPolygon",
@@ -179,11 +177,9 @@ class TestDiscoverSentinel1WvFootprintsDry:
     def test_vignettes_outside_recipe_bbox_are_filtered_out(self, monkeypatch):
         """A WV product's overall catalog envelope only guarantees it
         touches the recipe's requested bbox -- individual vignettes can
-        still fall well outside it (confirmed live: one real product
-        spanned ~700km along-track, 145 vignettes). Only centroids
-        actually inside cfg.geographic_bounds should survive into
-        points, and bbox must reflect just the survivors, not the full
-        unfiltered set."""
+        still fall well outside it. Only centroids actually inside
+        cfg.geographic_bounds should survive into points, and bbox must
+        reflect just the survivors, not the full unfiltered set."""
         from sar_validation.core import dry_collocation
 
         fake_records = [
@@ -249,8 +245,8 @@ class TestDiscoverSentinel1WvFootprintsDry:
 
     def test_non_wv_granule_is_excluded_from_wv_discovery(self, monkeypatch):
         """Inverse of test_wv_granule_is_excluded_from_non_wv_discovery --
-        Task 3 and Task 4 partition the same underlying CDSE query results
-        by mode, so a non-WV Name must be filtered out here."""
+        WV and non-WV discovery partition the same underlying CDSE query
+        results by mode, so a non-WV Name must be filtered out here."""
         from sar_validation.core import dry_collocation
 
         fake_records = [
@@ -392,11 +388,10 @@ class TestDiscoverNisarSme2FootprintsDry:
         assert fp.source_file == fake_granule["meta"]["native-id"]
 
     def test_closed_ring_drops_repeated_closing_vertex(self, monkeypatch):
-        """CONFIRMED LIVE 2026-08-18 against NASA's real CMR catalog:
-        NISAR SME2's real GPolygons repeat their first vertex to close the
-        ring, exactly like CDSE's GeoFootprint (Task 3). That trailing
-        duplicate must be dropped so SarFootprint.polygon holds one entry
-        per distinct vertex, mirroring
+        """NISAR SME2's GPolygons repeat their first vertex to close the
+        ring, exactly like CDSE's GeoFootprint. That trailing duplicate
+        must be dropped so SarFootprint.polygon holds one entry per
+        distinct vertex, mirroring
         _polygon_and_bbox_from_geofootprint's convention."""
         from sar_validation.core import dry_collocation
 
