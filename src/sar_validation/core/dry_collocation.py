@@ -18,7 +18,10 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, List, Literal, Optional, Tuple
+
+import pandas as pd
 
 from ..downloaders import radarsat2_wind_downloader as _rs2
 from ..downloaders.base import (
@@ -28,9 +31,17 @@ from ..downloaders.base import (
     normalize_datetime,
     prefer_ipv4_dns,
 )
+from . import orbit_coverage
+from .datatree_converter import DataTreeConverter
 from .orbit_coverage import _point_in_bbox
 
 __all__ = ["SarFootprint"]
+
+#: Registered Sentinel-1 orbit specs (orbit_coverage.SATELLITE_ORBIT_SPECS)
+#: to try per CLMS SSM tile-day candidate -- a tile could have been
+#: covered by any of the three, so every one is tried and their matched
+#: windows are unioned (see _discover_clms_ssm_footprints_dry).
+_CLMS_SSM_SATELLITES = ("sentinel-1a", "sentinel-1b", "sentinel-1c")
 
 _WV_MODE_RE = re.compile(r"^S1[A-D]_WV_")
 
@@ -425,3 +436,104 @@ def _discover_sentinel1_ocn_footprints_dry(cfg) -> "list[SarFootprint]":
             )
         )
     return footprints
+
+
+def _query_clms_ssm_dry(cfg) -> "list[dict]":
+    """CDSE CLMS catalog search for Sentinel-1 SSM tiles, no download --
+    reuses SoilMoistureDownloader.query's exact dataset_identifier (see
+    sentinel1_soil_moisture_downloader.py). output_dir is a required
+    constructor argument there but is never consulted by query() itself
+    (only download() touches it), so a harmless placeholder is passed.
+    query() returns a pd.DataFrame; it is converted to list[dict] here so
+    every discovery function in this module shares the same
+    record["field"] access pattern."""
+    from ..downloaders.sentinel1_soil_moisture_downloader import SoilMoistureDownloader
+
+    bounds = cfg.geographic_bounds
+    dl = SoilMoistureDownloader(output_dir=Path("."), dry_run=True)
+    df = dl.query(
+        min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+        min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+        start=cfg.temporal_bounds.start, end=cfg.temporal_bounds.end,
+    )
+    return df.to_dict("records")
+
+
+def _discover_clms_ssm_footprints_dry(cfg) -> "list[SarFootprint]":
+    """CLMS SSM's own catalog footprint is the tile's whole nominal
+    region (e.g. all of Europe), not real per-day coverage -- propagate
+    Sentinel-1's own orbit across the tile's day (via
+    orbit_coverage.orbit_overlap_windows) to predict which part of the
+    tile was actually overpassed, producing kind="orbit_swath"
+    footprints (polygon is always None -- only a predicted bbox is
+    available here, never real vertices).
+
+    Each candidate tile could have been covered by any of Sentinel-1A/B/C
+    (_CLMS_SSM_SATELLITES), so all three are tried and their matched
+    windows unioned -- deduplicated by (start, end) value, since more
+    than one satellite reporting the exact same window (or a fail-open
+    "whole day" window from more than one of them) must not produce one
+    redundant footprint per satellite."""
+    records = _query_clms_ssm_dry(cfg)
+    bounds = cfg.geographic_bounds
+    bbox = (bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat)
+
+    footprints = []
+    for record in records:
+        start = datetime.fromisoformat(record["ContentDate_Start"].replace("Z", "+00:00"))
+        end = datetime.fromisoformat(record["ContentDate_End"].replace("Z", "+00:00"))
+
+        matched_windows: "set[tuple[datetime, datetime]]" = set()
+        for satellite in _CLMS_SSM_SATELLITES:
+            windows = orbit_coverage.orbit_overlap_windows(
+                satellite, start, end,
+                bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat,
+            )
+            matched_windows.update(windows)
+
+        for w_start, w_end in sorted(matched_windows):
+            footprints.append(
+                SarFootprint(
+                    kind="orbit_swath",
+                    bbox=bbox,
+                    polygon=None,
+                    points=None,
+                    sensing_start=w_start,
+                    sensing_end=w_end,
+                    source_file=record["Name"],
+                )
+            )
+    return footprints
+
+
+def _clms_ssm_footprint_from_downloaded(tif_path: "Path") -> "Optional[SarFootprint]":
+    """Real non-NaN pixel extent from an already-downloaded CLMS SSM
+    GeoTIFF -- more accurate than orbit propagation since the real data
+    is already on disk. Returns None when the GeoTIFF is missing
+    (mirrors DataTreeConverter.from_sar_l3_ssm_geotiff's own "file not
+    found" contract) or when every pixel is NaN (a tile with zero valid
+    retrievals for the day has no real extent to report)."""
+    ds = DataTreeConverter.from_sar_l3_ssm_geotiff(tif_path)
+    if ds is None:
+        return None
+
+    valid = ds["sarSSM"].notnull()
+    if not bool(valid.any()):
+        return None
+
+    valid_lon = ds["lon"].where(valid)
+    valid_lat = ds["lat"].where(valid)
+    bbox = (
+        float(valid_lon.min()), float(valid_lon.max()),
+        float(valid_lat.min()), float(valid_lat.max()),
+    )
+    sensing = pd.Timestamp(ds["time"].values).to_pydatetime()
+    return SarFootprint(
+        kind="orbit_swath",
+        bbox=bbox,
+        polygon=None,
+        points=None,
+        sensing_start=sensing,
+        sensing_end=sensing,
+        source_file=str(tif_path),
+    )

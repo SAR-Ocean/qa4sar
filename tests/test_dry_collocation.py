@@ -565,3 +565,159 @@ class TestDiscoverNisarSme2FootprintsDry:
         good_fp = next(fp for fp in footprints if fp.source_file == "NISAR_L3_PR_SME2_good.h5")
         assert good_fp.polygon == [(35.0, -10.0), (35.0, 10.0), (55.0, 10.0), (55.0, -10.0)]
         assert good_fp.bbox == (-10.0, 10.0, 35.0, 55.0)
+
+
+class TestClmsSsmFootprints:
+    """CLMS SSM's own catalog footprint is the product tile's whole
+    nominal region (e.g. all of Europe), not real per-day coverage --
+    unlike every other SAR source in this module. The dry-search path
+    therefore propagates Sentinel-1's own orbit (via
+    orbit_coverage.orbit_overlap_windows) across each candidate tile's
+    day to predict the real overpass corridor, trying each of the three
+    registered satellites (1A/1B/1C) and taking the union -- deduplicated
+    by (start, end) value, since a tile can be covered by more than one
+    satellite and each would otherwise report the exact same matched
+    window. The from-downloaded path instead reads the real non-NaN pixel
+    extent directly off an already-downloaded GeoTIFF, which is more
+    accurate than propagation since the real data is already on disk."""
+
+    def test_dry_discovery_uses_orbit_overlap_windows_per_candidate_satellite(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        fake_records = [
+            {
+                "Name": "S1A_CLMS_SSM1km_20260801T000000.tif",
+                "ContentDate_Start": "2026-08-01T00:00:00.000Z",
+                "ContentDate_End": "2026-08-01T23:59:59.000Z",
+            },
+        ]
+        monkeypatch.setattr(dry_collocation, "_query_clms_ssm_dry", lambda cfg: fake_records)
+
+        call_args = []
+
+        def _fake_windows(satellite, start, end, min_lon, max_lon, min_lat, max_lat, **kwargs):
+            call_args.append(satellite)
+            # Every candidate satellite reports the exact same matched
+            # window here -- the union must dedupe these down to one
+            # footprint, not one per satellite.
+            return [(start, end)]
+
+        monkeypatch.setattr(dry_collocation.orbit_coverage, "orbit_overlap_windows", _fake_windows)
+
+        class _FakeCfg:
+            geographic_bounds = SimpleNamespace(min_lon=-10.0, max_lon=30.0, min_lat=35.0, max_lat=60.0)
+
+        footprints = dry_collocation._discover_clms_ssm_footprints_dry(cfg=_FakeCfg())
+
+        assert len(footprints) == 1
+        assert footprints[0].kind == "orbit_swath"
+        assert footprints[0].polygon is None
+        assert footprints[0].bbox == (-10.0, 30.0, 35.0, 60.0)
+        assert "sentinel-1a" in call_args  # at least Sentinel-1A's orbit was checked
+        assert "sentinel-1b" in call_args
+        assert "sentinel-1c" in call_args
+
+    def test_dry_discovery_unions_distinct_windows_across_satellites(self, monkeypatch):
+        """When different satellites match genuinely different windows
+        (not just the same one reported twice), every distinct window
+        must survive as its own footprint -- the dedup is by (start, end)
+        value equality, not a "keep only the first satellite's result"
+        shortcut."""
+        from datetime import datetime as dt
+
+        from sar_validation.core import dry_collocation
+
+        fake_records = [
+            {
+                "Name": "S1A_CLMS_SSM1km_20260801T000000.tif",
+                "ContentDate_Start": "2026-08-01T00:00:00.000Z",
+                "ContentDate_End": "2026-08-01T23:59:59.000Z",
+            },
+        ]
+        monkeypatch.setattr(dry_collocation, "_query_clms_ssm_dry", lambda cfg: fake_records)
+
+        _WINDOWS_BY_SAT = {
+            "sentinel-1a": [(dt(2026, 8, 1, 5, 0), dt(2026, 8, 1, 5, 5))],
+            "sentinel-1b": [(dt(2026, 8, 1, 17, 0), dt(2026, 8, 1, 17, 5))],
+            "sentinel-1c": [(dt(2026, 8, 1, 5, 0), dt(2026, 8, 1, 5, 5))],  # duplicate of 1a's
+        }
+
+        def _fake_windows(satellite, start, end, min_lon, max_lon, min_lat, max_lat, **kwargs):
+            return _WINDOWS_BY_SAT[satellite]
+
+        monkeypatch.setattr(dry_collocation.orbit_coverage, "orbit_overlap_windows", _fake_windows)
+
+        class _FakeCfg:
+            geographic_bounds = SimpleNamespace(min_lon=-10.0, max_lon=30.0, min_lat=35.0, max_lat=60.0)
+
+        footprints = dry_collocation._discover_clms_ssm_footprints_dry(cfg=_FakeCfg())
+
+        windows = {(fp.sensing_start, fp.sensing_end) for fp in footprints}
+        assert windows == {
+            (dt(2026, 8, 1, 5, 0), dt(2026, 8, 1, 5, 5)),
+            (dt(2026, 8, 1, 17, 0), dt(2026, 8, 1, 17, 5)),
+        }
+
+    def test_from_downloaded_reads_real_non_nan_pixel_extent(self, tmp_path, monkeypatch):
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core import dry_collocation
+
+        # A 4x4 grid where only the top-left 2x2 block has real data --
+        # the real footprint should be just that block's lat/lon range,
+        # not the whole grid's.
+        lon2d, lat2d = np.meshgrid([0.0, 1.0, 2.0, 3.0], [40.0, 41.0, 42.0, 43.0])
+        sarssm = np.full((4, 4), np.nan)
+        sarssm[0:2, 0:2] = 25.0  # valid data only in this block
+        fake_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), sarssm)},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d), "time": datetime(2026, 8, 1)},
+        )
+        monkeypatch.setattr(
+            dry_collocation.DataTreeConverter, "from_sar_l3_ssm_geotiff", staticmethod(lambda p: fake_ds),
+        )
+
+        fp = dry_collocation._clms_ssm_footprint_from_downloaded(tmp_path / "fake.tif")
+
+        assert fp is not None
+        assert fp.kind == "orbit_swath"
+        assert fp.bbox == (0.0, 1.0, 40.0, 41.0)  # only the valid 2x2 block's extent
+        assert fp.polygon is None
+        assert fp.source_file == str(tmp_path / "fake.tif")
+
+    def test_from_downloaded_returns_none_when_geotiff_missing(self, monkeypatch):
+        """from_sar_l3_ssm_geotiff itself returns None when the file
+        doesn't exist -- that must propagate as None here too, not raise
+        (mirrors the converter's own "missing file" contract)."""
+        from sar_validation.core import dry_collocation
+
+        monkeypatch.setattr(
+            dry_collocation.DataTreeConverter, "from_sar_l3_ssm_geotiff", staticmethod(lambda p: None),
+        )
+
+        fp = dry_collocation._clms_ssm_footprint_from_downloaded("/nonexistent/fake.tif")
+
+        assert fp is None
+
+    def test_from_downloaded_returns_none_when_all_pixels_nan(self, monkeypatch):
+        """An all-NaN raster (e.g. a tile with zero valid retrievals for
+        the day) has no real pixel extent to report -- must degrade to
+        None, not a degenerate/nonsensical bbox."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core import dry_collocation
+
+        lon2d, lat2d = np.meshgrid([0.0, 1.0], [40.0, 41.0])
+        fake_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.full((2, 2), np.nan))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d), "time": datetime(2026, 8, 1)},
+        )
+        monkeypatch.setattr(
+            dry_collocation.DataTreeConverter, "from_sar_l3_ssm_geotiff", staticmethod(lambda p: fake_ds),
+        )
+
+        fp = dry_collocation._clms_ssm_footprint_from_downloaded("fake.tif")
+
+        assert fp is None
