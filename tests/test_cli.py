@@ -174,6 +174,79 @@ class TestHfradarResolutionCliFlag:
         assert hf_source.download_kwargs == {"resolution_km": "finest"}
 
 
+class TestAltimeterFreqCliFlag:
+    @pytest.mark.parametrize("category", ["wind", "currents", "soil_moisture"])
+    def test_rejected_for_non_waves_template(self, category, tmp_path, monkeypatch, capsys):
+        from sar_validation.cli import main
+
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit):
+            main(["--create-recipe", category, "--altimeter-freq", "5hz"])
+        captured = capsys.readouterr()
+        assert "waves" in (captured.out + captured.err)
+
+    def test_accepted_for_waves_template_and_written_to_yaml(self, tmp_path, monkeypatch):
+        from sar_validation.cli import main
+        from sar_validation.core.recipe import Recipe
+
+        monkeypatch.chdir(tmp_path)
+        main(["--create-recipe", "waves", "--altimeter-freq", "5hz"])
+        recipe = Recipe.from_yaml(tmp_path / "recipes" / "waves_validation.yaml")
+        alt_source = next(
+            s for s in recipe.config.validation_sources if s.source_type == "altimeter"
+        )
+        assert alt_source.download_kwargs == {"frequencies": ["5hz"]}
+
+    def test_omitted_flag_defaults_waves_recipe_to_1hz(self, tmp_path, monkeypatch):
+        from sar_validation.cli import main
+        from sar_validation.core.recipe import Recipe
+
+        monkeypatch.chdir(tmp_path)
+        main(["--create-recipe", "waves"])
+        recipe = Recipe.from_yaml(tmp_path / "recipes" / "waves_validation.yaml")
+        alt_source = next(
+            s for s in recipe.config.validation_sources if s.source_type == "altimeter"
+        )
+        assert alt_source.download_kwargs == {"frequencies": ["1hz"]}
+
+    def test_both_value_written_to_yaml(self, tmp_path, monkeypatch):
+        from sar_validation.cli import main
+        from sar_validation.core.recipe import Recipe
+
+        monkeypatch.chdir(tmp_path)
+        main(["--create-recipe", "waves", "--altimeter-freq", "both"])
+        recipe = Recipe.from_yaml(tmp_path / "recipes" / "waves_validation.yaml")
+        alt_source = next(
+            s for s in recipe.config.validation_sources if s.source_type == "altimeter"
+        )
+        assert alt_source.download_kwargs == {"frequencies": ["1hz", "5hz"]}
+
+    def test_invalid_value_rejected_by_argparse(self, tmp_path, monkeypatch, capsys):
+        from sar_validation.cli import main
+
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit):
+            main(["--create-recipe", "waves", "--altimeter-freq", "10hz"])
+
+    def test_rejected_when_combined_with_recipe_flag(self, tmp_path, monkeypatch, capsys):
+        """--altimeter-freq only makes sense at recipe-creation time
+        (--create-recipe waves); combining it with --recipe (executing an
+        *existing* recipe file) must be rejected the same way as combining
+        it with a non-waves --create-recipe category. args.create_recipe is
+        None here, so the guard's `!= "waves"` check fires regardless of
+        whether the recipe file exists -- parser.error() must run before
+        the file is ever touched."""
+        from sar_validation.cli import main
+
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit):
+            main(["--recipe", "some_recipe.yaml", "--altimeter-freq", "5hz"])
+        captured = capsys.readouterr()
+        assert "waves" in (captured.out + captured.err) or "--recipe" in (
+            captured.out + captured.err
+        )
+
+
 class TestLoadPrecomputedStats:
     def test_finds_files_saved_under_filter_variable_pairs_keys(self, tmp_path):
         """Regression test: run_statistics saves files keyed by
@@ -863,6 +936,64 @@ class TestBuildWavesConfigEra5:
         assert "era5" in source_types
         era5_source = next(s for s in cfg.validation_sources if s.source_type == "era5")
         assert era5_source.download_kwargs == {}
+
+
+class TestBuildWavesConfigAltimeterFrequency:
+    def test_default_is_1hz_only(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config()
+        alt_source = next(s for s in cfg.validation_sources if s.source_type == "altimeter")
+        assert alt_source.download_kwargs == {"frequencies": ["1hz"]}
+        specs = cfg.collocation.layer_vs_layer.layer_type_specs
+        assert "altimeter_1hz" in specs
+        assert "altimeter_5hz" not in specs
+
+    def test_none_is_treated_as_1hz(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config(altimeter_freq=None)
+        alt_source = next(s for s in cfg.validation_sources if s.source_type == "altimeter")
+        assert alt_source.download_kwargs == {"frequencies": ["1hz"]}
+
+    def test_explicit_1hz(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config(altimeter_freq="1hz")
+        alt_source = next(s for s in cfg.validation_sources if s.source_type == "altimeter")
+        assert alt_source.download_kwargs == {"frequencies": ["1hz"]}
+        specs = cfg.collocation.layer_vs_layer.layer_type_specs
+        assert "altimeter_1hz" in specs
+        assert "altimeter_5hz" not in specs
+
+    def test_5hz(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config(altimeter_freq="5hz")
+        alt_source = next(s for s in cfg.validation_sources if s.source_type == "altimeter")
+        assert alt_source.download_kwargs == {"frequencies": ["5hz"]}
+        specs = cfg.collocation.layer_vs_layer.layer_type_specs
+        assert "altimeter_5hz" in specs
+        assert "altimeter_1hz" not in specs
+
+    def test_both(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config(altimeter_freq="both")
+        alt_source = next(s for s in cfg.validation_sources if s.source_type == "altimeter")
+        assert alt_source.download_kwargs == {"frequencies": ["1hz", "5hz"]}
+        specs = cfg.collocation.layer_vs_layer.layer_type_specs
+        assert "altimeter_1hz" in specs
+        assert "altimeter_5hz" in specs
+
+    def test_era5_layer_type_spec_still_present_regardless_of_frequency(self):
+        # Guard against the layer_type_specs trim accidentally dropping the
+        # unrelated era5_waves entry alongside the altimeter ones.
+        from sar_validation.cli import _build_waves_config
+
+        for freq in ("1hz", "5hz", "both"):
+            cfg = _build_waves_config(altimeter_freq=freq)
+            assert "era5_waves" in cfg.collocation.layer_vs_layer.layer_type_specs
 
 
 class TestBuildSoilMoistureConfig:

@@ -42,6 +42,15 @@ class TestSatelliteOrbitSpecs:
     def test_metop_a_not_registered(self):
         assert "metop-a" not in SATELLITE_ORBIT_SPECS
 
+    def test_hy2_and_oceansat3_registered(self):
+        assert SATELLITE_ORBIT_SPECS["hy2b"] == SatelliteOrbitSpec(norad_id=43655, swath_half_width_km=900.0)
+        assert SATELLITE_ORBIT_SPECS["hy2c"] == SatelliteOrbitSpec(norad_id=46469, swath_half_width_km=900.0)
+        assert SATELLITE_ORBIT_SPECS["oceansat3"] == SatelliteOrbitSpec(norad_id=54361, swath_half_width_km=720.0)
+
+    def test_gcom_w1_and_smos_registered(self):
+        assert SATELLITE_ORBIT_SPECS["gcom-w1"] == SatelliteOrbitSpec(norad_id=38337, swath_half_width_km=800.0)
+        assert SATELLITE_ORBIT_SPECS["smos"] == SatelliteOrbitSpec(norad_id=36036, swath_half_width_km=525.0)
+
 
 class TestBearingDeg:
     def test_due_north_is_zero(self):

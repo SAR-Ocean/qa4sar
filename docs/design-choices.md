@@ -115,8 +115,20 @@ CMEMS along-track altimetry comes at 1 Hz (~7 km along-track spacing, carries
 distinct layer types** (`altimeter_1hz` / `altimeter_5hz`) because the
 collocation aggregation window must match the sensor's footprint spacing —
 a single window would be wrong for at least one of them (§5.2). The frequency
-is detected from the file content (5 Hz files do not carry `WIND_SPEED`). 
-Wind recipes download only 1 Hz (as 5 Hz has no wind); wave recipes download both.
+is detected from the file content (5 Hz files do not carry `WIND_SPEED`).
+Wind recipes download only 1 Hz (as 5 Hz has no wind).
+
+Wave recipes default to 1 Hz only, as of 2026-08. Downloading both
+frequencies by default meant a 5 Hz point and its nearest 1 Hz point often
+fall within the same SAR pixel's collocation window — effectively
+double-sampling that pixel with two altimeter observations of differing
+resolution and noise characteristics, skewing wave-height validation
+statistics toward it. `--altimeter-freq {1hz,5hz,both}` at
+`--create-recipe waves` time opts into a different source (rejected as an
+error for every other `--create-recipe` category); the choice is written
+explicitly into the generated recipe's altimeter `download_kwargs`, e.g.
+`{"frequencies": ["5hz"]}`, so it's visible and independently editable per
+recipe rather than an implicit toolbox-wide default.
 
 ### 3.4 Radiometer products are pre-gridded to 0.25° bins
 
@@ -1797,3 +1809,53 @@ no other code changes anywhere in the pipeline.
 > `core/datatree_converter.py` (`from_radarsat2_wind`),
 > `core/sar_sources.py` (`SAR_SOURCES["radarsat2"]`), `cli.py`
 > (`_build_wind_config`'s `radarsat2` description branch).
+
+## 11. Orbit-based geographic pre-filter: which sources use it, and why
+
+`core/orbit_coverage.py`'s `orbit_overlaps_bbox()` predicts, via SGP4/TLE
+propagation (`pyorbital`, historical TLEs from Space-Track's `gp_history`
+archive), whether a satellite's ground track/swath could have passed near
+a bbox during a sensing window -- letting a downloader with no
+server-side spatial query skip files that can't possibly overlap the
+requested region, before downloading them. It **fails open** throughout:
+an unregistered satellite, a TLE that can't be fetched, or any
+propagation error all keep the file rather than drop it, since this is a
+download-time optimization only, never a substitute for the real
+domain-cropping that happens downstream -- it must never risk a false
+negative.
+
+**Sources that use it:** H-SAF ASCAT SSM NRT (`hsaf_downloader.py`,
+`metop-b`/`metop-c`), HY-2B/HY-2C/Oceansat-3 wind
+(`scatterometer_ftp_downloader.py`, `hy2b`/`hy2c`/`oceansat3`), AMSR2 soil
+moisture (`gportal_downloader.py`, `gcom-w1`), and SMOS soil moisture
+(`smos_downloader.py`, `smos`) -- the four sources whose upstream servers
+provide no spatial query of their own (full-orbit-swath FTP/SFTP archives
+that accept a bbox purely for interface consistency and crop downstream).
+
+**Sources that don't, and why:**
+- ASCAT wind + ASCAT SSM historical (EUMDAC), SMAP/NISAR SME2 (NASA CMR),
+  Sentinel-1 L2 OCN (CDSE) -- all already get spatial filtering via a
+  server-side catalog bbox query, a different, already-effective
+  mechanism.
+- RADARSAT-2 -- has its own independent pre-download geographic filter (a
+  coarse filename-embedded-longitude check, then an exact per-granule
+  bbox fetched from THREDDS' NCML metadata endpoint); see §10. Not
+  unified onto orbit propagation.
+- Every gridded (ERA5, HYCOM, CDS SSM) or point-station (ISMN, HF-radar
+  variants, in-situ currents) source -- not swath-based; orbit
+  propagation doesn't apply.
+
+**Known low-yield caveat (AMSR2):** AMSR2's G-Portal files are daily
+composite grids, not per-orbit-segment granules -- their filenames embed
+only a date, not a time-of-day, so the filter uses the whole day
+`[00:00:00Z, 23:59:59Z]` as the sensing window. Since AMSR2 achieves
+near-global coverage roughly twice a day, this window overlaps almost any
+bbox almost every day, so the pre-filter rarely actually excludes a file
+for this source in practice -- kept anyway for consistency with the other
+three sources, and because the mechanism was already built for them.
+
+> Code: `core/orbit_coverage.py` (`SATELLITE_ORBIT_SPECS`,
+> `orbit_overlaps_bbox`), `downloaders/hsaf_downloader.py`,
+> `downloaders/scatterometer_ftp_downloader.py`,
+> `downloaders/gportal_downloader.py`, `downloaders/smos_downloader.py`
+> (each source's own `_filter_by_orbit_overlap` method).

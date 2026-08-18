@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import sys
 import zipfile
 from datetime import date
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -181,12 +183,19 @@ class TestCDSSoilMoistureDownloaderBuildRequest:
         dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
         req = dl._build_request(date(2026, 3, 15))
         assert req["type_of_sensor"] == ["active"]
-        assert req["type_of_record"] == ["icdr"]
+        assert req["type_of_record"] == ["cdr"]
         assert req["year"] == ["2026"]
         assert req["month"] == ["03"]
         assert req["day"] == ["15"]
         assert "variable" in req
         assert "time_aggregation" in req
+
+    def test_build_request_honors_explicit_type_of_record(self, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        req = dl._build_request(date(2026, 3, 15), type_of_record="icdr")
+        assert req["type_of_record"] == ["icdr"]
 
     def test_build_request_passive(self, tmp_path):
         from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
@@ -263,6 +272,83 @@ class TestCDSSoilMoistureDownloaderBuildRequest:
         )
         req = dl._build_request(date(2024, 1, 1))
         assert req["version"] == ["v202312"]
+
+
+class TestCDSSoilMoistureDownloaderCdrIcdrFallback:
+    """_download_day() must prefer the finalized CDR record and only fall
+    back to the faster, near-real-time ICDR record when the CDR request
+    itself fails -- e.g. CDR hasn't been published yet for a very recent
+    day. Requesting ICDR unconditionally (the previous behavior) never
+    asks for the better-quality finalized product even when it's already
+    available."""
+
+    def test_requests_cdr_first_and_succeeds_without_fallback(self, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        fake_remote = MagicMock()
+        fake_client = MagicMock()
+        fake_client.retrieve.return_value = fake_remote
+
+        def fake_download(dest):
+            with zipfile.ZipFile(dest, "w") as zf:
+                zf.writestr("c3s_ssm_active_20260315.nc", b"fake")
+
+        fake_remote.download.side_effect = fake_download
+
+        with patch.dict(sys.modules, {"cdsapi": MagicMock(Client=MagicMock(return_value=fake_client))}):
+            result = dl._download_day(date(2026, 3, 15))
+
+        assert result is not None
+        assert fake_client.retrieve.call_count == 1
+        request = fake_client.retrieve.call_args[0][1]
+        assert request["type_of_record"] == ["cdr"]
+        assert dl._had_request_failure is False
+
+    def test_falls_back_to_icdr_when_cdr_request_fails(self, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        fake_client = MagicMock()
+
+        def fake_download(dest):
+            with zipfile.ZipFile(dest, "w") as zf:
+                zf.writestr("c3s_ssm_active_20260315.nc", b"fake")
+
+        succeeding_remote = MagicMock()
+        succeeding_remote.download.side_effect = fake_download
+        fake_client.retrieve.side_effect = [
+            RuntimeError("CDR not yet published for this day"),
+            succeeding_remote,
+        ]
+
+        with patch.dict(sys.modules, {"cdsapi": MagicMock(Client=MagicMock(return_value=fake_client))}):
+            result = dl._download_day(date(2026, 3, 15))
+
+        assert result is not None
+        assert fake_client.retrieve.call_count == 2
+        first_request = fake_client.retrieve.call_args_list[0][0][1]
+        second_request = fake_client.retrieve.call_args_list[1][0][1]
+        assert first_request["type_of_record"] == ["cdr"]
+        assert second_request["type_of_record"] == ["icdr"]
+        assert dl._had_request_failure is False
+
+    def test_fails_when_both_cdr_and_icdr_requests_fail(self, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        fake_client = MagicMock()
+        fake_client.retrieve.side_effect = [
+            RuntimeError("CDR not yet published"),
+            RuntimeError("ICDR also unavailable"),
+        ]
+
+        with patch.dict(sys.modules, {"cdsapi": MagicMock(Client=MagicMock(return_value=fake_client))}):
+            result = dl._download_day(date(2026, 3, 15))
+
+        assert result is None
+        assert fake_client.retrieve.call_count == 2
+        assert dl._had_request_failure is True
 
 
 class TestCDSSoilMoistureDownloaderExtractNc:

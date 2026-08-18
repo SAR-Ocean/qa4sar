@@ -158,6 +158,10 @@ class GPortalAMSR2Downloader:
         orchestrator's AMSR2 G-Portal fallback, which runs unattended --
         must pass False so a missing credential raises instead of hanging
         on an interactive password prompt.
+    orbit_prefilter : bool
+        When True (default), drop files whose embedded date's whole-day
+        window shows no predicted orbit overlap with the requested bbox
+        (see orbit_coverage.orbit_overlaps_bbox) before downloading them.
     """
 
     def __init__(
@@ -168,6 +172,7 @@ class GPortalAMSR2Downloader:
         username: Optional[str] = None,
         password: Optional[str] = None,
         allow_prompt: bool = True,
+        orbit_prefilter: bool = True,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
@@ -175,6 +180,7 @@ class GPortalAMSR2Downloader:
         self._username = username
         self._password = password
         self._allow_prompt = allow_prompt
+        self.orbit_prefilter = orbit_prefilter
 
     def download(
         self,
@@ -249,6 +255,7 @@ class GPortalAMSR2Downloader:
             for product_dir in product_dirs:
                 downloaded = self._download_from_product_directory(
                     sftp, product_dir, start_dt, end_dt,
+                    min_lon, max_lon, min_lat, max_lat,
                 )
                 if downloaded:
                     return downloaded
@@ -359,6 +366,7 @@ class GPortalAMSR2Downloader:
 
     def _download_from_product_directory(
         self, sftp, product_dir: str, start_dt: str, end_dt: str,
+        min_lon: float, max_lon: float, min_lat: float, max_lat: float,
     ) -> list[Path]:
         is_nrt = product_dir.startswith("nrt/")
 
@@ -381,6 +389,9 @@ class GPortalAMSR2Downloader:
             m = _FILENAME_DATE_RE.search(name)
             if m and start_date <= m.group(1) <= end_date:
                 matches.append((dir_path, name))
+
+        if self.orbit_prefilter:
+            matches = self._filter_by_orbit_overlap(matches, min_lon, max_lon, min_lat, max_lat)
 
         print(f"Found {len(matches)} AMSR2 file(s) in window.")
         if not matches:
@@ -407,6 +418,53 @@ class GPortalAMSR2Downloader:
 
         print(f"Downloaded {len(downloaded)} AMSR2 file(s).")
         return downloaded
+
+    def _filter_by_orbit_overlap(
+        self, matches: list[tuple[str, str]], min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    ) -> list[tuple[str, str]]:
+        """Drop (dir_path, name) entries whose embedded date's whole-day
+        window shows no predicted orbit overlap with the requested bbox
+        -- see orbit_coverage.orbit_overlaps_bbox. Every entry here
+        already matched _FILENAME_DATE_RE by construction (see
+        _download_from_product_directory's matches-building loop), so
+        re-matching it is guaranteed to succeed.
+
+        Filenames only embed a date, not a time-of-day, so the whole day
+        [00:00:00Z, 23:59:59Z] is used as the sensing window -- expected
+        to rarely filter anything out, since AMSR2's near-global daily
+        coverage means most days overlap most bboxes. Kept for
+        consistency with the other two orbit-prefiltered sources.
+
+        _FILENAME_DATE_RE is just an 8-digit run, not a real-date check --
+        a string like "20260231" is lexicographically inside a requested
+        date range and passes the earlier start_date <= ... <= end_date
+        filter, but isn't a real calendar date, so strptime is wrapped in
+        its own try/except: on a ValueError, keep the file without
+        applying the orbit filter to it (matching this module's own
+        fail-open philosophy) rather than letting the exception propagate
+        and abort the whole AMSR2 download over a single bad filename."""
+        from datetime import datetime, timedelta, timezone
+
+        from ..core.orbit_coverage import orbit_overlaps_bbox
+
+        kept = []
+        dropped = 0
+        for dir_path, name in matches:
+            match = _FILENAME_DATE_RE.search(name)
+            assert match is not None  # matches was already filtered to only entries where this matched
+            try:
+                day_start = datetime.strptime(match.group(1), "%Y%m%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                kept.append((dir_path, name))
+                continue
+            day_end = day_start + timedelta(hours=23, minutes=59, seconds=59)
+            if orbit_overlaps_bbox("gcom-w1", day_start, day_end, min_lon, max_lon, min_lat, max_lat):
+                kept.append((dir_path, name))
+            else:
+                dropped += 1
+        if dropped:
+            print(f"Orbit pre-filter: skipped {dropped} file(s) with no predicted overlap.")
+        return kept
 
     def _standard_tree_candidates(
         self, sftp, product_dir: str, start_dt: str, end_dt: str,
@@ -477,6 +535,10 @@ def _parse_args(argv=None):
     p.add_argument("--password", default=None)
     p.add_argument("--output-dir", default=None)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--no-orbit-prefilter", dest="orbit_prefilter", action="store_false", default=True,
+        help="Disable the orbit-based geographic pre-filter (default: enabled).",
+    )
     return p.parse_args(argv)
 
 
@@ -510,6 +572,7 @@ def main(argv=None):
         dry_run=args.dry_run,
         username=args.username,
         password=args.password,
+        orbit_prefilter=args.orbit_prefilter,
     )
     dl.download(
         min_lon=min_lon, max_lon=max_lon,

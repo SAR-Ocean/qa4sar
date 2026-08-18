@@ -58,19 +58,8 @@ __all__ = ["CDSSoilMoistureDownloader"]
 _CDS_DATASET = "satellite-soil-moisture"
 
 #: Every CDS product version this dataset has published for the
-#: icdr/daily facet combination this downloader requests, submitted
-#: together as a multi-value facet on every request rather than picking
-#: one. CDS's own request validation resolves an OR-style multi-value
-#: selection to whichever value(s) actually apply to the requested
-#: year/sensor/record combination, so this works correctly across the
-#: whole archive without this downloader needing to track which version
-#: covers which year range itself -- confirmed live: a single hardcoded
-#: "latest" version (v202505) is only valid for 2025-2026 and silently
-#: 400s ("Request has not produced a valid combination of values") for
-#: anything older, e.g. a 2024-01-01 request. Extracted from
-#: https://cds.climate.copernicus.eu/api/catalogue/v1/collections/
-#: satellite-soil-moisture/constraints.json (fetched 2026-08-07); update
-#: if CDS publishes a new version and old requests start failing again.
+#: icdr/daily facet combination this downloader requests. if CDS
+#: publishes a new version and old requests start failing.
 _CDS_VERSIONS: list[str] = [
     "v201706", "v201812", "deprecated_v201912", "v201912_1",
     "v202012", "v202212", "v202312", "v202505", "v202505_1",
@@ -79,9 +68,7 @@ _CDS_VERSIONS: list[str] = [
 ProductType = Literal["active", "passive", "combined"]
 
 #: CDS's ``satellite-soil-moisture`` dataset uses a different ``variable``
-#: facet per sensor type -- confirmed live against the dataset's own
-#: constraints.json (https://cds.climate.copernicus.eu/api/catalogue/v1/
-#: collections/satellite-soil-moisture/constraints.json): every
+#: facet per sensor type (active/passive/combined).
 #: ``type_of_sensor: active`` combination requires
 #: ``surface_soil_moisture_saturation`` (percent saturation, matching
 #: ASCAT's native unit), never ``..._volumetric``; ``passive``/``combined``
@@ -198,15 +185,6 @@ class CDSSoilMoistureDownloader:
             day += timedelta(days=1)
 
         if not downloaded and self._had_request_failure:
-            # Every requested day either errored at the CDS API level or
-            # produced no extractable .nc file, and NONE of them yielded a
-            # real "no data here" empty-but-valid response -- previously
-            # this silently returned [] with "status": "success" in the
-            # orchestrator, so the actual cause (each day's own WARNING
-            # log line, e.g. a 400 Bad Request from an invalid facet
-            # combination) never reached the run's final summary. Raise so
-            # _run_download's existing exception handling records it in
-            # metadata["errors"] instead.
             raise RuntimeError(
                 f"CDS {self.product_type} SSM: every requested day in "
                 f"[{start_date}, {end_date}] failed at the CDS API level -- "
@@ -223,7 +201,7 @@ class CDSSoilMoistureDownloader:
         """Return the expected output NC path for *day*."""
         return self.output_dir / f"c3s_ssm_{self.product_type}_{day.strftime('%Y%m%d')}.nc"
 
-    def _build_request(self, day: date) -> dict:
+    def _build_request(self, day: date, type_of_record: str = "cdr") -> dict:
         """Build the cdsapi request dict for a single *day*."""
         # The CDS API requires month/day as zero-padded strings.
         return {
@@ -233,10 +211,14 @@ class CDSSoilMoistureDownloader:
             "year": [str(day.year)],
             "month": [f"{day.month:02d}"],
             "day": [f"{day.day:02d}"],
-            # Use ICDR for recent/NRT data; CDR is available for older dates
-            # but ICDR requests succeed even for historical dates (the server
-            # returns CDR data when ICDR is not yet available for that day).
-            "type_of_record": ["icdr"],
+            # CDR ("Climate Data Record") is the finalized, fully
+            # quality-controlled product -- prefer it whenever it's been
+            # published for the requested day. ICDR ("Interim" CDR) is the
+            # faster, near-real-time product published for the most recent
+            # days before CDR catches up; _download_day() falls back to it
+            # only when the CDR request itself fails (e.g. CDR not published
+            # yet for a recent day).
+            "type_of_record": [type_of_record],
             "version": self._versions,
         }
 
@@ -245,6 +227,10 @@ class CDSSoilMoistureDownloader:
         Download one day's CDS product and extract the NetCDF from the
         returned zip archive.  Returns the extracted NC path, or ``None``
         on failure.
+
+        Requests the finalized CDR record first; if that request fails
+        (e.g. CDR hasn't been published yet for a very recent day), retries
+        once with ICDR, the faster near-real-time record.
         """
         try:
             import cdsapi  # noqa: PLC0415 — optional dependency, imported lazily
@@ -255,17 +241,33 @@ class CDSSoilMoistureDownloader:
             ) from exc
 
         zip_path = self.output_dir / f"c3s_ssm_{self.product_type}_{day.strftime('%Y%m%d')}.zip"
-        request = self._build_request(day)
 
-        logger.info("  %s: requesting CDS %s SSM …", day.isoformat(), self.product_type)
-        try:
-            client = cdsapi.Client(quiet=True)
-            client.retrieve(_CDS_DATASET, request).download(str(zip_path))
-        except Exception as exc:  # noqa: BLE001 — cdsapi raises broad exceptions
-            logger.warning("  %s: CDS download failed: %s", day.isoformat(), exc)
-            zip_path.unlink(missing_ok=True)
-            self._had_request_failure = True
-            return None
+        cdr_exc: Optional[Exception] = None
+        for type_of_record in ("cdr", "icdr"):
+            request = self._build_request(day, type_of_record=type_of_record)
+            logger.info(
+                "  %s: requesting CDS %s SSM (%s) …",
+                day.isoformat(), self.product_type, type_of_record,
+            )
+            try:
+                client = cdsapi.Client(quiet=True)
+                client.retrieve(_CDS_DATASET, request).download(str(zip_path))
+                break
+            except Exception as exc:  # noqa: BLE001 — cdsapi raises broad exceptions
+                if type_of_record == "cdr":
+                    cdr_exc = exc
+                    logger.info(
+                        "  %s: CDR not available (%s), retrying with ICDR …",
+                        day.isoformat(), exc,
+                    )
+                    continue
+                logger.warning(
+                    "  %s: CDS download failed for both CDR (%s) and ICDR (%s)",
+                    day.isoformat(), cdr_exc, exc,
+                )
+                zip_path.unlink(missing_ok=True)
+                self._had_request_failure = True
+                return None
 
         nc_path = self._extract_nc(zip_path, day)
         zip_path.unlink(missing_ok=True)

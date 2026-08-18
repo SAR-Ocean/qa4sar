@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -9,6 +10,7 @@ import pytest
 
 paramiko = pytest.importorskip("paramiko")
 
+from sar_validation.core.orbit_coverage import TleFetchError  # noqa: E402
 from sar_validation.downloaders.gportal_downloader import (  # noqa: E402
     GPortalAMSR2Downloader,
     _connect_with_retry,
@@ -65,7 +67,7 @@ class TestGPortalAMSR2DownloaderDryRun:
         sftp.listdir.side_effect = lambda path: listing.get(path, [])
 
         dl = GPortalAMSR2Downloader(
-            output_dir=tmp_path, dry_run=True, username="u", password="p",
+            output_dir=tmp_path, dry_run=True, username="u", password="p", orbit_prefilter=False,
         )
         with patch("paramiko.Transport") as mock_transport_cls, \
              patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
@@ -192,7 +194,9 @@ class TestGPortalAMSR2DownloaderDiscovery:
         }
         sftp = self._mock_sftp(listing)
 
-        dl = GPortalAMSR2Downloader(output_dir=tmp_path, username="u", password="p")
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
         with patch("paramiko.Transport") as mock_transport_cls, \
              patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
              patch("socket.create_connection") as mock_create_connection:
@@ -242,7 +246,9 @@ class TestGPortalAMSR2DownloaderDiscovery:
         sftp = self._mock_sftp(listing)
         sftp.get.side_effect = lambda remote, local: Path(local).write_bytes(b"data")
 
-        dl = GPortalAMSR2Downloader(output_dir=tmp_path, username="u", password="p")
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
         with patch("paramiko.Transport") as mock_transport_cls, \
              patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
              patch("socket.create_connection", return_value=MagicMock()):
@@ -360,7 +366,9 @@ class TestGPortalAMSR2DownloaderDiscovery:
         sftp = self._mock_sftp(listing)
         sftp.get.side_effect = lambda remote, local: Path(local).write_bytes(b"data")
 
-        dl = GPortalAMSR2Downloader(output_dir=tmp_path, username="u", password="p")
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
         with patch("paramiko.Transport") as mock_transport_cls, \
              patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
              patch("socket.create_connection", return_value=MagicMock()):
@@ -393,7 +401,9 @@ class TestGPortalAMSR2DownloaderForceDownload:
         sftp = MagicMock()
         sftp.listdir.side_effect = lambda path: listing.get(path, [])
 
-        dl = GPortalAMSR2Downloader(output_dir=tmp_path, username="u", password="p")
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
         with patch("paramiko.Transport") as mock_transport_cls, \
              patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
              patch("socket.create_connection", return_value=MagicMock()):
@@ -431,3 +441,137 @@ class TestGPortalAMSR2DownloaderResourceCleanup:
 
             # Even though connect() failed, transport.close() should have been called
             mock_transport.close.assert_called_once()
+
+
+class TestGPortalAMSR2DownloaderOrbitPrefilter:
+    def _mock_sftp(self, listing_by_path: dict[str, list[str]]):
+        sftp = MagicMock()
+        sftp.listdir.side_effect = lambda path: listing_by_path.get(path, [])
+        sftp.get.side_effect = lambda remote, local: Path(local).write_bytes(b"data")
+        return sftp
+
+    _LISTING = {
+        "standard": ["GCOM-W"],
+        "standard/GCOM-W": ["GCOM-W.AMSR2"],
+        "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+        "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
+        "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2026"],
+        "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026": ["07"],
+        "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/07": [
+            "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",
+        ],
+    }
+
+    def _run(self, tmp_path, orbit_prefilter=True, overlap_return=True):
+        sftp = self._mock_sftp(self._LISTING)
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=orbit_prefilter,
+        )
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
+             patch("socket.create_connection", return_value=MagicMock()), \
+             patch(
+                 "sar_validation.core.orbit_coverage.orbit_overlaps_bbox",
+                 return_value=overlap_return,
+             ) as mock_overlap:
+            mock_transport_cls.return_value = MagicMock()
+            downloaded = dl.download(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-01", end="2026-07-01",
+            )
+        return downloaded, mock_overlap
+
+    def test_default_orbit_prefilter_is_enabled(self, tmp_path):
+        dl = GPortalAMSR2Downloader(output_dir=tmp_path)
+        assert dl.orbit_prefilter is True
+
+    def test_dropped_files_are_excluded_from_download(self, tmp_path):
+        downloaded, _ = self._run(tmp_path, orbit_prefilter=True, overlap_return=False)
+        assert downloaded == []
+
+    def test_orbit_prefilter_false_reproduces_todays_behavior(self, tmp_path):
+        downloaded, mock_overlap = self._run(tmp_path, orbit_prefilter=False)
+        assert not mock_overlap.called
+        assert len(downloaded) == 1
+
+    def test_orbit_overlaps_bbox_receives_whole_day_window(self, tmp_path):
+        """AMSR2 filenames only embed a date, not a time -- the whole day
+        must be used as the sensing window, not a degenerate single
+        instant."""
+        _downloaded, mock_overlap = self._run(tmp_path, orbit_prefilter=True, overlap_return=True)
+
+        assert mock_overlap.call_count == 1
+        satellite, start, end = mock_overlap.call_args[0][0:3]
+        assert satellite == "gcom-w1"
+        assert start == datetime(2026, 7, 1, 0, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2026, 7, 1, 23, 59, 59, tzinfo=timezone.utc)
+
+    def test_tle_fetch_error_keeps_file_fail_open(self, tmp_path):
+        """A mocked TleFetchError must keep the file (fail-open), matching
+        H-SAF's equivalent test. This downloader's _filter_by_orbit_overlap
+        uses `assert match is not None` on _FILENAME_DATE_RE -- a real
+        invariant, since `matches` is pre-filtered upstream to only entries
+        where that regex already matched -- so a parse-failure test (as
+        used for H-SAF's satellite-name parse) isn't a valid failure
+        surface here. Instead this exercises the *real*, unmocked
+        orbit_overlaps_bbox by making the TLE fetch it depends on fail:
+        patching get_tle (not orbit_overlaps_bbox itself) lets
+        orbit_overlaps_bbox's own documented `except TleFetchError: return
+        True` fail-open path run for real, which is the actual failure
+        surface this downloader relies on."""
+        sftp = self._mock_sftp(self._LISTING)
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=True,
+        )
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
+             patch("socket.create_connection", return_value=MagicMock()), \
+             patch(
+                 "sar_validation.core.orbit_coverage.get_tle",
+                 side_effect=TleFetchError("no TLE available"),
+             ):
+            mock_transport_cls.return_value = MagicMock()
+            downloaded = dl.download(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-01", end="2026-07-01",
+            )
+
+        assert len(downloaded) == 1
+
+    def test_invalid_but_in_range_date_string_is_kept_not_crashed_on(self, tmp_path):
+        """_FILENAME_DATE_RE is just an 8-digit run, not a real-calendar-
+        date check -- "20260231" (Feb 31st doesn't exist) is
+        lexicographically inside [start_date, end_date] and passes that
+        string-comparison filter, but must not crash datetime.strptime
+        and abort the whole download; it must be kept (fail-open),
+        matching this module's philosophy elsewhere."""
+        listing = {
+            "standard": ["GCOM-W"],
+            "standard/GCOM-W": ["GCOM-W.AMSR2"],
+            "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2026"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026": ["02"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/02": [
+                "GW1AM2_20260231_01D_EQMA_L3SGSMCLQ_2210.h5",
+            ],
+        }
+        sftp = self._mock_sftp(listing)
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=True,
+        )
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
+             patch("socket.create_connection", return_value=MagicMock()), \
+             patch(
+                 "sar_validation.core.orbit_coverage.orbit_overlaps_bbox",
+                 side_effect=AssertionError("must not be called for an invalid date string"),
+             ):
+            mock_transport_cls.return_value = MagicMock()
+            downloaded = dl.download(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-02-01", end="2026-03-01",
+            )
+
+        assert len(downloaded) == 1
+        assert "20260231" in downloaded[0].name

@@ -580,6 +580,44 @@ class TestDownloadTemporalPadding:
         assert call_kwargs["end"] == "2026-02-03"
 
 
+class TestAltimeterFrequenciesByVariable:
+    def test_waves_fallback_default_is_1hz_only(self):
+        assert DataOrchestrator._ALTIMETER_FREQUENCIES_BY_VARIABLE["waves"] == ["1hz"]
+
+    def test_wind_fallback_default_is_unchanged(self):
+        assert DataOrchestrator._ALTIMETER_FREQUENCIES_BY_VARIABLE["wind"] == ["1hz"]
+
+    def test_variable_absent_from_dict_falls_back_to_1hz_only(self, tmp_path):
+        """A recipe variable that isn't even a key in
+        _ALTIMETER_FREQUENCIES_BY_VARIABLE (e.g. currents, soil_moisture, or
+        any future variable) must still resolve to 1 Hz only via
+        _download_altimeter's own .get(..., default) -- that default must
+        stay in lockstep with the dict's own "1 Hz by default" policy
+        rather than silently reverting to both frequencies."""
+        cfg = RecipeConfig(
+            name="test", variable="currents",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[ValidationDataSource(source_type="altimeter")],
+        )
+        recipe = Recipe(cfg)
+        orchestrator = DataOrchestrator(recipe, dry_run=True)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.altimeter_downloader.AltimeterDownloader"
+        ) as mock_cls:
+            mock_instance = MagicMock()
+            mock_instance.download.return_value = []
+            mock_cls.return_value = mock_instance
+
+            ok = orchestrator._dispatch_source(cfg.validation_sources[0])
+
+        assert ok is True
+        call_kwargs = mock_instance.download.call_args.kwargs
+        assert call_kwargs["frequencies"] == ["1hz"]
+
+
 class TestComputeSarSceneTimes:
     """self._sar_scene_times is populated (sorted) from the real SAR
     files' embedded timestamps via each source's own .convert callable

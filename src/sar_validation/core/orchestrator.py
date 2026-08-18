@@ -1537,12 +1537,19 @@ class DataOrchestrator:
     def _download_glider_historical(self, source) -> bool:
         return self._download_currents_historical(source, "glider")
 
-    # Altimeter download frequencies, keyed by recipe variable. Wind never
-    # needs 5 Hz (no WIND_SPEED there, and 5x the point density for no
-    # benefit); waves uses both since VAVH/VAVH_UNFILTERED exist at both.
+    # Altimeter download frequencies, keyed by recipe variable. This is
+    # only a fallback for a recipe whose altimeter ValidationDataSource
+    # omits "frequencies" from download_kwargs -- cli.py's
+    # _build_waves_config/_build_wind_config always set it explicitly, so
+    # this only matters for hand-edited recipes. Wind never needs 5 Hz (no
+    # WIND_SPEED there, and 5x the point density for no benefit); waves
+    # defaults to 1 Hz too -- co-downloading both by default over-samples
+    # SAR pixels near the ground track (see docs/design-choices.md §3.3).
+    # A recipe can still opt into 5 Hz or both via --altimeter-freq at
+    # creation time, or by editing download_kwargs directly.
     _ALTIMETER_FREQUENCIES_BY_VARIABLE = {
         "wind":  ["1hz"],
-        "waves": ["1hz", "5hz"],
+        "waves": ["1hz"],
     }
 
     def _download_altimeter(self, source) -> bool:
@@ -1559,7 +1566,7 @@ class DataOrchestrator:
         out_dir = self.base_dir / "altimeter"
         kwargs = {
             "frequencies": self._ALTIMETER_FREQUENCIES_BY_VARIABLE.get(
-                cfg.variable, ["1hz", "5hz"]
+                cfg.variable, ["1hz"]
             ),
         }
         kwargs.update(source.download_kwargs)   # recipe-level override wins

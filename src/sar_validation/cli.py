@@ -68,6 +68,7 @@ Available SAR sources (--sar-source): {', '.join(AVAILABLE_SATELLITES)}
 Examples:
   sar-validate --list-recipes
   sar-validate --create-recipe wind
+  sar-validate --create-recipe waves --altimeter-freq 5hz
   sar-validate --set-credential eumdac
   sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65
   sar-validate --create-recipe wind --start 2026-03-01 --end 2026-03-31
@@ -179,6 +180,15 @@ Examples:
              "resolution available for the recipe's region.",
     )
     parser.add_argument(
+        "--altimeter-freq",
+        choices=["1hz", "5hz", "both"],
+        default=None,
+        help="Along-track altimeter frequency for --create-recipe waves "
+             "(default: 1hz). Only valid with --create-recipe waves -- 5 Hz "
+             "has no WIND_SPEED, so wind recipes always use 1hz regardless "
+             "of this flag.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what will be downloaded without actually downloading",
@@ -241,6 +251,9 @@ Examples:
     if args.hfradar_resolution is not None and args.create_recipe != "currents":
         parser.error("--hfradar-resolution is only valid with --create-recipe currents")
 
+    if args.altimeter_freq is not None and args.create_recipe != "waves":
+        parser.error("--altimeter-freq is only valid with --create-recipe waves")
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
@@ -263,6 +276,7 @@ Examples:
             recipe_name=args.recipe_name,
             sar_source=args.sar_source,
             hfradar_resolution=args.hfradar_resolution,
+            altimeter_freq=args.altimeter_freq,
         )
     elif args.recipe:
         _execute_recipe(
@@ -612,12 +626,23 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
     )
 
 
-def _build_waves_config(limit: Optional[int] = None, sar_source: str = "sentinel1_l2_ocn"):
+def _build_waves_config(
+    limit: Optional[int] = None,
+    sar_source: str = "sentinel1_l2_ocn",
+    altimeter_freq: Optional[str] = None,
+):
     """Build the 'waves' recipe template's RecipeConfig.
 
     Extracted from ``_create_recipe`` so the template content is
     unit-testable independent of the CLI's file-writing side effects,
     mirroring ``_build_wind_config``/``_build_currents_config``.
+
+    ``altimeter_freq`` selects which along-track altimeter frequency the
+    generated recipe validates against: "1hz" (default), "5hz", or "both".
+    1 Hz and 5 Hz sample the same ground track at different point spacing
+    (~7km vs ~1.4km) — mixing both by default over-samples SAR pixels near
+    the ground track, skewing validation statistics toward them (see
+    docs/design-choices.md §3.3). ``None`` is treated as "1hz".
     """
     from .core.sar_sources import resolve_sar_source
     sar_source = resolve_sar_source(sar_source, "waves")
@@ -630,6 +655,30 @@ def _build_waves_config(limit: Optional[int] = None, sar_source: str = "sentinel
         SARDataSpec,
         ValidationDataSource,
     )
+
+    _ALTIMETER_FREQ_LISTS = {
+        "1hz": ["1hz"],
+        "5hz": ["5hz"],
+        "both": ["1hz", "5hz"],
+    }
+    altimeter_freqs = _ALTIMETER_FREQ_LISTS[altimeter_freq or "1hz"]
+
+    _ALTIMETER_LAYER_SPECS = {
+        "altimeter_1hz": {
+            "time_tolerance_minutes": 180,
+            "aggregation_window_km": 7.0,
+            "distance_weighting": "equal",
+        },
+        "altimeter_5hz": {
+            "time_tolerance_minutes": 180,
+            "aggregation_window_km": 1.4,
+            "distance_weighting": "equal",
+        },
+    }
+    altimeter_layer_specs = {
+        f"altimeter_{freq}": _ALTIMETER_LAYER_SPECS[f"altimeter_{freq}"]
+        for freq in altimeter_freqs
+    }
 
     return RecipeConfig(
         name="Wave Height Validation",
@@ -645,7 +694,10 @@ def _build_waves_config(limit: Optional[int] = None, sar_source: str = "sentinel
             ValidationDataSource(source_type="mooring"),
             ValidationDataSource(source_type="tidal_gauge"),
             ValidationDataSource(source_type="drifter"),
-            ValidationDataSource(source_type="altimeter"),
+            ValidationDataSource(
+                source_type="altimeter",
+                download_kwargs={"frequencies": altimeter_freqs},
+            ),
             # ERA5 reanalysis (Copernicus CDS).
             ValidationDataSource(source_type="era5"),
         ],
@@ -663,16 +715,7 @@ def _build_waves_config(limit: Optional[int] = None, sar_source: str = "sentinel
                         "method": "cell-averaging",
                         "temporal_method": "hyperbolic",
                     },
-                    "altimeter_1hz": {
-                        "time_tolerance_minutes": 180,
-                        "aggregation_window_km": 7.0,
-                        "distance_weighting": "equal",
-                    },
-                    "altimeter_5hz": {
-                        "time_tolerance_minutes": 180,
-                        "aggregation_window_km": 1.4,
-                        "distance_weighting": "equal",
-                    },
+                    **altimeter_layer_specs,
                 }
             ),
         ),
@@ -813,6 +856,7 @@ def _create_recipe(
     recipe_name: Optional[str] = None,
     sar_source: Optional[str] = None,
     hfradar_resolution: Optional[str] = None,
+    altimeter_freq: Optional[str] = None,
 ) -> None:
     from .core.recipe import (
         GeographicBounds,
@@ -844,7 +888,7 @@ def _create_recipe(
                 min_lon, max_lon, min_lat, max_lat,
             ),
             "soil_moisture": _build_soil_moisture_config(limit, _source_for("soil_moisture")),
-            "waves": _build_waves_config(limit, _source_for("waves")),
+            "waves": _build_waves_config(limit, _source_for("waves"), altimeter_freq),
         }
     except ValueError as exc:
         print(str(exc))
