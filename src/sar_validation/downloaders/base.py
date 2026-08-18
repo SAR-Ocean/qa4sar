@@ -318,7 +318,8 @@ class CopernicusODataClient:
         Query products from the CDSE catalogue.
 
         Returns a list of product dicts with keys:
-            Id, Name, ContentDate_Start, ContentDate_End, ContentLength_GB, Online
+            Id, Name, ContentDate_Start, ContentDate_End, ContentLength_GB,
+            Online, GeoFootprint (raw CDSE GeoJSON-style geometry, or None)
         """
         self._ensure_token()
 
@@ -360,6 +361,7 @@ class CopernicusODataClient:
                     "ContentDate_End": prod.get("ContentDate", {}).get("End"),
                     "ContentLength_GB": prod.get("ContentLength", 0) / (1024 ** 3),
                     "Online": prod.get("Online"),
+                    "GeoFootprint": prod.get("GeoFootprint"),
                 }
             )
         return records
