@@ -51,6 +51,11 @@ class TestSatelliteOrbitSpecs:
         assert SATELLITE_ORBIT_SPECS["gcom-w1"] == SatelliteOrbitSpec(norad_id=38337, swath_half_width_km=800.0)
         assert SATELLITE_ORBIT_SPECS["smos"] == SatelliteOrbitSpec(norad_id=36036, swath_half_width_km=525.0)
 
+    def test_sentinel1_a_b_c_registered(self):
+        assert SATELLITE_ORBIT_SPECS["sentinel-1a"] == SatelliteOrbitSpec(norad_id=39634, swath_half_width_km=250.0)
+        assert SATELLITE_ORBIT_SPECS["sentinel-1b"] == SatelliteOrbitSpec(norad_id=41456, swath_half_width_km=250.0)
+        assert SATELLITE_ORBIT_SPECS["sentinel-1c"] == SatelliteOrbitSpec(norad_id=62261, swath_half_width_km=250.0)
+
 
 class TestBearingDeg:
     def test_due_north_is_zero(self):

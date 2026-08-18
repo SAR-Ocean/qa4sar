@@ -127,6 +127,21 @@ SATELLITE_ORBIT_SPECS: Dict[str, SatelliteOrbitSpec] = {
     # live-confirmed via N2YO/CEOS, 2026-08-17. Swath width ~1050km
     # (ESA eoPortal / CEOS instrument database), half per side.
     "smos": SatelliteOrbitSpec(norad_id=36036, swath_half_width_km=525.0),
+    # Sentinel-1A/B/C (C-SAR, IW mode). NORAD IDs (SATCAT numbers)
+    # live-confirmed via Wikipedia's Sentinel-1A/1B/1C pages, 2026-08-18:
+    # 1A=39634 (launched 2014-04-03), 1B=41456 (launched 2016-04-25,
+    # deactivated 2022-08-03 -- kept registered anyway, since a recipe can
+    # validate SAR data from before that date), 1C=62261 (launched
+    # 2024-12-05). Swath width: IW mode's documented 250km (ESA Sentinel
+    # Online user guide, sentinel.esa.int, 2026-08-18) -- Sentinel-1's SAR
+    # instrument images one side of the ground track only (unlike
+    # ASCAT/HY-2's genuinely two-sided swaths), so treating 250km as the
+    # per-side half-width (checking both sides via this module's existing
+    # bearing +/- 90 sweep) is a deliberate, conservative over-inclusion,
+    # consistent with every other entry in this dict.
+    "sentinel-1a": SatelliteOrbitSpec(norad_id=39634, swath_half_width_km=250.0),
+    "sentinel-1b": SatelliteOrbitSpec(norad_id=41456, swath_half_width_km=250.0),
+    "sentinel-1c": SatelliteOrbitSpec(norad_id=62261, swath_half_width_km=250.0),
 }
 
 
