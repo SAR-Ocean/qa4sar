@@ -1,14 +1,12 @@
 """
 Visualization — step 5b of the validation pipeline.
 
-Five public plot functions:
+Four public plot functions:
 
 * :func:`plot_scatter`      — SAR vs. validation variable scatter plot
 * :func:`plot_geographic`   — SAR field + collocated points, one subplot per SAR scene
 * :func:`plot_statistics`   — bar chart of bias / RMSE / correlation per source
 * :func:`plot_residuals`    — histogram / KDE of (SAR − validation) residuals
-* :func:`plot_temporal_offset` — |SAR − validation| residual magnitude vs.
-  temporal collocation offset
 
 Plus fallback and convenience wrappers:
 
@@ -16,7 +14,7 @@ Plus fallback and convenience wrappers:
   validation points (one category per validation source actually present),
   always generated as part of the collocation step (step 3), including when
   there are zero collocated pairs.
-* :func:`validation_report` — runs all five plots, infers variable pairs from the recipe,
+* :func:`validation_report` — runs all four plots, infers variable pairs from the recipe,
   embeds plots in ``validation_report<suffix>.pdf``, and saves the collocation-diagnostics PNG to ``<out_dir>/plots/``
 
 All functions accept an ``interactive=False`` keyword argument.  When
@@ -134,7 +132,6 @@ __all__ = [
     "plot_geographic",
     "plot_statistics",
     "plot_residuals",
-    "plot_temporal_offset",
     "plot_collocation_diagnostics",
     "validation_report",
 ]
@@ -512,7 +509,6 @@ def plot_scatter(
     val_var: str,
     *,
     by_source: bool = True,
-    color_by: str = "source",
     interactive: bool = False,
     ax=None,
     split_when_imbalanced: bool = True,
@@ -530,15 +526,7 @@ def plot_scatter(
     val_var : str
         Validation variable name *without* ``val_`` prefix (e.g. ``"WSPD"``).
     by_source : bool
-        Whether per-source legend labels are shown (``color_by="source"``)
-        or the per-source marker-shape legend is shown
-        (``color_by="temporal_offset"``).
-    color_by : str
-        ``"source"`` (default) colours points by ``val_source``.
-        ``"temporal_offset"`` colours points by ``temporal_distance_minutes``
-        (continuous colormap + colorbar) instead, with marker shape still
-        varying by source — falls back to ``"source"`` with a warning if
-        ``temporal_distance_minutes`` is not present in *collocation_ds*.
+        Whether per-source legend labels are shown.
     interactive : bool
         Return a plotly Figure instead of matplotlib.
     ax : matplotlib.axes.Axes, optional
@@ -596,32 +584,11 @@ def plot_scatter(
         counts = df["val_source"].value_counts()
         dominant_share = float(counts.max()) / float(counts.sum())
 
-    # Resolved here (rather than only below, in the single-shared-axes
-    # path) so the split branch immediately below can forward the caller's
-    # actual color_by intent into small multiples instead of silently
-    # dropping it -- previously, whenever imbalance/force_split triggered
-    # a split, color_by="temporal_offset" was ignored entirely and
-    # _plot_scatter_small_multiples always rendered the plain by-source
-    # view, producing a page that duplicated the main scatter instead of
-    # showing temporal-offset coloring. Guarded by `not interactive`
-    # because the interactive/plotly branch below ignores color_by
-    # entirely already and must not emit this warning for it.
-    color_by_offset = color_by == "temporal_offset"
-    if not interactive and color_by_offset and "temporal_distance_minutes" not in df.columns:
-        warnings.warn(
-            "color_by='temporal_offset' requested but collocation_ds has no "
-            "'temporal_distance_minutes' column; falling back to color_by='source'."
-        )
-        color_by_offset = False
-
     if (
         not interactive and ax is None and split_when_imbalanced
         and len(sources_for_split) >= 2 and (dominant_share > 0.7 or force_split)
     ):
-        return _plot_scatter_small_multiples(
-            df, sar_col, val_col, sar_var, val_var, collocation_ds,
-            color_by="temporal_offset" if color_by_offset else "source",
-        )
+        return _plot_scatter_small_multiples(df, sar_col, val_col, sar_var, val_var, collocation_ds)
 
     if interactive:
         _require("plotly")
@@ -663,35 +630,19 @@ def plot_scatter(
         if has_var_code else [(src, None) for src in sorted(sources)]
     )
 
-    offset_sm = None
-    offset_vmin = offset_vmax = None
-    if color_by_offset:
-        offset_vmin = float(df["temporal_distance_minutes"].min())
-        offset_vmax = float(df["temporal_distance_minutes"].max())
     for src, var_code in groups:
         sub = (
             df[(df["val_source"] == src) & (df["val_var_code"] == var_code)]
             if var_code is not None else df[df["val_source"] == src]
         )
         marker = style[src][1]
-        if color_by_offset:
-            offset_sm = ax.scatter(
-                sub[val_col], sub[sar_col], s=18, alpha=0.7,
-                c=sub["temporal_distance_minutes"], cmap="plasma",
-                vmin=offset_vmin, vmax=offset_vmax,
-                marker=marker, rasterized=True,
-            )
-        else:
-            label = (f"{src} [{var_code}]" if var_code is not None else src) if by_source else None
-            ax.scatter(sub[val_col], sub[sar_col], s=18, alpha=0.6,
-                       color=style[src][0], marker=marker, label=label, rasterized=True)
+        label = (f"{src} [{var_code}]" if var_code is not None else src) if by_source else None
+        ax.scatter(sub[val_col], sub[sar_col], s=18, alpha=0.6,
+                   color=style[src][0], marker=marker, label=label, rasterized=True)
 
     all_vals = np.concatenate([df[val_col].values, df[sar_col].values])
     vmin, vmax = _pad_degenerate_range(float(np.nanmin(all_vals)), float(np.nanmax(all_vals)))
-    line11 = ax.plot([vmin, vmax], [vmin, vmax], "k--", linewidth=1, label="1:1")[0]
-
-    if color_by_offset and offset_sm is not None:
-        fig.colorbar(offset_sm, ax=ax, label="Temporal offset (min)", shrink=0.8)
+    ax.plot([vmin, vmax], [vmin, vmax], "k--", linewidth=1, label="1:1")
 
     # Annotate with N, bias, RMSE
     from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg  # noqa: PLC0415
@@ -737,35 +688,18 @@ def plot_scatter(
     ax.set_aspect("equal", "box")
     ax.grid(True, linewidth=0.4)
 
-    if color_by_offset:
-        if by_source:
-            handles = _source_marker_handles(
-                ((src, style[src][1]) for src in sorted(sources)), markersize=6,
-            )
-            handles.append(line11)
-            ax.legend(handles=handles, fontsize=7, framealpha=0.7)
-    elif by_source:
+    if by_source:
         ax.legend(fontsize=7, framealpha=0.7)
 
     fig.tight_layout()
     return fig
 
 
-def _plot_scatter_small_multiples(
-    df, sar_col, val_col, sar_var, val_var, collocation_ds, *, color_by: str = "source",
-):
+def _plot_scatter_small_multiples(df, sar_col, val_col, sar_var, val_var, collocation_ds):
     """One scatter subplot per val_source -- used by plot_scatter when one
     source's point count dominates enough to visually bury the others in
     a single shared axes (see split_when_imbalanced), or when force_split
     requests a split regardless of imbalance.
-
-    color_by mirrors plot_scatter's own parameter: ``"source"`` (default)
-    colors each subplot with that source's stable color; ``"temporal_offset"``
-    colors by temporal_distance_minutes instead, sharing one color scale
-    (and one colorbar) across every subplot so offsets stay comparable
-    source to source -- previously this parameter was silently dropped
-    whenever a split was triggered, producing a duplicate of the plain
-    by-source view under a "colored by temporal offset" title.
 
     When *df* carries a ``val_var_code`` column (waves' merged VHM0/VAVH/
     VGHS "SWH" pair -- see merge_wave_height_columns), splitting is by
@@ -789,13 +723,6 @@ def _plot_scatter_small_multiples(
     nrows = math.ceil(len(groups) / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 6 * nrows), squeeze=False)
 
-    color_by_offset = color_by == "temporal_offset" and "temporal_distance_minutes" in df.columns
-    offset_vmin = offset_vmax = None
-    last_offset_sm = None
-    if color_by_offset:
-        offset_vmin = float(df["temporal_distance_minutes"].min())
-        offset_vmax = float(df["temporal_distance_minutes"].max())
-
     for idx, (src, var_code) in enumerate(groups):
         r, c = divmod(idx, ncols)
         sub_ax = axes[r][c]
@@ -803,15 +730,8 @@ def _plot_scatter_small_multiples(
             df[(df["val_source"] == src) & (df["val_var_code"] == var_code)]
             if var_code is not None else df[df["val_source"] == src]
         )
-        if color_by_offset:
-            last_offset_sm = sub_ax.scatter(
-                sub[val_col], sub[sar_col], s=18, alpha=0.7,
-                c=sub["temporal_distance_minutes"], cmap="plasma",
-                vmin=offset_vmin, vmax=offset_vmax, rasterized=True,
-            )
-        else:
-            sub_ax.scatter(sub[val_col], sub[sar_col], s=18, alpha=0.6,
-                            color=color_map[src], rasterized=True)
+        sub_ax.scatter(sub[val_col], sub[sar_col], s=18, alpha=0.6,
+                        color=color_map[src], rasterized=True)
         sub_ax.set_xlabel(_labeled_var(collocation_ds, val_col, val_var, val_source=src))
         sub_ax.set_ylabel(_labeled_var(collocation_ds, sar_col, sar_var))
         title = f"{src} (N={len(sub)})" if var_code is None else f"{src} [{var_code}] (N={len(sub)})"
@@ -822,17 +742,11 @@ def _plot_scatter_small_multiples(
         sub_vmin, sub_vmax = _pad_degenerate_range(float(np.nanmin(sub_vals)), float(np.nanmax(sub_vals)))
         sub_ax.plot([sub_vmin, sub_vmax], [sub_vmin, sub_vmax], "k--", linewidth=1, label="1:1")
 
-    visible_axes = [axes[idx // ncols][idx % ncols] for idx in range(len(groups))]
     for idx in range(len(groups), nrows * ncols):
         axes[idx // ncols][idx % ncols].set_visible(False)
 
     fig.suptitle(f"{sar_var} vs {val_var}")
-    # tight_layout before the colorbar -- fig.colorbar(ax=<list>) creates a
-    # standalone Axes outside the subplot grid, which tight_layout can't
-    # account for (and warns about) if it already exists.
     fig.tight_layout()
-    if color_by_offset and last_offset_sm is not None:
-        fig.colorbar(last_offset_sm, ax=visible_axes, label="Temporal offset (min)", shrink=0.6)
     return fig
 
 
@@ -2055,143 +1969,7 @@ def plot_residuals(
 
 
 # ---------------------------------------------------------------------------
-# 4a. Temporal offset vs. residual
-# ---------------------------------------------------------------------------
-
-def plot_temporal_offset(
-    collocation_ds,
-    sar_var: str,
-    val_var: str,
-    *,
-    by_source: bool = True,
-    interactive: bool = False,
-    ax=None,
-):
-    """
-    Scatter of |SAR - validation| residual magnitude vs. temporal collocation
-    offset (minutes between the SAR acquisition and the validation
-    observation) — pairs matched further apart in time are expected to agree
-    less well, which helps explain a lower-than-expected correlation
-    coefficient in the scatter plot.
-
-    Parameters
-    ----------
-    collocation_ds : xr.Dataset
-        Step-3 collocations (``collocation_results.nc``).
-    sar_var : str
-        SAR variable name without ``sar_`` prefix.
-    val_var : str
-        Validation variable name without ``val_`` prefix.
-    by_source : bool
-        Colour/marker points by ``val_source``.
-    interactive : bool
-        Return a plotly Figure instead of matplotlib.
-    ax : matplotlib.axes.Axes, optional
-        Axes to draw into (static only).
-
-    Returns
-    -------
-    matplotlib.figure.Figure or plotly.graph_objects.Figure
-    """
-    sar_col = f"sar_{sar_var}"
-    val_col = f"val_{val_var}"
-
-    missing = [c for c in (sar_col, val_col, "temporal_distance_minutes") if c not in collocation_ds]
-    if missing:
-        warnings.warn(f"No valid data for {sar_col} vs {val_col} (missing {missing}).")
-        return None
-
-    _units_for_label = _val_units_for_source(collocation_ds)
-    if _units_for_label is not None:
-        residual_label = f"|{sar_var} − {val_var}| ({_units_for_label})"
-    elif "val_units" in collocation_ds:
-        residual_label = f"|{sar_var} − {val_var}| (units vary by source)"
-    else:
-        val_units = collocation_ds[val_col].attrs.get("units")
-        residual_label = f"|{sar_var} − {val_var}|" + (f" ({val_units})" if val_units else "")
-
-    extra_cols = [c for c in ("val_id", "val_lat", "val_lon") if c in collocation_ds]
-    base_cols = [sar_col, val_col, "val_source", "temporal_distance_minutes"] + extra_cols
-    df_raw = collocation_ds[base_cols].to_dataframe()
-    if "val_time" in collocation_ds.coords:
-        df_raw["val_time"] = collocation_ds["val_time"].values
-    df_raw = df_raw.dropna(subset=[sar_col, val_col, "temporal_distance_minutes"])
-
-    if df_raw.empty:
-        warnings.warn(f"No valid data for {sar_col} vs {val_col}.")
-        return None
-
-    df = _deduplicate_obs(df_raw, sar_col, val_col)
-
-    from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg  # noqa: PLC0415
-
-    if val_var in CIRCULAR_VAL_VARS:
-        residual = circular_diff_deg(df[sar_col].values, df[val_col].values)
-    else:
-        residual = df[sar_col].values - df[val_col].values
-    df["abs_residual"] = np.abs(residual)
-
-    if interactive:
-        _require("plotly")
-        import plotly.express as px  # noqa: PLC0415
-
-        fig = px.scatter(
-            df, x="temporal_distance_minutes", y="abs_residual",
-            color="val_source" if by_source else None,
-            labels={
-                "temporal_distance_minutes": "Temporal offset (min)",
-                "abs_residual": residual_label,
-                "val_source": "Source",
-            },
-            title=f"{residual_label} vs. temporal offset",
-        )
-        return fig
-
-    import matplotlib.pyplot as plt  # noqa: PLC0415
-
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 4))
-    else:
-        fig = ax.get_figure()
-
-    if by_source:
-        sources = sorted(df["val_source"].unique())
-        style = _source_style_map(sources)
-        for src in sources:
-            sub = df[df["val_source"] == src]
-            color, marker = style[src]
-            ax.scatter(sub["temporal_distance_minutes"], sub["abs_residual"],
-                       s=18, alpha=0.6, color=color, marker=marker, label=src,
-                       rasterized=True)
-        ax.legend(fontsize=7, framealpha=0.7)
-    else:
-        ax.scatter(df["temporal_distance_minutes"], df["abs_residual"],
-                   s=18, alpha=0.6, color="#1f77b4", rasterized=True)
-
-    from .statistics import MIN_N_FOR_CORRELATION  # noqa: PLC0415
-
-    n = len(df)
-    if (
-        n >= MIN_N_FOR_CORRELATION
-        and np.std(df["temporal_distance_minutes"].values) > 0 and np.std(df["abs_residual"].values) > 0
-    ):
-        corr = float(np.corrcoef(df["temporal_distance_minutes"].values, df["abs_residual"].values)[0, 1])
-    else:
-        corr = float("nan")
-    ax.text(0.04, 0.96, f"N={n}\nr={corr:.3f}", transform=ax.transAxes,
-            va="top", ha="left", fontsize=8,
-            bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.7))
-
-    ax.set_xlabel("Temporal offset (min)")
-    ax.set_ylabel(residual_label)
-    ax.set_title(f"{sar_var} vs {val_var} — residual magnitude vs. temporal offset")
-    ax.grid(True, linewidth=0.4)
-    fig.tight_layout()
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# 4b. Collocation diagnostics plot
+# 4a. Collocation diagnostics plot
 # ---------------------------------------------------------------------------
 
 #: Target real-world spacing (degrees) between plotted SAR-footprint dots
@@ -3995,34 +3773,6 @@ def validation_report(
             title = f"{sar_var} vs {val_var} — residuals{cdf_matched_suffix}"
             if base_dir is not None:
                 _write_page(title, _finalize_figure_for_report(fig_res, None))
-
-        # Scatter colored by temporal offset, and temporal offset vs.
-        # residual magnitude — both meaningless for soil_moisture, whose
-        # ISMN/satellite values are pre-averaged over a ±12h window around
-        # each SAR overpass (validation_temporal_averaging_minutes /
-        # §8.6-§8.7 in design-choices.md) rather than matched to a single
-        # raw timestamp, so per-pair temporal offset no longer explains
-        # anything about the residual.
-        if variable != "soil_moisture":
-            # Scatter colored by temporal offset — same SAR-vs-validation
-            # comparison as above, but colored by how far apart in time each
-            # pair was matched, to help explain a lower-than-expected r.
-            fig_scatter_offset = plot_scatter(
-                pair_ds, sar_var, val_var, color_by="temporal_offset", force_split=force_split,
-            )
-            if fig_scatter_offset is not None:
-                figs.append(fig_scatter_offset)
-                title = f"{sar_var} vs {val_var} — scatter (colored by temporal offset)"
-                if base_dir is not None:
-                    _write_page(title, _finalize_figure_for_report(fig_scatter_offset, None))
-
-            # Temporal offset vs. residual magnitude
-            fig_offset = plot_temporal_offset(pair_ds, sar_var, val_var)
-            if fig_offset is not None:
-                figs.append(fig_offset)
-                title = f"{sar_var} vs {val_var} — residual vs. temporal offset"
-                if base_dir is not None:
-                    _write_page(title, _finalize_figure_for_report(fig_offset, None))
 
         # Native-units section: same plot functions, applied to the raw
         # (non-rescaled) geo_pair_ds restricted to val_source groups whose
