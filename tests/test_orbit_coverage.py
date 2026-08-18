@@ -242,6 +242,15 @@ class TestPointInPolygon:
         assert orbit_coverage._point_in_polygon(5.0, 15.0, self._SQUARE) is False
         assert orbit_coverage._point_in_polygon(-5.0, 5.0, self._SQUARE) is False
 
+    def test_degenerate_polygon_fails_open(self):
+        """Fewer than 3 vertices isn't a real polygon -- this module's
+        fail-toward-inclusion convention means _point_in_polygon must
+        return True (not raise, not silently misbehave) rather than fail
+        closed, since Plan 3 imports this function directly with no
+        surrounding try/except of its own."""
+        assert orbit_coverage._point_in_polygon(5.0, 5.0, []) is True
+        assert orbit_coverage._point_in_polygon(5.0, 5.0, [(0.0, 0.0), (1.0, 1.0)]) is True
+
     def test_point_near_but_outside_a_corner(self):
         """The specific case this function exists for: a point that
         would pass a bbox-corner check but is outside the true polygon
@@ -383,7 +392,15 @@ class TestOrbitOverlapWindows:
     def test_narrow_window_on_real_ground_track_returns_one_window_matching_input(self, monkeypatch):
         """A window already narrow enough that the whole thing overlaps
         (mirrors TestOrbitOverlapsBbox.test_bbox_on_real_ground_track_overlaps)
-        must return a single window approximately equal to the input."""
+        must return a single window approximately equal to the input.
+
+        Only the sample at EPOCH+90s (lat~5.297, lon~106.611) actually
+        falls in the bbox; with the default sample_interval_s=15.0, the
+        returned window is that single matching sample's timestamp
+        padded by 15s on each side -- EPOCH+75s to EPOCH+105s -- not the
+        raw, un-padded sample timestamp (which would make this a
+        zero-duration window). Pinned via a real run of this exact TLE/
+        bbox/window combination, not a hand derivation."""
         self._patch_tle(monkeypatch)
         start = _METOP_B_TLE_EPOCH + timedelta(seconds=60)
         end = _METOP_B_TLE_EPOCH + timedelta(seconds=120)
@@ -393,10 +410,9 @@ class TestOrbitOverlapWindows:
             min_lon=106.0, max_lon=107.0, min_lat=5.0, max_lat=5.6,
         )
 
-        assert len(windows) == 1
-        w_start, w_end = windows[0]
-        assert start <= w_start <= end
-        assert start <= w_end <= end
+        assert windows == [
+            (_METOP_B_TLE_EPOCH + timedelta(seconds=75), _METOP_B_TLE_EPOCH + timedelta(seconds=105)),
+        ]
 
     def test_no_overlap_anywhere_returns_empty_list(self, monkeypatch):
         self._patch_tle(monkeypatch)
@@ -448,7 +464,15 @@ class TestOrbitOverlapWindows:
         small bbox twice during a longer window must return two disjoint
         sub-windows, not one covering the whole span -- this is
         specifically what orbit_overlap_windows exists to expose over
-        orbit_overlaps_bbox's plain boolean."""
+        orbit_overlaps_bbox's plain boolean.
+
+        Samples land at t=0,30,...,180s. Samples at t=0,30s match (inside
+        the bbox); t=60,90s don't (far away); t=120,150,180s match again.
+        Each padded by sample_interval_s=30s on each side and clamped to
+        [start, end]: first window (0-30s matches) pads to [0-30, 30+30]
+        clamped to [0, 60]; second window (120-180s matches) pads to
+        [120-30, 180+30] clamped to [90, 180]. Pinned via a real run of
+        this exact synthetic scenario, not a hand derivation."""
         self._patch_tle(monkeypatch)
         start = _METOP_B_TLE_EPOCH
         end = _METOP_B_TLE_EPOCH + timedelta(seconds=180)
@@ -479,7 +503,10 @@ class TestOrbitOverlapWindows:
             sample_interval_s=30.0,
         )
 
-        assert len(windows) == 2
+        assert windows == [
+            (start, start + timedelta(seconds=60)),
+            (start + timedelta(seconds=90), end),
+        ]
 
     def test_polygon_excludes_a_point_the_bbox_alone_would_accept(self, monkeypatch):
         """Precision test: a synthetic ground-track sample lands inside
@@ -511,3 +538,37 @@ class TestOrbitOverlapWindows:
 
         assert without_polygon == [(start, end)]
         assert with_polygon == []
+
+    def test_wrap_convention_bbox_with_antimeridian_polygon_matches_correctly(self, monkeypatch):
+        """Pins the CORRECT usage documented in _region_contains's and
+        orbit_overlap_windows's docstrings: when polygon crosses the
+        antimeridian, min_lon/max_lon must use the wrap convention
+        (min_lon > max_lon), NOT a naive min(lons)/max(lons) taken over
+        the polygon's own vertices. Reuses the same wrapping polygon as
+        TestPointInPolygon.test_antimeridian_crossing_polygon (lon 170 to
+        -170, lat 0-10) paired with a bbox given in the wrap convention
+        (min_lon=170.0, max_lon=-170.0). A sample point at lon=175
+        (inside both the wrap-convention bbox and the polygon) must be
+        matched, not silently excluded."""
+
+        def _fake_lonlatalt(self, t):
+            # Constant sub-satellite point at (lat=5.0, lon=175.0) --
+            # east of the seam, inside both the wrap-convention bbox and
+            # the antimeridian-crossing polygon below.
+            return 175.0, 5.0, 800.0
+
+        monkeypatch.setattr("pyorbital.orbital.Orbital.get_lonlatalt", _fake_lonlatalt)
+        monkeypatch.setattr(
+            orbit_coverage, "get_tle", lambda satellite, target_time, cache_dir=None: _METOP_B_TLE,
+        )
+        start = _METOP_B_TLE_EPOCH
+        end = _METOP_B_TLE_EPOCH + timedelta(seconds=15)
+        polygon = [(0.0, 170.0), (0.0, -170.0), (10.0, -170.0), (10.0, 170.0)]
+
+        windows = orbit_coverage.orbit_overlap_windows(
+            "metop-b", start, end,
+            min_lon=170.0, max_lon=-170.0, min_lat=0.0, max_lat=10.0,
+            polygon=polygon,
+        )
+
+        assert windows == [(start, end)]

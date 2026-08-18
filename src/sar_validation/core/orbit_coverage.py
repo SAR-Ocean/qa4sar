@@ -7,6 +7,12 @@ box -- so a downloader with no server-side bbox filter (e.g. H-SAF's FTP
 archive, see hsaf_downloader.py) can skip files whose orbit segment
 never came near the requested region, before downloading them.
 
+Also provides a windowed, polygon-aware variant, orbit_overlap_windows,
+which returns every matching sub-window (instead of a single bool) and
+can test against a true footprint polygon instead of just its bounding
+box -- needed for wide-window sources (e.g. AMSR2's whole-day window)
+where "yes, sometime today" alone isn't useful.
+
 Fails open throughout (returns True -- "could overlap, don't filter this
 file out") whenever prediction isn't possible or trustworthy: an
 unregistered satellite, a TLE that can't be fetched, or any propagation
@@ -148,8 +154,9 @@ SATELLITE_ORBIT_SPECS: Dict[str, SatelliteOrbitSpec] = {
 
 class TleFetchError(Exception):
     """Raised when no usable historical TLE can be obtained for a given
-    satellite/time -- callers (orbit_overlaps_bbox) must treat this as
-    "cannot predict, fail open", never propagate it as a hard error."""
+    satellite/time -- callers (orbit_overlaps_bbox and
+    orbit_overlap_windows) must treat this as "cannot predict, fail
+    open", never propagate it as a hard error."""
 
 
 def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -363,7 +370,17 @@ def _point_in_polygon(lat: float, lon: float, polygon: "list[tuple[float, float]
     genuinely spanning most of the globe, since no real SAR/validation
     footprint is that wide). This runs the ray-casting math in one
     continuous, unwrapped frame instead of jumping across +/-180.
+
+    Fails open (returns True) on degenerate input -- fewer than 3
+    vertices isn't a real polygon, and this module's convention
+    throughout is to fail OPEN (assume overlap) rather than closed
+    whenever something can't be genuinely evaluated. This matters
+    because callers outside this module may call _point_in_polygon
+    directly with no surrounding try/except of their own.
     """
+    if len(polygon) < 3:
+        return True
+
     lons = [v[1] for v in polygon]
     if (max(lons) - min(lons)) > 180.0:
         polygon = [(plat, plon + 360.0 if plon < 0.0 else plon) for plat, plon in polygon]
@@ -490,10 +507,22 @@ def _region_contains(
     min_lon: float, max_lon: float, min_lat: float, max_lat: float,
     polygon: "Optional[list[tuple[float, float]]]",
 ) -> bool:
-    """bbox is always checked first (a cheap O(1) reject, and always a
-    superset of polygon when one is given -- so this never causes a false
-    negative). Only when the bbox check passes is polygon (if supplied)
-    checked too."""
+    """bbox is always checked first (a cheap O(1) reject). Only when the
+    bbox check passes is polygon (if supplied) checked too.
+
+    IMPORTANT: the bbox is a superset of polygon (and so never causes a
+    false negative) ONLY when min_lon/max_lon use the same wrap
+    convention _point_in_bbox/split_antimeridian_bbox require -- i.e.
+    min_lon > max_lon signals a region that crosses the antimeridian.
+    _point_in_polygon detects wrapping completely differently (whether
+    the polygon's OWN vertices span more than 180 degrees of longitude).
+    A bbox derived the "obvious" way -- min(lons), max(lons) taken
+    directly over a wrapping polygon's vertices -- does NOT use the wrap
+    convention and produces the WRONG region: points genuinely inside
+    the polygon can test as outside the AND'd (bbox and polygon) region,
+    a real false negative. Callers passing a polygon that may cross the
+    antimeridian must derive min_lon/max_lon using the wrap convention,
+    not a naive min/max over the polygon's vertices."""
     if not _point_in_bbox(lat, lon, min_lon, max_lon, min_lat, max_lat):
         return False
     if polygon is not None:
@@ -536,6 +565,22 @@ def orbit_overlap_windows(
     single-sample window) -- same fail-open contract as
     orbit_overlaps_bbox, extended to "assume the whole window overlaps"
     since which sub-window can't be known when failing open.
+
+    Each returned window is padded by sample_interval_s on each side
+    (clamped to [sensing_start, sensing_end]) before being returned: the
+    bounds of the matching SAMPLES are not the true underlying crossing,
+    which can begin/end anywhere between two samples, so returning the
+    raw sample timestamps would under-cover the true overlap by up to
+    sample_interval_s at each edge -- the opposite of this module's
+    fail-toward-inclusion principle. Without padding, a single matching
+    sample would even produce a zero-duration window.
+
+    PRECONDITION when passing a polygon that may cross the antimeridian:
+    min_lon/max_lon must use the wrap convention _point_in_bbox and
+    split_antimeridian_bbox require (min_lon > max_lon signals a
+    wrapping region) -- NOT a bbox derived by taking min(lons), max(lons)
+    over the polygon's own vertices. See _region_contains's docstring
+    for why the naive derivation produces false negatives.
     """
     spec = SATELLITE_ORBIT_SPECS.get(satellite)
     if spec is None:
@@ -565,6 +610,7 @@ def orbit_overlap_windows(
             return [(sensing_start, sensing_end)]
 
         max_offset_km = spec.swath_half_width_km + margin_km
+        # Mirrors orbit_overlaps_bbox's sampling/sweep; keep in sync.
         _CROSS_TRACK_STEP_KM = 50.0
         n_steps = max(1, math.ceil(max_offset_km / _CROSS_TRACK_STEP_KM))
         sweep_distances_km = [max_offset_km * (i / n_steps) for i in range(1, n_steps + 1)]
@@ -599,7 +645,9 @@ def orbit_overlap_windows(
             j = i
             while j + 1 < n and matched[j + 1]:
                 j += 1
-            windows.append((samples[i][0], samples[j][0]))
+            window_start = max(sensing_start, samples[i][0] - timedelta(seconds=sample_interval_s))
+            window_end = min(sensing_end, samples[j][0] + timedelta(seconds=sample_interval_s))
+            windows.append((window_start, window_end))
             i = j + 1
         return windows
     except TleFetchError:
