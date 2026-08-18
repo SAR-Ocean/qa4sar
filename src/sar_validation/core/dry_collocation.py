@@ -636,7 +636,7 @@ class CollocationReport:
 #: Populated incrementally by each per-validation-source-type predicate:
 #: maps a source_type string (matching cfg's own recipe source-type keys)
 #: to a predicate function `(source, cfg, sar_footprints) -> SourcePrediction`.
-_PREDICATES: "dict[str, object]" = {}
+_PREDICATES: "dict[str, Callable[..., SourcePrediction]]" = {}
 
 
 def predict_source(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
