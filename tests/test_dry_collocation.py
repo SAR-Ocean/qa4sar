@@ -353,6 +353,37 @@ class TestSearchNisarSme2Dry:
             "NISAR_L3_SME2_PROVISIONAL_V1_granule",
         }
 
+    def test_authenticates_before_searching(self, monkeypatch):
+        """Mirrors EarthdataSoilMoistureDownloader.download()'s own
+        unconditional authenticate_earthdata() call before its
+        per-candidate search loop -- a dry (no-download) search still
+        needs valid NASA Earthdata Login credentials to query CMR, the
+        same way _query_sentinel1_ocn_dry authenticates against CDSE
+        before its own pure catalog query."""
+        from sar_validation.core import dry_collocation
+
+        calls = []
+
+        fake_earthaccess = MagicMock()
+        fake_earthaccess.search_data.side_effect = (
+            lambda **kwargs: calls.append("search") or []
+        )
+        monkeypatch.setitem(sys.modules, "earthaccess", fake_earthaccess)
+
+        from sar_validation.downloaders import base as _base
+
+        monkeypatch.setattr(_base, "authenticate_earthdata", lambda: calls.append("auth"))
+
+        class _FakeCfg:
+            geographic_bounds = SimpleNamespace(min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0)
+            temporal_bounds = SimpleNamespace(start="2026-08-01", end="2026-08-02")
+
+        dry_collocation._search_nisar_sme2_dry(cfg=_FakeCfg())
+
+        # authenticate_earthdata() must run before any search_data() call,
+        # mirroring EarthdataSoilMoistureDownloader.download()'s ordering.
+        assert calls == ["auth", "search", "search"]
+
 
 class TestDiscoverNisarSme2FootprintsDry:
     def test_granule_with_real_polygon_geometry(self, monkeypatch):
@@ -478,3 +509,59 @@ class TestDiscoverNisarSme2FootprintsDry:
         assert len(footprints) == 1
         assert footprints[0].polygon is None
         assert footprints[0].bbox == (-10.0, 10.0, 35.0, 55.0)
+
+    def test_malformed_gpolygons_degrades_to_cfg_bbox_without_aborting_batch(self, monkeypatch):
+        """A granule with GPolygons present but missing the "Boundary"
+        key (or any other malformed-geometry shape) must degrade that one
+        granule to the cfg-bbox fallback, matching
+        _polygon_and_bbox_from_geofootprint's "degrade, don't drop"
+        convention -- not raise and abort discovery for every other
+        granule in the same batch."""
+        from sar_validation.core import dry_collocation
+
+        malformed_granule = {
+            "umm": {
+                "TemporalExtent": {"RangeDateTime": {
+                    "BeginningDateTime": "2026-08-01T06:00:00.000Z",
+                    "EndingDateTime": "2026-08-01T06:05:00.000Z",
+                }},
+                "SpatialExtent": {"HorizontalSpatialDomain": {"Geometry": {
+                    "GPolygons": [{}],  # missing "Boundary"
+                }}},
+            },
+            "meta": {"native-id": "NISAR_L3_PR_SME2_malformed.h5"},
+        }
+        good_granule = {
+            "umm": {
+                "TemporalExtent": {"RangeDateTime": {
+                    "BeginningDateTime": "2026-08-01T07:00:00.000Z",
+                    "EndingDateTime": "2026-08-01T07:05:00.000Z",
+                }},
+                "SpatialExtent": {"HorizontalSpatialDomain": {"Geometry": {
+                    "GPolygons": [{"Boundary": {"Points": [
+                        {"Longitude": -10.0, "Latitude": 35.0},
+                        {"Longitude": 10.0, "Latitude": 35.0},
+                        {"Longitude": 10.0, "Latitude": 55.0},
+                        {"Longitude": -10.0, "Latitude": 55.0},
+                    ]}}]
+                }}},
+            },
+            "meta": {"native-id": "NISAR_L3_PR_SME2_good.h5"},
+        }
+        monkeypatch.setattr(
+            dry_collocation, "_search_nisar_sme2_dry", lambda cfg: [malformed_granule, good_granule],
+        )
+
+        class _FakeCfg:
+            geographic_bounds = SimpleNamespace(min_lon=-20.0, max_lon=20.0, min_lat=30.0, max_lat=60.0)
+
+        footprints = dry_collocation._discover_nisar_sme2_footprints_dry(cfg=_FakeCfg())
+
+        assert len(footprints) == 2
+        malformed_fp = next(fp for fp in footprints if fp.source_file == "NISAR_L3_PR_SME2_malformed.h5")
+        assert malformed_fp.polygon is None
+        assert malformed_fp.bbox == (-20.0, 20.0, 30.0, 60.0)
+
+        good_fp = next(fp for fp in footprints if fp.source_file == "NISAR_L3_PR_SME2_good.h5")
+        assert good_fp.polygon == [(35.0, -10.0), (35.0, 10.0), (55.0, 10.0), (55.0, -10.0)]
+        assert good_fp.bbox == (-10.0, 10.0, 35.0, 55.0)

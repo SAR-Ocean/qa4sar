@@ -316,7 +316,10 @@ def _search_nisar_sme2_dry(cfg) -> "list[dict]":
     partially) in the provisional-only range."""
     import earthaccess
 
+    from ..downloaders.base import authenticate_earthdata
     from .sar_sources import NISAR_SME2_CANDIDATES
+
+    authenticate_earthdata()
 
     bounds = cfg.geographic_bounds
     all_results: "list[dict]" = []
@@ -347,32 +350,40 @@ def _discover_nisar_sme2_footprints_dry(cfg) -> "list[SarFootprint]":
     used throughout this module. Unlike CDSE's optional GeoFootprint,
     CMR's UMM-G schema guarantees every granule carries TemporalExtent
     and SpatialExtent.HorizontalSpatialDomain.Geometry, so those outer
-    lookups are not defensively wrapped -- only the
-    GPolygons-vs-BoundingRectangles choice within Geometry is genuinely
-    either/or and needs the fallback chain."""
+    lookups are not defensively wrapped -- but the
+    GPolygons-vs-BoundingRectangles parsing within Geometry is wrapped in
+    a per-granule try/except, matching
+    _polygon_and_bbox_from_geofootprint's convention: a malformed
+    Geometry (missing "Boundary"/"Points"/coordinate keys) degrades that
+    one granule to the cfg-bbox fallback instead of aborting discovery
+    for the whole batch."""
     footprints = []
     for granule in _search_nisar_sme2_dry(cfg):
         umm = granule["umm"]
         geom = umm["SpatialExtent"]["HorizontalSpatialDomain"]["Geometry"]
-        gpolygons = geom.get("GPolygons")
-        if gpolygons:
-            pts = gpolygons[0]["Boundary"]["Points"]
-            if len(pts) > 1 and (pts[0]["Latitude"], pts[0]["Longitude"]) == (
-                pts[-1]["Latitude"], pts[-1]["Longitude"]
-            ):
-                pts = pts[:-1]
-            polygon = [(p["Latitude"], p["Longitude"]) for p in pts]
-            lons = [p["Longitude"] for p in pts]
-            lats = [p["Latitude"] for p in pts]
-            bbox = (min(lons), max(lons), min(lats), max(lats))
-        elif "BoundingRectangles" in geom:
-            polygon = None
-            rect = geom["BoundingRectangles"][0]
-            bbox = (
-                rect["WestBoundingCoordinate"], rect["EastBoundingCoordinate"],
-                rect["SouthBoundingCoordinate"], rect["NorthBoundingCoordinate"],
-            )
-        else:
+        try:
+            gpolygons = geom.get("GPolygons")
+            if gpolygons:
+                pts = gpolygons[0]["Boundary"]["Points"]
+                if len(pts) > 1 and (pts[0]["Latitude"], pts[0]["Longitude"]) == (
+                    pts[-1]["Latitude"], pts[-1]["Longitude"]
+                ):
+                    pts = pts[:-1]
+                polygon = [(p["Latitude"], p["Longitude"]) for p in pts]
+                lons = [p["Longitude"] for p in pts]
+                lats = [p["Latitude"] for p in pts]
+                bbox = (min(lons), max(lons), min(lats), max(lats))
+            elif "BoundingRectangles" in geom:
+                polygon = None
+                rect = geom["BoundingRectangles"][0]
+                bbox = (
+                    rect["WestBoundingCoordinate"], rect["EastBoundingCoordinate"],
+                    rect["SouthBoundingCoordinate"], rect["NorthBoundingCoordinate"],
+                )
+            else:
+                polygon = None
+                bbox = _fallback_bbox_from_cfg(cfg)
+        except (KeyError, IndexError, TypeError, ValueError):
             polygon = None
             bbox = _fallback_bbox_from_cfg(cfg)
         temporal = umm["TemporalExtent"]["RangeDateTime"]
