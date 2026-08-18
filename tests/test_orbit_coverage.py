@@ -230,6 +230,42 @@ _METOP_B_TLE = (
 _METOP_B_TLE_EPOCH = datetime(2026, 8, 12, 13, 44, 29, 219424)
 
 
+class TestPointInPolygon:
+    # A 10x10 degree square: lat 0-10, lon 0-10.
+    _SQUARE = [(0.0, 0.0), (0.0, 10.0), (10.0, 10.0), (10.0, 0.0)]
+
+    def test_point_inside_simple_square(self):
+        assert orbit_coverage._point_in_polygon(5.0, 5.0, self._SQUARE) is True
+
+    def test_point_outside_simple_square(self):
+        assert orbit_coverage._point_in_polygon(15.0, 15.0, self._SQUARE) is False
+        assert orbit_coverage._point_in_polygon(5.0, 15.0, self._SQUARE) is False
+        assert orbit_coverage._point_in_polygon(-5.0, 5.0, self._SQUARE) is False
+
+    def test_point_near_but_outside_a_corner(self):
+        """The specific case this function exists for: a point that
+        would pass a bbox-corner check but is outside the true polygon
+        shape -- a triangle occupying only half of its own bounding
+        box's square."""
+        triangle = [(0.0, 0.0), (0.0, 10.0), (10.0, 0.0)]  # right triangle
+        # (8, 8) is inside the triangle's bbox (0-10, 0-10) but outside
+        # the triangle itself (above the hypotenuse lat+lon=10).
+        assert orbit_coverage._point_in_polygon(8.0, 8.0, triangle) is False
+        # (2, 2) is inside both the bbox and the triangle.
+        assert orbit_coverage._point_in_polygon(2.0, 2.0, triangle) is True
+
+    def test_antimeridian_crossing_polygon(self):
+        """A footprint spanning the dateline: lon 170 to -170 (a 20-degree
+        span through 180), lat 0-10. Points on both sides of the seam
+        must be recognized as inside; a point nowhere near the seam must
+        not."""
+        polygon = [(0.0, 170.0), (0.0, -170.0), (10.0, -170.0), (10.0, 170.0)]
+        assert orbit_coverage._point_in_polygon(5.0, 175.0, polygon) is True   # east side
+        assert orbit_coverage._point_in_polygon(5.0, -175.0, polygon) is True  # west side
+        assert orbit_coverage._point_in_polygon(5.0, 0.0, polygon) is False    # far away
+        assert orbit_coverage._point_in_polygon(5.0, 90.0, polygon) is False   # far away
+
+
 class TestOrbitOverlapsBbox:
     def _patch_tle(self, monkeypatch):
         monkeypatch.setattr(

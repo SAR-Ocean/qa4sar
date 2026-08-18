@@ -348,6 +348,41 @@ def _point_in_bbox(
     return any(lo <= lon <= hi for lo, hi in split_antimeridian_bbox(min_lon, max_lon))
 
 
+def _point_in_polygon(lat: float, lon: float, polygon: "list[tuple[float, float]]") -> bool:
+    """Standard even-odd ray-casting point-in-polygon test. *polygon* is a
+    list of (lat, lon) vertices; it does not need to be explicitly closed
+    (the last vertex need not repeat the first).
+
+    Antimeridian-crossing polygons (a real case in this codebase -- see
+    the antimeridian-crossing support already in downloaders/base.py's
+    split_antimeridian_bbox) are handled by shifting every negative
+    longitude -- both the polygon's own vertices and the test point -- by
+    +360 degrees first, whenever the polygon's own longitude span exceeds
+    180 degrees (the signal that it wraps through the seam rather than
+    genuinely spanning most of the globe, since no real SAR/validation
+    footprint is that wide). This runs the ray-casting math in one
+    continuous, unwrapped frame instead of jumping across +/-180.
+    """
+    lons = [v[1] for v in polygon]
+    if (max(lons) - min(lons)) > 180.0:
+        polygon = [(plat, plon + 360.0 if plon < 0.0 else plon) for plat, plon in polygon]
+        if lon < 0.0:
+            lon = lon + 360.0
+
+    inside = False
+    n = len(polygon)
+    j = n - 1
+    for i in range(n):
+        lat_i, lon_i = polygon[i]
+        lat_j, lon_j = polygon[j]
+        if (lat_i > lat) != (lat_j > lat):
+            lon_intercept = (lon_j - lon_i) * (lat - lat_i) / (lat_j - lat_i) + lon_i
+            if lon < lon_intercept:
+                inside = not inside
+        j = i
+    return inside
+
+
 def orbit_overlaps_bbox(
     satellite: str,
     sensing_start: datetime,
