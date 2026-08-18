@@ -155,7 +155,11 @@ class TestDiscoverSentinel1WvFootprintsDry:
             dry_collocation, "_query_sentinel1_ocn_dry", lambda cfg: fake_records,
         )
 
-        footprints = dry_collocation._discover_sentinel1_wv_footprints_dry(cfg=object())
+        class _FakeCfg:
+            # Wide enough to keep all 3 synthetic vignette centroids.
+            geographic_bounds = SimpleNamespace(min_lon=0.0, max_lon=20.0, min_lat=0.0, max_lat=30.0)
+
+        footprints = dry_collocation._discover_sentinel1_wv_footprints_dry(cfg=_FakeCfg())
 
         assert len(footprints) == 1
         fp = footprints[0]
@@ -169,6 +173,77 @@ class TestDiscoverSentinel1WvFootprintsDry:
         assert fp.bbox == (10.1, 12.1, 20.1, 22.1)
         assert fp.sensing_start.isoformat().startswith("2026-08-01T06:00:00")
         assert fp.source_file == fake_records[0]["Name"]
+
+    def test_vignettes_outside_recipe_bbox_are_filtered_out(self, monkeypatch):
+        """A WV product's overall catalog envelope only guarantees it
+        touches the recipe's requested bbox -- individual vignettes can
+        still fall well outside it (confirmed live: one real product
+        spanned ~700km along-track, 145 vignettes). Only centroids
+        actually inside cfg.geographic_bounds should survive into
+        points, and bbox must reflect just the survivors, not the full
+        unfiltered set."""
+        from sar_validation.core import dry_collocation
+
+        fake_records = [
+            {
+                "Name": "S1A_WV_OCN__2SSV_20260801T060000_20260801T060200_000000_000000_0000.SAFE",
+                "ContentDate_Start": "2026-08-01T06:00:00.000Z",
+                "ContentDate_End": "2026-08-01T06:02:00.000Z",
+                "GeoFootprint": self._WV_MULTIPOLYGON,
+            },
+        ]
+        monkeypatch.setattr(
+            dry_collocation, "_query_sentinel1_ocn_dry", lambda cfg: fake_records,
+        )
+
+        class _FakeCfg:
+            # Only the first vignette's centroid (20.1, 10.1) falls
+            # inside this bbox; the other two (21.1, 11.1) and
+            # (22.1, 12.1) fall outside it.
+            geographic_bounds = SimpleNamespace(min_lon=9.0, max_lon=10.5, min_lat=19.0, max_lat=20.5)
+
+        footprints = dry_collocation._discover_sentinel1_wv_footprints_dry(cfg=_FakeCfg())
+
+        assert len(footprints) == 1
+        fp = footprints[0]
+        assert fp.kind == "wv_points"
+        assert fp.points == [(20.1, 10.1)]
+        # bbox is the enclosing box over the surviving centroid only, not
+        # the full unfiltered (10.1, 12.1, 20.1, 22.1) envelope.
+        assert fp.bbox == (10.1, 10.1, 20.1, 20.1)
+
+    def test_all_vignettes_outside_recipe_bbox_falls_back_to_empty_points(self, monkeypatch):
+        """When every vignette centroid falls outside cfg.geographic_bounds,
+        the record must still degrade to a valid (empty-points, cfg-bbox)
+        footprint -- the same "not drop this granule" convention already
+        used for a missing/malformed GeoFootprint -- rather than being
+        silently skipped."""
+        from sar_validation.core import dry_collocation
+
+        fake_records = [
+            {
+                "Name": "S1A_WV_OCN__2SSV_20260801T060000_20260801T060200_000000_000000_0000.SAFE",
+                "ContentDate_Start": "2026-08-01T06:00:00.000Z",
+                "ContentDate_End": "2026-08-01T06:02:00.000Z",
+                "GeoFootprint": self._WV_MULTIPOLYGON,
+            },
+        ]
+        monkeypatch.setattr(
+            dry_collocation, "_query_sentinel1_ocn_dry", lambda cfg: fake_records,
+        )
+
+        class _FakeCfg:
+            # None of the 3 synthetic vignette centroids fall inside this
+            # bbox, which is far away from all of them.
+            geographic_bounds = SimpleNamespace(min_lon=-10.0, max_lon=-5.0, min_lat=-10.0, max_lat=-5.0)
+
+        footprints = dry_collocation._discover_sentinel1_wv_footprints_dry(cfg=_FakeCfg())
+
+        assert len(footprints) == 1
+        fp = footprints[0]
+        assert fp.kind == "wv_points"
+        assert fp.points == []
+        assert fp.bbox == (-10.0, -5.0, -10.0, -5.0)
 
     def test_non_wv_granule_is_excluded_from_wv_discovery(self, monkeypatch):
         """Inverse of test_wv_granule_is_excluded_from_non_wv_discovery --
