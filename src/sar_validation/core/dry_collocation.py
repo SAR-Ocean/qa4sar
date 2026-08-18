@@ -36,7 +36,7 @@ from . import orbit_coverage
 from .datatree_converter import DataTreeConverter
 from .orbit_coverage import _point_in_bbox
 
-__all__ = ["SarFootprint"]
+__all__ = ["SarFootprint", "Verdict", "SourcePrediction", "CollocationReport", "predict_source"]
 
 #: Registered Sentinel-1 orbit specs (orbit_coverage.SATELLITE_ORBIT_SPECS)
 #: to try per CLMS SSM tile-day candidate -- a tile could have been
@@ -589,3 +589,64 @@ def sar_footprints_from_downloaded(sar_files, sar_source_spec) -> "list[SarFootp
         f"way _compute_sar_scene_times does; add that dispatch branch here when wiring "
         f"the corresponding source into a later plan."
     )
+
+
+Verdict = Literal["collocated", "none-predicted", "unknown"]
+
+
+@dataclass(frozen=True)
+class SourcePrediction:
+    """The predicted collocation outcome for one configured validation
+    source against the recipe's discovered SAR footprints.
+
+    matched_windows and matched_stations default to empty lists rather
+    than None -- callers can always iterate them without a None check --
+    but a mutable default can't be given directly on a dataclass field,
+    so they're seeded in __post_init__ instead (frozen-safe via
+    object.__setattr__, since normal attribute assignment is blocked on
+    a frozen dataclass)."""
+
+    source_type: str
+    bucket: str
+    verdict: Verdict
+    detail: str
+    message: Optional[str] = None
+    matched_windows: List[Tuple[datetime, datetime]] = None  # type: ignore[assignment]
+    matched_stations: List[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.matched_windows is None:
+            object.__setattr__(self, "matched_windows", [])
+        if self.matched_stations is None:
+            object.__setattr__(self, "matched_stations", [])
+
+
+@dataclass(frozen=True)
+class CollocationReport:
+    """The full dry-collocation result for one recipe: one
+    SourcePrediction per configured validation source, plus the SAR-side
+    footprint count they were all evaluated against."""
+
+    recipe_path: str
+    sar_footprint_count: int
+    predictions: List[SourcePrediction]
+
+
+#: Populated incrementally by each per-validation-source-type predicate:
+#: maps a source_type string (matching cfg's own recipe source-type keys)
+#: to a predicate function `(source, cfg, sar_footprints) -> SourcePrediction`.
+_PREDICATES: "dict[str, object]" = {}
+
+
+def predict_source(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Dispatch to the right bucket's predicate for source.source_type.
+    An unrecognized source_type is itself an "unknown" verdict -- never
+    raises, since the report loop calls this once per configured
+    validation source and must not crash on one bad/future entry."""
+    predicate = _PREDICATES.get(source.source_type)
+    if predicate is None:
+        return SourcePrediction(
+            source_type=source.source_type, bucket="unregistered", verdict="unknown",
+            detail=f"No dry-collocation predicate registered for source_type={source.source_type!r}.",
+        )
+    return predicate(source, cfg, sar_footprints)

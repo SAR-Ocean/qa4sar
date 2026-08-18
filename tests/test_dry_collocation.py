@@ -823,3 +823,21 @@ class TestTopLevelDispatchers:
         )
 
         assert result == [fp]
+
+
+class TestPredictSourceDispatch:
+    def test_unregistered_source_type_returns_unknown_not_an_exception(self):
+        """predict_source must never raise for the caller (Plan 4's
+        report loop iterates every configured source) -- an
+        unrecognized source_type is itself an "unknown" verdict, not a
+        crash."""
+        from sar_validation.core.dry_collocation import predict_source
+
+        class _FakeSource:
+            source_type = "not_a_real_source_type"
+
+        result = predict_source(_FakeSource(), cfg=object(), sar_footprints=[])
+
+        assert result.verdict == "unknown"
+        assert result.source_type == "not_a_real_source_type"
+        assert "not_a_real_source_type" in result.detail
