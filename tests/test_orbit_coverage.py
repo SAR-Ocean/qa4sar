@@ -372,3 +372,142 @@ class TestOrbitOverlapsBbox:
             "metop-b", _METOP_B_TLE_EPOCH, _METOP_B_TLE_EPOCH + timedelta(minutes=3),
             min_lon=0.0, max_lon=1.0, min_lat=0.0, max_lat=1.0,
         ) is True
+
+
+class TestOrbitOverlapWindows:
+    def _patch_tle(self, monkeypatch):
+        monkeypatch.setattr(
+            orbit_coverage, "get_tle", lambda satellite, target_time, cache_dir=None: _METOP_B_TLE,
+        )
+
+    def test_narrow_window_on_real_ground_track_returns_one_window_matching_input(self, monkeypatch):
+        """A window already narrow enough that the whole thing overlaps
+        (mirrors TestOrbitOverlapsBbox.test_bbox_on_real_ground_track_overlaps)
+        must return a single window approximately equal to the input."""
+        self._patch_tle(monkeypatch)
+        start = _METOP_B_TLE_EPOCH + timedelta(seconds=60)
+        end = _METOP_B_TLE_EPOCH + timedelta(seconds=120)
+
+        windows = orbit_coverage.orbit_overlap_windows(
+            "metop-b", start, end,
+            min_lon=106.0, max_lon=107.0, min_lat=5.0, max_lat=5.6,
+        )
+
+        assert len(windows) == 1
+        w_start, w_end = windows[0]
+        assert start <= w_start <= end
+        assert start <= w_end <= end
+
+    def test_no_overlap_anywhere_returns_empty_list(self, monkeypatch):
+        self._patch_tle(monkeypatch)
+        start = _METOP_B_TLE_EPOCH + timedelta(seconds=60)
+        end = _METOP_B_TLE_EPOCH + timedelta(seconds=120)
+
+        windows = orbit_coverage.orbit_overlap_windows(
+            "metop-b", start, end,
+            min_lon=-75.0, max_lon=-72.0, min_lat=-7.0, max_lat=-4.0,
+        )
+
+        assert windows == []
+
+    def test_unregistered_satellite_fails_open_with_whole_window(self):
+        start = _METOP_B_TLE_EPOCH
+        end = _METOP_B_TLE_EPOCH + timedelta(minutes=3)
+
+        windows = orbit_coverage.orbit_overlap_windows(
+            "metop-a", start, end, min_lon=0.0, max_lon=1.0, min_lat=0.0, max_lat=1.0,
+        )
+
+        assert windows == [(start, end)]
+
+    def test_tle_fetch_error_fails_open_with_whole_window(self, monkeypatch):
+        def _raise(*a, **k):
+            raise orbit_coverage.TleFetchError("no TLE available")
+        monkeypatch.setattr(orbit_coverage, "get_tle", _raise)
+        start = _METOP_B_TLE_EPOCH
+        end = _METOP_B_TLE_EPOCH + timedelta(minutes=3)
+
+        windows = orbit_coverage.orbit_overlap_windows(
+            "metop-b", start, end, min_lon=0.0, max_lon=1.0, min_lat=0.0, max_lat=1.0,
+        )
+
+        assert windows == [(start, end)]
+
+    def test_degenerate_zero_duration_window_fails_open_with_whole_window(self, monkeypatch):
+        self._patch_tle(monkeypatch)
+        t = _METOP_B_TLE_EPOCH
+
+        windows = orbit_coverage.orbit_overlap_windows(
+            "metop-b", t, t, min_lon=-170.0, max_lon=-160.0, min_lat=-60.0, max_lat=-50.0,
+        )
+
+        assert windows == [(t, t)]
+
+    def test_whole_day_window_returns_multiple_disjoint_sub_windows(self, monkeypatch):
+        """A synthetic satellite whose ground track sweeps past the same
+        small bbox twice during a longer window must return two disjoint
+        sub-windows, not one covering the whole span -- this is
+        specifically what orbit_overlap_windows exists to expose over
+        orbit_overlaps_bbox's plain boolean."""
+        self._patch_tle(monkeypatch)
+        start = _METOP_B_TLE_EPOCH
+        end = _METOP_B_TLE_EPOCH + timedelta(seconds=180)
+
+        # Real ground track at start+60s..+90s is near (lat~5.3, lon~106.6)
+        # (see TestOrbitOverlapsBbox). Build a synthetic longitude track
+        # via monkeypatch that revisits that neighborhood twice: once
+        # early, once late, with real METOP-B geometry ignored in favor
+        # of a fully controlled synthetic path.
+        visits = [
+            (5.3, 106.6), (5.3, 106.6),   # samples 0-1: inside
+            (20.0, 106.6), (20.0, 106.6), # samples 2-3: far away (outside)
+            (5.3, 106.6), (5.3, 106.6),   # samples 4-5: inside again
+        ]
+
+        def _fake_lonlatalt(self, t):
+            idx = min(
+                int((t - start).total_seconds() // 30), len(visits) - 1,
+            )
+            lat, lon = visits[idx]
+            return lon, lat, 800.0
+
+        monkeypatch.setattr("pyorbital.orbital.Orbital.get_lonlatalt", _fake_lonlatalt)
+
+        windows = orbit_coverage.orbit_overlap_windows(
+            "metop-b", start, end,
+            min_lon=106.0, max_lon=107.0, min_lat=5.0, max_lat=5.6,
+            sample_interval_s=30.0,
+        )
+
+        assert len(windows) == 2
+
+    def test_polygon_excludes_a_point_the_bbox_alone_would_accept(self, monkeypatch):
+        """Precision test: a synthetic ground-track sample lands inside
+        the target bbox but outside a smaller polygon within it -- with
+        polygon=None the bbox alone must match; with polygon supplied,
+        that same sample must be correctly rejected."""
+
+        def _fake_lonlatalt(self, t):
+            # Constant sub-satellite point at (lat=5.0, lon=5.0) for
+            # every sample -- deliberately inside the bbox below but
+            # outside the small polygon below.
+            return 5.0, 5.0, 800.0
+
+        monkeypatch.setattr("pyorbital.orbital.Orbital.get_lonlatalt", _fake_lonlatalt)
+        monkeypatch.setattr(
+            orbit_coverage, "get_tle", lambda satellite, target_time, cache_dir=None: _METOP_B_TLE,
+        )
+        start = _METOP_B_TLE_EPOCH
+        end = _METOP_B_TLE_EPOCH + timedelta(seconds=15)
+        bbox_kwargs = dict(min_lon=0.0, max_lon=10.0, min_lat=0.0, max_lat=10.0)
+        small_polygon = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0)]  # excludes (5, 5)
+
+        without_polygon = orbit_coverage.orbit_overlap_windows(
+            "metop-b", start, end, **bbox_kwargs,
+        )
+        with_polygon = orbit_coverage.orbit_overlap_windows(
+            "metop-b", start, end, **bbox_kwargs, polygon=small_polygon,
+        )
+
+        assert without_polygon == [(start, end)]
+        assert with_polygon == []

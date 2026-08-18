@@ -38,6 +38,7 @@ __all__ = [
     "TleFetchError",
     "get_tle",
     "orbit_overlaps_bbox",
+    "orbit_overlap_windows",
 ]
 
 _EARTH_RADIUS_KM = 6371.0
@@ -482,3 +483,129 @@ def orbit_overlaps_bbox(
             "orbit_overlaps_bbox: propagation failed for %s, failing open.", satellite, exc_info=True,
         )
         return True
+
+
+def _region_contains(
+    lat: float, lon: float,
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    polygon: "Optional[list[tuple[float, float]]]",
+) -> bool:
+    """bbox is always checked first (a cheap O(1) reject, and always a
+    superset of polygon when one is given -- so this never causes a false
+    negative). Only when the bbox check passes is polygon (if supplied)
+    checked too."""
+    if not _point_in_bbox(lat, lon, min_lon, max_lon, min_lat, max_lat):
+        return False
+    if polygon is not None:
+        return _point_in_polygon(lat, lon, polygon)
+    return True
+
+
+def orbit_overlap_windows(
+    satellite: str,
+    sensing_start: datetime,
+    sensing_end: datetime,
+    min_lon: float,
+    max_lon: float,
+    min_lat: float,
+    max_lat: float,
+    polygon: "Optional[list[tuple[float, float]]]" = None,
+    margin_km: float = 100.0,
+    sample_interval_s: float = 15.0,
+    cache_dir: Optional[Path] = None,
+) -> "list[tuple[datetime, datetime]]":
+    """Like orbit_overlaps_bbox, but returns every matching sub-window
+    (grouping consecutive overlapping samples) instead of a single bool,
+    and optionally tests against a true footprint polygon instead of just
+    its bounding box.
+
+    Needed because orbit_overlaps_bbox only answers "did the ground track
+    cross the bbox at *some* point in this window" -- for a source whose
+    window is already narrow (H-SAF's ~3-minute real sensing window,
+    HY-2/Oceansat-3's padded single timestamp), that's equivalent. But
+    AMSR2 (and SMOS, when it falls back to a whole-day window) uses a
+    WHOLE-DAY window, where "yes, sometime today" is true almost always
+    and tells a caller nothing about *when* -- which is exactly what's
+    needed to compare against a SAR scene's own
+    [sensing_start, sensing_end] +/- a time tolerance.
+
+    Empty list if no sample crosses the target region (equivalent to
+    orbit_overlaps_bbox returning False); the whole window as a
+    single-element list on any fail-open condition (unregistered
+    satellite, TleFetchError, propagation exception, or a degenerate
+    single-sample window) -- same fail-open contract as
+    orbit_overlaps_bbox, extended to "assume the whole window overlaps"
+    since which sub-window can't be known when failing open.
+    """
+    spec = SATELLITE_ORBIT_SPECS.get(satellite)
+    if spec is None:
+        return [(sensing_start, sensing_end)]
+
+    try:
+        from pyorbital.orbital import Orbital
+
+        line1, line2 = get_tle(satellite, sensing_start, cache_dir=cache_dir)
+        orb = Orbital(satellite.upper(), line1=line1, line2=line2)
+
+        samples = []
+        t = sensing_start
+        step = timedelta(seconds=sample_interval_s)
+        while t <= sensing_end:
+            lon, lat, _alt = orb.get_lonlatalt(t)
+            samples.append((t, lat, lon))
+            t = t + step
+        if not samples or samples[-1][0] < sensing_end:
+            lon, lat, _alt = orb.get_lonlatalt(sensing_end)
+            samples.append((sensing_end, lat, lon))
+
+        if len(samples) < 2:
+            # Degenerate window -- no adjacent sample to derive a heading
+            # from, matching orbit_overlaps_bbox's fail-open behavior for
+            # this same case.
+            return [(sensing_start, sensing_end)]
+
+        max_offset_km = spec.swath_half_width_km + margin_km
+        _CROSS_TRACK_STEP_KM = 50.0
+        n_steps = max(1, math.ceil(max_offset_km / _CROSS_TRACK_STEP_KM))
+        sweep_distances_km = [max_offset_km * (i / n_steps) for i in range(1, n_steps + 1)]
+
+        matched = [False] * len(samples)
+        for i, (_t, lat, lon) in enumerate(samples):
+            if _region_contains(lat, lon, min_lon, max_lon, min_lat, max_lat, polygon):
+                matched[i] = True
+                continue
+            if i + 1 < len(samples):
+                _next_t, next_lat, next_lon = samples[i + 1]
+                heading = _bearing_deg(lat, lon, next_lat, next_lon)
+            else:
+                _prev_t, prev_lat, prev_lon = samples[i - 1]
+                heading = _bearing_deg(prev_lat, prev_lon, lat, lon)
+            for side_bearing in (heading + 90.0, heading - 90.0):
+                for dist in sweep_distances_km:
+                    swept_lat, swept_lon = _destination_point(lat, lon, side_bearing, dist)
+                    if _region_contains(swept_lat, swept_lon, min_lon, max_lon, min_lat, max_lat, polygon):
+                        matched[i] = True
+                        break
+                if matched[i]:
+                    break
+
+        windows: "list[tuple[datetime, datetime]]" = []
+        i = 0
+        n = len(samples)
+        while i < n:
+            if not matched[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < n and matched[j + 1]:
+                j += 1
+            windows.append((samples[i][0], samples[j][0]))
+            i = j + 1
+        return windows
+    except TleFetchError:
+        return [(sensing_start, sensing_end)]
+    except Exception:
+        logger.debug(
+            "orbit_overlap_windows: propagation failed for %s, failing open.", satellite, exc_info=True,
+        )
+        return [(sensing_start, sensing_end)]
