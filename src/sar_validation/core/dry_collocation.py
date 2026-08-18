@@ -691,11 +691,15 @@ def _bbox_overlaps_footprint(
     extent) overlaps footprint -- a coarser area-vs-area check than
     _point_in_footprint's point-vs-shape test, for ground sources whose
     real unit is itself an area (a radar grid region), not a point
-    (a station). For kind="polygon" with a real polygon, this tests bbox
-    corner/edge overlap against the polygon; for bbox-only footprints
-    (RADARSAT-2, orbit_swath, or wv_points' own enclosing box), this
-    degrades to a plain bbox-vs-bbox intersection test -- always a safe
-    over-approximation, consistent with this module's fail-toward-
-    inclusion principle throughout."""
+    (a station). Always a plain bbox-vs-bbox intersection test against
+    footprint.bbox, regardless of kind -- including kind="polygon",
+    where footprint.bbox is a superset of the real polygon, so this can
+    only over-predict overlap, never miss a real one (the same
+    fail-toward-inclusion property every bbox check in this module has).
+    It does not add precision beyond the coarse bbox pass for
+    kind="polygon" footprints specifically -- callers that need that
+    precision for a single point should use _point_in_footprint instead;
+    this function exists for area-shaped ground sources, where a
+    per-point check doesn't apply."""
     f_min_lon, f_max_lon, f_min_lat, f_max_lat = footprint.bbox
     return not (max_lon < f_min_lon or min_lon > f_max_lon or max_lat < f_min_lat or min_lat > f_max_lat)
