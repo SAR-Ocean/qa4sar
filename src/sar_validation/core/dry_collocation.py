@@ -33,6 +33,7 @@ from ..downloaders.base import (
     split_antimeridian_bbox,
 )
 from . import orbit_coverage
+from .collocation import _haversine_distance
 from .datatree_converter import DataTreeConverter
 from .orbit_coverage import _point_in_bbox
 
@@ -650,3 +651,51 @@ def predict_source(source, cfg, sar_footprints: "list[SarFootprint]") -> SourceP
             detail=f"No dry-collocation predicate registered for source_type={source.source_type!r}.",
         )
     return predicate(source, cfg, sar_footprints)
+
+
+def _point_in_footprint(
+    lat: float, lon: float, footprint: "SarFootprint", wv_search_radius_km: float = 14.0,
+) -> bool:
+    """Whether (lat, lon) falls inside footprint's real shape -- not just
+    its bbox. kind="polygon": real point-in-polygon via
+    orbit_coverage._point_in_polygon when a polygon is available (the
+    same helper the orbit-corridor bucket's fine refinement uses -- one
+    implementation, not two), falling back to the bbox check when
+    polygon is None (RADARSAT-2). kind="wv_points": within
+    wv_search_radius_km of any vignette point -- a coarser,
+    distance-based check since a vignette is a small area, not a single
+    point boundary; callers with a real recipe should pass
+    cfg.collocation.sar_footprint_radius_km rather than relying on this
+    default. kind="orbit_swath": bbox only, since that kind's own
+    geometry is already an approximation with nothing more precise to
+    test against."""
+    if footprint.kind == "polygon":
+        if footprint.polygon is not None:
+            return orbit_coverage._point_in_polygon(lat, lon, footprint.polygon)
+        return _point_in_bbox(lat, lon, footprint.bbox[0], footprint.bbox[1], footprint.bbox[2], footprint.bbox[3])
+    if footprint.kind == "wv_points":
+        if not footprint.points:
+            return False
+        for vlat, vlon in footprint.points:
+            if _haversine_distance(lon, lat, vlon, vlat) <= wv_search_radius_km:
+                return True
+        return False
+    # kind == "orbit_swath"
+    return _point_in_bbox(lat, lon, footprint.bbox[0], footprint.bbox[1], footprint.bbox[2], footprint.bbox[3])
+
+
+def _bbox_overlaps_footprint(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, footprint: "SarFootprint",
+) -> bool:
+    """Whether the given bbox (e.g. an HF-radar region's own coverage
+    extent) overlaps footprint -- a coarser area-vs-area check than
+    _point_in_footprint's point-vs-shape test, for ground sources whose
+    real unit is itself an area (a radar grid region), not a point
+    (a station). For kind="polygon" with a real polygon, this tests bbox
+    corner/edge overlap against the polygon; for bbox-only footprints
+    (RADARSAT-2, orbit_swath, or wv_points' own enclosing box), this
+    degrades to a plain bbox-vs-bbox intersection test -- always a safe
+    over-approximation, consistent with this module's fail-toward-
+    inclusion principle throughout."""
+    f_min_lon, f_max_lon, f_min_lat, f_max_lat = footprint.bbox
+    return not (max_lon < f_min_lon or min_lon > f_max_lon or max_lat < f_min_lat or min_lat > f_max_lat)

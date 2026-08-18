@@ -841,3 +841,67 @@ class TestPredictSourceDispatch:
         assert result.verdict == "unknown"
         assert result.source_type == "not_a_real_source_type"
         assert "not_a_real_source_type" in result.detail
+
+
+class TestPointInFootprint:
+    def test_polygon_kind_uses_real_point_in_polygon(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0),
+            polygon=[(35.0, -10.0), (35.0, 10.0), (55.0, 10.0), (55.0, -10.0)],
+            points=None, sensing_start=datetime(2026, 8, 1), sensing_end=datetime(2026, 8, 1),
+            source_file="s1.SAFE",
+        )
+        # A point inside the bbox but outside a smaller real polygon would
+        # be wrongly accepted by a bbox-only check -- prove the real
+        # orbit_coverage._point_in_polygon is actually being called by
+        # monkeypatching it to force a "no" and confirming the result
+        # follows it, not the bbox.
+        monkeypatch.setattr(dry_collocation.orbit_coverage, "_point_in_polygon", lambda lat, lon, polygon: False)
+
+        assert dry_collocation._point_in_footprint(45.0, 0.0, footprint) is False
+
+    def test_wv_points_kind_uses_vignette_search_radius(self):
+        from sar_validation.core.dry_collocation import SarFootprint, _point_in_footprint
+
+        footprint = SarFootprint(
+            kind="wv_points", bbox=(-1.0, 1.0, -1.0, 1.0), polygon=None,
+            points=[(0.0, 0.0)], sensing_start=datetime(2026, 8, 1), sensing_end=datetime(2026, 8, 1),
+            source_file="wv.SAFE",
+        )
+        # Within the ~20km vignette radius of (0,0).
+        assert _point_in_footprint(0.05, 0.05, footprint) is True
+        # Far outside any vignette's radius.
+        assert _point_in_footprint(10.0, 10.0, footprint) is False
+
+    def test_orbit_swath_kind_falls_back_to_bbox(self):
+        from sar_validation.core.dry_collocation import SarFootprint, _point_in_footprint
+
+        footprint = SarFootprint(
+            kind="orbit_swath", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1), sensing_end=datetime(2026, 8, 1), source_file="ssm.tif",
+        )
+        assert _point_in_footprint(45.0, 0.0, footprint) is True
+        assert _point_in_footprint(0.0, 0.0, footprint) is False
+
+
+class TestBboxOverlapsFootprint:
+    def test_overlapping_bbox_returns_true(self):
+        from sar_validation.core.dry_collocation import SarFootprint, _bbox_overlaps_footprint
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1), sensing_end=datetime(2026, 8, 1), source_file="s1.SAFE",
+        )
+        assert _bbox_overlaps_footprint(5.0, 15.0, 40.0, 50.0, footprint) is True
+
+    def test_disjoint_bbox_returns_false(self):
+        from sar_validation.core.dry_collocation import SarFootprint, _bbox_overlaps_footprint
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1), sensing_end=datetime(2026, 8, 1), source_file="s1.SAFE",
+        )
+        assert _bbox_overlaps_footprint(50.0, 60.0, 0.0, 10.0, footprint) is False
