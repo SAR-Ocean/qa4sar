@@ -299,3 +299,24 @@ class TestDiscoverSentinel1WvFootprintsDry:
         assert footprints[0].polygon is None
         assert footprints[0].points == []
         assert footprints[0].bbox == (-10.0, 10.0, 35.0, 55.0)
+
+
+class TestDiscoverRadarsat2FootprintsDry:
+    def test_granule_becomes_bbox_only_polygon_footprint(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        fake_candidates = [
+            ("RS2_OK1234_PK5678_DK9012_SCWA_20260801_060000_HH_SGF.nc", datetime(2026, 8, 1, 6, 0, 0)),
+        ]
+        monkeypatch.setattr(dry_collocation, "_list_radarsat2_candidates_dry", lambda cfg: fake_candidates)
+        monkeypatch.setattr(
+            dry_collocation, "_radarsat2_ncml_bbox", lambda url_path: (-70.0, -60.0, 40.0, 50.0),
+        )
+
+        footprints = dry_collocation._discover_radarsat2_footprints_dry(cfg=object())
+
+        assert len(footprints) == 1
+        fp = footprints[0]
+        assert fp.kind == "polygon"
+        assert fp.polygon is None
+        assert fp.bbox == (-70.0, -60.0, 40.0, 50.0)

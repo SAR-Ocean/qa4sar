@@ -14,11 +14,20 @@ This module is built up across four sequential implementation plans:
 from __future__ import annotations
 
 import re
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, List, Literal, Optional, Tuple
 
-from ..downloaders.base import CopernicusODataClient, authenticate_cdse
+from ..downloaders import radarsat2_wind_downloader as _rs2
+from ..downloaders.base import (
+    CopernicusODataClient,
+    authenticate_cdse,
+    months_touched,
+    normalize_datetime,
+    prefer_ipv4_dns,
+)
 from .orbit_coverage import _point_in_bbox
 
 __all__ = ["SarFootprint"]
@@ -207,6 +216,92 @@ def _discover_sentinel1_wv_footprints_dry(cfg) -> "list[SarFootprint]":
                 sensing_start=datetime.fromisoformat(record["ContentDate_Start"].replace("Z", "+00:00")),
                 sensing_end=datetime.fromisoformat(record["ContentDate_End"].replace("Z", "+00:00")),
                 source_file=record["Name"],
+            )
+        )
+    return footprints
+
+
+def _list_radarsat2_candidates_dry(cfg) -> "list[tuple[str, datetime]]":
+    """(url_path, sensing_time) pairs for every RADARSAT-2 candidate in
+    cfg's window, via the same THREDDS catalog.xml listing
+    radarsat2_wind_downloader.py's real download() already does --
+    filename-embedded center point only, no NCML fetch yet. Mirrors
+    RADARSAT2WindDownloader._download_window's month-loop exactly (one
+    catalog.xml fetch per touched (year, month), 404 == "no catalog for
+    this month, skip", any other HTTP error re-raised).
+
+    Unlike RADARSAT2WindDownloader.download(), this does not pre-split
+    an antimeridian-crossing bbox via split_antimeridian_bbox -- Task
+    3's sibling _query_sentinel1_ocn_dry doesn't replicate that kind of
+    request-splitting either (CDSE's own query_products handles it), so
+    this keeps the same pattern here for consistency. A caller with a
+    genuinely antimeridian-crossing cfg.geographic_bounds would need
+    _list_radarsat2_granules's own bbox handling to cope; that helper
+    accepts min_lon > max_lon only via the padded-wraparound check in
+    _lon_within_padded_bbox, not a general antimeridian split -- a
+    known simplification of this dry-search path."""
+    bounds = cfg.geographic_bounds
+    start_dt = datetime.fromisoformat(normalize_datetime(cfg.temporal_bounds.start))
+    end_dt = datetime.fromisoformat(normalize_datetime(cfg.temporal_bounds.end))
+
+    candidates: "list[tuple[str, datetime]]" = []
+    for year, month in months_touched(start_dt, end_dt):
+        catalog_url = f"{_rs2.THREDDS_BASE}/catalog/sar-winds/radarsat2/{year}/{month:02d}/catalog.xml"
+        try:
+            with prefer_ipv4_dns(), urllib.request.urlopen(catalog_url, timeout=15) as resp:
+                text = resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                continue
+            raise
+        for ts, url_path, _lon, _lat in _rs2._list_radarsat2_granules(
+            text, start_dt, end_dt,
+            bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat,
+        ):
+            candidates.append((url_path, ts))
+    return candidates
+
+
+def _radarsat2_ncml_bbox(url_path: str) -> "Optional[tuple[float, float, float, float]]":
+    """(min_lon, max_lon, min_lat, max_lat) from the granule's NCML
+    metadata, or None if unavailable -- fetches the NCML document
+    exactly as RADARSAT2WindDownloader._passes_ncml_check already does
+    (same URL template, same prefer_ipv4_dns() + urlopen call shape),
+    then delegates the parse to radarsat2_wind_downloader._parse_ncml_bbox.
+    Unlike _passes_ncml_check, this never fails open to True/False -- it
+    has no requested bbox to compare against here, it just reports what
+    the metadata says (or None on any fetch/parse failure), leaving the
+    "fall back to the recipe's own bbox" decision to the caller."""
+    try:
+        with prefer_ipv4_dns(), urllib.request.urlopen(
+            f"{_rs2.THREDDS_BASE}/ncml/{url_path}", timeout=15
+        ) as resp:
+            text = resp.read().decode()
+    except urllib.error.URLError:
+        # Covers HTTPError too (it subclasses URLError).
+        return None
+    return _rs2._parse_ncml_bbox(text)
+
+
+def _discover_radarsat2_footprints_dry(cfg) -> "list[SarFootprint]":
+    """RADARSAT-2 footprints from a dry THREDDS/NCML search. polygon is
+    always None -- RADARSAT-2's NCML metadata only exposes a bounding
+    box (geospatial_lon_min/max, geospatial_lat_min/max), never real
+    vertices, unlike CDSE's GeoFootprint (see this plan's correction
+    note at the top of this document). Falls back to the recipe's own
+    requested bbox (cfg.geographic_bounds) when a candidate's NCML bbox
+    is unavailable -- cfg is only consulted for that fallback lazily,
+    mirroring _polygon_and_bbox_from_geofootprint's fallback_bbox_fn
+    convention elsewhere in this module, since cfg need not carry
+    geographic_bounds at all when every candidate's NCML check succeeds."""
+    footprints = []
+    for url_path, sensing_time in _list_radarsat2_candidates_dry(cfg):
+        bbox = _radarsat2_ncml_bbox(url_path) or _fallback_bbox_from_cfg(cfg)
+        footprints.append(
+            SarFootprint(
+                kind="polygon", bbox=bbox, polygon=None, points=None,
+                sensing_start=sensing_time, sensing_end=sensing_time,
+                source_file=url_path,
             )
         )
     return footprints
