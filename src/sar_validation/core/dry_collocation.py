@@ -73,10 +73,8 @@ def _query_sentinel1_ocn_dry(cfg) -> "list[dict]":
 def _fallback_bbox_from_cfg(cfg) -> "tuple[float, float, float, float]":
     """The recipe's own requested bbox, used as the conservative
     fallback when a CDSE record's GeoFootprint is missing/malformed.
-    Accepts either a full RecipeConfig (bbox nested under
-    .geographic_bounds) or a bounds-like object exposing
-    min_lon/max_lon/min_lat/max_lat directly."""
-    bounds = getattr(cfg, "geographic_bounds", cfg)
+    cfg is a full RecipeConfig (bbox nested under .geographic_bounds)."""
+    bounds = cfg.geographic_bounds
     return (bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat)
 
 

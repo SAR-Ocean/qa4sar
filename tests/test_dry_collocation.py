@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -112,7 +113,7 @@ class TestDiscoverSentinel1OcnFootprintsDry:
         )
 
         class _FakeCfg:
-            min_lon, max_lon, min_lat, max_lat = -10.0, 10.0, 35.0, 55.0
+            geographic_bounds = SimpleNamespace(min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0)
 
         footprints = dry_collocation._discover_sentinel1_ocn_footprints_dry(cfg=_FakeCfg())
 
