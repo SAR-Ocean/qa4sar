@@ -107,6 +107,90 @@ def _polygon_and_bbox_from_geofootprint(
         return None, fallback_bbox_fn()
 
 
+def _vignette_points_and_bbox_from_geofootprint(
+    geofootprint: "Optional[dict]", fallback_bbox_fn: "Callable[[], tuple[float, float, float, float]]",
+) -> "tuple[list[tuple[float, float]], tuple[float, float, float, float]]":
+    """(points, bbox) from a CDSE WV-mode GeoFootprint. CONFIRMED LIVE
+    2026-08-18 (curl against the real CDSE OData API): CDSE catalogs an
+    entire WV pass as ONE product, not one vignette per catalog entry --
+    GeoFootprint's type is "MultiPolygon" and its "coordinates" list
+    already holds one small ~20-30km quad ring per vignette (125-145 per
+    product in three live samples inspected), directly in the catalog
+    search response. No manifest.safe fetch via CDSE's
+    /Products({id})/Nodes(...) endpoint is needed.
+
+    Each ring's centroid becomes one point: the mean of its deduped
+    unique [lon, lat] vertices (GeoJSON rings repeat their first vertex
+    to close the loop, so that trailing duplicate is dropped first --
+    mirroring _polygon_and_bbox_from_geofootprint's convention). bbox is
+    the enclosing box over all vignette centroids (not over the raw
+    vertices), since points -- not polygon -- is what a wv_points
+    footprint is compared against downstream.
+
+    Falls back to ([], fallback_bbox_fn()) when geofootprint is
+    missing/malformed or contains zero usable vignette rings -- never
+    raises, since a missing/broken footprint must degrade to "less
+    precise" (an empty points list is still a valid wv_points footprint),
+    not "drop this granule"."""
+    if not geofootprint or geofootprint.get("type") != "MultiPolygon":
+        return [], fallback_bbox_fn()
+    try:
+        points: "list[tuple[float, float]]" = []
+        for polygon_entry in geofootprint["coordinates"]:
+            ring = polygon_entry
+            # A MultiPolygon's coordinates nest one "list of rings" level
+            # per polygon; descend until we reach a flat list of [lon,
+            # lat] positions, so both a bare ring and a
+            # fully-GeoJSON-nested single-ring polygon are handled.
+            while ring and not (
+                isinstance(ring[0], (list, tuple)) and len(ring[0]) == 2 and isinstance(ring[0][0], (int, float))
+            ):
+                ring = ring[0]
+            vertices = ring[:-1] if len(ring) > 1 and ring[0] == ring[-1] else ring
+            if not vertices:
+                continue
+            lons = [v[0] for v in vertices]
+            lats = [v[1] for v in vertices]
+            points.append((sum(lats) / len(lats), sum(lons) / len(lons)))
+        if not points:
+            return [], fallback_bbox_fn()
+        centroid_lons = [lon for _lat, lon in points]
+        centroid_lats = [lat for lat, _lon in points]
+        bbox = (min(centroid_lons), max(centroid_lons), min(centroid_lats), max(centroid_lats))
+        return points, bbox
+    except (KeyError, IndexError, TypeError, ValueError):
+        return [], fallback_bbox_fn()
+
+
+def _discover_sentinel1_wv_footprints_dry(cfg) -> "list[SarFootprint]":
+    """WV-mode Sentinel-1 footprints from a dry CDSE catalog search --
+    see _vignette_points_and_bbox_from_geofootprint for the confirmed-live
+    finding that CDSE catalogs an entire WV pass (many vignettes) as one
+    product, with per-vignette geometry already in the catalog response.
+    Non-WV granules are excluded here -- see
+    _discover_sentinel1_ocn_footprints_dry (Task 3)."""
+    records = _query_sentinel1_ocn_dry(cfg)
+    footprints = []
+    for record in records:
+        if not _WV_MODE_RE.match(record["Name"]):
+            continue
+        points, bbox = _vignette_points_and_bbox_from_geofootprint(
+            record.get("GeoFootprint"), lambda: _fallback_bbox_from_cfg(cfg),
+        )
+        footprints.append(
+            SarFootprint(
+                kind="wv_points",
+                bbox=bbox,
+                polygon=None,
+                points=points,
+                sensing_start=datetime.fromisoformat(record["ContentDate_Start"].replace("Z", "+00:00")),
+                sensing_end=datetime.fromisoformat(record["ContentDate_End"].replace("Z", "+00:00")),
+                source_file=record["Name"],
+            )
+        )
+    return footprints
+
+
 def _discover_sentinel1_ocn_footprints_dry(cfg) -> "list[SarFootprint]":
     """Non-WV (IW/EW/SM) Sentinel-1 OCN footprints from a dry CDSE
     catalog search. WV-mode granules are excluded here -- see
