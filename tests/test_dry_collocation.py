@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -320,3 +322,164 @@ class TestDiscoverRadarsat2FootprintsDry:
         assert fp.kind == "polygon"
         assert fp.polygon is None
         assert fp.bbox == (-70.0, -60.0, 40.0, 50.0)
+
+
+class TestSearchNisarSme2Dry:
+    def test_both_candidates_searched_and_merged(self, monkeypatch):
+        """NISAR SME2's underlying CMR collection changed mid-mission with
+        no temporal overlap between its beta and provisional
+        product-maturity levels (sar_sources.NISAR_SME2_CANDIDATES) --
+        _search_nisar_sme2_dry must query BOTH candidates and merge their
+        results, not just the first. Verified here by returning different
+        fake granules keyed off the short_name kwarg earthaccess.search_data
+        is called with."""
+        from sar_validation.core import dry_collocation
+
+        fake_earthaccess = MagicMock()
+        fake_earthaccess.search_data.side_effect = (
+            lambda short_name, version, bounding_box, temporal: [
+                {"meta": {"native-id": f"{short_name}_granule"}}
+            ]
+        )
+
+        class _FakeCfg:
+            geographic_bounds = SimpleNamespace(min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0)
+            temporal_bounds = SimpleNamespace(start="2026-08-01", end="2026-08-02")
+
+        monkeypatch.setitem(sys.modules, "earthaccess", fake_earthaccess)
+
+        results = dry_collocation._search_nisar_sme2_dry(cfg=_FakeCfg())
+
+        assert fake_earthaccess.search_data.call_count == 2
+        native_ids = {r["meta"]["native-id"] for r in results}
+        assert native_ids == {
+            "NISAR_L3_SME2_BETA_V1_granule",
+            "NISAR_L3_SME2_PROVISIONAL_V1_granule",
+        }
+
+
+class TestDiscoverNisarSme2FootprintsDry:
+    def test_granule_with_real_polygon_geometry(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        fake_granule = {
+            "umm": {
+                "TemporalExtent": {"RangeDateTime": {
+                    "BeginningDateTime": "2026-08-01T06:00:00.000Z",
+                    "EndingDateTime": "2026-08-01T06:05:00.000Z",
+                }},
+                "SpatialExtent": {"HorizontalSpatialDomain": {"Geometry": {
+                    "GPolygons": [{"Boundary": {"Points": [
+                        {"Longitude": -10.0, "Latitude": 35.0},
+                        {"Longitude": 10.0, "Latitude": 35.0},
+                        {"Longitude": 10.0, "Latitude": 55.0},
+                        {"Longitude": -10.0, "Latitude": 55.0},
+                    ]}}]
+                }}},
+            },
+            "meta": {"native-id": "NISAR_L3_PR_SME2_003_005_A_014_..._001.h5"},
+        }
+        monkeypatch.setattr(dry_collocation, "_search_nisar_sme2_dry", lambda cfg: [fake_granule])
+
+        footprints = dry_collocation._discover_nisar_sme2_footprints_dry(cfg=object())
+
+        assert len(footprints) == 1
+        fp = footprints[0]
+        assert fp.kind == "polygon"
+        assert fp.polygon == [(35.0, -10.0), (35.0, 10.0), (55.0, 10.0), (55.0, -10.0)]
+        assert fp.bbox == (-10.0, 10.0, 35.0, 55.0)
+        assert fp.sensing_start.isoformat().startswith("2026-08-01T06:00:00")
+        assert fp.source_file == fake_granule["meta"]["native-id"]
+
+    def test_closed_ring_drops_repeated_closing_vertex(self, monkeypatch):
+        """CONFIRMED LIVE 2026-08-18 against NASA's real CMR catalog:
+        NISAR SME2's real GPolygons repeat their first vertex to close the
+        ring, exactly like CDSE's GeoFootprint (Task 3). That trailing
+        duplicate must be dropped so SarFootprint.polygon holds one entry
+        per distinct vertex, mirroring
+        _polygon_and_bbox_from_geofootprint's convention."""
+        from sar_validation.core import dry_collocation
+
+        fake_granule = {
+            "umm": {
+                "TemporalExtent": {"RangeDateTime": {
+                    "BeginningDateTime": "2026-08-01T06:00:00.000Z",
+                    "EndingDateTime": "2026-08-01T06:05:00.000Z",
+                }},
+                "SpatialExtent": {"HorizontalSpatialDomain": {"Geometry": {
+                    "GPolygons": [{"Boundary": {"Points": [
+                        {"Latitude": 22.79518, "Longitude": -109.6084},
+                        {"Latitude": 24.10005, "Longitude": -109.97092},
+                        {"Latitude": 23.50525, "Longitude": -112.38056},
+                        {"Latitude": 22.20781, "Longitude": -111.99627},
+                        {"Latitude": 22.79518, "Longitude": -109.6084},
+                    ]}}]
+                }}},
+            },
+            "meta": {"native-id": "NISAR_L3_PR_SME2_real_granule.h5"},
+        }
+        monkeypatch.setattr(dry_collocation, "_search_nisar_sme2_dry", lambda cfg: [fake_granule])
+
+        footprints = dry_collocation._discover_nisar_sme2_footprints_dry(cfg=object())
+
+        assert len(footprints) == 1
+        assert footprints[0].polygon is not None and len(footprints[0].polygon) == 4
+
+    def test_missing_gpolygons_falls_back_to_bounding_rectangle(self, monkeypatch):
+        """Defensive fallback: a granule whose Geometry has no GPolygons
+        (a different/future NISAR collection, or an edge case) must still
+        produce a usable bbox-only footprint from BoundingRectangles,
+        rather than being dropped."""
+        from sar_validation.core import dry_collocation
+
+        fake_granule = {
+            "umm": {
+                "TemporalExtent": {"RangeDateTime": {
+                    "BeginningDateTime": "2026-08-01T06:00:00.000Z",
+                    "EndingDateTime": "2026-08-01T06:05:00.000Z",
+                }},
+                "SpatialExtent": {"HorizontalSpatialDomain": {"Geometry": {
+                    "BoundingRectangles": [{
+                        "WestBoundingCoordinate": -10.0,
+                        "EastBoundingCoordinate": 10.0,
+                        "SouthBoundingCoordinate": 35.0,
+                        "NorthBoundingCoordinate": 55.0,
+                    }]
+                }}},
+            },
+            "meta": {"native-id": "NISAR_L3_PR_SME2_bbox_only.h5"},
+        }
+        monkeypatch.setattr(dry_collocation, "_search_nisar_sme2_dry", lambda cfg: [fake_granule])
+
+        footprints = dry_collocation._discover_nisar_sme2_footprints_dry(cfg=object())
+
+        assert len(footprints) == 1
+        assert footprints[0].polygon is None
+        assert footprints[0].bbox == (-10.0, 10.0, 35.0, 55.0)
+
+    def test_missing_geometry_falls_back_to_cfg_bbox(self, monkeypatch):
+        """When a granule has neither GPolygons nor BoundingRectangles,
+        fall back to the recipe's own requested bbox -- the same
+        "degrade, don't drop" convention used for Sentinel-1/RADARSAT-2."""
+        from sar_validation.core import dry_collocation
+
+        fake_granule = {
+            "umm": {
+                "TemporalExtent": {"RangeDateTime": {
+                    "BeginningDateTime": "2026-08-01T06:00:00.000Z",
+                    "EndingDateTime": "2026-08-01T06:05:00.000Z",
+                }},
+                "SpatialExtent": {"HorizontalSpatialDomain": {"Geometry": {}}},
+            },
+            "meta": {"native-id": "NISAR_L3_PR_SME2_no_geometry.h5"},
+        }
+        monkeypatch.setattr(dry_collocation, "_search_nisar_sme2_dry", lambda cfg: [fake_granule])
+
+        class _FakeCfg:
+            geographic_bounds = SimpleNamespace(min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0)
+
+        footprints = dry_collocation._discover_nisar_sme2_footprints_dry(cfg=_FakeCfg())
+
+        assert len(footprints) == 1
+        assert footprints[0].polygon is None
+        assert footprints[0].bbox == (-10.0, 10.0, 35.0, 55.0)

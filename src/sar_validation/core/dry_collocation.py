@@ -307,6 +307,97 @@ def _discover_radarsat2_footprints_dry(cfg) -> "list[SarFootprint]":
     return footprints
 
 
+def _search_nisar_sme2_dry(cfg) -> "list[dict]":
+    """earthaccess/CMR granule search for NISAR SME2, no download --
+    searches BOTH (short_name, version) candidates in
+    sar_sources.NISAR_SME2_CANDIDATES and merges their results, mirroring
+    EarthdataSoilMoistureDownloader.download()'s own per-candidate search
+    loop (earthdata_soil_moisture_downloader.py). NISAR SME2's underlying
+    CMR collection changed mid-mission with no temporal overlap between its
+    beta and provisional product-maturity levels (see sar_sources.py's own
+    comment on NISAR_SME2_CANDIDATES) -- searching only the first candidate
+    would silently miss real granules whenever cfg's window falls (even
+    partially) in the provisional-only range."""
+    import earthaccess
+
+    from .sar_sources import NISAR_SME2_CANDIDATES
+
+    bounds = cfg.geographic_bounds
+    all_results: "list[dict]" = []
+    for short_name, version in NISAR_SME2_CANDIDATES:
+        all_results.extend(
+            earthaccess.search_data(
+                short_name=short_name,
+                version=version,
+                bounding_box=(bounds.min_lon, bounds.min_lat, bounds.max_lon, bounds.max_lat),
+                temporal=(cfg.temporal_bounds.start, cfg.temporal_bounds.end),
+            )
+        )
+    return all_results
+
+
+def _discover_nisar_sme2_footprints_dry(cfg) -> "list[SarFootprint]":
+    """NISAR SME2 footprints from a dry earthaccess/CMR search across both
+    beta/provisional candidates -- see _search_nisar_sme2_dry.
+
+    CONFIRMED LIVE 2026-08-18 (real query against
+    https://cmr.earthdata.nasa.gov/search/granules.umm_json?short_name=NISAR_L3_SME2_BETA_V1&version=1):
+    this collection's granules DO publish GPolygons with real vertex
+    geometry (unlike RADARSAT-2's NCML, Task 5, which is bbox-only), so
+    that path is the primary one here, mirroring Task 3's
+    _polygon_and_bbox_from_geofootprint convention of dropping a ring's
+    repeated closing vertex when present (CMR's own GPolygons close their
+    ring the same way GeoJSON does -- confirmed in the same live sample).
+    A BoundingRectangles-only fallback is still kept for defensiveness (a
+    different/future NISAR collection, or an edge-case granule, might lack
+    GPolygons), with the recipe's own requested bbox as the final
+    fallback for that tier -- the same "degrade, don't drop" convention
+    used throughout this module. Unlike CDSE's optional GeoFootprint
+    (Task 3/4), CMR's UMM-G schema guarantees every granule carries
+    TemporalExtent and SpatialExtent.HorizontalSpatialDomain.Geometry, so
+    those outer lookups are not defensively wrapped -- only the
+    GPolygons-vs-BoundingRectangles choice within Geometry is genuinely
+    either/or and needs the fallback chain."""
+    footprints = []
+    for granule in _search_nisar_sme2_dry(cfg):
+        umm = granule["umm"]
+        geom = umm["SpatialExtent"]["HorizontalSpatialDomain"]["Geometry"]
+        gpolygons = geom.get("GPolygons")
+        if gpolygons:
+            pts = gpolygons[0]["Boundary"]["Points"]
+            if len(pts) > 1 and (pts[0]["Latitude"], pts[0]["Longitude"]) == (
+                pts[-1]["Latitude"], pts[-1]["Longitude"]
+            ):
+                pts = pts[:-1]
+            polygon = [(p["Latitude"], p["Longitude"]) for p in pts]
+            lons = [p["Longitude"] for p in pts]
+            lats = [p["Latitude"] for p in pts]
+            bbox = (min(lons), max(lons), min(lats), max(lats))
+        elif "BoundingRectangles" in geom:
+            polygon = None
+            rect = geom["BoundingRectangles"][0]
+            bbox = (
+                rect["WestBoundingCoordinate"], rect["EastBoundingCoordinate"],
+                rect["SouthBoundingCoordinate"], rect["NorthBoundingCoordinate"],
+            )
+        else:
+            polygon = None
+            bbox = _fallback_bbox_from_cfg(cfg)
+        temporal = umm["TemporalExtent"]["RangeDateTime"]
+        footprints.append(
+            SarFootprint(
+                kind="polygon",
+                bbox=bbox,
+                polygon=polygon,
+                points=None,
+                sensing_start=datetime.fromisoformat(temporal["BeginningDateTime"].replace("Z", "+00:00")),
+                sensing_end=datetime.fromisoformat(temporal["EndingDateTime"].replace("Z", "+00:00")),
+                source_file=granule["meta"]["native-id"],
+            )
+        )
+    return footprints
+
+
 def _discover_sentinel1_ocn_footprints_dry(cfg) -> "list[SarFootprint]":
     """Non-WV (IW/EW/SM) Sentinel-1 OCN footprints from a dry CDSE
     catalog search. WV-mode granules are excluded here -- see
