@@ -1043,6 +1043,117 @@ class TestOrbitCorridorPredicate:
         assert result.verdict == "unknown"
 
 
+class TestCatalogPrecisePredicate:
+    """_predict_catalog_precise_source resolves its time tolerance via
+    _resolve_temporal_padding_minutes(cfg, source_type) -- same
+    convention as _predict_orbit_corridor_source (see
+    TestOrbitCorridorPredicate) -- so every test here mocks that
+    resolver rather than relying on a fake cfg shape."""
+
+    def test_collocated_when_a_footprint_yields_any_candidate(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        def _fake_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            return [("granule_x", datetime(2026, 8, 1, 6, 0, 0), datetime(2026, 8, 1, 6, 5, 0))]
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_catalog_precise_source(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            list_candidates_dry=_fake_list_candidates_dry, source_type="scatterometer",
+        )
+
+        assert result.verdict == "collocated"
+        assert result.bucket == "catalog-precise"
+
+    def test_none_predicted_when_no_footprint_yields_any_candidate(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        def _fake_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            return []
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_catalog_precise_source(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            list_candidates_dry=_fake_list_candidates_dry, source_type="scatterometer",
+        )
+
+        assert result.verdict == "none-predicted"
+
+    def test_wv_points_queried_individually_not_batched(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        call_count = {"n": 0}
+
+        def _fake_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            call_count["n"] += 1
+            return []
+
+        footprint = SarFootprint(
+            kind="wv_points", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None,
+            points=[(40.0, 0.0), (41.0, 1.0)],
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="wv.SAFE",
+        )
+
+        dry_collocation._predict_catalog_precise_source(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            list_candidates_dry=_fake_list_candidates_dry, source_type="scatterometer",
+        )
+
+        assert call_count["n"] == 2  # one query per vignette
+
+    def test_no_footprints_is_unknown(self):
+        from sar_validation.core import dry_collocation
+
+        result = dry_collocation._predict_catalog_precise_source(
+            source=object(), cfg=object(), sar_footprints=[],
+            list_candidates_dry=lambda *a, **k: [], source_type="scatterometer",
+        )
+
+        assert result.verdict == "unknown"
+
+    def test_listing_failure_is_unknown_not_none_predicted(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        def _raising_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            raise RuntimeError("network error")
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_catalog_precise_source(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            list_candidates_dry=_raising_list_candidates_dry, source_type="scatterometer",
+        )
+
+        assert result.verdict == "unknown"
+
+
 class TestPredictAscatSsm:
     def test_footprint_before_cutoff_only_checked_via_eumdac(self, monkeypatch):
         from sar_validation.core import dry_collocation
@@ -1266,6 +1377,251 @@ class TestPredictSmosSsm:
         from sar_validation.core import dry_collocation
 
         assert dry_collocation._PREDICATES["smos_ssm"] is dry_collocation._predict_smos_ssm
+
+
+class TestPredictCatalogPreciseSources:
+    """predict_source integration test per newly registered
+    catalog-precise source_type -- exercises the real _PREDICATES
+    dispatch, not _predict_catalog_precise_source directly."""
+
+    @pytest.mark.parametrize(
+        "source_type,list_candidates_dry_name",
+        [
+            pytest.param("scatterometer", "_scatterometer_list_candidates_dry", id="scatterometer"),
+            pytest.param("smap_ssm", "_smap_ssm_list_candidates_dry", id="smap_ssm"),
+            pytest.param("altimeter", "_altimeter_list_candidates_dry", id="altimeter"),
+        ],
+    )
+    def test_collocated_via_predict_source(self, monkeypatch, source_type, list_candidates_dry_name):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint, predict_source
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        def _fake_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            return [("fake_candidate", datetime(2026, 8, 1, 6, 0, 0), datetime(2026, 8, 1, 6, 3, 0))]
+
+        monkeypatch.setattr(dry_collocation, list_candidates_dry_name, _fake_list_candidates_dry)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = predict_source(
+            SimpleNamespace(source_type=source_type), cfg=object(), sar_footprints=[footprint],
+        )
+
+        assert result.verdict == "collocated"
+        assert result.bucket == "catalog-precise"
+        assert result.source_type == source_type
+
+    @pytest.mark.parametrize("source_type", ["scatterometer", "smap_ssm", "altimeter"])
+    def test_registered_under_own_source_type(self, source_type):
+        from sar_validation.core import dry_collocation
+
+        predicate = dry_collocation._PREDICATES[source_type]
+        assert predicate is getattr(dry_collocation, f"_predict_{source_type}")
+
+
+class TestPredictAmsrSsm:
+    """Combined predicate for source_type='amsr_ssm': NASA Earthdata/CMR
+    (catalog-precise) checked first, JAXA G-Portal SFTP (orbit-corridor)
+    a real second source. Unlike ascat_ssm there is no date-based
+    eligibility split -- both branches apply to every footprint, every
+    time (see _predict_amsr_ssm's own docstring)."""
+
+    def test_collocated_when_only_earthdata_branch_finds_something(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        def _fake_catalog_precise(source, cfg, sar_footprints, *, list_candidates_dry, source_type):
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="catalog-precise", verdict="collocated", detail="earthdata ok",
+            )
+
+        def _fake_orbit_corridor(source, cfg, sar_footprints, *, satellite_resolver, list_candidates_dry, source_type):
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="orbit-corridor", verdict="none-predicted", detail="gportal empty",
+            )
+
+        monkeypatch.setattr(dry_collocation, "_predict_catalog_precise_source", _fake_catalog_precise)
+        monkeypatch.setattr(dry_collocation, "_predict_orbit_corridor_source", _fake_orbit_corridor)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_amsr_ssm(source=object(), cfg=object(), sar_footprints=[footprint])
+
+        assert result.verdict == "collocated"
+        assert result.bucket == "catalog-precise"
+
+    def test_collocated_when_only_gportal_branch_finds_something(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        def _fake_catalog_precise(source, cfg, sar_footprints, *, list_candidates_dry, source_type):
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="catalog-precise", verdict="none-predicted", detail="earthdata empty",
+            )
+
+        def _fake_orbit_corridor(source, cfg, sar_footprints, *, satellite_resolver, list_candidates_dry, source_type):
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="orbit-corridor", verdict="collocated", detail="gportal ok",
+            )
+
+        monkeypatch.setattr(dry_collocation, "_predict_catalog_precise_source", _fake_catalog_precise)
+        monkeypatch.setattr(dry_collocation, "_predict_orbit_corridor_source", _fake_orbit_corridor)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_amsr_ssm(source=object(), cfg=object(), sar_footprints=[footprint])
+
+        assert result.verdict == "collocated"
+
+    def test_collocated_when_both_branches_find_something(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        def _fake_catalog_precise(source, cfg, sar_footprints, *, list_candidates_dry, source_type):
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="catalog-precise", verdict="collocated", detail="earthdata ok",
+            )
+
+        def _fake_orbit_corridor(source, cfg, sar_footprints, *, satellite_resolver, list_candidates_dry, source_type):
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="orbit-corridor", verdict="collocated", detail="gportal ok",
+            )
+
+        monkeypatch.setattr(dry_collocation, "_predict_catalog_precise_source", _fake_catalog_precise)
+        monkeypatch.setattr(dry_collocation, "_predict_orbit_corridor_source", _fake_orbit_corridor)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_amsr_ssm(source=object(), cfg=object(), sar_footprints=[footprint])
+
+        assert result.verdict == "collocated"
+
+    def test_none_predicted_only_when_both_branches_find_nothing(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        def _fake_catalog_precise(source, cfg, sar_footprints, *, list_candidates_dry, source_type):
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="catalog-precise", verdict="none-predicted", detail="earthdata empty",
+            )
+
+        def _fake_orbit_corridor(source, cfg, sar_footprints, *, satellite_resolver, list_candidates_dry, source_type):
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="orbit-corridor", verdict="none-predicted", detail="gportal empty",
+            )
+
+        monkeypatch.setattr(dry_collocation, "_predict_catalog_precise_source", _fake_catalog_precise)
+        monkeypatch.setattr(dry_collocation, "_predict_orbit_corridor_source", _fake_orbit_corridor)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_amsr_ssm(source=object(), cfg=object(), sar_footprints=[footprint])
+
+        assert result.verdict == "none-predicted"
+
+    def test_unknown_propagates_even_if_other_branch_is_none_predicted(self, monkeypatch):
+        """An 'unknown' verdict from either branch must never be silently
+        downgraded to 'none-predicted' just because the other branch
+        answered confidently -- fail toward inclusion."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        def _fake_catalog_precise(source, cfg, sar_footprints, *, list_candidates_dry, source_type):
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="catalog-precise", verdict="unknown", detail="earthdata listing failed",
+            )
+
+        def _fake_orbit_corridor(source, cfg, sar_footprints, *, satellite_resolver, list_candidates_dry, source_type):
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="orbit-corridor", verdict="none-predicted", detail="gportal empty",
+            )
+
+        monkeypatch.setattr(dry_collocation, "_predict_catalog_precise_source", _fake_catalog_precise)
+        monkeypatch.setattr(dry_collocation, "_predict_orbit_corridor_source", _fake_orbit_corridor)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_amsr_ssm(source=object(), cfg=object(), sar_footprints=[footprint])
+
+        assert result.verdict == "unknown"
+
+    def test_registered_under_amsr_ssm_source_type(self):
+        from sar_validation.core import dry_collocation
+
+        assert dry_collocation._PREDICATES["amsr_ssm"] is dry_collocation._predict_amsr_ssm
+
+
+class TestEarthdataAmsrSsmListCandidatesDryDatasetSelection:
+    """_earthdata_amsr_ssm_list_candidates_dry must pick the same CMR
+    dataset orchestrator.py's _download_amsr_ssm would pick for this
+    call's own window end -- NSIDC-0451 on/before the cutoff, AU_Land
+    after."""
+
+    def test_picks_nsidc_0451_on_or_before_cutoff(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        seen_datasets = []
+
+        class _FakeDownloader:
+            def __init__(self, dataset, output_dir):
+                seen_datasets.append(dataset)
+
+            def list_candidates_dry(self, *a, **k):
+                return []
+
+        monkeypatch.setattr(dry_collocation, "EarthdataSoilMoistureDownloader", _FakeDownloader)
+
+        dry_collocation._earthdata_amsr_ssm_list_candidates_dry(
+            -10.0, 10.0, 35.0, 55.0, "2023-01-01T00:00:00", "2023-12-31T06:00:00",
+        )
+
+        assert seen_datasets == ["NSIDC-0451"]
+
+    def test_picks_au_land_after_cutoff(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        seen_datasets = []
+
+        class _FakeDownloader:
+            def __init__(self, dataset, output_dir):
+                seen_datasets.append(dataset)
+
+            def list_candidates_dry(self, *a, **k):
+                return []
+
+        monkeypatch.setattr(dry_collocation, "EarthdataSoilMoistureDownloader", _FakeDownloader)
+
+        dry_collocation._earthdata_amsr_ssm_list_candidates_dry(
+            -10.0, 10.0, 35.0, 55.0, "2026-01-01T00:00:00", "2026-08-01T06:00:00",
+        )
+
+        assert seen_datasets == ["AU_Land"]
 
 
 class TestBboxOverlapsFootprint:

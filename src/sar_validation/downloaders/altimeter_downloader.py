@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -108,6 +109,84 @@ class AltimeterDownloader:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
         self.force_download = force_download
+
+    def list_candidates_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+        frequencies: Iterable[str] = VALID_FREQUENCIES,
+        satellites: Optional[list[str]] = None,
+    ) -> "list[tuple[str, datetime, datetime]]":
+        """(dataset_id, sensing_start, sensing_end) for every
+        satellite/frequency combination that has real along-track data in
+        [start, end] over the given bbox.
+
+        Opens each candidate dataset lazily via
+        ``copernicusmarine.open_dataset()`` (server-side bbox/time
+        filtered, no local download) instead of ``subset()``'s
+        download-to-disk call, then reports the actual min/max sensing
+        time found in the resulting "time" coordinate. A dataset/window
+        combination that raises (no matching data at all -- an
+        out-of-bounds bbox/time selection can raise rather than return an
+        empty dataset) or comes back with an empty "time" coordinate is
+        silently skipped, so one satellite/frequency having no data never
+        aborts the others -- mirroring download()'s own "no data in this
+        region/time window" handling of the same case.
+        """
+        import copernicusmarine
+        import pandas as pd
+
+        start_dt = normalize_datetime(start)
+        end_dt = normalize_datetime(end)
+
+        frequencies = [f.lower() for f in frequencies]
+        candidates: "list[tuple[str, datetime, datetime]]" = []
+
+        for freq in frequencies:
+            if freq not in VALID_FREQUENCIES:
+                continue
+            avail_start = AVAILABILITY_START[freq]
+            if end_dt < avail_start:
+                continue
+            eff_start_dt = max(start_dt, avail_start)
+
+            sat_map = _satellite_map(freq)
+            if satellites:
+                requested = {s.lower() for s in satellites}
+                sat_codes = [s for s in sat_map if s in requested]
+            else:
+                sat_codes = list(sat_map)
+
+            variables = VARIABLES[freq]
+            template = DATASET_ID_TEMPLATE[freq]
+
+            for sat_code in sat_codes:
+                dataset_id = template.format(sat=sat_code)
+                for win_min_lon, win_max_lon in split_antimeridian_bbox(min_lon, max_lon):
+                    try:
+                        ds = copernicusmarine.open_dataset(
+                            dataset_id=dataset_id,
+                            variables=variables,
+                            minimum_longitude=win_min_lon,
+                            maximum_longitude=win_max_lon,
+                            minimum_latitude=min_lat,
+                            maximum_latitude=max_lat,
+                            start_datetime=eff_start_dt,
+                            end_datetime=end_dt,
+                        )
+                    except Exception:
+                        continue
+                    if "time" not in ds.sizes or ds.sizes["time"] == 0:
+                        continue
+                    time_values = ds["time"].values
+                    t_min = pd.Timestamp(time_values.min()).to_pydatetime()
+                    t_max = pd.Timestamp(time_values.max()).to_pydatetime()
+                    candidates.append((dataset_id, t_min, t_max))
+        return candidates
 
     def download(
         self,

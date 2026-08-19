@@ -383,6 +383,140 @@ class TestGPortalAMSR2DownloaderDiscovery:
         assert "01M" not in downloaded[0].name
 
 
+class TestGPortalAMSR2DownloaderListCandidatesDry:
+    """list_candidates_dry, added for the dry-collocation predictor --
+    same SFTP directory-discovery + date-matching logic
+    _download_from_product_directory uses, without the orbit prefilter
+    and without ever calling sftp.get."""
+
+    def _mock_sftp(self, listing_by_path: "dict[str, list[str]]"):
+        sftp = MagicMock()
+        sftp.listdir.side_effect = lambda path: listing_by_path.get(path, [])
+        return sftp
+
+    def test_returns_matches_without_downloading(self, tmp_path):
+        listing = {
+            "standard": ["GCOM-W"],
+            "standard/GCOM-W": ["GCOM-W.AMSR2"],
+            "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2026"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026": ["07"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/07": [
+                "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",
+                "GW1AM2_20260702_01D_EQMA_L3SGSMCLQ_2210.h5",
+            ],
+        }
+        sftp = self._mock_sftp(listing)
+
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
+             patch("socket.create_connection", return_value=MagicMock()):
+            mock_transport_cls.return_value = MagicMock()
+            candidates = dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        sftp.get.assert_not_called()
+        assert len(candidates) == 2
+        names = {name for name, _start, _end in candidates}
+        assert names == {
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/07/GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/07/GW1AM2_20260702_01D_EQMA_L3SGSMCLQ_2210.h5",
+        }
+
+    def test_sensing_window_is_the_whole_utc_day(self, tmp_path):
+        """Filenames only embed a date, not a time-of-day -- each match's
+        sensing window must be the whole UTC day, mirroring
+        _filter_by_orbit_overlap's own whole-day construction."""
+        listing = {
+            "standard": ["GCOM-W"],
+            "standard/GCOM-W": ["GCOM-W.AMSR2"],
+            "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2026"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026": ["07"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/07": [
+                "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",
+            ],
+        }
+        sftp = self._mock_sftp(listing)
+
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
+             patch("socket.create_connection", return_value=MagicMock()):
+            mock_transport_cls.return_value = MagicMock()
+            candidates = dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        assert len(candidates) == 1
+        _name, day_start, day_end = candidates[0]
+        assert day_start == datetime(2026, 7, 1, 0, 0, 0, tzinfo=timezone.utc)
+        assert day_end == datetime(2026, 7, 1, 23, 59, 59, tzinfo=timezone.utc)
+
+    def test_monthly_composite_file_excluded(self, tmp_path):
+        listing = {
+            "standard": ["GCOM-W"],
+            "standard/GCOM-W": ["GCOM-W.AMSR2"],
+            "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["3300300"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/3300300": ["2026"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/3300300/2026": ["07"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/3300300/2026/07": [
+                "GW1AM2_20260700_01M_EQMA_L3SGSMCHF3300300.h5",  # monthly composite
+                "GW1AM2_20260701_01D_EQMA_L3SGSMCHF3300300.h5",  # real daily granule
+            ],
+        }
+        sftp = self._mock_sftp(listing)
+
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
+             patch("socket.create_connection", return_value=MagicMock()):
+            mock_transport_cls.return_value = MagicMock()
+            candidates = dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-06-25", end="2026-07-02",
+            )
+
+        assert len(candidates) == 1
+        assert "01D" in candidates[0][0]
+
+    def test_never_prompts_interactively_even_when_allow_prompt_defaults_true(self, tmp_path, monkeypatch):
+        """Unlike download() (which honors self._allow_prompt, defaulting
+        to True for direct/CLI use), list_candidates_dry is a prediction
+        call that must never block on an interactive password prompt --
+        it always authenticates with allow_prompt=False."""
+        monkeypatch.delenv("GPORTAL_USERNAME", raising=False)
+        monkeypatch.delenv("GPORTAL_PASSWORD", raising=False)
+
+        dl = GPortalAMSR2Downloader(output_dir=tmp_path)  # allow_prompt defaults True
+
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch(
+                 "sar_validation.downloaders.base._resolve_from_keyring_or_legacy_file",
+                 return_value=(None, None),
+             ):
+            with pytest.raises(RuntimeError):
+                dl.list_candidates_dry(
+                    min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                    start="2026-07-01", end="2026-07-02",
+                )
+
+        mock_transport_cls.assert_not_called()  # never even attempted a connection
+
+
 class TestGPortalAMSR2DownloaderForceDownload:
     def test_skips_already_downloaded_file(self, tmp_path):
         listing = {

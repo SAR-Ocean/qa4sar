@@ -44,6 +44,7 @@ import json
 import shutil
 import sys
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -88,6 +89,40 @@ class ScatterometerDownloader:
         if self._token is None:
             self._token = authenticate_eumdac(self._username, self._password)
         return self._token
+
+    def list_candidates_dry(
+        self, min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+    ) -> "list[tuple[str, datetime, datetime]]":
+        """(product_id, sensing_start, sensing_end) for every EUMDAC
+        OSI-104 product download() would find in [start, end] -- the
+        same collection.search() call, deduplicated and satellite-filtered
+        the same way, without fetching any product. This is a real
+        network/authentication call (not a dry_run shortcut, same as
+        download() itself), mirroring
+        ascat_soil_moisture_downloader.ASCATSoilMoistureDownloader.list_candidates_dry.
+        """
+        import eumdac
+
+        token = self._get_token()
+        datastore = eumdac.DataStore(token)
+        collection = datastore.get_collection(COLLECTION_ID)
+
+        start_dt = normalize_datetime(start)
+        end_dt = normalize_datetime(end)
+
+        seen_ids: set[str] = set()
+        candidates: "list[tuple[str, datetime, datetime]]" = []
+        for lo, hi in split_antimeridian_bbox(min_lon, max_lon):
+            bbox = f"{lo},{min_lat},{hi},{max_lat}"
+            for product in collection.search(bbox=bbox, dtstart=start_dt, dtend=end_dt):
+                key = str(product)
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+                if not any(sat in key.lower() for sat in SATELLITES):
+                    continue
+                candidates.append((key, product.sensing_start, product.sensing_end))
+        return candidates
 
     def download(
         self,

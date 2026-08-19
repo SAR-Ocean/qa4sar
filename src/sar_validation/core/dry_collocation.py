@@ -25,6 +25,7 @@ from typing import Callable, List, Literal, Optional, Tuple
 import pandas as pd
 
 from ..downloaders import radarsat2_wind_downloader as _rs2
+from ..downloaders.altimeter_downloader import AltimeterDownloader
 from ..downloaders.ascat_soil_moisture_downloader import ASCATSoilMoistureDownloader
 from ..downloaders.base import (
     CopernicusODataClient,
@@ -34,8 +35,10 @@ from ..downloaders.base import (
     prefer_ipv4_dns,
     split_antimeridian_bbox,
 )
+from ..downloaders.earthdata_soil_moisture_downloader import EarthdataSoilMoistureDownloader
 from ..downloaders.hsaf_downloader import HSAFDownloader
 from ..downloaders.hsaf_downloader import _parse_satellite as _hsaf_parse_satellite
+from ..downloaders.scatterometer_downloader import ScatterometerDownloader
 from ..downloaders.scatterometer_ftp_downloader import ScatterometerFTPDownloader
 from ..downloaders.smos_downloader import SMOSDownloader
 from . import orbit_coverage
@@ -813,6 +816,69 @@ def _predict_orbit_corridor_source(
     )
 
 
+def _predict_catalog_precise_source(
+    source,
+    cfg,
+    sar_footprints: "list[SarFootprint]",
+    *,
+    list_candidates_dry: "Callable[..., list[tuple[str, datetime, datetime]]]",
+    source_type: str,
+) -> SourcePrediction:
+    """Shared predicate for every catalog-precise-bucket source (ASCAT
+    winds, SMAP/AMSR2 via NASA Earthdata/CMR, altimeter via Copernicus
+    Marine): the coarse listing IS the geometrically-precise answer,
+    since these sources already run a real bbox-filtered server-side
+    catalog search -- unlike the orbit-corridor bucket, no fine
+    refinement against a predicted orbit swath is needed or performed.
+
+    A wv_points footprint is queried per-vignette (one bbox-filtered
+    listing call per point, matching that vignette's own tiny extent),
+    never against one enclosing box, mirroring
+    _predict_orbit_corridor_source's identical per-vignette handling.
+    """
+    if not sar_footprints:
+        return SourcePrediction(
+            source_type=source_type, bucket="catalog-precise", verdict="unknown",
+            detail="No SAR footprints supplied -- cannot predict.",
+        )
+
+    tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, source_type))
+    matched_windows: "list[tuple[datetime, datetime]]" = []
+
+    for footprint in sar_footprints:
+        padded_start = footprint.sensing_start - tolerance
+        padded_end = footprint.sensing_end + tolerance
+        points: "list[Optional[tuple[float, float]]]" = (
+            list(footprint.points or []) if footprint.kind == "wv_points" else [None]
+        )
+        for point in points:
+            bbox = footprint.bbox if point is None else (point[1], point[1], point[0], point[0])
+            try:
+                candidates = list_candidates_dry(
+                    bbox[0], bbox[1], bbox[2], bbox[3],
+                    padded_start.isoformat(), padded_end.isoformat(),
+                )
+            except Exception:
+                logger.debug("_predict_catalog_precise_source: listing failed", exc_info=True)
+                return SourcePrediction(
+                    source_type=source_type, bucket="catalog-precise", verdict="unknown",
+                    detail=f"Candidate listing failed for {source_type}.",
+                )
+            for _name, cand_start, cand_end in candidates:
+                matched_windows.append((cand_start, cand_end))
+
+    if matched_windows:
+        return SourcePrediction(
+            source_type=source_type, bucket="catalog-precise", verdict="collocated",
+            detail=f"{len(matched_windows)} candidate(s) across {len(sar_footprints)} SAR footprint(s).",
+            matched_windows=matched_windows,
+        )
+    return SourcePrediction(
+        source_type=source_type, bucket="catalog-precise", verdict="none-predicted",
+        detail=f"No candidates found across {len(sar_footprints)} SAR footprint(s).",
+    )
+
+
 def _hsaf_list_candidates_dry(
     min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
 ) -> "list[tuple[str, datetime, datetime]]":
@@ -1039,3 +1105,171 @@ def _predict_smos_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> Sour
 
 
 _PREDICATES["smos_ssm"] = _predict_smos_ssm
+
+
+def _scatterometer_list_candidates_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> "list[tuple[str, datetime, datetime]]":
+    """Thin wrapper: constructs a ScatterometerDownloader (EUMDAC OSI-104
+    ASCAT winds) and calls its list_candidates_dry. output_dir is never
+    written to by list_candidates_dry, so a harmless placeholder is safe
+    here."""
+    dl = ScatterometerDownloader(output_dir=Path("/dev/null"))
+    return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _predict_scatterometer(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Catalog-precise predicate for source_type="scatterometer" (ASCAT
+    winds via EUMDAC) -- EUMDAC's own collection.search(bbox=...) is
+    already a real geometrically-precise server-side query."""
+    return _predict_catalog_precise_source(
+        source, cfg, sar_footprints,
+        list_candidates_dry=_scatterometer_list_candidates_dry,
+        source_type="scatterometer",
+    )
+
+
+_PREDICATES["scatterometer"] = _predict_scatterometer
+
+
+def _smap_ssm_list_candidates_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> "list[tuple[str, datetime, datetime]]":
+    """Thin wrapper: constructs an EarthdataSoilMoistureDownloader for
+    SMAP's SPL2SMP_E dataset (matching orchestrator.py's
+    _download_smap_ssm) and calls its list_candidates_dry."""
+    dl = EarthdataSoilMoistureDownloader(dataset="SPL2SMP_E", version="006", output_dir=Path("/dev/null"))
+    return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _predict_smap_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Catalog-precise predicate for source_type="smap_ssm" -- NASA
+    Earthdata/CMR's earthaccess.search_data(bounding_box=...) is already
+    a real geometrically-precise server-side query."""
+    return _predict_catalog_precise_source(
+        source, cfg, sar_footprints,
+        list_candidates_dry=_smap_ssm_list_candidates_dry,
+        source_type="smap_ssm",
+    )
+
+
+_PREDICATES["smap_ssm"] = _predict_smap_ssm
+
+
+def _altimeter_list_candidates_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> "list[tuple[str, datetime, datetime]]":
+    """Thin wrapper: constructs an AltimeterDownloader and calls its
+    list_candidates_dry (every mission/frequency it covers, default
+    selection -- matching orchestrator.py's _download_altimeter default
+    of frequencies=["1hz"] would require plumbing the recipe's own
+    download_kwargs through here, which dry-collocation prediction has
+    no access to; querying every mission/frequency is the conservative
+    (fail-toward-inclusion) choice instead)."""
+    dl = AltimeterDownloader(output_dir=Path("/dev/null"))
+    return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _predict_altimeter(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Catalog-precise predicate for source_type="altimeter" -- Copernicus
+    Marine's along-track datasets are opened bbox/time-filtered via
+    copernicusmarine.open_dataset(), already a real geometrically-precise
+    server-side query."""
+    return _predict_catalog_precise_source(
+        source, cfg, sar_footprints,
+        list_candidates_dry=_altimeter_list_candidates_dry,
+        source_type="altimeter",
+    )
+
+
+_PREDICATES["altimeter"] = _predict_altimeter
+
+
+#: Mirrors orchestrator.py's own `_NSIDC_0451_CUTOFF` exactly -- NASA
+#: Earthdata's NSIDC-0451 AMSR2 soil-moisture dataset stopped being
+#: updated after this date, with AU_Land taking over afterward. Kept as
+#: a separate module-level constant (not imported from orchestrator.py)
+#: to avoid coupling the two cutoff values to a single import site --
+#: both must be updated together if NSIDC's cutoff ever moves.
+_NSIDC_0451_CUTOFF = "2023-12-31"
+
+
+def _earthdata_amsr_ssm_list_candidates_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> "list[tuple[str, datetime, datetime]]":
+    """Thin wrapper: constructs an EarthdataSoilMoistureDownloader for
+    whichever AMSR2 CMR dataset covers *end*'s date (NSIDC-0451 or its
+    AU_Land replacement), mirroring orchestrator.py's own
+    _download_amsr_ssm dataset-cutoff selection, and calls its
+    list_candidates_dry."""
+    # Compare only the date portion -- end is a full ISO datetime (this
+    # wrapper's own caller always passes a padded_end.isoformat() with a
+    # time-of-day), while _NSIDC_0451_CUTOFF is a bare date. A naive
+    # full-string comparison would misclassify any timestamp ON the
+    # cutoff day itself (e.g. "2023-12-31T06:00:00" > "2023-12-31"
+    # lexicographically, even though both are the same calendar day).
+    dataset = "NSIDC-0451" if end[:10] <= _NSIDC_0451_CUTOFF else "AU_Land"
+    dl = EarthdataSoilMoistureDownloader(dataset=dataset, output_dir=Path("/dev/null"))
+    return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _gportal_amsr_ssm_list_candidates_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> "list[tuple[str, datetime, datetime]]":
+    """Thin wrapper: constructs a GPortalAMSR2Downloader and calls its
+    list_candidates_dry. Imported lazily (not at module top) since
+    paramiko -- G-Portal's SFTP dependency -- is optional and this
+    module must import cleanly without it."""
+    from ..downloaders.gportal_downloader import GPortalAMSR2Downloader
+
+    dl = GPortalAMSR2Downloader(output_dir=Path("/dev/null"))
+    return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _predict_amsr_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Combined predicate for source_type="amsr_ssm", mirroring
+    orchestrator.py's _download_amsr_ssm: NASA Earthdata/CMR is checked
+    first, JAXA G-Portal (SFTP) is a real second source that often
+    succeeds when Earthdata doesn't. Unlike ascat_ssm, both branches
+    apply to every footprint -- there is no date-based eligibility
+    split, since Earthdata's coverage cutoff only changes which CMR
+    dataset is queried (see _earthdata_amsr_ssm_list_candidates_dry), it
+    never makes the whole branch inapplicable. Collocated if either
+    branch predicts collocated. bucket is "catalog-precise" (matching
+    this source's own registration) even though the G-Portal branch
+    internally reuses the orbit-corridor bucket's shared predicate --
+    the label describes the source, not which internal path happened to
+    answer.
+    """
+    earthdata_prediction = _predict_catalog_precise_source(
+        source, cfg, sar_footprints,
+        list_candidates_dry=_earthdata_amsr_ssm_list_candidates_dry,
+        source_type="amsr_ssm",
+    )
+    gportal_prediction = _predict_orbit_corridor_source(
+        source, cfg, sar_footprints,
+        satellite_resolver=lambda name: "gcom-w1",
+        list_candidates_dry=_gportal_amsr_ssm_list_candidates_dry,
+        source_type="amsr_ssm",
+    )
+
+    predictions = [earthdata_prediction, gportal_prediction]
+    if any(p.verdict == "collocated" for p in predictions):
+        matched = [w for p in predictions for w in (p.matched_windows or [])]
+        return SourcePrediction(
+            source_type="amsr_ssm", bucket="catalog-precise", verdict="collocated",
+            detail=" / ".join(p.detail for p in predictions),
+            matched_windows=matched,
+        )
+    if any(p.verdict == "unknown" for p in predictions):
+        return SourcePrediction(
+            source_type="amsr_ssm", bucket="catalog-precise", verdict="unknown",
+            detail=" / ".join(p.detail for p in predictions),
+        )
+    return SourcePrediction(
+        source_type="amsr_ssm", bucket="catalog-precise", verdict="none-predicted",
+        detail=" / ".join(p.detail for p in predictions),
+    )
+
+
+_PREDICATES["amsr_ssm"] = _predict_amsr_ssm

@@ -44,6 +44,7 @@ import json
 import logging
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -260,6 +261,75 @@ class GPortalAMSR2Downloader:
                 if downloaded:
                     return downloaded
             return downloaded
+        finally:
+            if sftp is not None:
+                sftp.close()
+            if transport is not None:
+                transport.close()
+
+    def list_candidates_dry(
+        self, min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+    ) -> "list[tuple[str, datetime, datetime]]":
+        """(remote_path, day_start, day_end) for every AMSR2 file whose
+        embedded date falls in [start, end] -- the same SFTP directory
+        discovery and date-matching logic download()/
+        _download_from_product_directory use, without the orbit
+        prefilter (_filter_by_orbit_overlap) and without fetching
+        anything. min_lon/max_lon/min_lat/max_lat are accepted for
+        interface consistency but unused here for the same reason
+        download() doesn't use them for server-side filtering (SFTP has
+        no spatial query) -- geographic refinement is the caller's job
+        (see dry_collocation._predict_orbit_corridor_source, which this
+        feeds).
+
+        Filenames only embed a date, not a time-of-day, so the whole UTC
+        day is used as each match's sensing window, mirroring
+        _filter_by_orbit_overlap's identical whole-day construction.
+
+        Always authenticates with allow_prompt=False -- like download()'s
+        own dry-run branch, a prediction call must never block on an
+        interactive password prompt.
+        """
+        from datetime import timedelta, timezone
+
+        start_dt = normalize_datetime(start)
+        end_dt = normalize_datetime(end)
+        username, password = authenticate_gportal(self._username, self._password, allow_prompt=False)
+
+        transport = None
+        sftp = None
+        try:
+            transport, sftp = _connect_with_retry(username, password)
+            product_dirs = self._discover_product_directory(sftp)
+
+            start_date = start_dt[:10].replace("-", "")
+            end_date = end_dt[:10].replace("-", "")
+
+            candidates: "list[tuple[str, datetime, datetime]]" = []
+            for product_dir in product_dirs:
+                is_nrt = product_dir.startswith("nrt/")
+                if is_nrt:
+                    try:
+                        filenames = sftp.listdir(product_dir)
+                    except IOError:
+                        continue
+                    raw_candidates = [(product_dir, name) for name in filenames]
+                else:
+                    raw_candidates = self._standard_tree_candidates(sftp, product_dir, start_dt, end_dt)
+
+                for dir_path, name in raw_candidates:
+                    if _NON_DAILY_AGGREGATION_RE.search(name):
+                        continue
+                    m = _FILENAME_DATE_RE.search(name)
+                    if not (m and start_date <= m.group(1) <= end_date):
+                        continue
+                    try:
+                        day_start = datetime.strptime(m.group(1), "%Y%m%d").replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        continue
+                    day_end = day_start + timedelta(hours=23, minutes=59, seconds=59)
+                    candidates.append((f"{dir_path}/{name}", day_start, day_end))
+            return candidates
         finally:
             if sftp is not None:
                 sftp.close()
