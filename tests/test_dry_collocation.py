@@ -1224,6 +1224,50 @@ class TestPredictScatterometerFtpSources:
         assert predicate is getattr(dry_collocation, f"_predict_{source_type}")
 
 
+class TestPredictSmosSsm:
+    """predict_source integration test for the newly registered
+    smos_ssm source_type -- exercises the real _PREDICATES dispatch, not
+    _predict_orbit_corridor_source directly."""
+
+    def test_collocated_via_predict_source(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint, predict_source
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        candidate_start = datetime(2026, 8, 1, 6, 0, 0)
+        candidate_end = datetime(2026, 8, 1, 6, 3, 0)
+
+        def _fake_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            return [("fake_candidate.nc", candidate_start, candidate_end)]
+
+        monkeypatch.setattr(dry_collocation, "_smos_list_candidates_dry", _fake_list_candidates_dry)
+
+        def _fake_orbit_overlap_windows(satellite, start, end, min_lon, max_lon, min_lat, max_lat, **kwargs):
+            return [(start, end)]  # full overlap
+
+        monkeypatch.setattr(dry_collocation.orbit_coverage, "orbit_overlap_windows", _fake_orbit_overlap_windows)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = predict_source(
+            SimpleNamespace(source_type="smos_ssm"), cfg=object(), sar_footprints=[footprint],
+        )
+
+        assert result.verdict == "collocated"
+        assert result.bucket == "orbit-corridor"
+        assert result.source_type == "smos_ssm"
+
+    def test_registered_under_smos_ssm_source_type(self):
+        from sar_validation.core import dry_collocation
+
+        assert dry_collocation._PREDICATES["smos_ssm"] is dry_collocation._predict_smos_ssm
+
+
 class TestBboxOverlapsFootprint:
     def test_overlapping_bbox_returns_true(self):
         from sar_validation.core.dry_collocation import SarFootprint, _bbox_overlaps_footprint

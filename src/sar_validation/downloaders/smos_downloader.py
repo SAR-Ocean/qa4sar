@@ -314,6 +314,57 @@ class SMOSDownloader:
             print(f"Orbit pre-filter: skipped {dropped} file(s) with no predicted overlap.")
         return kept
 
+    def list_candidates_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+    ) -> "list[tuple[str, datetime, datetime]]":
+        """(filename, sensing_start, sensing_end) for every candidate
+        product in [start, end] -- the same day-by-day OADS tree-browse
+        download() does, without the orbit prefilter and without
+        downloading anything. sensing_start/sensing_end come from each
+        filename's own embedded timestamps when parseable (see
+        _parse_sensing_window); a filename that doesn't match the
+        expected convention falls back to the whole day [00:00:00Z,
+        23:59:59Z], mirroring _filter_by_orbit_overlap's own fallback.
+        bbox is accepted for interface consistency with download() but
+        not used here either (see module docstring); a caller wanting
+        geographic refinement should apply its own orbit-overlap check
+        against the returned windows (see dry_collocation.py).
+        """
+        start_dt = normalize_datetime(start)
+        end_dt = normalize_datetime(end)
+
+        username, password = authenticate_smos_ftp(self._username, self._password)
+
+        day = datetime.fromisoformat(start_dt).date()
+        last = datetime.fromisoformat(end_dt).date()
+
+        session = requests.Session()
+        self._login(session, username, password)
+
+        candidates: "list[tuple[str, datetime, datetime]]" = []
+        while day <= last:
+            products = self._list_products_for_day(session, day)
+            for product in products:
+                fname = product["filename"]
+                if not fname.endswith((".nc", ".tgz")):
+                    continue
+                window = _parse_sensing_window(fname)
+                if window is not None:
+                    sensing_start, sensing_end = window
+                else:
+                    sensing_start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+                    sensing_end = sensing_start + timedelta(hours=23, minutes=59, seconds=59)
+                candidates.append((fname, sensing_start, sensing_end))
+            day += timedelta(days=1)
+
+        return candidates
+
     def download(
         self,
         min_lon: float,

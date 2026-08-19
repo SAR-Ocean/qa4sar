@@ -37,6 +37,7 @@ from ..downloaders.base import (
 from ..downloaders.hsaf_downloader import HSAFDownloader
 from ..downloaders.hsaf_downloader import _parse_satellite as _hsaf_parse_satellite
 from ..downloaders.scatterometer_ftp_downloader import ScatterometerFTPDownloader
+from ..downloaders.smos_downloader import SMOSDownloader
 from . import orbit_coverage
 from .collocation import _haversine_distance
 from .datatree_converter import DataTreeConverter
@@ -1010,3 +1011,31 @@ def _predict_scatterometer_oceansat3(source, cfg, sar_footprints: "list[SarFootp
 _PREDICATES["scatterometer_hy2b"] = _predict_scatterometer_hy2b
 _PREDICATES["scatterometer_hy2c"] = _predict_scatterometer_hy2c
 _PREDICATES["scatterometer_oceansat3"] = _predict_scatterometer_oceansat3
+
+
+def _smos_list_candidates_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> "list[tuple[str, datetime, datetime]]":
+    """Thin wrapper: constructs an SMOSDownloader and calls its
+    list_candidates_dry. output_dir is never written to by
+    list_candidates_dry (except for a defensive debug-HTML dump when
+    OADS's own response is unparseable, wrapped in its own try/except),
+    so a harmless placeholder is safe here."""
+    dl = SMOSDownloader(output_dir=Path("/dev/null"))
+    return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _predict_smos_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Orbit-corridor predicate for source_type="smos_ssm" -- SMOS's OADS
+    listing (see smos_downloader.py) only ever contains SMOS's own data,
+    so satellite_resolver is a fixed constant rather than parsed per
+    candidate."""
+    return _predict_orbit_corridor_source(
+        source, cfg, sar_footprints,
+        satellite_resolver=lambda name: "smos",
+        list_candidates_dry=_smos_list_candidates_dry,
+        source_type="smos_ssm",
+    )
+
+
+_PREDICATES["smos_ssm"] = _predict_smos_ssm
