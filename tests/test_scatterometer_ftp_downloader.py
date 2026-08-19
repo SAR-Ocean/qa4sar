@@ -465,3 +465,74 @@ class TestScatterometerFTPDownloaderOrbitPrefilter:
             )
 
         assert len(result) == 1
+
+
+class TestListCandidatesDry:
+    def test_returns_matches_without_fetching(self, tmp_path):
+        """Mirrors download()'s own FTP-listing/matching logic exactly, but
+        never touches self.dry_run and never calls retrbinary. sensing_end
+        is estimated from the satellite's assumed per-file pass duration,
+        since each filename embeds only a single timestamp."""
+        now = datetime.now(timezone.utc)
+        ts = now.strftime("%Y%m%d_%H%M%S")
+        name = f"oscat_{ts}_ocsat3_1_o_250_4007_ovw_l2.nc"
+
+        fake_ftp = MagicMock()
+        fake_ftp.nlst.return_value = [name, name + ".md5"]
+
+        with patch("ftplib.FTP", return_value=fake_ftp), patch(
+            "sar_validation.downloaders.scatterometer_ftp_downloader.authenticate_osi_saf_ftp",
+            return_value=("user", "pass"),
+        ):
+            dl = ScatterometerFTPDownloader(satellite="oceansat3", output_dir=tmp_path, orbit_prefilter=False)
+            start = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
+            end = (now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
+            candidates = dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start=start, end=end,
+            )
+
+        assert not fake_ftp.retrbinary.called
+        assert len(candidates) == 1
+        cand_name, sensing_start, sensing_end = candidates[0]
+        assert cand_name == name
+        expected_start = datetime.strptime(ts, "%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc)
+        assert sensing_start == expected_start
+        assert sensing_end == expected_start + _ASSUMED_PASS_DURATION_BY_SATELLITE["oceansat3"]
+
+    def test_no_matches_returns_empty(self, tmp_path):
+        now = datetime.now(timezone.utc)
+        fake_ftp = MagicMock()
+        fake_ftp.nlst.return_value = ["readme.txt"]
+
+        with patch("ftplib.FTP", return_value=fake_ftp), patch(
+            "sar_validation.downloaders.scatterometer_ftp_downloader.authenticate_osi_saf_ftp",
+            return_value=("user", "pass"),
+        ):
+            dl = ScatterometerFTPDownloader(satellite="hy2b", output_dir=tmp_path, orbit_prefilter=False)
+            start = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
+            end = now.strftime("%Y-%m-%dT%H:%M:%S")
+            candidates = dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start=start, end=end,
+            )
+
+        assert candidates == []
+
+    def test_stale_window_returns_empty_without_touching_network(self, tmp_path):
+        """Mirrors download()'s own recency guard: a window entirely older
+        than the FTP server's rolling retention must short-circuit before
+        any FTP connection is attempted."""
+        now = datetime.now(timezone.utc)
+        end = (now - timedelta(days=4)).strftime("%Y-%m-%d")
+        start = (now - timedelta(days=5)).strftime("%Y-%m-%d")
+
+        dl = ScatterometerFTPDownloader(satellite="oceansat3", output_dir=tmp_path, orbit_prefilter=False)
+        with patch("ftplib.FTP") as mock_ftp_cls:
+            candidates = dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start=start, end=end,
+            )
+
+        assert candidates == []
+        mock_ftp_cls.assert_not_called()

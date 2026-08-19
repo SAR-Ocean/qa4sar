@@ -1164,6 +1164,66 @@ class TestPredictAscatSsm:
         assert dry_collocation._PREDICATES["ascat_ssm"] is dry_collocation._predict_ascat_ssm
 
 
+class TestPredictScatterometerFtpSources:
+    """One predict_source integration test per newly registered
+    scatterometer_hy2b/hy2c/oceansat3 source_type -- exercises the real
+    _PREDICATES dispatch (predict_source), not _predict_orbit_corridor_source
+    directly. Each of these downloaders' own FTP listing only ever
+    contains one satellite's data, so satellite_resolver is a fixed
+    constant, unlike ascat_ssm's EUMDAC branch."""
+
+    @pytest.mark.parametrize(
+        "source_type,list_candidates_dry_name",
+        [
+            pytest.param("scatterometer_hy2b", "_hy2b_list_candidates_dry", id="hy2b"),
+            pytest.param("scatterometer_hy2c", "_hy2c_list_candidates_dry", id="hy2c"),
+            pytest.param("scatterometer_oceansat3", "_oceansat3_list_candidates_dry", id="oceansat3"),
+        ],
+    )
+    def test_collocated_via_predict_source(self, monkeypatch, source_type, list_candidates_dry_name):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint, predict_source
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        candidate_start = datetime(2026, 8, 1, 6, 0, 0)
+        candidate_end = datetime(2026, 8, 1, 6, 3, 0)
+
+        def _fake_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            return [("fake_candidate.nc", candidate_start, candidate_end)]
+
+        monkeypatch.setattr(dry_collocation, list_candidates_dry_name, _fake_list_candidates_dry)
+
+        def _fake_orbit_overlap_windows(satellite, start, end, min_lon, max_lon, min_lat, max_lat, **kwargs):
+            return [(start, end)]  # full overlap
+
+        monkeypatch.setattr(dry_collocation.orbit_coverage, "orbit_overlap_windows", _fake_orbit_overlap_windows)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = predict_source(
+            SimpleNamespace(source_type=source_type), cfg=object(), sar_footprints=[footprint],
+        )
+
+        assert result.verdict == "collocated"
+        assert result.bucket == "orbit-corridor"
+        assert result.source_type == source_type
+
+    @pytest.mark.parametrize(
+        "source_type",
+        ["scatterometer_hy2b", "scatterometer_hy2c", "scatterometer_oceansat3"],
+    )
+    def test_registered_under_own_source_type(self, source_type):
+        from sar_validation.core import dry_collocation
+
+        predicate = dry_collocation._PREDICATES[source_type]
+        assert predicate is getattr(dry_collocation, f"_predict_{source_type}")
+
+
 class TestBboxOverlapsFootprint:
     def test_overlapping_bbox_returns_true(self):
         from sar_validation.core.dry_collocation import SarFootprint, _bbox_overlaps_footprint

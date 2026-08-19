@@ -36,6 +36,7 @@ from ..downloaders.base import (
 )
 from ..downloaders.hsaf_downloader import HSAFDownloader
 from ..downloaders.hsaf_downloader import _parse_satellite as _hsaf_parse_satellite
+from ..downloaders.scatterometer_ftp_downloader import ScatterometerFTPDownloader
 from . import orbit_coverage
 from .collocation import _haversine_distance
 from .datatree_converter import DataTreeConverter
@@ -940,3 +941,72 @@ def _predict_ascat_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> Sou
 
 
 _PREDICATES["ascat_ssm"] = _predict_ascat_ssm
+
+
+def _scatterometer_ftp_list_candidates_dry(
+    satellite: str,
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> "list[tuple[str, datetime, datetime]]":
+    """Thin wrapper: constructs a ScatterometerFTPDownloader for *satellite*
+    and calls its list_candidates_dry. output_dir is never written to by
+    list_candidates_dry, so a harmless placeholder is safe here."""
+    dl = ScatterometerFTPDownloader(satellite=satellite, output_dir=Path("/dev/null"))
+    return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _hy2b_list_candidates_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> "list[tuple[str, datetime, datetime]]":
+    return _scatterometer_ftp_list_candidates_dry("hy2b", min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _hy2c_list_candidates_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> "list[tuple[str, datetime, datetime]]":
+    return _scatterometer_ftp_list_candidates_dry("hy2c", min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _oceansat3_list_candidates_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> "list[tuple[str, datetime, datetime]]":
+    return _scatterometer_ftp_list_candidates_dry("oceansat3", min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _predict_scatterometer_hy2b(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Orbit-corridor predicate for source_type="scatterometer_hy2b" --
+    HY-2B's OSI-SAF wind FTP listing (see scatterometer_ftp_downloader.py)
+    only ever contains HY-2B's own data, so satellite_resolver is a fixed
+    constant rather than parsed per candidate."""
+    return _predict_orbit_corridor_source(
+        source, cfg, sar_footprints,
+        satellite_resolver=lambda name: "hy2b",
+        list_candidates_dry=_hy2b_list_candidates_dry,
+        source_type="scatterometer_hy2b",
+    )
+
+
+def _predict_scatterometer_hy2c(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Orbit-corridor predicate for source_type="scatterometer_hy2c" --
+    see _predict_scatterometer_hy2b."""
+    return _predict_orbit_corridor_source(
+        source, cfg, sar_footprints,
+        satellite_resolver=lambda name: "hy2c",
+        list_candidates_dry=_hy2c_list_candidates_dry,
+        source_type="scatterometer_hy2c",
+    )
+
+
+def _predict_scatterometer_oceansat3(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Orbit-corridor predicate for source_type="scatterometer_oceansat3"
+    -- see _predict_scatterometer_hy2b."""
+    return _predict_orbit_corridor_source(
+        source, cfg, sar_footprints,
+        satellite_resolver=lambda name: "oceansat3",
+        list_candidates_dry=_oceansat3_list_candidates_dry,
+        source_type="scatterometer_oceansat3",
+    )
+
+
+_PREDICATES["scatterometer_hy2b"] = _predict_scatterometer_hy2b
+_PREDICATES["scatterometer_hy2c"] = _predict_scatterometer_hy2c
+_PREDICATES["scatterometer_oceansat3"] = _predict_scatterometer_oceansat3

@@ -291,6 +291,71 @@ class ScatterometerFTPDownloader:
         print(f"Downloaded {len(downloaded)} {self.satellite} file(s).")
         return downloaded
 
+    def list_candidates_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+    ) -> "list[tuple[str, datetime, datetime]]":
+        """(filename, sensing_start, sensing_end) for every candidate file
+        in [start, end] -- the same FTP listing + timestamp-matching
+        download() does, without the orbit prefilter and without fetching
+        anything. sensing_end is estimated as sensing_start plus this
+        satellite's assumed per-file pass duration
+        (_ASSUMED_PASS_DURATION_BY_SATELLITE), since each filename embeds
+        only a single timestamp. bbox is accepted for interface
+        consistency with download() but not used here either (this
+        class's server never supports bbox filtering -- see module
+        docstring); a caller wanting geographic refinement should apply
+        its own orbit-overlap check against the returned windows (see
+        dry_collocation.py). Mirrors download()'s recency guard: a window
+        entirely older than the server's rolling retention returns an
+        empty list without ever connecting.
+        """
+        end_dt = _parse_iso_dt(normalize_datetime(end))
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_MAX_AGE_DAYS)
+        if end_dt < cutoff:
+            return []
+
+        is_end_date_only = len(end.strip().rstrip("Z")) == 10  # YYYY-MM-DD
+        end_dt_for_matching = end_dt + timedelta(days=1) if is_end_date_only else end_dt
+
+        start_dt = _parse_iso_dt(normalize_datetime(start))
+        path = _SATELLITE_PATHS[self.satellite]
+
+        username, password = authenticate_osi_saf_ftp(self._username, self._password)
+
+        import ftplib
+
+        ftp = ftplib.FTP(FTP_HOST, timeout=60)
+        try:
+            ftp.login(username, password)
+            ftp.cwd(path)
+            names = ftp.nlst()
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+
+        candidates: "list[tuple[str, datetime, datetime]]" = []
+        for name in names:
+            if not _matches_25km(name):
+                continue
+            ts = _parse_filename_timestamp(name)
+            if ts is None:
+                continue
+            end_check = ts < end_dt_for_matching if is_end_date_only else ts <= end_dt_for_matching
+            if not (start_dt <= ts and end_check):
+                continue
+            sensing_end = ts + _ASSUMED_PASS_DURATION_BY_SATELLITE[self.satellite]
+            candidates.append((name, ts, sensing_end))
+        return candidates
+
     def _filter_by_orbit_overlap(
         self, matches: list[str], min_lon: float, max_lon: float, min_lat: float, max_lat: float,
     ) -> list[str]:
