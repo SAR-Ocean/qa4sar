@@ -250,6 +250,62 @@ class HSAFDownloader:
         print(f"Downloaded {len(downloaded)} H-SAF {self.product.upper()} file(s).")
         return downloaded
 
+    def list_candidates_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+    ) -> "list[tuple[str, datetime, datetime]]":
+        """(filename, sensing_start, sensing_end) for every candidate file
+        in [start, end] -- the same FTP listing + timestamp-matching
+        download() does, without the orbit prefilter and without fetching
+        anything. bbox is accepted for interface consistency with
+        download() but not used here either (this class's server never
+        supports bbox filtering -- see module docstring); a caller wanting
+        geographic refinement should apply its own orbit-overlap check
+        against the returned windows (see dry_collocation.py).
+        """
+        start_dt = _parse_iso_dt(normalize_datetime(start))
+        end_dt = _parse_iso_dt(normalize_datetime(end))
+        is_end_date_only = len(end.strip().rstrip("Z")) == 10
+        end_dt_for_matching = end_dt + timedelta(days=1) if is_end_date_only else end_dt
+
+        username, password = authenticate_hsaf_ftp(self._username, self._password)
+
+        import ftplib
+
+        ftp = ftplib.FTP(FTP_HOST, timeout=60)
+        try:
+            ftp.login(username, password)
+            ftp.cwd(_PRODUCT_PATHS[self.product])
+            names = ftp.nlst()
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+
+        candidates: "list[tuple[str, datetime, datetime]]" = []
+        for name in names:
+            if not _matches_ascat_nc(name):
+                continue
+            sensing_start = _parse_sensing_start(name)
+            sensing_end = _parse_sensing_end(name)
+            if sensing_start is None or sensing_end is None:
+                continue
+            end_check = (
+                sensing_start < end_dt_for_matching
+                if is_end_date_only
+                else sensing_start <= end_dt_for_matching
+            )
+            if not (start_dt <= sensing_start and end_check):
+                continue
+            candidates.append((name, sensing_start, sensing_end))
+        return candidates
+
     def _filter_by_orbit_overlap(
         self, matches: list[str], min_lon: float, max_lon: float, min_lat: float, max_lat: float,
     ) -> list[str]:

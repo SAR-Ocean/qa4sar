@@ -13,11 +13,12 @@ This module is built up across four sequential implementation plans:
 
 from __future__ import annotations
 
+import logging
 import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, List, Literal, Optional, Tuple
 
@@ -32,10 +33,14 @@ from ..downloaders.base import (
     prefer_ipv4_dns,
     split_antimeridian_bbox,
 )
+from ..downloaders.hsaf_downloader import HSAFDownloader
 from . import orbit_coverage
 from .collocation import _haversine_distance
 from .datatree_converter import DataTreeConverter
 from .orbit_coverage import _point_in_bbox
+from .orchestrator import _resolve_temporal_padding_minutes
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["SarFootprint", "Verdict", "SourcePrediction", "CollocationReport", "predict_source"]
 
@@ -703,3 +708,113 @@ def _bbox_overlaps_footprint(
     per-point check doesn't apply."""
     f_min_lon, f_max_lon, f_min_lat, f_max_lat = footprint.bbox
     return not (max_lon < f_min_lon or min_lon > f_max_lon or max_lat < f_min_lat or min_lat > f_max_lat)
+
+
+def _windows_overlap(
+    a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime,
+) -> bool:
+    """Whether time windows [a_start, a_end] and [b_start, b_end] overlap
+    at all (inclusive of touching endpoints)."""
+    return a_start <= b_end and b_start <= a_end
+
+
+def _predict_orbit_corridor_source(
+    source,
+    cfg,
+    sar_footprints: "list[SarFootprint]",
+    *,
+    satellite_resolver: "Callable[[str], str]",
+    list_candidates_dry: "Callable[..., list[tuple[str, datetime, datetime]]]",
+    source_type: str,
+) -> SourcePrediction:
+    """Shared predicate for every orbit-corridor-bucket source (ASCAT SSM
+    via H-SAF/EUMDAC, HY-2B/HY-2C/Oceansat-3, AMSR2, SMOS): a coarse
+    dry-listing per footprint's padded time window, then
+    orbit_overlap_windows as the fine refinement. Each candidate's own
+    satellite is resolved independently via satellite_resolver rather
+    than assuming one fixed satellite for the whole call, since a single
+    listing can span multiple satellites. Refinement windows are
+    intersected against the footprint's own sensing window padded by
+    cfg's resolved collocation time tolerance for source_type.
+
+    A wv_points footprint is checked per-vignette (one zero-width-bbox
+    orbit_overlap_windows call per point), never against one enclosing
+    box, since a vignette is a small area far smaller than the
+    footprint's overall bbox.
+    """
+    if not sar_footprints:
+        return SourcePrediction(
+            source_type=source_type, bucket="orbit-corridor", verdict="unknown",
+            detail="No SAR footprints supplied -- cannot predict.",
+        )
+
+    tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, source_type))
+    matched_windows: "list[tuple[datetime, datetime]]" = []
+
+    for footprint in sar_footprints:
+        padded_start = footprint.sensing_start - tolerance
+        padded_end = footprint.sensing_end + tolerance
+        try:
+            candidates = list_candidates_dry(
+                footprint.bbox[0], footprint.bbox[1], footprint.bbox[2], footprint.bbox[3],
+                padded_start.isoformat(), padded_end.isoformat(),
+            )
+        except Exception:
+            logger.debug("_predict_orbit_corridor_source: list_candidates_dry failed", exc_info=True)
+            return SourcePrediction(
+                source_type=source_type, bucket="orbit-corridor", verdict="unknown",
+                detail=f"Candidate listing failed for {source_type}.",
+            )
+
+        points: "list[Optional[tuple[float, float]]]" = (
+            list(footprint.points or []) if footprint.kind == "wv_points" else [None]
+        )
+        for candidate_name, cand_start, cand_end in candidates:
+            try:
+                satellite = satellite_resolver(candidate_name)
+            except Exception:
+                logger.debug("_predict_orbit_corridor_source: satellite_resolver failed", exc_info=True)
+                matched_windows.append((cand_start, cand_end))  # fail open
+                continue
+            for point in points:
+                if point is None:
+                    target_bbox = footprint.bbox
+                    target_polygon = footprint.polygon
+                else:
+                    lat, lon = point
+                    target_bbox = (lon, lon, lat, lat)
+                    target_polygon = None
+                try:
+                    windows = orbit_coverage.orbit_overlap_windows(
+                        satellite, cand_start, cand_end,
+                        target_bbox[0], target_bbox[1], target_bbox[2], target_bbox[3],
+                        polygon=target_polygon,
+                    )
+                except Exception:
+                    logger.debug("_predict_orbit_corridor_source: orbit_overlap_windows failed", exc_info=True)
+                    windows = [(cand_start, cand_end)]  # fail open
+                for w_start, w_end in windows:
+                    if _windows_overlap(w_start, w_end, padded_start, padded_end):
+                        matched_windows.append((w_start, w_end))
+
+    if matched_windows:
+        return SourcePrediction(
+            source_type=source_type, bucket="orbit-corridor", verdict="collocated",
+            detail=f"{len(matched_windows)} matched window(s) across {len(sar_footprints)} SAR footprint(s).",
+            matched_windows=matched_windows,
+        )
+    return SourcePrediction(
+        source_type=source_type, bucket="orbit-corridor", verdict="none-predicted",
+        detail=f"No predicted overlap across {len(sar_footprints)} SAR footprint(s).",
+    )
+
+
+def _hsaf_list_candidates_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> "list[tuple[str, datetime, datetime]]":
+    """Thin wrapper: constructs an HSAFDownloader (default product h122,
+    matching orchestrator.py's own default) and calls its
+    list_candidates_dry. output_dir is never written to by
+    list_candidates_dry, so a harmless placeholder is safe here."""
+    dl = HSAFDownloader(output_dir=Path("/dev/null"), product="h122")
+    return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)

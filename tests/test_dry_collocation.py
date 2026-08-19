@@ -887,6 +887,162 @@ class TestPointInFootprint:
         assert _point_in_footprint(0.0, 0.0, footprint) is False
 
 
+class TestOrbitCorridorPredicate:
+    """_predict_orbit_corridor_source resolves its time tolerance via
+    _resolve_temporal_padding_minutes(cfg, source_type) -- the real
+    tolerance-resolution function orchestrator.py uses -- not a flat
+    cfg.time_tolerance_minutes attribute (RecipeConfig has no such
+    attribute), so every test here mocks that resolver rather than
+    relying on a fake cfg shape."""
+
+    def test_collocated_when_a_candidate_overlaps_a_footprint_window(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        candidate_start = datetime(2026, 8, 1, 6, 0, 0)
+        candidate_end = datetime(2026, 8, 1, 6, 3, 0)
+
+        def _fake_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            return [("h103_fake.nc", candidate_start, candidate_end)]
+
+        def _fake_orbit_overlap_windows(satellite, start, end, min_lon, max_lon, min_lat, max_lat, **kwargs):
+            return [(start, end)]  # full overlap
+
+        monkeypatch.setattr(dry_collocation.orbit_coverage, "orbit_overlap_windows", _fake_orbit_overlap_windows)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_orbit_corridor_source(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            satellite_resolver=lambda name: "metop-b", list_candidates_dry=_fake_list_candidates_dry,
+            source_type="ascat_ssm",
+        )
+
+        assert result.verdict == "collocated"
+        assert result.bucket == "orbit-corridor"
+
+    def test_none_predicted_when_no_candidate_overlaps_any_footprint(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        def _fake_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            return [("h103_fake.nc", datetime(2026, 8, 1, 6, 0, 0), datetime(2026, 8, 1, 6, 3, 0))]
+
+        def _fake_orbit_overlap_windows(satellite, start, end, min_lon, max_lon, min_lat, max_lat, **kwargs):
+            return []  # never overlaps the bbox at all
+
+        monkeypatch.setattr(dry_collocation.orbit_coverage, "orbit_overlap_windows", _fake_orbit_overlap_windows)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_orbit_corridor_source(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            satellite_resolver=lambda name: "metop-b", list_candidates_dry=_fake_list_candidates_dry,
+            source_type="ascat_ssm",
+        )
+
+        assert result.verdict == "none-predicted"
+
+    def test_wv_points_footprint_checked_per_vignette_never_batched(self, monkeypatch):
+        """A wv_points footprint with N points must drive N separate
+        orbit_overlap_windows calls (one per vignette, zero-width bbox),
+        never one call against an enclosing box."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        call_count = {"n": 0}
+
+        def _fake_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            return [("h103_fake.nc", datetime(2026, 8, 1, 6, 0, 0), datetime(2026, 8, 1, 6, 3, 0))]
+
+        def _fake_orbit_overlap_windows(satellite, start, end, min_lon, max_lon, min_lat, max_lat, **kwargs):
+            call_count["n"] += 1
+            return []
+
+        monkeypatch.setattr(dry_collocation.orbit_coverage, "orbit_overlap_windows", _fake_orbit_overlap_windows)
+
+        footprint = SarFootprint(
+            kind="wv_points", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None,
+            points=[(40.0, 0.0), (41.0, 1.0), (42.0, 2.0)],
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="wv.SAFE",
+        )
+
+        dry_collocation._predict_orbit_corridor_source(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            satellite_resolver=lambda name: "metop-b", list_candidates_dry=_fake_list_candidates_dry,
+            source_type="ascat_ssm",
+        )
+
+        assert call_count["n"] == 3  # one call per vignette point, not one for the whole footprint
+
+    def test_satellite_resolver_called_per_candidate_not_once_per_source(self, monkeypatch):
+        """Two candidates from different satellites in the same listing
+        must each get their own orbit_overlap_windows call with their own
+        resolved satellite key -- a single fixed satellite for the whole
+        predicate would silently mis-refine one of them."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        def _fake_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            return [
+                ("metopb_fake.nc", datetime(2026, 8, 1, 6, 0, 0), datetime(2026, 8, 1, 6, 3, 0)),
+                ("metopc_fake.nc", datetime(2026, 8, 1, 6, 0, 0), datetime(2026, 8, 1, 6, 3, 0)),
+            ]
+
+        seen_satellites = []
+
+        def _fake_orbit_overlap_windows(satellite, start, end, min_lon, max_lon, min_lat, max_lat, **kwargs):
+            seen_satellites.append(satellite)
+            return []
+
+        def _resolver(candidate_name):
+            return "metop-b" if "metopb" in candidate_name else "metop-c"
+
+        monkeypatch.setattr(dry_collocation.orbit_coverage, "orbit_overlap_windows", _fake_orbit_overlap_windows)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        dry_collocation._predict_orbit_corridor_source(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            satellite_resolver=_resolver, list_candidates_dry=_fake_list_candidates_dry,
+            source_type="ascat_ssm",
+        )
+
+        assert seen_satellites == ["metop-b", "metop-c"]
+
+    def test_no_footprints_is_unknown(self):
+        from sar_validation.core import dry_collocation
+
+        result = dry_collocation._predict_orbit_corridor_source(
+            source=object(), cfg=object(), sar_footprints=[],
+            satellite_resolver=lambda name: "metop-b", list_candidates_dry=lambda *a, **k: [],
+            source_type="ascat_ssm",
+        )
+
+        assert result.verdict == "unknown"
+
+
 class TestBboxOverlapsFootprint:
     def test_overlapping_bbox_returns_true(self):
         from sar_validation.core.dry_collocation import SarFootprint, _bbox_overlaps_footprint
