@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -1041,6 +1041,127 @@ class TestOrbitCorridorPredicate:
         )
 
         assert result.verdict == "unknown"
+
+
+class TestPredictAscatSsm:
+    def test_footprint_before_cutoff_only_checked_via_eumdac(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        calls = []
+
+        def _fake_predict_orbit_corridor_source(
+            source, cfg, sar_footprints, *, satellite_resolver, list_candidates_dry, source_type,
+        ):
+            calls.append(list_candidates_dry)
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="orbit-corridor", verdict="collocated", detail="ok",
+            )
+
+        monkeypatch.setattr(dry_collocation, "_predict_orbit_corridor_source", _fake_predict_orbit_corridor_source)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2024, 1, 1, 6, 0, 0), sensing_end=datetime(2024, 1, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_ascat_ssm(source=object(), cfg=object(), sar_footprints=[footprint])
+
+        assert result.verdict == "collocated"
+        assert calls == [dry_collocation._eumdac_ascat_ssm_list_candidates_dry]
+
+    def test_footprint_within_hsaf_window_only_checked_via_hsaf(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        calls = []
+
+        def _fake_predict_orbit_corridor_source(
+            source, cfg, sar_footprints, *, satellite_resolver, list_candidates_dry, source_type,
+        ):
+            calls.append(list_candidates_dry)
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="orbit-corridor", verdict="none-predicted", detail="ok",
+            )
+
+        monkeypatch.setattr(dry_collocation, "_predict_orbit_corridor_source", _fake_predict_orbit_corridor_source)
+
+        now = datetime.now(timezone.utc)
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=now - timedelta(days=1), sensing_end=now - timedelta(days=1) + timedelta(minutes=1),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_ascat_ssm(source=object(), cfg=object(), sar_footprints=[footprint])
+
+        assert result.verdict == "none-predicted"
+        assert calls == [dry_collocation._hsaf_list_candidates_dry]
+
+    def test_collocated_if_either_branch_predicts_collocated(self, monkeypatch):
+        """A footprint whose padded window straddles both archives must
+        be collocated if EITHER branch finds something -- never require
+        both."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+        # Force "always eligible for EUMDAC" for this test.
+        monkeypatch.setattr(dry_collocation, "_ASCAT_COVERAGE_CUTOFF", "2099-01-01")
+
+        def _fake_predict_orbit_corridor_source(
+            source, cfg, sar_footprints, *, satellite_resolver, list_candidates_dry, source_type,
+        ):
+            is_hsaf = list_candidates_dry is dry_collocation._hsaf_list_candidates_dry
+            verdict = "collocated" if is_hsaf else "none-predicted"
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="orbit-corridor", verdict=verdict, detail="ok",
+                matched_windows=[(datetime(2026, 8, 1), datetime(2026, 8, 1))] if verdict == "collocated" else None,
+            )
+
+        monkeypatch.setattr(dry_collocation, "_predict_orbit_corridor_source", _fake_predict_orbit_corridor_source)
+
+        now = datetime.now(timezone.utc)
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=now - timedelta(days=1), sensing_end=now - timedelta(days=1) + timedelta(minutes=1),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_ascat_ssm(source=object(), cfg=object(), sar_footprints=[footprint])
+
+        assert result.verdict == "collocated"
+
+    def test_footprint_in_neither_window_is_unknown_not_none_predicted(self, monkeypatch):
+        """A footprint older than the EUMDAC cutoff-check window and
+        older than H-SAF's rolling window must be 'unknown' (fail
+        toward inclusion), never a confident 'none-predicted'."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+        # Force "never eligible for EUMDAC" for this test.
+        monkeypatch.setattr(dry_collocation, "_ASCAT_COVERAGE_CUTOFF", "2020-01-01")
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2023, 1, 1, 6, 0, 0), sensing_end=datetime(2023, 1, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_ascat_ssm(source=object(), cfg=object(), sar_footprints=[footprint])
+
+        assert result.verdict == "unknown"
+
+    def test_registered_under_ascat_ssm_source_type(self):
+        from sar_validation.core import dry_collocation
+
+        assert dry_collocation._PREDICATES["ascat_ssm"] is dry_collocation._predict_ascat_ssm
 
 
 class TestBboxOverlapsFootprint:

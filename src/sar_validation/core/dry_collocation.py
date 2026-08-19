@@ -18,13 +18,14 @@ import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, List, Literal, Optional, Tuple
 
 import pandas as pd
 
 from ..downloaders import radarsat2_wind_downloader as _rs2
+from ..downloaders.ascat_soil_moisture_downloader import ASCATSoilMoistureDownloader
 from ..downloaders.base import (
     CopernicusODataClient,
     authenticate_cdse,
@@ -34,6 +35,7 @@ from ..downloaders.base import (
     split_antimeridian_bbox,
 )
 from ..downloaders.hsaf_downloader import HSAFDownloader
+from ..downloaders.hsaf_downloader import _parse_satellite as _hsaf_parse_satellite
 from . import orbit_coverage
 from .collocation import _haversine_distance
 from .datatree_converter import DataTreeConverter
@@ -818,3 +820,123 @@ def _hsaf_list_candidates_dry(
     list_candidates_dry, so a harmless placeholder is safe here."""
     dl = HSAFDownloader(output_dir=Path("/dev/null"), product="h122")
     return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+#: Mirrors orchestrator.py's own `_ASCAT_COVERAGE_CUTOFF` exactly -- the
+#: EUMDAC SOMO12 collection stopped receiving new products on this date.
+#: Kept as a separate module-level constant (not imported from
+#: orchestrator.py) to avoid coupling the two cutoff values to a single
+#: import site -- both must be updated together if EUMETSAT's cutoff
+#: ever moves.
+_ASCAT_COVERAGE_CUTOFF = "2025-07-15"
+
+#: EUMETSAT's SOMO12 product-ID satellite codes -> orbit_coverage.py's
+#: SATELLITE_ORBIT_SPECS keys. EUMETSAT's numbering is launch-order-based,
+#: not letter-order-based: M01=MetOp-B, M02=MetOp-A, M03=MetOp-C. MetOp-A
+#: has no SATELLITE_ORBIT_SPECS entry (decommissioned) -- mapped here
+#: anyway so a real "m02" product still reaches orbit_overlap_windows,
+#: which fails open (falls back to the candidate's own coarse window) on
+#: an unrecognized satellite key rather than raising.
+_EUMDAC_ASCAT_SATELLITE_MAP = {"m01": "metop-b", "m02": "metop-a", "m03": "metop-c"}
+
+
+def _hsaf_satellite_resolver(filename: str) -> str:
+    """satellite_resolver adapter for H-SAF: hsaf_downloader._parse_satellite
+    returns Optional[str] (None for an unparseable filename), while
+    _predict_orbit_corridor_source's satellite_resolver contract wants a
+    str -- an unrecognized/unresolvable key ("unknown") still reaches
+    orbit_overlap_windows, which itself fails open (whole candidate
+    window kept) on any key absent from SATELLITE_ORBIT_SPECS, matching
+    _filter_by_orbit_overlap's own fail-open handling of the same case."""
+    return _hsaf_parse_satellite(filename) or "unknown"
+
+
+def _parse_eumdac_ascat_satellite(product_id: str) -> str:
+    """Best-effort satellite key for a SOMO12 product ID; falls back to
+    'metop-b' (never raises) for an unrecognized ID."""
+    lowered = product_id.lower()
+    for code, sat in _EUMDAC_ASCAT_SATELLITE_MAP.items():
+        if code in lowered:
+            return sat
+    return "metop-b"
+
+
+def _eumdac_ascat_ssm_list_candidates_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> "list[tuple[str, datetime, datetime]]":
+    """Thin wrapper: constructs an ASCATSoilMoistureDownloader and calls
+    its list_candidates_dry. output_dir is never written to by
+    list_candidates_dry, so a harmless placeholder is safe here."""
+    dl = ASCATSoilMoistureDownloader(output_dir=Path("/dev/null"))
+    return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _predict_ascat_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Combined predicate for source_type="ascat_ssm", mirroring
+    orchestrator.py's _download_ascat_ssm branching: EUMDAC's SOMO12
+    archive covers footprints on/before _ASCAT_COVERAGE_CUTOFF, H-SAF's
+    rolling on-line archive covers roughly the last 60 days. A
+    footprint's own sensing time (padded by the resolved collocation
+    time tolerance) determines which branch(es) actually apply, matching
+    real download behavior rather than always checking both. Collocated
+    if either applicable branch predicts collocated; a footprint that
+    falls in the genuine gap between the two archives (neither branch
+    applies) is "unknown" rather than a confident "none-predicted",
+    since that gap is a coverage limitation, not evidence of absence.
+    """
+    tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, "ascat_ssm"))
+    hsaf_window_start = (datetime.now(timezone.utc).date() - timedelta(days=60)).isoformat()
+
+    eumdac_footprints = [
+        fp for fp in sar_footprints
+        if (fp.sensing_start - tolerance).date().isoformat() <= _ASCAT_COVERAGE_CUTOFF
+    ]
+    hsaf_footprints = [
+        fp for fp in sar_footprints
+        if (fp.sensing_end + tolerance).date().isoformat() >= hsaf_window_start
+    ]
+
+    predictions: "list[SourcePrediction]" = []
+    if eumdac_footprints:
+        predictions.append(_predict_orbit_corridor_source(
+            source, cfg, eumdac_footprints,
+            satellite_resolver=_parse_eumdac_ascat_satellite,
+            list_candidates_dry=_eumdac_ascat_ssm_list_candidates_dry,
+            source_type="ascat_ssm",
+        ))
+    if hsaf_footprints:
+        predictions.append(_predict_orbit_corridor_source(
+            source, cfg, hsaf_footprints,
+            satellite_resolver=_hsaf_satellite_resolver,
+            list_candidates_dry=_hsaf_list_candidates_dry,
+            source_type="ascat_ssm",
+        ))
+
+    if not predictions:
+        return SourcePrediction(
+            source_type="ascat_ssm", bucket="orbit-corridor", verdict="unknown",
+            detail=(
+                f"No SAR footprint falls within EUMDAC's historical archive "
+                f"(through {_ASCAT_COVERAGE_CUTOFF}) or H-SAF's rolling "
+                f"on-line archive (since {hsaf_window_start})."
+            ),
+        )
+    if any(p.verdict == "collocated" for p in predictions):
+        matched = [w for p in predictions for w in (p.matched_windows or [])]
+        return SourcePrediction(
+            source_type="ascat_ssm", bucket="orbit-corridor", verdict="collocated",
+            detail=" / ".join(p.detail for p in predictions),
+            matched_windows=matched,
+        )
+    if any(p.verdict == "unknown" for p in predictions):
+        return SourcePrediction(
+            source_type="ascat_ssm", bucket="orbit-corridor", verdict="unknown",
+            detail=" / ".join(p.detail for p in predictions),
+        )
+    return SourcePrediction(
+        source_type="ascat_ssm", bucket="orbit-corridor", verdict="none-predicted",
+        detail=" / ".join(p.detail for p in predictions),
+    )
+
+
+_PREDICATES["ascat_ssm"] = _predict_ascat_ssm
