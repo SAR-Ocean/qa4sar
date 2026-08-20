@@ -124,21 +124,18 @@ class RadiometerDownloader:
 
     Parameters
     ----------
-    output_dir : Path, optional
-        Directory to save downloaded NetCDF files. Required by
-        :meth:`download`; may be omitted (``None``) when only
-        :meth:`check_exists_dry` is used, since that read-only existence
-        check never writes to disk.
+    output_dir : Path
+        Directory to save downloaded NetCDF files.
     dry_run : bool
         If True, print the sensor/date/URL matrix without downloading.
     """
 
     def __init__(
         self,
-        output_dir: Optional[Path],
+        output_dir: Path,
         dry_run: bool = False,
     ) -> None:
-        self.output_dir = Path(output_dir) if output_dir is not None else None
+        self.output_dir = Path(output_dir)
         self.dry_run = dry_run
 
     def download(
@@ -171,9 +168,6 @@ class RadiometerDownloader:
         list[Path]
             Paths to the downloaded NetCDF files.
         """
-        if self.output_dir is None:
-            raise ValueError("download() requires a real output_dir (got None).")
-
         start_dt = normalize_datetime(start)
         end_dt = normalize_datetime(end)
 
@@ -271,7 +265,6 @@ class RadiometerDownloader:
 
     def _fetch_first(self, sensor: str, day, candidates: list[tuple[str, str]]) -> Optional[Path]:
         """Try each candidate URL in order; save the first that exists."""
-        assert self.output_dir is not None, "_fetch_first requires a real output_dir (see download())"
         for url, filename in candidates:
             dest = self.output_dir / filename
             if dest.exists():
@@ -307,6 +300,17 @@ class RadiometerDownloader:
         Mirrors :meth:`download`'s own per-day candidate-URL construction
         (dated file, then the ``rt_file`` near-real-time fallback), but
         issues a HEAD request per candidate instead of a streamed GET.
+        ``allow_redirects=True`` is passed explicitly since ``requests``
+        itself defaults HEAD to no redirect-following -- without it, a
+        future RSS server redirect would silently look like "not found".
+
+        A candidate raising ``requests.RequestException`` (DNS failure,
+        connection refused, timeout) is not a definitive "doesn't exist"
+        answer, unlike a real HTTP response (200 or 404) -- if every
+        attempted candidate across every requested sensor raises, this
+        method can't tell whether the data exists or not, so it raises
+        rather than returning a false ``False``. Callers must treat an
+        exception here as "couldn't determine", never as "no data".
 
         Parameters
         ----------
@@ -323,6 +327,8 @@ class RadiometerDownloader:
             responds with HTTP 200.
         """
         requested = list(sensors) if sensors else list(SUPPORTED_SENSORS)
+        any_attempted = False
+        any_definitive = False
         for sensor in requested:
             cfg = SENSORS.get(sensor)
             if cfg is None or not cfg.get("url_path"):
@@ -342,12 +348,21 @@ class RadiometerDownloader:
                 )
 
             for url in candidates:
+                any_attempted = True
                 try:
-                    resp = requests.head(url, timeout=30)
+                    resp = requests.head(url, timeout=30, allow_redirects=True)
                 except requests.RequestException:
                     continue
+                any_definitive = True
                 if resp.status_code == 200:
                     return True
+
+        if any_attempted and not any_definitive:
+            raise RuntimeError(
+                f"check_exists_dry: every candidate URL request failed for "
+                f"{day.isoformat()} -- couldn't determine radiometer availability "
+                f"(network/DNS/timeout error on every attempt)."
+            )
         return False
 
 
