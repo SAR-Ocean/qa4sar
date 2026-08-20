@@ -2289,6 +2289,117 @@ class TestNOAAHFRadarDownload:
         assert "[(-126.0):(-115.8056)]" in called_url
 
 
+_DAS_RANGE_START = (datetime.now(timezone.utc) - timedelta(days=30)).replace(microsecond=0)
+_DAS_RANGE_END = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0)
+
+
+def _fake_das_text(range_start: datetime, range_end: datetime) -> str:
+    return f"""Attributes {{
+ time {{
+  String _CoordinateAxisType "Time";
+  Float64 actual_range {range_start.timestamp()}, {range_end.timestamp()};
+  String axis "T";
+  String ioos_category "Time";
+  String standard_name "time";
+  String time_origin "01-JAN-1970 00:00:00";
+  String units "seconds since 1970-01-01T00:00:00Z";
+ }}
+ latitude {{
+  String _CoordinateAxisType "Lat";
+  Float64 actual_range 30.25, 49.98;
+ }}
+ water_u {{
+  Float64 colorBarMaximum 0.5;
+  String ioos_category "Currents";
+ }}
+ NC_GLOBAL {{
+  String title "HFRnet RTV";
+ }}
+}}
+"""
+
+
+_FAKE_DAS_TEXT = _fake_das_text(_DAS_RANGE_START, _DAS_RANGE_END)
+
+
+class TestNoaaHfRadarParseDasTimeRange:
+    def test_parses_actual_range_to_utc_datetimes(self):
+        from sar_validation.downloaders.noaa_hfradar_downloader import _parse_das_time_range
+
+        result = _parse_das_time_range(_FAKE_DAS_TEXT)
+        assert result == (
+            _DAS_RANGE_START.replace(tzinfo=None), _DAS_RANGE_END.replace(tzinfo=None),
+        )
+
+    def test_missing_time_block_returns_none(self):
+        from sar_validation.downloaders.noaa_hfradar_downloader import _parse_das_time_range
+
+        assert _parse_das_time_range("Attributes {\n latitude { }\n}\n") is None
+
+
+class TestNOAAHFRadarCheckAvailabilityDry:
+    def test_true_when_requested_window_overlaps_das_time_range(self, tmp_path):
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            _configure_fake_download_response(m, data=_FAKE_DAS_TEXT.encode())
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is True
+        called_url = m.call_args[0][0]
+        assert called_url.endswith("ucsdHfrW6.das")
+
+    def test_false_when_requested_window_outside_das_time_range(self, tmp_path):
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        # A window entirely before the .das-reported coverage, but still
+        # inside ERDDAP's own ~90-day rolling window (so select_backend
+        # itself doesn't short-circuit this to False for the wrong reason).
+        before_start = (datetime.now(timezone.utc) - timedelta(days=89)).strftime("%Y-%m-%d")
+        before_end = (datetime.now(timezone.utc) - timedelta(days=88)).strftime("%Y-%m-%d")
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            _configure_fake_download_response(m, data=_FAKE_DAS_TEXT.encode())
+            result = dl.check_availability_dry(-125, -119, 33, 38, before_start, before_end)
+
+        assert result is False
+
+    def test_true_when_das_has_no_parseable_time_range(self, tmp_path):
+        """Fail-open: an unparseable .das response must not rule out
+        availability."""
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            _configure_fake_download_response(m, data=b"Attributes { }\n")
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is True
+
+    def test_false_when_end_date_outside_erddap_window(self, tmp_path):
+        old = (datetime.now(timezone.utc) - timedelta(days=200)).strftime("%Y-%m-%d")
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            result = dl.check_availability_dry(-125, -119, 33, 38, old, old)
+
+        assert result is False
+        m.assert_not_called()
+
+    def test_false_when_resolution_unavailable_for_region(self, tmp_path):
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=0.5)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            # 0.5km isn't available for US-EastGulfCoast.
+            result = dl.check_availability_dry(-80, -70, 35, 42, _RECENT_START, _RECENT_END)
+
+        assert result is False
+        m.assert_not_called()
+
+
 class TestNOAAHFRadarDownload500m:
     def test_select_erddap_dataset_accepts_500m_for_us_west(self):
         from sar_validation.downloaders.noaa_hfradar_downloader import select_erddap_dataset

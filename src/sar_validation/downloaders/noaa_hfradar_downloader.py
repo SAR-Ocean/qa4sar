@@ -23,6 +23,7 @@ CLI usage::
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import urllib.request
 from datetime import datetime, timezone
@@ -45,6 +46,35 @@ ERDDAP_BASE = "https://coastwatch.pfeg.noaa.gov/erddap/griddap"
 # ERDDAP keeps a rolling ~3-month window; older dates need the THREDDS archive.
 ERDDAP_WINDOW_DAYS = 90
 DEFAULT_RESOLUTION_KM = 6
+
+# Matches the "time" attribute block's actual_range in an ERDDAP .das
+# (Dataset Attribute Structure) response, e.g.:
+#   time {
+#    String _CoordinateAxisType "Time";
+#    Float64 actual_range 1.7178912e+9, 1.755648e+9;
+#    ...
+#   }
+# actual_range values are seconds since the Unix epoch -- ERDDAP's own
+# convention for a "seconds since 1970-01-01T00:00:00Z" time axis.
+_DAS_TIME_RANGE_RE = re.compile(
+    r"\btime\s*\{.*?Float64\s+actual_range\s+([-0-9.eE]+)\s*,\s*([-0-9.eE]+)\s*;", re.DOTALL,
+)
+
+
+def _parse_das_time_range(das_text: str) -> Optional[tuple[datetime, datetime]]:
+    """(start, end) naive UTC datetimes parsed from a .das response's
+    "time" actual_range attribute, or None if that block/attribute isn't
+    present or isn't parseable -- a malformed/unexpected .das response,
+    not something to raise on."""
+    m = _DAS_TIME_RANGE_RE.search(das_text)
+    if not m:
+        return None
+    try:
+        start = datetime.fromtimestamp(float(m.group(1)), tz=timezone.utc).replace(tzinfo=None)
+        end = datetime.fromtimestamp(float(m.group(2)), tz=timezone.utc).replace(tzinfo=None)
+    except (ValueError, OverflowError, OSError):
+        return None
+    return start, end
 
 
 def select_erddap_dataset(min_lon, max_lon, min_lat, max_lat, resolution_km: float) -> str:
@@ -207,6 +237,48 @@ class NOAAHFRadarDownloader:
         with prefer_ipv4_dns(), urllib.request.urlopen(url, timeout=15) as resp:
             out_path.write_bytes(resp.read())
         return out_path
+
+    def check_availability_dry(
+        self, min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+        start: str, end: str,
+    ) -> bool:
+        """
+        Whether ERDDAP's own reported time coverage for the region/resolution
+        this request resolves to overlaps [start, end], via a single small
+        ``<dataset_url>.das`` (Dataset Attribute Structure) fetch -- a
+        standard, lightweight ERDDAP metadata endpoint (a few KB of ASCII
+        text), never a real griddap data subset.
+
+        Returns False (never raises) when the requested date is outside
+        ERDDAP's rolling window (``select_backend``) or the region/resolution
+        combination has no ERDDAP dataset at all (``select_erddap_dataset``)
+        -- both structural "ERDDAP doesn't apply here" outcomes, not check
+        failures. Returns True (fails open) when the .das response doesn't
+        expose a parseable "time" actual_range -- can't rule out coverage
+        from an unparseable response, matching this module's
+        fail-toward-inclusion convention.
+        """
+        try:
+            select_backend(end)
+        except NotImplementedError:
+            return False
+        try:
+            dataset_id = select_erddap_dataset(min_lon, max_lon, min_lat, max_lat, self.resolution_km)
+        except ValueError:
+            return False
+
+        das_url = f"{ERDDAP_BASE}/{dataset_id}.das"
+        with prefer_ipv4_dns(), urllib.request.urlopen(das_url, timeout=15) as resp:
+            text = resp.read().decode()
+
+        time_range = _parse_das_time_range(text)
+        if time_range is None:
+            return True
+
+        das_start, das_end = time_range
+        req_start = datetime.fromisoformat(normalize_datetime(start))
+        req_end = datetime.fromisoformat(normalize_datetime(end))
+        return req_start <= das_end and das_start <= req_end
 
 
 def _parse_args(argv=None):
