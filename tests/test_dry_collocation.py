@@ -1425,6 +1425,88 @@ class TestPredictCatalogPreciseSources:
         assert predicate is getattr(dry_collocation, f"_predict_{source_type}")
 
 
+class TestPredictAltimeterTolerance:
+    """Regression coverage for a bug where _predict_altimeter resolved its
+    time tolerance via the bare "altimeter" source_type. That key has no
+    DEFAULT_LAYER_TYPE_SPECS entry (only "altimeter_1hz"/"altimeter_5hz"
+    do, both 180 minutes) -- so it silently fell back to the generic
+    30-minute point_vs_layer default instead of the 180-minute tolerance
+    orchestrator.py's real _download_altimeter uses. A real altimeter pass
+    30-180 minutes from a SAR scene would then be missed by the predictor
+    and wrongly reported "none-predicted". Unlike the rest of this
+    module's tests, _resolve_temporal_padding_minutes is deliberately NOT
+    mocked in test_padded_window_reflects_180_minutes_end_to_end below --
+    it needs to exercise the real key lookup to catch this class of bug."""
+
+    def test_resolves_tolerance_via_altimeter_1hz_and_5hz_keys(self, monkeypatch):
+        """Pins the exact keys passed to _resolve_temporal_padding_minutes
+        -- a flat mocked return value alone wouldn't catch a caller still
+        passing the wrong (bare "altimeter") key."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        calls = []
+
+        def _fake_resolve(cfg, *source_types):
+            calls.append(source_types)
+            return 90
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", _fake_resolve)
+        monkeypatch.setattr(dry_collocation, "_altimeter_list_candidates_dry", lambda *a, **k: [])
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        dry_collocation._predict_altimeter(source=object(), cfg=object(), sar_footprints=[footprint])
+
+        assert calls == [("altimeter_1hz", "altimeter_5hz")]
+
+    def test_padded_window_reflects_180_minutes_end_to_end(self, monkeypatch):
+        """Uses the REAL _resolve_temporal_padding_minutes (not mocked)
+        against a realistically-shaped cfg (recipe.py's own CollocationType,
+        whose defaults already carry DEFAULT_LAYER_TYPE_SPECS), and asserts
+        the padded start/end actually passed to list_candidates_dry reflect
+        180-minute padding -- pinning the bug's true end-to-end symptom,
+        not just the numeric tolerance in isolation."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+        from sar_validation.core.recipe import CollocationType
+
+        cfg = SimpleNamespace(collocation=CollocationType(), validation_sources=[])
+
+        captured = {}
+
+        def _fake_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            captured["start"] = start
+            captured["end"] = end
+            return []
+
+        monkeypatch.setattr(dry_collocation, "_altimeter_list_candidates_dry", _fake_list_candidates_dry)
+
+        sensing_start = datetime(2026, 8, 1, 6, 0, 30)
+        sensing_end = datetime(2026, 8, 1, 6, 1, 0)
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=sensing_start, sensing_end=sensing_end, source_file="s1.SAFE",
+        )
+
+        dry_collocation._predict_altimeter(source=object(), cfg=cfg, sar_footprints=[footprint])
+
+        expected_start = (sensing_start - timedelta(minutes=180)).isoformat()
+        expected_end = (sensing_end + timedelta(minutes=180)).isoformat()
+        assert captured["start"] == expected_start
+        assert captured["end"] == expected_end
+
+        # The narrower (buggy) 30-minute padding this bug used to produce
+        # must not match -- a stronger check than only asserting equality
+        # with the correct value.
+        wrong_start = (sensing_start - timedelta(minutes=30)).isoformat()
+        assert captured["start"] != wrong_start
+
+
 class TestPredictAmsrSsm:
     """Combined predicate for source_type='amsr_ssm': NASA Earthdata/CMR
     (catalog-precise) checked first, JAXA G-Portal SFTP (orbit-corridor)

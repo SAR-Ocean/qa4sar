@@ -823,6 +823,7 @@ def _predict_catalog_precise_source(
     *,
     list_candidates_dry: "Callable[..., list[tuple[str, datetime, datetime]]]",
     source_type: str,
+    tolerance_source_types: "Optional[tuple[str, ...]]" = None,
 ) -> SourcePrediction:
     """Shared predicate for every catalog-precise-bucket source (ASCAT
     winds, SMAP/AMSR2 via NASA Earthdata/CMR, altimeter via Copernicus
@@ -835,6 +836,12 @@ def _predict_catalog_precise_source(
     listing call per point, matching that vignette's own tiny extent),
     never against one enclosing box, mirroring
     _predict_orbit_corridor_source's identical per-vignette handling.
+
+    tolerance_source_types overrides which key(s) resolve the time
+    tolerance via _resolve_temporal_padding_minutes, for a caller whose
+    source_type doesn't itself carry a DEFAULT_LAYER_TYPE_SPECS entry
+    (e.g. altimeter, keyed there as "altimeter_1hz"/"altimeter_5hz").
+    Defaults to (source_type,), matching every other caller.
     """
     if not sar_footprints:
         return SourcePrediction(
@@ -842,7 +849,9 @@ def _predict_catalog_precise_source(
             detail="No SAR footprints supplied -- cannot predict.",
         )
 
-    tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, source_type))
+    tolerance = timedelta(
+        minutes=_resolve_temporal_padding_minutes(cfg, *(tolerance_source_types or (source_type,)))
+    )
     matched_windows: "list[tuple[datetime, datetime]]" = []
 
     for footprint in sar_footprints:
@@ -1174,11 +1183,19 @@ def _predict_altimeter(source, cfg, sar_footprints: "list[SarFootprint]") -> Sou
     """Catalog-precise predicate for source_type="altimeter" -- Copernicus
     Marine's along-track datasets are opened bbox/time-filtered via
     copernicusmarine.open_dataset(), already a real geometrically-precise
-    server-side query."""
+    server-side query.
+
+    tolerance_source_types passes ("altimeter_1hz", "altimeter_5hz")
+    rather than the bare "altimeter" source_type, mirroring
+    orchestrator.py's _download_altimeter -- DEFAULT_LAYER_TYPE_SPECS has
+    no "altimeter" entry, only per-frequency ones (both 180 minutes), so
+    using the bare key would silently fall back to the generic 30-minute
+    default."""
     return _predict_catalog_precise_source(
         source, cfg, sar_footprints,
         list_candidates_dry=_altimeter_list_candidates_dry,
         source_type="altimeter",
+        tolerance_source_types=("altimeter_1hz", "altimeter_5hz"),
     )
 
 
