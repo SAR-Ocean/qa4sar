@@ -60,7 +60,7 @@ from .orchestrator import _resolve_temporal_padding_minutes
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["SarFootprint", "Verdict", "SourcePrediction", "CollocationReport", "predict_source"]
+__all__ = ["SarFootprint", "Verdict", "SourcePrediction", "CollocationReport", "predict_source", "predict_collocation"]
 
 #: Registered Sentinel-1 orbit specs (orbit_coverage.SATELLITE_ORBIT_SPECS)
 #: to try per CLMS SSM tile-day candidate -- a tile could have been
@@ -716,6 +716,28 @@ def predict_source(source, cfg, sar_footprints: "list[SarFootprint]") -> SourceP
             detail=f"No dry-collocation predicate registered for source_type={source.source_type!r}.",
         )
     return predicate(source, cfg, sar_footprints)
+
+
+def predict_collocation(cfg, sar_footprints: "list[SarFootprint]", recipe_path: str = "") -> CollocationReport:
+    """Predict collocation for every configured validation source in
+    cfg.validation_sources against sar_footprints. One source's predicate
+    raising is caught and turned into an "unknown" verdict for that
+    source alone -- never aborts the whole report."""
+    predictions = []
+    for source in cfg.validation_sources:
+        try:
+            predictions.append(predict_source(source, cfg, sar_footprints))
+        except Exception:
+            logger.debug("predict_collocation: predict_source failed for %s", source.source_type, exc_info=True)
+            predictions.append(
+                SourcePrediction(
+                    source_type=source.source_type, bucket="unregistered", verdict="unknown",
+                    detail=f"Prediction raised an exception for {source.source_type}.",
+                )
+            )
+    return CollocationReport(
+        recipe_path=recipe_path, sar_footprint_count=len(sar_footprints), predictions=predictions,
+    )
 
 
 def _point_in_footprint(

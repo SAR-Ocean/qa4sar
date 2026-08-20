@@ -3566,3 +3566,57 @@ class TestPredictModelSourceRegistrations:
         assert result.verdict == "collocated"
         assert result.source_type == "era5"
         assert result.bucket == "model"
+
+
+class TestPredictCollocation:
+    def test_aggregates_one_prediction_per_validation_source(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        class _FakeSource:
+            def __init__(self, source_type):
+                self.source_type = source_type
+
+        class _FakeCfg:
+            validation_sources = [_FakeSource("ismn"), _FakeSource("era5")]
+
+        fake_predictions = {
+            "ismn": dry_collocation.SourcePrediction(source_type="ismn", bucket="ground-point", verdict="collocated", detail="x"),
+            "era5": dry_collocation.SourcePrediction(source_type="era5", bucket="model", verdict="none-predicted", detail="y"),
+        }
+        monkeypatch.setattr(
+            dry_collocation, "predict_source",
+            lambda source, cfg, sar_footprints: fake_predictions[source.source_type],
+        )
+
+        report = dry_collocation.predict_collocation(_FakeCfg(), sar_footprints=[], recipe_path="r.yaml")
+
+        assert report.recipe_path == "r.yaml"
+        assert report.sar_footprint_count == 0
+        assert len(report.predictions) == 2
+        assert {p.source_type for p in report.predictions} == {"ismn", "era5"}
+
+    def test_a_single_source_raising_becomes_unknown_not_a_crash(self, monkeypatch):
+        """One source's predicate misbehaving must not take down the
+        whole report -- every OTHER source's prediction must still
+        appear."""
+        from sar_validation.core import dry_collocation
+
+        class _FakeSource:
+            def __init__(self, source_type):
+                self.source_type = source_type
+
+        class _FakeCfg:
+            validation_sources = [_FakeSource("ismn"), _FakeSource("era5")]
+
+        def _fake_predict_source(source, cfg, sar_footprints):
+            if source.source_type == "ismn":
+                raise RuntimeError("boom")
+            return dry_collocation.SourcePrediction(source_type="era5", bucket="model", verdict="collocated", detail="y")
+
+        monkeypatch.setattr(dry_collocation, "predict_source", _fake_predict_source)
+
+        report = dry_collocation.predict_collocation(_FakeCfg(), sar_footprints=[])
+
+        assert len(report.predictions) == 2
+        ismn_pred = next(p for p in report.predictions if p.source_type == "ismn")
+        assert ismn_pred.verdict == "unknown"
