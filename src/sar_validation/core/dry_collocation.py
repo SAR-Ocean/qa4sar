@@ -589,17 +589,28 @@ def discover_sar_footprints_dry(sar_data_spec, cfg) -> "list[SarFootprint]":
     return discover_fn(cfg)
 
 
-def sar_footprints_from_downloaded(sar_files, sar_source_spec) -> "list[SarFootprint]":
+def sar_footprints_from_downloaded(sar_files, sar_source_spec, product_type: str) -> "list[SarFootprint]":
     """Footprints from already-downloaded, already-converted SAR files --
     used by a real run's inline (non-dry) prediction path. sar_source_spec
     is the matching entry from SAR_SOURCES (core/sar_sources.py).
+    product_type (the recipe's cfg.variable, e.g. "wind"/"waves"/
+    "currents"/"soil_moisture") is threaded straight through to
+    sar_source_spec.convert(path, product_type), mirroring
+    orchestrator.py's own _compute_sar_scene_times pattern -- required
+    (no default) since only the caller knows the real value, and passing
+    a placeholder would silently break sentinel1_l2_ocn's convert(),
+    which branches on it.
 
-    Only "sentinel1_clms_ssm" is wired here so far -- the other three
-    SAR_SOURCES keys (Sentinel-1 OCN, RADARSAT-2, NISAR SME2) raise
-    NotImplementedError below. This is a deliberately deferred gap, not
-    an oversight: wiring their from-downloaded paths is left to whichever
-    later plan first needs it, since nothing in this plan's own tests
-    exercises it for those three sources."""
+    "sentinel1_clms_ssm" keeps its own dedicated path
+    (_clms_ssm_footprint_from_downloaded), since CLMS SSM tiles need
+    real non-NaN pixel extent, not just a converted Dataset's overall
+    bbox. Every other SAR_SOURCES key (Sentinel-1 OCN, NISAR SME2,
+    RADARSAT-2) shares one generic path below: each source's convert()
+    already normalizes its native format into a (lon, lat, time)
+    xarray.Dataset with either a WV-mode "point" dimension or a
+    grid-mode (y, x) shape -- see DataTreeConverter.from_sar_l2_ocn_safe/
+    from_nisar_sme2/from_radarsat2_wind -- so no further per-source
+    branching is needed here."""
     if sar_source_spec.key == "sentinel1_clms_ssm":
         footprints = []
         for path in sar_files:
@@ -607,12 +618,43 @@ def sar_footprints_from_downloaded(sar_files, sar_source_spec) -> "list[SarFootp
             if fp is not None:
                 footprints.append(fp)
         return footprints
-    raise NotImplementedError(
-        f"sar_footprints_from_downloaded: {sar_source_spec.key!r} not yet wired -- "
-        f"non-CLMS-SSM sources reuse SAR_SOURCES[...].convert(...) directly the same "
-        f"way _compute_sar_scene_times does; add that dispatch branch here when wiring "
-        f"the corresponding source into a later plan."
-    )
+
+    footprints = []
+    for path in sar_files:
+        try:
+            ds = sar_source_spec.convert(path, product_type)
+        except Exception:
+            logger.debug("sar_footprints_from_downloaded: convert() failed for %s", path, exc_info=True)
+            continue
+        if ds is None:
+            continue
+        lon_min, lon_max = float(ds["lon"].min()), float(ds["lon"].max())
+        lat_min, lat_max = float(ds["lat"].min()), float(ds["lat"].max())
+        is_wv = "point" in ds.dims and "y" not in ds.dims  # matches collocation.py's own is_wv_mode check
+        if is_wv:
+            lats = ds["lat"].values.tolist()
+            lons = ds["lon"].values.tolist()
+            points = list(zip(lats, lons))
+            # A WV product's "time" coord holds one value per vignette
+            # (dims=["point"]) -- a real product bundles ~16 of them at
+            # DIFFERENT acquisition times (see
+            # DataTreeConverter.from_sar_l2_ocn_wv_safe), so it's an
+            # array, not a scalar; sensing_start/sensing_end span its
+            # full range rather than assuming a single .item()-able value.
+            times = pd.to_datetime(ds["time"].values)
+            footprints.append(SarFootprint(
+                kind="wv_points", bbox=(lon_min, lon_max, lat_min, lat_max), polygon=None, points=points,
+                sensing_start=times.min().to_pydatetime(), sensing_end=times.max().to_pydatetime(),
+                source_file=str(path),
+            ))
+        else:
+            time_val = ds["time"].values
+            sensing = time_val.item() if hasattr(time_val, "item") else time_val
+            footprints.append(SarFootprint(
+                kind="polygon", bbox=(lon_min, lon_max, lat_min, lat_max), polygon=None, points=None,
+                sensing_start=sensing, sensing_end=sensing, source_file=str(path),
+            ))
+    return footprints
 
 
 Verdict = Literal["collocated", "none-predicted", "unknown"]

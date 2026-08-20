@@ -819,10 +819,194 @@ class TestTopLevelDispatchers:
             key = "sentinel1_clms_ssm"
 
         result = dry_collocation.sar_footprints_from_downloaded(
-            [tmp_path / "a.tif"], _FakeSarSourceSpec(),
+            [tmp_path / "a.tif"], _FakeSarSourceSpec(), "soil_moisture",
         )
 
         assert result == [fp]
+
+
+class TestSarFootprintsFromDownloadedRemainingSources:
+    """sentinel1_l2_ocn / nisar_sme2 / radarsat2 all share the same
+    generic from-downloaded path -- SARSourceSpec.convert() has already
+    normalized each source's native format into a (lon, lat, time)
+    xarray.Dataset, so no per-source branching is needed here beyond
+    detecting WV mode's "point" dimension (see collocation.py's own
+    is_wv_mode check)."""
+
+    def test_sentinel1_ocn_uses_converted_dataset_geometry(self, tmp_path):
+        import xarray as xr
+
+        from sar_validation.core import dry_collocation
+
+        fake_ds = xr.Dataset(
+            {"oswWindSpeed": (("y", "x"), [[5.0]])},
+            coords={
+                "lon": (("y", "x"), [[10.0]]), "lat": (("y", "x"), [[45.0]]),
+                "time": datetime(2026, 8, 1, 6, 0, 0),
+            },
+        )
+
+        class _FakeSarSourceSpec:
+            key = "sentinel1_l2_ocn"
+
+            @staticmethod
+            def convert(path, product_type):
+                assert product_type == "wind"
+                return fake_ds
+
+        result = dry_collocation.sar_footprints_from_downloaded(
+            [tmp_path / "a.nc"], _FakeSarSourceSpec(), "wind",
+        )
+
+        assert len(result) == 1
+        assert result[0].kind == "polygon"
+        assert result[0].bbox == (10.0, 10.0, 45.0, 45.0)
+        assert result[0].sensing_start == datetime(2026, 8, 1, 6, 0, 0)
+        assert result[0].sensing_end == datetime(2026, 8, 1, 6, 0, 0)
+        assert result[0].source_file == str(tmp_path / "a.nc")
+
+    def test_conversion_failure_is_skipped_not_raised(self, tmp_path):
+        from sar_validation.core import dry_collocation
+
+        class _FakeSarSourceSpec:
+            key = "sentinel1_l2_ocn"
+
+            @staticmethod
+            def convert(path, product_type):
+                raise RuntimeError("boom")
+
+        result = dry_collocation.sar_footprints_from_downloaded(
+            [tmp_path / "a.nc"], _FakeSarSourceSpec(), "wind",
+        )
+
+        assert result == []
+
+    def test_none_dataset_is_skipped_not_raised(self, tmp_path):
+        """convert() returning None (e.g. a currents run whose scene has
+        no RVL data -- see _from_sar_l2_ocn_iw_safe) must be skipped like
+        a caught exception, not treated as a footprint."""
+        from sar_validation.core import dry_collocation
+
+        class _FakeSarSourceSpec:
+            key = "sentinel1_l2_ocn"
+
+            @staticmethod
+            def convert(path, product_type):
+                return None
+
+        result = dry_collocation.sar_footprints_from_downloaded(
+            [tmp_path / "a.nc"], _FakeSarSourceSpec(), "currents",
+        )
+
+        assert result == []
+
+    def test_wv_mode_produces_multi_point_footprint_spanning_its_time_range(self, tmp_path):
+        """WV mode's converted Dataset carries one (lon, lat, time) triple
+        per vignette along a "point" dimension (see
+        DataTreeConverter.from_sar_l2_ocn_wv_safe) -- a real WV SAFE
+        product bundles ~16 vignettes at DIFFERENT acquisition times, so
+        ds["time"].values is a multi-element array, not a scalar.
+        sensing_start/sensing_end must span that range rather than assume
+        a single scalar time."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core import dry_collocation
+
+        fake_ds = xr.Dataset(
+            {"oswTotalHs": (["point"], [1.0, 2.0])},
+            coords={
+                "lon": (["point"], [10.0, 11.0]),
+                "lat": (["point"], [45.0, 46.0]),
+                "time": (["point"], np.array(
+                    ["2026-08-01T06:00:00", "2026-08-01T06:05:00"], dtype="datetime64[ns]",
+                )),
+            },
+        )
+
+        class _FakeSarSourceSpec:
+            key = "sentinel1_l2_ocn"
+
+            @staticmethod
+            def convert(path, product_type):
+                return fake_ds
+
+        result = dry_collocation.sar_footprints_from_downloaded(
+            [tmp_path / "a.SAFE"], _FakeSarSourceSpec(), "waves",
+        )
+
+        assert len(result) == 1
+        fp = result[0]
+        assert fp.kind == "wv_points"
+        assert fp.points == [(45.0, 10.0), (46.0, 11.0)]
+        assert fp.bbox == (10.0, 11.0, 45.0, 46.0)
+        assert fp.sensing_start == datetime(2026, 8, 1, 6, 0, 0)
+        assert fp.sensing_end == datetime(2026, 8, 1, 6, 5, 0)
+
+    def test_wv_mode_single_vignette_does_not_crash(self, tmp_path):
+        """A single-vignette WV product's ds["time"].values is a
+        1-element array -- must not be treated any differently from the
+        multi-vignette case above."""
+        import xarray as xr
+
+        from sar_validation.core import dry_collocation
+
+        fake_ds = xr.Dataset(
+            {"oswTotalHs": (["point"], [1.0])},
+            coords={
+                "lon": (["point"], [10.0]),
+                "lat": (["point"], [45.0]),
+                "time": (["point"], [datetime(2026, 8, 1, 6, 0, 0)]),
+            },
+        )
+
+        class _FakeSarSourceSpec:
+            key = "sentinel1_l2_ocn"
+
+            @staticmethod
+            def convert(path, product_type):
+                return fake_ds
+
+        result = dry_collocation.sar_footprints_from_downloaded(
+            [tmp_path / "a.SAFE"], _FakeSarSourceSpec(), "waves",
+        )
+
+        assert len(result) == 1
+        assert result[0].kind == "wv_points"
+        assert result[0].points == [(45.0, 10.0)]
+        assert result[0].sensing_start == result[0].sensing_end == datetime(2026, 8, 1, 6, 0, 0)
+
+    @pytest.mark.parametrize("key", ["nisar_sme2", "radarsat2"])
+    def test_nisar_and_radarsat2_route_through_the_same_generic_grid_path(self, tmp_path, key):
+        """nisar_sme2 and radarsat2's convert() callbacks both produce a
+        (y, x)-gridded Dataset (see from_nisar_sme2 / from_radarsat2_wind)
+        just like sentinel1_l2_ocn's non-WV path -- this was the
+        NotImplementedError gap this task closes for those two sources."""
+        import xarray as xr
+
+        from sar_validation.core import dry_collocation
+
+        fake_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), [[0.2]])},
+            coords={
+                "lon": (("y", "x"), [[20.0]]), "lat": (("y", "x"), [[50.0]]),
+                "time": datetime(2026, 8, 1, 12, 0, 0),
+            },
+        )
+
+        class _FakeSarSourceSpec:
+            pass
+
+        _FakeSarSourceSpec.key = key
+        _FakeSarSourceSpec.convert = staticmethod(lambda path, product_type: fake_ds)
+
+        result = dry_collocation.sar_footprints_from_downloaded(
+            [tmp_path / "a.h5"], _FakeSarSourceSpec(), "soil_moisture",
+        )
+
+        assert len(result) == 1
+        assert result[0].kind == "polygon"
+        assert result[0].bbox == (20.0, 20.0, 50.0, 50.0)
 
 
 class TestPredictSourceDispatch:
