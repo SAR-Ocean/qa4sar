@@ -3620,3 +3620,45 @@ class TestPredictCollocation:
         assert len(report.predictions) == 2
         ismn_pred = next(p for p in report.predictions if p.source_type == "ismn")
         assert ismn_pred.verdict == "unknown"
+
+
+class TestReportRendering:
+    def test_console_table_includes_every_prediction(self):
+        from sar_validation.core.dry_collocation import CollocationReport, SourcePrediction, render_console_table
+
+        report = CollocationReport(
+            recipe_path="r.yaml", sar_footprint_count=2,
+            predictions=[
+                SourcePrediction(source_type="ismn", bucket="ground-point", verdict="collocated", detail="2 station(s)"),
+                SourcePrediction(source_type="era5", bucket="model", verdict="none-predicted", detail="outside coverage"),
+            ],
+        )
+
+        table = render_console_table(report)
+
+        assert "ismn" in table
+        assert "collocated" in table
+        assert "era5" in table
+        assert "none-predicted" in table
+
+    def test_json_round_trips_every_field(self):
+        import json
+        from sar_validation.core.dry_collocation import CollocationReport, SourcePrediction, report_to_json
+
+        report = CollocationReport(
+            recipe_path="r.yaml", sar_footprint_count=1,
+            predictions=[
+                SourcePrediction(
+                    source_type="ismn", bucket="ground-point", verdict="unknown",
+                    detail="no archive", message="see README",
+                    matched_windows=[], matched_stations=[],
+                ),
+            ],
+        )
+
+        parsed = json.loads(report_to_json(report))
+
+        assert parsed["recipe_path"] == "r.yaml"
+        assert parsed["sar_footprint_count"] == 1
+        assert parsed["predictions"][0]["source_type"] == "ismn"
+        assert parsed["predictions"][0]["message"] == "see README"

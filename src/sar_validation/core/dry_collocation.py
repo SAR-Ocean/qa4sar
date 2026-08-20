@@ -13,6 +13,7 @@ This module is built up across four sequential implementation plans:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import urllib.error
@@ -60,7 +61,7 @@ from .orchestrator import _resolve_temporal_padding_minutes
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["SarFootprint", "Verdict", "SourcePrediction", "CollocationReport", "predict_source", "predict_collocation"]
+__all__ = ["SarFootprint", "Verdict", "SourcePrediction", "CollocationReport", "predict_source", "predict_collocation", "render_console_table", "report_to_json"]
 
 #: Registered Sentinel-1 orbit specs (orbit_coverage.SATELLITE_ORBIT_SPECS)
 #: to try per CLMS SSM tile-day candidate -- a tile could have been
@@ -738,6 +739,42 @@ def predict_collocation(cfg, sar_footprints: "list[SarFootprint]", recipe_path: 
     return CollocationReport(
         recipe_path=recipe_path, sar_footprint_count=len(sar_footprints), predictions=predictions,
     )
+
+
+def render_console_table(report: CollocationReport) -> str:
+    """A simple fixed-width table -- source_type | bucket | verdict |
+    detail -- one row per prediction, no external dependency (no
+    tabulate/rich) since every other CLI output in this codebase is
+    plain print()."""
+    header = f"{'source':<24}{'bucket':<18}{'verdict':<16}detail"
+    lines = [header, "-" * len(header)]
+    for p in report.predictions:
+        lines.append(f"{p.source_type:<24}{p.bucket:<18}{p.verdict:<16}{p.detail}")
+        if p.message:
+            lines.append(f"{'':<24}{'':<18}{'':<16}  -> {p.message}")
+    return "\n".join(lines)
+
+
+def report_to_json(report: CollocationReport) -> str:
+    """JSON serialization of report -- datetimes become ISO-8601 strings."""
+    def _default(obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        raise TypeError(f"Not JSON serializable: {obj!r}")
+
+    payload = {
+        "recipe_path": report.recipe_path,
+        "sar_footprint_count": report.sar_footprint_count,
+        "predictions": [
+            {
+                "source_type": p.source_type, "bucket": p.bucket, "verdict": p.verdict,
+                "detail": p.detail, "message": p.message,
+                "matched_windows": p.matched_windows, "matched_stations": p.matched_stations,
+            }
+            for p in report.predictions
+        ],
+    }
+    return json.dumps(payload, default=_default, indent=2)
 
 
 def _point_in_footprint(
