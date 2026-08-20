@@ -1747,8 +1747,17 @@ def _predict_global_composite(
     """Shared predicate for the global-composite bucket (RSS radiometer,
     CDS SSM): both sources publish one daily global-coverage file, so
     spatial refinement isn't meaningful -- a footprint's own bbox/polygon
-    is never consulted, only its sensing day. Collocated if any
-    footprint's day has data available from *check_exists_dry*.
+    is never consulted, only which calendar day(s) its (padded) sensing
+    window touches. Collocated if any of those days has data available
+    from *check_exists_dry*.
+
+    Each footprint's sensing window is padded by the resolved collocation
+    time tolerance before being converted to calendar days -- mirroring
+    the real download path's own padding (see
+    ``orchestrator._padded_temporal_bounds``) -- since a footprint near a
+    UTC day boundary can pull real data from an adjacent day once that
+    padding is applied, which checking only the footprint's own unpadded
+    ``sensing_start`` date would miss.
     """
     if not sar_footprints:
         return SourcePrediction(
@@ -1756,18 +1765,28 @@ def _predict_global_composite(
             detail="No SAR footprints supplied -- cannot predict.",
         )
 
+    tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, source_type))
+
     any_exists = False
     for footprint in sar_footprints:
-        day = footprint.sensing_start.date()
-        try:
-            if check_exists_dry(day):
-                any_exists = True
-        except Exception:
-            logger.debug("_predict_global_composite: existence check failed", exc_info=True)
-            return SourcePrediction(
-                source_type=source_type, bucket="global-composite", verdict="unknown",
-                detail=f"Existence check failed for {source_type}.",
-            )
+        padded_start = footprint.sensing_start - tolerance
+        padded_end = footprint.sensing_end + tolerance
+        days: "list[date]" = []
+        d = padded_start.date()
+        while d <= padded_end.date():
+            days.append(d)
+            d += timedelta(days=1)
+
+        for day in days:
+            try:
+                if check_exists_dry(day):
+                    any_exists = True
+            except Exception:
+                logger.debug("_predict_global_composite: existence check failed", exc_info=True)
+                return SourcePrediction(
+                    source_type=source_type, bucket="global-composite", verdict="unknown",
+                    detail=f"Existence check failed for {source_type}.",
+                )
 
     verdict: Verdict = "collocated" if any_exists else "none-predicted"
     return SourcePrediction(

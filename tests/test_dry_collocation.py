@@ -2456,8 +2456,12 @@ class TestPredictHfRadarUs:
 class TestPredictGlobalComposite:
     """_predict_global_composite is the shared predicate for the
     global-composite bucket (RSS radiometer, CDS SSM): both sources
-    publish one daily global-coverage file, so only a footprint's own
-    sensing day matters -- no spatial (bbox/polygon) refinement."""
+    publish one daily global-coverage file, so only the calendar day(s) a
+    footprint's (padded) sensing window touches matters -- no spatial
+    (bbox/polygon) refinement. Every test here mocks
+    _resolve_temporal_padding_minutes (matching every other predicate's
+    own tests in this module) since cfg is a bare sentinel with no real
+    ``collocation`` config attached."""
 
     def _footprint(self, day=datetime(2026, 8, 1, 6, 0, 0)):
         from sar_validation.core.dry_collocation import SarFootprint
@@ -2479,8 +2483,11 @@ class TestPredictGlobalComposite:
         assert result.verdict == "unknown"
         assert result.bucket == "global-composite"
 
-    def test_collocated_when_any_footprint_day_exists(self):
+    def test_collocated_when_any_footprint_day_exists(self, monkeypatch):
+        from sar_validation.core import dry_collocation
         from sar_validation.core.dry_collocation import _predict_global_composite
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
 
         seen_days = []
 
@@ -2498,8 +2505,11 @@ class TestPredictGlobalComposite:
         assert result.bucket == "global-composite"
         assert seen_days == [datetime(2026, 8, 1).date(), datetime(2026, 8, 2).date()]
 
-    def test_none_predicted_when_no_footprint_day_exists(self):
+    def test_none_predicted_when_no_footprint_day_exists(self, monkeypatch):
+        from sar_validation.core import dry_collocation
         from sar_validation.core.dry_collocation import _predict_global_composite
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
 
         result = _predict_global_composite(
             source=object(), cfg=object(), sar_footprints=[self._footprint()],
@@ -2509,8 +2519,11 @@ class TestPredictGlobalComposite:
         assert result.verdict == "none-predicted"
         assert result.source_type == "cds_ssm"
 
-    def test_unknown_when_check_raises(self):
+    def test_unknown_when_check_raises(self, monkeypatch):
+        from sar_validation.core import dry_collocation
         from sar_validation.core.dry_collocation import _predict_global_composite
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
 
         def _raise(day):
             raise RuntimeError("boom")
@@ -2522,11 +2535,14 @@ class TestPredictGlobalComposite:
 
         assert result.verdict == "unknown"
 
-    def test_bbox_and_polygon_never_consulted(self):
+    def test_bbox_and_polygon_never_consulted(self, monkeypatch):
         """Spatial refinement isn't meaningful for a daily global-coverage
-        file -- check_exists_dry only ever receives the footprint's day,
-        never its bbox/polygon."""
+        file -- check_exists_dry only ever receives a calendar day, never
+        the footprint's bbox/polygon."""
+        from sar_validation.core import dry_collocation
         from sar_validation.core.dry_collocation import SarFootprint, _predict_global_composite
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
 
         footprint = SarFootprint(
             kind="polygon", bbox=(-10.0, 5.0, 50.0, 62.0), polygon=[(50.0, -10.0), (62.0, 5.0)], points=None,
@@ -2545,6 +2561,38 @@ class TestPredictGlobalComposite:
         )
 
         assert call_args == [(datetime(2026, 8, 1).date(),)]
+
+    def test_padded_window_crossing_day_boundary_checks_both_days(self, monkeypatch):
+        """A footprint whose sensing window is close to a UTC day boundary
+        must have BOTH the unpadded day and the padded-in adjacent day
+        checked -- the real download path (orchestrator._padded_temporal_bounds)
+        applies this same padding, so a footprint at 23:50 with a 30-minute
+        tolerance can genuinely pull data from the next day; checking only
+        the footprint's own unpadded sensing_start date would risk a false
+        "none-predicted" for that adjacent day's real data."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint, _predict_global_composite
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 30)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 5.0, 50.0, 62.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 23, 50, 0), sensing_end=datetime(2026, 8, 1, 23, 51, 0),
+            source_file="s1.SAFE",
+        )
+        seen_days = []
+
+        def _check(day):
+            seen_days.append(day)
+            return day == datetime(2026, 8, 2).date()
+
+        result = _predict_global_composite(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            check_exists_dry=_check, source_type="radiometer",
+        )
+
+        assert seen_days == [datetime(2026, 8, 1).date(), datetime(2026, 8, 2).date()]
+        assert result.verdict == "collocated"
 
 
 class TestRadiometerCheckDry:
@@ -2650,6 +2698,7 @@ class TestPredictGlobalCompositeRegistrations:
         from sar_validation.core.dry_collocation import SarFootprint, predict_source
 
         monkeypatch.setattr(dry_collocation, check_dry_name, lambda source, day: True)
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
 
         footprint = SarFootprint(
             kind="polygon", bbox=(-10.0, 5.0, 50.0, 62.0), polygon=None, points=None,
@@ -2671,8 +2720,9 @@ class TestPredictGlobalCompositeRegistrations:
         from sar_validation.core import dry_collocation
         from sar_validation.core.dry_collocation import SarFootprint, predict_source
 
-        check_dry_name = f"_{'radiometer' if source_type == 'radiometer' else 'cds_ssm'}_check_dry"
+        check_dry_name = f"_{source_type}_check_dry"
         monkeypatch.setattr(dry_collocation, check_dry_name, lambda source, day: False)
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
 
         footprint = SarFootprint(
             kind="polygon", bbox=(-10.0, 5.0, 50.0, 62.0), polygon=None, points=None,
