@@ -1363,3 +1363,52 @@ def _predict_ismn(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePr
 
 
 _PREDICATES["ismn"] = _predict_ismn
+
+
+def _predict_insitu(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Predicate for the five real Copernicus Marine in-situ source
+    types (mooring, buoy, drifter, ferrybox, tidal_gauge) -- see
+    orchestrator.py's _INSITU_TYPES. Unlike those five types' real
+    (non-dry) download path, which batches every requested platform type
+    into one InSituDownloader.download(source_types=[...]) call,
+    predict_source is called once per individual validation source, so
+    this predicate filters its own check_availability_dry call down to
+    just the single source.source_type it was invoked for.
+
+    This bucket stays bbox-only (no _point_in_footprint refinement):
+    check_availability_dry is a single aggregate "does any data exist"
+    boolean from the Copernicus Marine service itself, with no per-station
+    coordinates to check further -- unlike ISMN's local station index.
+    """
+    from ..downloaders.insitu_downloader import InSituDownloader
+
+    dl = InSituDownloader(output_dir=Path("."))
+    tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, source.source_type))
+    any_available = False
+
+    for footprint in sar_footprints:
+        padded_start = footprint.sensing_start - tolerance
+        padded_end = footprint.sensing_end + tolerance
+        try:
+            if dl.check_availability_dry(
+                footprint.bbox[0], footprint.bbox[1], footprint.bbox[2], footprint.bbox[3],
+                padded_start.isoformat(), padded_end.isoformat(),
+                source_types=[source.source_type],
+            ):
+                any_available = True
+        except Exception:
+            logger.debug("_predict_insitu: availability check failed", exc_info=True)
+            return SourcePrediction(
+                source_type=source.source_type, bucket="ground-point", verdict="unknown",
+                detail="In-situ availability check failed.",
+            )
+
+    verdict: Verdict = "collocated" if any_available else "none-predicted"
+    return SourcePrediction(
+        source_type=source.source_type, bucket="ground-point", verdict=verdict,
+        detail=f"In-situ data {'found' if any_available else 'not found'} in predicted window(s).",
+    )
+
+
+for _insitu_type in ("mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"):
+    _PREDICATES[_insitu_type] = _predict_insitu

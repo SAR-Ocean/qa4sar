@@ -5,9 +5,31 @@ from __future__ import annotations
 import logging
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
+
 from sar_validation.downloaders.insitu_downloader import InSituDownloader
 
 _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT = 165.0, 180.0, 60.0, 68.0
+
+
+class _FakeCopernicusMarineModule:
+    """Minimal stand-in for the copernicusmarine module, exposing just the
+    read_dataframe() call check_availability_dry uses. platform_type
+    defaults to "MO" (mooring) -- callers that need to test source_types
+    filtering pass a different code."""
+
+    def __init__(self, has_data: bool, platform_type: str = "MO"):
+        self._has_data = has_data
+        self._platform_type = platform_type
+
+    def read_dataframe(self, **kwargs):
+        if not self._has_data:
+            return pd.DataFrame()
+        return pd.DataFrame({
+            "variable": ["VHM0"],
+            "platform_type": [self._platform_type],
+            "value": [1.0],
+        })
 
 
 class TestNoDataOutcome:
@@ -72,3 +94,70 @@ class TestNoDataOutcome:
 
         assert len(out) == 1
         assert out[0].exists()
+
+
+class TestCheckAvailabilityDry:
+    def test_check_availability_dry_returns_true_when_data_exists(self, monkeypatch, tmp_path):
+        fake_copernicusmarine = _FakeCopernicusMarineModule(has_data=True)
+        monkeypatch.setattr(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader._get_copernicusmarine",
+            lambda self: fake_copernicusmarine,
+        )
+
+        dl = InSituDownloader(output_dir=tmp_path)
+        result = dl.check_availability_dry(
+            min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0,
+            start="2026-08-01T00:00:00", end="2026-08-01T01:00:00",
+        )
+
+        assert result is True
+
+    def test_check_availability_dry_returns_false_when_no_data(self, monkeypatch, tmp_path):
+        fake_copernicusmarine = _FakeCopernicusMarineModule(has_data=False)
+        monkeypatch.setattr(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader._get_copernicusmarine",
+            lambda self: fake_copernicusmarine,
+        )
+
+        dl = InSituDownloader(output_dir=tmp_path)
+        result = dl.check_availability_dry(
+            min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0,
+            start="2026-08-01T00:00:00", end="2026-08-01T01:00:00",
+        )
+
+        assert result is False
+
+    def test_check_availability_dry_filters_by_source_types(self, monkeypatch, tmp_path):
+        """Data exists, but only from a mooring ("MO") platform -- a
+        caller asking for "buoy" ("DB") specifically must not see it as
+        available, even though the raw fetch was non-empty."""
+        fake_copernicusmarine = _FakeCopernicusMarineModule(has_data=True, platform_type="MO")
+        monkeypatch.setattr(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader._get_copernicusmarine",
+            lambda self: fake_copernicusmarine,
+        )
+
+        dl = InSituDownloader(output_dir=tmp_path)
+        result = dl.check_availability_dry(
+            min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0,
+            start="2026-08-01T00:00:00", end="2026-08-01T01:00:00",
+            source_types=["buoy"],
+        )
+
+        assert result is False
+
+    def test_check_availability_dry_matching_source_type_returns_true(self, monkeypatch, tmp_path):
+        fake_copernicusmarine = _FakeCopernicusMarineModule(has_data=True, platform_type="MO")
+        monkeypatch.setattr(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader._get_copernicusmarine",
+            lambda self: fake_copernicusmarine,
+        )
+
+        dl = InSituDownloader(output_dir=tmp_path)
+        result = dl.check_availability_dry(
+            min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0,
+            start="2026-08-01T00:00:00", end="2026-08-01T01:00:00",
+            source_types=["mooring"],
+        )
+
+        assert result is True

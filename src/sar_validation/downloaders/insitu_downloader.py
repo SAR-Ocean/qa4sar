@@ -151,6 +151,19 @@ class InSituDownloader:
         self.max_depth = max_depth
         self.force_download = force_download
 
+    def _get_copernicusmarine(self):
+        """Lazy import of copernicusmarine, isolated into its own method
+        (rather than an inline ``import`` in each caller) so tests can
+        monkeypatch this one method instead of faking ``sys.modules``."""
+        try:
+            import copernicusmarine
+        except ImportError as exc:
+            raise ImportError(
+                "copernicusmarine is required for in-situ downloads.\n"
+                "Install it with:  pip install copernicusmarine"
+            ) from exc
+        return copernicusmarine
+
     def download(
         self,
         min_lon: float,
@@ -180,13 +193,7 @@ class InSituDownloader:
         list[Path]
             Paths to the downloaded CSVs (one per window that produced data).
         """
-        try:
-            import copernicusmarine
-        except ImportError as exc:
-            raise ImportError(
-                "copernicusmarine is required for in-situ downloads.\n"
-                "Install it with:  pip install copernicusmarine"
-            ) from exc
+        copernicusmarine = self._get_copernicusmarine()
 
         start_dt = normalize_datetime(start)
         end_dt   = normalize_datetime(end)
@@ -200,6 +207,63 @@ class InSituDownloader:
             if path is not None:
                 downloaded.append(path)
         return downloaded
+
+    def check_availability_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+        source_types: Optional[list[str]] = None,
+        dataset_part: Optional[str] = None,
+    ) -> bool:
+        """
+        Whether any in-situ observation exists in this bbox/time window,
+        without writing anything to disk.
+
+        Uses ``copernicusmarine.read_dataframe()`` rather than ``subset()``
+        (the real download path's call) or ``open_dataset()`` (used by
+        this codebase's other Copernicus Marine sources): this dataset's
+        storage format doesn't support lazy ``xarray`` loading, so
+        ``read_dataframe()`` -- an in-memory, bbox/time-filtered fetch
+        with no local file written -- is the lightest real existence
+        check available for it. Queries the same ``ALL_VARIABLES`` set
+        ``download()`` does, since a platform reporting only one variable
+        (e.g. wind speed only) would otherwise be missed by a narrower
+        variable list. ``source_types`` filters the result the same way
+        ``download()``'s own post-hoc ``platform_type`` filter does.
+        """
+        copernicusmarine = self._get_copernicusmarine()
+
+        start_dt = normalize_datetime(start)
+        end_dt = normalize_datetime(end)
+        resolved_part = dataset_part or ("latest" if is_date_recent(end_dt) else "monthly")
+
+        df = copernicusmarine.read_dataframe(
+            dataset_id=DATASET_ID,
+            dataset_part=resolved_part,
+            variables=ALL_VARIABLES,
+            minimum_longitude=min_lon,
+            maximum_longitude=max_lon,
+            minimum_latitude=min_lat,
+            maximum_latitude=max_lat,
+            start_datetime=start_dt,
+            end_datetime=end_dt,
+            minimum_depth=self.min_depth,
+            maximum_depth=self.max_depth,
+            disable_progress_bar=True,
+        )
+        if df.empty:
+            return False
+
+        if source_types:
+            platform_codes = _resolve_platform_codes(source_types)
+            if platform_codes and "platform_type" in df.columns:
+                df = df[df["platform_type"].isin(platform_codes)]
+
+        return not df.empty
 
     def _download_window(
         self,

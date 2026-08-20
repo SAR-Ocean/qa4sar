@@ -1821,3 +1821,123 @@ class TestPredictIsmn:
         result = dry_collocation._predict_ismn(source=object(), cfg=object(), sar_footprints=[])
 
         assert result.verdict == "unknown"
+
+
+class TestPredictInsitu:
+    """_predict_insitu is registered under all five real
+    orchestrator._INSITU_TYPES keys (mooring, buoy, drifter, ferrybox,
+    tidal_gauge) -- there is no source_type="insitu" anywhere in this
+    codebase. predict_source is called once per individual validation
+    source, so the predicate must filter its own check_availability_dry
+    call down to just [source.source_type], never the full five-type
+    batch InSituDownloader.download() itself accepts."""
+
+    def _footprint(self):
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        return SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+    @pytest.mark.parametrize(
+        "source_type", ["mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"],
+    )
+    def test_registered_under_each_real_insitu_source_type(self, source_type):
+        from sar_validation.core import dry_collocation
+
+        assert dry_collocation._PREDICATES[source_type] is dry_collocation._predict_insitu
+
+    def test_no_source_type_insitu_key_registered(self):
+        """The original plan draft assumed a single source_type="insitu"
+        -- that key must not exist anywhere in _PREDICATES."""
+        from sar_validation.core import dry_collocation
+
+        assert "insitu" not in dry_collocation._PREDICATES
+
+    @pytest.mark.parametrize(
+        "source_type", ["mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"],
+    )
+    def test_check_availability_dry_filtered_to_single_source_type_not_full_batch(
+        self, monkeypatch, source_type,
+    ):
+        """The core correction this task makes: even though a real
+        InSituDownloader.download() call batches every requested platform
+        type into one source_types=[...] list, predict_source is called
+        once per validation source -- check_availability_dry must only
+        ever be asked about the one source_type it was invoked for."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        seen_source_types = []
+
+        def _fake_check_availability_dry(self, *a, source_types=None, **k):
+            seen_source_types.append(source_types)
+            return True
+
+        monkeypatch.setattr(InSituDownloader, "check_availability_dry", _fake_check_availability_dry)
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type=source_type), cfg=object(), sar_footprints=[self._footprint()],
+        )
+
+        assert seen_source_types == [[source_type]]
+        assert all(st != ["mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"] for st in seen_source_types)
+        assert result.verdict == "collocated"
+        assert result.source_type == source_type
+        assert result.bucket == "ground-point"
+
+    def test_none_predicted_when_no_data_available(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        monkeypatch.setattr(InSituDownloader, "check_availability_dry", lambda self, *a, **k: False)
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="buoy"), cfg=object(), sar_footprints=[self._footprint()],
+        )
+
+        assert result.verdict == "none-predicted"
+
+    def test_unknown_when_availability_check_raises(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        def _raise(self, *a, **k):
+            raise RuntimeError("copernicusmarine unreachable")
+
+        monkeypatch.setattr(InSituDownloader, "check_availability_dry", _raise)
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="tidal_gauge"), cfg=object(), sar_footprints=[self._footprint()],
+        )
+
+        assert result.verdict == "unknown"
+
+    def test_collocated_if_any_footprint_has_data(self, monkeypatch):
+        """Even if only one of several footprints yields data, the
+        overall verdict is collocated -- mirrors _predict_ismn's
+        any_available accumulation across footprints."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        calls = []
+
+        def _fake_check(self, *a, **k):
+            calls.append(a)
+            return len(calls) == 2  # only the second footprint has data
+
+        monkeypatch.setattr(InSituDownloader, "check_availability_dry", _fake_check)
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        footprints = [self._footprint(), self._footprint()]
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="ferrybox"), cfg=object(), sar_footprints=footprints,
+        )
+
+        assert result.verdict == "collocated"
+        assert len(calls) == 2
