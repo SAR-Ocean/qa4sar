@@ -351,6 +351,78 @@ class TestCDSSoilMoistureDownloaderCdrIcdrFallback:
         assert dl._had_request_failure is True
 
 
+class TestCDSSoilMoistureDownloaderCheckAvailabilityDry:
+    """check_availability_dry is a real, lightweight existence probe for
+    dry-collocation prediction -- reuses the CDR-then-ICDR fallback pattern
+    already in _download_day (see PR #8's CDR-first fix), but never calls
+    .download() on the retrieved handle, so no file transfer happens."""
+
+    def test_check_availability_dry_true_when_cdr_request_succeeds(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        fake_client = MagicMock()
+        with patch.dict(sys.modules, {"cdsapi": MagicMock(Client=MagicMock(return_value=fake_client))}):
+            result = dl.check_availability_dry(date(2026, 3, 15))
+
+        assert result is True
+        fake_client.retrieve.assert_called_once()
+        # Never calls .download() on the retrieved handle -- no file transfer.
+        fake_client.retrieve.return_value.download.assert_not_called()
+
+    def test_check_availability_dry_requests_cdr_first(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        fake_client = MagicMock()
+        with patch.dict(sys.modules, {"cdsapi": MagicMock(Client=MagicMock(return_value=fake_client))}):
+            dl.check_availability_dry(date(2026, 3, 15))
+
+        request = fake_client.retrieve.call_args[0][1]
+        assert request["type_of_record"] == ["cdr"]
+
+    def test_check_availability_dry_falls_back_to_icdr_when_cdr_fails(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        fake_client = MagicMock()
+        fake_client.retrieve.side_effect = [
+            RuntimeError("CDR not yet published"),
+            MagicMock(),
+        ]
+        with patch.dict(sys.modules, {"cdsapi": MagicMock(Client=MagicMock(return_value=fake_client))}):
+            result = dl.check_availability_dry(date(2026, 3, 15))
+
+        assert result is True
+        assert fake_client.retrieve.call_count == 2
+        second_request = fake_client.retrieve.call_args_list[1][0][1]
+        assert second_request["type_of_record"] == ["icdr"]
+
+    def test_check_availability_dry_false_when_both_cdr_and_icdr_fail(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        fake_client = MagicMock()
+        fake_client.retrieve.side_effect = [
+            RuntimeError("CDR not yet published"),
+            RuntimeError("ICDR also unavailable"),
+        ]
+        with patch.dict(sys.modules, {"cdsapi": MagicMock(Client=MagicMock(return_value=fake_client))}):
+            result = dl.check_availability_dry(date(2026, 3, 15))
+
+        assert result is False
+        assert fake_client.retrieve.call_count == 2
+
+    def test_check_availability_dry_false_when_cdsapi_not_installed(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        with patch.dict(sys.modules, {"cdsapi": None}):
+            result = dl.check_availability_dry(date(2026, 3, 15))
+
+        assert result is False
+
+
 class TestCDSSoilMoistureDownloaderExtractNc:
     def test_extract_nc_renames_to_stable_filename(self, tmp_path):
         """_extract_nc pulls the first .nc from the zip and renames it to the

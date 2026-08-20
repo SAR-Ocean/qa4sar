@@ -273,6 +273,40 @@ class CDSSoilMoistureDownloader:
         zip_path.unlink(missing_ok=True)
         return nc_path
 
+    def check_availability_dry(self, day: date) -> bool:
+        """
+        Whether CDS has data for *day*, without downloading it.
+
+        Submits the same request ``_download_day`` makes (CDR first,
+        falling back to ICDR on a CDR failure, matching that method's own
+        fallback order) but never calls ``.download()`` on the returned
+        handle, so no file bytes are transferred.
+
+        This still submits a real request that CDS processes server-side
+        before returning -- ``cdsapi`` has no separate metadata-only "does
+        this exist" call for this dataset, so a request failure/success is
+        the only available signal.
+
+        Returns
+        -------
+        bool
+            True if either the CDR or ICDR request succeeds.
+        """
+        try:
+            import cdsapi  # noqa: PLC0415 — optional dependency, imported lazily
+        except ImportError:
+            return False
+
+        for type_of_record in ("cdr", "icdr"):
+            request = self._build_request(day, type_of_record=type_of_record)
+            try:
+                client = cdsapi.Client(quiet=True)
+                client.retrieve(_CDS_DATASET, request)
+                return True
+            except Exception:  # noqa: BLE001 — cdsapi raises broad exceptions
+                continue
+        return False
+
     def _extract_nc(self, zip_path: Path, day: date) -> Optional[Path]:
         """Extract the first .nc file from *zip_path* to :attr:`output_dir`."""
         try:
