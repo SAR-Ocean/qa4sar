@@ -728,11 +728,29 @@ def _bbox_overlaps_footprint(
     return not (max_lon < f_min_lon or min_lon > f_max_lon or max_lat < f_min_lat or min_lat > f_max_lat)
 
 
+def _to_naive_utc(d: datetime) -> datetime:
+    """*d* as a naive UTC datetime -- every timestamp this module compares
+    is UTC, whether or not it happens to carry an explicit tzinfo (a
+    SarFootprint's own sensing_start/sensing_end are not guaranteed
+    timezone-aware, and neither are the various per-source timestamps
+    compared against them, e.g. ISMN's .stm-parsed station date ranges).
+    An aware value is converted to UTC and then has its tzinfo stripped;
+    an already-naive value passes through unchanged. Used by
+    _windows_overlap so two real timestamps of differing tz-awareness can
+    still be compared without raising."""
+    return d.astimezone(timezone.utc).replace(tzinfo=None) if d.tzinfo is not None else d
+
+
 def _windows_overlap(
     a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime,
 ) -> bool:
     """Whether time windows [a_start, a_end] and [b_start, b_end] overlap
-    at all (inclusive of touching endpoints)."""
+    at all (inclusive of touching endpoints). Each bound is normalized via
+    _to_naive_utc first, since callers routinely mix a tz-aware SarFootprint
+    bound against a naive per-source one (or vice versa)."""
+    a_start, a_end, b_start, b_end = (
+        _to_naive_utc(a_start), _to_naive_utc(a_end), _to_naive_utc(b_start), _to_naive_utc(b_end),
+    )
     return a_start <= b_end and b_start <= a_end
 
 
@@ -1895,9 +1913,13 @@ def _predict_model_source(
     probe_failed = False
 
     for footprint in sar_footprints:
-        if coverage_start is not None and footprint.sensing_end < coverage_start:
+        # _to_naive_utc: coverage_start/coverage_end are plain module-level
+        # constants (naive) while a real footprint's sensing_start/sensing_end
+        # are typically tz-aware -- normalize both sides before comparing to
+        # avoid "can't compare offset-naive and offset-aware datetimes".
+        if coverage_start is not None and _to_naive_utc(footprint.sensing_end) < _to_naive_utc(coverage_start):
             continue
-        if coverage_end is not None and footprint.sensing_start > coverage_end:
+        if coverage_end is not None and _to_naive_utc(footprint.sensing_start) > _to_naive_utc(coverage_end):
             continue
 
         is_recent = footprint.sensing_start.date() >= recent_cutoff
@@ -1943,8 +1965,18 @@ def _hycom_live_probe(footprint: "SarFootprint") -> bool:
     """Whether HyCOM's live OPeNDAP dataset already has a granule for
     footprint's own sensing window -- reuses HycomDownloader.has_coverage
     (metadata-only, no full grid load) per dataset-segment touched by the
-    window (see _resolve_hycom_segments)."""
-    segments = _resolve_hycom_segments(footprint.sensing_start, footprint.sensing_end)
+    window (see _resolve_hycom_segments).
+
+    _resolve_hycom_segments compares its arguments against the naive
+    _HYCOM_MIN_DATE/_HYCOM_CUTOVER_DATE constants (matching the real
+    download path's own always-naive windows -- see
+    orchestrator._padded_temporal_bounds); a real SarFootprint's
+    sensing_start/sensing_end is typically tz-aware, so it is normalized
+    via _to_naive_utc first to avoid "can't compare offset-naive and
+    offset-aware datetimes"."""
+    segments = _resolve_hycom_segments(
+        _to_naive_utc(footprint.sensing_start), _to_naive_utc(footprint.sensing_end),
+    )
     dl = HycomDownloader(output_dir=Path("/dev/null"))
     clip_at_cutover = len(segments) == 2
     return any(

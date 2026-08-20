@@ -47,6 +47,24 @@ class TestNormalizeDatetime:
             pytest.param("  2026-01-01  ", "2026-01-01T00:00:00", id="whitespace_stripped"),
             pytest.param("2026-01-01 120000", "2026-01-01T12:00:00", id="space_and_hhmmss"),
             pytest.param("2026-01-01T120000Z", "2026-01-01T12:00:00", id="iso_hhmmss_with_z"),
+            # Regression: a tz-aware datetime's own .isoformat() (e.g. a
+            # dry-collocation SarFootprint's sensing_start/sensing_end,
+            # always aware) renders as "...+00:00", never "Z" -- the
+            # offset must be stripped the same way "Z" already is, or
+            # downstream fromisoformat(normalize_datetime(...)) callers
+            # that compare against a naive "now" raise "can't compare
+            # offset-naive and offset-aware datetimes". Found live against
+            # noaa_hfradar_downloader.select_backend().
+            pytest.param(
+                "2026-01-01T12:34:56+00:00", "2026-01-01T12:34:56", id="utc_offset_removed",
+            ),
+            pytest.param(
+                "2026-01-01T12:34:56.123456+00:00", "2026-01-01T12:34:56",
+                id="utc_offset_and_microseconds_removed",
+            ),
+            pytest.param(
+                "2026-01-01T12:34:56-05:00", "2026-01-01T12:34:56", id="negative_offset_removed",
+            ),
         ],
     )
     def test_normalizes_various_formats(self, raw, expected):

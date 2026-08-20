@@ -1822,6 +1822,66 @@ class TestPredictIsmn:
 
         assert result.verdict == "unknown"
 
+    def test_collocated_when_footprint_is_tz_aware_and_station_range_is_naive(self, monkeypatch):
+        """Regression test: a real SarFootprint's sensing_start/sensing_end
+        is tz-aware (every real discover_sar_footprints_dry construction
+        site uses datetime.fromisoformat(...replace("Z", "+00:00"))), while
+        a real ISMNDownloader.station_date_ranges_dry's (lat, lon, earliest,
+        latest) tuples are naive (parsed via bare datetime.strptime on each
+        .stm file's own timestamp column). Before _windows_overlap routed
+        through _to_naive_utc, comparing an aware footprint window against
+        a naive station range raised "can't compare offset-naive and
+        offset-aware datetimes" and crashed predict_source outright --
+        found via a live sanity check against a real local ISMN archive."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+        from sar_validation.core.recipe import CollocationType
+
+        class _FakeIsmnDownloader:
+            def station_date_ranges_dry(self, *a, **k):
+                return {"Net_Stn": (45.0, 0.0, datetime(2026, 7, 1), datetime(2026, 9, 1))}
+
+        monkeypatch.setattr(dry_collocation, "_build_ismn_downloader", lambda cfg: _FakeIsmnDownloader())
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0, tzinfo=timezone.utc),
+            sensing_end=datetime(2026, 8, 1, 6, 1, 0, tzinfo=timezone.utc),
+            source_file="s1.SAFE",
+        )
+
+        cfg = SimpleNamespace(collocation=CollocationType())
+        result = dry_collocation._predict_ismn(source=object(), cfg=cfg, sar_footprints=[footprint])
+
+        assert result.verdict == "collocated"
+        assert "Net_Stn" in result.matched_stations
+
+
+class TestToNaiveUtc:
+    def test_aware_datetime_converted_to_naive_utc(self):
+        from sar_validation.core import dry_collocation
+
+        aware = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        result = dry_collocation._to_naive_utc(aware)
+
+        assert result == datetime(2026, 1, 1, 12, 0, 0)
+        assert result.tzinfo is None
+
+    def test_naive_datetime_passes_through_unchanged(self):
+        from sar_validation.core import dry_collocation
+
+        naive = datetime(2026, 1, 1, 12, 0, 0)
+        assert dry_collocation._to_naive_utc(naive) == naive
+
+    def test_non_utc_aware_datetime_is_converted_not_just_stripped(self):
+        from sar_validation.core import dry_collocation
+
+        aware = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=5)))
+        result = dry_collocation._to_naive_utc(aware)
+
+        assert result == datetime(2026, 1, 1, 7, 0, 0)
+
 
 class TestPredictInsitu:
     """_predict_insitu is registered under all five real
@@ -2836,6 +2896,48 @@ class TestPredictModelSource:
 
         assert result.verdict == "unknown"
 
+    def test_collocated_when_footprint_is_tz_aware_and_coverage_bound_is_naive(self):
+        """Regression test: coverage_start/coverage_end (e.g. HYCOM's own
+        module-level _HYCOM_MIN_DATE) are plain naive datetime constants,
+        while a real SarFootprint's sensing_start/sensing_end is tz-aware.
+        Before this comparison routed through _to_naive_utc, this raised
+        "can't compare offset-naive and offset-aware datetimes" and
+        crashed predict_source outright -- found via a live sanity check."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2019, 6, 1, 6, 0, 0, tzinfo=timezone.utc),
+            sensing_end=datetime(2019, 6, 1, 6, 1, 0, tzinfo=timezone.utc),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_model_source(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            coverage_start=datetime(2018, 12, 4), coverage_end=None, source_type="hycom",
+        )
+
+        assert result.verdict == "collocated"
+
+    def test_none_predicted_when_tz_aware_footprint_is_before_naive_coverage_start(self):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2010, 1, 1, 6, 0, 0, tzinfo=timezone.utc),
+            sensing_end=datetime(2010, 1, 1, 6, 1, 0, tzinfo=timezone.utc),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_model_source(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            coverage_start=datetime(2018, 12, 4), coverage_end=None, source_type="hycom",
+        )
+
+        assert result.verdict == "none-predicted"
+
 
 class TestPredictModelSourceLiveProbe:
     """The recent-date live-probe extension: for a footprint within
@@ -3012,6 +3114,37 @@ class TestHycomLiveProbe:
 
         assert dry_collocation._hycom_live_probe(footprint) is True
         assert sorted(seen_keys) == ["espc_d_v02", "gofs31_930"]
+
+    def test_tz_aware_footprint_does_not_crash_resolve_hycom_segments(self, monkeypatch):
+        """Regression test: _resolve_hycom_segments compares its arguments
+        against the naive _HYCOM_MIN_DATE/_HYCOM_CUTOVER_DATE constants.
+        Before _hycom_live_probe normalized via _to_naive_utc first, a
+        tz-aware footprint (the real shape every SarFootprint from
+        discover_sar_footprints_dry has) raised "can't compare
+        offset-naive and offset-aware datetimes" -- found via a live
+        sanity check against the real tds.hycom.org OPeNDAP endpoint."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        class _FakeHycomDownloader:
+            def __init__(self, output_dir):
+                pass
+
+            def has_coverage(self, dataset_key, seg_start, seg_end, clip_at_cutover=False):
+                assert seg_start.tzinfo is None
+                assert seg_end.tzinfo is None
+                return True
+
+        monkeypatch.setattr(dry_collocation, "HycomDownloader", _FakeHycomDownloader)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2025, 1, 1, 6, 0, 0, tzinfo=timezone.utc),
+            sensing_end=datetime(2025, 1, 1, 6, 1, 0, tzinfo=timezone.utc),
+            source_file="s1.SAFE",
+        )
+
+        assert dry_collocation._hycom_live_probe(footprint) is True
 
 
 class TestEra5LiveProbe:

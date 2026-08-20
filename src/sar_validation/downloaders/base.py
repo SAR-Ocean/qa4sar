@@ -27,6 +27,7 @@ import base64
 import json
 import logging
 import os
+import re
 import socket
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -893,9 +894,21 @@ def normalize_datetime(dt_str: str) -> str:
     - With space separator: "2026-01-01 12:34:56" → "2026-01-01T12:34:56"
     - With HHMMSS (no colons): "2026-01-01 120000" → "2026-01-01T12:00:00"
     - With Z suffix: "2026-01-01T12:34:56Z" → "2026-01-01T12:34:56"
+    - With UTC offset: "2026-01-01T12:34:56+00:00" → "2026-01-01T12:34:56"
     """
-    dt_str = dt_str.strip().rstrip("Z").split(".")[0]  # Remove Z and milliseconds
-    
+    dt_str = dt_str.strip()
+    # Strip a trailing numeric UTC offset (e.g. "+00:00", "-05:00") the
+    # same way a literal "Z" suffix is already stripped below -- every
+    # offset produced anywhere in this codebase is UTC (e.g. a tz-aware
+    # SarFootprint.sensing_start/sensing_end's own .isoformat() renders
+    # as "...+00:00", never "Z"), so dropping it is equivalent to an
+    # already-UTC value losing its (redundant) tzinfo. Gated on length so
+    # a bare "YYYY-MM-DD" date's own hyphens are never mistaken for a
+    # sign -- an offset can only appear after a time component.
+    if len(dt_str) > 10:
+        dt_str = re.sub(r"[+-]\d{2}:?\d{2}$", "", dt_str)
+    dt_str = dt_str.rstrip("Z").split(".")[0]  # Remove Z and milliseconds
+
     # Replace space with T if present
     if " " in dt_str:
         dt_str = dt_str.replace(" ", "T")
