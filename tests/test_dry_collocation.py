@@ -2002,6 +2002,15 @@ class TestPredictInsitu:
         assert result.verdict == "collocated"
         assert len(calls) == 2
 
+    def test_unknown_when_no_sar_footprints_supplied(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="mooring"), cfg=object(), sar_footprints=[],
+        )
+
+        assert result.verdict == "unknown"
+
 
 class TestPredictInsituCurrentsHistorical:
     """_predict_insitu_currents_historical is registered under the four

@@ -1408,6 +1408,12 @@ def _predict_insitu(source, cfg, sar_footprints: "list[SarFootprint]") -> Source
     boolean from the Copernicus Marine service itself, with no per-station
     coordinates to check further -- unlike ISMN's local station index.
     """
+    if not sar_footprints:
+        return SourcePrediction(
+            source_type=source.source_type, bucket="ground-point", verdict="unknown",
+            detail="No SAR footprints supplied -- cannot predict.",
+        )
+
     from ..downloaders.insitu_downloader import InSituDownloader
 
     dl = InSituDownloader(output_dir=Path("."))
