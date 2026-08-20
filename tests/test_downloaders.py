@@ -2847,6 +2847,73 @@ class TestHFRadarDownloaderGrid:
                 dl.download(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")
 
 
+class _FakeGridDataset:
+    """Minimal stand-in for the xarray.Dataset copernicusmarine.open_dataset
+    returns -- just enough surface (.sizes) for check_availability_dry to
+    read, matching test_altimeter_downloader.py's _FakeDataset convention."""
+
+    def __init__(self, time_size: int):
+        self.sizes = {"time": time_size}
+
+
+class TestHFRadarDownloaderCheckAvailabilityDry:
+    def test_true_when_time_coordinate_non_empty(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        dl = HFRadarDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+        fake_module.open_dataset.return_value = _FakeGridDataset(3)
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            result = dl.check_availability_dry(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")
+
+        assert result is True
+        fake_module.subset.assert_not_called()
+        _, kwargs = fake_module.open_dataset.call_args
+        assert kwargs["dataset_part"] == "monthly-radar-total--US-EastGulfCoast"
+
+    def test_false_when_time_coordinate_empty(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        dl = HFRadarDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+        fake_module.open_dataset.return_value = _FakeGridDataset(0)
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            result = dl.check_availability_dry(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")
+
+        assert result is False
+
+    def test_false_when_no_region_overlaps_bbox(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        dl = HFRadarDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            result = dl.check_availability_dry(0.0, 5.0, 0.0, 5.0, "2026-01-01", "2026-01-02")
+
+        assert result is False
+        fake_module.open_dataset.assert_not_called()
+
+    def test_recent_date_uses_latest_part_when_region_has_one(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        recent_end = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+        recent_start = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%d")
+        dl = HFRadarDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+        fake_module.open_dataset.return_value = _FakeGridDataset(1)
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            dl.check_availability_dry(-125.0, -119.0, 33.0, 38.0, recent_start, recent_end)
+
+        _, kwargs = fake_module.open_dataset.call_args
+        assert kwargs["dataset_part"] == "latest-radar-total--US-WestCoast"
+
+
 class TestHFRadarDownloaderGridAntimeridian:
     def test_crossing_bbox_with_no_covering_region_on_either_side_raises(self, tmp_path):
         # lat 0-5 doesn't overlap any HFR_REGIONS entry on either side of
@@ -3115,6 +3182,64 @@ class TestHFRadarHistoricalDownloader:
         assert len(out) == 1
         result = xr.open_dataset(out[0])
         assert result.sizes["time"] == 4
+
+
+class TestHFRadarHistoricalDownloaderCheckAvailabilityDry:
+    def test_true_for_recent_enough_region_year_with_known_archive(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        old_end = (datetime.now(timezone.utc) - timedelta(days=200)).strftime("%Y-%m-%d")
+        old_start = (datetime.now(timezone.utc) - timedelta(days=201)).strftime("%Y-%m-%d")
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path)
+        assert dl.check_availability_dry(-121.0, -120.0, 33.0, 34.0, old_start, old_end) is True
+
+    def test_false_when_end_is_too_recent(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path)
+        # Well within the _MIN_AGE_DAYS=182 recency guard.
+        assert dl.check_availability_dry(-121.0, -120.0, 33.0, 34.0, "2026-08-01", "2026-08-02") is False
+
+    def test_false_when_no_region_overlaps_bbox(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path)
+        assert dl.check_availability_dry(0.0, 5.0, 0.0, 5.0, "2021-01-01", "2021-01-02") is False
+
+    def test_false_when_region_has_no_historical_archive_at_all(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path)
+        # GoS (Italy) has an NRT feed but no delayed-mode archive.
+        assert dl.check_availability_dry(13.5, 15.5, 40.0, 41.0, "2021-01-01", "2021-01-02") is False
+
+    def test_false_when_split_by_year_region_year_out_of_range(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path)
+        # US-EastGulfCoast's split-by-year archive only covers 2019-2024.
+        assert dl.check_availability_dry(-90.0, -60.0, 30.0, 40.0, "2018-01-01", "2018-01-02") is False
+
+    def test_multi_year_request_raises_not_implemented(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path)
+        with pytest.raises(NotImplementedError, match="single calendar year"):
+            dl.check_availability_dry(-90.0, -60.0, 30.0, 40.0, "2020-12-30", "2021-01-02")
 
 
 class TestHFRadarHistoricalDownloaderAntimeridian:

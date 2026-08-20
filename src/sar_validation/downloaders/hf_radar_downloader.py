@@ -124,6 +124,63 @@ class HFRadarDownloader:
             raise last_error
         return downloaded
 
+    def check_availability_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+    ) -> bool:
+        """
+        Whether the Copernicus Marine HF-radar grid for the region
+        overlapping this bbox has any data in [start, end], without writing
+        anything to disk.
+
+        Resolves the same region + dataset_part ``_download_region_window``
+        would. Unlike that method, this makes no dataset_part fallback
+        retry attempt (a footprint sitting right at the ``latest``/``monthly``
+        boundary could in principle get a less accurate answer than a real
+        download would) -- the same known, deliberately out-of-scope gap
+        ``InSituDownloader.check_availability_dry`` also leaves.
+
+        Uses ``copernicusmarine.open_dataset()`` -- a lazy, server-side
+        bbox/time-filtered xarray open with no local file written -- rather
+        than ``subset()``'s download-to-disk call. The
+        ``"<latest|monthly>-radar-total--<Region>"`` dataset_parts are
+        genuine gridded NetCDF products, unlike the plain ``"latest"``/
+        ``"monthly"`` in-situ dataset_parts under this same ``DATASET_ID``
+        that ``InSituDownloader.check_availability_dry`` targets instead
+        (which needed ``read_dataframe()`` -- see that method's own
+        docstring for why ``open_dataset()`` doesn't work there).
+
+        Returns False when no known region overlaps the bbox at all.
+        """
+        import copernicusmarine
+
+        try:
+            region = resolve_hfr_region(min_lon, max_lon, min_lat, max_lat)
+        except ValueError:
+            return False
+
+        start_dt = normalize_datetime(start)
+        end_dt = normalize_datetime(end)
+        use_latest = HFR_REGIONS[region]["has_latest"] and is_date_recent(end_dt)
+        dataset_part = f"{'latest' if use_latest else 'monthly'}-radar-total--{region}"
+
+        ds = copernicusmarine.open_dataset(
+            dataset_id=DATASET_ID,
+            dataset_part=dataset_part,
+            minimum_longitude=min_lon,
+            maximum_longitude=max_lon,
+            minimum_latitude=min_lat,
+            maximum_latitude=max_lat,
+            start_datetime=start_dt,
+            end_datetime=end_dt,
+        )
+        return "time" in ds.sizes and ds.sizes["time"] > 0
+
     def _download_region_window(
         self,
         region: str,

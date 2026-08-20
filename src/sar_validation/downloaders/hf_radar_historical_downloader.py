@@ -184,6 +184,57 @@ class HFRadarHistoricalDownloader:
             raise last_error
         return downloaded
 
+    def check_availability_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+    ) -> bool:
+        """
+        Whether a delayed-mode HF-radar archive plausibly covers this
+        bbox/window, without fetching the archive file itself (100s of MB,
+        one per region, covering that region's entire multi-year record --
+        there is no cheaper remote metadata endpoint for this dataset that
+        would report a specific archive file's own real temporal extent
+        short of opening it).
+
+        Purely a local lookup, reusing ``download()``'s own pre-flight
+        checks exactly: the ``_MIN_AGE_DAYS`` recency guard, region
+        resolution via ``resolve_hfr_region``, and archive-filename
+        resolution via ``_region_filename`` (which already encodes,
+        offline, which regions/years have an archive at all -- see its own
+        ``ValueError`` cases, mirrored here as a False return). A
+        region/year combination that resolves successfully here may still
+        turn out to have no data for the exact requested days once the
+        file is actually opened -- a plausible, not certain, "yes", the
+        same fail-toward-inclusion convention used throughout this
+        codebase's dry-collocation prediction path.
+
+        A multi-year-spanning request against the split-by-year region
+        (``NotImplementedError``) is a genuine, different limitation and is
+        intentionally not caught here, mirroring ``_download_region_window``'s
+        own handling of the same case.
+        """
+        start_dt = normalize_datetime(start)
+        end_dt = normalize_datetime(end)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_MIN_AGE_DAYS)
+        if _parse_iso_dt(end_dt) > cutoff:
+            return False
+
+        try:
+            region = resolve_hfr_region(min_lon, max_lon, min_lat, max_lat)
+        except ValueError:
+            return False
+
+        try:
+            _region_filename(region, start_dt, end_dt)
+        except ValueError:
+            return False
+        return True
+
     def _download_region_window(
         self,
         region: str,
