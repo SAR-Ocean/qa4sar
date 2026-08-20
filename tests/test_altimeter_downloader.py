@@ -113,3 +113,52 @@ class TestListCandidatesDry:
 
         fake_module.open_dataset.assert_not_called()
         assert candidates == []
+
+    def test_raises_when_every_candidate_raises(self, tmp_path):
+        """A network/auth error on every single candidate is not the same
+        as a definitive "no data" answer -- unlike the legitimate
+        out-of-bounds case, this must not silently return []. The caller
+        (_predict_catalog_precise_source) relies on this raising to
+        produce "unknown" rather than a false "none-predicted"."""
+        dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
+
+        fake_module = MagicMock()
+        fake_module.open_dataset.side_effect = RuntimeError("connection refused")
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            try:
+                dl.list_candidates_dry(
+                    min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+                    start="2026-06-01", end="2026-06-02",
+                    frequencies=["1hz"], satellites=["al", "c2"],
+                )
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("expected list_candidates_dry to raise")
+
+    def test_mixed_network_error_and_definitive_empty_result_does_not_raise(self, tmp_path):
+        """One candidate raising (network error) alongside another that
+        definitively resolves (even to empty/no data) is still a real
+        signal -- not every candidate failed, so this must return
+        normally (an empty list here, since the one definitive candidate
+        found no data) rather than raising."""
+        dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
+
+        fake_module = MagicMock()
+
+        def _fake_open_dataset(dataset_id, **kwargs):
+            if "al" in dataset_id:
+                raise RuntimeError("connection refused")
+            return _FakeDataset([])
+
+        fake_module.open_dataset.side_effect = _fake_open_dataset
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            candidates = dl.list_candidates_dry(
+                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+                start="2026-06-01", end="2026-06-02",
+                frequencies=["1hz"], satellites=["al", "c2"],
+            )
+
+        assert candidates == []

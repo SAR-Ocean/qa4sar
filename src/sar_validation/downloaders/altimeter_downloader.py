@@ -136,6 +136,15 @@ class AltimeterDownloader:
         silently skipped, so one satellite/frequency having no data never
         aborts the others -- mirroring download()'s own "no data in this
         region/time window" handling of the same case.
+
+        A candidate that raises is not necessarily "no data" though -- the
+        same exception also covers auth failures and network errors, which
+        aren't a definitive answer. Only a candidate that successfully
+        opens (whether or not it then turns out empty) counts as
+        definitive. If every attempted candidate raises, this method can't
+        tell whether data exists or not, so it raises rather than silently
+        returning an empty list. Callers must treat an exception here as
+        "couldn't determine", never as "no data".
         """
         import copernicusmarine
         import pandas as pd
@@ -145,6 +154,8 @@ class AltimeterDownloader:
 
         frequencies = [f.lower() for f in frequencies]
         candidates: "list[tuple[str, datetime, datetime]]" = []
+        any_attempted = False
+        any_definitive = False
 
         for freq in frequencies:
             if freq not in VALID_FREQUENCIES:
@@ -167,6 +178,7 @@ class AltimeterDownloader:
             for sat_code in sat_codes:
                 dataset_id = template.format(sat=sat_code)
                 for win_min_lon, win_max_lon in split_antimeridian_bbox(min_lon, max_lon):
+                    any_attempted = True
                     try:
                         ds = copernicusmarine.open_dataset(
                             dataset_id=dataset_id,
@@ -180,12 +192,20 @@ class AltimeterDownloader:
                         )
                     except Exception:
                         continue
+                    any_definitive = True
                     if "time" not in ds.sizes or ds.sizes["time"] == 0:
                         continue
                     time_values = ds["time"].values
                     t_min = pd.Timestamp(time_values.min()).to_pydatetime()
                     t_max = pd.Timestamp(time_values.max()).to_pydatetime()
                     candidates.append((dataset_id, t_min, t_max))
+
+        if any_attempted and not any_definitive:
+            raise RuntimeError(
+                f"list_candidates_dry: every candidate dataset open failed for "
+                f"[{start}, {end}] -- couldn't determine altimeter availability "
+                f"(network/auth error on every attempt)."
+            )
         return candidates
 
     def download(
