@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 class TestHoursNeededForDay:
@@ -410,3 +412,117 @@ class TestERA5DownloaderRealDownloadPrintsProgress:
         assert "ERA5" in captured
         assert "wind" in captured
         assert "2026-07-12" in captured
+
+
+class TestERA5DownloaderCheckAvailabilityDry:
+    """check_availability_dry is a fast, unauthenticated existence probe for
+    dry-collocation prediction -- queries the CDS catalogue's live
+    collection-metadata endpoint (``ecmwf.datastores.Client.get_collection``)
+    for the variable's own dataset's real temporal extent, rather than
+    submitting a real cdsapi.Client.retrieve() processing job the way
+    _download_day does. Mirrors
+    CDSSoilMoistureDownloader.check_availability_dry's own test suite."""
+
+    @staticmethod
+    def _patch_datastores(monkeypatch, begin=None, end=None, client_cls=None):
+        """Install a fake ``ecmwf.datastores`` module in sys.modules whose
+        Client(...).get_collection(...) returns a fake Collection exposing
+        begin_datetime/end_datetime. Returns (fake_client_cls,
+        fake_client_instance) so tests can assert on construction/calls."""
+        fake_collection = MagicMock(begin_datetime=begin, end_datetime=end)
+        fake_client_instance = MagicMock()
+        fake_client_instance.get_collection.return_value = fake_collection
+        fake_client_cls = client_cls or MagicMock(return_value=fake_client_instance)
+
+        fake_datastores_module = MagicMock()
+        fake_datastores_module.Client = fake_client_cls
+
+        fake_ecmwf_module = MagicMock()
+        fake_ecmwf_module.datastores = fake_datastores_module
+
+        monkeypatch.setitem(sys.modules, "ecmwf", fake_ecmwf_module)
+        monkeypatch.setitem(sys.modules, "ecmwf.datastores", fake_datastores_module)
+        return fake_client_cls, fake_client_instance
+
+    def test_true_when_day_falls_within_live_extent(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.era5_downloader import ERA5Downloader
+
+        self._patch_datastores(
+            monkeypatch,
+            begin=datetime(1940, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 10, tzinfo=timezone.utc),
+        )
+
+        dl = ERA5Downloader(variable="wind", output_dir=tmp_path)
+        assert dl.check_availability_dry(date(2026, 3, 15)) is True
+
+    def test_false_when_day_falls_outside_live_extent(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.era5_downloader import ERA5Downloader
+
+        self._patch_datastores(
+            monkeypatch,
+            begin=datetime(1940, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 10, tzinfo=timezone.utc),
+        )
+
+        dl = ERA5Downloader(variable="wind", output_dir=tmp_path)
+        assert dl.check_availability_dry(date(2026, 9, 1)) is False
+
+    def test_queries_the_dataset_matching_the_configured_variable(self, monkeypatch, tmp_path):
+        """soil_moisture uses a different CDS dataset (reanalysis-era5-land)
+        than wind/waves (reanalysis-era5-single-levels) -- see
+        _CDS_DATASET_BY_VARIABLE. The right one must be looked up for
+        whichever variable this downloader instance was built for."""
+        from sar_validation.downloaders.era5_downloader import ERA5Downloader
+
+        _fake_cls, fake_client = self._patch_datastores(
+            monkeypatch,
+            begin=datetime(1940, 1, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 10, tzinfo=timezone.utc),
+        )
+
+        dl = ERA5Downloader(variable="soil_moisture", output_dir=tmp_path)
+        dl.check_availability_dry(date(2026, 3, 15))
+
+        fake_client.get_collection.assert_called_once_with("reanalysis-era5-land")
+        # No blocking cdsapi.Client.retrieve() processing job is ever submitted.
+        fake_client.retrieve.assert_not_called()
+
+    def test_raises_when_catalogue_lookup_fails(self, monkeypatch, tmp_path):
+        """A network/auth/API error while querying the catalogue (e.g. no
+        connectivity, or the endpoint itself erroring) must propagate --
+        never be swallowed into False -- so _predict_model_source's own
+        exception handling is what converts it to an 'unknown' verdict,
+        never a false 'none-predicted'."""
+        from sar_validation.downloaders.era5_downloader import ERA5Downloader
+
+        failing_client_cls = MagicMock(side_effect=RuntimeError("connection refused"))
+        self._patch_datastores(monkeypatch, client_cls=failing_client_cls)
+
+        dl = ERA5Downloader(variable="wind", output_dir=tmp_path)
+        with pytest.raises(RuntimeError, match="connection refused"):
+            dl.check_availability_dry(date(2026, 3, 15))
+
+    def test_raises_when_ecmwf_datastores_not_installed(self, monkeypatch, tmp_path):
+        """A missing cdsapi/ecmwf-datastores-client dependency must
+        propagate as an ImportError so the caller's own exception handling
+        produces 'unknown', never a false 'none-predicted'."""
+        from sar_validation.downloaders.era5_downloader import ERA5Downloader
+
+        dl = ERA5Downloader(variable="wind", output_dir=tmp_path)
+        monkeypatch.setitem(sys.modules, "ecmwf.datastores", None)
+
+        with pytest.raises(ImportError):
+            dl.check_availability_dry(date(2026, 3, 15))
+
+    def test_raises_when_catalogue_extent_is_missing(self, monkeypatch, tmp_path):
+        """A malformed/incomplete catalogue response (no usable
+        begin/end datetime) can't answer the "does data exist" question
+        either -- this must raise, not silently return False."""
+        from sar_validation.downloaders.era5_downloader import ERA5Downloader
+
+        self._patch_datastores(monkeypatch, begin=None, end=None)
+
+        dl = ERA5Downloader(variable="wind", output_dir=tmp_path)
+        with pytest.raises(RuntimeError, match="temporal extent"):
+            dl.check_availability_dry(date(2026, 3, 15))

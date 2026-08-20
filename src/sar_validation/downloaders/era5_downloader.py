@@ -52,6 +52,14 @@ _CDS_DATASET_BY_VARIABLE: dict[Era5Variable, str] = {
     "soil_moisture": "reanalysis-era5-land",
 }
 
+#: Base URL for the CDS catalogue's collection-metadata endpoint, used by
+#: check_availability_dry (see that method). Mirrors
+#: cds_soil_moisture_downloader.py's own ``_CDS_API_URL`` -- kept as a
+#: separate module-level constant rather than imported from that sibling
+#: module, since the two downloaders are otherwise independent and this
+#: is the one piece of shared infrastructure between them.
+_CDS_API_URL = "https://cds.climate.copernicus.eu/api"
+
 #: CDS variable name(s) per ERA5 variable. NOTE: the ERA5-Land soil
 #: moisture variable is named "..._layer_1" (not "..._level_1") in the
 #: live CDS API's variable enum -- confirmed 2026-08-07 by querying
@@ -245,6 +253,66 @@ class ERA5Downloader:
             day += timedelta(days=1)
 
         return downloaded
+
+    def check_availability_dry(self, day: date) -> bool:
+        """
+        Whether ERA5 has published data for *day*, without downloading it.
+
+        Queries the CDS catalogue's collection-metadata endpoint (via
+        ``ecmwf.datastores.Client.get_collection`` -- a ``cdsapi``
+        dependency) for this variable's dataset (see
+        :data:`_CDS_DATASET_BY_VARIABLE`) real, live temporal coverage
+        extent (``begin_datetime``/``end_datetime``) and checks whether
+        *day* falls within it. Never submits a real
+        ``cdsapi.Client.retrieve()`` processing job -- the catalogue
+        endpoint is a fast, unauthenticated, sub-second metadata lookup
+        instead.
+
+        Any failure to determine the extent (missing dependency, network
+        error, unexpected response shape) is raised rather than
+        swallowed into ``False`` -- callers must treat an exception here
+        as "couldn't determine", never as "no data".
+
+        Returns
+        -------
+        bool
+            True if *day* falls within the dataset's live-queried
+            begin/end temporal extent.
+        """
+        try:
+            import ecmwf.datastores  # noqa: PLC0415 — optional dependency, imported lazily
+        except ImportError as exc:
+            logger.debug("check_availability_dry: ecmwf.datastores unavailable: %s", exc)
+            raise ImportError(
+                "ecmwf-datastores-client (installed automatically alongside cdsapi) is "
+                "required for ERA5 availability checks. Install it with: "
+                "pip install 'sar-l2-validation-toolbox[era5]'"
+            ) from exc
+
+        dataset = _CDS_DATASET_BY_VARIABLE[self.variable]
+        try:
+            client = ecmwf.datastores.Client(url=_CDS_API_URL)
+            collection = client.get_collection(dataset)
+            begin = collection.begin_datetime
+            end = collection.end_datetime
+        except Exception:
+            logger.debug(
+                "check_availability_dry: catalogue lookup failed for %s (%s)",
+                dataset, day.isoformat(), exc_info=True,
+            )
+            raise
+
+        if begin is None or end is None:
+            logger.debug(
+                "check_availability_dry: catalogue reported no usable temporal extent "
+                "for %s (begin=%r, end=%r)", dataset, begin, end,
+            )
+            raise RuntimeError(
+                f"CDS catalogue returned no usable temporal extent for {dataset!r} "
+                f"(begin={begin!r}, end={end!r})."
+            )
+
+        return begin.date() <= day <= end.date()
 
     # ------------------------------------------------------------------
     # Private helpers
