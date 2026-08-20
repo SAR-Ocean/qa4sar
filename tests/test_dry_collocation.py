@@ -1941,3 +1941,326 @@ class TestPredictInsitu:
 
         assert result.verdict == "collocated"
         assert len(calls) == 2
+
+
+class TestHfRadarCandidateRegions:
+    """_hf_radar_candidate_regions is the per-region area-vs-area
+    refinement HF-radar's predicate needs -- a footprint sitting only in
+    one corner of a large multi-region country must still be attributed
+    to the right specific region(s), not whichever region the recipe's
+    own (much larger) nominal bbox happens to overlap most."""
+
+    _REGIONS = {
+        "West": {"bbox": (-130.0, -115.0, 30.0, 50.0)},
+        "East": {"bbox": (-98.0, -60.0, 22.0, 46.0)},
+        "Elsewhere": {"bbox": (100.0, 110.0, 0.0, 10.0)},
+    }
+
+    def test_only_genuinely_overlapping_regions_are_returned(self):
+        from sar_validation.core.dry_collocation import SarFootprint, _hf_radar_candidate_regions
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-126.0, -120.0, 33.0, 38.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1), sensing_end=datetime(2026, 8, 1), source_file="s1.SAFE",
+        )
+
+        candidates = _hf_radar_candidate_regions(self._REGIONS, footprint)
+
+        names = [name for name, _bbox in candidates]
+        assert names == ["West"]
+
+    def test_intersected_bbox_is_clamped_to_region_bounds(self):
+        from sar_validation.core.dry_collocation import SarFootprint, _hf_radar_candidate_regions
+
+        # Footprint spans across West's eastern edge (-115.0) into open space.
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-118.0, -110.0, 33.0, 38.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1), sensing_end=datetime(2026, 8, 1), source_file="s1.SAFE",
+        )
+
+        candidates = _hf_radar_candidate_regions(self._REGIONS, footprint)
+
+        assert len(candidates) == 1
+        name, bbox = candidates[0]
+        assert name == "West"
+        # Clamped to West's own eastern edge (-115.0), not the footprint's own -110.0.
+        assert bbox == (-118.0, -115.0, 33.0, 38.0)
+
+    def test_footprint_overlapping_two_regions_returns_both(self):
+        from sar_validation.core.dry_collocation import SarFootprint, _hf_radar_candidate_regions
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-120.0, -90.0, 25.0, 35.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1), sensing_end=datetime(2026, 8, 1), source_file="s1.SAFE",
+        )
+
+        candidates = _hf_radar_candidate_regions(self._REGIONS, footprint)
+
+        names = {name for name, _bbox in candidates}
+        assert names == {"West", "East"}
+
+    def test_no_overlapping_region_returns_empty(self):
+        from sar_validation.core.dry_collocation import SarFootprint, _hf_radar_candidate_regions
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(0.0, 5.0, 0.0, 5.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1), sensing_end=datetime(2026, 8, 1), source_file="s1.SAFE",
+        )
+
+        assert _hf_radar_candidate_regions(self._REGIONS, footprint) == []
+
+
+class TestPredictHfRadarShared:
+    """_predict_hf_radar is the shared predicate parameterized across the
+    three HF-radar sources with their own region table (hf_radar,
+    hf_radar_historical, hf_radar_noaa) -- mirrors _predict_ismn's
+    tolerance-resolution mocking convention."""
+
+    _REGIONS = {"West": {"bbox": (-130.0, -115.0, 30.0, 50.0)}}
+
+    def _footprint(self):
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        return SarFootprint(
+            kind="polygon", bbox=(-126.0, -120.0, 33.0, 38.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+    def test_unknown_when_no_sar_footprints_supplied(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        result = dry_collocation._predict_hf_radar(
+            source=object(), cfg=object(), sar_footprints=[],
+            check_availability_dry=lambda *a, **k: True,
+            regions_table=self._REGIONS, source_type="hf_radar",
+        )
+
+        assert result.verdict == "unknown"
+
+    def test_collocated_when_candidate_region_check_true(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        seen_bboxes = []
+
+        def _fake_check(min_lon, max_lon, min_lat, max_lat, start, end):
+            seen_bboxes.append((min_lon, max_lon, min_lat, max_lat))
+            return True
+
+        result = dry_collocation._predict_hf_radar(
+            source=object(), cfg=object(), sar_footprints=[self._footprint()],
+            check_availability_dry=_fake_check,
+            regions_table=self._REGIONS, source_type="hf_radar",
+        )
+
+        assert result.verdict == "collocated"
+        assert result.source_type == "hf_radar"
+        assert result.bucket == "ground-point"
+        # Called with the region-clamped bbox (West's own bounds), not the
+        # footprint's raw bbox.
+        assert seen_bboxes == [(-126.0, -120.0, 33.0, 38.0)]
+
+    def test_none_predicted_when_no_candidate_region_has_data(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation._predict_hf_radar(
+            source=object(), cfg=object(), sar_footprints=[self._footprint()],
+            check_availability_dry=lambda *a, **k: False,
+            regions_table=self._REGIONS, source_type="hf_radar",
+        )
+
+        assert result.verdict == "none-predicted"
+
+    def test_none_predicted_when_footprint_overlaps_no_known_region(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(0.0, 5.0, 0.0, 5.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_hf_radar(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            check_availability_dry=lambda *a, **k: True,
+            regions_table=self._REGIONS, source_type="hf_radar",
+        )
+
+        assert result.verdict == "none-predicted"
+
+    def test_unknown_when_check_raises(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        def _raise(*a, **k):
+            raise RuntimeError("copernicusmarine unreachable")
+
+        result = dry_collocation._predict_hf_radar(
+            source=object(), cfg=object(), sar_footprints=[self._footprint()],
+            check_availability_dry=_raise,
+            regions_table=self._REGIONS, source_type="hf_radar",
+        )
+
+        assert result.verdict == "unknown"
+
+    def test_resolves_tolerance_via_hf_radar_grid_key(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        seen_keys = []
+
+        def _fake_resolve(cfg, *source_types):
+            seen_keys.append(source_types)
+            return 90
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", _fake_resolve)
+
+        dry_collocation._predict_hf_radar(
+            source=object(), cfg=object(), sar_footprints=[self._footprint()],
+            check_availability_dry=lambda *a, **k: True,
+            regions_table=self._REGIONS, source_type="hf_radar_noaa",
+        )
+
+        assert seen_keys == [("hf_radar_grid",)]
+
+
+class TestPredictHfRadarRegistrations:
+    """One predict_source integration test per real HF-radar
+    source_type, exercising the actual _PREDICATES dispatch."""
+
+    @pytest.mark.parametrize(
+        "source_type,check_dry_name",
+        [
+            pytest.param("hf_radar", "_hf_radar_copernicus_check_dry", id="hf_radar"),
+            pytest.param("hf_radar_historical", "_hf_radar_historical_check_dry", id="hf_radar_historical"),
+            pytest.param("hf_radar_noaa", "_hf_radar_noaa_check_dry", id="hf_radar_noaa"),
+        ],
+    )
+    def test_collocated_via_predict_source(self, monkeypatch, source_type, check_dry_name):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint, predict_source
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+        monkeypatch.setattr(dry_collocation, check_dry_name, lambda *a, **k: True)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-126.0, -120.0, 33.0, 38.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = predict_source(
+            SimpleNamespace(source_type=source_type), cfg=object(), sar_footprints=[footprint],
+        )
+
+        assert result.verdict == "collocated"
+        assert result.source_type == source_type
+        assert result.bucket == "ground-point"
+
+    def test_registered_under_own_source_type_hf_radar(self):
+        from sar_validation.core import dry_collocation
+
+        assert dry_collocation._PREDICATES["hf_radar"] is dry_collocation._predict_hf_radar_copernicus
+
+    @pytest.mark.parametrize(
+        "source_type", ["hf_radar_historical", "hf_radar_noaa", "hf_radar_us"],
+    )
+    def test_registered_under_own_source_type(self, source_type):
+        from sar_validation.core import dry_collocation
+
+        predicate = dry_collocation._PREDICATES[source_type]
+        assert predicate is getattr(dry_collocation, f"_predict_{source_type}")
+
+    def test_no_thredds_only_source_type_registered(self):
+        """noaa_hfradar_thredds_downloader.py is used internally by
+        hf_radar_us's own waterfall, not dispatched on its own -- there is
+        no separate NOAA-THREDDS-only source_type in orchestrator.py's
+        _dispatch_source registry."""
+        from sar_validation.core import dry_collocation
+
+        assert "hf_radar_thredds" not in dry_collocation._PREDICATES
+        assert "noaa_hfradar_thredds" not in dry_collocation._PREDICATES
+
+
+class TestPredictHfRadarUs:
+    """_predict_hf_radar_us delegates directly to
+    HFRadarUSDownloader.check_availability_dry per footprint's own
+    (un-refined) bbox -- unlike its three siblings, it does not iterate a
+    local region table, since the delegated waterfall already resolves
+    its own region internally."""
+
+    def _footprint(self):
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        return SarFootprint(
+            kind="polygon", bbox=(-126.0, -120.0, 33.0, 38.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+    def test_unknown_when_no_sar_footprints_supplied(self):
+        from sar_validation.core import dry_collocation
+
+        result = dry_collocation._predict_hf_radar_us(source=object(), cfg=object(), sar_footprints=[])
+
+        assert result.verdict == "unknown"
+
+    def test_collocated_via_predict_source(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import predict_source
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        seen_bboxes = []
+
+        def _fake_check(min_lon, max_lon, min_lat, max_lat, start, end):
+            seen_bboxes.append((min_lon, max_lon, min_lat, max_lat))
+            return True
+
+        monkeypatch.setattr(dry_collocation, "_hf_radar_us_check_dry", _fake_check)
+
+        result = predict_source(
+            SimpleNamespace(source_type="hf_radar_us"), cfg=object(), sar_footprints=[self._footprint()],
+        )
+
+        assert result.verdict == "collocated"
+        assert result.source_type == "hf_radar_us"
+        assert result.bucket == "ground-point"
+        # Called with the footprint's own raw bbox -- no per-region
+        # candidate-table refinement at this layer.
+        assert seen_bboxes == [(-126.0, -120.0, 33.0, 38.0)]
+
+    def test_none_predicted_when_check_returns_false(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+        monkeypatch.setattr(dry_collocation, "_hf_radar_us_check_dry", lambda *a, **k: False)
+
+        result = dry_collocation._predict_hf_radar_us(
+            source=object(), cfg=object(), sar_footprints=[self._footprint()],
+        )
+
+        assert result.verdict == "none-predicted"
+
+    def test_unknown_when_check_raises(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        def _raise(*a, **k):
+            raise RuntimeError("waterfall exploded")
+
+        monkeypatch.setattr(dry_collocation, "_hf_radar_us_check_dry", _raise)
+
+        result = dry_collocation._predict_hf_radar_us(
+            source=object(), cfg=object(), sar_footprints=[self._footprint()],
+        )
+
+        assert result.verdict == "unknown"

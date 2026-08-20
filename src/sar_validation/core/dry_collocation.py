@@ -25,6 +25,8 @@ from typing import Callable, List, Literal, Optional, Tuple
 import pandas as pd
 
 from ..downloaders import radarsat2_wind_downloader as _rs2
+from ..downloaders._hf_radar_regions import HFR_REGIONS
+from ..downloaders._noaa_hfr_regions import NOAA_HFR_REGIONS
 from ..downloaders.altimeter_downloader import AltimeterDownloader
 from ..downloaders.ascat_soil_moisture_downloader import ASCATSoilMoistureDownloader
 from ..downloaders.base import (
@@ -36,9 +38,13 @@ from ..downloaders.base import (
     split_antimeridian_bbox,
 )
 from ..downloaders.earthdata_soil_moisture_downloader import EarthdataSoilMoistureDownloader
+from ..downloaders.hf_radar_downloader import HFRadarDownloader
+from ..downloaders.hf_radar_historical_downloader import HFRadarHistoricalDownloader
+from ..downloaders.hf_radar_us_downloader import HFRadarUSDownloader
 from ..downloaders.hsaf_downloader import HSAFDownloader
 from ..downloaders.hsaf_downloader import _parse_satellite as _hsaf_parse_satellite
 from ..downloaders.ismn_downloader import ISMNDownloader
+from ..downloaders.noaa_hfradar_downloader import NOAAHFRadarDownloader
 from ..downloaders.scatterometer_downloader import ScatterometerDownloader
 from ..downloaders.scatterometer_ftp_downloader import ScatterometerFTPDownloader
 from ..downloaders.smos_downloader import SMOSDownloader
@@ -1412,3 +1418,231 @@ def _predict_insitu(source, cfg, sar_footprints: "list[SarFootprint]") -> Source
 
 for _insitu_type in ("mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"):
     _PREDICATES[_insitu_type] = _predict_insitu
+
+
+def _hf_radar_candidate_regions(
+    regions_table: "dict", footprint: "SarFootprint",
+) -> "list[tuple[str, tuple[float, float, float, float]]]":
+    """(region_name, intersected_bbox) for every entry in *regions_table*
+    (HFR_REGIONS or NOAA_HFR_REGIONS -- both share a "bbox" field per
+    entry) whose own bbox genuinely overlaps *footprint*'s real shape, per
+    _bbox_overlaps_footprint -- an area-vs-area refinement over a naive
+    "does the recipe's own bbox intersect the region's bbox" comparison,
+    so a footprint sitting only in one corner of a large multi-region
+    country still gets attributed to the right specific region(s), not
+    just whichever region happens to have the largest overlap with the
+    recipe's own (typically much larger) requested bbox.
+
+    intersected_bbox is entirely inside the matched region's own bbox
+    (clamped on all four bounds), so passing it on to that region's own
+    resolve_hfr_region/match_noaa_hfr_region call (inside the downloader's
+    check_availability_dry) is guaranteed to resolve back to this exact
+    region, never a differently-overlapping neighbor.
+    """
+    f_min_lon, f_max_lon, f_min_lat, f_max_lat = footprint.bbox
+    candidates: "list[tuple[str, tuple[float, float, float, float]]]" = []
+    for name, region in regions_table.items():
+        r_min_lon, r_max_lon, r_min_lat, r_max_lat = region["bbox"]
+        if not _bbox_overlaps_footprint(r_min_lon, r_max_lon, r_min_lat, r_max_lat, footprint):
+            continue
+        intersected = (
+            max(f_min_lon, r_min_lon), min(f_max_lon, r_max_lon),
+            max(f_min_lat, r_min_lat), min(f_max_lat, r_max_lat),
+        )
+        candidates.append((name, intersected))
+    return candidates
+
+
+def _predict_hf_radar(
+    source,
+    cfg,
+    sar_footprints: "list[SarFootprint]",
+    *,
+    check_availability_dry: "Callable[..., bool]",
+    regions_table: "dict",
+    source_type: str,
+) -> SourcePrediction:
+    """Shared predicate for the three HF-radar source_types with a real
+    per-region grid table of their own: "hf_radar" (Copernicus Marine
+    NRT), "hf_radar_historical" (Copernicus Marine delayed-mode), and
+    "hf_radar_noaa" (NOAA ERDDAP). "hf_radar_us" (the ERDDAP->THREDDS->
+    Copernicus waterfall) has its own _predict_hf_radar_us instead, since
+    it delegates to the other four downloaders' own check_availability_dry
+    rather than owning a single region table itself.
+
+    HF-radar's real unit is a whole grid region, not a point station --
+    unlike ISMN/in-situ (_predict_ismn/_predict_insitu), the coarse pass
+    here is a per-region _bbox_overlaps_footprint area check
+    (_hf_radar_candidate_regions) *before* ever calling
+    check_availability_dry, rather than a raw footprint-bbox query
+    followed by a point-in-shape refinement -- this is what lets a
+    footprint sitting only in one corner of a large multi-region country
+    still get attributed to the right specific region(s), rather than
+    whichever region the recipe's own (typically much larger) nominal
+    bbox happens to overlap most.
+
+    All four real HF-radar source_types resolve their time tolerance via
+    the same "hf_radar_grid" key (not their own source_type string) --
+    a single shared tolerance-lookup key across all four, not a
+    per-source_type one, matching orchestrator.py's own
+    _padded_temporal_bounds("hf_radar_grid") call sites.
+    """
+    if not sar_footprints:
+        return SourcePrediction(
+            source_type=source_type, bucket="ground-point", verdict="unknown",
+            detail="No SAR footprints supplied -- cannot predict.",
+        )
+
+    tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, "hf_radar_grid"))
+    any_available = False
+
+    for footprint in sar_footprints:
+        padded_start = footprint.sensing_start - tolerance
+        padded_end = footprint.sensing_end + tolerance
+        for _region_name, (r_min_lon, r_max_lon, r_min_lat, r_max_lat) in _hf_radar_candidate_regions(
+            regions_table, footprint,
+        ):
+            try:
+                if check_availability_dry(
+                    r_min_lon, r_max_lon, r_min_lat, r_max_lat,
+                    padded_start.isoformat(), padded_end.isoformat(),
+                ):
+                    any_available = True
+            except Exception:
+                logger.debug("_predict_hf_radar: availability check failed", exc_info=True)
+                return SourcePrediction(
+                    source_type=source_type, bucket="ground-point", verdict="unknown",
+                    detail=f"HF-radar availability check failed for {source_type}.",
+                )
+
+    verdict: Verdict = "collocated" if any_available else "none-predicted"
+    return SourcePrediction(
+        source_type=source_type, bucket="ground-point", verdict=verdict,
+        detail=f"HF-radar data {'found' if any_available else 'not found'} in predicted window(s).",
+    )
+
+
+def _hf_radar_copernicus_check_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> bool:
+    """Thin wrapper: constructs an HFRadarDownloader and calls its
+    check_availability_dry. output_dir is never written to by that
+    method, so a harmless placeholder is safe here."""
+    dl = HFRadarDownloader(output_dir=Path("/dev/null"))
+    return dl.check_availability_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _predict_hf_radar_copernicus(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Predicate for source_type="hf_radar" (Copernicus Marine NRT grid)."""
+    return _predict_hf_radar(
+        source, cfg, sar_footprints,
+        check_availability_dry=_hf_radar_copernicus_check_dry,
+        regions_table=HFR_REGIONS,
+        source_type="hf_radar",
+    )
+
+
+_PREDICATES["hf_radar"] = _predict_hf_radar_copernicus
+
+
+def _hf_radar_historical_check_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> bool:
+    """Thin wrapper: constructs an HFRadarHistoricalDownloader and calls
+    its check_availability_dry. output_dir is never written to by that
+    method, so a harmless placeholder is safe here."""
+    dl = HFRadarHistoricalDownloader(output_dir=Path("/dev/null"))
+    return dl.check_availability_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _predict_hf_radar_historical(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Predicate for source_type="hf_radar_historical" (Copernicus Marine
+    delayed-mode archive)."""
+    return _predict_hf_radar(
+        source, cfg, sar_footprints,
+        check_availability_dry=_hf_radar_historical_check_dry,
+        regions_table=HFR_REGIONS,
+        source_type="hf_radar_historical",
+    )
+
+
+_PREDICATES["hf_radar_historical"] = _predict_hf_radar_historical
+
+
+def _hf_radar_noaa_check_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> bool:
+    """Thin wrapper: constructs a NOAAHFRadarDownloader and calls its
+    check_availability_dry. output_dir is never written to by that
+    method, so a harmless placeholder is safe here."""
+    dl = NOAAHFRadarDownloader(output_dir=Path("/dev/null"))
+    return dl.check_availability_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _predict_hf_radar_noaa(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Predicate for source_type="hf_radar_noaa" (NOAA ERDDAP griddap)."""
+    return _predict_hf_radar(
+        source, cfg, sar_footprints,
+        check_availability_dry=_hf_radar_noaa_check_dry,
+        regions_table=NOAA_HFR_REGIONS,
+        source_type="hf_radar_noaa",
+    )
+
+
+_PREDICATES["hf_radar_noaa"] = _predict_hf_radar_noaa
+
+
+def _hf_radar_us_check_dry(
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+) -> bool:
+    """Thin wrapper: constructs an HFRadarUSDownloader and calls its
+    check_availability_dry. output_dir is never written to by that
+    method, so a harmless placeholder is safe here."""
+    dl = HFRadarUSDownloader(output_dir=Path("/dev/null"))
+    return dl.check_availability_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+
+
+def _predict_hf_radar_us(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Predicate for source_type="hf_radar_us" (the ERDDAP->THREDDS->
+    Copernicus waterfall). Unlike _predict_hf_radar's three sibling
+    registrations, this delegates directly to HFRadarUSDownloader.
+    check_availability_dry per footprint's own (un-refined) bbox -- no
+    local per-region-table iteration here, since that delegator's own
+    check_availability_dry already resolves whichever single NOAA or
+    Copernicus region applies via its own internal waterfall (mirroring
+    download()'s own region resolution), the same way each of the other
+    four sources resolves its own region internally.
+    """
+    if not sar_footprints:
+        return SourcePrediction(
+            source_type="hf_radar_us", bucket="ground-point", verdict="unknown",
+            detail="No SAR footprints supplied -- cannot predict.",
+        )
+
+    tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, "hf_radar_grid"))
+    any_available = False
+
+    for footprint in sar_footprints:
+        padded_start = footprint.sensing_start - tolerance
+        padded_end = footprint.sensing_end + tolerance
+        try:
+            if _hf_radar_us_check_dry(
+                footprint.bbox[0], footprint.bbox[1], footprint.bbox[2], footprint.bbox[3],
+                padded_start.isoformat(), padded_end.isoformat(),
+            ):
+                any_available = True
+        except Exception:
+            logger.debug("_predict_hf_radar_us: availability check failed", exc_info=True)
+            return SourcePrediction(
+                source_type="hf_radar_us", bucket="ground-point", verdict="unknown",
+                detail="HF-radar availability check failed for hf_radar_us.",
+            )
+
+    verdict: Verdict = "collocated" if any_available else "none-predicted"
+    return SourcePrediction(
+        source_type="hf_radar_us", bucket="ground-point", verdict=verdict,
+        detail=f"HF-radar data {'found' if any_available else 'not found'} in predicted window(s).",
+    )
+
+
+_PREDICATES["hf_radar_us"] = _predict_hf_radar_us
