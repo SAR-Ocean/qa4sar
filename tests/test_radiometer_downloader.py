@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from datetime import date
 
-import pytest
-
 
 class _FakeResponse:
     def __init__(self, status_code: int) -> None:
@@ -46,7 +44,7 @@ class TestRadiometerDownloaderCheckExistsDry:
         assert result is False
 
     def test_defaults_to_all_supported_sensors_when_omitted(self, monkeypatch):
-        from sar_validation.downloaders.radiometer_downloader import SENSORS, RadiometerDownloader, SUPPORTED_SENSORS
+        from sar_validation.downloaders.radiometer_downloader import SENSORS, SUPPORTED_SENSORS, RadiometerDownloader
 
         head_calls = []
         monkeypatch.setattr(

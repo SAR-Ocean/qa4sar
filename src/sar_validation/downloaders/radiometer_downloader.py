@@ -171,6 +171,9 @@ class RadiometerDownloader:
         list[Path]
             Paths to the downloaded NetCDF files.
         """
+        if self.output_dir is None:
+            raise ValueError("download() requires a real output_dir (got None).")
+
         start_dt = normalize_datetime(start)
         end_dt = normalize_datetime(end)
 
@@ -268,6 +271,7 @@ class RadiometerDownloader:
 
     def _fetch_first(self, sensor: str, day, candidates: list[tuple[str, str]]) -> Optional[Path]:
         """Try each candidate URL in order; save the first that exists."""
+        assert self.output_dir is not None, "_fetch_first requires a real output_dir (see download())"
         for url, filename in candidates:
             dest = self.output_dir / filename
             if dest.exists():

@@ -2451,3 +2451,248 @@ class TestPredictHfRadarUs:
         )
 
         assert result.verdict == "unknown"
+
+
+class TestPredictGlobalComposite:
+    """_predict_global_composite is the shared predicate for the
+    global-composite bucket (RSS radiometer, CDS SSM): both sources
+    publish one daily global-coverage file, so only a footprint's own
+    sensing day matters -- no spatial (bbox/polygon) refinement."""
+
+    def _footprint(self, day=datetime(2026, 8, 1, 6, 0, 0)):
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        return SarFootprint(
+            kind="polygon", bbox=(-10.0, 5.0, 50.0, 62.0), polygon=None, points=None,
+            sensing_start=day, sensing_end=day + timedelta(minutes=1),
+            source_file="s1.SAFE",
+        )
+
+    def test_unknown_when_no_sar_footprints_supplied(self):
+        from sar_validation.core.dry_collocation import _predict_global_composite
+
+        result = _predict_global_composite(
+            source=object(), cfg=object(), sar_footprints=[],
+            check_exists_dry=lambda day: True, source_type="radiometer",
+        )
+
+        assert result.verdict == "unknown"
+        assert result.bucket == "global-composite"
+
+    def test_collocated_when_any_footprint_day_exists(self):
+        from sar_validation.core.dry_collocation import _predict_global_composite
+
+        seen_days = []
+
+        def _check(day):
+            seen_days.append(day)
+            return day == datetime(2026, 8, 2).date()
+
+        result = _predict_global_composite(
+            source=object(), cfg=object(),
+            sar_footprints=[self._footprint(datetime(2026, 8, 1, 6)), self._footprint(datetime(2026, 8, 2, 6))],
+            check_exists_dry=_check, source_type="radiometer",
+        )
+
+        assert result.verdict == "collocated"
+        assert result.bucket == "global-composite"
+        assert seen_days == [datetime(2026, 8, 1).date(), datetime(2026, 8, 2).date()]
+
+    def test_none_predicted_when_no_footprint_day_exists(self):
+        from sar_validation.core.dry_collocation import _predict_global_composite
+
+        result = _predict_global_composite(
+            source=object(), cfg=object(), sar_footprints=[self._footprint()],
+            check_exists_dry=lambda day: False, source_type="cds_ssm",
+        )
+
+        assert result.verdict == "none-predicted"
+        assert result.source_type == "cds_ssm"
+
+    def test_unknown_when_check_raises(self):
+        from sar_validation.core.dry_collocation import _predict_global_composite
+
+        def _raise(day):
+            raise RuntimeError("boom")
+
+        result = _predict_global_composite(
+            source=object(), cfg=object(), sar_footprints=[self._footprint()],
+            check_exists_dry=_raise, source_type="radiometer",
+        )
+
+        assert result.verdict == "unknown"
+
+    def test_bbox_and_polygon_never_consulted(self):
+        """Spatial refinement isn't meaningful for a daily global-coverage
+        file -- check_exists_dry only ever receives the footprint's day,
+        never its bbox/polygon."""
+        from sar_validation.core.dry_collocation import SarFootprint, _predict_global_composite
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 5.0, 50.0, 62.0), polygon=[(50.0, -10.0), (62.0, 5.0)], points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+        call_args = []
+
+        def _check(*args):
+            call_args.append(args)
+            return True
+
+        _predict_global_composite(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            check_exists_dry=_check, source_type="radiometer",
+        )
+
+        assert call_args == [(datetime(2026, 8, 1).date(),)]
+
+
+class TestRadiometerCheckDry:
+    def test_passes_sensors_from_download_kwargs(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        captured = {}
+
+        class _FakeRadiometerDownloader:
+            def __init__(self, output_dir):
+                captured["output_dir"] = output_dir
+
+            def check_exists_dry(self, day, sensors=None):
+                captured["day"] = day
+                captured["sensors"] = sensors
+                return True
+
+        monkeypatch.setattr(dry_collocation, "RadiometerDownloader", _FakeRadiometerDownloader)
+
+        source = SimpleNamespace(download_kwargs={"sensors": ["amsr2"]})
+        result = dry_collocation._radiometer_check_dry(source, datetime(2026, 8, 1).date())
+
+        assert result is True
+        assert captured["sensors"] == ["amsr2"]
+        assert captured["day"] == datetime(2026, 8, 1).date()
+
+    def test_defaults_sensors_to_none_when_not_in_download_kwargs(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        captured = {}
+
+        class _FakeRadiometerDownloader:
+            def __init__(self, output_dir):
+                pass
+
+            def check_exists_dry(self, day, sensors=None):
+                captured["sensors"] = sensors
+                return False
+
+        monkeypatch.setattr(dry_collocation, "RadiometerDownloader", _FakeRadiometerDownloader)
+
+        source = SimpleNamespace(download_kwargs={})
+        dry_collocation._radiometer_check_dry(source, datetime(2026, 8, 1).date())
+
+        assert captured["sensors"] is None
+
+
+class TestCdsSsmCheckDry:
+    def test_passes_product_type_from_download_kwargs(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        captured = {}
+
+        class _FakeCDSSoilMoistureDownloader:
+            def __init__(self, product_type, output_dir):
+                captured["product_type"] = product_type
+
+            def check_availability_dry(self, day):
+                captured["day"] = day
+                return True
+
+        monkeypatch.setattr(dry_collocation, "CDSSoilMoistureDownloader", _FakeCDSSoilMoistureDownloader)
+
+        source = SimpleNamespace(download_kwargs={"product_type": "passive"})
+        result = dry_collocation._cds_ssm_check_dry(source, datetime(2026, 8, 1).date())
+
+        assert result is True
+        assert captured["product_type"] == "passive"
+
+    def test_defaults_product_type_to_active(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        captured = {}
+
+        class _FakeCDSSoilMoistureDownloader:
+            def __init__(self, product_type, output_dir):
+                captured["product_type"] = product_type
+
+            def check_availability_dry(self, day):
+                return False
+
+        monkeypatch.setattr(dry_collocation, "CDSSoilMoistureDownloader", _FakeCDSSoilMoistureDownloader)
+
+        source = SimpleNamespace(download_kwargs={})
+        dry_collocation._cds_ssm_check_dry(source, datetime(2026, 8, 1).date())
+
+        assert captured["product_type"] == "active"
+
+
+class TestPredictGlobalCompositeRegistrations:
+    """One predict_source integration test per real global-composite
+    source_type, exercising the actual _PREDICATES dispatch."""
+
+    @pytest.mark.parametrize(
+        "source_type,check_dry_name",
+        [
+            pytest.param("radiometer", "_radiometer_check_dry", id="radiometer"),
+            pytest.param("cds_ssm", "_cds_ssm_check_dry", id="cds_ssm"),
+        ],
+    )
+    def test_collocated_via_predict_source(self, monkeypatch, source_type, check_dry_name):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint, predict_source
+
+        monkeypatch.setattr(dry_collocation, check_dry_name, lambda source, day: True)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 5.0, 50.0, 62.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = predict_source(
+            SimpleNamespace(source_type=source_type, download_kwargs={}),
+            cfg=object(), sar_footprints=[footprint],
+        )
+
+        assert result.verdict == "collocated"
+        assert result.source_type == source_type
+        assert result.bucket == "global-composite"
+
+    @pytest.mark.parametrize("source_type", ["radiometer", "cds_ssm"])
+    def test_none_predicted_via_predict_source(self, monkeypatch, source_type):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint, predict_source
+
+        check_dry_name = f"_{'radiometer' if source_type == 'radiometer' else 'cds_ssm'}_check_dry"
+        monkeypatch.setattr(dry_collocation, check_dry_name, lambda source, day: False)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 5.0, 50.0, 62.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = predict_source(
+            SimpleNamespace(source_type=source_type, download_kwargs={}),
+            cfg=object(), sar_footprints=[footprint],
+        )
+
+        assert result.verdict == "none-predicted"
+
+    def test_registered_under_own_source_type_radiometer(self):
+        from sar_validation.core import dry_collocation
+
+        assert dry_collocation._PREDICATES["radiometer"] is dry_collocation._predict_radiometer
+
+    def test_registered_under_own_source_type_cds_ssm(self):
+        from sar_validation.core import dry_collocation
+
+        assert dry_collocation._PREDICATES["cds_ssm"] is dry_collocation._predict_cds_ssm

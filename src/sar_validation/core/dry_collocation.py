@@ -18,7 +18,7 @@ import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, List, Literal, Optional, Tuple
 
@@ -37,6 +37,7 @@ from ..downloaders.base import (
     prefer_ipv4_dns,
     split_antimeridian_bbox,
 )
+from ..downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
 from ..downloaders.earthdata_soil_moisture_downloader import EarthdataSoilMoistureDownloader
 from ..downloaders.hf_radar_downloader import HFRadarDownloader
 from ..downloaders.hf_radar_historical_downloader import HFRadarHistoricalDownloader
@@ -45,6 +46,7 @@ from ..downloaders.hsaf_downloader import HSAFDownloader
 from ..downloaders.hsaf_downloader import _parse_satellite as _hsaf_parse_satellite
 from ..downloaders.ismn_downloader import ISMNDownloader
 from ..downloaders.noaa_hfradar_downloader import NOAAHFRadarDownloader
+from ..downloaders.radiometer_downloader import RadiometerDownloader
 from ..downloaders.scatterometer_downloader import ScatterometerDownloader
 from ..downloaders.scatterometer_ftp_downloader import ScatterometerFTPDownloader
 from ..downloaders.smos_downloader import SMOSDownloader
@@ -1732,3 +1734,89 @@ def _predict_hf_radar_us(source, cfg, sar_footprints: "list[SarFootprint]") -> S
 
 
 _PREDICATES["hf_radar_us"] = _predict_hf_radar_us
+
+
+def _predict_global_composite(
+    source,
+    cfg,
+    sar_footprints: "list[SarFootprint]",
+    *,
+    check_exists_dry: "Callable[[date], bool]",
+    source_type: str,
+) -> SourcePrediction:
+    """Shared predicate for the global-composite bucket (RSS radiometer,
+    CDS SSM): both sources publish one daily global-coverage file, so
+    spatial refinement isn't meaningful -- a footprint's own bbox/polygon
+    is never consulted, only its sensing day. Collocated if any
+    footprint's day has data available from *check_exists_dry*.
+    """
+    if not sar_footprints:
+        return SourcePrediction(
+            source_type=source_type, bucket="global-composite", verdict="unknown",
+            detail="No SAR footprints supplied -- cannot predict.",
+        )
+
+    any_exists = False
+    for footprint in sar_footprints:
+        day = footprint.sensing_start.date()
+        try:
+            if check_exists_dry(day):
+                any_exists = True
+        except Exception:
+            logger.debug("_predict_global_composite: existence check failed", exc_info=True)
+            return SourcePrediction(
+                source_type=source_type, bucket="global-composite", verdict="unknown",
+                detail=f"Existence check failed for {source_type}.",
+            )
+
+    verdict: Verdict = "collocated" if any_exists else "none-predicted"
+    return SourcePrediction(
+        source_type=source_type, bucket="global-composite", verdict=verdict,
+        detail=f"{source_type} data {'found' if any_exists else 'not found'} for the SAR footprint day(s).",
+    )
+
+
+def _radiometer_check_dry(source, day: date) -> bool:
+    """Thin wrapper: constructs a RadiometerDownloader and calls its
+    check_exists_dry, restricted to source.download_kwargs["sensors"] when
+    present (mirroring orchestrator.py's _download_radiometer, which passes
+    that same key straight through to download()). output_dir is never
+    written to by check_exists_dry, so a harmless placeholder is safe here."""
+    dl = RadiometerDownloader(output_dir=Path("/dev/null"))
+    sensors = source.download_kwargs.get("sensors")
+    return dl.check_exists_dry(day, sensors=sensors)
+
+
+def _cds_ssm_check_dry(source, day: date) -> bool:
+    """Thin wrapper: constructs a CDSSoilMoistureDownloader for
+    source.download_kwargs["product_type"] (default "active", mirroring
+    orchestrator.py's own _download_cds_ssm default) and calls its
+    check_availability_dry. output_dir is never written to by
+    check_availability_dry, so a harmless placeholder is safe here."""
+    product_type = source.download_kwargs.get("product_type", "active")
+    dl = CDSSoilMoistureDownloader(product_type=product_type, output_dir=Path("/dev/null"))
+    return dl.check_availability_dry(day)
+
+
+def _predict_radiometer(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Predicate for source_type="radiometer" (RSS microwave radiometer
+    daily gridded ocean-wind product)."""
+    return _predict_global_composite(
+        source, cfg, sar_footprints,
+        check_exists_dry=lambda day: _radiometer_check_dry(source, day),
+        source_type="radiometer",
+    )
+
+
+def _predict_cds_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Predicate for source_type="cds_ssm" (C3S CDS daily gridded satellite
+    soil moisture product)."""
+    return _predict_global_composite(
+        source, cfg, sar_footprints,
+        check_exists_dry=lambda day: _cds_ssm_check_dry(source, day),
+        source_type="cds_ssm",
+    )
+
+
+_PREDICATES["radiometer"] = _predict_radiometer
+_PREDICATES["cds_ssm"] = _predict_cds_ssm
