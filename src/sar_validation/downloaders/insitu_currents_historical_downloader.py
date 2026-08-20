@@ -143,6 +143,52 @@ class InSituCurrentsHistoricalDownloader:
                 downloaded.append(path)
         return downloaded
 
+    def check_availability_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+    ) -> bool:
+        """
+        Whether any delayed-mode current observation for this instrument
+        exists in this bbox/time window, without writing anything to disk.
+
+        Uses ``copernicusmarine.read_dataframe()`` rather than ``subset()``
+        (the real download path's call above) -- the same choice
+        ``InSituDownloader.check_availability_dry`` makes for the sibling
+        aggregate in-situ dataset, since this product line's storage
+        format doesn't support lazy ``xarray`` loading either.
+        """
+        try:
+            import copernicusmarine
+        except ImportError as exc:
+            raise ImportError(
+                "copernicusmarine is required for delayed-mode currents downloads.\n"
+                "Install it with:  pip install copernicusmarine"
+            ) from exc
+
+        dataset_id = _DATASET_IDS[self.instrument]
+        start_dt = normalize_datetime(start)
+        end_dt = normalize_datetime(end)
+
+        df = copernicusmarine.read_dataframe(
+            dataset_id=dataset_id,
+            variables=_VARIABLES,
+            minimum_longitude=min_lon,
+            maximum_longitude=max_lon,
+            minimum_latitude=min_lat,
+            maximum_latitude=max_lat,
+            start_datetime=start_dt,
+            end_datetime=end_dt,
+            minimum_depth=self.min_depth,
+            maximum_depth=self.max_depth,
+            disable_progress_bar=True,
+        )
+        return not df.empty
+
     def _download_window(
         self,
         min_lon: float,

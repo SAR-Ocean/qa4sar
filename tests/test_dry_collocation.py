@@ -1943,6 +1943,193 @@ class TestPredictInsitu:
         assert len(calls) == 2
 
 
+class TestPredictInsituCurrentsHistorical:
+    """_predict_insitu_currents_historical is registered under the four
+    real orchestrator.py source_type keys (adcp_historical,
+    argo_historical, drifter_historical, glider_historical) -- there is
+    no source_type="insitu_currents_historical" anywhere in this
+    codebase. Unlike _predict_insitu (a shared InSituDownloader instance
+    filtered per-call by source_types=[...]), each of these four keys
+    must construct its own InSituCurrentsHistoricalDownloader instance
+    with instrument=<key minus "_historical">, since instrument is a
+    required constructor argument there, not a query filter."""
+
+    def _old_footprint(self):
+        """Sensing time well past _MIN_AGE_DAYS (182 days) so the
+        delayed-mode archive eligibility check passes."""
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        old = datetime.now(timezone.utc) - timedelta(days=400)
+        return SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=old, sensing_end=old + timedelta(minutes=1),
+            source_file="s1.SAFE",
+        )
+
+    def _recent_footprint(self):
+        """Sensing time inside the archive's real lag window -- download()
+        itself would skip this without touching the network."""
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        recent = datetime.now(timezone.utc) - timedelta(days=10)
+        return SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=recent, sensing_end=recent + timedelta(minutes=1),
+            source_file="s1.SAFE",
+        )
+
+    @pytest.mark.parametrize(
+        "source_type", ["adcp_historical", "argo_historical", "drifter_historical", "glider_historical"],
+    )
+    def test_registered_under_each_real_source_type(self, source_type):
+        from sar_validation.core import dry_collocation
+
+        assert (
+            dry_collocation._PREDICATES[source_type]
+            is dry_collocation._predict_insitu_currents_historical
+        )
+
+    def test_no_bare_insitu_currents_historical_key_registered(self):
+        """The original plan draft assumed a single
+        source_type="insitu_currents_historical" -- that key must not
+        exist anywhere in _PREDICATES."""
+        from sar_validation.core import dry_collocation
+
+        assert "insitu_currents_historical" not in dry_collocation._PREDICATES
+
+    @pytest.mark.parametrize(
+        "source_type, expected_instrument",
+        [
+            ("adcp_historical", "adcp"),
+            ("argo_historical", "argo"),
+            ("drifter_historical", "drifter"),
+            ("glider_historical", "glider"),
+        ],
+    )
+    def test_constructs_downloader_with_correct_instrument(
+        self, monkeypatch, source_type, expected_instrument,
+    ):
+        """The core correction this task makes: instrument must be
+        derived by stripping "_historical" off source.source_type, never
+        left as the raw source_type string and never hardcoded to one
+        fixed instrument regardless of which key was invoked."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_currents_historical_downloader import (
+            InSituCurrentsHistoricalDownloader,
+        )
+
+        seen_instruments = []
+        real_init = InSituCurrentsHistoricalDownloader.__init__
+
+        def _spy_init(self, instrument, *a, **k):
+            seen_instruments.append(instrument)
+            real_init(self, instrument, *a, **k)
+
+        monkeypatch.setattr(InSituCurrentsHistoricalDownloader, "__init__", _spy_init)
+        monkeypatch.setattr(
+            InSituCurrentsHistoricalDownloader, "check_availability_dry", lambda self, *a, **k: True,
+        )
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type=source_type), cfg=object(),
+            sar_footprints=[self._old_footprint()],
+        )
+
+        assert seen_instruments == [expected_instrument]
+        assert expected_instrument != source_type
+        assert result.verdict == "collocated"
+        assert result.source_type == source_type
+        assert result.bucket == "ground-point"
+
+    def test_none_predicted_when_no_data_available(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_currents_historical_downloader import (
+            InSituCurrentsHistoricalDownloader,
+        )
+
+        monkeypatch.setattr(
+            InSituCurrentsHistoricalDownloader, "check_availability_dry", lambda self, *a, **k: False,
+        )
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="argo_historical"), cfg=object(),
+            sar_footprints=[self._old_footprint()],
+        )
+
+        assert result.verdict == "none-predicted"
+
+    def test_unknown_when_availability_check_raises(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_currents_historical_downloader import (
+            InSituCurrentsHistoricalDownloader,
+        )
+
+        def _raise(self, *a, **k):
+            raise RuntimeError("copernicusmarine unreachable")
+
+        monkeypatch.setattr(InSituCurrentsHistoricalDownloader, "check_availability_dry", _raise)
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="glider_historical"), cfg=object(),
+            sar_footprints=[self._old_footprint()],
+        )
+
+        assert result.verdict == "unknown"
+
+    def test_unknown_when_every_footprint_is_too_recent(self, monkeypatch):
+        """download() itself skips (no network call) for any window whose
+        end date is younger than _MIN_AGE_DAYS -- the predicate must
+        mirror that real eligibility gate as "unknown" (not a confident
+        "none-predicted"), since a too-recent footprint says nothing
+        about whether data would eventually appear once the archive
+        catches up."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_currents_historical_downloader import (
+            InSituCurrentsHistoricalDownloader,
+        )
+
+        calls = []
+        monkeypatch.setattr(
+            InSituCurrentsHistoricalDownloader, "check_availability_dry",
+            lambda self, *a, **k: calls.append(1) or True,
+        )
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="drifter_historical"), cfg=object(),
+            sar_footprints=[self._recent_footprint()],
+        )
+
+        assert result.verdict == "unknown"
+        assert calls == []
+
+    def test_collocated_if_any_footprint_has_data(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_currents_historical_downloader import (
+            InSituCurrentsHistoricalDownloader,
+        )
+
+        calls = []
+
+        def _fake_check(self, *a, **k):
+            calls.append(a)
+            return len(calls) == 2  # only the second footprint has data
+
+        monkeypatch.setattr(InSituCurrentsHistoricalDownloader, "check_availability_dry", _fake_check)
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        footprints = [self._old_footprint(), self._old_footprint()]
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="adcp_historical"), cfg=object(), sar_footprints=footprints,
+        )
+
+        assert result.verdict == "collocated"
+        assert len(calls) == 2
+
+
 class TestHfRadarCandidateRegions:
     """_hf_radar_candidate_regions is the per-region area-vs-area
     refinement HF-radar's predicate needs -- a footprint sitting only in

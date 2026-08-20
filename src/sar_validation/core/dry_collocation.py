@@ -1420,6 +1420,92 @@ for _insitu_type in ("mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"):
     _PREDICATES[_insitu_type] = _predict_insitu
 
 
+def _predict_insitu_currents_historical(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Predicate for the four real delayed-mode in-situ currents source
+    types (adcp_historical, argo_historical, drifter_historical,
+    glider_historical) -- see orchestrator.py's
+    _download_currents_historical. There is no single source_type
+    "insitu_currents_historical": unlike _predict_insitu's shared
+    InSituDownloader instance (filtered per-call via
+    source_types=[...]), instrument is a required *constructor* argument
+    here, so each call builds its own InSituCurrentsHistoricalDownloader
+    instance, with instrument derived by stripping the "_historical"
+    suffix off source.source_type (e.g. "adcp_historical" -> "adcp").
+
+    Delayed-mode data isn't finalized until
+    insitu_currents_historical_downloader._MIN_AGE_DAYS (182 days, ~6
+    months) after acquisition -- download() itself skips (no network
+    call) for any window younger than that. A footprint younger than the
+    cutoff is excluded from the availability check entirely and, if
+    every supplied footprint is too recent, the verdict is "unknown"
+    (not "none-predicted"): a too-recent footprint says nothing about
+    whether data would eventually appear once the archive catches up.
+    Age is compared via a bare date string (mirroring _predict_ascat_ssm's
+    own _ASCAT_COVERAGE_CUTOFF comparison) rather than raw datetimes, since
+    a SarFootprint's sensing_start/sensing_end are not guaranteed
+    timezone-aware.
+
+    This bucket stays bbox-only (no _point_in_footprint refinement) for
+    the same reason _predict_insitu does: check_availability_dry is a
+    single aggregate "does any data exist" boolean, with no per-platform
+    coordinates to check further.
+    """
+    from ..downloaders.insitu_currents_historical_downloader import (
+        _MIN_AGE_DAYS,
+        InSituCurrentsHistoricalDownloader,
+    )
+
+    instrument = source.source_type.removesuffix("_historical")
+    tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, source.source_type))
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=_MIN_AGE_DAYS)).date().isoformat()
+
+    eligible_footprints = [
+        fp for fp in sar_footprints
+        if (fp.sensing_end + tolerance).date().isoformat() <= cutoff_date
+    ]
+    if not eligible_footprints:
+        return SourcePrediction(
+            source_type=source.source_type, bucket="ground-point", verdict="unknown",
+            detail=(
+                f"No SAR footprint is old enough for the delayed-mode currents "
+                f"archive (data lags real-time by {_MIN_AGE_DAYS} days)."
+            ),
+        )
+
+    dl = InSituCurrentsHistoricalDownloader(instrument=instrument, output_dir=Path("."))
+    any_available = False
+
+    for footprint in eligible_footprints:
+        padded_start = footprint.sensing_start - tolerance
+        padded_end = footprint.sensing_end + tolerance
+        try:
+            if dl.check_availability_dry(
+                footprint.bbox[0], footprint.bbox[1], footprint.bbox[2], footprint.bbox[3],
+                padded_start.isoformat(), padded_end.isoformat(),
+            ):
+                any_available = True
+        except Exception:
+            logger.debug(
+                "_predict_insitu_currents_historical: availability check failed", exc_info=True,
+            )
+            return SourcePrediction(
+                source_type=source.source_type, bucket="ground-point", verdict="unknown",
+                detail="Delayed-mode currents availability check failed.",
+            )
+
+    verdict: Verdict = "collocated" if any_available else "none-predicted"
+    return SourcePrediction(
+        source_type=source.source_type, bucket="ground-point", verdict=verdict,
+        detail=f"Delayed-mode currents data {'found' if any_available else 'not found'} in predicted window(s).",
+    )
+
+
+for _currents_historical_type in (
+    "adcp_historical", "argo_historical", "drifter_historical", "glider_historical",
+):
+    _PREDICATES[_currents_historical_type] = _predict_insitu_currents_historical
+
+
 def _hf_radar_candidate_regions(
     regions_table: "dict", footprint: "SarFootprint",
 ) -> "list[tuple[str, tuple[float, float, float, float]]]":

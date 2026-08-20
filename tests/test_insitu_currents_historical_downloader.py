@@ -6,14 +6,31 @@ import logging
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
 import pytest
 
 from sar_validation.downloaders.insitu_currents_historical_downloader import (
     _DATASET_IDS,
+    _VARIABLES,
     InSituCurrentsHistoricalDownloader,
 )
 
 _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT = -20.0, 0.0, 35.0, 60.0
+
+
+class _FakeCopernicusMarineModule:
+    """Minimal stand-in for the copernicusmarine module, exposing just
+    the read_dataframe() call check_availability_dry uses -- mirrors
+    InSituDownloader's own test fixture of the same name
+    (test_insitu_downloader.py)."""
+
+    def __init__(self, has_data: bool):
+        self._has_data = has_data
+
+    def read_dataframe(self, **kwargs):
+        if not self._has_data:
+            return pd.DataFrame()
+        return pd.DataFrame({"EWCT": [0.1], "NSCT": [0.2]})
 
 
 class TestConstruction:
@@ -193,6 +210,61 @@ class TestForceDownload:
 
         fake_module.subset.assert_not_called()
         assert out == [dest_path]
+
+
+class TestCheckAvailabilityDry:
+    def test_returns_true_when_data_exists(self, tmp_path):
+        fake_module = _FakeCopernicusMarineModule(has_data=True)
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="adcp", output_dir=tmp_path)
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            result = dl.check_availability_dry(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2024-01-01T00:00:00", "2024-01-02T00:00:00",
+            )
+
+        assert result is True
+
+    def test_returns_false_when_no_data(self, tmp_path):
+        fake_module = _FakeCopernicusMarineModule(has_data=False)
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="argo", output_dir=tmp_path)
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            result = dl.check_availability_dry(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2024-01-01T00:00:00", "2024-01-02T00:00:00",
+            )
+
+        assert result is False
+
+    def test_queries_correct_dataset_id_and_variables(self, tmp_path):
+        fake_module = MagicMock()
+        fake_module.read_dataframe.return_value = pd.DataFrame({"EWCT": [0.1]})
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="glider", output_dir=tmp_path)
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            dl.check_availability_dry(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2024-01-01T00:00:00", "2024-01-02T00:00:00",
+            )
+
+        kwargs = fake_module.read_dataframe.call_args.kwargs
+        assert kwargs["dataset_id"] == _DATASET_IDS["glider"]
+        assert kwargs["variables"] == _VARIABLES
+
+    def test_no_file_written_to_disk(self, tmp_path):
+        """check_availability_dry must not create anything under
+        output_dir -- it's a pure in-memory existence check."""
+        fake_module = _FakeCopernicusMarineModule(has_data=True)
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="drifter", output_dir=tmp_path)
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            dl.check_availability_dry(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2024-01-01T00:00:00", "2024-01-02T00:00:00",
+            )
+
+        assert list(tmp_path.iterdir()) == []
 
 
 class TestDryRun:
