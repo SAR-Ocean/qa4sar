@@ -4611,3 +4611,153 @@ class TestHFRadarUSDownloaderWaterfall:
             dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
 
         assert any("already contains cached" in rec.message for rec in caplog.records)
+
+
+class TestHFRadarUSDownloaderCheckAvailabilityDry:
+    """check_availability_dry mirrors download()'s own waterfall try-order
+    exactly, but delegates to the four wrapped downloaders' own
+    check_availability_dry methods instead of re-deriving any
+    region-resolution/dataset-selection logic."""
+
+    def test_erddap_true_short_circuits_thredds_and_copernicus(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_erddap.return_value.check_availability_dry.return_value = True
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is True
+        m_thredds.return_value.check_availability_dry.assert_not_called()
+        m_cop.return_value.check_availability_dry.assert_not_called()
+        m_cop_hist.return_value.check_availability_dry.assert_not_called()
+
+    def test_erddap_false_falls_through_to_thredds(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_erddap.return_value.check_availability_dry.return_value = False
+            m_thredds.return_value.check_availability_dry.return_value = True
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is True
+        m_cop.return_value.check_availability_dry.assert_not_called()
+        m_cop_hist.return_value.check_availability_dry.assert_not_called()
+
+    def test_erddap_and_thredds_false_falls_through_to_copernicus_historical_then_nrt(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_erddap.return_value.check_availability_dry.return_value = False
+            m_thredds.return_value.check_availability_dry.return_value = False
+            m_cop_hist.return_value.check_availability_dry.return_value = False
+            m_cop.return_value.check_availability_dry.return_value = True
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is True
+        m_cop_hist.return_value.check_availability_dry.assert_called_once()
+        m_cop.return_value.check_availability_dry.assert_called_once()
+
+    def test_historical_true_short_circuits_nrt(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_erddap.return_value.check_availability_dry.return_value = False
+            m_thredds.return_value.check_availability_dry.return_value = False
+            m_cop_hist.return_value.check_availability_dry.return_value = True
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is True
+        m_cop.return_value.check_availability_dry.assert_not_called()
+
+    def test_non_us_bbox_skips_erddap_and_thredds_entirely(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_cop_hist.return_value.check_availability_dry.return_value = False
+            m_cop.return_value.check_availability_dry.return_value = False
+            dl.check_availability_dry(2.0, 8.0, 53.0, 55.0, _RECENT_START, _RECENT_END)
+
+        m_erddap.return_value.check_availability_dry.assert_not_called()
+        m_thredds.return_value.check_availability_dry.assert_not_called()
+
+    def test_great_lakes_region_skips_erddap_entirely(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds:
+            m_thredds.return_value.check_availability_dry.return_value = True
+            # US_GREAT_LAKES bbox center: lon ~-84.8, lat ~45.8
+            result = dl.check_availability_dry(-85.3, -84.2, 45.6, 46.05, "2024-01-31", "2024-01-31")
+
+        assert result is True
+        m_erddap.return_value.check_availability_dry.assert_not_called()
+
+    def test_false_when_no_backend_finds_anything(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_erddap.return_value.check_availability_dry.return_value = False
+            m_thredds.return_value.check_availability_dry.return_value = False
+            m_cop_hist.return_value.check_availability_dry.return_value = False
+            m_cop.return_value.check_availability_dry.return_value = False
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is False

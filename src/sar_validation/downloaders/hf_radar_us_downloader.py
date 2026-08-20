@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Union
 
-from ._noaa_hfr_regions import finest_resolution_km, match_noaa_hfr_region
+from ._noaa_hfr_regions import NoaaHfrRegion, finest_resolution_km, match_noaa_hfr_region
 from .hf_radar_downloader import HFRadarDownloader
 from .hf_radar_historical_downloader import HFRadarHistoricalDownloader
 from .noaa_hfradar_downloader import DEFAULT_RESOLUTION_KM, NOAAHFRadarDownloader
@@ -90,6 +90,17 @@ class HFRadarUSDownloader:
         #: "no data found" notice's wording.
         self.attempted_backends: list[str] = []
 
+    def _resolve_resolution_km(self, region: "Optional[NoaaHfrRegion]") -> float:
+        """The same resolution_km resolution download() applies -- None
+        auto-picks the matched region's own default, "finest" picks
+        finest_resolution_km(region), a float is used as-is -- shared with
+        check_availability_dry so both stay in lockstep."""
+        if self.resolution_km == "finest":
+            return finest_resolution_km(region) if region is not None else DEFAULT_RESOLUTION_KM
+        if isinstance(self.resolution_km, (int, float)):
+            return self.resolution_km
+        return region["default_resolution_km"] if region is not None else DEFAULT_RESOLUTION_KM
+
     def download(
         self, min_lon: float, max_lon: float, min_lat: float, max_lat: float,
         start: str, end: str,
@@ -101,13 +112,7 @@ class HFRadarUSDownloader:
         except ValueError:
             region_name, region = None, None
 
-        resolution_km: float
-        if self.resolution_km == "finest":
-            resolution_km = finest_resolution_km(region) if region is not None else DEFAULT_RESOLUTION_KM
-        elif isinstance(self.resolution_km, (int, float)):
-            resolution_km = self.resolution_km
-        else:
-            resolution_km = region["default_resolution_km"] if region is not None else DEFAULT_RESOLUTION_KM
+        resolution_km = self._resolve_resolution_km(region)
 
         if region is not None:
             if region["erddap_datasets"] is not None:
@@ -180,6 +185,46 @@ class HFRadarUSDownloader:
         )
         downloaded.extend(nrt.download(min_lon, max_lon, min_lat, max_lat, start, end))
         return downloaded
+
+    def check_availability_dry(
+        self, min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+        start: str, end: str,
+    ) -> bool:
+        """
+        Whether the ERDDAP->THREDDS->Copernicus waterfall would find real
+        data for this bbox/window, without downloading anything --
+        delegates to the four wrapped downloaders' own check_availability_dry
+        methods in exactly download()'s own try-order (first "yes" wins),
+        rather than re-deriving any of their region-resolution or
+        dataset-selection logic here. Each of the four already returns
+        False (never raises) for its own "this backend structurally
+        doesn't apply to this bbox/date" cases, so no exception handling
+        is needed here either -- an exception from any of them is a
+        genuine, unexpected failure that should propagate.
+        """
+        try:
+            _region_name, region = match_noaa_hfr_region(min_lon, max_lon, min_lat, max_lat)
+        except ValueError:
+            region = None
+
+        resolution_km = self._resolve_resolution_km(region)
+
+        if region is not None:
+            if region["erddap_datasets"] is not None:
+                erddap_dl = NOAAHFRadarDownloader(output_dir=Path("/dev/null"), resolution_km=resolution_km)
+                if erddap_dl.check_availability_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+                    return True
+
+            thredds_dl = NOAATHREDDSHFRadarDownloader(output_dir=Path("/dev/null"), resolution_km=resolution_km)
+            if thredds_dl.check_availability_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+                return True
+
+        historical = HFRadarHistoricalDownloader(output_dir=Path("/dev/null"))
+        if historical.check_availability_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            return True
+
+        nrt = HFRadarDownloader(output_dir=Path("/dev/null"))
+        return nrt.check_availability_dry(min_lon, max_lon, min_lat, max_lat, start, end)
 
     def _warn_if_stale_output(self, subdir: str, backend_label: str) -> None:
         """Warn if <output_dir>/subdir already holds cached .nc files from a
