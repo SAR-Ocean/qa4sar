@@ -907,3 +907,97 @@ class TestDownloadSegmentResourceCleanup:
         assert result is None
         assert opened_labels == ["u", "v"]
         assert sorted(closed) == ["u", "v"]
+
+
+class TestHasCoverage:
+    """has_coverage is the boolean-returning sibling of _probe_coverage
+    (which only logs), reusing the exact same _buffered_bounds/
+    _dodsc_urls/xr.open_dataset calls via the shared _probe_segment_windows
+    generator -- used by the dry-collocation recent-date live probe to
+    check whether HyCOM has actually published data for a footprint whose
+    date is only nominally within documented coverage."""
+
+    def test_true_when_a_granule_falls_in_the_buffered_window(self, tmp_path, monkeypatch):
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import HycomDownloader
+
+        class FakeLazyDataset:
+            def __init__(self):
+                self.time = xr.DataArray(pd.to_datetime(["2025-01-01T00:00:00"]), dims="time")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(xr, "open_dataset", lambda url, *a, **kw: FakeLazyDataset())
+
+        dl = HycomDownloader(output_dir=tmp_path)
+        assert dl.has_coverage(
+            "espc_d_v02", datetime(2025, 1, 1), datetime(2025, 1, 1, 6),
+        ) is True
+
+    def test_false_when_no_granule_falls_in_the_buffered_window(self, tmp_path, monkeypatch):
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import HycomDownloader
+
+        class FakeLazyDataset:
+            def __init__(self):
+                # Far outside even the buffered window.
+                self.time = xr.DataArray(pd.to_datetime(["2020-01-01T00:00:00"]), dims="time")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(xr, "open_dataset", lambda url, *a, **kw: FakeLazyDataset())
+
+        dl = HycomDownloader(output_dir=tmp_path)
+        assert dl.has_coverage(
+            "espc_d_v02", datetime(2025, 1, 1), datetime(2025, 1, 1, 6),
+        ) is False
+
+    def test_false_when_every_url_fails_to_open(self, tmp_path, monkeypatch):
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import HycomDownloader
+
+        def fake_open_dataset(url, *a, **kw):
+            raise OSError("simulated OPeNDAP failure")
+
+        monkeypatch.setattr(xr, "open_dataset", fake_open_dataset)
+
+        dl = HycomDownloader(output_dir=tmp_path)
+        assert dl.has_coverage(
+            "espc_d_v02", datetime(2025, 1, 1), datetime(2025, 1, 1, 6),
+        ) is False
+
+    def test_probe_coverage_still_logs_per_label_granule_counts(self, tmp_path, monkeypatch, caplog):
+        """Regression guard for the _probe_segment_windows extraction --
+        _probe_coverage's own --dry-run reporting behaviour must be
+        unchanged after has_coverage was factored out to share its
+        URL-opening logic."""
+        import logging
+
+        import pandas as pd
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import HycomDownloader
+
+        class FakeLazyDataset:
+            def __init__(self):
+                self.time = xr.DataArray(pd.to_datetime(["2025-01-01T00:00:00"]), dims="time")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(xr, "open_dataset", lambda url, *a, **kw: FakeLazyDataset())
+
+        dl = HycomDownloader(output_dir=tmp_path, dry_run=True)
+        with caplog.at_level(logging.INFO):
+            dl.download(
+                min_lon=-10.0, max_lon=10.0, min_lat=40.0, max_lat=55.0,
+                start="2025-01-01T00:00:00", end="2025-01-01T06:00:00",
+            )
+        assert "1 granule(s)" in caplog.text

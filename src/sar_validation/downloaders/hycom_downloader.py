@@ -343,14 +343,19 @@ class HycomDownloader:
         years = range(seg_start.year, seg_end.year + 1)
         return {f"uv_{year}": f"{base}/{year}" for year in years}
 
-    def _probe_coverage(
+    def _probe_segment_windows(
         self, dataset_key: str, seg_start: datetime, seg_end: datetime, clip_at_cutover: bool = False,
-    ) -> None:
-        """Open each URL for this segment and report which requested
-        days have granules in the live dataset's ``time`` coordinate 
-        (`_buffered_bounds`-widened window) -- no full u/v grid load. 
-        Analogous to ``noaa_hfradar_thredds_downloader.py``'s 
-        ``catalog.xml`` probe. Used for the ``--dry-run`` CLI option.
+    ):
+        """Yield ``(label, buffered_start, buffered_end, in_window_times)``
+        for each of this segment's OPeNDAP URLs (see :meth:`_dodsc_urls`) --
+        opens each lazily via ``xr.open_dataset`` (metadata only, no full
+        u/v grid load) and filters its ``time`` coordinate down to the
+        ``_buffered_bounds``-widened window. A URL that fails to open is
+        skipped (logged, not raised) rather than aborting the whole
+        segment. Shared by :meth:`_probe_coverage` (per-label granule-count
+        reporting) and :meth:`has_coverage` (boolean "any granule in
+        window" check) so both reuse the exact same URL-opening/
+        time-filtering logic instead of duplicating it.
         """
         import numpy as np
         import xarray as xr
@@ -363,17 +368,48 @@ class HycomDownloader:
             try:
                 remote = xr.open_dataset(url, drop_variables=_DROP_VARS)
             except Exception as exc:  # noqa: BLE001 — remote OPeNDAP errors are broad
-                logger.warning("  [dry-run] %s (%s): could not open %s: %s", dataset_key, label, url, exc)
+                logger.warning("  [probe] %s (%s): could not open %s: %s", dataset_key, label, url, exc)
                 continue
             times = remote.time.values
             remote.close()
             in_window = times[
                 (times >= np.datetime64(buffered_start)) & (times <= np.datetime64(buffered_end))
             ]
+            yield label, buffered_start, buffered_end, in_window
+
+    def _probe_coverage(
+        self, dataset_key: str, seg_start: datetime, seg_end: datetime, clip_at_cutover: bool = False,
+    ) -> None:
+        """Report which requested days have granules in the live
+        dataset's ``time`` coordinate (`_buffered_bounds`-widened window)
+        -- no full u/v grid load. Analogous to
+        ``noaa_hfradar_thredds_downloader.py``'s ``catalog.xml`` probe.
+        Used for the ``--dry-run`` CLI option.
+        """
+        for label, buffered_start, buffered_end, in_window in self._probe_segment_windows(
+            dataset_key, seg_start, seg_end, clip_at_cutover,
+        ):
             logger.info(
                 "  [dry-run] %s (%s): %d granule(s) in [%s, %s]",
                 dataset_key, label, len(in_window), buffered_start, buffered_end,
             )
+
+    def has_coverage(
+        self, dataset_key: str, seg_start: datetime, seg_end: datetime, clip_at_cutover: bool = False,
+    ) -> bool:
+        """Whether any of this segment's OPeNDAP datasets has a granule
+        within the buffered [*seg_start*, *seg_end*] window -- metadata
+        only (no full u/v grid load), reusing :meth:`_probe_segment_windows`.
+        Used by the dry-collocation recent-date live probe to check
+        whether HyCOM has actually published data for a footprint whose
+        date is only nominally within documented coverage.
+        """
+        return any(
+            len(in_window) > 0
+            for _label, _buffered_start, _buffered_end, in_window in self._probe_segment_windows(
+                dataset_key, seg_start, seg_end, clip_at_cutover,
+            )
+        )
 
     def _download_segment(
         self,
