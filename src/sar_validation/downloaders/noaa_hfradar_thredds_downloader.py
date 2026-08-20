@@ -149,9 +149,16 @@ class NOAATHREDDSHFRadarDownloader:
             raise last_error
         return downloaded
 
-    def _download_window(
-        self, min_lon, max_lon, min_lat, max_lat, start: str, end: str, filename_suffix: str,
-    ) -> Optional[Path]:
+    def _list_catalog_granules(
+        self, min_lon, max_lon, min_lat, max_lat, start: str, end: str,
+    ):
+        """(region_name, region, matched granules, any_catalog_fetched) via
+        the same per-month catalog.xml listing loop _download_window and
+        check_availability_dry both need -- one real HTTP GET per touched
+        (year, month) for a small XML document, never a fileServer fetch.
+        Shared here so both callers stay in exact lockstep (same region
+        resolution, same date-only-end widening, same 404-means-no-catalog
+        handling) instead of drifting apart."""
         region_name, region = match_noaa_hfr_region(min_lon, max_lon, min_lat, max_lat)
         thredds_code = region["thredds_code"]
         start_dt = datetime.fromisoformat(normalize_datetime(start))
@@ -196,6 +203,35 @@ class NOAATHREDDSHFRadarDownloader:
             )
 
         logger.info("hf_radar_thredds: %d granule(s) matched", len(granules))
+        return region_name, region, granules, any_catalog_fetched
+
+    def check_availability_dry(
+        self, min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+        start: str, end: str,
+    ) -> bool:
+        """
+        Whether the NCEI THREDDS archive has at least one granule for this
+        region/resolution/window, via the same per-month catalog.xml
+        listing ``_download_window`` already performs before ever touching
+        a full fileServer download -- no data file is ever fetched here.
+        """
+        _region_name, _region, granules, _any_catalog_fetched = self._list_catalog_granules(
+            min_lon, max_lon, min_lat, max_lat, start, end,
+        )
+        return bool(granules)
+
+    def _download_window(
+        self, min_lon, max_lon, min_lat, max_lat, start: str, end: str, filename_suffix: str,
+    ) -> Optional[Path]:
+        region_name, region, granules, any_catalog_fetched = self._list_catalog_granules(
+            min_lon, max_lon, min_lat, max_lat, start, end,
+        )
+        thredds_code = region["thredds_code"]
+        start_dt = datetime.fromisoformat(normalize_datetime(start))
+        end_dt = datetime.fromisoformat(normalize_datetime(end))
+        token = _resolution_token(self.resolution_km)
+        is_end_date_only = len(end.strip().rstrip("Z")) == 10  # YYYY-MM-DD
+        end_dt_for_matching = end_dt + timedelta(days=1) if is_end_date_only else end_dt
 
         if self.dry_run:
             # Still queries each touched month's (lightweight) catalog.xml

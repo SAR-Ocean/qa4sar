@@ -144,6 +144,82 @@ def _make_thredds_nc(
     return path
 
 
+class TestNoaaThreddsHfRadarDownloaderCheckAvailabilityDry:
+    def test_true_when_a_granule_matches(self, tmp_path):
+        from sar_validation.downloaders.noaa_hfradar_thredds_downloader import (
+            NOAATHREDDSHFRadarDownloader,
+        )
+
+        def fake_urlopen(url, timeout=None):
+            cm = MagicMock()
+            cm.__enter__.return_value.read.return_value = _OLD_ERA_CATALOG_XML.encode()
+            return cm
+
+        dl = NOAATHREDDSHFRadarDownloader(output_dir=tmp_path, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_thredds_downloader.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ) as m:
+            result = dl.check_availability_dry(-125, -119, 33, 38, "2024-01-31", "2024-01-31")
+
+        assert result is True
+        # Only the catalog.xml was fetched -- never a fileServer granule.
+        assert not any("/fileServer/" in c.args[0] for c in m.call_args_list)
+        assert not any(tmp_path.glob("*.nc"))
+
+    def test_false_when_catalog_reachable_but_no_granule_matches(self, tmp_path):
+        from sar_validation.downloaders.noaa_hfradar_thredds_downloader import (
+            NOAATHREDDSHFRadarDownloader,
+        )
+
+        empty_catalog = (
+            '<?xml version="1.0"?>'
+            '<catalog xmlns="http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0"></catalog>'
+        )
+
+        def fake_urlopen(url, timeout=None):
+            cm = MagicMock()
+            cm.__enter__.return_value.read.return_value = empty_catalog.encode()
+            return cm
+
+        dl = NOAATHREDDSHFRadarDownloader(output_dir=tmp_path, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_thredds_downloader.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            result = dl.check_availability_dry(-125, -119, 33, 38, "2024-01-31", "2024-01-31")
+
+        assert result is False
+
+    def test_false_when_every_month_404s(self, tmp_path):
+        import urllib.error
+
+        from sar_validation.downloaders.noaa_hfradar_thredds_downloader import (
+            NOAATHREDDSHFRadarDownloader,
+        )
+
+        def fake_urlopen(url, timeout=None):
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+        dl = NOAATHREDDSHFRadarDownloader(output_dir=tmp_path, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_thredds_downloader.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            result = dl.check_availability_dry(-125, -119, 33, 38, "2024-01-31", "2024-01-31")
+
+        assert result is False
+
+    def test_no_matching_region_raises_value_error(self, tmp_path):
+        from sar_validation.downloaders.noaa_hfradar_thredds_downloader import (
+            NOAATHREDDSHFRadarDownloader,
+        )
+
+        dl = NOAATHREDDSHFRadarDownloader(output_dir=tmp_path, resolution_km=6)
+        with pytest.raises(ValueError):
+            dl.check_availability_dry(2.0, 8.0, 53.0, 55.0, "2024-01-31", "2024-01-31")
+
+
 class TestNoaaThreddsHfRadarDownloaderDownload:
     def test_no_match_raises_value_error(self, tmp_path):
         from sar_validation.downloaders.noaa_hfradar_thredds_downloader import (
