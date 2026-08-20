@@ -1339,6 +1339,19 @@ def _predict_ismn(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePr
     (not "none-predicted") whenever no local ISMN archive is found at
     all, since ISMN has no download API and the absence of an archive is
     a missing precondition, not evidence that no station would match.
+
+    station_date_ranges_dry rescans the local ISMN archive's .stm files
+    from scratch on every call, so it is called exactly once here --
+    against the bounding envelope (union) of every supplied footprint's
+    own bbox, rather than once per footprint -- and the result is reused
+    for every footprint's own (cheap, in-memory) fine refinement below.
+    The union bbox can only widen the coarse pre-filter relative to a
+    per-footprint call, never narrow it, so every station a per-footprint
+    call would have found is still present here; _point_in_footprint
+    still restricts each footprint's own matches to its real shape, so
+    the set of stations ultimately matched per footprint is unchanged.
+    For a single footprint the union bbox is exactly that footprint's own
+    bbox.
     """
     if not sar_footprints:
         return SourcePrediction(
@@ -1348,31 +1361,36 @@ def _predict_ismn(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePr
 
     dl = _build_ismn_downloader(cfg)
     tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, "ismn"))
-    all_stations_matched: "set[str]" = set()
 
-    for footprint in sar_footprints:
-        ranges = dl.station_date_ranges_dry(
-            footprint.bbox[0], footprint.bbox[1], footprint.bbox[2], footprint.bbox[3],
+    union_min_lon = min(fp.bbox[0] for fp in sar_footprints)
+    union_max_lon = max(fp.bbox[1] for fp in sar_footprints)
+    union_min_lat = min(fp.bbox[2] for fp in sar_footprints)
+    union_max_lat = max(fp.bbox[3] for fp in sar_footprints)
+
+    ranges = dl.station_date_ranges_dry(union_min_lon, union_max_lon, union_min_lat, union_max_lat)
+    if ranges is None:
+        return SourcePrediction(
+            source_type="ismn", bucket="ground-point", verdict="unknown",
+            detail="No local ISMN archive found.",
+            message=(
+                "ISMN has no download API -- download an export once from "
+                "https://ismn.earth/en/dataviewer/ and place it under "
+                "data/_archive_cache/ismn (see README's ISMN credentials section)."
+            ),
         )
-        if ranges is None:
-            return SourcePrediction(
-                source_type="ismn", bucket="ground-point", verdict="unknown",
-                detail="No local ISMN archive found.",
-                message=(
-                    "ISMN has no download API -- download an export once from "
-                    "https://ismn.earth/en/dataviewer/ and place it under "
-                    "data/_archive_cache/ismn (see README's ISMN credentials section)."
-                ),
-            )
+
+    all_stations_matched: "set[str]" = set()
+    for footprint in sar_footprints:
         padded_start = footprint.sensing_start - tolerance
         padded_end = footprint.sensing_end + tolerance
         for dir_prefix, (lat, lon, earliest, latest) in ranges.items():
-            # station_date_ranges_dry's own bbox argument (above) is only
-            # the coarse pre-filter -- it has no notion of the
-            # footprint's real shape. _point_in_footprint is the fine
-            # refinement: a station inside the footprint's bbox but
-            # outside its true (e.g. rotated) polygon must not count as
-            # collocated.
+            # ranges was pre-filtered against the union bbox above, which
+            # is only ever a superset of this footprint's own bbox --
+            # _point_in_footprint is still the fine refinement: a station
+            # inside the footprint's bbox but outside its true (e.g.
+            # rotated) polygon must not count as collocated, and a station
+            # only inside another footprint's bbox (not this one's) must
+            # not count here either.
             if not _point_in_footprint(lat, lon, footprint, cfg.collocation.sar_footprint_radius_km):
                 continue
             if _windows_overlap(earliest, latest, padded_start, padded_end):

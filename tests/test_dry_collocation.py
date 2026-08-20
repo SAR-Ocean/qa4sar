@@ -1857,6 +1857,89 @@ class TestPredictIsmn:
         assert result.verdict == "collocated"
         assert "Net_Stn" in result.matched_stations
 
+    def test_station_date_ranges_dry_called_once_not_per_footprint(self, monkeypatch):
+        """Performance regression test: station_date_ranges_dry rescans
+        the real ISMN archive's .stm files from scratch on every call
+        (confirmed non-trivial I/O against a real archive) -- with
+        multiple footprints, it must be called exactly once (against the
+        union bbox), not once per footprint."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+        from sar_validation.core.recipe import CollocationType
+
+        calls = []
+
+        class _FakeIsmnDownloader:
+            def station_date_ranges_dry(self, min_lon, max_lon, min_lat, max_lat, *a, **k):
+                calls.append((min_lon, max_lon, min_lat, max_lat))
+                return {"Net_Stn": (45.0, 0.0, datetime(2026, 7, 1), datetime(2026, 9, 1))}
+
+        monkeypatch.setattr(dry_collocation, "_build_ismn_downloader", lambda cfg: _FakeIsmnDownloader())
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        footprints = [
+            SarFootprint(
+                kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+                sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+                source_file="s1.SAFE",
+            ),
+            SarFootprint(
+                kind="polygon", bbox=(20.0, 30.0, 60.0, 70.0), polygon=None, points=None,
+                sensing_start=datetime(2026, 8, 1, 7, 0, 0), sensing_end=datetime(2026, 8, 1, 7, 1, 0),
+                source_file="s2.SAFE",
+            ),
+            SarFootprint(
+                kind="polygon", bbox=(-30.0, -20.0, 10.0, 20.0), polygon=None, points=None,
+                sensing_start=datetime(2026, 8, 1, 8, 0, 0), sensing_end=datetime(2026, 8, 1, 8, 1, 0),
+                source_file="s3.SAFE",
+            ),
+        ]
+
+        cfg = SimpleNamespace(collocation=CollocationType())
+        dry_collocation._predict_ismn(source=object(), cfg=cfg, sar_footprints=footprints)
+
+        assert len(calls) == 1
+        # The bounding envelope over all three footprints' own bboxes.
+        assert calls[0] == (-30.0, 30.0, 10.0, 70.0)
+
+    def test_union_bbox_still_matches_station_only_in_one_corner_footprint(self, monkeypatch):
+        """Two footprints in different corners of a region; a station only
+        overlaps one of them. Even though the single archive scan now
+        covers the union bbox (a superset of either footprint's own
+        bbox), the per-footprint _point_in_footprint refinement must
+        still correctly attribute the station's match to only the
+        footprint it actually falls inside."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+        from sar_validation.core.recipe import CollocationType
+
+        class _FakeIsmnDownloader:
+            def station_date_ranges_dry(self, *a, **k):
+                # Sits inside the first (south-west) footprint's bbox only.
+                return {"SW_Stn": (5.0, -5.0, datetime(2026, 7, 1), datetime(2026, 9, 1))}
+
+        monkeypatch.setattr(dry_collocation, "_build_ismn_downloader", lambda cfg: _FakeIsmnDownloader())
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        sw_footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 0.0, 0.0, 10.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="sw.SAFE",
+        )
+        ne_footprint = SarFootprint(
+            kind="polygon", bbox=(40.0, 50.0, 40.0, 50.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 7, 0, 0), sensing_end=datetime(2026, 8, 1, 7, 1, 0),
+            source_file="ne.SAFE",
+        )
+
+        cfg = SimpleNamespace(collocation=CollocationType())
+        result = dry_collocation._predict_ismn(
+            source=object(), cfg=cfg, sar_footprints=[sw_footprint, ne_footprint],
+        )
+
+        assert result.verdict == "collocated"
+        assert result.matched_stations == ["SW_Stn"]
+
 
 class TestToNaiveUtc:
     def test_aware_datetime_converted_to_naive_utc(self):
