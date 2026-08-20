@@ -39,11 +39,13 @@ from ..downloaders.base import (
 )
 from ..downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
 from ..downloaders.earthdata_soil_moisture_downloader import EarthdataSoilMoistureDownloader
+from ..downloaders.era5_downloader import ERA5Downloader
 from ..downloaders.hf_radar_downloader import HFRadarDownloader
 from ..downloaders.hf_radar_historical_downloader import HFRadarHistoricalDownloader
 from ..downloaders.hf_radar_us_downloader import HFRadarUSDownloader
 from ..downloaders.hsaf_downloader import HSAFDownloader
 from ..downloaders.hsaf_downloader import _parse_satellite as _hsaf_parse_satellite
+from ..downloaders.hycom_downloader import _HYCOM_MIN_DATE, HycomDownloader, _resolve_hycom_segments
 from ..downloaders.ismn_downloader import ISMNDownloader
 from ..downloaders.noaa_hfradar_downloader import NOAAHFRadarDownloader
 from ..downloaders.radiometer_downloader import RadiometerDownloader
@@ -1839,3 +1841,135 @@ def _predict_cds_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> Sourc
 
 _PREDICATES["radiometer"] = _predict_radiometer
 _PREDICATES["cds_ssm"] = _predict_cds_ssm
+
+
+#: Footprints whose sensing_start falls within this many days of "now"
+#: get an extra live-probe check before a model source's temporal-
+#: coverage-window verdict is trusted as "collocated" -- a model's most
+#: recent granule(s) may not be published yet even though the date is
+#: nominally within its documented coverage window.
+_MODEL_RECENT_PROBE_WINDOW_DAYS = 30
+
+
+def _predict_model_source(
+    source,
+    cfg,
+    sar_footprints: "list[SarFootprint]",
+    *,
+    coverage_start: "Optional[datetime]",
+    coverage_end: "Optional[datetime]",
+    source_type: str,
+    live_probe: "Optional[Callable[[SarFootprint], bool]]" = None,
+) -> SourcePrediction:
+    """Models (ERA5, HYCOM): no spatial check -- global/regional grid
+    coverage is assumed. Only a temporal-coverage-window check against
+    the source's documented availability boundary, plus (when
+    *live_probe* is given) a follow-up live check for any footprint
+    within _MODEL_RECENT_PROBE_WINDOW_DAYS of today -- a model's most
+    recent data may not be published yet even though the window is
+    nominally within coverage. A footprint's own recency is compared via
+    a bare calendar date (not raw datetime subtraction), since a
+    SarFootprint's sensing_start/sensing_end are not guaranteed
+    timezone-aware.
+
+    A single footprint confirmed collocated (either not recent, or
+    recent and live_probe returned True) is enough for an overall
+    "collocated" verdict, even if other footprints' probes failed or
+    came back empty -- only when EVERY in-coverage footprint is both
+    recent and unconfirmed does the verdict fall back to "unknown"
+    (couldn't confirm yet, not evidence of absence), and a live-probe
+    exception is likewise "unknown", never a false "none-predicted".
+    """
+    if not sar_footprints:
+        return SourcePrediction(
+            source_type=source_type, bucket="model", verdict="unknown",
+            detail="No SAR footprints supplied -- cannot predict.",
+        )
+
+    recent_cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=_MODEL_RECENT_PROBE_WINDOW_DAYS)
+    ).date()
+
+    any_confirmed = False
+    any_recent_unconfirmed = False
+    probe_failed = False
+
+    for footprint in sar_footprints:
+        if coverage_start is not None and footprint.sensing_end < coverage_start:
+            continue
+        if coverage_end is not None and footprint.sensing_start > coverage_end:
+            continue
+
+        is_recent = footprint.sensing_start.date() >= recent_cutoff
+        if not is_recent or live_probe is None:
+            any_confirmed = True
+            continue
+
+        try:
+            if live_probe(footprint):
+                any_confirmed = True
+            else:
+                any_recent_unconfirmed = True
+        except Exception:
+            logger.debug("_predict_model_source: live probe failed for %s", source_type, exc_info=True)
+            probe_failed = True
+
+    if any_confirmed:
+        return SourcePrediction(
+            source_type=source_type, bucket="model", verdict="collocated",
+            detail=f"SAR footprint window(s) within {source_type}'s documented coverage.",
+        )
+    if probe_failed:
+        return SourcePrediction(
+            source_type=source_type, bucket="model", verdict="unknown",
+            detail=f"Live coverage probe failed for {source_type}.",
+        )
+    if any_recent_unconfirmed:
+        return SourcePrediction(
+            source_type=source_type, bucket="model", verdict="unknown",
+            detail=(
+                f"SAR footprint window(s) within {source_type}'s documented coverage, "
+                f"but {source_type} has not yet published data for the most recent "
+                f"footprint(s) (live probe found no granule)."
+            ),
+        )
+    return SourcePrediction(
+        source_type=source_type, bucket="model", verdict="none-predicted",
+        detail=f"SAR footprint window(s) outside {source_type}'s documented coverage.",
+    )
+
+
+def _hycom_live_probe(footprint: "SarFootprint") -> bool:
+    """Whether HyCOM's live OPeNDAP dataset already has a granule for
+    footprint's own sensing window -- reuses HycomDownloader.has_coverage
+    (metadata-only, no full grid load) per dataset-segment touched by the
+    window (see _resolve_hycom_segments)."""
+    segments = _resolve_hycom_segments(footprint.sensing_start, footprint.sensing_end)
+    dl = HycomDownloader(output_dir=Path("/dev/null"))
+    clip_at_cutover = len(segments) == 2
+    return any(
+        dl.has_coverage(dataset_key, seg_start, seg_end, clip_at_cutover)
+        for dataset_key, seg_start, seg_end in segments
+    )
+
+
+def _era5_live_probe(cfg, footprint: "SarFootprint") -> bool:
+    """Whether ERA5's live CDS catalogue already reports data covering
+    footprint's own sensing day -- reuses ERA5Downloader.check_availability_dry
+    (a fast, unauthenticated catalogue-extent lookup, never a real
+    cdsapi.Client.retrieve() job), against whichever CDS dataset cfg's
+    own configured variable maps to."""
+    dl = ERA5Downloader(variable=cfg.variable, output_dir=Path("/dev/null"))
+    return dl.check_availability_dry(footprint.sensing_start.date())
+
+
+_PREDICATES["hycom"] = lambda source, cfg, sar_footprints: _predict_model_source(
+    source, cfg, sar_footprints,
+    coverage_start=_HYCOM_MIN_DATE, coverage_end=None, source_type="hycom",
+    live_probe=_hycom_live_probe,
+)
+_PREDICATES["era5"] = lambda source, cfg, sar_footprints: _predict_model_source(
+    source, cfg, sar_footprints,
+    coverage_start=None, coverage_end=None, source_type="era5",
+    live_probe=lambda footprint: _era5_live_probe(cfg, footprint),
+)

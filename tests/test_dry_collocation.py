@@ -2746,3 +2746,391 @@ class TestPredictGlobalCompositeRegistrations:
         from sar_validation.core import dry_collocation
 
         assert dry_collocation._PREDICATES["cds_ssm"] is dry_collocation._predict_cds_ssm
+
+
+class TestPredictModelSource:
+    """The models bucket (ERA5, HYCOM): a temporal-coverage-window check
+    only -- no spatial refinement, since global/regional grid coverage is
+    assumed."""
+
+    def test_collocated_when_footprint_within_documented_coverage(self):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2019, 6, 1, 6, 0, 0), sensing_end=datetime(2019, 6, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_model_source(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            coverage_start=datetime(2018, 12, 4), coverage_end=None, source_type="hycom",
+        )
+
+        assert result.verdict == "collocated"
+        assert result.source_type == "hycom"
+        assert result.bucket == "model"
+
+    def test_none_predicted_when_footprint_before_coverage_start(self):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2017, 1, 1, 6, 0, 0), sensing_end=datetime(2017, 1, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_model_source(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            coverage_start=datetime(2018, 12, 4), coverage_end=None, source_type="hycom",
+        )
+
+        assert result.verdict == "none-predicted"
+
+    def test_none_predicted_when_footprint_after_coverage_end(self):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2015, 1, 1, 6, 0, 0), sensing_end=datetime(2015, 1, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_model_source(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            coverage_start=None, coverage_end=datetime(2010, 1, 1), source_type="era5",
+        )
+
+        assert result.verdict == "none-predicted"
+
+    def test_collocated_when_coverage_start_is_none(self):
+        """era5's own registration passes coverage_start=None -- it has no
+        documented lower bound -- so even a very old footprint must count
+        as within coverage."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(1960, 1, 1, 6, 0, 0), sensing_end=datetime(1960, 1, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_model_source(
+            source=object(), cfg=object(), sar_footprints=[footprint],
+            coverage_start=None, coverage_end=None, source_type="era5",
+        )
+
+        assert result.verdict == "collocated"
+
+    def test_unknown_when_no_footprints_supplied(self):
+        from sar_validation.core import dry_collocation
+
+        result = dry_collocation._predict_model_source(
+            source=object(), cfg=object(), sar_footprints=[],
+            coverage_start=None, coverage_end=None, source_type="era5",
+        )
+
+        assert result.verdict == "unknown"
+
+
+class TestPredictModelSourceLiveProbe:
+    """The recent-date live-probe extension: for a footprint within
+    _MODEL_RECENT_PROBE_WINDOW_DAYS of "now", the coverage-window check
+    alone isn't enough -- an explicit live_probe callable must also
+    confirm before the verdict is trusted as "collocated"."""
+
+    @staticmethod
+    def _recent_footprint():
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        recent_start = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1)
+        return SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=recent_start, sensing_end=recent_start + timedelta(minutes=1),
+            source_file="s1.SAFE",
+        )
+
+    @staticmethod
+    def _old_footprint():
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        return SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2020, 1, 1, 6, 0, 0), sensing_end=datetime(2020, 1, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+    def test_collocated_when_recent_footprint_confirmed_by_live_probe(self):
+        from sar_validation.core import dry_collocation
+
+        result = dry_collocation._predict_model_source(
+            source=object(), cfg=object(), sar_footprints=[self._recent_footprint()],
+            coverage_start=None, coverage_end=None, source_type="era5",
+            live_probe=lambda fp: True,
+        )
+
+        assert result.verdict == "collocated"
+
+    def test_unknown_when_recent_footprint_not_yet_confirmed_by_live_probe(self):
+        from sar_validation.core import dry_collocation
+
+        result = dry_collocation._predict_model_source(
+            source=object(), cfg=object(), sar_footprints=[self._recent_footprint()],
+            coverage_start=None, coverage_end=None, source_type="era5",
+            live_probe=lambda fp: False,
+        )
+
+        assert result.verdict == "unknown"
+
+    def test_unknown_when_live_probe_raises(self):
+        from sar_validation.core import dry_collocation
+
+        def _boom(fp):
+            raise RuntimeError("network error")
+
+        result = dry_collocation._predict_model_source(
+            source=object(), cfg=object(), sar_footprints=[self._recent_footprint()],
+            coverage_start=None, coverage_end=None, source_type="era5",
+            live_probe=_boom,
+        )
+
+        assert result.verdict == "unknown"
+
+    def test_older_footprint_never_invokes_live_probe(self):
+        """A footprint well outside the recent-probe window must be
+        trusted from the coverage-window check alone -- the live probe
+        exists to cover recent, possibly-not-yet-published data, not
+        every request."""
+        from sar_validation.core import dry_collocation
+
+        calls = []
+
+        def _probe(fp):
+            calls.append(fp)
+            return True
+
+        result = dry_collocation._predict_model_source(
+            source=object(), cfg=object(), sar_footprints=[self._old_footprint()],
+            coverage_start=None, coverage_end=None, source_type="era5",
+            live_probe=_probe,
+        )
+
+        assert result.verdict == "collocated"
+        assert calls == []
+
+    def test_older_confirmed_footprint_outweighs_recent_unconfirmed_one(self):
+        """One confirmed footprint (old, no probe needed) is enough for an
+        overall "collocated" verdict, even alongside a recent footprint
+        whose live probe came back empty."""
+        from sar_validation.core import dry_collocation
+
+        result = dry_collocation._predict_model_source(
+            source=object(), cfg=object(),
+            sar_footprints=[self._old_footprint(), self._recent_footprint()],
+            coverage_start=None, coverage_end=None, source_type="era5",
+            live_probe=lambda fp: False,
+        )
+
+        assert result.verdict == "collocated"
+
+
+class TestHycomLiveProbe:
+    def test_true_when_has_coverage_reports_a_granule(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        captured = {}
+
+        class _FakeHycomDownloader:
+            def __init__(self, output_dir):
+                captured["output_dir"] = output_dir
+
+            def has_coverage(self, dataset_key, seg_start, seg_end, clip_at_cutover=False):
+                captured["args"] = (dataset_key, seg_start, seg_end, clip_at_cutover)
+                return True
+
+        monkeypatch.setattr(dry_collocation, "HycomDownloader", _FakeHycomDownloader)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2025, 1, 1, 6, 0, 0), sensing_end=datetime(2025, 1, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        assert dry_collocation._hycom_live_probe(footprint) is True
+        assert captured["args"][0] == "espc_d_v02"
+
+    def test_false_when_has_coverage_reports_no_granule(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        class _FakeHycomDownloader:
+            def __init__(self, output_dir):
+                pass
+
+            def has_coverage(self, dataset_key, seg_start, seg_end, clip_at_cutover=False):
+                return False
+
+        monkeypatch.setattr(dry_collocation, "HycomDownloader", _FakeHycomDownloader)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2025, 1, 1, 6, 0, 0), sensing_end=datetime(2025, 1, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        assert dry_collocation._hycom_live_probe(footprint) is False
+
+    def test_straddling_window_checks_both_segments(self, monkeypatch):
+        """A footprint straddling _HYCOM_CUTOVER_DATE resolves to two
+        segments (see _resolve_hycom_segments) -- has_coverage must be
+        checked for each, and any() confirming is enough."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        seen_keys = []
+
+        class _FakeHycomDownloader:
+            def __init__(self, output_dir):
+                pass
+
+            def has_coverage(self, dataset_key, seg_start, seg_end, clip_at_cutover=False):
+                seen_keys.append(dataset_key)
+                return dataset_key == "espc_d_v02"
+
+        monkeypatch.setattr(dry_collocation, "HycomDownloader", _FakeHycomDownloader)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2024, 8, 9, 12, 0, 0), sensing_end=datetime(2024, 8, 10, 12, 0, 0),
+            source_file="s1.SAFE",
+        )
+
+        assert dry_collocation._hycom_live_probe(footprint) is True
+        assert sorted(seen_keys) == ["espc_d_v02", "gofs31_930"]
+
+
+class TestEra5LiveProbe:
+    def test_uses_cfg_variable_and_footprint_day(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        captured = {}
+
+        class _FakeERA5Downloader:
+            def __init__(self, variable, output_dir):
+                captured["variable"] = variable
+
+            def check_availability_dry(self, day):
+                captured["day"] = day
+                return True
+
+        monkeypatch.setattr(dry_collocation, "ERA5Downloader", _FakeERA5Downloader)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+        cfg = SimpleNamespace(variable="wind")
+
+        assert dry_collocation._era5_live_probe(cfg, footprint) is True
+        assert captured["variable"] == "wind"
+        assert captured["day"] == datetime(2026, 8, 1).date()
+
+    def test_false_when_check_availability_dry_reports_no_data(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        class _FakeERA5Downloader:
+            def __init__(self, variable, output_dir):
+                pass
+
+            def check_availability_dry(self, day):
+                return False
+
+        monkeypatch.setattr(dry_collocation, "ERA5Downloader", _FakeERA5Downloader)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+        cfg = SimpleNamespace(variable="soil_moisture")
+
+        assert dry_collocation._era5_live_probe(cfg, footprint) is False
+
+
+class TestPredictModelSourceRegistrations:
+    """One predict_source integration test per real models-bucket
+    source_type, exercising the actual _PREDICATES dispatch."""
+
+    def test_registered_under_own_source_type_hycom(self):
+        from sar_validation.core import dry_collocation
+
+        assert "hycom" in dry_collocation._PREDICATES
+
+    def test_registered_under_own_source_type_era5(self):
+        from sar_validation.core import dry_collocation
+
+        assert "era5" in dry_collocation._PREDICATES
+
+    def test_hycom_collocated_via_predict_source(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint, predict_source
+
+        monkeypatch.setattr(dry_collocation, "_hycom_live_probe", lambda fp: True)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2019, 6, 1, 6, 0, 0), sensing_end=datetime(2019, 6, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = predict_source(
+            SimpleNamespace(source_type="hycom"), cfg=object(), sar_footprints=[footprint],
+        )
+
+        assert result.verdict == "collocated"
+        assert result.source_type == "hycom"
+        assert result.bucket == "model"
+
+    def test_hycom_none_predicted_before_coverage_start_via_predict_source(self):
+        from sar_validation.core.dry_collocation import SarFootprint, predict_source
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2010, 1, 1, 6, 0, 0), sensing_end=datetime(2010, 1, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = predict_source(
+            SimpleNamespace(source_type="hycom"), cfg=object(), sar_footprints=[footprint],
+        )
+
+        assert result.verdict == "none-predicted"
+
+    def test_era5_collocated_via_predict_source(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint, predict_source
+
+        monkeypatch.setattr(dry_collocation, "_era5_live_probe", lambda cfg, fp: True)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(1970, 1, 1, 6, 0, 0), sensing_end=datetime(1970, 1, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = predict_source(
+            SimpleNamespace(source_type="era5"),
+            cfg=SimpleNamespace(variable="wind"), sar_footprints=[footprint],
+        )
+
+        assert result.verdict == "collocated"
+        assert result.source_type == "era5"
+        assert result.bucket == "model"
