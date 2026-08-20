@@ -44,7 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -124,18 +124,21 @@ class RadiometerDownloader:
 
     Parameters
     ----------
-    output_dir : Path
-        Directory to save downloaded NetCDF files.
+    output_dir : Path, optional
+        Directory to save downloaded NetCDF files. Required by
+        :meth:`download`; may be omitted (``None``) when only
+        :meth:`check_exists_dry` is used, since that read-only existence
+        check never writes to disk.
     dry_run : bool
         If True, print the sensor/date/URL matrix without downloading.
     """
 
     def __init__(
         self,
-        output_dir: Path,
+        output_dir: Optional[Path],
         dry_run: bool = False,
     ) -> None:
-        self.output_dir = Path(output_dir)
+        self.output_dir = Path(output_dir) if output_dir is not None else None
         self.dry_run = dry_run
 
     def download(
@@ -291,6 +294,57 @@ class RadiometerDownloader:
 
         print(f"  {sensor} {day.isoformat()}: no file available (404), skipped.")
         return None
+
+    def check_exists_dry(self, day: date, sensors: Optional[Iterable[str]] = None) -> bool:
+        """
+        Whether any requested sensor's daily file exists for *day*, without
+        downloading it.
+
+        Mirrors :meth:`download`'s own per-day candidate-URL construction
+        (dated file, then the ``rt_file`` near-real-time fallback), but
+        issues a HEAD request per candidate instead of a streamed GET.
+
+        Parameters
+        ----------
+        day : date
+            The single day to check (no date range).
+        sensors : iterable of str, optional
+            Restrict to these sensor keys (see :data:`SENSORS`). None
+            (default) means every currently-supported sensor.
+
+        Returns
+        -------
+        bool
+            True as soon as any candidate URL, for any requested sensor,
+            responds with HTTP 200.
+        """
+        requested = list(sensors) if sensors else list(SUPPORTED_SENSORS)
+        for sensor in requested:
+            cfg = SENSORS.get(sensor)
+            if cfg is None or not cfg.get("url_path"):
+                continue
+
+            avail_start = cfg.get("availability_start")
+            if avail_start and datetime.fromisoformat(avail_start).date() > day:
+                continue
+
+            fields = {"Y": f"{day.year:04d}", "m": f"{day.month:02d}", "d": f"{day.day:02d}"}
+            candidates = [
+                f"{BASE_URL}/{cfg['url_path'].format(**fields)}/{cfg['file'].format(**fields)}",
+            ]
+            if cfg.get("rt_url_path"):
+                candidates.append(
+                    f"{BASE_URL}/{cfg['rt_url_path'].format(**fields)}/{cfg['rt_file'].format(**fields)}",
+                )
+
+            for url in candidates:
+                try:
+                    resp = requests.head(url, timeout=30)
+                except requests.RequestException:
+                    continue
+                if resp.status_code == 200:
+                    return True
+        return False
 
 
 # ---------------------------------------------------------------------------
