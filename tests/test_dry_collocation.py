@@ -3024,6 +3024,29 @@ class TestPredictModelSourceLiveProbe:
         assert result.verdict == "collocated"
         assert calls == []
 
+    def test_live_probe_stops_after_first_confirmation(self):
+        """A single confirmed recent footprint is enough for the overall
+        verdict -- the loop must not keep calling live_probe (a real,
+        slow network round-trip for e.g. HYCOM) for every remaining
+        recent, in-coverage footprint once one has already confirmed."""
+        from sar_validation.core import dry_collocation
+
+        recent_footprints = [self._recent_footprint() for _ in range(5)]
+        calls = []
+
+        def _probe(fp):
+            calls.append(fp)
+            return True
+
+        result = dry_collocation._predict_model_source(
+            source=object(), cfg=object(), sar_footprints=recent_footprints,
+            coverage_start=None, coverage_end=None, source_type="era5",
+            live_probe=_probe,
+        )
+
+        assert result.verdict == "collocated"
+        assert len(calls) == 1
+
     def test_older_confirmed_footprint_outweighs_recent_unconfirmed_one(self):
         """One confirmed footprint (old, no probe needed) is enough for an
         overall "collocated" verdict, even alongside a recent footprint

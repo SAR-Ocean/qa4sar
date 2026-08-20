@@ -1930,6 +1930,7 @@ def _predict_model_source(
         try:
             if live_probe(footprint):
                 any_confirmed = True
+                break
             else:
                 any_recent_unconfirmed = True
         except Exception:
