@@ -1724,3 +1724,100 @@ class TestBboxOverlapsFootprint:
             sensing_start=datetime(2026, 8, 1), sensing_end=datetime(2026, 8, 1), source_file="s1.SAFE",
         )
         assert _bbox_overlaps_footprint(50.0, 60.0, 0.0, 10.0, footprint) is False
+
+
+class TestPredictIsmn:
+    """_predict_ismn resolves its time tolerance via
+    _resolve_temporal_padding_minutes(cfg, "ismn") -- the real
+    tolerance-resolution function orchestrator.py uses -- not a flat
+    cfg.time_tolerance_minutes attribute, so every test here mocks that
+    resolver rather than relying on a fake cfg shape. Tests that reach
+    _point_in_footprint also need a real cfg.collocation.sar_footprint_radius_km,
+    supplied via recipe.py's own CollocationType."""
+
+    def test_unknown_when_no_archive_present(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        class _FakeIsmnDownloader:
+            def station_date_ranges_dry(self, *a, **k):
+                return None
+
+        monkeypatch.setattr(dry_collocation, "_build_ismn_downloader", lambda cfg: _FakeIsmnDownloader())
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_ismn(source=object(), cfg=object(), sar_footprints=[footprint])
+
+        assert result.verdict == "unknown"
+        assert "ismn.earth" in result.message
+
+    def test_collocated_when_a_station_range_covers_a_footprint_window(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+        from sar_validation.core.recipe import CollocationType
+
+        class _FakeIsmnDownloader:
+            def station_date_ranges_dry(self, *a, **k):
+                return {"Net_Stn": (45.0, 0.0, datetime(2026, 7, 1), datetime(2026, 9, 1))}
+
+        monkeypatch.setattr(dry_collocation, "_build_ismn_downloader", lambda cfg: _FakeIsmnDownloader())
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        cfg = SimpleNamespace(collocation=CollocationType())
+        result = dry_collocation._predict_ismn(source=object(), cfg=cfg, sar_footprints=[footprint])
+
+        assert result.verdict == "collocated"
+        assert "Net_Stn" in result.matched_stations
+
+    def test_station_inside_bbox_but_outside_real_polygon_is_not_matched(self, monkeypatch):
+        """The two-tier precision this task adds: station_date_ranges_dry's
+        own bbox argument is only the coarse pre-filter (it can't be
+        anything finer -- it doesn't know about footprint shape at all).
+        _predict_ismn must apply _point_in_footprint as the fine
+        refinement, so a station inside the footprint's bbox but outside
+        its true (smaller) polygon must NOT count as collocated."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+        from sar_validation.core.recipe import CollocationType
+
+        class _FakeIsmnDownloader:
+            def station_date_ranges_dry(self, *a, **k):
+                # (55, 5) sits inside the footprint's bbox (-10..10, 35..55)
+                # but outside the triangular polygon below.
+                return {"Outside_Tri": (55.0, 5.0, datetime(2026, 7, 1), datetime(2026, 9, 1))}
+
+        monkeypatch.setattr(dry_collocation, "_build_ismn_downloader", lambda cfg: _FakeIsmnDownloader())
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0),
+            # A right triangle spanning only the lower-left half of the bbox.
+            polygon=[(35.0, -10.0), (35.0, 10.0), (55.0, -10.0)],
+            points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        cfg = SimpleNamespace(collocation=CollocationType())
+        result = dry_collocation._predict_ismn(source=object(), cfg=cfg, sar_footprints=[footprint])
+
+        assert result.verdict == "none-predicted"
+
+    def test_unknown_when_no_sar_footprints_supplied(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+
+        result = dry_collocation._predict_ismn(source=object(), cfg=object(), sar_footprints=[])
+
+        assert result.verdict == "unknown"

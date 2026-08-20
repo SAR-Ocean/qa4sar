@@ -549,3 +549,84 @@ class ISMNDownloader:
             # terminal for no benefit (the files themselves are on disk).
             print(f"  Wrote {len(written)} ISMN sensor CSV(s) to {self.output_dir}")
         return written
+
+    def station_date_ranges_dry(
+        self, min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+        archive_path: Optional[str] = None,
+    ) -> "Optional[dict[str, tuple[float, float, datetime, datetime]]]":
+        """(dir_prefix -> (lat, lon, earliest, latest real observation
+        timestamp)) for every station inside the bbox, read directly from
+        each matched sensor's own .stm file (its first and last data row)
+        -- the archive's station index has no date-range field of its own.
+        lat/lon are the station's real coordinates (already present in the
+        station index -- not re-derived), included so a caller can apply a
+        SAR footprint's real shape (not just its bbox) as a further, finer
+        filter.
+
+        Returns None if no local archive is found at all (ISMN has no
+        API -- see download()'s own _print_portal_instructions path for
+        the same check) -- callers must treat None as "unknown", not
+        "zero stations"."""
+        resolved_archive_path = (
+            Path(archive_path) if archive_path and Path(archive_path).exists()
+            else _auto_detect_archive(self.output_dir)
+            or _auto_detect_archive(_SHARED_ARCHIVE_CACHE_DIR)
+        )
+        if resolved_archive_path is None:
+            return None
+
+        index_df = _load_or_build_station_index(resolved_archive_path)
+        if index_df.empty:
+            return {}
+
+        in_bbox_idx = (
+            index_df["lat"].isna() | index_df["lon"].isna()
+            | (
+                (index_df["lon"] >= min_lon) & (index_df["lon"] <= max_lon)
+                & (index_df["lat"] >= min_lat) & (index_df["lat"] <= max_lat)
+            )
+        )
+        matched = index_df.loc[in_bbox_idx]
+        # One (lat, lon) per dir_prefix -- first row wins on the rare
+        # chance a dir_prefix appears more than once in the index (e.g.
+        # multiple sensors at the same station share one dir_prefix and
+        # therefore the same coordinates, so "first" is never a real
+        # ambiguity in practice).
+        coords_by_prefix = matched.drop_duplicates(subset="dir_prefix").set_index("dir_prefix")[["lat", "lon"]]
+        wanted_prefixes = set(coords_by_prefix.index)
+
+        # The archive is a real .zip -- .stm timestamps are read directly
+        # from zip members via zipfile.ZipFile, not from an extracted
+        # directory tree. This mirrors _build_station_index's own
+        # zf.namelist()/zf.open() access pattern, just reading full file
+        # content (for every data row's timestamp) instead of only the
+        # first line (for coordinates).
+        names_by_prefix: "dict[str, list[str]]" = {}
+        with zipfile.ZipFile(resolved_archive_path) as zf:
+            for name in zf.namelist():
+                if not name.endswith(".stm"):
+                    continue
+                dir_prefix = name.rsplit("/", 1)[0] + "/"
+                if dir_prefix not in wanted_prefixes:
+                    continue
+                names_by_prefix.setdefault(dir_prefix, []).append(name)
+
+            ranges: "dict[str, tuple[float, float, datetime, datetime]]" = {}
+            for dir_prefix, stm_names in names_by_prefix.items():
+                timestamps = []
+                for name in stm_names:
+                    with zf.open(name) as f:
+                        lines = f.read().decode("utf-8", errors="replace").splitlines()
+                    for line in lines[1:]:  # skip the one header line
+                        parts = line.split()
+                        if len(parts) < 2:
+                            continue
+                        try:
+                            timestamps.append(datetime.strptime(f"{parts[0]} {parts[1]}", "%Y/%m/%d %H:%M"))
+                        except ValueError:
+                            continue
+                if timestamps:
+                    lat = float(coords_by_prefix.loc[dir_prefix, "lat"])
+                    lon = float(coords_by_prefix.loc[dir_prefix, "lon"])
+                    ranges[dir_prefix] = (lat, lon, min(timestamps), max(timestamps))
+        return ranges

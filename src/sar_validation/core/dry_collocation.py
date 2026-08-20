@@ -38,6 +38,7 @@ from ..downloaders.base import (
 from ..downloaders.earthdata_soil_moisture_downloader import EarthdataSoilMoistureDownloader
 from ..downloaders.hsaf_downloader import HSAFDownloader
 from ..downloaders.hsaf_downloader import _parse_satellite as _hsaf_parse_satellite
+from ..downloaders.ismn_downloader import ISMNDownloader
 from ..downloaders.scatterometer_downloader import ScatterometerDownloader
 from ..downloaders.scatterometer_ftp_downloader import ScatterometerFTPDownloader
 from ..downloaders.smos_downloader import SMOSDownloader
@@ -1290,3 +1291,75 @@ def _predict_amsr_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> Sour
 
 
 _PREDICATES["amsr_ssm"] = _predict_amsr_ssm
+
+
+def _build_ismn_downloader(cfg) -> ISMNDownloader:
+    """Thin wrapper (a separate function so tests can monkeypatch it
+    directly, matching this module's own convention): constructs an
+    ISMNDownloader. output_dir is never written to by
+    station_date_ranges_dry, so a harmless placeholder is safe here."""
+    return ISMNDownloader(output_dir=Path("/dev/null"))
+
+
+def _predict_ismn(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+    """Predicate for source_type="ismn", the first ground/point-bucket
+    source: station_date_ranges_dry's own bbox argument is only a coarse
+    pre-filter (it has no notion of a footprint's real shape), so
+    _point_in_footprint is applied per matched station as the fine
+    refinement -- a station inside a footprint's bbox but outside its
+    true (e.g. rotated) polygon must not count as collocated. "unknown"
+    (not "none-predicted") whenever no local ISMN archive is found at
+    all, since ISMN has no download API and the absence of an archive is
+    a missing precondition, not evidence that no station would match.
+    """
+    if not sar_footprints:
+        return SourcePrediction(
+            source_type="ismn", bucket="ground-point", verdict="unknown",
+            detail="No SAR footprints supplied -- cannot predict.",
+        )
+
+    dl = _build_ismn_downloader(cfg)
+    tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, "ismn"))
+    all_stations_matched: "set[str]" = set()
+
+    for footprint in sar_footprints:
+        ranges = dl.station_date_ranges_dry(
+            footprint.bbox[0], footprint.bbox[1], footprint.bbox[2], footprint.bbox[3],
+        )
+        if ranges is None:
+            return SourcePrediction(
+                source_type="ismn", bucket="ground-point", verdict="unknown",
+                detail="No local ISMN archive found.",
+                message=(
+                    "ISMN has no download API -- download an export once from "
+                    "https://ismn.earth/en/dataviewer/ and place it under "
+                    "data/_archive_cache/ismn (see README's ISMN credentials section)."
+                ),
+            )
+        padded_start = footprint.sensing_start - tolerance
+        padded_end = footprint.sensing_end + tolerance
+        for dir_prefix, (lat, lon, earliest, latest) in ranges.items():
+            # station_date_ranges_dry's own bbox argument (above) is only
+            # the coarse pre-filter -- it has no notion of the
+            # footprint's real shape. _point_in_footprint is the fine
+            # refinement: a station inside the footprint's bbox but
+            # outside its true (e.g. rotated) polygon must not count as
+            # collocated.
+            if not _point_in_footprint(lat, lon, footprint, cfg.collocation.sar_footprint_radius_km):
+                continue
+            if _windows_overlap(earliest, latest, padded_start, padded_end):
+                all_stations_matched.add(dir_prefix)
+
+    if all_stations_matched:
+        return SourcePrediction(
+            source_type="ismn", bucket="ground-point", verdict="collocated",
+            detail=f"{len(all_stations_matched)} station(s) with data in the predicted window(s).",
+            matched_stations=sorted(all_stations_matched),
+        )
+    return SourcePrediction(
+        source_type="ismn", bucket="ground-point", verdict="none-predicted",
+        detail="No ISMN station has data within any predicted SAR footprint window.",
+    )
+
+
+_PREDICATES["ismn"] = _predict_ismn
