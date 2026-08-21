@@ -26,6 +26,9 @@ Step 1 — Download data
           │  download SAR L2_OCN + all validation sources
           │  for the recipe region and time window
           |  --dry-run available to check product availibility
+          |  default: only downloads validation-source data predicted to
+          |  collocate with the SAR data; --download-all-in-bbox restores
+          |  the old behavior (download everything in the bbox/window)
           ▼
 Step 2 — Convert to xarray.DataTree
           │  standardize all formats + attach CF-convention metadata 
@@ -37,6 +40,8 @@ Step 3 — Collocation + store collocated pairs
           │  point vs. layer    (mooring / buoy / drifter / ferrybox / tidal gauge vs. SAR)
           │  layer vs. layer    (scatterometer / altimeter / radiometer / HF-radar vs. SAR)
           |  create a collocation diagnostics plot
+          |  --dry-collocation previews this step's predicted collocation
+          |  before running steps 1-2 (download/convert) at all
           │  store collocated data + spatial/temporal offset metadata
           ▼
 Step 4 — Compute statistics

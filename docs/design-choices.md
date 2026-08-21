@@ -1859,3 +1859,62 @@ three sources, and because the mechanism was already built for them.
 > `downloaders/scatterometer_ftp_downloader.py`,
 > `downloaders/gportal_downloader.py`, `downloaders/smos_downloader.py`
 > (each source's own `_filter_by_orbit_overlap` method).
+
+## 12. Dry-collocation prediction and default download-skip gating
+
+**What `--dry-collocation` predicts.** Given a recipe, determines the SAR
+data that would actually be found (real footprints + timestamps via a
+dry, no-fetch catalog search -- see `discover_sar_footprints_dry` in
+`core/dry_collocation.py`) and, for every configured validation source,
+predicts whether it would yield collocated data with that SAR data --
+without downloading anything from either side. Prints a console table and
+writes `dry_collocation_report.json`.
+
+**Default behavior change for real runs.** `download_all()` now computes
+the same prediction inline once SAR data is actually downloaded (reusing
+the real, already-converted files instead of a dry catalog search -- see
+`sar_footprints_from_downloaded`), and skips a validation source's
+download step on a *confirmed* `none-predicted` verdict. `--download-all-
+in-bbox` restores the previous behavior exactly (download everything in
+the bbox/window, no gating).
+
+**Three-state verdict, not a boolean.** `collocated` / `none-predicted` /
+`unknown`. `unknown` never gates a skip -- fail-open, same principle as
+the orbit prefilter (§11, orbit_coverage.py): a check that can't be
+answered (e.g. ISMN's local archive missing entirely) must never risk a
+false negative.
+
+**SAR footprint model.** Three kinds, dispatched per SAR product family:
+`polygon` (Sentinel-1 OCN non-WV / NISAR SME2 -- real vertex geometry from
+the catalog; RADARSAT-2 also uses this kind but its NCML metadata only
+ever gives a bounding box, so its `polygon` stays `None`), `wv_points`
+(Sentinel-1 WV mode -- sparse per-vignette points, no clustering), and
+`orbit_swath` (Sentinel-1 CLMS SSM -- the catalog's own footprint is the
+whole nominal tile, not real per-day coverage, so this kind is derived by
+propagating Sentinel-1's own orbit for the dry-search path, or by reading
+the real non-NaN pixel extent for the from-downloaded path).
+
+**Five-bucket source classification** (see `core/dry_collocation.py`'s
+module docstring and `_PREDICATES` registry for the authoritative,
+current list): orbit-corridor (H-SAF, HY-2B/HY-2C/Oceansat-3, AMSR2, SMOS
+-- reuses `orbit_coverage.orbit_overlap_windows`), catalog-precise (ASCAT
+winds, SMAP/AMSR2, altimeter -- the coarse dry-search listing itself is
+the precise answer), ground/point (ISMN, HF-radar, in-situ -- each with
+its own real-availability-check caveats, see the per-source comments in
+`dry_collocation.py`), global-composite (RSS radiometer, CDS SSM --
+temporal-only, spatial refinement isn't meaningful for a daily global
+grid), and models (ERA5, HYCOM -- temporal-coverage-boundary check plus a
+live probe for recent dates).
+
+**True polygon geometry where available.** The orbit-corridor bucket's
+fine refinement tests a SAR footprint's true polygon (when its `kind` is
+`"polygon"` and a real one was found), not just its bounding box --
+`orbit_coverage._point_in_polygon`, shared with the ground/point bucket's
+own point-in-footprint check (one implementation, not two). A bbox-only
+fallback (`polygon=None`) is always safe, never a false negative -- a
+bbox is always a superset of the true polygon.
+
+> Code: `core/dry_collocation.py`, `core/orbit_coverage.py`
+> (`orbit_overlap_windows`, `_point_in_polygon`), `core/orchestrator.py`
+> (`_collocation_predictions`, `_should_skip_for_collocation`), `cli.py`
+> (`--dry-collocation`, `--download-all-in-bbox`).
