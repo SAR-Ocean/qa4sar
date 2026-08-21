@@ -1323,3 +1323,50 @@ class TestExecuteRecipeStopsWhenNoSarData:
         mock_convert.assert_not_called()
         out = capsys.readouterr().out
         assert "No SAR data found" in out
+
+
+class TestDryCollocationFlag:
+    def test_flag_prints_report_and_returns_before_downloading(self, tmp_path, capsys, monkeypatch):
+        from sar_validation.core.dry_collocation import CollocationReport, SourcePrediction
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-dry-collocation", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        fake_report = CollocationReport(
+            recipe_path=str(recipe_path),
+            sar_footprint_count=0,
+            predictions=[
+                SourcePrediction(
+                    source_type="sentinel1_l2_ocn", bucket="orbit-corridor",
+                    verdict="none-predicted", detail="no SAR footprints discovered",
+                ),
+            ],
+        )
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.discover_sar_footprints_dry",
+            lambda spec, cfg: [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.predict_collocation",
+            lambda cfg, fps, recipe_path="": fake_report,
+        )
+
+        download_called = {"n": 0}
+        monkeypatch.setattr(
+            "sar_validation.core.orchestrator.DataOrchestrator.download_all",
+            lambda self: download_called.__setitem__("n", download_called["n"] + 1) or True,
+        )
+
+        cli.main(["--recipe", str(recipe_path), "--dry-collocation"])
+
+        assert download_called["n"] == 0  # download_all was never reached
+        captured = capsys.readouterr().out
+        assert "source" in captured  # the console table header
+        assert "sentinel1_l2_ocn" in captured
+
+        report_path = tmp_path / "run" / "dry_collocation_report.json"
+        assert report_path.exists()
+        assert "sentinel1_l2_ocn" in report_path.read_text()

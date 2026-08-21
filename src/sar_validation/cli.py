@@ -194,6 +194,15 @@ Examples:
         help="Show what will be downloaded without actually downloading",
     )
     parser.add_argument(
+        "--dry-collocation",
+        action="store_true",
+        help=(
+            "Predict which validation sources would collocate with this "
+            "recipe's SAR data, without downloading anything from any "
+            "source. Prints a report and writes dry_collocation_report.json."
+        ),
+    )
+    parser.add_argument(
         "--convert",
         action="store_true",
         help="Convert downloaded data to xarray.DataTree (step 2)",
@@ -282,6 +291,7 @@ Examples:
         _execute_recipe(
             args.recipe,
             dry_run=args.dry_run,
+            dry_collocation=args.dry_collocation,
             output_dir=args.output_dir,
             force_download=args.force_download,
             convert=args.convert or args.collocate or args.stats or args.plot,
@@ -939,6 +949,7 @@ _METHOD_SUFFIX = {"cell-averaging": "", "individual": "_individual"}
 def _execute_recipe(
     recipe_path: str,
     dry_run: bool = False,
+    dry_collocation: bool = False,
     output_dir: Optional[str] = None,
     force_download: bool = False,
     convert: bool = False,
@@ -963,6 +974,30 @@ def _execute_recipe(
 
     if output_dir:
         recipe.config.output_dir = output_dir
+
+    if dry_collocation:
+        from .core.dry_collocation import (
+            discover_sar_footprints_dry,
+            predict_collocation,
+            render_console_table,
+            report_to_json,
+        )
+        from .downloaders.base import build_output_dir
+
+        sar_footprints = discover_sar_footprints_dry(recipe.config.sar_data, recipe.config)
+        report = predict_collocation(recipe.config, sar_footprints, recipe_path=recipe_path)
+        print(render_console_table(report))
+        if recipe.config.output_dir:
+            output_base = Path(recipe.config.output_dir)
+        else:
+            b = recipe.config.geographic_bounds
+            t = recipe.config.temporal_bounds
+            output_base = build_output_dir(t.start, t.end, b.min_lon, b.max_lon, b.min_lat, b.max_lat)
+        report_path = output_base / "dry_collocation_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(report_to_json(report))
+        print(f"\nWrote {report_path}")
+        return
 
     orchestrator = DataOrchestrator(recipe, dry_run=dry_run, force_download=force_download)
 
