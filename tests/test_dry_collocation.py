@@ -4235,13 +4235,15 @@ class TestReportRendering:
 
         from sar_validation.core.dry_collocation import CollocationReport, SourcePrediction, report_to_json
 
+        window_start = datetime(2026, 8, 1, 6, 0, 0)
+        window_end = datetime(2026, 8, 1, 6, 5, 30)
         report = CollocationReport(
             recipe_path="r.yaml", sar_footprint_count=1,
             predictions=[
                 SourcePrediction(
-                    source_type="ismn", bucket="ground-point", verdict="unknown",
-                    detail="no archive", message="see README",
-                    matched_windows=[], matched_stations=[],
+                    source_type="ismn", bucket="ground-point", verdict="collocated",
+                    detail="1 station(s) with data in the predicted window(s).", message="see README",
+                    matched_windows=[(window_start, window_end)], matched_stations=["station_a"],
                 ),
             ],
         )
@@ -4252,3 +4254,11 @@ class TestReportRendering:
         assert parsed["sar_footprint_count"] == 1
         assert parsed["predictions"][0]["source_type"] == "ismn"
         assert parsed["predictions"][0]["message"] == "see README"
+        # The datetime -> ISO-8601 serialization branch (report_to_json's
+        # own _default callback) is only ever exercised when
+        # matched_windows is non-empty -- pin the exact ISO-8601 strings
+        # for both elements of the tuple, not just that JSON encoding
+        # didn't raise.
+        assert parsed["predictions"][0]["matched_windows"] == [
+            [window_start.isoformat(), window_end.isoformat()]
+        ]
