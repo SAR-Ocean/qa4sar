@@ -2511,3 +2511,83 @@ class TestCollocationSkipGating:
         orchestrator.download_all()
 
         assert predictions_called["n"] == 0  # never even computed -- true no-op, matching today's behavior exactly
+
+    def test_none_predicted_source_is_skipped_in_historical_first_loop(self, tmp_path, monkeypatch):
+        """Same skip contract as the generic "other sources" loop, but
+        exercised at the historical-first loop (source_type in
+        _HISTORICAL_FIRST_TYPES) -- this loop dispatches before the
+        "other sources" loop even runs, so it needs its own proof the
+        wiring is in place there too."""
+        orchestrator = _orchestrator_with_source(tmp_path, "drifter_historical")
+
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: {"drifter_historical": _FakePrediction(verdict="none-predicted")},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(orchestrator, "_dispatch_source", lambda source: (_ for _ in ()).throw(
+            AssertionError("must not dispatch a none-predicted source")
+        ))
+
+        orchestrator.download_all()
+
+        assert orchestrator.metadata["downloads"]["drifter_historical"]["status"] == "skipped"
+        assert "collocation" in orchestrator.metadata["downloads"]["drifter_historical"]["reason"]
+
+    def test_unknown_verdict_does_not_skip_historical_first_loop(self, tmp_path, monkeypatch):
+        orchestrator = _orchestrator_with_source(tmp_path, "drifter_historical")
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: {"drifter_historical": _FakePrediction(verdict="unknown")},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        dispatched = {"n": 0}
+
+        def _fake_dispatch(source):
+            dispatched["n"] += 1
+            return True
+
+        monkeypatch.setattr(orchestrator, "_dispatch_source", _fake_dispatch)
+
+        orchestrator.download_all()
+
+        assert dispatched["n"] == 1
+
+    def test_none_predicted_source_is_excluded_from_insitu_batch(self, tmp_path, monkeypatch):
+        """The in-situ batch loop filters a none-predicted source_type out
+        of source_types before it ever reaches _download_insitu -- unlike
+        the other two skip points, this loop records no per-source
+        "skipped" metadata entry (there's nothing to write once the type
+        has been dropped from the batch list), so the only observable
+        proof is that _download_insitu itself is never invoked."""
+        orchestrator = _orchestrator_with_source(tmp_path, "mooring")
+
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: {"mooring": _FakePrediction(verdict="none-predicted")},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(orchestrator, "_download_insitu", lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("must not batch-download a none-predicted in-situ source")
+        ))
+
+        orchestrator.download_all()
+
+        assert "mooring" not in orchestrator.metadata["downloads"]
+
+    def test_unknown_verdict_does_not_skip_insitu_batch(self, tmp_path, monkeypatch):
+        orchestrator = _orchestrator_with_source(tmp_path, "mooring")
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: {"mooring": _FakePrediction(verdict="unknown")},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        insitu_calls = []
+        monkeypatch.setattr(
+            orchestrator, "_download_insitu",
+            lambda source_types, min_depth, max_depth: insitu_calls.append(source_types) or True,
+        )
+
+        orchestrator.download_all()
+
+        assert insitu_calls == [["mooring"]]
