@@ -834,6 +834,7 @@ class TestSarFootprintsFromDownloadedRemainingSources:
     is_wv_mode check)."""
 
     def test_sentinel1_ocn_uses_converted_dataset_geometry(self, tmp_path):
+        import numpy as np
         import xarray as xr
 
         from sar_validation.core import dry_collocation
@@ -842,7 +843,16 @@ class TestSarFootprintsFromDownloadedRemainingSources:
             {"oswWindSpeed": (("y", "x"), [[5.0]])},
             coords={
                 "lon": (("y", "x"), [[10.0]]), "lat": (("y", "x"), [[45.0]]),
-                "time": datetime(2026, 8, 1, 6, 0, 0),
+                # A real SARSourceSpec.convert() always produces a real
+                # numpy datetime64[ns] "time" coordinate (never a bare
+                # Python datetime object) -- using np.datetime64 here
+                # (rather than a plain datetime(...) literal, which
+                # xarray stores as an object-dtype scalar with different
+                # .values.item() behavior) is what actually exercises the
+                # real conversion path below and would have caught the
+                # "sensing_start/sensing_end silently become a raw int
+                # nanosecond count" regression.
+                "time": np.datetime64("2026-08-01T06:00:00", "ns"),
             },
         )
 
@@ -861,6 +871,11 @@ class TestSarFootprintsFromDownloadedRemainingSources:
         assert len(result) == 1
         assert result[0].kind == "polygon"
         assert result[0].bbox == (10.0, 10.0, 45.0, 45.0)
+        # isinstance, not just equality: a raw int nanosecond count would
+        # fail this even though downstream code silently tolerates it
+        # right up until a predicate does datetime arithmetic on it.
+        assert isinstance(result[0].sensing_start, datetime)
+        assert isinstance(result[0].sensing_end, datetime)
         assert result[0].sensing_start == datetime(2026, 8, 1, 6, 0, 0)
         assert result[0].sensing_end == datetime(2026, 8, 1, 6, 0, 0)
         assert result[0].source_file == str(tmp_path / "a.nc")
@@ -3580,8 +3595,12 @@ class TestPredictCollocation:
             validation_sources = [_FakeSource("ismn"), _FakeSource("era5")]
 
         fake_predictions = {
-            "ismn": dry_collocation.SourcePrediction(source_type="ismn", bucket="ground-point", verdict="collocated", detail="x"),
-            "era5": dry_collocation.SourcePrediction(source_type="era5", bucket="model", verdict="none-predicted", detail="y"),
+            "ismn": dry_collocation.SourcePrediction(
+                source_type="ismn", bucket="ground-point", verdict="collocated", detail="x"
+            ),
+            "era5": dry_collocation.SourcePrediction(
+                source_type="era5", bucket="model", verdict="none-predicted", detail="y"
+            ),
         }
         monkeypatch.setattr(
             dry_collocation, "predict_source",
@@ -3611,7 +3630,9 @@ class TestPredictCollocation:
         def _fake_predict_source(source, cfg, sar_footprints):
             if source.source_type == "ismn":
                 raise RuntimeError("boom")
-            return dry_collocation.SourcePrediction(source_type="era5", bucket="model", verdict="collocated", detail="y")
+            return dry_collocation.SourcePrediction(
+                source_type="era5", bucket="model", verdict="collocated", detail="y"
+            )
 
         monkeypatch.setattr(dry_collocation, "predict_source", _fake_predict_source)
 
@@ -3629,8 +3650,12 @@ class TestReportRendering:
         report = CollocationReport(
             recipe_path="r.yaml", sar_footprint_count=2,
             predictions=[
-                SourcePrediction(source_type="ismn", bucket="ground-point", verdict="collocated", detail="2 station(s)"),
-                SourcePrediction(source_type="era5", bucket="model", verdict="none-predicted", detail="outside coverage"),
+                SourcePrediction(
+                    source_type="ismn", bucket="ground-point", verdict="collocated", detail="2 station(s)"
+                ),
+                SourcePrediction(
+                    source_type="era5", bucket="model", verdict="none-predicted", detail="outside coverage"
+                ),
             ],
         )
 
@@ -3643,6 +3668,7 @@ class TestReportRendering:
 
     def test_json_round_trips_every_field(self):
         import json
+
         from sar_validation.core.dry_collocation import CollocationReport, SourcePrediction, report_to_json
 
         report = CollocationReport(

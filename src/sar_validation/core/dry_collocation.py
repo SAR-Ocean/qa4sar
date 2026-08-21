@@ -61,7 +61,16 @@ from .orchestrator import _resolve_temporal_padding_minutes
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["SarFootprint", "Verdict", "SourcePrediction", "CollocationReport", "predict_source", "predict_collocation", "render_console_table", "report_to_json"]
+__all__ = [
+    "SarFootprint",
+    "Verdict",
+    "SourcePrediction",
+    "CollocationReport",
+    "predict_source",
+    "predict_collocation",
+    "render_console_table",
+    "report_to_json",
+]
 
 #: Registered Sentinel-1 orbit specs (orbit_coverage.SATELLITE_ORBIT_SPECS)
 #: to try per CLMS SSM tile-day candidate -- a tile could have been
@@ -105,11 +114,17 @@ def _query_sentinel1_ocn_dry(cfg) -> "list[dict]":
     collection/product_type values (see sentinel1_l2_ocn_downloader.py)."""
     username, password = authenticate_cdse()
     client = CopernicusODataClient(username, password)
+    # CDSE's OData $filter rejects anything but full ISO-8601 with a Z
+    # suffix -- same normalization the real downloader applies (see
+    # SARDownloader.query in sentinel1_l2_ocn_downloader.py) before this
+    # value ever reaches query_products.
+    start_norm = normalize_datetime(cfg.temporal_bounds.start) + ".000Z"
+    end_norm = normalize_datetime(cfg.temporal_bounds.end) + ".000Z"
     return client.query_products(
         collection="SENTINEL-1",
         product_type="OCN",
-        start_date=cfg.temporal_bounds.start,
-        end_date=cfg.temporal_bounds.end,
+        start_date=start_norm,
+        end_date=end_norm,
         min_lon=cfg.geographic_bounds.min_lon,
         max_lon=cfg.geographic_bounds.max_lon,
         min_lat=cfg.geographic_bounds.min_lat,
@@ -649,8 +664,17 @@ def sar_footprints_from_downloaded(sar_files, sar_source_spec, product_type: str
                 source_file=str(path),
             ))
         else:
+            # pd.Timestamp(...), not numpy's own .item(): a numpy
+            # datetime64 scalar's .item() returns a raw int (nanoseconds
+            # since epoch), not a datetime -- every predicate below does
+            # datetime arithmetic (subtraction/comparison/.isoformat())
+            # on sensing_start/sensing_end, so an int here makes every
+            # single prediction raise and fall back to "unknown", which
+            # never satisfies _should_skip_for_collocation's
+            # verdict == "none-predicted" check -- silently disabling
+            # the entire skip-gating feature for every real (non-dry) run.
             time_val = ds["time"].values
-            sensing = time_val.item() if hasattr(time_val, "item") else time_val
+            sensing = pd.Timestamp(time_val).to_pydatetime()
             footprints.append(SarFootprint(
                 kind="polygon", bbox=(lon_min, lon_max, lat_min, lat_max), polygon=None, points=None,
                 sensing_start=sensing, sensing_end=sensing, source_file=str(path),
@@ -1549,6 +1573,7 @@ def _predict_insitu(source, cfg, sar_footprints: "list[SarFootprint]") -> Source
                 source_types=[source.source_type],
             ):
                 any_available = True
+                break  # one confirmed hit is enough -- see _predict_model_source's identical short-circuit
         except Exception:
             logger.debug("_predict_insitu: availability check failed", exc_info=True)
             return SourcePrediction(
@@ -1631,6 +1656,7 @@ def _predict_insitu_currents_historical(source, cfg, sar_footprints: "list[SarFo
                 padded_start.isoformat(), padded_end.isoformat(),
             ):
                 any_available = True
+                break  # one confirmed hit is enough -- see _predict_model_source's identical short-circuit
         except Exception:
             logger.debug(
                 "_predict_insitu_currents_historical: availability check failed", exc_info=True,

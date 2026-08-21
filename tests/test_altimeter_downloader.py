@@ -11,28 +11,19 @@ from __future__ import annotations
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
-import numpy as np
+import pandas as pd
 
 from sar_validation.downloaders.altimeter_downloader import AltimeterDownloader
 
 
-class _FakeDataArray:
-    def __init__(self, values):
-        self.values = values
-
-
-class _FakeDataset:
-    """Minimal stand-in for the xarray.Dataset copernicusmarine.open_dataset
-    returns -- just enough surface (.sizes, ["time"].values) for
-    list_candidates_dry to read."""
-
-    def __init__(self, time_values):
-        self.sizes = {"time": len(time_values)}
-        self._time = _FakeDataArray(np.array(time_values, dtype="datetime64[ns]"))
-
-    def __getitem__(self, key):
-        assert key == "time"
-        return self._time
+def _fake_dataframe(time_values):
+    """Minimal stand-in for the pandas.DataFrame copernicusmarine.read_dataframe
+    returns -- just enough surface (.empty, ["time"]) for list_candidates_dry
+    to read. The real dataframe's "time" column is ISO-8601 strings, matching
+    what pd.to_datetime(df["time"]) in the implementation expects."""
+    if not time_values:
+        return pd.DataFrame()
+    return pd.DataFrame({"time": list(time_values)})
 
 
 class TestListCandidatesDry:
@@ -40,7 +31,7 @@ class TestListCandidatesDry:
         dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
 
         fake_module = MagicMock()
-        fake_module.open_dataset.return_value = _FakeDataset(
+        fake_module.read_dataframe.return_value = _fake_dataframe(
             ["2026-06-01T10:00:00", "2026-06-01T10:05:00"]
         )
 
@@ -62,7 +53,7 @@ class TestListCandidatesDry:
         dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
 
         fake_module = MagicMock()
-        fake_module.open_dataset.return_value = _FakeDataset([])
+        fake_module.read_dataframe.return_value = _fake_dataframe([])
 
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
             candidates = dl.list_candidates_dry(
@@ -73,7 +64,7 @@ class TestListCandidatesDry:
 
         assert candidates == []
 
-    def test_open_dataset_failure_for_one_satellite_does_not_abort_others(self, tmp_path):
+    def test_read_dataframe_failure_for_one_satellite_does_not_abort_others(self, tmp_path):
         """A raised exception (e.g. an out-of-bounds selection) for one
         satellite must not prevent the remaining satellites/frequencies
         from being checked -- mirrors download()'s own "no data in this
@@ -82,12 +73,12 @@ class TestListCandidatesDry:
 
         fake_module = MagicMock()
 
-        def _fake_open_dataset(dataset_id, **kwargs):
+        def _fake_read_dataframe(dataset_id, **kwargs):
             if "al" in dataset_id:
                 raise RuntimeError("no matching data")
-            return _FakeDataset(["2026-06-01T10:00:00"])
+            return _fake_dataframe(["2026-06-01T10:00:00"])
 
-        fake_module.open_dataset.side_effect = _fake_open_dataset
+        fake_module.read_dataframe.side_effect = _fake_read_dataframe
 
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
             candidates = dl.list_candidates_dry(
@@ -111,7 +102,7 @@ class TestListCandidatesDry:
                 frequencies=["5hz"], satellites=["al"],
             )
 
-        fake_module.open_dataset.assert_not_called()
+        fake_module.read_dataframe.assert_not_called()
         assert candidates == []
 
     def test_raises_when_every_candidate_raises(self, tmp_path):
@@ -123,7 +114,7 @@ class TestListCandidatesDry:
         dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
 
         fake_module = MagicMock()
-        fake_module.open_dataset.side_effect = RuntimeError("connection refused")
+        fake_module.read_dataframe.side_effect = RuntimeError("connection refused")
 
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
             try:
@@ -147,12 +138,12 @@ class TestListCandidatesDry:
 
         fake_module = MagicMock()
 
-        def _fake_open_dataset(dataset_id, **kwargs):
+        def _fake_read_dataframe(dataset_id, **kwargs):
             if "al" in dataset_id:
                 raise RuntimeError("connection refused")
-            return _FakeDataset([])
+            return _fake_dataframe([])
 
-        fake_module.open_dataset.side_effect = _fake_open_dataset
+        fake_module.read_dataframe.side_effect = _fake_read_dataframe
 
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
             candidates = dl.list_candidates_dry(

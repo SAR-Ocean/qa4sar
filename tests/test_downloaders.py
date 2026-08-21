@@ -1288,15 +1288,23 @@ class TestSARDownloaderForceDownload:
         fake_client = MagicMock()
         fake_client.query_products.return_value = [self._fake_record()]
         dl._client = fake_client
-        (tmp_path / "S1A_IW_OCN__2SDV_20260702T000000").mkdir()
+        product_dir = tmp_path / "S1A_IW_OCN__2SDV_20260702T000000"
+        product_dir.mkdir()
 
-        dl.download(
+        result = dl.download(
             min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
             start="2026-07-02", end="2026-07-03",
         )
 
         fake_client.download_product.assert_not_called()
         assert "Already downloaded" in capsys.readouterr().out
+        # An already-on-disk product must still be reported back -- not
+        # just a freshly-downloaded one -- since orchestrator.py writes
+        # this return value straight into download_metadata.json's
+        # "sar"."files", which dry_collocation.py's real (non-dry)
+        # collocation-gating check reads to find the real SAR footprints
+        # to predict against.
+        assert result == [product_dir]
 
     def test_force_download_redownloads_existing_product(self, tmp_path):
         from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
@@ -1316,6 +1324,64 @@ class TestSARDownloaderForceDownload:
         )
 
         fake_client.download_product.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# SARDownloader — zip-branch extraction
+# ---------------------------------------------------------------------------
+
+class TestSARDownloaderZipExtraction:
+    def test_extracted_product_directory_is_returned(self, tmp_path):
+        """CDSE always delivers a Sentinel-1 SAFE product as a .zip whose
+        sole top-level member is the product's own <name>.SAFE directory.
+        The extracted product directory must be appended to the returned
+        list (and hence written into download_metadata.json's
+        "sar"."files") -- not silently dropped after extraction, the way
+        TestASCATSoilMoistureDownloaderZipExtraction already covers for
+        the (differently-shaped, flat-file) ASCAT SSM case. Silently
+        dropping it here is what made the real (non-dry) collocation-
+        gating path in orchestrator.py/dry_collocation.py always operate
+        on zero real SAR footprints, since it reads this same file list."""
+        import io
+        import zipfile
+
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
+
+        product_name = "S1C_IW_OCN__2SDV_20260712T185023_20260712T185048_008514_010DB0_276D.SAFE"
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr(f"{product_name}/manifest.safe", b"fake manifest bytes")
+            zf.writestr(f"{product_name}/measurement/owi.nc", b"fake measurement bytes")
+        zip_bytes = buf.getvalue()
+
+        dl = SARDownloader(output_dir=tmp_path, dry_run=False)
+        fake_client = MagicMock()
+        fake_client.query_products.return_value = [{
+            "Id": "abc", "Name": product_name,
+            "ContentDate_Start": "2026-07-12T18:50:23Z",
+            "ContentDate_End": "2026-07-12T18:50:48Z",
+            "ContentLength_GB": 1.0, "Online": True,
+        }]
+        dl._client = fake_client
+
+        def _fake_download_product(product_id, output_dir, product_name_arg=""):
+            zip_path = output_dir / f"{product_name}.zip"
+            zip_path.write_bytes(zip_bytes)
+            return zip_path
+
+        fake_client.download_product.side_effect = _fake_download_product
+
+        result = dl.download(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2026-07-12", end="2026-07-13",
+        )
+
+        expected_dir = tmp_path / product_name
+        assert result == [expected_dir]
+        assert expected_dir.is_dir()
+        assert (expected_dir / "manifest.safe").exists()
+        assert not (tmp_path / f"{product_name}.zip").exists()
 
 
 # ---------------------------------------------------------------------------

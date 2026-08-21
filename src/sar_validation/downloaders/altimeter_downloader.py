@@ -125,22 +125,28 @@ class AltimeterDownloader:
         satellite/frequency combination that has real along-track data in
         [start, end] over the given bbox.
 
-        Opens each candidate dataset lazily via
-        ``copernicusmarine.open_dataset()`` (server-side bbox/time
-        filtered, no local download) instead of ``subset()``'s
-        download-to-disk call, then reports the actual min/max sensing
-        time found in the resulting "time" coordinate. A dataset/window
-        combination that raises (no matching data at all -- an
-        out-of-bounds bbox/time selection can raise rather than return an
-        empty dataset) or comes back with an empty "time" coordinate is
-        silently skipped, so one satellite/frequency having no data never
-        aborts the others -- mirroring download()'s own "no data in this
-        region/time window" handling of the same case.
+        Fetches each candidate dataset via ``copernicusmarine.read_dataframe()``
+        (server-side bbox/time filtered, no local download) instead of
+        ``subset()``'s download-to-disk call, then reports the actual
+        min/max sensing time found in the resulting "time" column.
+        ``open_dataset()`` (this codebase's usual lazy-loading call for
+        Copernicus Marine grid products) is NOT used here: this along-track
+        product's storage format doesn't support lazy ``xarray`` loading
+        (``copernicusmarine`` raises ``FormatNotSupported`` for it) --
+        ``read_dataframe()`` is the same fix already applied for the
+        in-situ TAC dataset, which has the identical storage-format
+        constraint (see ``InSituDownloader.check_availability_dry``). A
+        dataset/window combination that raises (no matching data at all --
+        an out-of-bounds bbox/time selection can raise rather than return
+        an empty result) or comes back empty is silently skipped, so one
+        satellite/frequency having no data never aborts the others --
+        mirroring download()'s own "no data in this region/time window"
+        handling of the same case.
 
         A candidate that raises is not necessarily "no data" though -- the
         same exception also covers auth failures and network errors, which
         aren't a definitive answer. Only a candidate that successfully
-        opens (whether or not it then turns out empty) counts as
+        fetches (whether or not it then turns out empty) counts as
         definitive. If every attempted candidate raises, this method can't
         tell whether data exists or not, so it raises rather than silently
         returning an empty list. Callers must treat an exception here as
@@ -180,7 +186,7 @@ class AltimeterDownloader:
                 for win_min_lon, win_max_lon in split_antimeridian_bbox(min_lon, max_lon):
                     any_attempted = True
                     try:
-                        ds = copernicusmarine.open_dataset(
+                        df = copernicusmarine.read_dataframe(
                             dataset_id=dataset_id,
                             variables=variables,
                             minimum_longitude=win_min_lon,
@@ -189,15 +195,16 @@ class AltimeterDownloader:
                             maximum_latitude=max_lat,
                             start_datetime=eff_start_dt,
                             end_datetime=end_dt,
+                            disable_progress_bar=True,
                         )
                     except Exception:
                         continue
                     any_definitive = True
-                    if "time" not in ds.sizes or ds.sizes["time"] == 0:
+                    if df.empty or "time" not in df.columns:
                         continue
-                    time_values = ds["time"].values
-                    t_min = pd.Timestamp(time_values.min()).to_pydatetime()
-                    t_max = pd.Timestamp(time_values.max()).to_pydatetime()
+                    time_values = pd.to_datetime(df["time"])
+                    t_min = time_values.min().to_pydatetime()
+                    t_max = time_values.max().to_pydatetime()
                     candidates.append((dataset_id, t_min, t_max))
 
         if any_attempted and not any_definitive:
