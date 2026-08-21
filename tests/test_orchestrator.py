@@ -1509,6 +1509,28 @@ class TestCombinedCurrentsHistoricalStatusMessage:
             "No delayed-mode in-situ current data found" in r.message for r in caplog.records
         )
 
+    def test_skipped_by_collocation_gating_does_not_trigger_no_data_warning(self, caplog):
+        """A source_type whose download was skipped by collocation-based
+        gating (metadata status="skipped", never even attempted) must not
+        be folded into the "no data found" warning -- that message implies
+        a real, empty download attempt, which a skip is not."""
+        recipe = self._recipe_with("adcp_historical", "argo_historical")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.metadata["downloads"]["adcp_historical"] = {
+            "status": "skipped", "reason": "no predicted collocation with SAR data",
+        }
+        orchestrator.metadata["downloads"]["argo_historical"] = {
+            "status": "skipped", "reason": "no predicted collocation with SAR data",
+        }
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_currents_status()
+
+        assert not any(
+            "No delayed-mode in-situ current data found" in r.message for r in caplog.records
+        )
+        assert orchestrator.metadata["notices"] == []
+
 
 class TestCombinedHfRadarUsStatusMessage:
     def _recipe(self) -> Recipe:
@@ -1560,6 +1582,22 @@ class TestCombinedHfRadarUsStatusMessage:
         orchestrator = DataOrchestrator(recipe, dry_run=dry_run)
         if downloads_entry is not None:
             orchestrator.metadata["downloads"]["hf_radar_us"] = downloads_entry
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_hf_radar_us_status()
+
+        assert not any("No US HF-radar data found" in r.message for r in caplog.records)
+        assert orchestrator.metadata["notices"] == []
+
+    def test_skipped_by_collocation_gating_does_not_trigger_no_data_warning(self, caplog):
+        """hf_radar_us's own download skipped entirely by collocation
+        gating (metadata status="skipped") must not be reported as "no
+        data found" -- it was never attempted."""
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.metadata["downloads"]["hf_radar_us"] = {
+            "status": "skipped", "reason": "no predicted collocation with SAR data",
+        }
 
         with caplog.at_level(logging.WARNING):
             orchestrator._report_combined_hf_radar_us_status()
@@ -1624,6 +1662,25 @@ class TestCombinedHfRadarStatusMessage:
         fired = any("No HF-radar data found" in r.message for r in caplog.records)
         assert fired is expected_fires
 
+    def test_both_skipped_by_collocation_gating_does_not_trigger_no_data_warning(self, caplog):
+        """Both hf_radar and hf_radar_historical skipped entirely by
+        collocation gating (never attempted) must not be reported as "no
+        data found" -- that warning implies a real, empty download
+        attempt."""
+        recipe = self._recipe_with("hf_radar", "hf_radar_historical")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.metadata["downloads"]["hf_radar"] = {
+            "status": "skipped", "reason": "no predicted collocation with SAR data",
+        }
+        orchestrator.metadata["downloads"]["hf_radar_historical"] = {
+            "status": "skipped", "reason": "no predicted collocation with SAR data",
+        }
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_hf_radar_status()
+
+        assert not any("No HF-radar data found" in r.message for r in caplog.records)
+        assert orchestrator.metadata["notices"] == []
 
 
 class TestPerSourceDownloadGating:

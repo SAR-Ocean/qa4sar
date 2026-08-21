@@ -872,6 +872,10 @@ class DataOrchestrator:
         attempted = [
             t for t in _CURRENTS_INSTRUMENT_TYPES
             if any(s.source_type == t for s in self.recipe.config.validation_sources)
+            # A "skipped" status means collocation-based gating never even
+            # attempted this source_type's download -- it must not count
+            # toward "we tried and got nothing", which this warning implies.
+            and self.metadata["downloads"].get(t, {}).get("status") != "skipped"
         ]
         if not attempted:
             return
@@ -893,7 +897,10 @@ class DataOrchestrator:
         if self.dry_run:
             return
         entry = self.metadata["downloads"].get("hf_radar_us")
-        if entry is None or entry.get("status") == "failed":
+        # "skipped" means collocation-based gating never even attempted
+        # this download -- it must not be reported as "no data found",
+        # which implies a real, empty download attempt.
+        if entry is None or entry.get("status") in ("failed", "skipped"):
             return
         if entry.get("file_count", 0) > 0:
             return
@@ -917,7 +924,10 @@ class DataOrchestrator:
         any_non_failed = False
         for t in attempted:
             entry = self.metadata["downloads"].get(t, {})
-            if entry.get("status") == "failed":
+            # "skipped" (collocation-based gating never even attempted
+            # this download) must not count toward "we tried and got
+            # nothing" any more than "failed" does.
+            if entry.get("status") in ("failed", "skipped"):
                 continue
             any_non_failed = True
             total_files += entry.get("file_count", 0)
