@@ -31,6 +31,27 @@ def _recipe(source: str) -> Recipe:
     return Recipe(cfg)
 
 
+def _orchestrator_with_source(tmp_path, source_type: str) -> DataOrchestrator:
+    """A minimal DataOrchestrator wired for one non-historical, non-in-situ
+    validation source_type, exercising download_all() end-to-end -- shared
+    by TestCollocationSkipGating's tests below."""
+    cfg = RecipeConfig(
+        name="test", variable="wind",
+        geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+        temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        validation_sources=[ValidationDataSource(source_type=source_type)],
+    )
+    recipe = Recipe(cfg)
+    orchestrator = DataOrchestrator(recipe, dry_run=False)
+    orchestrator.base_dir = tmp_path
+    return orchestrator
+
+
+class _FakePrediction:
+    def __init__(self, verdict: str) -> None:
+        self.verdict = verdict
+
+
 def test_download_all_in_bbox_defaults_to_false(tmp_path):
     """Default (no flag) means collocation-based skip-gating IS active --
     download_all_in_bbox=False is the new default, inverted from a plain
@@ -2422,3 +2443,71 @@ class TestDownloadAscatSsmWaterfall:
             "partial" in n.lower() or "one of the eumdac" in n.lower()
             for n in orch.metadata["notices"]
         )
+
+
+class TestCollocationSkipGating:
+    """download_all() gates every non-SAR source dispatch on a predicted
+    collocation verdict (default on), consulting _collocation_predictions()
+    at each of the three points identified during Plan 4's own
+    investigation: the historical-first loop, the in-situ batch's
+    source_types filter, and the "other sources" loop below it. Only a
+    CONFIRMED "none-predicted" verdict skips -- everything else (including
+    "unknown", and the case where prediction wasn't even computed) falls
+    through to the existing dispatch behaviour, matching this feature's
+    fail-open contract. download_all_in_bbox=True disables gating entirely,
+    without even computing a prediction, reproducing today's download_all()
+    exactly."""
+
+    def test_none_predicted_source_is_skipped_with_metadata_reason(self, tmp_path, monkeypatch):
+        """A source_type whose collocation prediction is a confirmed
+        none-predicted verdict must be skipped, recorded in metadata
+        exactly like the existing paired_historical skip pattern."""
+        orchestrator = _orchestrator_with_source(tmp_path, "era5")
+
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: {"era5": _FakePrediction(verdict="none-predicted")},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(orchestrator, "_dispatch_source", lambda source: (_ for _ in ()).throw(
+            AssertionError("must not dispatch a none-predicted source")
+        ))
+
+        orchestrator.download_all()
+
+        assert orchestrator.metadata["downloads"]["era5"]["status"] == "skipped"
+        assert "collocation" in orchestrator.metadata["downloads"]["era5"]["reason"]
+
+    def test_unknown_verdict_does_not_skip(self, tmp_path, monkeypatch):
+        orchestrator = _orchestrator_with_source(tmp_path, "era5")
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: {"era5": _FakePrediction(verdict="unknown")},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        dispatched = {"n": 0}
+
+        def _fake_dispatch(source):
+            dispatched["n"] += 1
+            return True
+
+        monkeypatch.setattr(orchestrator, "_dispatch_source", _fake_dispatch)
+
+        orchestrator.download_all()
+
+        assert dispatched["n"] >= 1  # era5 (and any other configured source) was still attempted
+
+    def test_download_all_in_bbox_disables_gating_entirely(self, tmp_path, monkeypatch):
+        orchestrator = _orchestrator_with_source(tmp_path, "era5")
+        orchestrator.download_all_in_bbox = True
+        predictions_called = {"n": 0}
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: predictions_called.__setitem__("n", predictions_called["n"] + 1) or {},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(orchestrator, "_dispatch_source", lambda source: True)
+
+        orchestrator.download_all()
+
+        assert predictions_called["n"] == 0  # never even computed -- true no-op, matching today's behavior exactly

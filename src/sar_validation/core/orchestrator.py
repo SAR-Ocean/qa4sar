@@ -268,6 +268,11 @@ class DataOrchestrator:
         # download would do in its absence.
         self._sar_scene_times: Optional[List[pd.Timestamp]] = None
 
+        # Populated lazily by _collocation_predictions() (see download_all())
+        # on first use, keyed by validation source_type -- None until then,
+        # matching _sar_scene_times's own established laziness pattern.
+        self._collocation_predictions_cache: Optional[Dict[str, Any]] = None
+
     # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------
@@ -595,6 +600,50 @@ class DataOrchestrator:
             )
             self._sar_scene_times = None
 
+    def _collocation_predictions(self) -> "Dict[str, Any]":
+        """Predicted collocation per validation source_type, computed
+        once (cached) from the real downloaded+converted SAR files --
+        empty dict if download_all_in_bbox is set (gating disabled, never
+        even compute this) or if footprint derivation/prediction itself
+        fails (fail open -- an empty dict means every source's lookup
+        below falls through to its own default, no gating)."""
+        if self.download_all_in_bbox:
+            return {}
+        if self._collocation_predictions_cache is not None:
+            return self._collocation_predictions_cache
+
+        from .dry_collocation import predict_collocation, sar_footprints_from_downloaded
+        from .sar_sources import SAR_SOURCES
+
+        try:
+            sar_entry = self.metadata["downloads"].get("sar", {})
+            sar_files = [Path(f) for f in sar_entry.get("files", [])]
+            sar_source_spec = SAR_SOURCES[self.recipe.config.sar_data.source]
+            sar_footprints = sar_footprints_from_downloaded(
+                sar_files, sar_source_spec, self.recipe.config.variable,
+            )
+            report = predict_collocation(self.recipe.config, sar_footprints)
+            self._collocation_predictions_cache = {p.source_type: p for p in report.predictions}
+        except Exception:
+            logger.debug(
+                "_collocation_predictions: prediction failed, disabling "
+                "gating for this run", exc_info=True,
+            )
+            self._collocation_predictions_cache = {}
+        return self._collocation_predictions_cache
+
+    def _should_skip_for_collocation(self, source_type: str) -> bool:
+        """True only for a CONFIRMED none-predicted verdict -- unknown
+        (including "no prediction computed at all") never skips, per this
+        feature's fail-open contract. Short-circuits on download_all_in_bbox
+        before even calling _collocation_predictions(), so gating truly
+        never runs (not just "runs and returns nothing") when it's
+        disabled."""
+        if self.download_all_in_bbox:
+            return False
+        prediction = self._collocation_predictions().get(source_type)
+        return prediction is not None and prediction.verdict == "none-predicted"
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -642,6 +691,12 @@ class DataOrchestrator:
         for source in self.recipe.config.validation_sources:
             if source.source_type not in _HISTORICAL_FIRST_TYPES:
                 continue
+            if self._should_skip_for_collocation(source.source_type):
+                self.metadata["downloads"][source.source_type] = {
+                    "status": "skipped", "reason": "no predicted collocation with SAR data",
+                }
+                logger.info("Skipping %s: no predicted collocation.", source.source_type)
+                continue
             if not self._dispatch_source(source):
                 ok = False
             file_count = self.metadata["downloads"].get(
@@ -661,6 +716,7 @@ class DataOrchestrator:
         source_types = [
             s.source_type for s in insitu_sources
             if not historical_had_data.get(_HISTORICAL_FIRST_PAIRS.get(s.source_type, ""))
+            and not self._should_skip_for_collocation(s.source_type)
         ]
         if source_types:
             # Use the most permissive depth window across the in-situ
@@ -706,6 +762,12 @@ class DataOrchestrator:
                     "Skipping %s: already succeeded in a previous run.",
                     source.source_type,
                 )
+                continue
+            if self._should_skip_for_collocation(source.source_type):
+                self.metadata["downloads"][source.source_type] = {
+                    "status": "skipped", "reason": "no predicted collocation with SAR data",
+                }
+                logger.info("Skipping %s: no predicted collocation.", source.source_type)
                 continue
             if not self._dispatch_source(source):
                 ok = False
