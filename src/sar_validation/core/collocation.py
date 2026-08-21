@@ -1,11 +1,30 @@
 """
 Collocation algorithms — step 3 of the validation pipeline.
 
-Two collocation geometries are supported:
+Four collocation types are supported (see README.md's "Collocation
+types" table):
 
-1. ``PointLayerCollocation`` — fixed / slow-moving point vs. SAR grid  ✅
-2. ``LayerLayerCollocation`` — gridded product vs. SAR grid            🚧
+  Point vs. Point  — mooring/buoy/ferrybox/drifter/tidal gauge vs. SAR
+                     WV-mode vignettes (plain average, no distance
+                     weighting)
+  Point vs. Layer  — mooring/buoy/ferrybox/drifter/tidal gauge/HF radar
+                     vs. SAR grid 
+  Layer vs. Layer  — scatterometer/altimeter/radiometer/HF-radar grid/
+                     satellite soil moisture vs. SAR grid
+  Model vs. Layer  — ERA5/HYCOM (gridded background field) vs. SAR
+                     grid, via bilinear spatial + temporal interpolation
+
+Point vs. Point and Point vs. Layer are both produced by
+``PointLayerCollocation`` (the ``collocation_type`` label on each
+result distinguishes them); ``LayerLayerCollocation`` implements
+Layer vs. Layer; ``ModelLayerCollocation`` (model_collocation.py)
+implements Model vs. Layer.
+
+:func:`run_collocation` is the entry point: it dispatches each
+validation source in a recipe's DataTree to the matching type and
+saves the combined result to ``collocation_results.nc``.
 """
+
 
 from __future__ import annotations
 
@@ -46,7 +65,9 @@ __all__ = [
 
 @dataclass
 class CollocatedPoint:
-    """One matched pair between a SAR grid cell and a validation observation."""
+    """
+    One matched pair between a SAR grid cell and a validation observation.
+    """
 
     # SAR side
     sar_lon:  float
@@ -115,17 +136,16 @@ def _haversine_distance(
 
 
 def _project_currents_to_radial(ewct: float, nsct: float, heading_deg: float) -> float:
-    """Project an eastward/northward current onto the SAR radial (line-of-sight).
+    """
+    Project an eastward/northward current onto the SAR radial (line-of-sight).
 
     The SAR line-of-sight is the range direction, perpendicular to the platform
     heading ``rvlHeading`` (azimuth/along-track), hence the ``- 90``. The result
     is the quantity compared against the L2 OCN ``rvlRadVel`` product
     (``rvlRadVel_projection``).
 
-    Typed here for this module's own scalar-per-row usage; the arithmetic is
-    actually generic over numpy arrays too via broadcasting/duck-typing, and
-    ``model_collocation.py``'s vectorized ``_derive_currents_radial_projection``
-    also calls this with whole arrays at once.
+    Typed here for this module's own scalar-per-row usage; the underlying 
+    arithmetic is generic over numpy arrays too via broadcasting.
 
     Reference: Martin, Gommenginger, Jacob & Staneva (2022), RSE 268:112758.
     """
@@ -137,7 +157,9 @@ def _haversine_distance_grid(
     lon1: float, lat1: float,
     grid_lon: np.ndarray, grid_lat: np.ndarray,
 ) -> np.ndarray:
-    """Great-circle distance from a scalar point to every cell in a 2-D grid (km)."""
+    """
+    Great-circle distance from a scalar point to every cell in a 2-D grid (km).
+    """
     R = 6371.0
     dlat = np.radians(grid_lat - lat1)
     dlon = np.radians(grid_lon - lon1)
@@ -167,7 +189,9 @@ def _lonlat_to_unit_xyz(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
 
 
 def _to_datetime_array(time_array) -> np.ndarray:
-    """Normalise heterogeneous time inputs to an object array of Python datetimes."""
+    """
+    Normalise heterogeneous time inputs to an object array of Python datetimes.
+    """
     if not isinstance(time_array, (list, tuple, np.ndarray)):
         time_array = [time_array]
     result = []
@@ -186,7 +210,9 @@ def _to_datetime_array(time_array) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def _normalize_weights(weights: np.ndarray) -> np.ndarray:
-    """Normalize *weights* to sum to 1.0; unchanged if the sum is 0."""
+    """
+    Normalize *weights* to sum to 1.0; unchanged if the sum is 0.
+    """
     weight_sum = np.sum(weights)
     if weight_sum > 0:
         weights = weights / weight_sum
@@ -294,17 +320,15 @@ LAYER_DATA_TYPES = {
     "scatterometer", "altimeter", "hf_radar", "hf_radar_grid", "radiometer",
     "scatterometer_ssm", "radiometer_ssm",
     "cds_ssm",
-    # ERA5 nodes never reach _detect_collocation_type in practice (they
-    # lack a "point" dimension and are pulled out by run_collocation's own
+    # ERA5 nodes never reach _detect_collocation_type (they lack a
+    # "point" dimension and are pulled out by run_collocation's own
     # model_sources scan before that check runs) -- these entries exist
     # purely so _canonical_source_order()'s registered-set check (in
     # visualization.py) includes era5's val_source labels for permanent
-    # palette slots. See docs/design-choices.md.
+    # palette slots. 
     "era5_wind", "era5_waves", "era5_soil_moisture",
-    # HyCOM never reaches _detect_collocation_type in practice either (see
-    # the ERA5 comment above) -- this entry exists purely so
-    # _canonical_source_order()'s registered-set check (visualization.py)
-    # includes hycom's val_source label for a permanent palette slot.
+    # HYCOM never reaches _detect_collocation_type either (see the ERA5 
+    # comment above).
     "hycom",
 }
 # path-fragment fallbacks when attributes are absent
@@ -321,13 +345,12 @@ def _model_source_type(data_type: str) -> Optional[str]:
     the ``source_type`` key used in the recipe's ``validation_sources``
     (and therefore in ``source_type_overrides``) -- e.g. ``"era5_wind"``
     -> ``"era5"``, ``"hycom"`` -> ``"hycom"``. Returns ``None`` if
-    *data_type* isn't a recognized model source.
+    *data_type* is not a recognized model source.
 
-    ERA5 spans three ``data_type`` values (one recipe `source_type` per
-    three possible `variable`s: wind/waves/soil_moisture), all sharing
-    the recipe `source_type` literal ``"era5"`` -- hence the prefix
-    match. HyCOM only ever produces ``data_type="hycom"``, identical to
-    its own `source_type`, so it's an exact match, no stripping needed.
+    ERA5 spans three ``data_type`` values (one per ``variable``: 
+    wind/waves/soil_moisture), all sharing the recipe `source_type` 
+    literal ``"era5"`` -- hence the prefix match. HYCOM only ever 
+    produces ``data_type="hycom"``, an exact match.
     """
     if data_type.startswith("era5_"):
         return "era5"
@@ -403,15 +426,15 @@ class PointLayerCollocation:
     dedup_nearest_in_time : bool
         When False (default), every validation observation within
         ``time_tolerance_minutes`` of a SAR acquisition produces its own
-        `CollocatedPoint` — the historical behaviour, relied on by
-        scatterometer/buoy/mooring sources where repeated readings at one
-        location are genuinely distinct passes/looks worth comparing
-        independently. When True, only the reading closest in time per
-        (station, SAR acquisition) is kept — for sources like ISMN, which
-        report far more densely (hourly) than the SAR revisit time, so a
-        wide ``time_tolerance_minutes`` (needed to tolerate reporting gaps)
-        would otherwise multiply one physical station into dozens of
-        near-duplicate collocations of the same slowly-evolving quantity.
+        `CollocatedPoint` — used by scatterometer/buoy/mooring sources, 
+        where repeated readings at one location are distinct passes/looks 
+        worth comparing independently. When True, only the reading closest 
+        in time per (station, SAR acquisition) is kept — for sources like 
+        ISMN, which report far more densely (hourly) than the SAR revisit 
+        time, so a wide ``time_tolerance_minutes`` (needed to tolerate 
+        reporting gaps) would otherwise multiply one physical station into 
+        dozens of near-duplicate collocations of the same slowly-evolving 
+        quantity.
     """
 
     #: Collocation type label stored on each CollocatedPoint result.
@@ -419,8 +442,8 @@ class PointLayerCollocation:
 
     def __init__(
         self,
-        spatial_tolerance_km: float = 12.5, #based on teh 12.5 km spatial tolerance used in Abderrahim et al. 2019
-        time_tolerance_minutes: int = 30, #based on the 30 min interval for buoys vs SAR in Abderrahim et al. 2019
+        spatial_tolerance_km: float = 12.5, #spatial tolerance from Abderrahim et al. 2019
+        time_tolerance_minutes: int = 30, #buoys vs SAR interval from Abderrahim et al. 2019
         interpolation_method: str = "nearest",
         aggregation_window_km: float = 5.0,
         validation_temporal_averaging_minutes: int = 30,
@@ -601,17 +624,9 @@ class PointLayerCollocation:
         if grid_tree is None:
             grid_tree = self._build_grid_tree(sar_lon, sar_lat)
 
-        # A wide time_tolerance_minutes (e.g. ISMN's 720 min, to tolerate
-        # reporting gaps) combined with a densely-reporting source (ISMN
-        # reports hourly) means many validation rows from the *same*
-        # station can fall within tolerance of one SAR time. Keep only the
-        # reading closest in time per (station, SAR time) — the loop below
-        # still emits a CollocatedPoint per (row, t_idx) match, but only
-        # the best one per key survives into the final result. Distinct
-        # SAR times for the same station stay separate (each is a genuine
-        # comparison against a different overpass); keyed by platform_id
-        # when available, else by the validation point's own coordinates
-        # (still constant for one physical station's repeated readings).
+        # dedup_nearest_in_time (see class docstring): keep only the reading
+        # closest in time per (station, SAR time), keyed by platform_id when
+        # available, else by the validation point's own coordinates.
         best_matches: Dict[Tuple[Any, int], "CollocatedPoint"] = {}
 
         # Process each validation observation
@@ -725,8 +740,7 @@ class PointLayerCollocation:
 
                 # Create CollocatedPoint. When dedup_nearest_in_time is set,
                 # keep only the closest-in-time match per (station, SAR
-                # time) — see best_matches above; otherwise every match is
-                # kept (historical behaviour).
+                # time) — see best_matches above.
                 point = CollocatedPoint(
                     sar_lon=s_lon,
                     sar_lat=s_lat,
@@ -982,9 +996,13 @@ def _resolve_layer_type(val_ds: "xr.Dataset", val_name: str, layer_vs_layer_spec
     - "scatterometer" -> "scatterometer_hy2b"/"_hy2c"/"_oceansat3" when the
       node's path names one of those FTP-sourced satellites — otherwise
       ASCAT/EUMDAC's plain "scatterometer" (12.5 km) applies. This
-      distinction can't come from ``data_type`` alone: every scatterometer
+      distinction cannot come from ``data_type`` alone: every scatterometer
       file (ASCAT or HY-2/Oceansat-3) is stamped with the same
       ``data_type="scatterometer"`` by ``from_scatterometer_nc``.
+    - "radiometer_ssm" -> "<sensor>_ssm" (e.g. "amsr_ssm"/"smap_ssm"/
+      "smos_ssm") when that sensor has its own spec -- AMSR-E/2, SMAP, and
+      SMOS soil moisture all share the generic ``data_type="radiometer_ssm"``
+      at conversion time; sensor-specific refinement happens here.
     """
     layer_type = val_ds.attrs.get("data_type", "").lower()
     path_parts = val_name.lower().split("/")
@@ -1036,12 +1054,14 @@ def _resolve_layer_type(val_ds: "xr.Dataset", val_name: str, layer_vs_layer_spec
 def _apply_hf_radar_resolution_override(
     layer_type: str, val_ds: "xr.Dataset", merged_kwargs: dict, recipe_layer_type_specs: dict,
 ) -> None:
-    """Override merged_kwargs["aggregation_window_km"] with the node's own
+    """
+    Override merged_kwargs["aggregation_window_km"] with the node's own
     hfr_resolution_km (stamped by from_hf_radar_grid from the file's actual
     lat/lon spacing) -- unless the recipe explicitly set
     aggregation_window_km for this layer_type itself, which always wins.
     A no-op for any layer_type other than "hf_radar_grid", or when the
-    node has no hfr_resolution_km attr (e.g. it wasn't computable)."""
+    node has no hfr_resolution_km attr (e.g. it was not computable).
+    """
     if layer_type != "hf_radar_grid":
         return
     hfr_resolution_km = val_ds.attrs.get("hfr_resolution_km")
@@ -1055,17 +1075,17 @@ def _apply_hf_radar_resolution_override(
 def _apply_ascat_resolution_override(
     layer_type: str, val_ds: "xr.Dataset", merged_kwargs: dict, recipe_layer_type_specs: dict,
 ) -> None:
-    """Override merged_kwargs["aggregation_window_km"] with the node's own
+    """
+    Override merged_kwargs["aggregation_window_km"] with the node's own
     ascat_resolution_km (stamped by from_ascat_ssm/from_hsaf_ssm from the
     file's own filename -- H-SAF's H29 is 12.5km, H122 is 6.25km, and
     EUMDAC/SOMO12 filenames never encode a resolution so they fall back to
-    12.5) -- unless the recipe explicitly set aggregation_window_km for
+    12.5km) -- unless the recipe explicitly set aggregation_window_km for
     this layer_type itself, which always wins. A no-op for any layer_type
     other than "scatterometer_ssm", or when the node has no
     ascat_resolution_km attr. Structurally identical to
-    _apply_hf_radar_resolution_override -- see design-choices.md §1a of
-    this feature's spec for why a second, separate function rather than
-    generalizing the existing one."""
+    _apply_hf_radar_resolution_override.
+    """
     if layer_type != "scatterometer_ssm":
         return
     ascat_resolution_km = val_ds.attrs.get("ascat_resolution_km")
@@ -1115,9 +1135,8 @@ def _average_within_sar_tolerance(
     tolerance -- correct as long as consecutive SAR times are spaced more
     than ``2 * time_tolerance_minutes`` apart, true for soil moisture's
     daily scenes with a 12h tolerance. Readings outside tolerance of every
-    SAR time are dropped (they could not have collocated with anything
-    anyway). The output's ``time`` column is set to the matched SAR time,
-    not the mean of the grouped readings' own times, so downstream
+    SAR time are dropped. The output's ``time`` column is set to the matched 
+    SAR time, not the mean of the grouped readings' own times, so downstream
     temporal-distance calculations see ~0 for these pre-averaged rows.
 
     Parameters
@@ -1148,13 +1167,8 @@ def _average_within_sar_tolerance(
 
     working = val_df.copy()
     working["_val_time_ns"] = pd.to_datetime(working["time"]).values.astype("datetime64[ns]")
-    # A NaT in the validation source's own time column is a real,
-    # documented case (e.g. from_amsr_ssm's NSIDC-0451 branch sets
-    # time=NaT when time_coverage_start is missing from the file, and
-    # such points are deliberately kept upstream rather than dropped --
-    # see _subset_point_ds's docstring). pd.merge_asof rejects a null
-    # merge key on either side identically, so drop these here, the same
-    # graceful-drop treatment already applied to the SAR side's times.
+    # Validation-side timestamps can legitimately be NaT; merge_asof requires
+    # non-null keys, so drop them here too, matching the SAR-side handling.
     working = working[working["_val_time_ns"].notna()].reset_index(drop=True)
     if working.empty:
         return val_df.iloc[0:0]
@@ -1202,30 +1216,14 @@ def _merge_sibling_ssm_nodes(
 ) -> None:
     """
     Collapse sibling per-file SSM satellite nodes sharing the same source
-    into a single logical node before any averaging or collocation runs.
+    into a single logical node before averaging or collocation.
 
-    Satellite SSM sources are stored as one datatree node per downloaded
-    file (e.g. ``validation/ascat_ssm/<stem1>``,
-    ``validation/ascat_ssm/<stem2>``, ... for multiple granules), each its
-    own ``val_name`` key in *buckets*. Without this step, an ascending and
-    a descending overpass delivered as two separate files would be
-    averaged independently by ``_average_within_sar_tolerance`` (called
-    per ``val_name``) rather than blended together, defeating the point
-    of blending overpasses within one ±time_tolerance window at all. This
-    mutates *buckets* and *source_metadata* in place: for every group of
-    >=2 sibling ``val_name``s sharing a ``source_type`` whose resolved
-    layer_type is in ``SSM_SATELLITE_LAYER_TYPES``, only one representative
-    ``val_name`` survives in ``buckets["layer_vs_layer"]``, with the raw
-    (pre-averaging) concatenation of every sibling's own
-    ``to_dataframe()`` stashed on ``source_metadata[representative]
-    ["_merged_raw_df"]`` for the val_dfs-building loop to pick up instead
-    of recomputing ``to_dataframe()`` from just the representative's own
-    single-file Dataset.
-
-    Grouped by ``source_type`` (the top-level validation-tree directory
-    name, e.g. ``"ascat_ssm"``), not by resolved layer_type, since that's
-    the "one physical source" key already used elsewhere in
-    ``run_collocation`` (e.g. for ``collocation_kwargs`` overrides).
+    Each downloaded file becomes its own datatree node, so e.g. an
+    ascending and a descending overpass end up as two separate nodes. Left
+    unmerged, they would be averaged independently instead of blended within
+    one time-tolerance window, defeating the purpose of overpass blending.
+    Mutates the input buckets and metadata in place, keeping one
+    representative node per source.
     """
     sources = buckets.get("layer_vs_layer")
     if not sources:
@@ -1402,7 +1400,7 @@ def _collocate_wv_points(
 
         # Project the in-situ current vector (EWCT/NSCT) onto the SAR radial
         # look direction so it can be compared against rvlRadVel — mirrors the
-        # grid collocation path. Here rvlHeading is a scalar per vignette point.
+        # grid collocation path. Here, rvlHeading is a scalar per vignette point.
         if (
             "rvlRadVel" in sar_aggregated
             and "rvlHeading" in sar_aggregated
@@ -1460,18 +1458,14 @@ def run_collocation(
     filename_suffix: str = "",
 ) -> Optional["xr.Dataset"]:
     """
-    Run both collocation passes between SAR and validation nodes in
-    *datatree* and save the combined results to
-    ``<base_dir>/collocation_results<filename_suffix>.nc``.
+    Collocate SAR and validation nodes in *datatree* and save the combined
+    results to ``<base_dir>/collocation_results<filename_suffix>.nc``.
 
-    Pass order
-    ----------
-    1. **point_vs_layer** — moorings, buoys, tidal gauges, HF radar, ferryboxes, drifters
-    2. **layer_vs_layer** — scatterometer swaths, OSI-SAF winds
-
-    Each validation source is auto-assigned to a pass based on its
-    ``platform_type`` / ``data_type`` Dataset attribute (see
-    :func:`_detect_collocation_type`).
+    Each validation source is auto-assigned to one of the four collocation
+    types described in this module's docstring (point_vs_point,
+    point_vs_layer, layer_vs_layer, model_vs_layer), based on its
+    ``platform_type`` / ``data_type`` attribute and whether the matching SAR
+    node is gridded or WV-mode (see :func:`_detect_collocation_type`).
 
     The collocation parameters (tolerances, interpolation method) are taken
     from ``recipe.config.collocation`` with per-source overrides applied
@@ -1479,9 +1473,9 @@ def run_collocation(
 
     DataTree layout expected
     ------------------------
-    - ``/sar/<scene-name>``              — one node per SAR SAFE file
+    - ``/sar/<scene-name>``              — one node per downloaded SAR file
     - ``/validation/<source-name>``      — point-observation Datasets
-      (may be nested one level deeper for satellite products)
+    (may be nested one level deeper for satellite products)
 
     Each SAR node must have ``lon`` and ``lat`` as 2-D ``(y, x)`` coordinates
     and a scalar ``time`` coordinate.  Each validation node must use a flat
@@ -1547,14 +1541,11 @@ def run_collocation(
         "emit_diagnostics": emit_diagnostics,
     }
     
-    # Layer-vs-layer specs: start from the built-in defaults (so recipes that
-    # declare no layer_vs_layer section at all still get sensible per-source
-    # aggregation windows), then let any recipe-level overrides win per-key.
-    # Deep merge (not layer_vs_layer_specs.update(...), which replaces a
-    # key's whole dict) -- a recipe overriding only e.g.
-    # "time_tolerance_minutes" for one key (soil_moisture_nisar_norway.yaml
-    # does exactly this) must not silently lose that key's other defaults
-    # (aggregation_window_km, distance_weighting, ...) in the process.
+    # Start from the built-in defaults so recipes with no layer_vs_layer
+    # section still get sensible per-source values, then merge recipe
+    # overrides per-key (not a top-level dict replace) so overriding one
+    # field of a layer_type spec does not drop that layer_type's other
+    # defaults.
     from .recipe import DEFAULT_LAYER_TYPE_SPECS
     layer_vs_layer_specs = dict(DEFAULT_LAYER_TYPE_SPECS)
     if coll_cfg.layer_vs_layer is not None:
@@ -1609,7 +1600,7 @@ def run_collocation(
                         "colloc_kwargs": source_type_overrides.get(source_type, {}),
                     }
 
-    # Gridded "model" sources (ERA5, HyCOM) -- kept as raw, native
+    # Gridded "model" sources (ERA5, HYCOM) -- kept as raw, native
     # (time, lat, lon) Datasets rather than flattened into `buckets`/
     # `val_dfs` like every other validation source, since
     # ModelLayerCollocation interpolates the field directly onto SAR pixel
@@ -1627,12 +1618,9 @@ def run_collocation(
                 model_source_metadata[name] = {
                     "colloc_kwargs": source_type_overrides.get(model_source_type, {}),
                 }
-            # One level deeper -- DataTreeConverter places ERA5 at
-            # "validation/era5/era5" (same "may be nested one level
-            # deeper" layout as every other satellite-product source; see
-            # the two-level scan above), so the actual leaf Dataset (and
-            # its data_type attr) lives one level below the group node
-            # checked above, which itself carries no attrs of its own.
+            # One level deeper: DataTreeConverter nests ERA5 at
+            # "validation/era5/era5" like other satellite-product sources, so its
+            # data_type attr lives on the leaf node below the (attr-less) group node.
             for subname, subnode in node.children.items():
                 sub_ds = subnode.to_dataset()
                 sub_model_source_type = _model_source_type(sub_ds.attrs.get("data_type", ""))
@@ -1650,16 +1638,11 @@ def run_collocation(
         logger.warning("No validation nodes with 'point' dimension found — nothing to collocate.")
         return None
 
-    # ``ds["time"]`` is a scalar coordinate for grid-mode (IW/EW/SM) scenes
-    # but a (point,)-dimensioned array of per-vignette times for WV-mode
-    # scenes -- np.atleast_1d normalises both to an iterable so every SAR
-    # acquisition time is collected regardless of scene mode. Scenes with
-    # no ``time`` coordinate at all, or individual NaT entries within one,
-    # are skipped here rather than raising -- the per-scene loop below
-    # already skips a no-time scene gracefully with a warning, and this
-    # must not short-circuit that with a crash first; a NaT entry would
-    # otherwise reach pd.merge_asof (inside _average_within_sar_tolerance)
-    # as a null merge key, which pandas rejects outright.
+    # np.atleast_1d normalises the scalar time (grid-mode) vs. (point,)
+    # array (WV-mode) into one iterable. Scenes with no time coordinate, or
+    # individual NaT entries, are skipped rather than raised here -- a NaT
+    # would otherwise reach merge_asof as a null merge key, which pandas
+    # rejects.
     sar_scene_times: List[datetime] = [
         pd.Timestamp(t).to_pydatetime()
         for ds in sar_scenes.values()
@@ -1681,8 +1664,7 @@ def run_collocation(
                 # Average every ISMN reading within ±time_tolerance_minutes
                 # of each SAR scene into one station-day value, instead of
                 # picking the single nearest (always-nighttime, since S1
-                # SSM scenes are stamped at midnight) reading. See
-                # docs/design-choices.md §8.6.
+                # SSM scenes are stamped at midnight) reading. 
                 per_source_kwargs = source_metadata.get(val_name, {}).get("colloc_kwargs", {})
                 merged_kwargs = _merge_collocation_kwargs(global_coll_kwargs, per_source_kwargs)
                 group_cols = ["platform_id"] if "platform_id" in df.columns else ["lon", "lat"]
@@ -1693,28 +1675,20 @@ def run_collocation(
             elif ctype == "layer_vs_layer":
                 layer_type = _resolve_layer_type(val_ds, val_name, layer_vs_layer_specs)
                 if layer_type in SSM_SATELLITE_LAYER_TYPES:
-                    # Blend every overpass (e.g. ascending + descending
-                    # passes) of the same grid cell within ±time_tolerance
-                    # into one day value -- same treatment as ISMN above.
-                    # This also shrinks soil-moisture's ~100k-point scale,
-                    # since multiple overpasses collapse into one row
-                    # before the per-row collocation loop runs. Km-based
-                    # sources (ASCAT/SMAP/SMOS/AMSR2-NSIDC-0451/AU_Land) are
-                    # snapped to the source's own aggregation_window_km
-                    # below; AMSR2's G-Portal format is stamped with a
-                    # native_grid_deg attribute at conversion time and
-                    # grouped by its raw (exact) lon/lat instead, since it's
-                    # already a fixed lattice that reports identical
-                    # coordinates for repeated readings of the same cell.
-                    # See docs/design-choices.md §8.7.
+                    # Blend every overpass of the same grid cell within ±time_tolerance
+                    # into one day value (same treatment as ISMN above), which also shrinks
+                    # soil-moisture's ~100k-point scale. Km-based sources are snapped to
+                    # aggregation_window_km below; AMSR2's fixed-lattice G-Portal format is
+                    # grouped by its raw lon/lat instead, since repeated readings already
+                    # share exact coordinates.
                     spec = layer_vs_layer_specs.get(layer_type, {})
                     time_tol = spec.get(
                         "time_tolerance_minutes", global_coll_kwargs["time_tolerance_minutes"]
                     )
                     native_grid_deg = val_ds.attrs.get("native_grid_deg")
                     if native_grid_deg is not None:
-                        # A genuinely degree-native fixed grid (e.g. AMSR2
-                        # G-Portal's 0.1x0.1 EQR grid) reports IDENTICAL
+                        # A degree-native fixed grid (e.g. AMSR2
+                        # G-Portal's 0.1x0.1 EQR grid) reports identical
                         # lon/lat for repeated readings of the same cell --
                         # no snapping needed, group on the raw coordinates
                         # directly. Rounding this grid's cell centres
@@ -1854,11 +1828,10 @@ def run_collocation(
                         sar_name, val_name, collocation_type, len(matches),
                     )
 
-            # ERA5 (or any future gridded "model" source) -- see
-            # docs/design-choices.md. WV vignettes are sparse SAR-anchor
-            # points, so ModelLayerCollocation.collocate_points always
-            # interpolates ERA5 directly at each vignette regardless of
-            # the recipe's chosen method.
+            # Gridded "model" source (e.g. ERA5, HYCOM); WV vignettes are 
+            # sparse SAR-anchor points, so ModelLayerCollocation.collocate_points 
+            # always interpolates the model directly at each vignette regardless
+            # of the recipe's chosen method.
             for val_name, val_ds in model_sources.items():
                 per_source_kwargs = model_source_metadata.get(val_name, {}).get("colloc_kwargs", {})
                 layer_type = val_ds.attrs.get("data_type", "era5")
@@ -1872,7 +1845,7 @@ def run_collocation(
                 matches = model_colloc.collocate_points(
                     sar_point_vars=sar_point_vars,
                     sar_lons=sar_lons, sar_lats=sar_lats, sar_times=sar_times,
-                    era5_ds=val_ds, val_source=source_label, sar_scene_name=sar_name,
+                    model_ds=val_ds, val_source=source_label, sar_scene_name=sar_name,
                 )
                 all_collocations.extend(matches)
                 logger.info(
@@ -1898,18 +1871,16 @@ def run_collocation(
                 logger.warning("SAR node '%s' has no (y, x) variables — skipping.", sar_name)
                 continue
 
-            # Built once per SAR scene and reused across every validation
-            # source matched against it below (both point_vs_layer and
-            # layer_vs_layer resolve to PointLayerCollocation.collocate(),
-            # which accepts a pre-built tree). Rebuilding this per
-            # validation file — the previous behavior — is fine for a
-            # handful of large, pre-batched validation sources, but
-            # pathological for many small per-source files against a large
-            # grid (e.g. ISMN's one-CSV-per-station output matched against
-            # the ~28M-cell CLMS Surface Soil Moisture 1 km Europe grid).
+            # Built once per SAR scene and reused across every matched validation
+            # source (both point_vs_layer and layer_vs_layer resolve to
+            # PointLayerCollocation.collocate(), which accepts a pre-built tree) --
+            # rebuilding per validation file is pathological for many small
+            # per-source files against one large grid (e.g. ISMN's per-station
+            # files against a multi-million-cell grid).
             grid_tree = PointLayerCollocation._build_grid_tree(sar_lon, sar_lat)
 
-            # Run the three passes in order
+            # Pass 1/2: layer_vs_layer and point_vs_layer buckets (model
+            # sources are handled separately below as pass 3).
             for ctype, sources in buckets.items():
                 if not sources:
                     continue
@@ -1959,9 +1930,7 @@ def run_collocation(
                         sar_name, val_name, ctype, len(matches),
                     )
 
-            # ERA5 (or any future gridded "model" source) -- see
-            # docs/design-choices.md and
-            # docs/superpowers/specs/2026-08-06-era5-model-validation-design.md.
+            # Gridded model sources (e.g. ERA5 HYCOM) 
             for val_name, val_ds in model_sources.items():
                 per_source_kwargs = model_source_metadata.get(val_name, {}).get("colloc_kwargs", {})
                 layer_type = val_ds.attrs.get("data_type", "era5")
@@ -1978,7 +1947,7 @@ def run_collocation(
                 source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
                 matches = model_colloc.collocate(
                     sar_data=sar_data_3d, sar_lon=sar_lon, sar_lat=sar_lat,
-                    sar_time=sar_time_arr, era5_ds=val_ds,
+                    sar_time=sar_time_arr, model_ds=val_ds,
                     val_source=source_label, sar_scene_name=sar_name,
                 )
                 all_collocations.extend(matches)
@@ -2019,45 +1988,41 @@ def run_collocation(
 
 class LayerLayerCollocation(PointLayerCollocation):
     """
-    Match a gridded validation product (e.g. ASCAT scatterometer swath) to a SAR
-    layer by aggregating SAR pixels within each scatterometer wind vector cell.
+    Match a gridded layer_vs_layer validation product (scatterometer,
+    altimeter, HF-radar grid, or satellite soil moisture) to a SAR layer, by
+    aggregating SAR pixels around each validation point, via one of two
+    methods selected by ``method``.
 
     Aggregation approach
     --------------------
-    ASCAT/OSI-SAF scatterometer products are delivered pre-gridded — one
-    observation per wind-vector cell (WVC), already ~12.5×12.5 km — so each
-    scatterometer point already *is* its own cell; no spatial re-clustering
-    is needed. ``cell-averaging`` therefore reuses the parent
-    ``PointLayerCollocation.collocate()`` algorithm directly, per
-    scatterometer point:
+    These sources are delivered pre-gridded — one observation per resolution
+    cell (e.g. ASCAT's ~12.5x12.5 km wind-vector cell) — so each validation
+    point already *is* its own cell; no spatial re-clustering is needed.
+    ``method="cell-averaging"`` (default) therefore reuses the parent
+    ``PointLayerCollocation.collocate()`` algorithm directly, per validation
+    point:
 
-    1. **SAR Aggregation**: For each scatterometer point, finds all SAR grid
-       cells within ``aggregation_window_km`` (e.g., 12.5 km for ASCAT) and
-       computes a distance-weighted average of SAR variables.
+    1. **SAR Aggregation**: For each validation point, finds all SAR grid
+    cells within ``aggregation_window_km`` and computes a distance-weighted
+    average of SAR variables.
 
-    2. **Output**: One ``CollocatedPoint`` per scatterometer point (per
-       matching SAR time), with the aggregated SAR mean vs. the point's own
-       raw value.
+    2. **Output**: One ``CollocatedPoint`` per validation point (per matching
+    SAR time), with the aggregated SAR mean vs. the point's own raw value.
 
-    Typical use cases: ASCAT scatterometer swaths (12.5×12.5 km cells), OSI-SAF wind products.
+    ``method="individual"`` instead matches each SAR pixel to its nearest
+    validation point via KD-tree search, allowing reuse; see
+    :meth:`_collocate_individual`.
 
     Collocation parameters
     ----------------------
-    See parent class, but LayerLayerCollocation provides different defaults optimized 
-    for scatterometer-SAR comparison:
+    The constructor defaults below are ASCAT-tuned; ``run_collocation``
+    overrides them per layer type via ``DEFAULT_LAYER_TYPE_SPECS`` for every
+    other supported source (altimeter, HF-radar, soil moisture, ...):
 
     - ``aggregation_window_km`` : 12.5 km (ASCAT scatterometer cell size)
-    - ``time_tolerance_minutes`` : 180 min (±3 hours, per hal-04202202)
+    - ``time_tolerance_minutes`` : 180 min (±3 hours, per Abderrahim et al. 2019)
     - ``distance_weighting`` : "equal" (uniform weights across regular grid cells)
     - ``validation_temporal_averaging_minutes`` : 60 min (±1 hour window)
-
-    Reference
-    ---------
-    Collocation methodology follows:
-    - Abderrahim et al. (2019) — paper hal-04202202
-      "Validation of Sentinel-1 wind products against scatterometer measurements"
-    - Spatial tolerance: 12.5 km (ASCAT cell size)
-    - Temporal tolerance: 180 minutes (3-hour match window)
     """
 
     collocation_type: str = "layer_vs_layer"
@@ -2139,15 +2104,18 @@ class LayerLayerCollocation(PointLayerCollocation):
         sar_scene_name: str = "",
     ) -> List[CollocatedPoint]:
         """
-        Match each individual SAR pixel to the closest scatterometer point (individual method).
+        Match each individual SAR pixel to its closest validation point (individual method).
 
         For each SAR grid cell at each time step:
-        1. Find closest scatterometer point (vectorized nearest-neighbour search
-           via a KD-tree over unit-sphere Cartesian coordinates)
+        1. Find closest validation point (vectorized nearest-neighbour search via a
+        KD-tree over unit-sphere Cartesian coordinates)
         2. Check spatial tolerance (within spatial_tolerance_km)
         3. Check temporal match (within time_tolerance_minutes)
-        4. Create CollocatedPoint with SAR as anchor, scatterometer as matched value
-        5. Scatterometer points can be reused across multiple SAR cells
+        4. For gridded HF-radar (EWCT/NSCT) matched against SAR radial velocity
+        (rvlRadVel/rvlHeading), project the current onto the SAR line-of-sight
+        for comparability (see :func:`_project_currents_to_radial`)
+        5. Create CollocatedPoint with SAR as anchor, validation point as matched value
+        6. Validation points can be reused across multiple SAR cells
 
         Returns
         -------
@@ -2221,11 +2189,8 @@ class LayerLayerCollocation(PointLayerCollocation):
         scat_times_objs = np.array([t.to_pydatetime() if hasattr(t, 'to_pydatetime') else t
                                     for t in scat_times_pd], dtype=object)
 
-        # Build a KD-tree over scatterometer points in unit-sphere Cartesian
-        # coordinates once: Euclidean nearest-neighbour there is equivalent to
-        # great-circle nearest-neighbour, so per-time-step matching becomes a
-        # single vectorized query instead of an O(pixels x scat_points)
-        # Python-level Haversine loop.
+        # Build a KD-tree over validation points in unit-sphere Cartesian
+        # coordinates once.
         R = 6371.0
         scat_tree = cKDTree(_lonlat_to_unit_xyz(scat_lons, scat_lats))
 
@@ -2418,7 +2383,8 @@ class LayerLayerCollocation(PointLayerCollocation):
         grid_tree: Optional[Tuple["cKDTree", np.ndarray, int]] = None,
     ) -> List[CollocatedPoint]:
         """
-        Match scatterometer to SAR using selected collocation method.
+        Match a layer_vs_layer validation source to SAR using selected 
+        collocation method.
 
         Dispatches to either individual point-to-point or cell-averaging methods
         based on self.method setting. ``grid_tree`` (see
@@ -2436,7 +2402,7 @@ class LayerLayerCollocation(PointLayerCollocation):
         sar_time : array-like
             SAR acquisition times, shape ``(time,)``.
         val_data : pd.DataFrame
-            Scatterometer data with columns ``lon``, ``lat``, ``time``, and variables.
+            Validation data with columns ``lon``, ``lat``, ``time``, and variables.
         val_source : str
             Label for validation source.
         sar_scene_name : str
@@ -2470,14 +2436,14 @@ class LayerLayerCollocation(PointLayerCollocation):
         grid_tree: Optional[Tuple["cKDTree", np.ndarray, int]] = None,
     ) -> List[CollocatedPoint]:
         """
-        Match scatterometer points to SAR grid using spatial aggregation
+        Match a layer_vs_layer validation source to SAR grid using spatial aggregation
         (cell-averaging method).
 
-        ASCAT/OSI-SAF scatterometer products are delivered pre-gridded — one
-        observation per wind-vector cell — so each scatterometer point
-        already *is* its own cell; no clustering is needed. This reuses
+        Layer_vs_layer validation sources already represent their own resolution
+        cell or footprint (e.g. a scatterometer wind-vector cell, an along-track
+        altimeter point) — no spatial clustering is needed. This reuses
         ``PointLayerCollocation.collocate()`` directly: for each
-        scatterometer point, find all SAR cells within
+        validation point, find all SAR cells within
         ``aggregation_window_km``, average them (distance-weighted or
         equal), and match against the point's own raw value.
 
@@ -2490,17 +2456,17 @@ class LayerLayerCollocation(PointLayerCollocation):
         sar_time : array-like
             SAR acquisition times, shape ``(time,)``.
         val_data : pd.DataFrame
-            Scatterometer data with columns ``lon``, ``lat``, ``time``, and
+            Validation data with columns ``lon``, ``lat``, ``time``, and
             any number of variable columns.
         val_source : str
-            Label for validation source (e.g. ``"scatterometer"``).
+            Label for validation source.
         sar_scene_name : str
             Name of SAR scene node in DataTree.
 
         Returns
         -------
         list[CollocatedPoint]
-            List of collocated matches (one per scatterometer point, per
+            List of collocated matches (one per validation point, per
             matching SAR time).
         """
         return PointLayerCollocation.collocate(

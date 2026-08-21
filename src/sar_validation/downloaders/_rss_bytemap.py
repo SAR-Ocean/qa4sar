@@ -7,13 +7,12 @@ AMSR2 NetCDF handled elsewhere. RSS ships Python-2 read routines for them;
 this module is a compact, Python-3 re-implementation of the same format
 (no RSS code copied), driven by a per-sensor layout table.
 
-Format (confirmed against RSS's read routines *and* empirically against real
-GMI / SSMIS / WindSat files):
+Format:
 
 - Uncompressed layout is ``(npass=2, nvar, nlat=720, nlon=1440)`` uint8, with
   ascending/descending as the two passes.
 - Grid: lon ``0.125..359.875`` (0–360 convention), lat ``-89.875..89.875``
-  (south→north; index 0 is the southernmost row — no flip needed).
+  (south→north; index 0 is the southernmost row).
 - Physical value = ``byte * scale + offset``.
 - Byte values ``>= 251`` are special/missing codes (land, sea-ice, coast,
   rain-flagged, no-observation, bad) and decode to ``NaN``.

@@ -25,13 +25,13 @@ def _fake_query_resp():
 
 
 class TestQueryProductsDateFilterIsInclusive:
-    """A daily product's ContentDate/Start commonly lands exactly on a
+    """
+    A daily product's ContentDate/Start commonly lands exactly on a
     requested window boundary (e.g. a recipe's start/end date normalizes
     to an exact midnight timestamp). A strict gt/lt filter silently drops
-    that boundary-matching product -- confirmed against a real recipe run
-    (2025-07-01..03) that only found the 07-02 CLMS SSM product, not
-    07-01, because 07-01's ContentDate/Start equalled the requested start
-    exactly. The filter must use ge/le so an exact-boundary match is kept."""
+    that boundary-matching product. The filter must use ge/le so an 
+    exact-boundary match is kept.
+    """
 
     def test_query_products_uses_inclusive_bounds(self):
         client = _make_client()

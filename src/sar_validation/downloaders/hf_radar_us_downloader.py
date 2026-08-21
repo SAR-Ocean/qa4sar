@@ -13,7 +13,7 @@ Tries, in order, the first to return at least one file wins:
      Copernicus for the same stations in the same run.
 
 Applies uniformly across all 6 regions in NOAA_HFR_REGIONS. A bbox that
-doesn't match any of the 6 (non-US networks, or Copernicus-only regions)
+does not match any of the 6 (non-US networks, or Copernicus-only regions)
 skips straight to step 3.
 
 All backends write to the same folder names the rest of the toolbox
@@ -48,7 +48,8 @@ __all__ = ["HFRadarUSDownloader"]
 
 
 class HFRadarUSDownloader:
-    """Download a US HF-radar current grid via the ERDDAP->THREDDS->Copernicus waterfall.
+    """
+    Download a US HF-radar current grid via the ERDDAP->THREDDS->Copernicus waterfall.
 
     Parameters
     ----------
@@ -182,12 +183,14 @@ class HFRadarUSDownloader:
         return downloaded
 
     def _warn_if_stale_output(self, subdir: str, backend_label: str) -> None:
-        """Warn if <output_dir>/subdir already holds cached .nc files from a
+        """
+        Warn if <output_dir>/subdir already holds cached .nc files from a
         run where a DIFFERENT backend was selected than this run's. Folder
         discovery in convert_downloaded_data is unconditional (checks only
         whether the folder exists), so leftover data from a prior run using
         the other backend would get discovered and collocated alongside
-        this run's, double-counting the same stations."""
+        this run's, double-counting the same stations.
+        """
         d = self.output_dir / subdir
         if d.exists() and any(d.glob("*.nc")):
             logger.warning(

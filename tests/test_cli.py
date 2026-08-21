@@ -691,10 +691,7 @@ class TestIsAlreadyDownloaded:
 
     def test_true_when_recorded_variable_missing_legacy_metadata(self, tmp_path):
         """Legacy/synthetic download_metadata.json without a top-level
-        "variable" key must keep the old trust-it behavior -- this is the
-        exact case that caused a live, unmocked network download during
-        Task 15 when a naive first version of the mismatch check ignored
-        the "recorded_variable is not None" guard."""
+        "variable" key must keep the old trust-it behavior."""
         import json
 
         from sar_validation.cli import _is_already_downloaded

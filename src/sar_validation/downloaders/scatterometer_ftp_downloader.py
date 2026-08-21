@@ -2,16 +2,16 @@
 Download HY-2B/HY-2C/Oceansat-3 25 km scatterometer wind data via the
 OSI-SAF wind FTP server (ftppro.knmi.nl).
 
-These satellites are processed by OSI-SAF but not distributed through the
-EUMDAC Data Store that ``scatterometer_downloader.py`` uses for ASCAT-B/C —
-the only access path is this FTP server, which retains a rolling 3-day
-window of data. ASCAT-B/C stays exclusively on the EUMDAC path; this
-downloader never touches it.
+These satellites are processed by OSI-SAF but are not distributed
+through the EUMDAC Data Store that ``scatterometer_downloader.py``
+uses for ASCAT-B/C; the only access path is this FTP server, which
+retains a rolling 3-day window of data. ASCAT-B/C remains exclusively
+on the EUMDAC path and is never accessed by this downloader.
 
-Filename matching is by substring (25 km resolution token + wind-vector
-product suffix), not the exact per-satellite numeric processing code, since
-that code isn't guaranteed stable across satellites/versions and can't be
-verified for HY-2B/HY-2C while their FTP directories are empty.
+Filename matching is by substring (the 25 km resolution token plus
+the wind-vector product suffix), rather than the exact per-satellite
+numeric processing code, since that code is not guaranteed stable
+across satellites or versions.
 
 Library usage::
 
@@ -49,8 +49,7 @@ __all__ = ["ScatterometerFTPDownloader"]
 
 FTP_HOST = "ftppro.knmi.nl"
 
-# FTP directory per satellite. Verified live 2026-07-21: hy2b/hy2c are
-# currently empty (no active files), oceansat3 has ~350 recent files.
+# FTP directory per satellite. 
 _SATELLITE_PATHS = {
     "hy2b": "/scat/netcdf/hy2b",
     "hy2c": "/scat/netcdf/hy2c",
@@ -69,38 +68,13 @@ _TIMESTAMP_RE = re.compile(r"(\d{8})_(\d{6})")
 #: open and silently disable filtering -- see orbit_coverage.py's
 #: orbit_overlaps_bbox docstring).
 #:
-#: Measured directly from live-downloaded files in this repo's data/
-#: directory by taking the timestamp delta between consecutive files
-#: whose revolution-counter token increments by exactly 1 (i.e. the
-#: genuine per-file sensing span, not an artifact of gaps in what was
-#: downloaded):
-#:
-#: - HY-2B: consecutive-revolution files 2026-08-16 "_045301..._39253" ->
-#:   "_063734..._39254" -> "_082200..._39255" give deltas of ~104m33s,
-#:   ~104m26s -- one file per orbit revolution, real span ~104.4 min.
-#: - HY-2C: consecutive-revolution files 2026-08-16 "_070246..._29758" ->
-#:   "_084652..._29759" -> "_103058..._29760" -> "_121459..._29761" ->
-#:   "_135909..._29762" give deltas of ~104m06s, ~104m06s, ~104m01s,
-#:   ~104m10s -- also one file per orbit revolution, real span ~104.4 min.
-#: - Oceansat-3: revolution-counter tokens repeat in pairs
-#:   ("_19649", "_19649", "_19650", "_19650", "_19651", ...) -- unlike
-#:   HY-2B/HY-2C, Oceansat-3 ships *two half-orbit files per revolution*,
-#:   not one file per revolution. Consecutive files 2026-08-16
-#:   "_211942..._19649" -> "_220936..._19649" -> "_225916..._19650" ->
-#:   "_234907..._19650" -> "_003850..._19651" give deltas of ~49m54s,
-#:   ~49m40s, ~49m51s, ~49m43s -- real span ~49.8 min.
-#:
-#: HY-2B/HY-2C and Oceansat-3 need different values because they differ
-#: in *instrument/file cadence* (one file per revolution vs. two
-#: half-orbit files per revolution), not because their orbital periods
-#: differ -- all three are sun-synchronous LEO satellites with broadly
-#: similar ~100 min orbital periods.
+#: Measured real per-file sensing span: ~104.4 min for HY-2B/2C (one
+#: file per orbit revolution), ~49.8 min for Oceansat-3 (half-orbit
+#: revolution per file). 
 #:
 #: Each value below adds a conservative safety margin over the measured
-#: real span (per the fail-toward-inclusion principle: err toward a
-#: conservatively long assumed duration rather than risk a false
-#: negative). Re-verify against real filename timestamp deltas or the
-#: OSI-SAF Product User Manual and widen further if real data disagrees.
+#: real span (fail-toward-inclusion: a conservatively long assumed duration
+#: risks over-including rather than a false negative). 
 _ASSUMED_PASS_DURATION_BY_SATELLITE: dict[str, timedelta] = {
     "hy2b": timedelta(minutes=110),
     "hy2c": timedelta(minutes=110),
@@ -109,14 +83,18 @@ _ASSUMED_PASS_DURATION_BY_SATELLITE: dict[str, timedelta] = {
 
 
 def _matches_25km(filename: str) -> bool:
-    """True if filename is a 25 km wind-vector product file (not its .md5 sidecar)."""
+    """
+    True if filename is a 25 km wind-vector product file (not its .md5 sidecar).
+    """
     if filename.endswith(".md5"):
         return False
     return "_250_" in filename and "_ovw" in filename
 
 
 def _parse_filename_timestamp(filename: str) -> Optional[datetime]:
-    """Extract the embedded _YYYYMMDD_HHMMSS_ timestamp from an OSI-SAF FTP filename."""
+    """
+    Extract the embedded _YYYYMMDD_HHMMSS_ timestamp from an OSI-SAF FTP filename.
+    """
     m = _TIMESTAMP_RE.search(filename)
     if not m:
         return None
@@ -129,7 +107,9 @@ def _parse_filename_timestamp(filename: str) -> Optional[datetime]:
 
 
 def _parse_iso_dt(s: str) -> datetime:
-    """Convert an ISO datetime string (from normalize_datetime) to a UTC-aware datetime."""
+    """
+    Convert an ISO datetime string (from normalize_datetime) to a UTC-aware datetime.
+    """
     return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=timezone.utc)
 
 
@@ -210,10 +190,10 @@ class ScatterometerFTPDownloader:
             return []
 
         # If end was a date-only string, expand the matching-window bound to
-        # include the full day (files can be timestamped later than
-        # midnight on the end date). This expanded value is only used for
-        # the file-matching comparison below, never for the recency guard
-        # above, which must use the plain, un-expanded end_dt.
+        # include the full day as files can be timestamped later than midnight
+        # on the end date. Used only for the file-matching comparison below
+        # -- the recency guard above must still use the plain, un-expanded
+        # end_dt.
         is_end_date_only = len(end.strip().rstrip("Z")) == 10  # YYYY-MM-DD
         end_dt_for_matching = end_dt + timedelta(days=1) if is_end_date_only else end_dt
 
@@ -222,10 +202,7 @@ class ScatterometerFTPDownloader:
 
         if self.dry_run:
             # Report real file availability when credentials are already
-            # configured; authenticate_osi_saf_ftp never prompts
-            # interactively (unlike G-Portal's SFTP path) -- it either
-            # resolves credentials or raises RuntimeError immediately, so
-            # there's no interactive-prompt risk to guard against here.
+            # configured, otherwise raises RuntimeError.
             try:
                 username, password = authenticate_osi_saf_ftp(self._username, self._password)
             except RuntimeError:
@@ -294,12 +271,14 @@ class ScatterometerFTPDownloader:
     def _filter_by_orbit_overlap(
         self, matches: list[str], min_lon: float, max_lon: float, min_lat: float, max_lat: float,
     ) -> list[str]:
-        """Drop filenames whose padded sensing window shows no predicted
+        """
+        Drop filenames whose padded sensing window shows no predicted
         orbit overlap with the requested bbox -- see
         orbit_coverage.orbit_overlaps_bbox. Fails open per-file: any
         prediction failure inside orbit_overlaps_bbox itself already
         returns True (never raises), so this method never needs its own
-        try/except."""
+        try/except.
+        """
         from ..core.orbit_coverage import orbit_overlaps_bbox
 
         kept = []

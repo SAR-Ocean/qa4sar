@@ -4,16 +4,14 @@ Copernicus Marine — ADCP moorings, Argo floats, drifters, and gliders.
 
 Data source: INSITU_GLO_PHY_UV_DISCRETE_MY_013_044 — the same parent product
 ``hf_radar_historical_downloader.py`` uses for its ``radar-total`` dataset
-part. Each instrument type here lives under its own sibling dataset_id and,
-unlike the radar-total grid (which is not subsettable server-side — see that
-file's docstring), IS subsettable directly via ``copernicusmarine.subset()``,
-so this downloader follows the same direct output_directory/output_filename
-call shape as ``hf_radar_downloader.py``.
+part. Each instrument type here lives under its own sibling dataset_id and
+is subsettable directly via ``copernicusmarine.subset()``. This downloader 
+follows the same direct output_directory/output_filename call shape as 
+``hf_radar_downloader.py``.
 
-Only EWCT/NSCT (eastward/northward current components) are downloaded, per
-the recipe's request for current-only data from these instruments.
+Only EWCT/NSCT (eastward/northward current components) are downloaded (current-only).
 
-Delayed-mode data typically isn't finalized until 6-24 months after
+Delayed-mode data typically is not finalized until 6-24 months after
 acquisition, so ``download()`` short-circuits (skip + log) for any request
 whose end date is younger than ``_MIN_AGE_DAYS`` (182, ~6 months) — the same
 threshold used by ``hf_radar_historical_downloader``.
@@ -204,12 +202,8 @@ class InSituCurrentsHistoricalDownloader:
         )
 
         if not dest_path.exists():
-            # copernicusmarine.subset() doesn't always write a header-only
-            # CSV for a genuinely empty result -- sometimes it writes no
-            # file at all. This is the same "no data" outcome as the
-            # empty-CSV case just below, not a real failure: treat it the
-            # same way (debug-log, no exception) so the caller's success
-            # path -- and its output-directory cleanup -- still runs.
+            # copernicusmarine.subset() does not write any file in case of 
+            # no data.
             logger.debug(
                 "No %s delayed-mode currents data in [%s, %s]; copernicusmarine "
                 "wrote no output file.",

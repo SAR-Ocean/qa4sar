@@ -4,14 +4,16 @@ Convert validation data to xarray.DataTree format.
 Step 2 of the validation pipeline.
 
 Provides converters for:
-  - SAR L2_OCN data              → standardised Dataset
-  - In-situ CSV (Copernicus)     → point-geometry Dataset (point dim)
-  - Scatterometer NetCDF (ASCAT) → flattened point-geometry Dataset
-  - Altimeter netCDF             → Dataset
-  - Collocated results           → Dataset  (step 4 output)
+  - SAR sources (L2_OCN, CLMS SSM, NISAR SME2, RADARSAT-2)         → standardised Dataset
+  - In-situ CSV (Copernicus Marine, ISMN)                          → point-geometry Dataset (point dim)
+  - Scatterometer / altimeter / radiometer                         → flattened point-geometry Dataset
+  - Satellite soil moisture (ASCAT/H-SAF, AMSR/SMAP/SMOS, C3S CDS) → point-geometry Dataset
+  - HF-radar grid, ERA5, HYCOM                                     → gridded Dataset
+  - Collocated results                                             → Dataset (step 3 output)
 
-And a ``to_datatree()`` helper to assemble multiple Datasets into one
-hierarchical DataTree.
+``convert_downloaded_data()`` dispatches every downloaded source in a
+run's data directory to its matching converter above; ``to_datatree()``
+assembles the resulting Datasets into one hierarchical DataTree.
 """
 
 from __future__ import annotations
@@ -31,12 +33,12 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["DataTreeConverter"]
 
-# OSI-SAF/ASCAT `wvc_quality_flag` bit meanings (see the file's own
-# flag_masks/flag_meanings attrs) that indicate the wind retrieval itself is
-# invalid or contaminated. Wind-vector cells carrying any of these bits are
-# dropped in ``DataTreeConverter.from_scatterometer_nc`` before they ever
-# reach collocation — otherwise they show up as spurious points over land/ice
-# with no (or a bogus) retrieved value.
+# OSI-SAF/ASCAT wvc_quality_flag bits (see the file's own
+# flag_masks/flag_meanings attrs) indicating an invalid or
+# contaminated wind retrieval. Cells carrying any of these bits are
+# dropped in from_scatterometer_nc before reaching collocation, to
+# avoid spurious points over land/ice with no, or a bogus, retrieved
+# value.
 _ASCAT_REJECT_FLAGS = {
     "some_portion_of_wvc_is_over_land",
     "some_portion_of_wvc_is_over_ice",
@@ -47,8 +49,7 @@ _ASCAT_REJECT_FLAGS = {
 
 #: ERA5 variable metadata per recipe variable -- raw CDS/NetCDF short
 #: names, the data_type tag stamped on the result, and CF-ish attrs. Kept
-#: gridded (never flattened to `point`, unlike every other validation
-#: source) since ModelLayerCollocation interpolates it directly onto SAR
+#: gridded since ModelLayerCollocation interpolates it directly onto SAR
 #: pixel locations at collocation time.
 _ERA5_VARS: dict[str, dict] = {
     "wind": {
@@ -95,16 +96,16 @@ def _normalize_era5_grib_coords(ds: xr.Dataset) -> xr.Dataset:
     ``time``/``lat``/``lon`` convention the rest of this converter (and
     ``sar_validation.core.model_collocation``) expects.
 
-    Live-verified 2026-08-07: the CDS API's ``"data_format": "netcdf"``
-    facet for ``reanalysis-era5-single-levels`` (and ``-land``) is actually
-    produced by converting the underlying GRIB message via ``cfgrib``,
-    which names the time dimension ``valid_time`` (not ``time``) and adds
-    two GRIB-bookkeeping coordinates that carry no useful information for a
-    deterministic reanalysis request: ``number`` (ensemble member, always
-    0) and ``expver`` (experiment version, e.g. preliminary ERA5T vs final
-    ERA5). Applied per-file (before any concatenation) so both the
-    single-file and antimeridian-stitched paths through :meth:`from_era5`
-    end up with a consistent ``time`` dim to concatenate/index on.
+    The CDS API's ``"data_format": "netcdf"`` facet for 
+    ``reanalysis-era5-single-levels`` (and ``-land``) is produced by 
+    converting the underlying GRIB message via ``cfgrib``, which names the 
+    time dimension ``valid_time`` (not ``time``) and adds two GRIB-bookkeeping 
+    coordinates that carry no useful information for a deterministic reanalysis 
+    request: ``number`` (ensemble member, always 0) and ``expver`` (experiment 
+    version, e.g. preliminary ERA5T vs final ERA5). Applied per-file (before 
+    any concatenation) so both the single-file and antimeridian-stitched paths 
+    through :meth:`from_era5` end up with a consistent ``time`` dim to 
+    concatenate/index on.
     """
     rename = {}
     if "latitude" in ds.coords:
@@ -138,15 +139,13 @@ def _group_era5_paths_by_day(paths: List[Path]) -> Dict[str, List[Path]]:
 
 def _stitch_antimeridian_window_files(paths: List[Path]) -> Optional[xr.Dataset]:
     """
-    Combine the 2 antimeridian-split window files for one day (see
-    ``ERA5Downloader.download`` / ``split_antimeridian_bbox``) into a
+    Combine the two antimeridian-split window files for one day into a
     single contiguous grid: window 1 (west, originally ``-180..max_lon``)
     has its longitude axis shifted by +360 degrees so it becomes
     numerically continuous with window 0 (east, ``min_lon..180``), then
     the two are concatenated along the longitude dimension.
 
-    The combined lon axis may extend past 180 (e.g. up to 190) -- this is
-    fine, it's a coordinate array, not required to stay within +/-180; SAR
+    The combined lon axis may extend past 180 (e.g. up to 190). SAR
     query longitudes are remapped to match at collocation time (see
     ``model_collocation._normalize_query_lon``).
 
@@ -341,12 +340,11 @@ _ASCAT_RESOLUTION_RE = re.compile(r"-(\d+\.?\d*)km-")
 
 
 def _parse_ascat_resolution_km(filename: str) -> float:
-    """Parse the spatial-sampling resolution (km) embedded in an ASCAT SSM
+    """
+    Parse the spatial-sampling resolution (km) embedded in an ASCAT SSM
     filename -- H-SAF's H29 ("-12.5km-") and H122 ("-6.25km-") filenames
-    both embed it; EUMDAC/SOMO12 filenames never do (confirmed against
-    ascat_soil_moisture_downloader.py's real filename example), so this
-    falls back to 12.5 (SOMO12's own, and H29's, shared resolution) when
-    no match is found.
+    both embed it; EUMDAC/SOMO12 filenames never do, falling back to 12.5
+    (SOMO12's own, and H29's, shared resolution) when no match is found.
     """
     m = _ASCAT_RESOLUTION_RE.search(filename)
     if not m:
@@ -358,7 +356,9 @@ def _parse_ascat_resolution_km(filename: str) -> float:
 
 
 class DataTreeConverter:
-    """Convert various data formats to standardised xarray objects."""
+    """
+    Convert various data formats to standardised xarray objects.
+    """
 
     # ------------------------------------------------------------------
     # Step 2 converters
@@ -404,8 +404,7 @@ class DataTreeConverter:
         )
         raw = raw.squeeze("band", drop=True)
 
-        # CLMS SSM decoding — confirmed against a real downloaded product's
-        # embedded GDAL tags: scale_factor=0.5, add_offset=0.0, units="%",
+        # CLMS SSM decoding: scale_factor=0.5, add_offset=0.0, units="%",
         # flag_values={241,242,251,252,253} (ExceedingMin/ExceedingMax/
         # WaterMask/SensitivityMask/SlopeMask QC flags, masked to NaN like
         # real no-data — these are specific reserved DNs, not a range).
@@ -426,7 +425,7 @@ class DataTreeConverter:
                 "time": _parse_ssm_timestamp(tif_path.name),
             },
         )
-        apply_cf_metadata(ds, "sar", {
+        apply_cf_metadata(ds, "sentinel1_clms_ssm", {
             "sarSSM": {"long_name": "Sentinel-1 CLMS surface soil moisture (percent saturation)", "units": "%"},
         })
         ds.attrs["data_type"] = "sar_l3_ssm"
@@ -442,11 +441,9 @@ class DataTreeConverter:
         and SAR L2_OCN products use, so it reuses the existing
         grid-collocation path unchanged.
 
-        Confirmed 2026-07-31 against a real downloaded granule
-        (``NISAR_L3_PR_SME2_003_005_A_014_..._001.h5``): ``soilMoisture``
-        (float32, meter^3/meter^3, CF-1.7 dataset attrs including its own
-        ``_FillValue``) lives directly under ``science/LSAR/SME2/grids`` --
-        *not* a ``frequencyA`` subgroup. (A ``grids/radarData/frequencyA``
+        In NISAR SME2 granules, ``soilMoisture`` (float32, meter^3/meter^3, 
+        CF-1.7 dataset attrs including its own ``_FillValue``) lives 
+        directly under ``science/LSAR/SME2/grids``. (A ``grids/radarData/frequencyA``
         subgroup does exist, but only holds backscatter/sigma0 fields, no
         soil moisture.) ``latitude``/``longitude`` are 1-D EASE-grid axis
         arrays, not a 2-D meshgrid -- meshed into ``(y, x)`` coords below,
@@ -519,7 +516,7 @@ class DataTreeConverter:
                 "time": time_val,
             },
         )
-        apply_cf_metadata(ds, "sar", {
+        apply_cf_metadata(ds, "nisar_sme2", {
             "sarSSM": {
                 "long_name": "NISAR SME2 (beta) surface soil moisture",
                 "units": "m3 m-3",
@@ -543,25 +540,14 @@ class DataTreeConverter:
         Wind SPEED only (``owiWindSpeed``, from ``sar_wind``) -- this
         product's ``input_dir`` field is the NWP model direction fed into
         the CMOD wind-inversion, not an independent SAR retrieval, so no
-        ``owiWindDirection`` is produced (see design-choices.md Sec 10).
+        ``owiWindDirection`` is produced.
 
-        Land/ice/quality masking confirmed 2026-08-05 against a real
-        downloaded granule (SAR-Wind-HH-64N-174E_v3r0_rsat2_...): the
-        file's own ``pixel_level_quality_flags`` == 5 ("valid wind in
+        The file's own ``pixel_level_quality_flags`` == 5 ("valid wind in
         valid water region") is the strict, authoritative validity
         criterion (matches the file's own
-        ``quality_information.total_number_of_valid_water_pixels``
-        exactly, 63,810 pixels). ``mask``/``icemask`` alone are **not**
-        a substitute for it when it's available: ``mask == -1`` (water)
-        AND ``icemask == 1`` (water) alone keeps 115,267 pixels on that
-        same file -- 51,457 more than flag 5, including flag-0 cells
-        where ``sar_wind`` is a fill-like 0.0 and flag-4 "valid in
-        buffer region" lower-confidence retrievals. ``pixel_level_quality_flags``
-        does not exist in the old filename era (confirmed live against a
-        2019 granule), so this method uses it directly when present, and
-        falls back to ``mask == -1 AND icemask == 1`` only when it's
-        absent -- a documented, era-specific approximation, not claimed
-        equivalent to the new era's precision.
+        ``quality_information.total_number_of_valid_water_pixels``. 
+        ``mask``/``icemask`` are only used when ``pixel_level_quality_flags`` 
+        is absent.
 
         Parameters
         ----------
@@ -600,19 +586,12 @@ class DataTreeConverter:
 
             if "pixel_level_quality_flags" in ds_raw:
                 # New filename era only. Flag 5 = "valid wind in valid
-                # water region" -- the strict, authoritative criterion
-                # (matches quality_information.total_number_of_valid_water_pixels
-                # exactly). mask/icemask alone are NOT a substitute: they
-                # let through ~51k extra pixels this flag correctly
-                # excludes (fill-like flag-0 cells, lower-confidence
-                # flag-4 "buffer region" retrievals) -- confirmed live,
-                # see design-choices.md Sec 10.
+                # water region".
                 valid = ds_raw["pixel_level_quality_flags"].values == 5
             else:
-                # Old filename era: pixel_level_quality_flags doesn't
-                # exist. mask/icemask are the best available signal -- a
-                # documented approximation, slightly more permissive than
-                # the new era's flag-based criterion.
+                # Old filename era: pixel_level_quality_flags does not
+                # exist. mask/icemask are the best available option 
+                # (more permissive than the new era's flag-based criterion).
                 mask = ds_raw["mask"].values
                 icemask = ds_raw["icemask"].values
                 valid = (mask == -1) & (icemask == 1)
@@ -638,7 +617,7 @@ class DataTreeConverter:
                     "time": acq_time_ns,
                 },
             )
-            apply_cf_metadata(ds, "sar", {
+            apply_cf_metadata(ds, "radarsat2", {
                 "owiWindSpeed": {
                     "long_name": "RADARSAT-2 SAR-derived wind speed at 10-m height neutral stability",
                     "units": "m s-1",
@@ -752,16 +731,11 @@ class DataTreeConverter:
         # A single in-situ platform can report more than one significant
         # wave height estimate in the same row -- VHM0 (spectral Hm0) and
         # VAVH (time-domain H1/3) are independently-computed, non-identical
-        # quantities (confirmed live 2026-08-10: mooring 6200442 reported
-        # VAVH=1.0 and VHM0=1.1 for the same reading), and CMEMS's
-        # long-format export pivots each into its own column above. Left
-        # as-is, that one physical observation would land in BOTH the
-        # VAVH-paired (altimeter) and VHM0-paired (ERA5) report sections --
-        # double-counting a single match across two comparisons. Keep only
-        # the highest-precedence column per row (VHM0 > VAVH > VGHS,
-        # matching _variable_map.py's own wave_val_params fallback order)
-        # and null the rest, so each observation contributes to exactly one
-        # comparison; a row reporting only one of them is untouched.
+        # quantities, and CMEMS's long-format export pivots each into its 
+        # own column above. Keep only the highest-precedence column per row 
+        # (VHM0 > VAVH > VGHS, matching _variable_map.py's own wave_val_params 
+        # fallback order) and null the rest, so each observation contributes 
+        # to exactly one comparison; a row reporting only one of them is untouched.
         wave_height_cols = [c for c in ("VHM0", "VAVH", "VGHS") if c in df.columns]
         if len(wave_height_cols) > 1:
             claimed = pd.Series(False, index=df.index)
@@ -798,7 +772,9 @@ class DataTreeConverter:
             platform_type = np.array([source_type] * len(df))
 
         def _to_numpy(arr):
-            """Convert pandas extension arrays (e.g. StringDtype) to numpy object."""
+            """
+            Convert pandas extension arrays (e.g. StringDtype) to numpy object.
+            """
             if hasattr(arr, "dtype") and not isinstance(arr.dtype, np.dtype):
                 return arr.astype(object)
             return arr
@@ -1162,9 +1138,7 @@ class DataTreeConverter:
         # ------------------------------------------------------------------
         # Drop wind-vector cells whose quality flag marks the retrieval as
         # invalid (over land/ice, failed inversion, etc.) — see
-        # ``_ASCAT_REJECT_FLAGS``. Without this, such cells still end up as
-        # collocated validation points with a bogus or missing value, often
-        # sitting on land.
+        # ``_ASCAT_REJECT_FLAGS``. 
         # ------------------------------------------------------------------
         n_points_raw = n_points
         keep_mask = np.ones(n_points_raw, dtype=bool)
@@ -1322,14 +1296,6 @@ class DataTreeConverter:
         .nc/.bfr/.nat — see ``ascat.eumetsat.level2.AscatL2File``) and
         return a standardised Dataset with a flat ``point`` dimension.
 
-        CONFIRMED against a real downloaded product: a genuine
-        ``EO:EUM:DAT:METOP:SOMO12`` ``.nat`` file (METOP-B, 2024-01-02)
-        fetched via EUMDAC was read successfully by ``AscatL2File(...).read(
-        generic=True, to_xarray=True)``, yielding generic ``sm``/``lon``/
-        ``lat``/``time`` fields as assumed below; the resulting
-        ``SOIL_MOISTURE`` values fell in the expected 0-100 (percent
-        saturation) range across 26789 points.
-
         Parameters
         ----------
         path : str or Path
@@ -1400,10 +1366,9 @@ class DataTreeConverter:
         Unlike the EUMDAC/SOMO12 path (from_ascat_ssm, via the ``ascat``
         package's WARP5-grid-aware reader), H29 files ship a flat
         ``(obs,)`` array with ``latitude``/``longitude``/``time`` already
-        resolved to real per-observation coordinates -- CONFIRMED against
-        a real downloaded file (see hsaf_downloader.py's module
-        docstring): no grid-point-ID lookup is needed, so this reads the
-        file directly with xarray rather than routing through ``ascat``.
+        resolved to real per-observation coordinates: no grid-point-ID 
+        lookup is needed, so this reads the file directly with xarray 
+        rather than routing through ``ascat``.
 
         Parameters
         ----------
@@ -1472,41 +1437,26 @@ class DataTreeConverter:
         layout:
 
         - **JAXA G-Portal L3SGSMC** (L3 daily 0.1-degree global grid;
-          what :class:`~sar_validation.downloaders.gportal_downloader.
-          GPortalAMSR2Downloader` actually delivers -- ``GW1AM2_
-          YYYYMMDD_01D_EQM[AD]_L3SGSMCHF*.h5``) -- detected via root-level
-          ``Geophysical Data``/``Time Information`` datasets and delegated
-          to :meth:`_from_amsr_ssm_gportal_l3_grid`. **Confirmed against a
-          real downloaded granule** (GW1AM2_20250701_01D_EQMA_
-          L3SGSMCHF3300300.h5) -- this is the format actually seen in
-          practice; the NSIDC-0451 branch below has not been.
+        what :class:`~sar_validation.downloaders.gportal_downloader.
+        GPortalAMSR2Downloader` delivers -- ``GW1AM2_YYYYMMDD_01D_
+        EQM[AD]_L3SGSMCHF*.h5``) -- detected via root-level
+        ``Geophysical Data``/``Time Information`` datasets and delegated
+        to :meth:`_from_amsr_ssm_gportal_l3_grid`.
         - **NSIDC-0451** (L3 daily global grid; used for dates on or
-          before 2023-12-31, per the orchestrator's ``_NSIDC_0451_CUTOFF``)
-          -- handled below.
-        - **AU_Land_NRT_R02**/**AU_Land** (L2B half-orbit granule,
-          HDF-EOS5 POINTS layout -- not SWATHS, despite the product's own
-          "half-orbit swath" description; the historical-coverage-
-          extension replacement for NSIDC-0451, used for dates after that
-          cutoff) -- detected via the presence of an ``HDFEOS/POINTS``
-          group and delegated to :meth:`_from_amsr_ssm_au_land_points`.
-          **Confirmed against a real downloaded granule**
-          (AMSR_U2_L2_Land_B02_202312312326_D.he5) -- the field layout
-          guessed before that (a ``SWATHS`` group with separate named
-          datasets) does not match any real granule and always fell
-          through to the "Missing vsm/longitude/latitude field(s)"
-          warning below.
+        before 2023-12-31, per the orchestrator's ``_NSIDC_0451_CUTOFF``)
+        -- handled below.
+        - **AU_Land** (L2B half-orbit granule, HDF-EOS5 POINTS layout --
+        not SWATHS, despite the product's own "half-orbit swath"
+        description; the historical-coverage-extension replacement for
+        NSIDC-0451, used for dates after that cutoff) -- detected via
+        the presence of an ``HDFEOS/POINTS`` group and delegated to
+        :meth:`_from_amsr_ssm_au_land_points`.
 
-        Field names for the NSIDC-0451 branch are assumed from the
-        NSIDC-0451 v3.1 technical readme: ``vsm`` (surface, <=2cm,
-        volumetric soil moisture, X-band 10.7 GHz), ``longitude``/
-        ``latitude`` as flat root-level datasets, plus a
-        ``time_coverage_start`` file attribute. This has not been confirmed
-        against a real downloaded file (see the plan's open items) -- if
-        the real product nests these under a group (e.g.
-        ``/Data Fields/vsm``), the ``f["vsm"]``/``f["longitude"]``/
-        ``f["latitude"]`` lookups below will need updating.
-        NSIDC-0451 uses -9999.0 as its fill value (not NaN) -- cells equal
-        to this value are dropped.
+        NSIDC-0451 fields: ``vsm`` (surface, <=2cm, volumetric soil
+        moisture, X-band 10.7 GHz), ``longitude``/``latitude`` as flat
+        root-level datasets, plus a ``time_coverage_start`` file
+        attribute. Fill value is -9999.0 (not NaN); cells equal to this
+        value are dropped.
 
         Parameters
         ----------
@@ -1581,29 +1531,18 @@ class DataTreeConverter:
     @staticmethod
     def _from_amsr_ssm_au_land_points(f: Any, path: Path) -> Optional[xr.Dataset]:
         """
-        Parse an ``AU_Land``/``AU_Land_NRT_R02`` L2B half-orbit granule
-        (HDF-EOS5 format) -- the historical-coverage-extension replacement
-        for the fully-discontinued NSIDC-0451 L3 daily grid.
+        Parse an ``AU_Land`` L2B half-orbit granule (HDF-EOS5 format) -- the
+        historical-coverage-extension replacement for the discontinued
+        NSIDC-0451 L3 daily grid.
 
-        **Confirmed against a real downloaded granule**
-        (AMSR_U2_L2_Land_B02_202312312326_D.he5, fetched live 2026-08-07):
-        despite the product's own "half-orbit swath" description, its
-        real on-disk layout is HDF-EOS5's POINTS structure, not SWATHS --
-        a single compound (structured) dataset at
-        ``HDFEOS/POINTS/AMSR-2 Level 2 Land Data/Data/Combined NPD and SCA
-        Output Fields``, whose named fields include ``Time``,
-        ``Latitude``, ``Longitude``, and -- per NSIDC's collection
-        abstract -- two independent, co-equal soil-moisture retrievals
-        with no stated "primary" one: ``SoilMoistureNPD`` (Normalized
-        Polarization Difference) and ``SoilMoistureSCA`` (Single Channel
-        Algorithm), each with its own ``RetrievalQualityFlag{NPD,SCA}``.
-        NPD is used here (see design-choices.md) since it matches the
-        algorithm NSIDC-0451, this product's predecessor, used
-        exclusively. ``Time`` is seconds since 1993-01-01T00:00:00 (TAI93
-        convention, common to NASA/JAXA AMSR products) -- confirmed
-        numerically live, not seconds since the Unix epoch. -9999.0 is
-        the fill value for both the soil-moisture and QC fields (same
-        convention as the NSIDC-0451 branch above).
+        Despite the product's "half-orbit swath" description, its on-disk
+        layout is HDF-EOS5's POINTS structure, not SWATHS: a compound dataset
+        at ``HDFEOS/POINTS/AMSR-2 Level 2 Land Data/Data/Combined NPD and SCA
+        Output Fields`` with fields ``Time``, ``Latitude``, ``Longitude``, and
+        two soil-moisture retrievals, ``SoilMoistureNPD`` and
+        ``SoilMoistureSCA``. NPD is used here to match NSIDC-0451's own
+        algorithm. ``Time`` is TAI93 (seconds since 1993-01-01T00:00:00), not
+        Unix epoch. Fill value is -9999.0, as in the NSIDC-0451 branch above.
         """
         try:
             data = f["HDFEOS/POINTS/AMSR-2 Level 2 Land Data/Data/Combined NPD and SCA Output Fields"][:]
@@ -1636,7 +1575,7 @@ class DataTreeConverter:
             sm[valid].astype(float), lon[valid].astype(float), lat[valid].astype(float), time_vals.values,
             data_type="radiometer_ssm", var_attrs=var_attrs,
             platform_type="amsr_ssm", sensor="amsr",
-            source="AMSR-E/AMSR2 Unified L2B Half-Orbit SSM (AU_Land/AU_Land_NRT_R02)",
+            source="AMSR-E/AMSR2 Unified L2B Half-Orbit SSM (AU_Land)",
             sensing_depth_cm="0-1", band="X/Ka", filename=path.name,
         )
 
@@ -1645,25 +1584,20 @@ class DataTreeConverter:
         """
         Parse a JAXA G-Portal AMSR2 L3 daily 0.1-degree global soil-moisture
         grid (``GW1AM2_YYYYMMDD_01D_EQM[AD]_L3SGSMCHF*.h5``) -- the format
-        actually delivered by :class:`~sar_validation.downloaders.
-        gportal_downloader.GPortalAMSR2Downloader`, distinct from both the
-        NSIDC-0451 grid and the AU_Land swath formats above.
+        delivered by :class:`~sar_validation.downloaders.gportal_downloader.
+        GPortalAMSR2Downloader`, distinct from both the NSIDC-0451 grid and
+        the AU_Land swath formats above.
 
-        **Confirmed against a real downloaded granule**
-        (GW1AM2_20250701_01D_EQMA_L3SGSMCHF3300300.h5): ``Geophysical
-        Data`` is a root-level ``(1800, 3600, 1)`` int16 dataset (its
-        ``SCALE FACTOR``/``UNIT`` attrs give raw*0.1 = percent volumetric
-        soil moisture -- confirmed by its own ``GeophysicalName`` file
-        attribute, "Soil Moisture Content"); ``Time Information`` is a
-        sibling ``(1800, 3600)`` int16 dataset in minutes-since-00:00-UTC
-        of the granule's date (consistent with the file's own
-        ``ObservationStartDateTime``/``ObservationEndDateTime`` attrs).
-        There are no on-disk longitude/latitude fields -- the grid is a
-        fixed global 0.1 degree EQR grid (JAXA GCOM-W's standard L3 grid
-        definition): row 0 = 89.95 N downward, column 0 = -179.95 E
+        ``Geophysical Data`` is a root-level ``(1800, 3600, 1)`` int16
+        dataset; its ``SCALE FACTOR``/``UNIT`` attrs give raw*0.1 = percent
+        volumetric soil moisture. ``Time Information`` is a sibling
+        ``(1800, 3600)`` int16 dataset, in minutes since 00:00 UTC of the
+        granule's date. There are no on-disk longitude/latitude fields -- the
+        grid is a fixed global 0.1-degree EQR grid (JAXA GCOM-W's standard L3
+        grid definition): row 0 = 89.95N downward, column 0 = -179.95E
         eastward. ``-32768``/``-32767`` are sentinel codes (no-retrieval /
-        missing-observation respectively, not physical readings) -- any
-        negative raw value is treated as invalid.
+        missing-observation), not physical readings; any negative raw value
+        is treated as invalid.
         """
         try:
             sm_raw = np.asarray(f["Geophysical Data"][:, :, 0], dtype=np.int32)
@@ -1676,7 +1610,7 @@ class DataTreeConverter:
             return None
 
         # Both the reading and its per-pixel observation time must be valid
-        # -- a soil-moisture value collocation can't use without a real
+        # -- a soil-moisture value collocation cannot use without a real
         # timestamp is as useless as no reading at all, and pushing NaT
         # handling downstream into collocation's temporal-distance math
         # would be fragile. ~15% of otherwise-valid-sm cells in the
@@ -1731,19 +1665,15 @@ class DataTreeConverter:
         (SPL2SMP_E, HDF5) and return a standardised Dataset with a flat
         ``point`` dimension.
 
-        CONFIRMED against a real downloaded product
-        (``SMAP_L2_SM_P_E_55665_A_20250703T162602_R19240_001.h5``): fields
-        do live under the ``Soil_Moisture_Retrieval_Data`` HDF5 group as
+        Fields live under the ``Soil_Moisture_Retrieval_Data`` HDF5 group as
         ``soil_moisture``, ``longitude``, ``latitude``, ``tb_time_utc``
         (per-cell ISO-8601 timestamp string), and ``soil_moisture`` uses
-        -9999.0 as its fill value (not NaN). Resulting SOIL_MOISTURE range
-        for that file: 0.02-0.79 m3/m3 (116711 of 264701 cells retained).
+        -9999.0 as its fill value (not NaN).
 
-        ``tb_time_utc`` carries its OWN, independent fill convention:
-        confirmed 118 of 264701 cells in that same file used a literal
-        ``"***"`` placeholder for the fractional-seconds digits (e.g.
-        ``"2025-07-03T17:19:25.***Z"``), at cells where ``soil_moisture``
-        itself was otherwise valid -- a strict ``pd.to_datetime`` on these
+        ``tb_time_utc`` carries its own, independent fill convention:
+        some cells use a literal ``"***"`` placeholder for the fractional
+        seconds digits (e.g. ``"2025-07-03T17:19:25.***Z"``), at cells where 
+        ``soil_moisture`` itself is valid -- a strict ``pd.to_datetime`` on these
         raises ``ValueError`` and aborts the whole conversion. Parsed with
         ``errors="coerce"`` instead (turning unparseable strings into
         ``NaT``) and dropped via the same validity mask as the
@@ -1796,8 +1726,7 @@ class DataTreeConverter:
         # tb_time_utc carries its own, independent fill convention: some
         # cells use a literal "***" placeholder for the fractional-seconds
         # digits (e.g. "2025-07-03T17:19:25.***Z") even when soil_moisture
-        # itself is valid at that cell -- confirmed against a real
-        # downloaded SPL2SMP_E granule (118 of 264701 cells). errors="coerce"
+        # itself is valid at that cell. errors="coerce"
         # turns those into NaT rather than raising, so they can be dropped
         # via the same validity mask as the -9999.0 soil_moisture fill.
         time_strs = [
@@ -1843,23 +1772,18 @@ class DataTreeConverter:
         SM_OPER_MIR_SMUDP2, NetCDF) and return a standardised Dataset with
         a flat ``point`` dimension.
 
-        CONFIRMED against a real downloaded product (fetched via the OADS
-        portal, NRT_Open/MIR_SMNRT2, 2025-07-02): field names are
-        **lowercase** (``soil_moisture``/``longitude``/``latitude``), NOT
-        the capitalised names originally assumed here. There is also no
-        single ``time`` variable -- per-point acquisition time is instead
-        split across two integer fields, ``days_since_01-01-2000`` (days
-        since the SMOS epoch 2000-01-01T00:00:00) and
-        ``seconds_since_midnight`` (seconds within that day), combined
-        below. Confirmed the real product is plain NetCDF at the top level
-        (no ``.tgz``/``.HDR`` extraction needed).
+        Field names are lowercase (``soil_moisture``/``longitude``/
+        ``latitude``). There is no single ``time`` variable -- per-point
+        acquisition time is instead split across two integer fields,
+        ``days_since_01-01-2000`` (days since the SMOS epoch
+        2000-01-01T00:00:00) and ``seconds_since_midnight`` (seconds within
+        that day), combined below. The product is plain NetCDF at the top
+        level; no ``.tgz``/``.HDR`` extraction is needed.
 
-        Confirmed soil_moisture has no ``-999.0``-style fill sentinel in
-        real data (a full real granule's min/max were both plain physical
-        values in ``[0, 1]``, no NaN) -- validity is primarily via
-        ``~np.isnan`` (matching whatever fill/missing-value decoding
-        ``xr.open_dataset``'s default ``mask_and_scale=True`` already
-        applied), with the ``-999.0`` check kept alongside it only as
+        ``soil_moisture`` has no ``-999.0``-style fill sentinel in practice;
+        validity is primarily via ``~np.isnan`` (matching the fill/missing-
+        value decoding ``xr.open_dataset``'s default ``mask_and_scale=True``
+        already applies), with the ``-999.0`` check kept alongside it only as
         cheap, harmless insurance in case some other file/swath does use
         that sentinel.
 
@@ -2087,13 +2011,13 @@ class DataTreeConverter:
         nc_paths: Union[str, Path, Sequence[Union[str, Path]]],
     ) -> Optional[xr.Dataset]:
         """
-        Open one or more HyCOM segment NetCDF files (as downloaded by
+        Open one or more HYCOM segment NetCDF files (as downloaded by
         :class:`~sar_validation.downloaders.hycom_downloader.HycomDownloader`)
         and return one combined, GRIDDED Dataset (dims: ``time``, ``lat``,
         ``lon``) covering every requested segment.
 
         Unlike every other validation-source converter (except
-        :meth:`from_era5`), the result is NOT flattened to a ``point``
+        :meth:`from_era5`), the result is not flattened to a ``point``
         dimension -- ``ModelLayerCollocation`` interpolates this grid
         directly onto SAR pixel/point locations at collocation time.
 
@@ -2107,7 +2031,7 @@ class DataTreeConverter:
         Parameters
         ----------
         nc_paths : Path or list of Path
-            One or more HyCOM segment NetCDF files. Multiple files (e.g.
+            One or more HYCOM segment NetCDF files. Multiple files (e.g.
             a recipe window straddling the ESPC-D-V02/GOFS 3.1 cutover)
             are concatenated along ``time``.
 
@@ -2126,27 +2050,21 @@ class DataTreeConverter:
         try:
             per_file = [xr.open_dataset(p) for p in existing]
             raw = per_file[0] if len(per_file) == 1 else xr.concat(per_file, dim="time")
-            # `existing` is sorted ALPHABETICALLY by filename (above), not
-            # chronologically -- HyCOM segment filenames embed the dataset
-            # key right after the "hycom_" prefix ("hycom_espc_d_v02_..."
-            # vs "hycom_gofs31_930_..."), so a straddling-cutover window's
-            # ESPC-D-V02 file ('e' < 'g') sorts BEFORE its GOFS 3.1 file
-            # even though ESPC-D-V02 is always the chronologically LATER
-            # segment (only ever used at/after _HYCOM_CUTOVER_DATE -- see
-            # hycom_downloader.py). xr.concat does not sort its inputs, so
-            # without this the resulting time axis goes forward then jumps
-            # backward at the cutover -- non-monotonic, which
-            # model_collocation.py's np.searchsorted-based bracket search
-            # has no correct behaviour for. sortby (not just a pre-sorted
-            # `existing`) establishes the genuine invariant regardless of
-            # input order, mirroring from_era5's own `sortby("lat")` fix
-            # for CDS's descending latitude (see that method).
+            # `existing` is sorted alphabetically by filename, not chronologically:
+            # HYCOM segment filenames embed the dataset key right after the
+            # "hycom_" prefix ("hycom_espc_d_v02_..." vs "hycom_gofs31_930_..."),
+            # so a straddling-cutover window's ESPC-D-V02 file sorts before its
+            # GOFS 3.1 file ('e' < 'g') even though ESPC-D-V02 is always the
+            # chronologically later segment. xr.concat does not sort its inputs,
+            # so without an explicit sortby the resulting time axis would be
+            # non-monotonic, which model_collocation.py's searchsorted-based
+            # bracket search has no correct behaviour for.
             raw = raw.sortby("time")
             raw = raw.load()
             for d in per_file:
                 d.close()
         except Exception as exc:
-            logger.warning("Could not open HyCOM file(s) %s: %s", paths, exc)
+            logger.warning("Could not open HYCOM file(s) %s: %s", paths, exc)
             return None
 
         missing = [v for v in ("water_u", "water_v") if v not in raw.variables]
@@ -2161,12 +2079,12 @@ class DataTreeConverter:
         ewct = raw["water_u"].astype("float32")
         ewct.attrs.update({
             "units": "m s-1", "standard_name": "eastward_sea_water_velocity",
-            "long_name": "HyCOM eastward sea water velocity (surface)",
+            "long_name": "HYCOM eastward sea water velocity (surface)",
         })
         nsct = raw["water_v"].astype("float32")
         nsct.attrs.update({
             "units": "m s-1", "standard_name": "northward_sea_water_velocity",
-            "long_name": "HyCOM northward sea water velocity (surface)",
+            "long_name": "HYCOM northward sea water velocity (surface)",
         })
 
         ds = xr.Dataset(
@@ -2175,7 +2093,7 @@ class DataTreeConverter:
         )
         ds.attrs["data_type"] = "hycom"
         ds.attrs["platform_type"] = "hycom"
-        ds.attrs["source"] = "HyCOM ocean model (surface currents)"
+        ds.attrs["source"] = "HYCOM ocean model (surface currents)"
         raw.close()
         return ds
 
@@ -2190,7 +2108,7 @@ class DataTreeConverter:
         and return one combined, GRIDDED Dataset (dims: ``time``, ``lat``,
         ``lon``) covering every requested day.
 
-        Unlike every other validation-source converter, the result is NOT
+        Unlike every other validation-source converter, the result is not
         flattened to a ``point`` dimension -- the whole point of ERA5's
         collocation method (bilinear spatial + nearest-hour/hyperbolic
         temporal interpolation, see
@@ -2224,7 +2142,7 @@ class DataTreeConverter:
             return None
 
         # xr.open_mfdataset requires the optional `dask` package, which
-        # isn't a dependency of this project -- open each daily file
+        # is not a dependency of this project -- open each daily file
         # individually and concatenate along time instead, matching how
         # the rest of this codebase (e.g. from_c3s_ssm) avoids that
         # dependency.
@@ -2247,7 +2165,7 @@ class DataTreeConverter:
             # e.g. 60.25, 60.00, ..., 34.75) -- model_collocation.py's
             # build_spatial_interpolator (a scipy RegularGridInterpolator)
             # requires a monotonic axis, and this toolbox relies on it
-            # actually being ASCENDING (see that function's docstring).
+            # actually being ascending (see that function's docstring).
             # scipy >= 1.10 also accepts descending axes transparently, so
             # this worked "by luck" on newer scipy -- sortby establishes a
             # genuinely ascending axis regardless of scipy version.
@@ -2283,49 +2201,29 @@ class DataTreeConverter:
             data_vars[var] = da
 
         # Rename/derive to the canonical val_var codes _variable_map.py's
-        # VARIABLE_PAIRS (and therefore statistics.py/visualization.py)
-        # expect -- every OTHER wind/waves/soil_moisture validation source
-        # is renamed to these same codes at conversion time (see e.g.
-        # from_scatterometer_nc's WSPD/WDIR rename, from_radiometer_bytemap's
-        # WindSat rotation). ERA5's raw CDS short names (swh, swvl1) never
-        # matched them, so run_statistics() silently produced zero rows for
-        # every era5_waves/era5_soil_moisture source -- confirmed against a
-        # live CDS run 2026-08-07 (wind_era5.yaml: "no statistics produced").
+        # VARIABLE_PAIRS expect. Every other wind/waves/soil_moisture 
+        # validation source is renamed to these same codes at conversion 
+        # time (see e.g. from_scatterometer_nc's WSPD/WDIR rename).
         #
-        # Wind is the one deliberate exception: u10/v10 are kept as raw
-        # components here, NOT renamed/derived into WSPD/WDIR. WDIR is a
-        # CIRCULAR quantity, and this Dataset is exactly what gets
-        # bilinearly-spatially / hyperbolically-temporally interpolated at
-        # collocation time (see model_collocation.py) -- interpolating an
-        # already-derived direction as an ordinary linear scalar produces
-        # wrong answers whenever the true value crosses the 0/360 seam
-        # (e.g. blending 359 and 1 degrees naively yields ~180, not ~0).
-        # model_collocation.py's `_derive_wind_wspd_wdir` instead derives
-        # WSPD/WDIR from the FINAL, already-interpolated u10/v10 values,
-        # after collocation -- so the eventual val_data/
-        # collocation_results.nc output still ends up with the same
-        # WSPD/WDIR columns every other wind validation source produces,
-        # just computed at the right time. This is the one exception to
-        # §2's "renamed at conversion time" invariant -- see
-        # docs/design-choices.md §2 ("Canonical variable naming") and §5.7
-        # ("ERA5 model validation").
+        # Wind is the one exception: u10/v10 are kept as raw components, not
+        # renamed/derived into WSPD/WDIR. WDIR is a circular quantity, and 
+        # interpolating an already-derived direction as an ordinary linear
+        # scaler produces wrong answers wherever the true value crosses the
+        # 0/360 seam. model_collocation.py's `_derive_wind_wspd_wdir` instead 
+        # derives WSPD/WDIR from the final, already-interpolated u10/v10 values,
+        # after collocation.
         if variable == "waves":
             data_vars = {"VHM0": data_vars["swh"]}
         elif variable == "soil_moisture":
             data_vars = {"SOIL_MOISTURE": data_vars["swvl1"]}
 
-        # land_sea_mask ("lsm" on the wire, requested only for wind -- see
-        # era5_downloader.py's _CDS_VARIABLE_NAMES_BY_VARIABLE) is a
-        # per-cell land-mask LOOKUP, not a per-hour model quantity to
-        # interpolate/report at collocation points. It's kept as a
-        # non-dimension COORDINATE (not a data_var), which means every
-        # downstream consumer that iterates `era5_ds.data_vars`
-        # (_model_values_at_points, _collocate_cell_averaging_grid in
-        # sar_validation.core.model_collocation) already skips it
-        # automatically -- it never leaks into val_data as a spurious
-        # val_lsm statistics column. Collapsed from (time, lat, lon) to
-        # (lat, lon) since it's time-invariant in reality (the CDS API
-        # just echoes the same value at every requested hour).
+        # land_sea_mask ("lsm" on the wire, requested only for wind) is a
+        # per-cell land-mask lookup, not a per-hour model quantity to
+        # interpolate/report at collocation points. Kept as a
+        # non-dimension coordinate (not a data_var), so it never leaks 
+        # into val_data as a spurious `val_lsm` statistics column. Collapsed 
+        # from (time, lat, lon) to (lat, lon) since it is time-invariant 
+        # (the CDS API just echoes the same value at every requested hour).
         lsm_2d = None
         if variable == "wind" and "lsm" in raw.variables:
             lsm_da = raw["lsm"].astype("float32")
@@ -2563,10 +2461,8 @@ class DataTreeConverter:
         (ascending / descending) per file and a per-cell measurement ``time``.
         This method flattens every (pass, lat, lon) cell to a point, keeps the
         cells with a valid wind retrieval, and renames the chosen wind-speed
-        variable (see :data:`_RADIOMETER_WSPD_VARS`) to the canonical ``WSPD``
-        code so radiometer wind lands in the same wind comparison as the
-        in-situ, scatterometer and altimeter sources. **No change to
-        ``_variable_map.py`` is needed.**
+        variable to the canonical ``WSPD`` code so radiometer wind lands in the
+        same wind comparison as the in-situ, scatterometer and altimeter sources. 
 
         The node is tagged with ``sensor`` (e.g. ``"amsr2"``) so collocation
         can look up a per-sensor spec (``radiometer_<sensor>``).
@@ -3022,7 +2918,7 @@ class DataTreeConverter:
 
                 # Wave height to validate against VHM0 = the product's
                 # integrated total significant wave height (oswTotalHs), which
-                # combines all wave systems. This is NOT the same as an
+                # combines all wave systems. This is not the same as an
                 # individual oswHs partition (oswHs holds one Hs per partition),
                 # and it is not the root-sum-square of the partitions either —
                 # it is integrated from the full spectrum. If a (legacy)
@@ -3089,7 +2985,7 @@ class DataTreeConverter:
         }
 
         ds = xr.Dataset(data_vars, coords=coords)
-        apply_cf_metadata(ds, "sar", osw_attrs)
+        apply_cf_metadata(ds, "sar_osw", osw_attrs)
         ds.attrs["data_type"] = "sar_l2_ocn"
         ds.attrs["source"] = "Sentinel-1"
         ds.attrs["safe_dir"] = safe_dir.name
@@ -3163,7 +3059,7 @@ class DataTreeConverter:
 
                 # RVL is 3-D (rvlAzSize, rvlRaSize, rvlSwath) for multi-swath
                 # modes (IW/EW). Concatenate the sub-swaths side by side along
-                # the range axis so the grid keeps EVERY sub-swath — slicing
+                # the range axis so the grid keeps every sub-swath — slicing
                 # [:, :, 0] would silently drop all but the first swath
                 # (4 of 5 for EW, 2 of 3 for IW). Single-swath products (SM)
                 # are already 2-D and pass through.
@@ -3266,7 +3162,7 @@ class DataTreeConverter:
                 }
 
                 ds = xr.Dataset(data_vars, coords=coords)
-                apply_cf_metadata(ds, "sar", {
+                apply_cf_metadata(ds, "sar_rvl", {
                     var: dict(ds_raw[var].attrs)
                     for var in data_vars
                     if var in ds_raw
@@ -3431,7 +3327,7 @@ class DataTreeConverter:
                 )
 
             ds = xr.Dataset(data_vars, coords=coords)
-            apply_cf_metadata(ds, "sar", rvl_attrs)
+            apply_cf_metadata(ds, "sar_rvl", rvl_attrs)
             ds.attrs["data_type"] = "sar_l2_ocn"
             ds.attrs["source"] = "Sentinel-1"
             ds.attrs["safe_dir"] = safe_dir.name
@@ -3642,7 +3538,7 @@ class DataTreeConverter:
             }
 
             ds = xr.Dataset(data_vars, coords=coords)
-            apply_cf_metadata(ds, "sar", {
+            apply_cf_metadata(ds, "sar_owi", {
                 var: dict(ds_raw[var].attrs)
                 for var in data_vars
                 if var in ds_raw
@@ -3736,8 +3632,7 @@ class DataTreeConverter:
                 return ds_rvl
 
         elif product_type.lower() == "currents":
-            # RVL is the currents observable. Do NOT fall back to OWI wind — a
-            # currents run must never silently produce wind data. If no RVL is
+            # RVL is the currents observable. If no RVL is
             # found, skip the scene (the caller drops None nodes) with a warning.
             ds_rvl = DataTreeConverter._extract_rvl_grid_data(
                 measurement_dir, safe_dir, flatten_to_points=False
@@ -3797,11 +3692,14 @@ class DataTreeConverter:
         - ``glider_historical/*.csv``  → ``validation/glider_historical/<stem>`` nodes
         - ``ismn/*.csv``                → ``validation/ismn/<stem>`` nodes
         - ``ascat_ssm/*``               → ``validation/ascat_ssm/<stem>`` nodes
+        - ``hsaf_ascat_ssm/*``          → ``validation/hsaf_ascat_ssm/<stem>`` nodes
+        - ``amsr_ssm/*.h5``             → ``validation/amsr_ssm/<stem>`` nodes
         - ``amsr_ssm/*.h5``             → ``validation/amsr_ssm/<stem>`` nodes
         - ``smap_ssm/*.h5``             → ``validation/smap_ssm/<stem>`` nodes
         - ``smos_ssm/*.nc``             → ``validation/smos_ssm/<stem>`` nodes
         - ``cds_ssm/*.nc``              → ``validation/cds_ssm/<stem>`` nodes
         - ``altimeter/*.nc``           → ``validation/altimeter/<stem>`` nodes
+        - ``radiometer/*.nc,*.gz``     → ``validation/radiometer/<stem>`` nodes
         - ``era5/*.nc``                 → single combined, GRIDDED ``validation/era5/era5`` node
         - ``hycom/*.nc``                → single combined, GRIDDED ``validation/hycom/hycom`` node
 
@@ -3818,8 +3716,7 @@ class DataTreeConverter:
             geographic/temporal bounds expanded by the largest collocation
             tolerance in play (see :func:`_subset_point_ds`) before it is
             stored, so ``datatree.nc`` only carries points that can actually
-            collocate. Full-orbit scatterometer files shrink by >95% this
-            way. SAR nodes are never cropped. ``None`` keeps everything.
+            collocate. SAR nodes are never cropped. ``None`` keeps everything.
 
         Returns
         -------
@@ -3847,9 +3744,7 @@ class DataTreeConverter:
             return out
 
         # SAR data -- only the recipe's chosen source's own subdirectory is
-        # scanned, so a stale sibling folder from a previous run using a
-        # different source (e.g. S1_L3_SSM left over when this run wants
-        # sentinel1_l2_ocn) is never picked up. See design-choices.md §8.11.
+        # scanned.
         if recipe is not None:
             from .sar_sources import SAR_SOURCES
 
@@ -3872,8 +3767,7 @@ class DataTreeConverter:
                     logger.info("Converted SAR product (%s): %s", spec.key, sar_path.name)
         else:
             # Legacy/test-only fallback: no recipe given, scan every known
-            # SAR-shaped folder. Never exercised by the real pipeline --
-            # cli.py always passes recipe.
+            # SAR-shaped folder.
             sar_dir = base_dir / "S1_L2_OCN"
             if sar_dir.exists():
                 for safe_dir in sorted(d for d in sar_dir.iterdir()
@@ -3944,7 +3838,7 @@ class DataTreeConverter:
         # Scatterometer / OSI-SAF winds (standardised to point dimension).
         # scatterometer_hy2b/hy2c/oceansat3 are the KNMI OSI-SAF FTP,
         # recent-only 25km sources; from_scatterometer_nc handles them
-        # unchanged (verified against real sample files — see design doc).
+        # unchanged.
         for subdir_name in (
             "osi_saf_winds", "scatterometer",
             "scatterometer_hy2b", "scatterometer_hy2c", "scatterometer_oceansat3",
@@ -3960,13 +3854,12 @@ class DataTreeConverter:
                         datasets[f"validation/{subdir_name}/{nc_path.stem}"] = ds
                         logger.info("Converted %s (scatterometer): %s", subdir_name, nc_path.name)
 
-        # ASCAT Soil Moisture (SOMO12, historical-only — see design doc).
+        # ASCAT Soil Moisture (SOMO12, historical-only).
         # Files are read format-agnostically by the ``ascat`` package
         # (.nc/.bfr/.nat all funnel through from_ascat_ssm). EUMDAC delivers
-        # each order alongside sidecar metadata files (confirmed against a
-        # real download: EOPMetadata.xml, manifest.xml sitting in the same
-        # flat directory as the .nat products) -- skip non-data extensions
-        # rather than attempting (and noisily failing to) convert them.
+        # each order alongside sidecar metadata files (EOPMetadata.xml, 
+        # manifest.xml sitting in the same flat directory as the .nat products) 
+        # -- skip non-data extensions rather than attempting to convert them.
         _ASCAT_DATA_SUFFIXES = (
             ".nc", ".nc.gz", ".bfr", ".bfr.gz", ".buf", ".buf.gz", ".nat", ".nat.gz",
         )
@@ -3998,7 +3891,7 @@ class DataTreeConverter:
                     logger.info("Converted H-SAF SSM: %s", f.name)
 
         # AMSR-E/AMSR2 Daily Global Land Parameters (NSIDC-0451, HDF5, ``.h5``)
-        # or AU_Land_NRT_R02/AU_Land (HDF-EOS5 swath, conventionally ``.he5``).
+        # or AU_Land (HDF-EOS5 swath, conventionally ``.he5``).
         subdir = base_dir / "amsr_ssm"
         if subdir.exists():
             for f in sorted(list(subdir.glob("*.h5")) + list(subdir.glob("*.he5"))):
@@ -4021,17 +3914,14 @@ class DataTreeConverter:
         if subdir.exists():
             nc_paths = sorted(subdir.glob("*.nc"))
             if not nc_paths and any(f.is_file() for f in subdir.iterdir()):
-                # It is currently unconfirmed whether ESA serves this product
-                # as NetCDF or as a .tgz archive (see from_smos_ssm's
-                # docstring) -- SMOSDownloader accepts both and reports a
-                # successful download either way, so a directory full of
-                # .tgz (or any other non-.nc) files here would otherwise
-                # silently yield zero SMOS collocations with no warning
-                # surfaced anywhere.
+                # Format is confirmed plain NetCDF (see from_smos_ssm's docstring), so
+                # files present here that don't match *.nc point at something else
+                # going wrong (unexpected extension, a partial/corrupt download,
+                # etc.) rather than an un-extracted archive. Surfaced as a warning
+                # rather than silently yielding zero SMOS collocations.
                 logger.warning(
-                    "SMOS downloads present in %s but none match *.nc — if "
-                    "these are .tgz archives, they are not yet extracted; "
-                    "see from_smos_ssm's docstring.",
+                    "SMOS downloads present in %s but none match *.nc — check for "
+                    "an unexpected file format or a failed download.",
                     subdir,
                 )
             for f in nc_paths:
@@ -4045,7 +3935,7 @@ class DataTreeConverter:
         # "passive"/"combined") comes from the recipe's cds_ssm validation
         # source download_kwargs -- the same channel the orchestrator reads
         # to build the download request -- so units stay consistent with
-        # what was actually downloaded. Defaults to "active" (matching
+        # what was downloaded. Defaults to "active" (matching
         # _download_cds_ssm's own default) when no recipe is given.
         subdir = base_dir / "cds_ssm"
         if subdir.exists():
@@ -4108,7 +3998,7 @@ class DataTreeConverter:
                     logger.info("Converted hf_radar_historical (Copernicus HF-radar grid): %s", nc_path.name)
 
         # Altimeter NetCDF products (kept as raw dataset). copernicusmarine
-        # sometimes can't merge a satellite/frequency request into a single
+        # sometimes cannot merge a satellite/frequency request into a single
         # flat file and instead writes a directory (named after the
         # requested output filename) containing one .nc per platform, so
         # discovery must recurse. The node key is built from the path
@@ -4144,7 +4034,7 @@ class DataTreeConverter:
                     logger.info("Converted radiometer: %s", f.name)
 
         # ERA5 reanalysis (Copernicus CDS) -- kept as a single combined,
-        # GRIDDED node (not flattened to `point`, unlike every other
+        # gridded node (not flattened to `point`, unlike every other
         # validation source) since ModelLayerCollocation interpolates it
         # directly onto SAR pixel locations at collocation time. Every
         # daily file downloaded for this run is opened together so the
@@ -4165,9 +4055,9 @@ class DataTreeConverter:
                     datasets["validation/era5/era5"] = ds
                     logger.info("Converted ERA5 (%s): %d file(s)", era5_variable, len(era5_files))
 
-        # HyCOM ocean model -- kept as a single combined, GRIDDED node
+        # HYCOM ocean model -- kept as a single combined, gridded node
         # (not flattened to `point`), same rationale as ERA5. Only
-        # relevant for currents recipes -- HyCOM has no wind/wave/soil-
+        # relevant for currents recipes -- HYCOM has no wind/wave/soil-
         # moisture variable. Not passed through _filtered() -- that
         # helper assumes a `point` dimension.
         subdir = base_dir / "hycom"
@@ -4178,7 +4068,7 @@ class DataTreeConverter:
                 ds = DataTreeConverter.from_hycom(hycom_files)
                 if ds is not None:
                     datasets["validation/hycom/hycom"] = ds
-                    logger.info("Converted HyCOM: %d file(s)", len(hycom_files))
+                    logger.info("Converted HYCOM: %d file(s)", len(hycom_files))
 
         if not datasets:
             logger.warning("No convertible data found in %s", base_dir)

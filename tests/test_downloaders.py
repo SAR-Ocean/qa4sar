@@ -699,8 +699,7 @@ class TestSetCredential:
 
 class TestSmosParseSensingWindow:
     def test_parses_real_naming_convention(self):
-        """Filename is a real one downloaded live from smos-diss.eo.esa.int
-        via recipes/soil_moisture_example.yaml, 2026-08-17 -- not a guess."""
+        """Filename comes from a real one downloaded file from smos-diss.eo.esa.int."""
         from sar_validation.downloaders.smos_downloader import _parse_sensing_window
 
         result = _parse_sensing_window(
@@ -976,13 +975,13 @@ class TestSMOSDownloaderOrbitPrefilter:
 
 class TestSMOSListProductsForDay:
     def test_parses_product_list_html(self, tmp_path):
-        """Fixture mirrors the REAL *authenticated* portal response (a real
-        user's logged-in session, confirmed live): the download link is a
-        direct URL (/oads/data/NRT_Open/<filename>), not the login-gated
-        redirect an unauthenticated fetch sees, and it carries an extra
-        target="_blank" attribute between href and the closing '>' -- the
-        original regex assumed '>' came immediately after href's closing
-        quote and silently matched 0 products against this real page."""
+        """Fixture mirrors the REAL *authenticated* portal response: the 
+        download link is a direct URL (/oads/data/NRT_Open/<filename>), 
+        not the login-gated redirect an unauthenticated fetch sees, and it 
+        carries an extra target="_blank" attribute between href and the 
+        closing '>' -- the original regex assumed '>' came immediately 
+        after href's closing quote and silently matched 0 products against 
+        this real page."""
         from sar_validation.downloaders.smos_downloader import SMOSDownloader
 
         html = """
@@ -1069,14 +1068,12 @@ class TestSMOSOadsLogin:
         then POST the returned SAMLResponse form back to the service
         provider's ACS endpoint.
 
-        Fixture HTML mirrors the REAL live page byte-for-byte in the two
+        Fixture HTML mirrors the real live page byte-for-byte in the two
         respects that broke the original (double-quote-only) regexes
         against the real server: the login form's action is a *relative*
         URL (``action="../samlsso"``), and the sessionDataKey hidden
         input's value is *single*-quoted (``value='...'``) while other
-        attributes on the same page use double quotes — confirmed live
-        against smos-diss.eo.esa.int/oads/access/login (redirects to
-        eoiam-idp.eo.esa.int), not a guessed/idealized shape.
+        attributes on the same page use double quotes.
         """
         from sar_validation.downloaders.smos_downloader import SMOSDownloader
 
@@ -1418,7 +1415,7 @@ class TestInSituDownloaderAntimeridian:
             _build_csv_filename,
         )
 
-        # force_download=True: Task 8's dest_path.exists() pre-check would
+        # force_download=True: dest_path.exists() pre-check would
         # otherwise skip subset() entirely for the pre-created files below
         # (they exist only to satisfy _download_window's post-call "already
         # at dest_path" branch, since the fake subset() doesn't write real
@@ -2227,10 +2224,9 @@ class TestNOAAHFRadarDownload:
     def test_download_uses_a_bounded_timeout(self, tmp_path):
         """Regression test: urlretrieve (the original implementation) has no
         timeout parameter at all, and a stalled connection would hang the
-        download indefinitely (observed live: a TCP socket stuck in
-        SYN-SENT for many minutes). The fix moved to urlopen(..., timeout=...)
-        specifically so a hung connection is bounded. Lowered from 60 to 15
-        (Task 9b): combined with prefer_ipv4_dns(), a genuinely broken IPv6
+        download indefinitely. The fix moved to urlopen(..., timeout=...)
+        specifically so a hung connection is bounded. Lowered from 60 to 15: 
+        combined with prefer_ipv4_dns(), a genuinely broken IPv6
         path now fails fast per address instead of eating up to 6 * timeout
         seconds before ever reaching a working IPv4 address."""
         dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
@@ -2420,7 +2416,7 @@ class TestNOAAHFRadarDownloaderForceDownload:
 
 
 # ---------------------------------------------------------------------------
-# Tests for DataOrchestrator "hf_radar_noaa" wiring (Task 7)
+# Tests for DataOrchestrator "hf_radar_noaa" wiring
 # ---------------------------------------------------------------------------
 # DataOrchestrator can be built cheaply from a stub Recipe (no network, no
 # real base-dir creation under dry_run), so a behavioural test is preferred
@@ -3468,7 +3464,7 @@ class TestOrchestratorAscatCoverageCutoffNotice:
     notice) rather than silently logging "Found 0 ASCAT SSM products."
     with no explanation.
 
-    Since the H-SAF NRT waterfall (Task A4), EUMDAC is no longer even
+    Since the H-SAF NRT waterfall, EUMDAC is no longer
     queried for dates past its cutoff -- HSAFDownloader serves the rolling
     last-60-days window instead -- so these tests use recent dates and
     mock HSAFDownloader, not ASCATSoilMoistureDownloader."""
@@ -4263,7 +4259,7 @@ class TestHFRadarUSDownloaderWaterfall:
         THREDDS is the first (and only NOAA) backend that structurally
         applies -- resolved_backend must report "thredds", not fall through
         to the terminal "copernicus" default the way it did before this
-        fix (Task: final-review Fix 5)."""
+        fix."""
         from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
 
         dl = HFRadarUSDownloader(output_dir=tmp_path, dry_run=True)

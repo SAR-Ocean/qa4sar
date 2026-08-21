@@ -1699,10 +1699,11 @@ class TestProjectCurrentsToRadial:
 
 
 class TestAverageWithinSarTolerance:
-    """Unit tests for the pre-collocation temporal-averaging helper used
+    """
+    Unit tests for the pre-collocation temporal-averaging helper used
     by run_collocation for soil-moisture sources (ISMN stations and
-    ASCAT/AMSR2/SMAP/SMOS grid cells). See
-    docs/superpowers/specs/2026-07-29-soil-moisture-temporal-averaging-design.md."""
+    ASCAT/AMSR2/SMAP/SMOS grid cells).
+    """
 
     def test_averages_all_readings_within_tolerance_for_one_station(self):
         from sar_validation.core.collocation import _average_within_sar_tolerance
@@ -1946,9 +1947,7 @@ class TestRunCollocationEra5Wiring:
                         # covers the inner 1deg x 1deg, so the nearest SAR
                         # pixel to an ERA5 corner cell is ~70km away. This
                         # test only verifies era5 nodes get wired into
-                        # run_collocation at all -- aggregation-window
-                        # tuning itself is covered by Task 9's dedicated
-                        # unit tests, so a wide window here avoids the test
+                        # run_collocation at all. A wide window here avoids the test
                         # being fragile to the exact synthetic geometry.
                         "aggregation_window_km": 300.0, "distance_weighting": "equal",
                     },

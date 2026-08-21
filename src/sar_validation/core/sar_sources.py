@@ -3,8 +3,7 @@ SAR source registry.
 
 The single place mapping a recipe's ``sar_data.source`` key to its
 downloader, output subdirectory, converter, and per-source recipe-template
-defaults. See
-docs/superpowers/specs/2026-07-30-nisar-soil-moisture-and-sar-source-selection-design.md
+defaults.
 
 Available SAR sources (satellite family -> ``--sar-source`` name -> which
 recipe variables it supports), kept here for readability -- see
@@ -15,11 +14,6 @@ always-in-sync version of this same list:
     soil_moisture (Sentinel-1 CLMS SSM, 1km, Europe)
   - nisar:     soil_moisture (NISAR SME2, beta)
   - radarsat2: wind (NOAA NCEI SAR-derived ocean surface wind speed)
-
-A future satellite is added by (1) registering a new ``SARSourceSpec`` in
-``SAR_SOURCES`` below with its own ``satellite`` name, and (2) updating the
-list above -- ``AVAILABLE_SATELLITES`` and ``resolve_sar_source`` need no
-changes, since both derive from the registry automatically.
 """
 
 from __future__ import annotations
@@ -57,7 +51,9 @@ class SARSourceSpec:
     file_glob: str
     #: (output_dir, dry_run, force_download) -> downloader instance with a
     #: .download(min_lon, max_lon, min_lat, max_lat, start, end, **kwargs)
-    #: method. Does its own lazy import.
+    #: method. Implementations should do their own lazy import of the
+    #: downloader class, keeping this module decoupled from heavy
+    #: downloader modules at load time.
     build_downloader: Callable[[Path, bool, bool], Any]
     #: Maps the recipe's sar_data fields to whatever extra kwargs THIS
     #: source's .download() call accepts -- existing downloaders'
@@ -66,7 +62,9 @@ class SARSourceSpec:
     extra_download_kwargs: Callable[["SARDataSpec"], Dict[str, Any]]
     #: (path, product_type) -> Dataset or None. product_type (OWI/OSW/RVL)
     #: only matters for sentinel1_l2_ocn; every other source's convert
-    #: callback ignores it. Does its own lazy import.
+    #: callback ignores it. Implementations should do their own lazy
+    #: import of DataTreeConverter, for the same reason as
+    #: build_downloader above.
     convert: Callable[[Path, str], Optional["xr.Dataset"]]
     default_min_depth: Optional[float] = None
     default_max_depth: Optional[float] = None
@@ -133,34 +131,21 @@ def _convert_sentinel1_clms_ssm(path: Path, product_type: str) -> Optional["xr.D
 
 
 # ---------------------------------------------------------------------------
-# nisar_sme2 -- soil_moisture (beta)
+# nisar_sme2 -- soil_moisture (beta and provisional)
 # ---------------------------------------------------------------------------
 
-#: NISAR SME2 (beta) CMR short_name/version -- confirmed 2026-07-31 against
-#: NASA's live CMR catalog (collection concept_id C2850265000-ASF, "NISAR
-#: Beta Soil Moisture (Version 1)"; granule ids start with
-#: "NISAR_L3_PR_SME2_", matching the .h5 file_glob below). A separate,
-#: more-mature "NISAR_L3_SME2_PROVISIONAL_V1" collection also exists
-#: (C2854344945-ASF) with more granules over a later time range -- kept on
-#: BETA here since that's the maturity level this source's docs/attrs
-#: ("NISAR SME2 (beta)") were written for; switching to PROVISIONAL is a
-#: deliberate product-choice decision, not a typo fix, so it's left for a
-#: separate change if wanted.
+#: NISAR SME2 (beta) CMR short_name/version (collection concept_id 
+#: C2850265000-ASF, "NISAR Beta Soil Moisture (Version 1)"; granule ids 
+#: start with "NISAR_L3_PR_SME2_", matching the .h5 file_glob below). A
+#: separate, more-mature "NISAR_L3_SME2_PROVISIONAL_V1" collection also exists
+#: (C2854344945-ASF) with more granules over a later time range.
 NISAR_SME2_SHORT_NAME = "NISAR_L3_SME2_BETA_V1"
 NISAR_SME2_VERSION: Optional[str] = "1"
 
-#: NISAR SME2's underlying CMR collection changed mid-mission with no
-#: temporal overlap between the two -- confirmed 2026-07-31 directly
-#: against NASA's live CMR catalog (cross-checked against a real
-#: user-reported gap, itself independently cross-checked against ASF
-#: Vertex): NISAR_L3_SME2_BETA_V1's real granules run 2025-10-01 through
-#: 2026-01-20, then NOTHING (not even in Vertex) until
-#: NISAR_L3_SME2_PROVISIONAL_V1's real granules pick up on 2026-06-17.
-#: Both candidates are queried and merged (see EarthdataSoilMoistureDownloader's
-#: multi-candidate support) rather than picking one via a hardcoded date
-#: cutoff, since CMR itself is the source of truth for which collection
-#: actually has data in a given window -- a hardcoded cutoff would just be
-#: another guess of exactly the kind that turned out wrong for AU_Land_NRT_R02.
+#: NISAR_L3_SME2_BETA_V1's real granules run 2025-10-01 through
+#: 2026-01-20, then no available data until NISAR_L3_SME2_PROVISIONAL_V1's
+#: granules start on 2026-06-17. Both candidates are queried and merged 
+#: (see EarthdataSoilMoistureDownloader's multi-candidate support).
 NISAR_SME2_CANDIDATES: List[Tuple[str, Optional[str]]] = [
     (NISAR_SME2_SHORT_NAME, NISAR_SME2_VERSION),
     ("NISAR_L3_SME2_PROVISIONAL_V1", "1"),
@@ -168,8 +153,7 @@ NISAR_SME2_CANDIDATES: List[Tuple[str, Optional[str]]] = [
 
 
 def _build_nisar_sme2_downloader(output_dir: Path, dry_run: bool, force_download: bool) -> Any:
-    # force_download intentionally unused -- EarthdataSoilMoistureDownloader
-    # has no such parameter yet (see design doc §6/§12); earthaccess.download()
+    # force_download intentionally unused. earthaccess.download()
     # already skips files it finds present under the same name.
     from ..downloaders.earthdata_soil_moisture_downloader import EarthdataSoilMoistureDownloader
     return EarthdataSoilMoistureDownloader(
@@ -184,14 +168,14 @@ def _nisar_sme2_kwargs(sd: "SARDataSpec") -> Dict[str, Any]:
 
 def _convert_nisar_sme2(path: Path, product_type: str) -> Optional["xr.Dataset"]:
     # Lazy import keeps this module decoupled from datatree_converter.py at
-    # load time (it's only needed when a NISAR SME2 conversion is actually
+    # load time (it is only needed when a NISAR SME2 conversion is actually
     # requested).
     from .datatree_converter import DataTreeConverter
     return DataTreeConverter.from_nisar_sme2(path)
 
 
 # ---------------------------------------------------------------------------
-# radarsat2 -- wind (speed only; see design-choices.md Sec 10)
+# radarsat2 -- wind (speed only)
 # ---------------------------------------------------------------------------
 
 def _build_radarsat2_downloader(output_dir: Path, dry_run: bool, force_download: bool) -> Any:
@@ -263,8 +247,7 @@ SAR_SOURCES: Dict[str, SARSourceSpec] = {
     ),
 }
 
-#: Satellite family names accepted by --sar-source, derived from the
-#: registry so this can never drift out of sync as new sources are added.
+#: Satellite family names accepted by --sar-source.
 AVAILABLE_SATELLITES: List[str] = sorted({spec.satellite for spec in SAR_SOURCES.values()})
 
 
@@ -274,10 +257,8 @@ def resolve_sar_source(name: str, variable: str) -> str:
 
     Accepts either a satellite family name (e.g. ``"sentinel1"``,
     ``"nisar"`` -- see ``AVAILABLE_SATELLITES``) or an exact internal
-    registry key (e.g. ``"sentinel1_clms_ssm"``), kept working for
-    backward compatibility with recipe files that already have a specific
-    key stored in ``sar_data.source``. A satellite name resolves to
-    whichever registered product actually supports *variable* -- e.g.
+    registry key (e.g. ``"sentinel1_clms_ssm"``). A satellite name resolves
+    to whichever registered product actually supports *variable* -- e.g.
     ``"sentinel1"`` resolves to the L2 OCN product for wind/waves/currents
     and to the CLMS SSM product for soil_moisture.
 

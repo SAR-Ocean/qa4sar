@@ -1,15 +1,19 @@
 """
 CF-convention metadata for datatree.nc and collocation_results.nc.
 
-The raw input products are already CF-annotated (OSI-SAF scatterometer,
-CMEMS altimeter L3, Sentinel-1 L2 OCN), so the converters capture each raw
-variable's attributes and pass them through :func:`apply_cf_metadata`, which
-sanitizes them and fills gaps from the tables below. The Copernicus in-situ
-CSVs carry no attributes at all — their parameter codes are covered by
-:data:`INSITU_VARIABLE_ATTRS`.
+The raw input products are already CF-annotated for most sources
+(e.g. OSI-SAF scatterometer, CMEMS altimeter L3, Sentinel-1 L2 OCN),
+so their converters capture each raw variable's attributes and pass
+them through :func:`apply_cf_metadata`, which sanitizes them and
+fills gaps from the tables below -- covering every product kind in
+:data:`PRODUCT_REFERENCES`. The Copernicus in-situ CSVs carry no
+attributes at all -- their parameter codes are covered by
+:data:`INSITU_VARIABLE_ATTRS`. ERA5 and HYCOM set their own
+attributes directly rather than going through
+:func:`apply_cf_metadata`.
 
-Product documentation for each source kind is recorded in the per-node
-``references`` attribute (see :data:`PRODUCT_REFERENCES`).
+Product documentation for each source kind is recorded in the
+per-node ``references`` attribute (see :data:`PRODUCT_REFERENCES`).
 """
 
 from __future__ import annotations
@@ -43,8 +47,14 @@ PRODUCT_REFERENCES: Dict[str, str] = {
     ),
     "radiometer": "https://www.remss.com/missions/amsr/",
     "radiometer_ssm": "https://nsidc.org/data/nsidc-0451; https://nsidc.org/data/spl2smp_e",
+    "cds_ssm": "https://cds.climate.copernicus.eu/datasets/satellite-soil-moisture?tab=documentation",
     "hf_radar": "https://hfradar.ioos.us/",
-    "sar": "https://s1.pages.eopf.copernicus.eu/s1-l12-rp/main/pfs/index.html",
+    "sar_owi": "https://s1.pages.eopf.copernicus.eu/s1-l12-rp/main/pfs/level_2_ocn_owi_product_specification.html",
+    "sar_osw": "https://s1.pages.eopf.copernicus.eu/s1-l12-rp/main/pfs/level_2_ocn_osw_product_specification.html",
+    "sar_rvl": "https://s1.pages.eopf.copernicus.eu/s1-l12-rp/main/pfs/level_2_ocn_rvl_product_specification.html",
+    "sentinel1_clms_ssm": "https://land.copernicus.eu/en/products/soil-moisture/daily-surface-soil-moisture-v1.0",
+    "nisar_sme2": "https://www.earthdata.nasa.gov/data/catalog/asf-nisar-l3-sme2-provisional-v1-1#documents-and-resources",
+    "radarsat2": "https://www.ncei.noaa.gov/access/metadata/landing-page/bin/iso?id=gov.noaa.nodc:SAR-Winds-RADARSAT2",
     "insitu": (
         "https://data.marine.copernicus.eu/product/"
         "INSITU_GLO_PHYBGCWAV_DISCRETE_MYNRT_013_030/description"
@@ -89,13 +99,14 @@ INSITU_VARIABLE_ATTRS: Dict[str, Dict[str, str]] = {
              "units": "degree"},
     "TEMP": {"standard_name": "sea_water_temperature",
              "long_name": "sea water temperature", "units": "degree_Celsius"},
-    "PSAL": {"standard_name": "sea_water_practical_salinity",
-             "long_name": "practical salinity", "units": "1e-3"},
-    "SLEV": {"standard_name": "water_surface_height_above_reference_datum",
-             "long_name": "observed sea level", "units": "m"},
+    #: SOIL_MOISTURE: currently only relied on as ISMN's fallback (via
+    #: from_insitu_csv(source_type="ismn")) -- every other soil-moisture
+    #: source (ASCAT/H-SAF/AMSR/SMAP/SMOS/CDS SSM) supplies its own
+    #: var_attrs, overriding this default.
     "SOIL_MOISTURE": {"standard_name": "volume_fraction_of_water_in_soil",
-                      "long_name": "ISMN in-situ volumetric soil moisture",
-                      "units": "m3 m-3"},
+                    "long_name": "volumetric soil moisture",
+                    "units": "m3 m-3"},
+
 }
 
 #: Descriptive attrs, kept when copying from a raw product variable.
@@ -139,8 +150,9 @@ def apply_cf_metadata(
     ds : xr.Dataset
         Dataset to annotate (modified in place and returned).
     source_kind : str
-        One of ``"scatterometer"``, ``"altimeter"``, ``"radiometer"``,
-        ``"sar"``, ``"insitu"``.
+        A key in :data:`PRODUCT_REFERENCES`. An unrecognized key is not
+        an error -- the ``references`` global attribute is simply left
+        unset.
     var_attrs : dict, optional
         Mapping of output variable name → raw attribute dict.
     """
@@ -197,19 +209,14 @@ _COLLOCATION_GEOMETRY_ATTRS: Dict[str, Dict[str, str]] = {
 }
 
 
-#: CF attrs for ``val_<var>`` columns that are DERIVED at collocation time
-#: rather than renamed at conversion time, so no datatree node variable
-#: named ``<var>`` ever exists for the ``datatree.subtree`` walk below to
-#: find. Currently only ERA5 wind: ``DataTreeConverter.from_era5``
-#: deliberately keeps ``u10``/``v10`` raw through conversion (WDIR is a
-#: circular quantity and must not be linearly/hyperbolically interpolated
-#: -- see docs/design-choices.md §2/§5.7), so ``WSPD``/``WDIR`` only come
-#: into existence inside ``model_collocation._derive_wind_wspd_wdir``,
-#: after this module's attrs lookup would otherwise run. Values match what
-#: ``from_era5`` used to stamp directly before that derivation moved
-#: downstream (commit 0b196ee). Keyed by ``(platform_type, var_name)``, and
-#: consulted as a fallback in :func:`annotate_collocation_ds` only when the
-#: normal datatree-node lookup finds nothing for a given platform type.
+#: CF attrs for ``val_<var>`` columns computed at collocation time
+#: (not renamed at conversion time), so no datatree node ever carries
+#: them -- currently ``WSPD``/``WDIR`` (ERA5 wind, from
+#: ``_derive_wind_wspd_wdir``) and ``rvlRadVel_projection`` (HYCOM
+#: currents, from ``_derive_currents_radial_projection``). Keyed by
+#: ``(platform_type, var_name)``, consulted in
+#: :func:`annotate_collocation_ds` only when the normal datatree-node
+#: lookup finds nothing.
 _DERIVED_VAL_VAR_ATTRS: Dict[Tuple[str, str], Dict[str, str]] = {
     ("era5_wind", "WSPD"): {
         "standard_name": "wind_speed",
@@ -221,6 +228,10 @@ _DERIVED_VAL_VAR_ATTRS: Dict[Tuple[str, str], Dict[str, str]] = {
         "long_name": "ERA5 10m wind direction (meteorological convention, derived from u10/v10)",
         "units": "degree",
     },
+    ("hycom", "rvlRadVel_projection"): {
+        "long_name": "HyCOM current velocity projected onto the SAR line-of-sight (derived from EWCT/NSCT)",
+        "units": "m s-1",
+    },
 }
 
 
@@ -230,19 +241,15 @@ def annotate_collocation_ds(result_ds: xr.Dataset, datatree: xr.DataTree) -> xr.
 
     ``sar_<var>`` columns inherit the descriptive attrs of the first
     datatree variable named ``<var>`` (a recipe run has exactly one SAR
-    product, so there's no ambiguity). ``val_<var>`` columns pool every
+    product, so there is no ambiguity). ``val_<var>`` columns pool every
     validation source's rows together, distinguished only by the
     per-point ``val_source`` value -- when every source present shares the
     same units for that variable (the common case), the column gets one
-    shared attrs value, same as before. When sources genuinely differ
-    (e.g. soil moisture: ASCAT's "%" alongside ISMN/SMAP/SMOS's "m3 m-3"),
-    a single column-level ``units`` string can't represent every row
-    correctly, so this adds per-point ``val_units``/``val_long_name``
-    companion variables instead of guessing -- the previous behavior
-    (silently keeping whichever source's attrs were encountered first
-    while walking ``datatree.subtree``) mislabeled every other source's
-    rows. Geometry and provenance columns get fixed attrs from
-    :data:`_COLLOCATION_GEOMETRY_ATTRS`.
+    shared attrs value. When sources differ (e.g. soil moisture: ASCAT's 
+    "%" alongside ISMN/SMAP/SMOS's "m3 m-3"), a single column-level ``units`` 
+    string cannot represent every row correctly, so this adds per-point 
+    ``val_units``/``val_long_name`` companion variables. Geometry and 
+    provenance columns get fixed attrs from :data:`_COLLOCATION_GEOMETRY_ATTRS`.
 
     Platform-based resolution keys off each datatree node's ``platform_type``
     *attribute*, matched against each collocation row's ``val_source``
@@ -253,24 +260,14 @@ def annotate_collocation_ds(result_ds: xr.Dataset, datatree: xr.DataTree) -> xr.
     ``platform_type`` data variable with mapped values (``"mooring"``,
     ``"buoy"``, ``"drifter"``, ...). Those never match
     ``source_attrs_by_platform``, so ``known_attrs`` comes back empty for
-    every source present. When that happens -- i.e. platform-based
-    resolution found *nothing* for *any* source in this column -- fall back
-    to the var-name-keyed lookup (``source_attrs``) used by the ``sar_``
-    branch below. This is deliberately narrower than the var-name fallback
-    that predates platform-based resolution: it only fires when
-    ``known_attrs`` is completely empty, so it cannot mask a genuine
-    mixed-units case where *some* sources resolved via platform_type and
-    others didn't -- that scenario still falls through to the
-    ``val_units``/``val_long_name`` branch below.
+    every source present. When that happens, fall back to the var-name-keyed 
+    lookup (``source_attrs``) used by the ``sar_`` branch below.
 
     A second, narrower fallback covers :data:`_DERIVED_VAL_VAR_ATTRS`: for
     a ``(platform_type, var_name)`` pair with no datatree-node match at
     all (e.g. ``("era5_wind", "WSPD")`` -- that variable is derived after
     collocation, so no node ever carries it), the fixed table is consulted
-    per platform type, same as a normal ``source_attrs_by_platform`` hit.
-    This keeps era5-only wind recipes from ending up with empty
-    ``val_WSPD``/``val_WDIR`` attrs just because ERA5 has no source
-    variable of that name to borrow from.
+    per platform type instead. 
     """
     source_attrs: Dict[str, Dict[str, Any]] = {}
     source_attrs_by_platform: Dict[tuple, Dict[str, Any]] = {}

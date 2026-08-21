@@ -6,6 +6,8 @@ entire pipeline:
 
     step 1 — download    → DataOrchestrator reads the recipe
     step 3 — collocation → uses collocation parameters from the recipe
+
+Recipe is created using --create-recipe (code can be found in cli.py).
 """
 
 from __future__ import annotations
@@ -69,16 +71,25 @@ class ValidationDataSource:
     Platform / product type.
 
     Accepted values:
-      in-situ   : mooring, buoy, ferrybox, drifter, tidal_gauge
-      satellite : scatterometer, altimeter, radiometer
-      coastal   : hf_radar
+      in-situ (real-time)   : mooring, buoy, ferrybox, drifter,
+                               tidal_gauge
+      in-situ (historical)  : adcp_historical, argo_historical,
+                               drifter_historical, glider_historical
+      in-situ (soil moisture): ismn
+      satellite (wind/waves) : scatterometer, scatterometer_hy2b,
+                               scatterometer_hy2c,
+                               scatterometer_oceansat3, altimeter,
+                               radiometer
+      satellite (soil moisture): ascat_ssm, amsr_ssm, smap_ssm,
+                               smos_ssm, cds_ssm
+      coastal (currents)     : hf_radar, hf_radar_noaa,
+                               hf_radar_historical, hf_radar_us
+      model reanalysis       : era5, hycom
     """
 
-    # Optional depth filter (only meaningful for in-situ and HF radar
-    # sources). None means "use DEFAULT_MIN_DEPTH/DEFAULT_MAX_DEPTH" — see
-    # resolved_min_depth/resolved_max_depth below. Left as None for source
-    # types that don't use depth (e.g. scatterometer) so recipes don't
-    # serialize a meaningless depth window for them.
+    # Optional depth filter (only used for sources downloaded via Copernicus 
+    # Marine (in-situ and HF radar). None means "use DEFAULT_MIN_DEPTH/DEFAULT_MAX_DEPTH". 
+    # Left as None for source types that do not use depth (e.g. scatterometer).
     min_depth: Optional[float] = None
     max_depth: Optional[float] = None
 
@@ -111,29 +122,33 @@ class ValidationDataSource:
 
 @dataclass
 class SARDataSpec:
-    """Specification for the SAR product to validate.
+    """
+    Specification for the SAR product to validate.
 
     ``source`` is a key into ``sar_sources.SAR_SOURCES`` -- the single
     registry mapping a source to its downloader, output subdirectory,
-    converter, and per-source recipe-template defaults. See
-    docs/superpowers/specs/2026-07-30-nisar-soil-moisture-and-sar-source-selection-design.md
+    converter, and per-source recipe-template defaults.
     """
     source: str = "sentinel1_l2_ocn"
     swath_mode: List[str] = field(default_factory=lambda: ["IW", "EW"])
-    """SAR beam mode(s), e.g. ``["IW", "EW"]`` or ``["WV"]``. Only
-    meaningful for ``source="sentinel1_l2_ocn"`` -- ignored (harmless
-    no-op) by every other source."""
+    """
+    SAR beam mode(s), e.g. ``["IW", "EW"]`` or ``["WV"]``. Only
+    meaningful for ``source="sentinel1_l2_ocn"`` -- ignored by every other source.
+    """
     max_downloads: Optional[int] = None   # None → download all found products
     download_kwargs: Dict[str, Any] = field(default_factory=dict)
-    """Extra keyword arguments forwarded to the registry's downloader."""
-
+    """
+    Extra keyword arguments forwarded to the registry's downloader.
+    """
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
 @dataclass
 class PointVsLayerCollocation:
-    """Collocation config for point vs gridded SAR data (buoys, moorings)."""
+    """
+    Collocation config for point vs gridded SAR data (buoys, moorings).
+    """
     time_tolerance_minutes: int = 30
     spatial_tolerance_km: float = 25
     interpolation_method: str = "nearest"
@@ -150,13 +165,12 @@ class PointVsLayerCollocation:
 #: regardless of whether a recipe declares a ``layer_vs_layer`` section at
 #: all. A recipe's own ``layer_type_specs`` entries (if any) override these
 #: per-key. Altimeter is split into ``altimeter_1hz``/``altimeter_5hz``
-#: because the two frequencies have very different along-track point
-#: spacing (7km vs 1.4km — see WAVE_GLO_PHY_SWH_L3_NRT_014_001), so a single
-#: aggregation window would be wrong for at least one of them.
-#: RSS radiometers are all distributed on a common 0.25° (~25 km) grid, so
-#: every ``radiometer_<sensor>`` entry defaults to the same aggregation window.
+#: because the two frequencies have different along-track point spacing
+#: (7km vs 1.4km — see WAVE_GLO_PHY_SWH_L3_NRT_014_001). RSS radiometers 
+#: are all distributed on a common 0.25° (~25 km) grid. Therefore, every
+#: ``radiometer_<sensor>`` entry defaults to the same aggregation window.
 #: They are kept as separate per-sensor keys (mirroring the altimeter split)
-#: purely so each can be tuned individually in a recipe — e.g. a different time
+#: so each can be tuned individually in a recipe — e.g. a different time
 #: tolerance, or down-weighting a coarser-footprint sensor. Collocation refines
 #: ``radiometer`` to ``radiometer_<sensor>`` from each node's ``sensor`` attr.
 _RADIOMETER_DEFAULT = {"time_tolerance_minutes": 180, "aggregation_window_km": 25.0, "distance_weighting": "equal"}
@@ -185,25 +199,15 @@ DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
     "radiometer_ssmis_f18": dict(_RADIOMETER_DEFAULT),
     "radiometer_windsat":   dict(_RADIOMETER_DEFAULT),
     "radiometer_amsre":     dict(_RADIOMETER_DEFAULT),
-    # Soil-moisture satellite sources — 12h tolerance (not the 180min wind
-    # default): soil moisture changes slowly relative to a roughly-daily
-    # overpass. See design-choices.md §8.7. Keyed by data_type
-    # ("scatterometer_ssm"/"radiometer_ssm"/"<sensor>_ssm"), NOT by
-    # source_type — see from_ascat_ssm's data_type tag and
-    # _resolve_layer_type.
+    # Soil-moisture satellite sources have a 12h tolerance as soil 
+    # moisture changes slowly relative to a roughly-daily overpass
+    # (sentinel1). Keyed by data_type
+    # ("scatterometer_ssm"/"radiometer_ssm"/"<sensor>_ssm").
     "scatterometer_ssm": {"time_tolerance_minutes": 720, "aggregation_window_km": 12.5, "distance_weighting": "equal"},
     # Bare key is the fallback for any radiometer-family soil-moisture
     # node whose data_type is the generic "radiometer_ssm" rather than
     # a sensor-refined "<sensor>_ssm" -- mirrors the "radiometer" bare
-    # key's role above. from_amsr_ssm/from_smap_ssm/from_smos_ssm all
-    # stamp data_type="radiometer_ssm" literally on the datatree node
-    # itself (sensor-level refinement to amsr_ssm/smap_ssm/smos_ssm only
-    # happens downstream, in _resolve_layer_type during collocation) --
-    # this entry was documented in the comment above but missing from
-    # this dict, so any code reading data_type directly off a node
-    # (e.g. plot_collocation_diagnostics's unmatched-point path) fell
-    # through to the recipe's generic point_vs_layer default instead of
-    # the intended 720-minute soil-moisture tolerance.
+    # key's role above.
     "radiometer_ssm": {"time_tolerance_minutes": 720, "aggregation_window_km": 25.0, "distance_weighting": "equal"},
     "amsr_ssm":  {"time_tolerance_minutes": 720, "aggregation_window_km": 25.0, "distance_weighting": "equal"},
     "smap_ssm":  {"time_tolerance_minutes": 720, "aggregation_window_km": 9.0,  "distance_weighting": "equal"},
@@ -215,28 +219,22 @@ DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
     # an observation with real coverage gaps, so its collocation uses
     # bilinear spatial + nearest-hour/hyperbolic temporal interpolation
     # (ModelLayerCollocation in model_collocation.py) rather than the
-    # KD-tree point-matching every other layer type above uses. See
-    # docs/design-choices.md for why that method is NOT extended to the
-    # observational sources above it.
+    # KD-tree point-matching every other layer type above uses.
     #
     # aggregation_window_km is ~half the native grid spacing (0.25 deg /
     # 27.75 km for wind/waves, 0.1 deg / 11.1 km for land soil moisture),
     # matching the convention already used for scatterometer/altimeter
-    # above, so cell-averaging's per-cell SAR aggregation windows don't
-    # overlap neighbouring ERA5 cells. The actual per-point match is
-    # always at the SAR scene's own exact time (temporal_distance_minutes
-    # is always 0 for era5 results; ModelLayerCollocation itself never
-    # reads time_tolerance_minutes) -- but ERA5Downloader/HycomDownloader
-    # DO read it (via orchestrator._resolve_temporal_padding_minutes) to
-    # size how far past the requested window they fetch granules, so a
-    # bracketing timestamp is always available for interpolation even for
-    # a SAR scene right at the window's edge. It must therefore be at
-    # least ``2 * cadence_hours * 60`` minutes -- see
+    # above, so cell-averaging's per-cell SAR aggregation windows do not
+    # overlap neighbouring ERA5 cells. 
+    # 
+    # time_tolerance_minutes does not affect matching itself (the SAR
+    # scene's own exact time is always used). It instead sizes how far
+    # past the requested window ERA5Downloader/HycomDownloader fetch
+    # granules, so a bracketing timestamp is always available for
+    # interpolation. It must therefore be at least 
+    # ``2 * cadence_hours * 60`` minutes -- see
     # ``MODEL_CADENCE_HOURS``/``min_safe_model_time_tolerance_minutes``
-    # below and each downloader's own worked derivation (e.g.
-    # hycom_downloader.py's ``_BRACKET_BUFFER_HOURS`` docstring) for why
-    # half that isn't enough. A recipe declaring less is allowed but logs
-    # a warning (orchestrator._resolve_temporal_padding_minutes).
+    # below). A recipe declaring less is allowed but logs a warning.
     "era5_wind": {
         "time_tolerance_minutes": 120, "aggregation_window_km": 12.5,
         "distance_weighting": "equal", "method": "cell-averaging", "temporal_method": "hyperbolic",
@@ -245,21 +243,17 @@ DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
         "time_tolerance_minutes": 120, "aggregation_window_km": 12.5,
         "distance_weighting": "equal", "method": "cell-averaging", "temporal_method": "hyperbolic",
     },
-    # 720 min (12h) is a deliberate choice (soil moisture changes slowly
-    # relative to a roughly-daily overpass, see design-choices.md §8.7),
-    # already well above the 120 min bracket-safety minimum below.
     "era5_soil_moisture": {
         "time_tolerance_minutes": 720, "aggregation_window_km": 5.0,
         "distance_weighting": "equal", "method": "cell-averaging", "temporal_method": "hyperbolic",
     },
-    # HyCOM ocean-current model -- same ModelLayerCollocation machinery
+    # HYCOM ocean-current model -- same ModelLayerCollocation machinery
     # as era5_wind/era5_waves/era5_soil_moisture above. aggregation_window_km
     # is ~half the native 1/12 deg grid spacing (~9.3 km at the equator),
     # same "half native cell spacing" convention as ERA5's own entries, so
-    # cell-averaging's per-cell SAR aggregation windows don't overlap
-    # neighbouring HyCOM cells. time_tolerance_minutes is 360 (6h) -- see
-    # MODEL_CADENCE_HOURS below (HyCOM's 3-hourly cadence needs 2x, not
-    # 1x, to guarantee bracket coverage at the requested window's edges).
+    # cell-averaging's per-cell SAR aggregation windows do not overlap
+    # neighbouring HYCOM cells. time_tolerance_minutes is 360 (6h) (2x 
+    # HYCOM's 3-hourly cadence).
     "hycom": {
         "time_tolerance_minutes": 360, "aggregation_window_km": 4.6,
         "distance_weighting": "equal", "method": "cell-averaging", "temporal_method": "hyperbolic",
@@ -267,11 +261,11 @@ DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
 }
 
 #: Model-layer granule cadence (hours) for each ``DEFAULT_LAYER_TYPE_SPECS``
-#: key that uses ``ModelLayerCollocation`` (bracket-based temporal
-#: interpolation, not a KD-tree tolerance search). Used to derive the
-#: minimum ``time_tolerance_minutes`` that guarantees a downloader fetches
-#: enough of a margin to always find a bracketing pair of granules, even
-#: for a SAR scene right at the edge of the requested window.
+#: key that uses ``ModelLayerCollocation``'s bracket-based temporal
+#: interpolation. Used to derive the minimum ``time_tolerance_minutes``
+#: that guarantees a downloader fetches enough margin to always find a
+#: bracketing pair of granules, even for a SAR scene right at the edge
+#: of the requested window.
 MODEL_CADENCE_HOURS: Dict[str, int] = {
     "hycom": 3,
     "era5_wind": 1,
@@ -281,15 +275,14 @@ MODEL_CADENCE_HOURS: Dict[str, int] = {
 
 
 def min_safe_model_time_tolerance_minutes(key: str) -> Optional[float]:
-    """Minimum ``time_tolerance_minutes`` for *key* that still guarantees
+    """
+    Minimum ``time_tolerance_minutes`` for *key* that guarantees
     ``ModelLayerCollocation`` always finds a bracketing pair of granules,
     or ``None`` if *key* isn't a model-layer type at all.
 
-    ``2 * cadence`` (not ``1 * cadence``/half): for an observation time T
+    ``2 * cadence`` is required: for an observation time T
     right at the requested window's edge, the earliest granule the
-    bracket search can need is up to just-under ``2 * cadence`` before T
-    (see e.g. hycom_downloader.py's ``_BRACKET_BUFFER_HOURS`` docstring
-    for the worked proof, which this mirrors).
+    bracket search can need is up to just-under ``2 * cadence`` before T.
     """
     cadence = MODEL_CADENCE_HOURS.get(key)
     return None if cadence is None else 2 * cadence * 60
@@ -297,7 +290,8 @@ def min_safe_model_time_tolerance_minutes(key: str) -> Optional[float]:
 
 @dataclass
 class LayerVsLayerCollocation:
-    """Collocation config for gridded vs gridded SAR data (scatterometer, altimeter, HF radar).
+    """
+    Collocation config for gridded vs gridded SAR data (scatterometer, altimeter, HF radar).
     
     Maps data source types to their specific collocation parameters.
     Supports two collocation methods: 'cell-averaging' (clusters scatterometer into grid cells)
@@ -331,10 +325,11 @@ class LayerVsLayerCollocation:
 
 @dataclass
 class CollocationType:
-    """Collocation configuration for SAR validation.
+    """
+    Collocation configuration for SAR validation.
     
-    Supports both point_vs_layer (buoys, moorings) and layer_vs_layer
-    (scatterometer, altimeter, HF radar) collocation strategies.
+    Supports both point_vs_layer (e.g. buoys, moorings) and layer_vs_layer
+    (e.g. scatterometer, altimeter, HF radar) collocation strategies.
     Per-source overrides in ValidationDataSource.collocation_kwargs take
     precedence over all recipe defaults.
     """
@@ -342,9 +337,7 @@ class CollocationType:
     layer_vs_layer: Optional[LayerVsLayerCollocation] = None
 
     #: Search radius (km) around each sparse SAR WV-mode OSW vignette point
-    #: used to gather validation observations. A WV vignette covers ~20×20 km,
-    #: so 14 km ≈ its center-to-corner distance (fully covers the footprint).
-    #: Only affects WV/point-mode SAR; IW/EW grid collocation is unaffected.
+    #: used to gather validation observations. Only affects WV/point-mode SAR.
     sar_footprint_radius_km: float = 14.0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -363,7 +356,9 @@ class CollocationType:
 
 @dataclass
 class RecipeConfig:
-    """Complete, self-contained recipe configuration."""
+    """
+    Complete, self-contained recipe configuration.
+    """
 
     # --- Required fields (no default) ---
     name: str
@@ -417,10 +412,15 @@ class RecipeConfig:
 # ---------------------------------------------------------------------------
 
 def _build_sar_data_spec(sar: Dict[str, Any], variable: str) -> SARDataSpec:
-    """Build and validate a SARDataSpec from a recipe dict's ``sar_data``
-    block. Raises ValueError for an unknown source key, or a known key
-    that isn't valid for *variable* -- catches a recipe whose ``variable``
-    was changed without updating ``sar_data.source`` to match."""
+    """
+    Build and validate a SARDataSpec from a recipe dict's ``sar_data``
+    block.
+
+    Raises ``ValueError`` in two cases: the ``source`` key is not
+    registered in ``SAR_SOURCES`` at all, or it is registered but does
+    not support *variable*.
+    """
+
     from .sar_sources import SAR_SOURCES
 
     source = sar.get("source", "sentinel1_l2_ocn")
@@ -530,7 +530,7 @@ class Recipe:
         ):
             raise ValueError(
                 "source_type 'hycom' is only valid for a 'currents' recipe -- "
-                "HyCOM has no wind/wave/soil-moisture variable. Remove the "
+                "HYCOM has no wind/wave/soil-moisture variable. Remove the "
                 "hycom validation source, or switch the recipe's variable to "
                 "'currents'."
             )

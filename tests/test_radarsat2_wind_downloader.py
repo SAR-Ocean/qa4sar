@@ -133,9 +133,7 @@ class TestListRadarsat2GranulesBboxFilter:
     def test_pad_lets_a_near_but_outside_center_through(self):
         """65N/168W's signed center is -168, which is outside the raw bbox
         [-179, -170] by ~2 degrees -- but within the 5-degree pad, so it
-        must still come through as a download candidate (Task 3's precise
-        NCML-based check is what makes the final keep/drop call, not this
-        coarse pre-filter)."""
+        must still come through as a download candidate."""
         from sar_validation.downloaders.radarsat2_wind_downloader import _list_radarsat2_granules
 
         granules = _list_radarsat2_granules(
@@ -188,7 +186,7 @@ class TestListRadarsat2GranulesBboxFilter:
         assert not any("64N-174E" in url for _, url, _, _ in granules)  # timestamped 2026-06-04 05:52:51
 
 
-# Trimmed fragments of real NCML documents (fetched live 2026-08-05) --
+# Trimmed fragments of real NCML documents --
 # only the parts _parse_ncml_bbox actually reads. The real documents also
 # carry a `location="Not provided..."` attribute on <netcdf> and a WKT
 # `geospatial_bounds` polygon attribute; both are dropped here (neither
@@ -233,7 +231,7 @@ class TestParseNcmlBbox:
 
     def test_old_era_falls_back_to_cfmetadata_group(self):
         """Old-era raw files carry no geospatial_*_min/max attributes at
-        all (confirmed live), but THREDDS' NCML service still computes
+        all, but THREDDS' NCML service still computes
         and reports them, nested under <group name="CFMetadata">."""
         from sar_validation.downloaders.radarsat2_wind_downloader import _parse_ncml_bbox
 

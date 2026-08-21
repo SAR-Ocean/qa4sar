@@ -7,12 +7,14 @@ from .core import (
     DataTreeConverter,
     GeographicBounds,
     LayerLayerCollocation,
+    ModelLayerCollocation,
     PointLayerCollocation,
     Recipe,
     RecipeConfig,
     SARDataSpec,
     TemporalBounds,
     ValidationDataSource,
+    run_collocation,
 )
 
 __version__ = "0.1.0"
@@ -29,5 +31,7 @@ __all__ = [
     "CollocatedPoint",
     "PointLayerCollocation",
     "LayerLayerCollocation",
+    "ModelLayerCollocation",
+    "run_collocation",
     "DataOrchestrator",
 ]
