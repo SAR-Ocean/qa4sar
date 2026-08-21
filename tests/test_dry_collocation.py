@@ -991,6 +991,121 @@ class TestSarFootprintsFromDownloadedRemainingSources:
         assert result[0].points == [(45.0, 10.0)]
         assert result[0].sensing_start == result[0].sensing_end == datetime(2026, 8, 1, 6, 0, 0)
 
+    def test_missing_lon_lat_after_convert_is_skipped_not_raised(self, tmp_path):
+        """A converted Dataset missing lon/lat (e.g. an unusual NISAR SME2
+        or RADARSAT-2 file) raises KeyError from the geometry-extraction
+        code that runs AFTER convert() -- that must be caught and skip
+        just this one file, like a convert() failure itself, not
+        propagate out of sar_footprints_from_downloaded (which would hit
+        _collocation_predictions()'s blanket except Exception and disable
+        gating for the ENTIRE run, not just this one bad file)."""
+        import xarray as xr
+
+        from sar_validation.core import dry_collocation
+
+        bad_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), [[0.2]])},
+            coords={"time": datetime(2026, 8, 1, 12, 0, 0)},  # no lon/lat
+        )
+        good_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), [[0.2]])},
+            coords={
+                "lon": (("y", "x"), [[20.0]]), "lat": (("y", "x"), [[50.0]]),
+                "time": datetime(2026, 8, 1, 12, 0, 0),
+            },
+        )
+
+        class _FakeSarSourceSpec:
+            key = "nisar_sme2"
+
+            @staticmethod
+            def convert(path, product_type):
+                return bad_ds if "bad" in str(path) else good_ds
+
+        result = dry_collocation.sar_footprints_from_downloaded(
+            [tmp_path / "bad.h5", tmp_path / "good.h5"], _FakeSarSourceSpec(), "soil_moisture",
+        )
+
+        assert len(result) == 1
+        assert result[0].source_file == str(tmp_path / "good.h5")
+
+    def test_non_wv_length_one_time_array_does_not_raise(self, tmp_path):
+        """A non-WV source whose converted Dataset's "time" value is a
+        length-1 array (rather than a true 0-d scalar) must not raise --
+        pd.Timestamp(...) rejects an array, unlike
+        pd.to_datetime(np.atleast_1d(...)) (mirroring orchestrator.py's
+        own _compute_sar_scene_times, which handles this exact same
+        defensively for the exact same converted files)."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core import dry_collocation
+
+        fake_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), [[0.2]])},
+            coords={
+                "lon": (("y", "x"), [[20.0]]), "lat": (("y", "x"), [[50.0]]),
+                "time": ("time", np.array(["2026-08-01T12:00:00"], dtype="datetime64[ns]")),
+            },
+        )
+
+        class _FakeSarSourceSpec:
+            key = "radarsat2"
+
+            @staticmethod
+            def convert(path, product_type):
+                return fake_ds
+
+        result = dry_collocation.sar_footprints_from_downloaded(
+            [tmp_path / "a.h5"], _FakeSarSourceSpec(), "wind",
+        )
+
+        assert len(result) == 1
+        assert result[0].sensing_start == datetime(2026, 8, 1, 12, 0, 0)
+        assert result[0].sensing_end == datetime(2026, 8, 1, 12, 0, 0)
+
+    def test_nat_time_footprint_is_dropped_not_appended(self, tmp_path):
+        """A converted Dataset whose time resolves to NaT (e.g. a NISAR
+        SME2 granule with a missing/unparseable zeroDopplerStartTime --
+        see datatree_converter.py) must NOT produce a footprint at all --
+        an unfiltered NaT footprint can make _predict_global_composite's
+        day-range loop produce zero days, a false "none-predicted"
+        verdict that wrongly SKIPS a real download (the one fail-closed
+        risk in this feature)."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.core import dry_collocation
+
+        nat_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), [[0.2]])},
+            coords={
+                "lon": (("y", "x"), [[20.0]]), "lat": (("y", "x"), [[50.0]]),
+                "time": np.datetime64("NaT", "ns"),
+            },
+        )
+        good_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), [[0.2]])},
+            coords={
+                "lon": (("y", "x"), [[21.0]]), "lat": (("y", "x"), [[51.0]]),
+                "time": datetime(2026, 8, 1, 12, 0, 0),
+            },
+        )
+
+        class _FakeSarSourceSpec:
+            key = "nisar_sme2"
+
+            @staticmethod
+            def convert(path, product_type):
+                return nat_ds if path.name == "nat_scene.h5" else good_ds
+
+        result = dry_collocation.sar_footprints_from_downloaded(
+            [tmp_path / "nat_scene.h5", tmp_path / "good.h5"], _FakeSarSourceSpec(), "soil_moisture",
+        )
+
+        assert len(result) == 1
+        assert result[0].source_file == str(tmp_path / "good.h5")
+
     @pytest.mark.parametrize("key", ["nisar_sme2", "radarsat2"])
     def test_nisar_and_radarsat2_route_through_the_same_generic_grid_path(self, tmp_path, key):
         """nisar_sme2 and radarsat2's convert() callbacks both produce a
@@ -1040,6 +1155,64 @@ class TestPredictSourceDispatch:
         assert result.verdict == "unknown"
         assert result.source_type == "not_a_real_source_type"
         assert "not_a_real_source_type" in result.detail
+
+    def test_stop_on_first_match_forwarded_to_a_supporting_predicate(self, monkeypatch):
+        """A predicate that declares stop_on_first_match (e.g. altimeter,
+        catalog-precise-bucket) must actually receive True when
+        predict_source is called with stop_on_first_match=True -- this is
+        the real-run gating path's own entry point into the predicate
+        dispatch (see DataOrchestrator._collocation_predictions)."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint, predict_source
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        seen_bboxes = []
+
+        def _tracking_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            seen_bboxes.append((min_lon, max_lon, min_lat, max_lat))
+            return [("fake_candidate", datetime(2026, 8, 1, 6, 0, 0), datetime(2026, 8, 1, 6, 3, 0))]
+
+        monkeypatch.setattr(dry_collocation, "_altimeter_list_candidates_dry", _tracking_list_candidates_dry)
+
+        footprint1 = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+        footprint2 = SarFootprint(
+            kind="polygon", bbox=(20.0, 30.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 2, 6, 0, 30), sensing_end=datetime(2026, 8, 2, 6, 1, 0),
+            source_file="s2.SAFE",
+        )
+
+        result = predict_source(
+            SimpleNamespace(source_type="altimeter"), cfg=object(),
+            sar_footprints=[footprint1, footprint2], stop_on_first_match=True,
+        )
+
+        assert result.verdict == "collocated"
+        assert seen_bboxes == [(-10.0, 10.0, 35.0, 55.0)]  # second footprint never queried
+
+    def test_stop_on_first_match_ignored_by_a_non_supporting_predicate(self, monkeypatch):
+        """A predicate that does not declare stop_on_first_match (e.g.
+        ismn) must keep working exactly as before when predict_source is
+        called with stop_on_first_match=True -- the flag is only ever
+        forwarded to predicates that opted in (see
+        _predicate_accepts_stop_on_first_match)."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import predict_source
+
+        monkeypatch.setattr(dry_collocation, "_build_ismn_downloader", lambda cfg: MagicMock(
+            station_date_ranges_dry=lambda *a, **k: None,
+        ))
+
+        result = predict_source(
+            SimpleNamespace(source_type="ismn"), cfg=object(), sar_footprints=[], stop_on_first_match=True,
+        )
+
+        assert result.verdict == "unknown"
+        assert result.source_type == "ismn"
 
 
 class TestPointInFootprint:
@@ -1241,6 +1414,87 @@ class TestOrbitCorridorPredicate:
 
         assert result.verdict == "unknown"
 
+    def test_stop_on_first_match_skips_remaining_footprints(self, monkeypatch):
+        """stop_on_first_match=True (the real-run gating path -- see
+        DataOrchestrator._collocation_predictions) must stop probing as
+        soon as one candidate's refined window overlaps -- the second
+        footprint's own candidate listing must never even be requested."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        def _fake_orbit_overlap_windows(satellite, start, end, min_lon, max_lon, min_lat, max_lat, **kwargs):
+            return [(start, end)]  # full overlap
+
+        monkeypatch.setattr(dry_collocation.orbit_coverage, "orbit_overlap_windows", _fake_orbit_overlap_windows)
+
+        seen_bboxes = []
+
+        def _tracking_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            seen_bboxes.append((min_lon, max_lon, min_lat, max_lat))
+            return [("h103_fake.nc", datetime(2026, 8, 1, 6, 0, 0), datetime(2026, 8, 1, 6, 3, 0))]
+
+        footprint1 = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+        footprint2 = SarFootprint(
+            kind="polygon", bbox=(20.0, 30.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 2, 6, 0, 30), sensing_end=datetime(2026, 8, 2, 6, 1, 0),
+            source_file="s2.SAFE",
+        )
+
+        result = dry_collocation._predict_orbit_corridor_source(
+            source=object(), cfg=object(), sar_footprints=[footprint1, footprint2],
+            satellite_resolver=lambda name: "metop-b", list_candidates_dry=_tracking_list_candidates_dry,
+            source_type="ascat_ssm", stop_on_first_match=True,
+        )
+
+        assert result.verdict == "collocated"
+        assert seen_bboxes == [(-10.0, 10.0, 35.0, 55.0)]
+
+    def test_default_stop_on_first_match_false_stays_exhaustive(self, monkeypatch):
+        """The --dry-collocation preview path relies on the default
+        (False) to keep scanning every footprint, since matched_windows'
+        length feeds the report's own "N matched window(s)" detail text."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        def _fake_orbit_overlap_windows(satellite, start, end, min_lon, max_lon, min_lat, max_lat, **kwargs):
+            return [(start, end)]  # full overlap
+
+        monkeypatch.setattr(dry_collocation.orbit_coverage, "orbit_overlap_windows", _fake_orbit_overlap_windows)
+
+        seen_bboxes = []
+
+        def _tracking_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            seen_bboxes.append((min_lon, max_lon, min_lat, max_lat))
+            return [("h103_fake.nc", datetime(2026, 8, 1, 6, 0, 0), datetime(2026, 8, 1, 6, 3, 0))]
+
+        footprint1 = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+        footprint2 = SarFootprint(
+            kind="polygon", bbox=(20.0, 30.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 2, 6, 0, 30), sensing_end=datetime(2026, 8, 2, 6, 1, 0),
+            source_file="s2.SAFE",
+        )
+
+        result = dry_collocation._predict_orbit_corridor_source(
+            source=object(), cfg=object(), sar_footprints=[footprint1, footprint2],
+            satellite_resolver=lambda name: "metop-b", list_candidates_dry=_tracking_list_candidates_dry,
+            source_type="ascat_ssm",
+        )
+
+        assert result.verdict == "collocated"
+        assert len(seen_bboxes) == 2
+
 
 class TestCatalogPrecisePredicate:
     """_predict_catalog_precise_source resolves its time tolerance via
@@ -1351,6 +1605,75 @@ class TestCatalogPrecisePredicate:
         )
 
         assert result.verdict == "unknown"
+
+    def test_stop_on_first_match_skips_remaining_footprints(self, monkeypatch):
+        """stop_on_first_match=True (the real-run gating path) must stop
+        querying as soon as the first footprint yields a candidate -- the
+        second footprint's own listing must never be requested."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        seen_bboxes = []
+
+        def _tracking_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            seen_bboxes.append((min_lon, max_lon, min_lat, max_lat))
+            return [("granule_x", datetime(2026, 8, 1, 6, 0, 0), datetime(2026, 8, 1, 6, 5, 0))]
+
+        footprint1 = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+        footprint2 = SarFootprint(
+            kind="polygon", bbox=(20.0, 30.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 2, 6, 0, 30), sensing_end=datetime(2026, 8, 2, 6, 1, 0),
+            source_file="s2.SAFE",
+        )
+
+        result = dry_collocation._predict_catalog_precise_source(
+            source=object(), cfg=object(), sar_footprints=[footprint1, footprint2],
+            list_candidates_dry=_tracking_list_candidates_dry, source_type="scatterometer",
+            stop_on_first_match=True,
+        )
+
+        assert result.verdict == "collocated"
+        assert seen_bboxes == [(-10.0, 10.0, 35.0, 55.0)]
+
+    def test_default_stop_on_first_match_false_stays_exhaustive(self, monkeypatch):
+        """The --dry-collocation preview path relies on the default
+        (False) to keep querying every footprint, since matched_windows'
+        length feeds the report's own "N candidate(s)" detail text."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        seen_bboxes = []
+
+        def _tracking_list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end):
+            seen_bboxes.append((min_lon, max_lon, min_lat, max_lat))
+            return [("granule_x", datetime(2026, 8, 1, 6, 0, 0), datetime(2026, 8, 1, 6, 5, 0))]
+
+        footprint1 = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+        footprint2 = SarFootprint(
+            kind="polygon", bbox=(20.0, 30.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 2, 6, 0, 30), sensing_end=datetime(2026, 8, 2, 6, 1, 0),
+            source_file="s2.SAFE",
+        )
+
+        result = dry_collocation._predict_catalog_precise_source(
+            source=object(), cfg=object(), sar_footprints=[footprint1, footprint2],
+            list_candidates_dry=_tracking_list_candidates_dry, source_type="scatterometer",
+        )
+
+        assert result.verdict == "collocated"
+        assert len(seen_bboxes) == 2
 
 
 class TestPredictAscatSsm:
@@ -1472,6 +1795,44 @@ class TestPredictAscatSsm:
         from sar_validation.core import dry_collocation
 
         assert dry_collocation._PREDICATES["ascat_ssm"] is dry_collocation._predict_ascat_ssm
+
+    def test_stop_on_first_match_skips_hsaf_branch_once_eumdac_confirms(self, monkeypatch):
+        """When stop_on_first_match=True and the EUMDAC branch alone
+        already confirms 'collocated', the H-SAF branch must not run at
+        all -- a real-run gating caller only needs one confirmed hit."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *source_types: 90)
+
+        calls = []
+
+        def _fake_predict_orbit_corridor_source(
+            source, cfg, sar_footprints, *, satellite_resolver, list_candidates_dry, source_type,
+            stop_on_first_match=False,
+        ):
+            calls.append((list_candidates_dry, stop_on_first_match))
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="orbit-corridor", verdict="collocated", detail="ok",
+            )
+
+        monkeypatch.setattr(dry_collocation, "_predict_orbit_corridor_source", _fake_predict_orbit_corridor_source)
+
+        # Recent enough to be eligible for BOTH the EUMDAC and H-SAF branches.
+        now = datetime.now(timezone.utc)
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=now - timedelta(days=1), sensing_end=now - timedelta(days=1) + timedelta(minutes=1),
+            source_file="s1.SAFE",
+        )
+        monkeypatch.setattr(dry_collocation, "_ASCAT_COVERAGE_CUTOFF", now.date().isoformat())
+
+        result = dry_collocation._predict_ascat_ssm(
+            source=object(), cfg=object(), sar_footprints=[footprint], stop_on_first_match=True,
+        )
+
+        assert result.verdict == "collocated"
+        assert calls == [(dry_collocation._eumdac_ascat_ssm_list_candidates_dry, True)]
 
 
 class TestPredictScatterometerFtpSources:
@@ -1856,6 +2217,44 @@ class TestPredictAmsrSsm:
         from sar_validation.core import dry_collocation
 
         assert dry_collocation._PREDICATES["amsr_ssm"] is dry_collocation._predict_amsr_ssm
+
+    def test_stop_on_first_match_skips_gportal_branch_once_earthdata_confirms(self, monkeypatch):
+        """When stop_on_first_match=True and the Earthdata branch alone
+        already confirms 'collocated', the G-Portal (orbit-corridor)
+        branch must not run at all."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        gportal_called = []
+
+        def _fake_catalog_precise(source, cfg, sar_footprints, *, list_candidates_dry, source_type, **kwargs):
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="catalog-precise", verdict="collocated", detail="earthdata ok",
+            )
+
+        def _fake_orbit_corridor(
+            source, cfg, sar_footprints, *, satellite_resolver, list_candidates_dry, source_type, **kwargs,
+        ):
+            gportal_called.append(True)
+            return dry_collocation.SourcePrediction(
+                source_type=source_type, bucket="orbit-corridor", verdict="collocated", detail="gportal ok",
+            )
+
+        monkeypatch.setattr(dry_collocation, "_predict_catalog_precise_source", _fake_catalog_precise)
+        monkeypatch.setattr(dry_collocation, "_predict_orbit_corridor_source", _fake_orbit_corridor)
+
+        footprint = SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 30), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+        result = dry_collocation._predict_amsr_ssm(
+            source=object(), cfg=object(), sar_footprints=[footprint], stop_on_first_match=True,
+        )
+
+        assert result.verdict == "collocated"
+        assert gportal_called == []
 
 
 class TestEarthdataAmsrSsmListCandidatesDryDatasetSelection:
@@ -2668,6 +3067,56 @@ class TestPredictHfRadarShared:
 
         assert seen_keys == [("hf_radar_grid",)]
 
+    def test_stops_after_first_confirmed_hit_across_regions(self, monkeypatch):
+        """Once one candidate region's check_availability_dry returns True,
+        no further region (for that footprint, or any later footprint)
+        should be probed -- this predicate runs on the default path of
+        every real recipe run once gating is active, so its live-probe
+        cost must be bounded by the first confirmed hit, not exhaustive.
+        Uses its own multi-region table (self._REGIONS on this class only
+        has one entry -- see TestHfRadarCandidateRegions for the
+        multi-region fixture this borrows the bboxes from)."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        regions = {
+            "West": {"bbox": (-130.0, -115.0, 30.0, 50.0)},
+            "East": {"bbox": (-98.0, -60.0, 22.0, 46.0)},
+            "Elsewhere": {"bbox": (100.0, 110.0, 0.0, 10.0)},
+        }
+
+        # Overlaps both "West" and "East".
+        multi_region_footprint = SarFootprint(
+            kind="polygon", bbox=(-120.0, -90.0, 25.0, 35.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+        second_footprint = SarFootprint(
+            kind="polygon", bbox=(100.0, 105.0, 1.0, 5.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 2, 6, 0, 0), sensing_end=datetime(2026, 8, 2, 6, 1, 0),
+            source_file="s2.SAFE",
+        )
+
+        calls = []
+
+        def _fake_check(min_lon, max_lon, min_lat, max_lat, start, end):
+            calls.append((min_lon, max_lon, min_lat, max_lat))
+            return True
+
+        result = dry_collocation._predict_hf_radar(
+            source=object(), cfg=object(), sar_footprints=[multi_region_footprint, second_footprint],
+            check_availability_dry=_fake_check,
+            regions_table=regions, source_type="hf_radar",
+        )
+
+        assert result.verdict == "collocated"
+        # Only the first overlapping region of the first footprint was
+        # ever checked -- neither the second overlapping region nor the
+        # second footprint's own region ("Elsewhere") triggered a call.
+        assert len(calls) == 1
+
 
 class TestPredictHfRadarRegistrations:
     """One predict_source integration test per real HF-radar
@@ -2803,6 +3252,36 @@ class TestPredictHfRadarUs:
 
         assert result.verdict == "unknown"
 
+    def test_stops_after_first_confirmed_hit_across_footprints(self, monkeypatch):
+        """Once the first footprint's own check confirms availability, the
+        second footprint must not be probed at all -- bounds this
+        predicate's live-probe cost on the real-run gating path."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        calls = []
+
+        def _fake_check(min_lon, max_lon, min_lat, max_lat, start, end):
+            calls.append((min_lon, max_lon, min_lat, max_lat))
+            return True
+
+        monkeypatch.setattr(dry_collocation, "_hf_radar_us_check_dry", _fake_check)
+
+        second_footprint = SarFootprint(
+            kind="polygon", bbox=(0.0, 5.0, 0.0, 5.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 2, 6, 0, 0), sensing_end=datetime(2026, 8, 2, 6, 1, 0),
+            source_file="s2.SAFE",
+        )
+
+        result = dry_collocation._predict_hf_radar_us(
+            source=object(), cfg=object(), sar_footprints=[self._footprint(), second_footprint],
+        )
+
+        assert result.verdict == "collocated"
+        assert len(calls) == 1
+
 
 class TestPredictGlobalComposite:
     """_predict_global_composite is the shared predicate for the
@@ -2855,6 +3334,30 @@ class TestPredictGlobalComposite:
         assert result.verdict == "collocated"
         assert result.bucket == "global-composite"
         assert seen_days == [datetime(2026, 8, 1).date(), datetime(2026, 8, 2).date()]
+
+    def test_stops_after_first_confirmed_day(self, monkeypatch):
+        """Once any day exists, no later day (of the same or a later
+        footprint) should be probed -- bounds this predicate's live-probe
+        cost on the real-run gating path."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.core.dry_collocation import _predict_global_composite
+
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        seen_days = []
+
+        def _check(day):
+            seen_days.append(day)
+            return True
+
+        result = _predict_global_composite(
+            source=object(), cfg=object(),
+            sar_footprints=[self._footprint(datetime(2026, 8, 1, 6)), self._footprint(datetime(2026, 8, 2, 6))],
+            check_exists_dry=_check, source_type="radiometer",
+        )
+
+        assert result.verdict == "collocated"
+        assert seen_days == [datetime(2026, 8, 1).date()]
 
     def test_none_predicted_when_no_footprint_day_exists(self, monkeypatch):
         from sar_validation.core import dry_collocation
@@ -3604,7 +4107,7 @@ class TestPredictCollocation:
         }
         monkeypatch.setattr(
             dry_collocation, "predict_source",
-            lambda source, cfg, sar_footprints: fake_predictions[source.source_type],
+            lambda source, cfg, sar_footprints, **kwargs: fake_predictions[source.source_type],
         )
 
         report = dry_collocation.predict_collocation(_FakeCfg(), sar_footprints=[], recipe_path="r.yaml")
@@ -3613,6 +4116,12 @@ class TestPredictCollocation:
         assert report.sar_footprint_count == 0
         assert len(report.predictions) == 2
         assert {p.source_type for p in report.predictions} == {"ismn", "era5"}
+        # Every prediction reflects the real (fake) predicate result, not a
+        # silently-swallowed "unknown" from a signature mismatch between
+        # predict_collocation's own stop_on_first_match forwarding and this
+        # fake -- i.e. the fake was genuinely called, not caught by
+        # predict_collocation's per-source try/except.
+        assert {p.verdict for p in report.predictions} == {"collocated", "none-predicted"}
 
     def test_a_single_source_raising_becomes_unknown_not_a_crash(self, monkeypatch):
         """One source's predicate misbehaving must not take down the
@@ -3627,7 +4136,7 @@ class TestPredictCollocation:
         class _FakeCfg:
             validation_sources = [_FakeSource("ismn"), _FakeSource("era5")]
 
-        def _fake_predict_source(source, cfg, sar_footprints):
+        def _fake_predict_source(source, cfg, sar_footprints, **kwargs):
             if source.source_type == "ismn":
                 raise RuntimeError("boom")
             return dry_collocation.SourcePrediction(
@@ -3641,6 +4150,61 @@ class TestPredictCollocation:
         assert len(report.predictions) == 2
         ismn_pred = next(p for p in report.predictions if p.source_type == "ismn")
         assert ismn_pred.verdict == "unknown"
+
+    def test_stop_on_first_match_forwarded_to_every_source(self, monkeypatch):
+        """The real-run gating path (DataOrchestrator._collocation_predictions)
+        calls predict_collocation(..., stop_on_first_match=True) -- confirm
+        that value reaches predict_source once per configured validation
+        source, not just the first."""
+        from sar_validation.core import dry_collocation
+
+        class _FakeSource:
+            def __init__(self, source_type):
+                self.source_type = source_type
+
+        class _FakeCfg:
+            validation_sources = [_FakeSource("ismn"), _FakeSource("era5")]
+
+        seen = []
+
+        def _fake_predict_source(source, cfg, sar_footprints, *, stop_on_first_match=False):
+            seen.append((source.source_type, stop_on_first_match))
+            return dry_collocation.SourcePrediction(
+                source_type=source.source_type, bucket="x", verdict="unknown", detail="x",
+            )
+
+        monkeypatch.setattr(dry_collocation, "predict_source", _fake_predict_source)
+
+        dry_collocation.predict_collocation(_FakeCfg(), sar_footprints=[], stop_on_first_match=True)
+
+        assert seen == [("ismn", True), ("era5", True)]
+
+    def test_stop_on_first_match_defaults_to_false(self, monkeypatch):
+        """The --dry-collocation preview path calls predict_collocation
+        without stop_on_first_match at all -- confirm that still resolves
+        to False at predict_source, preserving today's exhaustive
+        behavior."""
+        from sar_validation.core import dry_collocation
+
+        class _FakeSource:
+            source_type = "ismn"
+
+        class _FakeCfg:
+            validation_sources = [_FakeSource()]
+
+        seen = []
+
+        def _fake_predict_source(source, cfg, sar_footprints, *, stop_on_first_match=False):
+            seen.append(stop_on_first_match)
+            return dry_collocation.SourcePrediction(
+                source_type=source.source_type, bucket="x", verdict="unknown", detail="x",
+            )
+
+        monkeypatch.setattr(dry_collocation, "predict_source", _fake_predict_source)
+
+        dry_collocation.predict_collocation(_FakeCfg(), sar_footprints=[])
+
+        assert seen == [False]
 
 
 class TestReportRendering:

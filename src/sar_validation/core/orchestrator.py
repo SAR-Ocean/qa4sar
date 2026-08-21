@@ -622,7 +622,16 @@ class DataOrchestrator:
             sar_footprints = sar_footprints_from_downloaded(
                 sar_files, sar_source_spec, self.recipe.config.variable,
             )
-            report = predict_collocation(self.recipe.config, sar_footprints)
+            logger.info(
+                "Predicting collocation for %d validation source(s)...",
+                len(self.recipe.config.validation_sources),
+            )
+            # stop_on_first_match=True: this real-run gating path only ever
+            # needs a yes/no verdict per source, unlike the --dry-collocation
+            # preview path (predict_collocation's own default, False), which
+            # needs every predicate's exhaustive matched_windows count for
+            # its report. See predict_source's docstring.
+            report = predict_collocation(self.recipe.config, sar_footprints, stop_on_first_match=True)
             self._collocation_predictions_cache = {p.source_type: p for p in report.predictions}
         except Exception:
             logger.debug(

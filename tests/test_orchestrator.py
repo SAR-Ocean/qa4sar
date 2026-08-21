@@ -2591,3 +2591,65 @@ class TestCollocationSkipGating:
         orchestrator.download_all()
 
         assert insitu_calls == [["mooring"]]
+
+
+class TestCollocationPredictionsStopOnFirstMatch:
+    """_collocation_predictions() is the real-run gating path's own call
+    site into predict_collocation -- unlike the --dry-collocation CLI
+    preview path (which needs predict_collocation's exhaustive default,
+    for its own matched-window counts), this path only ever needs a
+    yes/no verdict per source, so it must request
+    stop_on_first_match=True to bound a live predicate's per-footprint
+    probing cost (see the final whole-branch review's Important #1). It
+    must also log before the (potentially multi-minute) probe starts, so
+    a real run isn't silently hanging with zero visibility."""
+
+    def _orchestrator(self, tmp_path):
+        cfg = RecipeConfig(
+            name="test", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            sar_data=SARDataSpec(source="sentinel1_l2_ocn"),
+            validation_sources=[
+                ValidationDataSource(source_type="era5"), ValidationDataSource(source_type="ismn"),
+            ],
+        )
+        orchestrator = DataOrchestrator(Recipe(cfg), dry_run=False)
+        orchestrator.base_dir = tmp_path
+        orchestrator.metadata["downloads"]["sar"] = {"files": []}
+        return orchestrator
+
+    def test_predict_collocation_called_with_stop_on_first_match_true(self, tmp_path, monkeypatch):
+        from sar_validation.core import dry_collocation as dc
+
+        orchestrator = self._orchestrator(tmp_path)
+        monkeypatch.setattr(dc, "sar_footprints_from_downloaded", lambda *a, **k: [])
+
+        captured = {}
+
+        def _fake_predict_collocation(cfg_arg, sar_footprints, **kwargs):
+            captured.update(kwargs)
+            return dc.CollocationReport(recipe_path="", sar_footprint_count=0, predictions=[])
+
+        monkeypatch.setattr(dc, "predict_collocation", _fake_predict_collocation)
+
+        orchestrator._collocation_predictions()
+
+        assert captured.get("stop_on_first_match") is True
+
+    def test_logs_before_predicting(self, tmp_path, monkeypatch, caplog):
+        from sar_validation.core import dry_collocation as dc
+
+        orchestrator = self._orchestrator(tmp_path)
+        monkeypatch.setattr(dc, "sar_footprints_from_downloaded", lambda *a, **k: [])
+        monkeypatch.setattr(
+            dc, "predict_collocation",
+            lambda cfg_arg, sar_footprints, **kwargs: dc.CollocationReport(
+                recipe_path="", sar_footprint_count=0, predictions=[],
+            ),
+        )
+
+        with caplog.at_level(logging.INFO, logger="sar_validation.core.orchestrator"):
+            orchestrator._collocation_predictions()
+
+        assert any("2" in r.message and "validation source" in r.message for r in caplog.records)

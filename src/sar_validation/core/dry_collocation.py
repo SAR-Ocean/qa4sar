@@ -13,6 +13,7 @@ This module is built up across four sequential implementation plans:
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -23,6 +24,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, List, Literal, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 from ..downloaders import radarsat2_wind_downloader as _rs2
@@ -637,48 +639,84 @@ def sar_footprints_from_downloaded(sar_files, sar_source_spec, product_type: str
 
     footprints = []
     for path in sar_files:
+        # Everything for one file -- both convert() itself AND the
+        # geometry/time extraction that follows it -- lives in this one
+        # try/except: a converted Dataset missing lon/lat raises KeyError,
+        # and a non-WV source's "time" value can be a length-1 array
+        # rather than a true scalar (see the pd.to_datetime(np.atleast_1d(
+        # ...)) note below) -- either must skip just THIS file, not
+        # propagate out of sar_footprints_from_downloaded and hit
+        # _collocation_predictions()'s blanket except Exception, which
+        # would silently disable gating for the ENTIRE run instead of
+        # just dropping one bad file.
         try:
             ds = sar_source_spec.convert(path, product_type)
+            if ds is None:
+                continue
+            lon_min, lon_max = float(ds["lon"].min()), float(ds["lon"].max())
+            lat_min, lat_max = float(ds["lat"].min()), float(ds["lat"].max())
+            is_wv = "point" in ds.dims and "y" not in ds.dims  # matches collocation.py's own is_wv_mode check
+            if is_wv:
+                lats = ds["lat"].values.tolist()
+                lons = ds["lon"].values.tolist()
+                points = list(zip(lats, lons))
+                # A WV product's "time" coord holds one value per vignette
+                # (dims=["point"]) -- a real product bundles ~16 of them at
+                # DIFFERENT acquisition times (see
+                # DataTreeConverter.from_sar_l2_ocn_wv_safe), so it's an
+                # array, not a scalar; sensing_start/sensing_end span its
+                # full range rather than assuming a single .item()-able value.
+                times = pd.to_datetime(ds["time"].values)
+                sensing_start_ts, sensing_end_ts = times.min(), times.max()
+                kind: "Literal['polygon', 'wv_points']" = "wv_points"
+            else:
+                # pd.to_datetime(np.atleast_1d(...)), not pd.Timestamp(...)
+                # or numpy's own .item(): a numpy datetime64 scalar's
+                # .item() returns a raw int (nanoseconds since epoch), not
+                # a datetime -- every predicate below does datetime
+                # arithmetic (subtraction/comparison/.isoformat()) on
+                # sensing_start/sensing_end, so an int here makes every
+                # single prediction raise and fall back to "unknown",
+                # which never satisfies _should_skip_for_collocation's
+                # verdict == "none-predicted" check -- silently disabling
+                # the entire skip-gating feature for every real (non-dry)
+                # run. pd.Timestamp(...) additionally raises TypeError
+                # outright if "time" happens to be a length-1 array rather
+                # than a true 0-d scalar -- np.atleast_1d normalizes that
+                # the same defensive way orchestrator.py's own
+                # _compute_sar_scene_times already does for these exact
+                # same converted files.
+                idx = pd.to_datetime(np.atleast_1d(ds["time"].values))
+                sensing_start_ts, sensing_end_ts = idx.min(), idx.max()
+                kind = "polygon"
+
+            # A resolved NaT (e.g. a NISAR SME2 granule with a missing/
+            # unparseable zeroDopplerStartTime -- see
+            # datatree_converter.py) must not become a footprint at all:
+            # an unfiltered NaT can make _predict_global_composite's
+            # day-range loop produce zero days, a false "none-predicted"
+            # verdict that wrongly SKIPS a real download -- the one
+            # fail-closed risk in this feature, and the only place in
+            # this module that must NOT fail toward inclusion.
+            if pd.isna(sensing_start_ts) or pd.isna(sensing_end_ts):
+                logger.debug("sar_footprints_from_downloaded: NaT sensing time for %s, skipping", path)
+                continue
+
+            if kind == "wv_points":
+                footprints.append(SarFootprint(
+                    kind="wv_points", bbox=(lon_min, lon_max, lat_min, lat_max), polygon=None, points=points,
+                    sensing_start=sensing_start_ts.to_pydatetime(), sensing_end=sensing_end_ts.to_pydatetime(),
+                    source_file=str(path),
+                ))
+            else:
+                footprints.append(SarFootprint(
+                    kind="polygon", bbox=(lon_min, lon_max, lat_min, lat_max), polygon=None, points=None,
+                    sensing_start=sensing_start_ts.to_pydatetime(), sensing_end=sensing_end_ts.to_pydatetime(),
+                    source_file=str(path),
+                ))
         except Exception:
-            logger.debug("sar_footprints_from_downloaded: convert() failed for %s", path, exc_info=True)
+            logger.debug("sar_footprints_from_downloaded: failed for %s", path, exc_info=True)
             continue
-        if ds is None:
-            continue
-        lon_min, lon_max = float(ds["lon"].min()), float(ds["lon"].max())
-        lat_min, lat_max = float(ds["lat"].min()), float(ds["lat"].max())
-        is_wv = "point" in ds.dims and "y" not in ds.dims  # matches collocation.py's own is_wv_mode check
-        if is_wv:
-            lats = ds["lat"].values.tolist()
-            lons = ds["lon"].values.tolist()
-            points = list(zip(lats, lons))
-            # A WV product's "time" coord holds one value per vignette
-            # (dims=["point"]) -- a real product bundles ~16 of them at
-            # DIFFERENT acquisition times (see
-            # DataTreeConverter.from_sar_l2_ocn_wv_safe), so it's an
-            # array, not a scalar; sensing_start/sensing_end span its
-            # full range rather than assuming a single .item()-able value.
-            times = pd.to_datetime(ds["time"].values)
-            footprints.append(SarFootprint(
-                kind="wv_points", bbox=(lon_min, lon_max, lat_min, lat_max), polygon=None, points=points,
-                sensing_start=times.min().to_pydatetime(), sensing_end=times.max().to_pydatetime(),
-                source_file=str(path),
-            ))
-        else:
-            # pd.Timestamp(...), not numpy's own .item(): a numpy
-            # datetime64 scalar's .item() returns a raw int (nanoseconds
-            # since epoch), not a datetime -- every predicate below does
-            # datetime arithmetic (subtraction/comparison/.isoformat())
-            # on sensing_start/sensing_end, so an int here makes every
-            # single prediction raise and fall back to "unknown", which
-            # never satisfies _should_skip_for_collocation's
-            # verdict == "none-predicted" check -- silently disabling
-            # the entire skip-gating feature for every real (non-dry) run.
-            time_val = ds["time"].values
-            sensing = pd.Timestamp(time_val).to_pydatetime()
-            footprints.append(SarFootprint(
-                kind="polygon", bbox=(lon_min, lon_max, lat_min, lat_max), polygon=None, points=None,
-                sensing_start=sensing, sensing_end=sensing, source_file=str(path),
-            ))
     return footprints
 
 
@@ -729,29 +767,69 @@ class CollocationReport:
 _PREDICATES: "dict[str, Callable[..., SourcePrediction]]" = {}
 
 
-def predict_source(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+def _predicate_accepts_stop_on_first_match(predicate: "Callable[..., SourcePrediction]") -> bool:
+    """Whether *predicate* declares a stop_on_first_match keyword argument
+    (directly, or via **kwargs) -- only the orbit-corridor/catalog-precise
+    bucket predicates (and the thin per-source_type wrappers registered
+    over them) do. This lets predict_source thread the real-run gating
+    path's early-exit request (see DataOrchestrator._collocation_predictions)
+    through to exactly those predicates, leaving every other predicate's
+    3-argument call signature -- and any test that monkeypatches one of
+    the shared bucket predicates with a fixed-arity fake -- untouched."""
+    try:
+        params = inspect.signature(predicate).parameters
+    except (TypeError, ValueError):
+        return False
+    return "stop_on_first_match" in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def predict_source(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
     """Dispatch to the right bucket's predicate for source.source_type.
     An unrecognized source_type is itself an "unknown" verdict -- never
     raises, since the report loop calls this once per configured
-    validation source and must not crash on one bad/future entry."""
+    validation source and must not crash on one bad/future entry.
+
+    stop_on_first_match (default False, used by the --dry-collocation
+    preview path): requests that a predicate stop probing as soon as one
+    confirmed collocation is found, rather than exhaustively checking
+    every SAR footprint -- see DataOrchestrator._collocation_predictions,
+    the real-run gating path this exists for. Only forwarded to predicates
+    that actually declare the parameter (see
+    _predicate_accepts_stop_on_first_match); every other predicate keeps
+    running its own default (exhaustive) behavior regardless of this
+    flag, since a plain yes/no predicate already short-circuits its own
+    footprint loop on the first hit (see e.g. _predict_insitu)."""
     predicate = _PREDICATES.get(source.source_type)
     if predicate is None:
         return SourcePrediction(
             source_type=source.source_type, bucket="unregistered", verdict="unknown",
             detail=f"No dry-collocation predicate registered for source_type={source.source_type!r}.",
         )
+    if stop_on_first_match and _predicate_accepts_stop_on_first_match(predicate):
+        return predicate(source, cfg, sar_footprints, stop_on_first_match=True)
     return predicate(source, cfg, sar_footprints)
 
 
-def predict_collocation(cfg, sar_footprints: "list[SarFootprint]", recipe_path: str = "") -> CollocationReport:
+def predict_collocation(
+    cfg, sar_footprints: "list[SarFootprint]", recipe_path: str = "", *, stop_on_first_match: bool = False,
+) -> CollocationReport:
     """Predict collocation for every configured validation source in
     cfg.validation_sources against sar_footprints. One source's predicate
     raising is caught and turned into an "unknown" verdict for that
-    source alone -- never aborts the whole report."""
+    source alone -- never aborts the whole report.
+
+    stop_on_first_match is forwarded to predict_source per source -- see
+    its docstring."""
     predictions = []
     for source in cfg.validation_sources:
         try:
-            predictions.append(predict_source(source, cfg, sar_footprints))
+            predictions.append(
+                predict_source(source, cfg, sar_footprints, stop_on_first_match=stop_on_first_match)
+            )
         except Exception:
             logger.debug("predict_collocation: predict_source failed for %s", source.source_type, exc_info=True)
             predictions.append(
@@ -887,6 +965,7 @@ def _predict_orbit_corridor_source(
     satellite_resolver: "Callable[[str], str]",
     list_candidates_dry: "Callable[..., list[tuple[str, datetime, datetime]]]",
     source_type: str,
+    stop_on_first_match: bool = False,
 ) -> SourcePrediction:
     """Shared predicate for every orbit-corridor-bucket source (ASCAT SSM
     via H-SAF/EUMDAC, HY-2B/HY-2C/Oceansat-3, AMSR2, SMOS): a coarse
@@ -902,6 +981,16 @@ def _predict_orbit_corridor_source(
     orbit_overlap_windows call per point), never against one enclosing
     box, since a vignette is a small area far smaller than the
     footprint's overall bbox.
+
+    stop_on_first_match: the --dry-collocation preview path (the default,
+    False) keeps scanning every footprint/candidate/point so matched_windows
+    accumulates a real count for the report's own "N matched window(s)"
+    detail text. The real-run gating path (DataOrchestrator._collocation_
+    predictions, via predict_collocation(..., stop_on_first_match=True))
+    only ever needs a yes/no verdict, so it opts into stopping at the
+    first confirmed match instead -- this is what bounds this predicate's
+    live-probe cost (list_candidates_dry / orbit_overlap_windows calls) on
+    the default path of every real recipe run.
     """
     if not sar_footprints:
         return SourcePrediction(
@@ -913,6 +1002,8 @@ def _predict_orbit_corridor_source(
     matched_windows: "list[tuple[datetime, datetime]]" = []
 
     for footprint in sar_footprints:
+        if stop_on_first_match and matched_windows:
+            break
         padded_start = footprint.sensing_start - tolerance
         padded_end = footprint.sensing_end + tolerance
         try:
@@ -931,6 +1022,8 @@ def _predict_orbit_corridor_source(
             list(footprint.points or []) if footprint.kind == "wv_points" else [None]
         )
         for candidate_name, cand_start, cand_end in candidates:
+            if stop_on_first_match and matched_windows:
+                break
             try:
                 satellite = satellite_resolver(candidate_name)
             except Exception:
@@ -938,6 +1031,8 @@ def _predict_orbit_corridor_source(
                 matched_windows.append((cand_start, cand_end))  # fail open
                 continue
             for point in points:
+                if stop_on_first_match and matched_windows:
+                    break
                 if point is None:
                     target_bbox = footprint.bbox
                     target_polygon = footprint.polygon
@@ -957,6 +1052,8 @@ def _predict_orbit_corridor_source(
                 for w_start, w_end in windows:
                     if _windows_overlap(w_start, w_end, padded_start, padded_end):
                         matched_windows.append((w_start, w_end))
+                        if stop_on_first_match:
+                            break
 
     if matched_windows:
         return SourcePrediction(
@@ -978,6 +1075,7 @@ def _predict_catalog_precise_source(
     list_candidates_dry: "Callable[..., list[tuple[str, datetime, datetime]]]",
     source_type: str,
     tolerance_source_types: "Optional[tuple[str, ...]]" = None,
+    stop_on_first_match: bool = False,
 ) -> SourcePrediction:
     """Shared predicate for every catalog-precise-bucket source (ASCAT
     winds, SMAP/AMSR2 via NASA Earthdata/CMR, altimeter via Copernicus
@@ -996,6 +1094,11 @@ def _predict_catalog_precise_source(
     source_type doesn't itself carry a DEFAULT_LAYER_TYPE_SPECS entry
     (e.g. altimeter, keyed there as "altimeter_1hz"/"altimeter_5hz").
     Defaults to (source_type,), matching every other caller.
+
+    stop_on_first_match: see _predict_orbit_corridor_source's identical
+    parameter -- False (the default) preserves the --dry-collocation
+    preview path's exhaustive matched_windows count; the real-run gating
+    path opts into True to bound this predicate's live listing-call cost.
     """
     if not sar_footprints:
         return SourcePrediction(
@@ -1009,12 +1112,16 @@ def _predict_catalog_precise_source(
     matched_windows: "list[tuple[datetime, datetime]]" = []
 
     for footprint in sar_footprints:
+        if stop_on_first_match and matched_windows:
+            break
         padded_start = footprint.sensing_start - tolerance
         padded_end = footprint.sensing_end + tolerance
         points: "list[Optional[tuple[float, float]]]" = (
             list(footprint.points or []) if footprint.kind == "wv_points" else [None]
         )
         for point in points:
+            if stop_on_first_match and matched_windows:
+                break
             bbox = footprint.bbox if point is None else (point[1], point[1], point[0], point[0])
             try:
                 candidates = list_candidates_dry(
@@ -1029,6 +1136,8 @@ def _predict_catalog_precise_source(
                 )
             for _name, cand_start, cand_end in candidates:
                 matched_windows.append((cand_start, cand_end))
+                if stop_on_first_match:
+                    break
 
     if matched_windows:
         return SourcePrediction(
@@ -1102,7 +1211,9 @@ def _eumdac_ascat_ssm_list_candidates_dry(
     return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
 
 
-def _predict_ascat_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+def _predict_ascat_ssm(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
     """Combined predicate for source_type="ascat_ssm", mirroring
     orchestrator.py's _download_ascat_ssm branching: EUMDAC's SOMO12
     archive covers footprints on/before _ASCAT_COVERAGE_CUTOFF, H-SAF's
@@ -1114,6 +1225,12 @@ def _predict_ascat_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> Sou
     falls in the genuine gap between the two archives (neither branch
     applies) is "unknown" rather than a confident "none-predicted",
     since that gap is a coverage limitation, not evidence of absence.
+
+    stop_on_first_match: forwarded to each branch's own
+    _predict_orbit_corridor_source call (see its docstring) -- and, when
+    True, also skips the H-SAF branch entirely once the EUMDAC branch
+    alone already confirmed "collocated", since a real-run gating caller
+    only needs one confirmed hit across either archive.
     """
     tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, "ascat_ssm"))
     hsaf_window_start = (datetime.now(timezone.utc).date() - timedelta(days=60)).isoformat()
@@ -1127,20 +1244,39 @@ def _predict_ascat_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> Sou
         if (fp.sensing_end + tolerance).date().isoformat() >= hsaf_window_start
     ]
 
+    def _orbit_corridor(
+        footprints: "list[SarFootprint]",
+        satellite_resolver: "Callable[[str], str]",
+        list_candidates_dry: "Callable[..., list[tuple[str, datetime, datetime]]]",
+    ) -> SourcePrediction:
+        # Explicit branching rather than a **kwargs spread: mypy can't
+        # verify a spread dict's value type against every one of
+        # _predict_orbit_corridor_source's differently-typed keyword
+        # parameters, and passing stop_on_first_match=False unconditionally
+        # would break the several existing tests that monkeypatch
+        # _predict_orbit_corridor_source with a fixed-arity fake lacking
+        # that parameter.
+        if stop_on_first_match:
+            return _predict_orbit_corridor_source(
+                source, cfg, footprints,
+                satellite_resolver=satellite_resolver, list_candidates_dry=list_candidates_dry,
+                source_type="ascat_ssm", stop_on_first_match=True,
+            )
+        return _predict_orbit_corridor_source(
+            source, cfg, footprints,
+            satellite_resolver=satellite_resolver, list_candidates_dry=list_candidates_dry,
+            source_type="ascat_ssm",
+        )
+
     predictions: "list[SourcePrediction]" = []
     if eumdac_footprints:
-        predictions.append(_predict_orbit_corridor_source(
-            source, cfg, eumdac_footprints,
-            satellite_resolver=_parse_eumdac_ascat_satellite,
-            list_candidates_dry=_eumdac_ascat_ssm_list_candidates_dry,
-            source_type="ascat_ssm",
+        predictions.append(_orbit_corridor(
+            eumdac_footprints, _parse_eumdac_ascat_satellite, _eumdac_ascat_ssm_list_candidates_dry,
         ))
-    if hsaf_footprints:
-        predictions.append(_predict_orbit_corridor_source(
-            source, cfg, hsaf_footprints,
-            satellite_resolver=_hsaf_satellite_resolver,
-            list_candidates_dry=_hsaf_list_candidates_dry,
-            source_type="ascat_ssm",
+    already_confirmed = stop_on_first_match and any(p.verdict == "collocated" for p in predictions)
+    if hsaf_footprints and not already_confirmed:
+        predictions.append(_orbit_corridor(
+            hsaf_footprints, _hsaf_satellite_resolver, _hsaf_list_candidates_dry,
         ))
 
     if not predictions:
@@ -1202,20 +1338,27 @@ def _oceansat3_list_candidates_dry(
     return _scatterometer_ftp_list_candidates_dry("oceansat3", min_lon, max_lon, min_lat, max_lat, start, end)
 
 
-def _predict_scatterometer_hy2b(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+def _predict_scatterometer_hy2b(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
     """Orbit-corridor predicate for source_type="scatterometer_hy2b" --
     HY-2B's OSI-SAF wind FTP listing (see scatterometer_ftp_downloader.py)
     only ever contains HY-2B's own data, so satellite_resolver is a fixed
-    constant rather than parsed per candidate."""
+    constant rather than parsed per candidate. stop_on_first_match is
+    forwarded straight through -- see _predict_orbit_corridor_source's
+    docstring."""
     return _predict_orbit_corridor_source(
         source, cfg, sar_footprints,
         satellite_resolver=lambda name: "hy2b",
         list_candidates_dry=_hy2b_list_candidates_dry,
         source_type="scatterometer_hy2b",
+        stop_on_first_match=stop_on_first_match,
     )
 
 
-def _predict_scatterometer_hy2c(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+def _predict_scatterometer_hy2c(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
     """Orbit-corridor predicate for source_type="scatterometer_hy2c" --
     see _predict_scatterometer_hy2b."""
     return _predict_orbit_corridor_source(
@@ -1223,10 +1366,13 @@ def _predict_scatterometer_hy2c(source, cfg, sar_footprints: "list[SarFootprint]
         satellite_resolver=lambda name: "hy2c",
         list_candidates_dry=_hy2c_list_candidates_dry,
         source_type="scatterometer_hy2c",
+        stop_on_first_match=stop_on_first_match,
     )
 
 
-def _predict_scatterometer_oceansat3(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+def _predict_scatterometer_oceansat3(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
     """Orbit-corridor predicate for source_type="scatterometer_oceansat3"
     -- see _predict_scatterometer_hy2b."""
     return _predict_orbit_corridor_source(
@@ -1234,6 +1380,7 @@ def _predict_scatterometer_oceansat3(source, cfg, sar_footprints: "list[SarFootp
         satellite_resolver=lambda name: "oceansat3",
         list_candidates_dry=_oceansat3_list_candidates_dry,
         source_type="scatterometer_oceansat3",
+        stop_on_first_match=stop_on_first_match,
     )
 
 
@@ -1254,7 +1401,9 @@ def _smos_list_candidates_dry(
     return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
 
 
-def _predict_smos_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+def _predict_smos_ssm(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
     """Orbit-corridor predicate for source_type="smos_ssm" -- SMOS's OADS
     listing (see smos_downloader.py) only ever contains SMOS's own data,
     so satellite_resolver is a fixed constant rather than parsed per
@@ -1264,6 +1413,7 @@ def _predict_smos_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> Sour
         satellite_resolver=lambda name: "smos",
         list_candidates_dry=_smos_list_candidates_dry,
         source_type="smos_ssm",
+        stop_on_first_match=stop_on_first_match,
     )
 
 
@@ -1281,7 +1431,9 @@ def _scatterometer_list_candidates_dry(
     return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
 
 
-def _predict_scatterometer(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+def _predict_scatterometer(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
     """Catalog-precise predicate for source_type="scatterometer" (ASCAT
     winds via EUMDAC) -- EUMDAC's own collection.search(bbox=...) is
     already a real geometrically-precise server-side query."""
@@ -1289,6 +1441,7 @@ def _predict_scatterometer(source, cfg, sar_footprints: "list[SarFootprint]") ->
         source, cfg, sar_footprints,
         list_candidates_dry=_scatterometer_list_candidates_dry,
         source_type="scatterometer",
+        stop_on_first_match=stop_on_first_match,
     )
 
 
@@ -1305,7 +1458,9 @@ def _smap_ssm_list_candidates_dry(
     return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
 
 
-def _predict_smap_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+def _predict_smap_ssm(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
     """Catalog-precise predicate for source_type="smap_ssm" -- NASA
     Earthdata/CMR's earthaccess.search_data(bounding_box=...) is already
     a real geometrically-precise server-side query."""
@@ -1313,6 +1468,7 @@ def _predict_smap_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> Sour
         source, cfg, sar_footprints,
         list_candidates_dry=_smap_ssm_list_candidates_dry,
         source_type="smap_ssm",
+        stop_on_first_match=stop_on_first_match,
     )
 
 
@@ -1333,7 +1489,9 @@ def _altimeter_list_candidates_dry(
     return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
 
 
-def _predict_altimeter(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+def _predict_altimeter(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
     """Catalog-precise predicate for source_type="altimeter" -- Copernicus
     Marine's along-track datasets are opened bbox/time-filtered via
     copernicusmarine.open_dataset(), already a real geometrically-precise
@@ -1350,6 +1508,7 @@ def _predict_altimeter(source, cfg, sar_footprints: "list[SarFootprint]") -> Sou
         list_candidates_dry=_altimeter_list_candidates_dry,
         source_type="altimeter",
         tolerance_source_types=("altimeter_1hz", "altimeter_5hz"),
+        stop_on_first_match=stop_on_first_match,
     )
 
 
@@ -1397,7 +1556,9 @@ def _gportal_amsr_ssm_list_candidates_dry(
     return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
 
 
-def _predict_amsr_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+def _predict_amsr_ssm(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
     """Combined predicate for source_type="amsr_ssm", mirroring
     orchestrator.py's _download_amsr_ssm: NASA Earthdata/CMR is checked
     first, JAXA G-Portal (SFTP) is a real second source that often
@@ -1411,18 +1572,49 @@ def _predict_amsr_ssm(source, cfg, sar_footprints: "list[SarFootprint]") -> Sour
     internally reuses the orbit-corridor bucket's shared predicate --
     the label describes the source, not which internal path happened to
     answer.
+
+    stop_on_first_match is forwarded to each branch's own shared-predicate
+    call (see _predict_orbit_corridor_source's docstring) and, when True,
+    also skips the G-Portal branch entirely once Earthdata alone already
+    confirmed "collocated" -- a real-run gating caller only needs one
+    confirmed hit across either source.
     """
-    earthdata_prediction = _predict_catalog_precise_source(
-        source, cfg, sar_footprints,
-        list_candidates_dry=_earthdata_amsr_ssm_list_candidates_dry,
-        source_type="amsr_ssm",
-    )
-    gportal_prediction = _predict_orbit_corridor_source(
-        source, cfg, sar_footprints,
-        satellite_resolver=lambda name: "gcom-w1",
-        list_candidates_dry=_gportal_amsr_ssm_list_candidates_dry,
-        source_type="amsr_ssm",
-    )
+    # Explicit branching rather than a **kwargs spread: mypy can't verify
+    # a spread dict's value type against every one of these shared
+    # predicates' differently-typed keyword parameters (e.g.
+    # tolerance_source_types: Optional[Tuple[str, ...]]), and passing
+    # stop_on_first_match=False unconditionally would break the several
+    # existing tests that monkeypatch _predict_catalog_precise_source /
+    # _predict_orbit_corridor_source with a fixed-arity fake lacking that
+    # parameter.
+    if stop_on_first_match:
+        earthdata_prediction = _predict_catalog_precise_source(
+            source, cfg, sar_footprints,
+            list_candidates_dry=_earthdata_amsr_ssm_list_candidates_dry,
+            source_type="amsr_ssm", stop_on_first_match=True,
+        )
+    else:
+        earthdata_prediction = _predict_catalog_precise_source(
+            source, cfg, sar_footprints,
+            list_candidates_dry=_earthdata_amsr_ssm_list_candidates_dry,
+            source_type="amsr_ssm",
+        )
+    if stop_on_first_match and earthdata_prediction.verdict == "collocated":
+        return earthdata_prediction
+    if stop_on_first_match:
+        gportal_prediction = _predict_orbit_corridor_source(
+            source, cfg, sar_footprints,
+            satellite_resolver=lambda name: "gcom-w1",
+            list_candidates_dry=_gportal_amsr_ssm_list_candidates_dry,
+            source_type="amsr_ssm", stop_on_first_match=True,
+        )
+    else:
+        gportal_prediction = _predict_orbit_corridor_source(
+            source, cfg, sar_footprints,
+            satellite_resolver=lambda name: "gcom-w1",
+            list_candidates_dry=_gportal_amsr_ssm_list_candidates_dry,
+            source_type="amsr_ssm",
+        )
 
     predictions = [earthdata_prediction, gportal_prediction]
     if any(p.verdict == "collocated" for p in predictions):
@@ -1767,12 +1959,15 @@ def _predict_hf_radar(
                     padded_start.isoformat(), padded_end.isoformat(),
                 ):
                     any_available = True
+                    break  # one confirmed hit is enough -- see _predict_model_source's identical short-circuit
             except Exception:
                 logger.debug("_predict_hf_radar: availability check failed", exc_info=True)
                 return SourcePrediction(
                     source_type=source_type, bucket="ground-point", verdict="unknown",
                     detail=f"HF-radar availability check failed for {source_type}.",
                 )
+        if any_available:
+            break
 
     verdict: Verdict = "collocated" if any_available else "none-predicted"
     return SourcePrediction(
@@ -1890,6 +2085,7 @@ def _predict_hf_radar_us(source, cfg, sar_footprints: "list[SarFootprint]") -> S
                 padded_start.isoformat(), padded_end.isoformat(),
             ):
                 any_available = True
+                break  # one confirmed hit is enough -- see _predict_model_source's identical short-circuit
         except Exception:
             logger.debug("_predict_hf_radar_us: availability check failed", exc_info=True)
             return SourcePrediction(
@@ -1952,12 +2148,15 @@ def _predict_global_composite(
             try:
                 if check_exists_dry(day):
                     any_exists = True
+                    break  # one confirmed hit is enough -- see _predict_model_source's identical short-circuit
             except Exception:
                 logger.debug("_predict_global_composite: existence check failed", exc_info=True)
                 return SourcePrediction(
                     source_type=source_type, bucket="global-composite", verdict="unknown",
                     detail=f"Existence check failed for {source_type}.",
                 )
+        if any_exists:
+            break
 
     verdict: Verdict = "collocated" if any_exists else "none-predicted"
     return SourcePrediction(
