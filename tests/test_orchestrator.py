@@ -31,6 +31,15 @@ def _recipe(source: str) -> Recipe:
     return Recipe(cfg)
 
 
+def test_download_all_in_bbox_defaults_to_false(tmp_path):
+    """Default (no flag) means collocation-based skip-gating IS active --
+    download_all_in_bbox=False is the new default, inverted from a plain
+    opt-in flag."""
+    orchestrator = DataOrchestrator(_recipe("sentinel1_l2_ocn"), dry_run=True)
+
+    assert orchestrator.download_all_in_bbox is False
+
+
 class TestCleanupIfEmpty:
     def test_removes_dir_with_no_files_including_nested_empty_subdirs(self, tmp_path):
         recipe = _recipe("sentinel1_l2_ocn")

@@ -231,10 +231,14 @@ class DataOrchestrator:
         If True, print download commands without executing them.
     """
 
-    def __init__(self, recipe: Recipe, dry_run: bool = False, force_download: bool = False) -> None:
+    def __init__(
+        self, recipe: Recipe, dry_run: bool = False, force_download: bool = False,
+        download_all_in_bbox: bool = False,
+    ) -> None:
         self.recipe   = recipe
         self.dry_run  = dry_run
         self.force_download = force_download
+        self.download_all_in_bbox = download_all_in_bbox
         self.base_dir = self._setup_base_dir()
         self._previous_downloads: Dict[str, Any] = self._load_previous_downloads()
         self._previous_variable: Optional[str] = self._load_previous_variable()
