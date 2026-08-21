@@ -511,6 +511,59 @@ class TestExecuteRecipePassesForceDownloadToOrchestrator:
         assert mock_cls.call_args.kwargs["force_download"] is True
 
 
+class TestExecuteRecipePassesDownloadAllInBboxToOrchestrator:
+    def test_download_all_in_bbox_flag_reaches_orchestrator_constructor(self, tmp_path):
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        with patch("sar_validation.core.orchestrator.DataOrchestrator") as mock_cls:
+            mock_cls.return_value.download_all.return_value = True
+            mock_cls.return_value.base_dir = tmp_path / "run"
+            cli._execute_recipe(str(recipe_path), download_all_in_bbox=True)
+
+        assert mock_cls.call_args.kwargs["download_all_in_bbox"] is True
+
+    def test_unflagged_run_passes_download_all_in_bbox_false(self, tmp_path):
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        with patch("sar_validation.core.orchestrator.DataOrchestrator") as mock_cls:
+            mock_cls.return_value.download_all.return_value = True
+            mock_cls.return_value.base_dir = tmp_path / "run"
+            cli._execute_recipe(str(recipe_path))
+
+        assert mock_cls.call_args.kwargs["download_all_in_bbox"] is False
+
+    def test_download_all_in_bbox_cli_flag_threads_through_main(self, tmp_path):
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        with patch("sar_validation.core.orchestrator.DataOrchestrator") as mock_cls:
+            mock_cls.return_value.download_all.return_value = True
+            mock_cls.return_value.base_dir = tmp_path / "run"
+            cli.main(["--recipe", str(recipe_path), "--download-all-in-bbox"])
+
+        assert mock_cls.call_args.kwargs["download_all_in_bbox"] is True
+
+
 class TestExecuteRecipeSkipsStatsWhenAlreadyComputed:
     """Step 4 (compute statistics) should be resumable just like steps 1-3:
     if validation_statistics_*.nc files for every pair already exist on

@@ -203,6 +203,15 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--download-all-in-bbox",
+        action="store_true",
+        help=(
+            "Disable the default collocation-based skip-gating: download "
+            "everything in the recipe's bbox/window regardless of "
+            "predicted collocation (today's pre-existing behavior)."
+        ),
+    )
+    parser.add_argument(
         "--convert",
         action="store_true",
         help="Convert downloaded data to xarray.DataTree (step 2)",
@@ -294,6 +303,7 @@ Examples:
             dry_collocation=args.dry_collocation,
             output_dir=args.output_dir,
             force_download=args.force_download,
+            download_all_in_bbox=args.download_all_in_bbox,
             convert=args.convert or args.collocate or args.stats or args.plot,
             collocate=args.collocate or args.stats or args.plot,
             stats=args.stats or args.plot,
@@ -952,6 +962,7 @@ def _execute_recipe(
     dry_collocation: bool = False,
     output_dir: Optional[str] = None,
     force_download: bool = False,
+    download_all_in_bbox: bool = False,
     convert: bool = False,
     collocate: bool = False,
     stats: bool = False,
@@ -999,7 +1010,10 @@ def _execute_recipe(
         print(f"\nWrote {report_path}")
         return
 
-    orchestrator = DataOrchestrator(recipe, dry_run=dry_run, force_download=force_download)
+    orchestrator = DataOrchestrator(
+        recipe, dry_run=dry_run, force_download=force_download,
+        download_all_in_bbox=download_all_in_bbox,
+    )
 
     # Skip download if data was already downloaded successfully and not forcing re-download
     download_step_ran = False
