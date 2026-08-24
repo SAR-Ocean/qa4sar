@@ -1,5 +1,5 @@
 """
-Validation statistics — step 5a of the validation pipeline.
+Validation statistics — step 4 of the validation pipeline.
 
 Computes per-source bias, RMSE, Pearson correlation, and scatter index
 from the collocated pairs produced by step 3 (``collocation_results.nc``).
@@ -30,12 +30,9 @@ _BINS_RESIZED_MESSAGE = "The bins have been resized"
 
 #: Minimum sample size for a reported correlation coefficient to be
 #: treated as meaningful rather than a numerically-precise-looking
-#: artifact of too few points. Pearson r is mathematically degenerate
-#: for N=2 and the same goes for the Jammalamadaka-Sarma circular
-#: correlation used for circular variables (e.g. wind direction). Below
-#: the minimum sample size threshold, correlation is reported as NaN;
-#: every other metric (bias, std, rmse, scatter_index) is still 
-#: computed and reported normally.
+#: artifact of too few points. Below the minimum sample size threshold,
+#: correlation is reported as NaN. Every other metric (bias, std, rmse,
+#: scatter_index) is still computed and reported normally.
 MIN_N_FOR_CORRELATION = 10
 
 __all__ = [
@@ -56,7 +53,9 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 def _circular_mean_deg(deg: np.ndarray) -> float:
-    """Circular mean of angles given in degrees, wrapped to [0, 360)."""
+    """
+    Circular mean of angles given in degrees, wrapped to [0, 360).
+    """
     rad = np.radians(deg)
     mean_rad = np.arctan2(np.mean(np.sin(rad)), np.mean(np.cos(rad)))
     return float(np.degrees(mean_rad)) % 360.0
@@ -87,13 +86,17 @@ def _circular_corrcoef_deg(a_deg: np.ndarray, b_deg: np.ndarray) -> float:
 
 
 def _missing_columns(collocation_ds: xr.Dataset, *cols: str) -> List[str]:
-    """Names in *cols* absent from *collocation_ds*, in order."""
+    """
+    Names in *cols* absent from *collocation_ds*, in order.
+    """
     return [c for c in cols if c not in collocation_ds]
 
 
 def _group_by_columns(df, group_by: List[str]):
-    """Group *df* by a single column, or by a synthetic ``_group`` column
-    joining all of *group_by* with ``" | "`` when there's more than one."""
+    """
+    Group *df* by a single column, or by a synthetic ``_group`` column
+    joining all of *group_by* with ``" | "`` when there's more than one.
+    """
     if len(group_by) == 1:
         return df.groupby(group_by[0])
     df["_group"] = df[group_by].astype(str).agg(" | ".join, axis=1)
@@ -101,10 +104,12 @@ def _group_by_columns(df, group_by: List[str]):
 
 
 def _core_metrics(sar_vals: np.ndarray, val_vals: np.ndarray) -> dict:
-    """bias/std/rmse/correlation/scatter_index for a non-circular
+    """
+    bias/std/rmse/correlation/scatter_index for a non-circular
     (sar_vals, val_vals) pair. Shared by :func:`compute_statistics`'s
     non-circular branch and :func:`_soil_moisture_metrics` (which adds
-    ubrmsd on top)."""
+    ubrmsd on top).
+    """
     diff = sar_vals - val_vals
     n = len(sar_vals)
     bias = float(np.mean(diff))
@@ -120,8 +125,10 @@ def _core_metrics(sar_vals: np.ndarray, val_vals: np.ndarray) -> dict:
 
 
 def _assemble_stats_dataset(records, source_labels, sar_var: str, val_var: str, group_by: List[str]) -> xr.Dataset:
-    """Build the per-source stats xr.Dataset shared by
-    :func:`compute_statistics` and :func:`compute_statistics_soil_moisture`."""
+    """
+    Build the per-source stats xr.Dataset shared by
+    :func:`compute_statistics` and :func:`compute_statistics_soil_moisture`.
+    """
     metrics = list(records[0].keys())
     return xr.Dataset(
         {
@@ -162,10 +169,7 @@ def compute_statistics(
     * **rmse** — root-mean-square error
     * **correlation** — Pearson r (or Jammalamadaka–Sarma circular correlation
       if val_var is circular); NaN if the group has fewer than
-      :data:`MIN_N_FOR_CORRELATION` pairs, since both correlation types are
-      mathematically degenerate at N=2 (any two points give exactly ±1,
-      however poorly they actually agree) and empirically still highly
-      unstable through N=4
+      :data:`MIN_N_FOR_CORRELATION` pairs.
     * **scatter_index** — RMSE / |mean(val)|  (dimensionless, NaN if mean_val ≈ 0)
 
     If ``val_var`` is a circular quantity (currently just ``"WDIR"`` — see
@@ -288,23 +292,18 @@ def _cdf_match_sar_series(
     """
     from pytesmo.scaling import scale
 
-    # pytesmo's own default (nbins=100, minobs=20) was confirmed against a
-    # real collocation run to silently produce an all-NaN CDF-matched
-    # series once nbins exceeds roughly minobs for a modestly-sized,
-    # coarsely-quantized SAR sample (52 unique values across 1517 points):
-    # nbins<=20 succeeded cleanly, nbins>=25 degenerated with a "Too few
-    # percentiles for chosen k" warning. Since soil-moisture validation
-    # runs are typically modest-sized and SAR SSM's own ~0.5%-step
-    # quantization caps how much benefit finer percentile binning would
-    # give anyway, cap nbins conservatively (still floored so tiny groups
-    # get at least 2 bins) rather than inheriting pytesmo's fragile 100.
+    # pytesmo's own default (nbins=100, minobs=20) can silently produce an 
+    # all-NaN CDF-matched series once nbins exceeds roughly minobs for a 
+    # modestly-sized, coarsely-quantized SAR sample. Since soil-moisture 
+    # validation runs are typically modest-sized and SAR SSM's own ~0.5%
+    # step quantization caps how much benefit finer percentile binning would
+    # give, cap nbins conservatively rather than inheriting pytesmo's fragile 100.
     nbins = max(2, min(10, len(sar_vals) // 20))
 
     df_pair = pd.DataFrame({"sar": sar_vals, "val": val_vals})
     with warnings.catch_warnings():
         # A direct, expected consequence of the small nbins cap above
-        # combined with pytesmo's own minobs=20 default -- not a sign
-        # anything went wrong, so don't let it leak to the CLI's console.
+        # combined with pytesmo's own minobs=20 default.
         warnings.filterwarnings(
             "ignore", message=re.escape(_BINS_RESIZED_MESSAGE), category=UserWarning,
         )
@@ -448,13 +447,10 @@ def add_rescaled_sar_column(
     functions instead of the raw column.
 
     The raw SAR series and the validation series live in different
-    physical domains (e.g. a relative SAR soil-saturation index vs. ISMN's
-    absolute volumetric water content) — plotting them directly against
-    each other (as the report's scatter/geographic/residual plots do) is
-    not meaningful, even though the underlying statistics are already
-    computed correctly on the rescaled pair internally. This makes the
-    same rescaled values available to the plotting layer, so a report
-    generated for ``variable == "soil_moisture"`` compares like with like.
+    physical domains (e.g. soil-saturation index vs. volumetric water 
+    content). Therefore, statistics are computed on the rescaled pairs. 
+    This function makes the same rescaled values available to the 
+    plotting layer for the validation report.
 
     Before the per-group loop below, :func:`_harmonize_percent_domain_sources`
     converts any val_source sharing SAR's own raw units family (e.g. ASCAT's
@@ -547,46 +543,32 @@ def fit_sar_to_val_transform(
 ):
     """
     Fit a CDF-matching transform from every valid collocated
-    ``(sar_<sar_var>, val_<val_var>)`` pair (pooled across all groups —
-    unlike :func:`add_rescaled_sar_column`'s per-``val_source`` rescaling,
-    which is for statistics, not display) and return a callable that maps
+    ``(sar_<sar_var>, val_<val_var>)`` pair, pooled across all groups
+    (unlike :func:`add_rescaled_sar_column`'s per-``val_source`` rescaling,
+    which is for statistics, not display), and return a callable mapping
     arbitrary SAR values (e.g. a full SAR scene's ``(y, x)`` grid, not just
     the collocated subset) into the validation series' domain.
 
-    Before fitting, :func:`_harmonize_percent_domain_sources` converts any
-    val_source sharing SAR's own raw units family (e.g. ASCAT's "%") into
-    the reference source's (ISMN's) volumetric domain — but only its
-    ``val_<val_var>`` *target* values are taken from that harmonized
-    dataset here. Each row's ``sar_<sar_var>`` *input* stays the RAW,
-    un-harmonized value from *collocation_ds*, since the fitted transform
-    is meant to be applied later to a genuinely raw SAR scene field
-    (always in SAR's own native units, e.g. percent) — not to a value
-    that has already been run through one percent→volumetric conversion.
-    Pairing a harmonized ``sar_col`` for ASCAT rows with a still-raw one
-    for ISMN rows would pool two very different numeric scales as input
-    to the same fit and skew the percentile binning; pooling raw percent
-    and raw volumetric pairs with no harmonization at all (the original
-    pre-fix behavior) was similarly nonsensical, just via the opposite
-    column.
+    :func:`_harmonize_percent_domain_sources` supplies the harmonized
+    ``val_<val_var>`` target values, but each row's ``sar_<sar_var>`` 
+    input stays raw and un-harmonized, since the fitted transform is
+    applied later to a raw SAR field. Pairing harmonized input for one
+    source with a raw input for another would pool different numeric 
+    scales into the same fit and skew the percentile binning.
 
-    Intended for plotting a SAR *field* (not just collocated points) in a
-    validation variable's units — e.g. ``plot_geographic``'s background
-    layer, which can't use :func:`add_rescaled_sar_column` directly since
-    that only rescales points that have a paired validation value, and a
-    background raster has values at every pixel, not just collocated ones.
+    Intended for plotting a SAR *field* in a validation variable's units, 
+    e.g. ``plot_geographic``'s background layer, which cannot use 
+    :func:`add_rescaled_sar_column` directly since that only rescales 
+    points that have a paired validation value.
 
     Returns
     -------
     callable or None
-        ``transform(values: np.ndarray) -> np.ndarray`` (same shape as the
-        input, NaN where the input was non-finite), or None if there
-        aren't enough valid pairs to fit, or the fit itself fails (e.g.
-        the same percentile-binning degeneration described in
-        :func:`_cdf_match_sar_series` — this uses the lower-level
-        ``pytesmo.cdf_matching.CDFMatching`` class directly rather than
-        the ``scale()`` convenience wrapper, since ``scale()`` only
-        transforms the columns of its own input DataFrame and has no
-        "apply this fit to new data" mode).
+        ``transform(values: np.ndarray) -> np.ndarray`` (same shape, NaN
+        where the input was non-finite), or None if there are too few
+        valid pairs to fit. This uses ``pytesmo.cdf_matching.CDFMatching`` 
+        directly rather than its ``scale()`` convenience wrapper, since 
+        ``scale()`` has no "apply this fit to new data" mode.
     """
     from pytesmo.cdf_matching import CDFMatching
 
@@ -651,11 +633,9 @@ def _harmonize_percent_domain_sources(
     CDF-matched report section shows every source on one consistent scale.
 
     Mechanism: SAR's own raw retrieval lives in the same physical domain as
-    the sources being converted (see design-choices.md SS8.7), so the CDF-
-    matching transform already fit for SAR-vs-reference_source pairs is
-    equally valid applied to those sources' own raw values -- this avoids
-    needing to collocate e.g. ASCAT against ISMN directly (they are never
-    paired with each other, only each with SAR).
+    the sources being converted, so the CDF-matching transform already fit for
+    SAR-vs-reference_source pairs is equally valid applied to those sources' 
+    own raw values.
 
     val_source groups already sharing reference_source's own units family
     (e.g. ISMN/SMAP/SMOS, all volumetric) are returned untouched --
@@ -666,7 +646,7 @@ def _harmonize_percent_domain_sources(
     lookup (the same one run_statistics_native_units already uses), not by
     inspecting a per-row units companion -- so this function is a true no-op
     (returns collocation_ds itself, no copy) for every non-soil-moisture
-    recipe and every soil-moisture recipe whose val_source labels aren't in
+    recipe and every soil-moisture recipe whose val_source labels are not in
     that dict.
 
     Returns
@@ -877,10 +857,7 @@ def run_statistics(
     for sar_var, val_var in pairs:
         logger.info("Computing statistics: %s vs %s …", sar_var, val_var)
 
-        # Exclude C3S CDS SSM rows: they are handled by run_statistics_cds_ssm
-        # (a separate, non-CDF-matched pass) and must not enter the CDF-matched
-        # section where their native units (%/m³m⁻³) would be treated as if
-        # they were ISMN-equivalent volumetric fractions.
+        # Exclude C3S CDS SSM rows as they are handled by run_statistics_cds_ssm.
         if "val_source" in collocation_ds:
             cds_mask = collocation_ds["val_source"] != "cds_ssm"
             ds_for_stats = collocation_ds.isel(collocation=cds_mask.values)
@@ -970,24 +947,13 @@ def run_statistics_cds_ssm(
 
 #: Unit family per validation-source platform type, used to gate the
 #: native-units statistics pass (run_statistics_native_units). Keyed by
-#: val_source, NOT read off the pooled val_<var> column — a single
-#: collocation_results.nc column mixes multiple sources' raw values (e.g.
-#: ASCAT's "%" alongside ISMN's "m3 m-3"), so a column-level units attr
-#: cannot represent per-row units once they're pooled. See
-#: design-choices.md §8.7.
+#: val_source, not read off the pooled val_<var> column.
 _VAL_SOURCE_UNITS_FAMILY: dict[str, str] = {
     "ismn": "volumetric",
     "ascat_ssm": "percent_saturation",
     "amsr_ssm": "volumetric",
     "smap_ssm": "volumetric",
     "smos_ssm": "volumetric",
-    # ERA5-Land's swvl1 ("volume_fraction_of_water_in_soil_layer", units
-    # "m3 m-3" -- see datatree_converter.py's _ERA5_VARS) is volumetric,
-    # same family as ISMN/AMSR/SMAP/SMOS. Harmless no-op for the
-    # currently-shipped soil_moisture_era5.yaml (CLMS SSM, percent-
-    # saturation SAR units), but needed so a volumetric-SAR recipe (e.g.
-    # NISAR SME2's sarSSM, also "m3 m-3") combined with era5_soil_moisture
-    # doesn't silently drop it from the native-units statistics section.
     "era5_soil_moisture": "volumetric",
 }
 
@@ -1040,9 +1006,7 @@ def run_statistics_native_units(
         sar_family = _normalize_units_family(collocation_ds[sar_col].attrs.get("units", ""))
 
         # Exclude cds_ssm from native-units pass: cds_ssm is handled by
-        # run_statistics_cds_ssm.  It is not in _VAL_SOURCE_UNITS_FAMILY so
-        # the matching-family filter below would drop it anyway, but an
-        # explicit exclusion here prevents it appearing in intermediate stats.
+        # run_statistics_cds_ssm. 
         if "val_source" in collocation_ds:
             cds_mask = collocation_ds["val_source"] != "cds_ssm"
             ds_for_native = collocation_ds.isel(collocation=cds_mask.values)

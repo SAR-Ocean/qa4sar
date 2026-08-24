@@ -838,9 +838,9 @@ class TestComputeSarSceneTimes:
         assert windows == [("2025-12-31T18:00:00", "2026-01-01T18:00:00")]
 
     def test_end_to_end_two_gapped_scenes_produce_two_download_windows(self, tmp_path):
-        """The scenario this task exists for: two SAR scenes with a real
+        """The scenario this test exists for: two SAR scenes with a real
         gap between them (further apart than 2x the collocation
-        tolerance) must produce TWO separate download windows through
+        tolerance) must produce two separate download windows through
         the full real wiring (files on disk -> _compute_sar_scene_times
         -> _padded_temporal_bounds), not one span covering the gap."""
         import dataclasses
@@ -964,9 +964,8 @@ class TestComputeSarSceneTimes:
         test_end_to_end_dispatch_receives_narrowed_window above (the gap
         this whole class's tests originally had, per code review -- a
         real _download_* invocation with populated tz-aware scene times
-        would have raised the tz-naive/tz-aware TypeError this task's
-        Fix 2 addresses), but with a genuinely tz-AWARE fake scene time
-        (mirroring NISAR SME2's from_nisar_sme2, see
+        would have raised the tz-naive/tz-aware TypeError), but with a 
+        tz-AWARE fake scene time (mirroring NISAR SME2's from_nisar_sme2, see
         TestComputeSarSceneTimes.test_tz_aware_scene_time_does_not_raise_and_is_normalized
         for the unit-level version of this same regression)."""
         import dataclasses
@@ -2159,10 +2158,7 @@ class TestSarEmptyStopsPipeline:
         downloaded files to the list it returns; a product already on
         disk (skipped as a duplicate) is never appended, so a fully
         successful run where every match was already cached still ends
-        up with files=[]. Confirmed live 2026-08-11: a copied-over
-        currents_useastcoast.yaml download_metadata.json from before
-        found_count existed was misread as "no SAR data found" despite
-        the SAFE files sitting right there in S1_L2_OCN/. Real files on
+        up with files=[]. Real files on
         disk matching the source's file_glob must override the
         ambiguous empty list."""
         import json

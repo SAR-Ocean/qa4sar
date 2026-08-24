@@ -7,8 +7,7 @@ window): hf_radar_us_downloader.py's waterfall tries ERDDAP first, then
 this module, then Copernicus.
 
 Catalog layout: thredds-ocean/catalog/ioos/hfradar/rtv/{YYYY}/{YYYYMM}/{REGION}/
-One file per hour per resolution. Filename format changed on 2025-07-01
-(verified live, bisected month-by-month):
+One file per hour per resolution. Filename format changed on 2025-07-01:
   - Before: {YYYYMMDDHHMM}_hfr_{region}_{res}_rtv_uwls_{SIO|NDBC|25hr_average_SIO}.nc
     -- only the _NDBC variant matches ERDDAP's own pipeline (same
     institution/creator_name); _SIO/_25hr_average_SIO are different products
@@ -67,17 +66,18 @@ def _list_thredds_granules(
     catalog_xml_text: str, resolution_km: float, start: datetime, end: datetime,
     end_exclusive: bool = False,
 ) -> List[Tuple[datetime, str]]:
-    """Parse one month's THREDDS catalog.xml and return (timestamp, urlPath)
+    """
+    Parse one month's THREDDS catalog.xml and return (timestamp, urlPath)
     for every granule at *resolution_km* whose timestamp falls in
     [start, end] (or [start, end) if *end_exclusive* is True). Handles both
-    filename eras; only the pre-2025-07-01 era's _NDBC variant is matched
-    (_SIO/_25hr_average_SIO are excluded).
+    filename eras.
 
     *end_exclusive* is for callers that have already widened *end* to the
     start of the day after a date-only bound (see _download_window) and need
-    a strict upper bound so that widening doesn't pull in the next day's
+    a strict upper bound so that widening does not pull in the next day's
     granules too. Direct full-precision-datetime callers should leave this
-    False to keep the inclusive <= semantics on both bounds."""
+    False to keep the inclusive <= semantics on both bounds.
+    """
     token = _resolution_token(resolution_km)
     root = ET.fromstring(catalog_xml_text)
     results: List[Tuple[datetime, str]] = []
@@ -103,7 +103,8 @@ def _list_thredds_granules(
 
 
 class NOAATHREDDSHFRadarDownloader:
-    """Download a NOAA HF-radar current grid from the NCEI THREDDS archive.
+    """
+    Download a NOAA HF-radar current grid from the NCEI THREDDS archive.
 
     Parameters
     ----------
@@ -290,7 +291,7 @@ class NOAATHREDDSHFRadarDownloader:
             # (and thus the whole dataset) across every variable, including
             # non-gridded ones like time_bnds(time, nv) and scalar CF
             # metadata variables (wgs84, processing_parameters,
-            # radial_metadata) that don't have lat/lon dims at all -- those
+            # radial_metadata) that do not have lat/lon dims at all -- those
             # get spuriously broadcast to full lat/lon grids and upcast
             # (e.g. int8 -> float32) by .where()'s NaN-filling machinery.
             # .isel() only touches the lat/lon dimensions and leaves every

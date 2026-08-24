@@ -177,7 +177,7 @@ class TestHycomDownloaderDownload:
 
 
 class TestTauVariableDropped:
-    """Live-verified 2026-08-11: both real HyCOM THREDDS datasets
+    """Both real HyCOM THREDDS datasets
     (GLBy0.08/expt_93.0 and ESPC-D-V02) carry a ``tau`` (forecast
     lead-time) data variable with a CF-noncompliant ``units`` attribute of
     ``"hours since analysis"`` -- "analysis" is not a parseable reference
@@ -271,7 +271,7 @@ class TestTauVariableDropped:
 
 class TestDownloadSegmentLonConvention:
     """
-    Live-confirmed 2026-08-11: HyCOM's REAL ``lon`` coordinate axis (both
+    HyCOM's REAL ``lon`` coordinate axis (both
     ``ESPC-D-V02`` and ``GLBy0.08/expt_93.0``) uses the 0-360 convention
     (0.0 .. 359.92), not this toolbox's standard -180..180 convention that
     every recipe bbox uses. ``_download_segment`` used to build ``west``/
@@ -371,8 +371,8 @@ class TestDownloadSegmentLonConvention:
         result = xr.open_dataset(nc_path)
         try:
             assert result.sizes["lon"] > 0, (
-                "negative-longitude bbox produced a zero-length lon axis -- "
-                "the exact live-confirmed bug (west/east never converted to "
+                "negative-longitude bbox produced a zero-length lon axis "
+                "(west/east never converted to "
                 "HyCOM's native 0-360 convention)."
             )
             lon = result["lon"].values
@@ -414,9 +414,9 @@ class TestDownloadSegmentLonConvention:
 
         assert nc_path is not None and nc_path.exists()
         assert any(
-            "espc_d_v02" in rec.message and "requesting HyCOM" in rec.message
+            "espc_d_v02" in rec.message and "requesting HYCOM" in rec.message
             for rec in caplog.records
-        ), f"no 'requesting HyCOM' notice logged; records were: {[r.message for r in caplog.records]}"
+        ), f"no 'requesting HYCOM' notice logged; records were: {[r.message for r in caplog.records]}"
 
     def test_wrapping_bbox_straddling_zero_degrees_stitches_monotonic_lon(
         self, tmp_path, monkeypatch,
@@ -479,6 +479,60 @@ class TestDownloadSegmentLonConvention:
         finally:
             result.close()
 
+    def test_antimeridian_crossing_bbox_selects_contiguous_window_no_stitch_needed(
+        self, tmp_path, monkeypatch,
+    ):
+        """A recipe bbox crossing the antimeridian (this toolbox's
+        ``min_lon > max_lon`` convention, e.g. min_lon=170.0,
+        max_lon=-170.0 -- see core/recipe.py's GeographicBounds) converts
+        to a 0-360 window that does NOT straddle HyCOM's own 0/360 seam
+        (169.92..190.08) -- unlike the 0-degree-straddling case above,
+        this must select in ONE plain, non-wrapping ``.sel()`` call, with
+        no +360 shift and no two-segment stitch. HyCOM's native grid has
+        no discontinuity at 180 degrees (that's only a seam in this
+        toolbox's -180..180 recipe convention), so the antimeridian
+        crossing that ERA5 needs a two-window-download-and-stitch fix for
+        (see ``DataTreeConverter._stitch_antimeridian_window_files``) is
+        already just an ordinary contiguous slice here."""
+        import numpy as np
+        import xarray as xr
+
+        from sar_validation.downloaders.hycom_downloader import HycomDownloader
+
+        seg_start, seg_end = datetime(2025, 1, 1), datetime(2025, 1, 2)
+        self._patch_open_dataset(monkeypatch, seg_start)
+
+        dl = HycomDownloader(output_dir=tmp_path)
+        nc_path = dl._download_segment(
+            "espc_d_v02", seg_start, seg_end,
+            170.0, -170.0, 40.0, 55.0,
+        )
+
+        assert nc_path is not None and nc_path.exists()
+        result = xr.open_dataset(nc_path)
+        try:
+            lon = result["lon"].values
+            assert len(lon) > 0
+            assert np.all(np.diff(lon) > 0), (
+                f"lon axis is not monotonically increasing: {lon}"
+            )
+            # west_360 = (170 - 1/12) % 360 = 169.9167
+            # east_360 = (-170 + 1/12) % 360 = 190.0833
+            assert lon.min() >= 169.9
+            assert lon.min() < 170.5
+            assert lon.max() > 189.5
+            assert lon.max() <= 190.1
+            # No +360 shift -- confirms the plain (non-wrap) branch was
+            # taken, not the 0/360-seam stitch path.
+            assert lon.max() < 360.0
+            # Data-level correctness: cells came from their own
+            # (unshifted) source longitude.
+            np.testing.assert_allclose(
+                result["water_u"].isel(time=0, lat=0).values, lon,
+            )
+        finally:
+            result.close()
+
     def test_ordinary_positive_lon_bbox_still_works_no_regression(
         self, tmp_path, monkeypatch,
     ):
@@ -520,7 +574,7 @@ class TestDownloadSegmentLonConvention:
 
 
 class TestBracketBuffer:
-    """Live-reproduced 2026-08-11 running recipes/currents_useastcoast.yaml
+    """Running recipes/currents_useastcoast.yaml
     end-to-end (~20-minute SAR window): the download succeeded, but
     ModelLayerCollocation logged "no bracketing ERA5 hour for scene ...
     -- skipping cell-averaging pass" for every SAR scene, producing ZERO

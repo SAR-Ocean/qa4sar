@@ -15,11 +15,19 @@ Provides:
 - set_credential         — Store a username/password pair in the OS keyring
   (used by ``sar-validate --set-credential``)
 - normalize_datetime     — ISO datetime normalisation helper
-- format_dir_datetime    — Directory-name-safe datetime string
+- is_date_recent         — True if a date/datetime string falls within a
+  recent threshold
 - build_output_dir       — Canonical output directory path
+- split_antimeridian_bbox — Split an antimeridian-crossing bbox into 1-2
+  non-crossing longitude windows
+- months_touched         — Every (year, month) pair an inclusive date
+  range touches
+- copernicus_marine_download_kwargs — skip_existing/overwrite kwargs for a
+  copernicusmarine call, matching this toolbox's --force-download semantics
 - prefer_ipv4_dns        — Context manager that reorders socket.getaddrinfo()
   results IPv4-first, to avoid wasting time on hosts with black-holed IPv6
 """
+
 
 from __future__ import annotations
 
@@ -77,7 +85,8 @@ _KEYRING_SERVICES = {
 
 
 def _keyring_get(service: str) -> Tuple[Optional[str], Optional[str]]:
-    """Read (username, password) from the OS keyring for *service*.
+    """
+    Read (username, password) from the OS keyring for *service*.
 
     Treats "no OS keyring backend available" (e.g. headless CI runners,
     which raise keyring.errors.NoKeyringError or similar) identically to
@@ -93,7 +102,8 @@ def _keyring_get(service: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def _keyring_set_quiet(service: str, username: str, password: str) -> None:
-    """Best-effort store of (username, password) into the OS keyring.
+    """
+    Best-effort store of (username, password) into the OS keyring.
 
     Used for the automatic legacy-file migration path, where a missing
     keyring backend must not turn a successful credential read into a
@@ -111,7 +121,8 @@ def _resolve_from_keyring_or_legacy_file(
     cred_file: Path,
     parse_legacy_file: Callable[[str], Tuple[Optional[str], Optional[str]]],
 ) -> Tuple[Optional[str], Optional[str]]:
-    """Resolve (username, password) from the OS keyring, migrating from a
+    """
+    Resolve (username, password) from the OS keyring, migrating from a
     legacy plaintext credentials file into the keyring on first use.
 
     Priority: keyring first; if the keyring has nothing stored for
@@ -153,7 +164,9 @@ def _resolve_from_keyring_or_legacy_file(
 
 
 def _parse_comma_separated_legacy_file(content: str) -> Tuple[Optional[str], Optional[str]]:
-    """Parse the EUMDAC legacy file format: 'username,password'."""
+    """
+    Parse the EUMDAC legacy file format: 'username,password'.
+    """
     parts = content.strip().split(",")
     if len(parts) >= 2:
         return parts[0].strip(), parts[1].strip()
@@ -161,15 +174,19 @@ def _parse_comma_separated_legacy_file(content: str) -> Tuple[Optional[str], Opt
 
 
 def _parse_json_legacy_file(content: str) -> Tuple[Optional[str], Optional[str]]:
-    """Parse the OSI-SAF/G-Portal/SMOS legacy file format:
-    '{"username": ..., "password": ...}'."""
+    """
+    Parse the OSI-SAF/G-Portal/SMOS legacy file format:
+    '{"username": ..., "password": ...}'.
+    """
     creds = json.loads(content)
     return creds.get("username"), creds.get("password")
 
 
 def _parse_netrc_legacy_file(content: str) -> Tuple[Optional[str], Optional[str]]:
-    """Parse a ~/.netrc file's urs.earthdata.nasa.gov machine entry
-    (login/password), using the stdlib netrc module."""
+    """
+    Parse a ~/.netrc file's urs.earthdata.nasa.gov machine entry
+    (login/password), using the stdlib netrc module.
+    """
     import netrc as netrc_module
     import os
     import tempfile
@@ -195,7 +212,8 @@ def _parse_netrc_legacy_file(content: str) -> Tuple[Optional[str], Optional[str]
 
 
 def set_credential(name: str, username: str, password: str) -> None:
-    """Store *username*/*password* in the OS keyring for a credential set.
+    """
+    Store *username*/*password* in the OS keyring for a credential set.
 
     Used by ``sar-validate --set-credential {eumdac,osi_saf,gportal,smos,earthdata}``.
 
@@ -211,10 +229,9 @@ def set_credential(name: str, username: str, password: str) -> None:
     ValueError
         If *name* is not one of the recognised credential sets.
     keyring.errors.KeyringError
-        If no OS keyring backend is available. Unlike the internal
-        migration helper, this is intentionally NOT swallowed here: this
-        function backs an explicit user action, so the caller (the CLI)
-        needs a real error to report rather than a silent no-op.
+        If no OS keyring backend is available. This function backs 
+        an explicit user action, so the caller (the CLI) needs a real 
+        error to report rather than a silent no-op.
     """
     try:
         service = _KEYRING_SERVICES[name]
@@ -593,11 +610,10 @@ def authenticate_earthdata(
          printed.
 
     Unlike the other ``authenticate_*`` helpers, this performs the actual
-    login (there is no separate credential-carrying return value to hand
-    back to the caller) -- ``earthaccess.login()`` is the toolbox's whole
-    NASA Earthdata client. If nothing resolves from any of the above, falls
-    back to a bare ``earthaccess.login()``, preserving its own netrc/
-    interactive-prompt resolution rather than raising.
+    login. ``earthaccess.login()`` is the toolbox's whole NASA Earthdata 
+    client. If nothing resolves from any of the above, falls back to a bare
+    ``earthaccess.login()``, preserving its own netrc/interactive-prompt 
+    resolution.
     """
     import os
 
@@ -782,20 +798,14 @@ def authenticate_gportal(
          to retrofit onto the others. Only reached when *allow_prompt* is
          True (the default, for direct/CLI use of the downloader).
 
-    G-Portal has no SSH-key registration option for this account (per the
-    G-Portal user manual, "public key cryptography is available to
-    specific users only") -- account+password is the only auth method
-    available here.
+    G-Portal has no SSH-key registration option for this account, so 
+    account+password is the only authentication method available here.
 
     Parameters
     ----------
     allow_prompt : bool
         When False, step 4 is skipped -- raises RuntimeError instead of
-        prompting if nothing resolved from steps 1-3. Automated/orchestrated
-        callers (e.g. the AMSR2 G-Portal fallback in orchestrator.py, which
-        reaches this on every amsr_ssm recipe run past the Earthdata
-        coverage cutoff) must never block an unattended pipeline run on an
-        interactive password prompt nobody expected to be asked for.
+        prompting if nothing resolved from steps 1-3.
     """
     if username and password:
         return username, password
@@ -1027,19 +1037,16 @@ def prefer_ipv4_dns() -> Iterator[None]:
     addresses (``socket.AF_INET``) come before IPv6 addresses
     (``socket.AF_INET6``), for the duration of the ``with`` block.
 
-    Some hosts (observed live for www.ncei.noaa.gov: all 6 of its IPv6
-    addresses are silently unreachable / black-holed, while all 6 of its
-    IPv4 addresses connect in ~0.1-0.2s) have broken IPv6 reachability that
-    a plain DNS/connect timeout doesn't protect against.
-    ``socket.create_connection`` -- used internally by
-    ``urllib.request.urlopen``/``http.client`` -- iterates
+    Some hosts have broken IPv6 reachability that a plain DNS/connect timeout
+    does not protect against. ``socket.create_connection`` -- used internally 
+    by ``urllib.request.urlopen``/``http.client`` -- iterates
     ``getaddrinfo(AF_UNSPEC)`` results in the order returned, which is
     IPv6-before-IPv4 by default on many systems. Every request to such a
     host therefore wastes up to ``len(ipv6_addresses) * timeout`` seconds
     cycling through dead candidates before ever reaching a working IPv4
-    one. This doesn't filter out IPv6 (it's still tried, just last) --
-    combined with a shorter per-address timeout, it just makes the common
-    case fast instead of catastrophically slow.
+    one. This function does not filter out IPv6, but tries IPv4 first.
+    Combined with a shorter per-address timeout, this function makes the 
+    common case (IPv4) fast instead of slow.
 
     Uses a stable sort (``key=lambda r: r[0] != socket.AF_INET``) so each
     family's original relative order is preserved -- only the IPv4-vs-IPv6
@@ -1048,12 +1055,8 @@ def prefer_ipv4_dns() -> Iterator[None]:
     Restores the original ``socket.getaddrinfo`` afterward, even if an
     exception is raised inside the ``with`` block.
 
-    This codebase's downloaders run sequentially, single-threaded (no
-    ThreadPoolExecutor/threading/multiprocessing anywhere in
-    ``core/orchestrator.py`` or ``downloaders/*.py``), so a temporary
-    global monkeypatch of ``socket.getaddrinfo`` is safe here -- but callers
-    should still scope the ``with`` block as narrowly as possible (only
-    around the actual network call) as good practice regardless.
+    This codebase's downloaders run sequentially, single-threaded, so a
+    temporary global monkeypatch of ``socket.getaddrinfo`` is safe here.
     """
     original_getaddrinfo = socket.getaddrinfo
 

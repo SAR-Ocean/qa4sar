@@ -1,26 +1,14 @@
 """
 Download H-SAF ASCAT Surface Soil Moisture NRT products from the H-SAF
 FTP server (ftphsaf.meteoam.it). Two products are available: H122
-(6.25km sampling, the default -- higher resolution) and H29 (12.5km,
-opt-in via product="h29").
+(6.25km sampling, the default) and H29 (12.5km, opt-in via product="h29"
+within the recipe). One file per ~3-minute orbit segment, not a daily composite. 
 
-This is the replacement for dates after the EUMDAC/SOMO12 downloader's
-coverage cutoff (2025-07-15, see ascat_soil_moisture_downloader.py) --
-that downloader is kept unchanged for historical dates; this one only
-covers H-SAF's on-line NRT archive.
-
-Live-confirmed (real downloaded file, 2026-08-12): the FTP directories
-/h29/h29_cur_mon_nc/ and /h122/h122_cur_mon_nc/ each hold a rolling
-*last-60-days* on-line NRT archive (confirmed by the user directly; the
-directories' own names are misleading here) -- one file per ~3-minute
-orbit segment, not a daily composite.
-Real filenames:
+Filename examples:
   W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPB-12.5km-H29_C_LIIB_20260609001514_20260608231200_20260608231459____.nc
   W_IT-HSAF-ROME,SAT,SSM-ASCAT-METOPB-6.25km-H122_C_LIIB_20260609001515_20260608231200_20260608231459____.nc
 Pattern: W_IT-HSAF-ROME,SAT,SSM-ASCAT-<SAT>-<res>km-<product>_C_LIIB_<created>_<sensing_start>_<sensing_end>____.nc,
-all timestamps YYYYMMDDHHMMSS. Plain FTP (port 21, ftplib) -- confirmed
-live via a raw socket connect, server banner "220 Welcome to Italian Air
-Force Meteorological Service H-SAF FTP service."
+all timestamps YYYYMMDDHHMMSS. Plain FTP (port 21, ftplib).
 
 No server-side bbox filtering exists (full-orbit swaths only) -- bbox is
 accepted for interface consistency with every other downloader but not
@@ -59,9 +47,7 @@ __all__ = ["HSAFDownloader"]
 
 FTP_HOST = "ftphsaf.meteoam.it"
 
-#: FTP directory per product -- live-confirmed 2026-08-12: H29's
-#: "/h29/h29_cur_mon_nc/" and H122's "/h122/h122_cur_mon_nc/" (both
-#: user-confirmed directly), same rolling last-60-days retention.
+#: FTP directory per product:
 _PRODUCT_PATHS = {
     "h29": "/h29/h29_cur_mon_nc",
     "h122": "/h122/h122_cur_mon_nc",
@@ -71,16 +57,19 @@ _SENSING_START_RE = re.compile(r"H\d+_C_LIIB_\d{14}_(\d{14})_\d{14}____\.nc$")
 
 
 def _matches_ascat_nc(filename: str) -> bool:
-    """True if filename is an ASCAT SSM netCDF product file -- H29 or
-    H122, not a .md5 sidecar. Resolution itself isn't derived here (see
-    datatree_converter.py's _parse_ascat_resolution_km) -- this only
+    """
+    True if filename is an ASCAT SSM netCDF product file -- H29 or
+    H122, not a .md5 sidecar. Resolution itself is not derived here (see
+    datatree_converter.py's _parse_ascat_resolution_km). This only
     matches the filename shape and extracts the sensing-start timestamp.
     """
     return bool(_SENSING_START_RE.search(filename))
 
 
 def _parse_sensing_start(filename: str) -> Optional[datetime]:
-    """Extract the embedded sensing-start timestamp from an H29 or H122 filename."""
+    """
+    Extract the embedded sensing-start timestamp from an H29 or H122 filename.
+    """
     m = _SENSING_START_RE.search(filename)
     if not m:
         return None
@@ -94,9 +83,11 @@ _SATELLITE_RE = re.compile(r"SSM-ASCAT-(METOP[ABC])-")
 
 
 def _parse_satellite(filename: str) -> Optional[str]:
-    """Extract the embedded satellite name from an H29/H122 filename,
+    """
+    Extract the embedded satellite name from an H29/H122 filename,
     normalized to orbit_coverage.py's SATELLITE_ORBIT_SPECS key format
-    (e.g. "METOPB" -> "metop-b"), or None if unparseable."""
+    (e.g. "METOPB" -> "metop-b"), or None if unparseable.
+    """
     m = _SATELLITE_RE.search(filename)
     if not m:
         return None
@@ -108,7 +99,9 @@ _SENSING_END_RE = re.compile(r"H\d+_C_LIIB_\d{14}_\d{14}_(\d{14})____\.nc$")
 
 
 def _parse_sensing_end(filename: str) -> Optional[datetime]:
-    """Extract the embedded sensing-end timestamp from an H29/H122 filename."""
+    """
+    Extract the embedded sensing-end timestamp from an H29/H122 filename.
+    """
     m = _SENSING_END_RE.search(filename)
     if not m:
         return None
@@ -119,7 +112,9 @@ def _parse_sensing_end(filename: str) -> Optional[datetime]:
 
 
 def _parse_iso_dt(s: str) -> datetime:
-    """Convert an ISO datetime string (from normalize_datetime) to a UTC-aware datetime."""
+    """
+    Convert an ISO datetime string (from normalize_datetime) to a UTC-aware datetime.
+    """
     return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=timezone.utc)
 
 
@@ -127,12 +122,6 @@ class HSAFDownloader:
     """
     Download H-SAF ASCAT Surface Soil Moisture NRT files (H122 6.25km by
     default, or H29 12.5km) from the H-SAF on-line FTP archive.
-
-    Only the rolling last-60-days on-line directory is queried -- H-SAF's
-    off-line/CDR archive (order-based access) is out of scope. A
-    request for dates older than 60 days simply returns no files;
-    callers wanting older data use ascat_soil_moisture_downloader.py
-    (up to its 2025-07-15 cutoff) or accept the gap.
 
     Parameters
     ----------
@@ -309,11 +298,12 @@ class HSAFDownloader:
     def _filter_by_orbit_overlap(
         self, matches: list[str], min_lon: float, max_lon: float, min_lat: float, max_lat: float,
     ) -> list[str]:
-        """Drop filenames whose embedded satellite/sensing-window orbit
+        """
+        Drop filenames whose embedded satellite/sensing-window orbit
         prediction shows no overlap with the requested bbox (+ margin) --
         see orbit_coverage.orbit_overlaps_bbox. Fails open per-file: an
         unparseable filename, unregistered satellite, or any prediction
-        failure keeps the file (matching today's behavior), never drops it.
+        failure keeps the file, never drops it.
         """
         from ..core.orbit_coverage import orbit_overlaps_bbox
 

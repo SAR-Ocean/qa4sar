@@ -7,13 +7,13 @@ Data source: INSITU_GLO_PHY_UV_DISCRETE_MY_013_044
 
 Unlike the NRT product (see ``hf_radar_downloader.py``), this dataset is not
 subsettable server-side: it exposes one bulk NetCDF file per named region
-under its "original-files" service (``history/HF/GL_TV_HF_HFR-<Region>_Total[_<YYYY>].nc``),
-1979-2026-ish depending on region. This downloader fetches the one matching
-region file (cached via ``skip_existing``, since a region's file covers many
-years and multiple runs will reuse it), then subsets it locally in xarray to
-the requested time window and bbox, normalizing the on-disk shape (uppercase
-OceanSITES dims + a singleton DEPTH axis) to match the NRT grid downloader's
-output so both share the same converter path.
+under its "original-files" service (``history/HF/GL_TV_HF_HFR-<Region>_Total[_<YYYY>].nc``).
+This downloader fetches the one matching region file (cached via 
+``skip_existing``, since a region's file covers many years and multiple runs 
+will reuse it), then subsets it locally in xarray to the requested time window 
+and bbox, normalizing the on-disk shape (uppercase OceanSITES dims + a singleton 
+DEPTH axis) to match the NRT grid downloader's output so both share the same 
+converter path.
 
 Library usage::
 
@@ -56,8 +56,7 @@ DATASET_ID = "cmems_obs-ins_glo_phy-cur_my_radar-total_irr"
 # skip_existing=True, instead of re-fetching into a fresh per-run folder.
 _ARCHIVE_CACHE_DIR = Path("data") / "_archive_cache" / "hf_radar_historical"
 
-# Regions present in the delayed-mode archive, verified via
-# copernicusmarine.get(dataset_id=DATASET_ID, dry_run=True) on 2026-07-15.
+# Regions present in the delayed-mode archive.
 # Regions in HFR_REGIONS but absent here (GoS, Granitola, WHub) have no
 # historical archive. US-EastGulfCoast is split into one file per year
 # (2019-2024); every other region is one file covering its whole record.
@@ -92,7 +91,9 @@ _MIN_AGE_DAYS: int = 182
 
 
 def _parse_iso_dt(s: str) -> datetime:
-    """Convert ISO date string from normalize_datetime to timezone-aware UTC datetime."""
+    """
+    Convert ISO date string from normalize_datetime to timezone-aware UTC datetime.
+    """
     return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=timezone.utc)
 
 
@@ -252,9 +253,7 @@ class HFRadarHistoricalDownloader:
             # No delayed-mode archive exists for this region, or (for the
             # split-by-year US-EastGulfCoast case) not for this year. This
             # is a "no data available" outcome, not a real failure — the
-            # caller falls back to the NRT downloader. NotImplementedError
-            # (multi-year-spanning request) is a different, genuine
-            # limitation and is intentionally not caught here.
+            # caller falls back to the NRT downloader. 
             logger.warning(
                 "Skipping delayed-mode HF-radar download for region '%s': %s",
                 region, exc,
@@ -310,7 +309,7 @@ class HFRadarHistoricalDownloader:
         raw = xr.open_dataset(raw_path)
         try:
             # Keep EWCT/NSCT plus every ancillary uncertainty/QC field the
-            # converter (Task 3) knows how to retain — standard deviations
+            # converter knows how to retain — standard deviations
             # (EWCS/NSCS), the geometric-dilution field (GDOP), the overall
             # QCflag, and each per-parameter QC flag — whichever of these
             # this archive file actually has.

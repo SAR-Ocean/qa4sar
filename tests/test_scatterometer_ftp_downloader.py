@@ -417,7 +417,7 @@ class TestScatterometerFTPDownloaderOrbitPrefilter:
         assert sensing_end == sensing_start + _ASSUMED_PASS_DURATION_BY_SATELLITE["oceansat3"]
 
     def test_assumed_pass_duration_covers_real_measured_cadence(self):
-        """Real per-file cadence measured from live-downloaded files
+        """Real per-file cadence measured from downloaded files
         (revolution-counter deltas): HY-2B/HY-2C ~104.4 min/file,
         Oceansat-3 ~49.8 min/file (two half-orbit files per revolution).
         The assumed padding must exceed these real spans with a safety

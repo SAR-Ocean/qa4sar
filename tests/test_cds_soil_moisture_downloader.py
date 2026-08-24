@@ -215,15 +215,8 @@ class TestCDSSoilMoistureDownloaderBuildRequest:
 
     def test_build_request_active_uses_saturation_variable(self, tmp_path):
         """ASCAT ('active') soil moisture is percent-saturation, not
-        volumetric -- confirmed against CDS's own live constraints.json
-        (https://cds.climate.copernicus.eu/api/catalogue/v1/collections/
-        satellite-soil-moisture/constraints.json): every active+daily+icdr
-        combination requires variable='surface_soil_moisture_saturation',
-        never '..._volumetric'. Requesting the volumetric variable for
-        'active' is rejected by the live API with a 400 Bad Request --
-        confirmed live, this exact request previously downloaded 0 files
-        for every 'active' day with no error surfaced past a WARNING log,
-        silently starving Sentinel-1 CLMS SSM recipes of C3S CDS data."""
+        volumetric -- see
+        https://cds.climate.copernicus.eu/api/catalogue/v1/collections/."""
         from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
 
         dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
@@ -246,14 +239,10 @@ class TestCDSSoilMoistureDownloaderBuildRequest:
 
     def test_build_request_submits_every_known_version_by_default(self, tmp_path):
         """A single hardcoded "latest" version (v202505) is only valid for
-        2025-2026 per CDS's own live constraints.json -- confirmed live,
-        requesting it for an older date (e.g. 2024-01-01) gets rejected
-        with a 400 "Request has not produced a valid combination of
-        values", even though older versions of this exact same dataset do
-        cover that date. Every known version must be submitted together
-        (an OR-style multi-value facet) so CDS's own constraint solver
-        picks whichever applies to the requested day, regardless of which
-        year is requested."""
+        2025-2026 per CDS's own live constraints.json. Every known version 
+        must be submitted together (an OR-style multi-value facet) so CDS's 
+        own constraint solver picks whichever applies to the requested day, 
+        regardless of which year is requested."""
         from sar_validation.downloaders.cds_soil_moisture_downloader import (
             _CDS_VERSIONS,
             CDSSoilMoistureDownloader,

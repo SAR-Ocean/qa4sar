@@ -34,10 +34,7 @@ class _FakeCopernicusMarineModule:
 
 class TestNoDataOutcome:
     def test_no_file_written_at_all_is_treated_as_no_data_not_a_failure(self, tmp_path, caplog):
-        """Real-world Copernicus Marine behaviour (confirmed live against
-        this recipe's own Bering Strait bbox, which has no CMEMS in-situ
-        moorings/buoys/ferryboxes/drifters/tidal-gauges for the requested
-        period): subset() reports success (status='000',
+        """Real-world Copernicus Marine behaviour: subset() reports success (status='000',
         file_status='DOWNLOADED') and raises no exception, yet writes no
         output file at all for a genuinely empty result. This used to fall
         through to a FileNotFoundError, which orchestrator.py's

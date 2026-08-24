@@ -115,7 +115,6 @@ class TestERA5DownloaderBuildRequest:
         assert req["time"] == ["18:00", "19:00", "20:00"]
         assert req["data_format"] == "netcdf"
         # Explicit, not left to the CDS backend's per-dataset default --
-        # see the comment in _build_request for why (live 2026-08-07:
         # omitting this made reanalysis-era5-land silently return a ZIP
         # archive saved with a misleading ".nc" extension).
         assert req["download_format"] == "unarchived"
@@ -128,7 +127,7 @@ class TestERA5DownloaderBuildRequest:
         req = dl._build_request(date(2026, 7, 12), [0], -10.0, 10.0, 40.0, 55.0)
         # No land_sea_mask here: a real downloaded era5_waves_*.nc already
         # has swh natively NaN'd over land grid points (ECMWF's ocean wave
-        # model), confirmed live 2026-08-10 -- no land-mask fix needed.
+        # model), no land-mask fix needed.
         assert req["variable"] == ["significant_height_of_combined_wind_waves_and_swell"]
         assert "land_sea_mask" not in req["variable"]
 

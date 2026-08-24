@@ -317,7 +317,7 @@ class TestComputeStatisticsSoilMoisture:
         """The ASCAT row in the CDF-matched statistics table must reflect
         volumetric-domain bias/rmse/ubrmsd (small numbers, ~0-1 scale), not
         percent-domain ones (~0-100 scale) -- consistent with what the
-        CDF-matched plots now show (Task 2)."""
+        CDF-matched plots now show."""
         from sar_validation.core.statistics import compute_statistics_soil_moisture
 
         rng = np.random.default_rng(31)
@@ -451,7 +451,7 @@ class TestAddRescaledSarColumn:
         assert np.isnan(rescaled[5]), "1-pair group can't CDF-match — left as NaN"
 
     def test_ascat_group_converted_to_volumetric_and_not_double_matched(self):
-        """ASCAT's group must be harmonized into ISMN's domain (Task 1),
+        """ASCAT's group must be harmonized into ISMN's domain,
         not additionally re-matched by add_rescaled_sar_column's own
         per-group _cdf_match_sar_series loop -- that would double-apply
         CDF-matching and corrupt the values."""

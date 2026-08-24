@@ -44,10 +44,12 @@ __all__ = ["EarthdataSoilMoistureDownloader"]
 
 
 def _describe_granule(granule: object) -> str:
-    """One-line ``name  (size)`` summary of an ``earthaccess.DataGranule``
+    """
+    One-line ``name  (size)`` summary of an ``earthaccess.DataGranule``
     for dry-run/found-granule listings. Falls back to ``str(granule)`` for
     anything that doesn't expose ``data_links()``/``size()`` (e.g. a plain
-    string used as a test double)."""
+    string used as a test double).
+    """
     try:
         links = granule.data_links()  # type: ignore[attr-defined]
         name = links[0].rsplit("/", 1)[-1] if links else str(granule)

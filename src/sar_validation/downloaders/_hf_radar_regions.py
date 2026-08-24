@@ -1,12 +1,12 @@
 """
 Shared Copernicus Marine HF-radar-total region table.
 
-Bounding boxes and the "has_latest" flag were read from
-``copernicusmarine.describe(dataset_id="cmems_obs-ins_glo_phybgcwav_mynrt_na_irr")``
-on 2026-07-15: each ``<latest|monthly>-radar-total--<Region>`` dataset_part's
-declared variable bbox is the region's real grid extent. ``monthly-radar-total``
-covers all 25 regions; ``latest-radar-total`` only exists for the 18 with a
-near-real-time feed.
+Bounding boxes and the "has_latest" flag are read from
+``copernicusmarine.describe(dataset_id="cmems_obs-ins_glo_phybgcwav_mynrt_na_irr")``:
+each ``<latest|monthly>-radar-total--<Region>`` dataset_part's declared
+variable bbox is the region's real grid extent. ``monthly-radar-total``
+covers all 25 regions; ``latest-radar-total`` exists only for the 18
+with a near-real-time feed.
 """
 
 from __future__ import annotations
@@ -60,7 +60,8 @@ HFR_REGIONS: Dict[str, HfrRegion] = {
 
 
 def resolve_hfr_region(min_lon: float, max_lon: float, min_lat: float, max_lat: float) -> str:
-    """Return the HFR_REGIONS name whose bbox overlaps the request the most.
+    """
+    Return the HFR_REGIONS name whose bbox overlaps the request the most.
 
     Raises ``ValueError`` if no known region overlaps the request bbox at all.
     """

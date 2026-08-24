@@ -667,7 +667,7 @@ class TestISMNDownloaderBboxPreFilterWiring:
         self, tmp_path, monkeypatch,
     ):
         """Regression test: ismn's own internal metadata cache lives
-        INSIDE the extracted subset directory -- if that directory were
+        inside the extracted subset directory -- if that directory were
         recreated fresh on every call (e.g. a random tempfile.mkdtemp()
         target, the original design), ismn would rebuild its metadata
         from scratch every time, even for two calls with the identical

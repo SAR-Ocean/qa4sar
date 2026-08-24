@@ -9,10 +9,10 @@ variable before download. This module is a **local-archive selector**, not
 a network downloader: given a path to that manually-downloaded archive (zip
 or extracted folder), it filters to stations/sensors inside the recipe's
 bbox/depth window and writes one CSV per surviving sensor, in the same
-long-format schema the Copernicus Marine in-situ CSVs use, so
-``DataTreeConverter.from_insitu_csv`` needs zero changes.
+long-format schema the Copernicus Marine in-situ CSVs use for compatibility
+with ``DataTreeConverter.from_insitu_csv``.
 
-No ``archive_path`` needs to be configured for the common case: if it's
+No ``archive_path`` needs to be configured for the common case: if it is
 absent (or stale), ``download()`` auto-detects the most-recently-modified
 ``*.zip`` sitting directly in ``output_dir`` — just drop the downloaded
 zip into this run's own ISMN folder and re-run. An explicit
@@ -50,12 +50,9 @@ logger = logging.getLogger(__name__)
 __all__ = ["ISMNDownloader"]
 
 #: Shared, manually-refreshed complete ISMN export used as a fallback when
-#: a recipe hasn't downloaded its own region/date-specific archive (yet).
-#: Same convention as hf_radar_historical_downloader.py's
-#: _ARCHIVE_CACHE_DIR. Unlike that cache (auto-populated by network
-#: downloads), this one is a manually-maintained full export and needs
-#: periodic manual refreshing from https://ismn.earth/en/dataviewer/ --
-#: see the 90-day staleness warning in download() below.
+#: a recipe has not downloaded its own region/date-specific archive (yet).
+#: It needs periodic manual refreshing from https://ismn.earth/en/dataviewer/
+#: (90-day staleness warning in download()).
 _SHARED_ARCHIVE_CACHE_DIR = Path("data") / "_archive_cache" / "ismn"
 
 #: Age threshold (days) past which download() logs a refresh reminder
@@ -63,20 +60,17 @@ _SHARED_ARCHIVE_CACHE_DIR = Path("data") / "_archive_cache" / "ismn"
 _SHARED_ARCHIVE_STALE_DAYS = 90
 
 #: Cache directory for the per-archive station-coordinate index (see
-#: _build_station_index) -- a separate, independent module constant
-#: from _SHARED_ARCHIVE_CACHE_DIR even though it defaults to the same
-#: literal path, so tests can isolate each one independently.
+#: _build_station_index).
 _STATION_INDEX_CACHE_DIR = Path("data") / "_archive_cache" / "ismn"
 
-#: Zip member names to always copy into an extracted subset alongside
-#: whatever station directories match a bbox filter -- small reference
-#: files (confirmed present in a real archive: ISMN_sensor_list.csv,
-#: ISMN_network_flags_descriptions.csv) that aren't required by every
-#: ismn package version, but copying them unconditionally avoids any
-#: risk of the reader expecting them to exist.
+#: Zip member names are always copied into an extracted subset alongside
+#: whatever station directories match a bbox filter. There are small
+#: reference files (ISMN_sensor_list.csv, ISMN_network_flags_descriptions.csv),
+#: which are not required by every ismn package version, but copied 
+#: unconditionally to avoid the reader expecting them to exist.
 _GLOBAL_REFERENCE_FILENAMES = ("ISMN_sensor_list.csv", "ISMN_network_flags_descriptions.csv")
 
-#: Sentinel file written inside an extracted-subset directory once
+#: Marker file written inside an extracted-subset directory once
 #: extraction genuinely finishes -- see _extract_matching_stations and
 #: the reuse check in ISMNDownloader.download().
 _EXTRACTION_COMPLETE_MARKER = ".extraction_complete"
@@ -89,12 +83,10 @@ def _archive_age_days(path: Path) -> float:
     convention this project's shared-cache archives have settled on) over
     the file's own mtime.
 
-    mtime resets on any copy/checkout/sync of the shared cache directory
-    (observed in practice: a real cache file's mtime read "0 days old"
-    even though its filename said it was over a week old), so it's an
-    unreliable proxy for how stale the underlying ISMN data actually is
-    whenever a name-embedded date is available. Falls back to mtime for
-    any filename without a recognizable trailing date.
+    mtime resets on any copy/checkout/sync of the shared cache directory,
+    so it is an unreliable proxy for how stale the underlying ISMN data
+    actually is whenever a name-embedded date is available. Falls back to
+    mtime for any filename without a recognizable trailing date.
     """
     match = re.search(r"_(\d{8})$", path.stem)
     if match:
@@ -109,7 +101,7 @@ def _archive_age_days(path: Path) -> float:
 def _auto_detect_archive(output_dir: Path) -> Optional[Path]:
     """
     Return the most-recently-modified ``*.zip`` sitting directly in
-    *output_dir*, or ``None`` if it doesn't exist or contains none.
+    *output_dir*, or ``None`` if it does not exist or contains none.
 
     Lets a user just drop the manually-downloaded ISMN zip into this run's
     own ISMN output folder instead of having to edit the recipe's
@@ -126,7 +118,9 @@ def _print_portal_instructions(
     start: str, end: str, min_depth: float, max_depth: float,
     output_dir: Path,
 ) -> None:
-    """Print copy-pasteable filter values for the ISMN web portal."""
+    """
+    Print copy-pasteable filter values for the ISMN web portal.
+    """
     print(
         "ISMN has no download API — data must be requested manually.\n"
         "1. Go to https://ismn.earth/en/dataviewer/ and log in\n"
@@ -155,7 +149,7 @@ def _print_portal_instructions(
         f"     {output_dir}\n"
         "   No recipe edits needed.\n"
         "5. Re-run this recipe — the archive is picked up automatically\n"
-        "   once it's there.\n"
+        "   once it is there.\n"
         "   To reuse one archive across multiple recipes instead, set its\n"
         "   path explicitly via 'ismn_archive_path' in this recipe's\n"
         "   download_kwargs for the 'ismn' validation source."
@@ -177,7 +171,7 @@ def _build_station_index(archive_path: Path) -> pd.DataFrame:
     ``network``, ``station``, ``lat``, ``lon``, ``dir_prefix`` (the zip
     path prefix, e.g. ``"REMEDHUS/Canizal/"``, used later to select
     every file belonging to that station for extraction). A row whose
-    first line couldn't be parsed as expected gets ``lat=NaN,
+    first line could not be parsed as expected gets ``lat=NaN,
     lon=NaN`` rather than being dropped -- callers must treat a NaN
     row as "always include", never silently excluding a real station
     over an unexpected format variant.
@@ -225,7 +219,7 @@ def _station_index_path(archive_path: Path) -> Path:
     # docstring already notes the shared archive "needs periodic manual
     # refreshing") invalidates the cache automatically instead of silently
     # serving a stale station list. Old cache files are simply orphaned,
-    # not actively cleaned up -- they're small CSVs, not worth the added
+    # not actively cleaned up -- they are small CSVs, not worth the added
     # cleanup logic.
     stat = archive_path.stat()
     fingerprint = f"{archive_path.stem}_{stat.st_size}_{int(stat.st_mtime)}"
@@ -285,24 +279,16 @@ def _extracted_subset_dir(
     Deterministic, persistent extraction target for a given (archive,
     bbox) pair.
 
-    A random per-call temp directory (the original design) meant
-    ``ismn``'s OWN internal metadata cache -- which it writes inside
-    whatever directory it's pointed at, e.g.
-    ``<subset_dir>/python_metadata/<name>.csv`` -- could never survive
-    between two calls, even for the identical bbox: a ``--dry-run``
-    immediately followed by the real run re-extracted and rebuilt
-    ``ismn``'s metadata from scratch a second time, and any two runs of
-    the same recipe paid that cost every single time instead of once.
-    Keying the extraction directory deterministically on the archive's
-    own fingerprint (same size+mtime scheme as ``_station_index_path``)
-    plus the bbox means a second call with the same archive and bbox
-    reuses the exact same directory -- including ``ismn``'s own cache
-    inside it -- and only the first-ever call for that (archive, bbox)
-    pair pays the extraction+metadata-build cost.
+    Keyed on the archive's own fingerprint (same size+mtime scheme as 
+    ``_station_index_path``) plus the bbox, so a second call with the
+    same archive and bbox reuses the exact same directory -- including 
+    ``ismn``'s own cache written inside it (e.g.
+    ``<subset_dir>/python_metadata/<name>.csv``). Only the first-ever
+    call for that (archive, bbox) pair pays the extraction and metadata
+    build cost.
 
-    Never cleaned up automatically (unlike the old temp-dir approach):
-    it's a cache now, not a scratch directory, and behaves the same way
-    the persistent station-coordinate index already does.
+    Never cleaned up automatically: it is a persistent cache, behaving
+    the same way the station-coordinate index does.
     """
     stat = archive_path.stat()
     fingerprint = f"{archive_path.stem}_{stat.st_size}_{int(stat.st_mtime)}"
@@ -417,17 +403,15 @@ class ISMNDownloader:
                 # Either never extracted, or a prior extraction into
                 # this exact directory was interrupted before finishing
                 # (no completion marker) -- (re-)extract. extractall
-                # happily overwrites/completes an existing partial tree.
+                # overwrites/completes an existing partial tree.
                 _extract_matching_stations(resolved_archive_path, matched_prefixes, subset_dir)
             reader_source = subset_dir
 
         if self.dry_run:
-            # Bail out before ever constructing ISMN_Interface below --
-            # that's what triggers ismn's own full sensor-level metadata
-            # scan (ismn.filecollection.IsmnFileCollection.build_from_scratch),
-            # which is slow (minutes, on a real multi-thousand-station
-            # archive) and, on the first scan of a given archive+bbox,
-            # floods the terminal with a per-station tqdm progress bar --
+            # Bail out before constructing ISMN_Interface below: doing so
+            # triggers ismn's own full sensor-level metadata scan
+            # (IsmnFileCollection.build_from_scratch), which is slow on a large
+            # archive and floods the terminal with a per-station progress bar --
             # exactly what --dry-run should avoid. Report the cheaper
             # station-level count from the index built above instead of the
             # exact sensor-level count a real run would report.
@@ -456,9 +440,9 @@ class ISMNDownloader:
             # render in place on an interactive tty -- piped/redirected/
             # logged output turns every update into its own line, flooding
             # the terminal with one line per station on the first scan of
-            # a given archive+bbox (confirmed: 653 lines for a 653-station
-            # subset). Only affects the one-time scan; a cached run reads
-            # the metadata CSV directly and never constructs a progress bar.
+            # a given archive+bbox. Only affects the one-time scan; a cached 
+            # run reads the metadata CSV directly and never constructs a 
+            # progress bar.
             with open(os.devnull, "w") as _devnull, contextlib.redirect_stderr(_devnull):
                 reader = ISMN_Interface(reader_source, parallel=True)
         except ValueError as exc:
@@ -468,8 +452,7 @@ class ISMNDownloader:
                 # and last line) -- a portal request for a single calendar
                 # day produces exactly one reading per station file, so
                 # every file fails to parse and this is what ismn raises
-                # once none of them survive. Confirmed against a real
-                # single-day ISMN export.
+                # once none of them survive.
                 raise ValueError(
                     "ismn could not parse any station file in this archive "
                     "-- every file appears to contain only a single "

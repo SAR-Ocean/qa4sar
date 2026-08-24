@@ -1,14 +1,14 @@
 """
 Shared NOAA HF-radar region table.
 
-Single source of truth for the 6 regions NOAA's HF-radar network covers
-(ERDDAP's rolling ~90-day window and/or NCEI THREDDS archive back to 2006):
-bbox, THREDDS folder code, ERDDAP dataset-id map (None where ERDDAP has no
-dataset at all), and the set of resolutions THREDDS serves. Consumed by
-noaa_hfradar_downloader.py (ERDDAP), noaa_hfradar_thredds_downloader.py
-(THREDDS), hf_radar_us_downloader.py (the ERDDAP->THREDDS->Copernicus
-waterfall), and cli.py (currents template auto-source-selection). See
-docs/superpowers/specs/2026-07-31-hf-radar-us-thredds-archive-and-region-expansion-design.md
+Single source of truth for the 6 regions NOAA's HF-radar network
+covers (ERDDAP's rolling ~90-day window and/or the NCEI THREDDS
+archive back to 2006): bbox, THREDDS folder code, ERDDAP dataset-id
+map (None where ERDDAP has no dataset at all), and the set of
+resolutions THREDDS serves. Consumed by noaa_hfradar_downloader.py
+(ERDDAP), noaa_hfradar_thredds_downloader.py (THREDDS),
+hf_radar_us_downloader.py (the ERDDAP -> THREDDS -> Copernicus
+waterfall), and cli.py (currents template auto-source-selection).
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ __all__ = [
 
 
 class NoaaHfrRegion(TypedDict):
-    bbox: Tuple[float, float, float, float]      # (min_lon, max_lon, min_lat, max_lat)
+    bbox: Tuple[float, float, float, float]        # (min_lon, max_lon, min_lat, max_lat)
     thredds_code: str                              # THREDDS folder name, e.g. "USWC"
     erddap_datasets: Optional[Dict[float, str]]    # resolution_km -> ERDDAP dataset id, or None
     thredds_resolutions_km: FrozenSet[float]       # resolution_km values THREDDS serves
@@ -40,13 +40,12 @@ NOAA_HFR_REGIONS: Dict[str, NoaaHfrRegion] = {
         "thredds_resolutions_km": frozenset({0.5, 1, 2, 6}),
         "default_resolution_km": 6,
     },
-    # Must precede US_EAST_GULF in this dict: US_GREAT_LAKES's small bbox
-    # center also falls inside US_EAST_GULF's much larger bbox (lon
-    # -97.88..-60, lat 22..46 -- nearly all of the US East Coast/Gulf),
-    # and match_noaa_hfr_region() below is a first-match-wins center-point
+    # Must precede US_EAST_GULF: US_GREAT_LAKES's small bbox center also
+    # falls inside US_EAST_GULF's much larger bbox (lon -97.88..-60, lat
+    # 22..46 -- nearly all of the US East Coast/Gulf), and
+    # match_noaa_hfr_region() below is a first-match-wins center-point
     # lookup over insertion order. No other pair of regions' bboxes
-    # overlap (verified pairwise across all 6), so this is the only
-    # order-dependent entry in this table.
+    # overlap, making this the only order-dependent entry in this table.
     "US_GREAT_LAKES": {
         "bbox": (-85.3587, -84.16428, 45.62711, 46.060886),
         "thredds_code": "GLNA",
@@ -90,7 +89,8 @@ def _bbox_center(min_lon, max_lon, min_lat, max_lat):
 
 
 def match_noaa_hfr_region(min_lon, max_lon, min_lat, max_lat) -> Tuple[str, NoaaHfrRegion]:
-    """Return the NOAA_HFR_REGIONS entry whose bbox contains the request's
+    """
+    Return the NOAA_HFR_REGIONS entry whose bbox contains the request's
     center point. Raises ValueError if no region contains it.
 
     First-match-wins over NOAA_HFR_REGIONS' insertion order: this only
@@ -110,10 +110,12 @@ def match_noaa_hfr_region(min_lon, max_lon, min_lat, max_lat) -> Tuple[str, Noaa
 
 
 def region_bbox_overlaps(region: NoaaHfrRegion, min_lon, max_lon, min_lat, max_lat) -> bool:
-    """True if the request bbox overlaps the region's bbox at all (not just
-    contains its center) -- a deliberately more permissive test than
-    match_noaa_hfr_region, used only for the CLI template's
-    source-selection heuristic, never for download-time routing."""
+    """
+    True if the request bbox overlaps the region's bbox at all, not
+    merely contains its center -- a deliberately more permissive test
+    than match_noaa_hfr_region, used only for the CLI template's
+    source-selection heuristic, never for download-time routing.
+    """
     lo, hi, la, ha = region["bbox"]
     lon_overlap = min(max_lon, hi) - max(min_lon, lo)
     lat_overlap = min(max_lat, ha) - max(min_lat, la)
@@ -121,9 +123,11 @@ def region_bbox_overlaps(region: NoaaHfrRegion, min_lon, max_lon, min_lat, max_l
 
 
 def finest_resolution_km(region: NoaaHfrRegion) -> float:
-    """min() over the union of erddap_datasets' keys (if any) and
+    """
+    min() over the union of erddap_datasets' keys (if any) and
     thredds_resolutions_km -- the smallest (finest) resolution_km reachable
-    for this region on any backend."""
+    for this region on any backend.
+    """
     available = set(region["thredds_resolutions_km"])
     if region["erddap_datasets"] is not None:
         available |= set(region["erddap_datasets"])
@@ -131,8 +135,10 @@ def finest_resolution_km(region: NoaaHfrRegion) -> float:
 
 
 def _resolution_token(resolution_km: float) -> str:
-    """Map a resolution_km value to the token NOAA's filenames/dataset ids
-    use on the wire: "500m" for 0.5, "{N}km" for a whole number."""
+    """
+    Map a resolution_km value to the token NOAA's filenames/dataset ids
+    use on the wire: "500m" for 0.5, "{N}km" for a whole number.
+    """
     if resolution_km == 0.5:
         return "500m"
     return f"{int(resolution_km)}km"

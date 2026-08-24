@@ -1,27 +1,18 @@
 """
 Download AMSR2 soil-moisture products from JAXA G-Portal via SFTP.
 
-NASA Earthdata's AMSR2 soil-moisture coverage (NSIDC-0451 / its
-replacement AU_Land_NRT_R02, see earthdata_soil_moisture_downloader.py)
-is frozen at 2025-09-01 (NSIDC stopped processing AMSR Unified data
-sets) -- there is no earthaccess path for any date after that. JAXA
-distributes AMSR2 (their own instrument, on GCOM-W1) directly with much
-lower latency via SFTP.
+NASA Earthdata's AMSR2 soil-moisture coverage (NSIDC-0451)
+is frozen at 2025-09-01. JAXA distributes AMSR2 via SFTP.
 
-Host/port/auth confirmed directly from the G-Portal (General) User's
-manual, section 3.3.4 "How to download using SFTP": host
-ftp.gportal.jaxa.jp, port 2051, protocol SFTP, account+password
-authentication (no SSH key registration available for this account).
-Directory layout confirmed from the same manual, section 3.1.1
-"Directory structure":
+Host, port, and authentication are specified in the G-Portal
+(General) User's Manual, section 3.3.4 ("How to download using
+SFTP"): host ``ftp.gportal.jaxa.jp``, port 2051, protocol SFTP,
+account-and-password authentication (no SSH key registration is
+available for this account). Directory layout is specified in the
+same manual, section 3.1.1 ("Directory structure"):
+
   standard/[Project]/[Satellite.Sensor]/[Product Name]/[Version]/[Year]/[Month]/
   nrt/[Project]/[Satellite.Sensor]/[Product Name]/  (flat, ~1 week retention)
-
-The manual is JAXA-generic and never names AMSR2's soil-moisture product
-directory directly (it illustrates the pattern with GPM examples only)
--- this downloader therefore *discovers* the right directory by listing
-and pattern-matching directory names, logging every directory it finds
-along the way, rather than hardcoding a guessed path.
 
 Library usage::
 
@@ -57,38 +48,20 @@ __all__ = ["GPortalAMSR2Downloader"]
 HOST = "ftp.gportal.jaxa.jp"
 PORT = 2051
 
-#: A transient connection-level failure (observed live: "Error reading SSH
-#: protocol banner" -- the TCP handshake succeeds but the server closes or
-#: goes silent before sending its SSH banner) gets one retry after a brief
-#: backoff, rather than aborting this whole best-effort fallback source
-#: outright. A bare reconnect moments later has reliably succeeded when this
-#: was observed, so a short retry is worth it before giving up.
+#: A transient connection-level failure ("Error reading SSH protocol banner" 
+#: -- the TCP handshake succeeds but the server closes or goes silent before 
+#: sending its SSH banner) gets one retry after a brief backoff.
 _CONNECT_MAX_ATTEMPTS = 2
 _CONNECT_RETRY_BACKOFF_SECONDS = 2.0
 
 _TOP_LEVEL_DIRS = ("standard", "nrt")
 _SENSOR_NAME_PATTERN = re.compile(r"amsr2|gcom-w", re.IGNORECASE)
-# "sm" must stand on its own as a token (e.g. "L3.SM_STD"), not be part of a
-# longer word -- \b won't do this because "_" counts as a word character in
-# Python's default \w, so "SM_STD" has no \b between "M" and "_". Use
-# explicit letter-based lookarounds instead so "SM" followed by "_"/"."/digits
-# still counts as a standalone token while "SMALL"/"OSMOSIS" etc. don't match.
 _PRODUCT_NAME_PATTERN = re.compile(r"(?<![a-z])sm(?![a-z])|soil|smc", re.IGNORECASE)
 _FILENAME_DATE_RE = re.compile(r"(\d{8})")
 # G-Portal's standard/ tree mixes daily granules ("..._01D_...") with
 # whole-month composite files ("..._01M_...") in the same Year/Month
-# listing -- both can carry an embedded date that matches the requested
-# window below, since a monthly file's date uses day="00" as a
-# placeholder for "the whole month" (e.g. "20260100"), which the plain
-# lexicographic start_date <= date <= end_date comparison can't tell
-# apart from a real day once collocation-tolerance padding pushes the
-# window's start into the previous month. This downloader/
-# DataTreeConverter.from_amsr_ssm's whole pipeline is built for daily L3
-# grids only -- a monthly file has a different HDF5 group layout (no
-# "Time Information" group) that from_amsr_ssm can't parse, confirmed
-# live: it falls through to the unrelated NSIDC-0451 branch and logs
-# "Missing vsm/longitude/latitude field(s)" before being silently
-# dropped.
+# listing. This downloader and DataTreeConverter.from_amsr_ssm's whole 
+# pipeline are built for daily L3 grids only.
 _NON_DAILY_AGGREGATION_RE = re.compile(r"_\d{2}M_")
 
 
@@ -198,18 +171,14 @@ class GPortalAMSR2Downloader:
 
         min_lon/max_lon/min_lat/max_lat are accepted for interface
         consistency with every other downloader but not used for
-        server-side filtering -- SFTP has no spatial query. Domain
-        cropping is a converter-layer concern (out of scope here; see
-        the design doc's "Out of scope" section).
+        server-side filtering, since SFTP has no spatial query.
         """
         start_dt = normalize_datetime(start)
         end_dt = normalize_datetime(end)
 
         if self.dry_run:
-            # Report real file availability when credentials are already
-            # configured -- but never prompt for one during a "dry" run
-            # (allow_prompt=False regardless of self._allow_prompt): a
-            # dry-run must never block on interactive input.
+            # Only report real file availability when credentials are 
+            # already configured.
             try:
                 username, password = authenticate_gportal(
                     self._username, self._password, allow_prompt=False,
@@ -231,27 +200,17 @@ class GPortalAMSR2Downloader:
         sftp = None
         try:
             # paramiko.Transport.__init__/.connect() accept no timeout of
-            # their own -- an unresponsive server would otherwise hang the
-            # caller indefinitely. _connect_with_retry opens the socket
-            # with a timeout first and hands it to Transport, mirroring
-            # the same fix already applied to smos_downloader.py's
-            # ftplib.FTP_TLS(..., timeout=60) -- and retries once on a
-            # transient connection-level failure (e.g. "Error reading SSH
-            # protocol banner", observed live against this exact server).
+            # their own, meaning an unresponsive server would hang
+            # indefinitely. _connect_with_retry opens the socket with a 
+            # timeout first and hands it to Transport, and retries once on
+            # a transient connection-level failure (e.g. "Error reading SSH
+            # protocol banner").
             transport, sftp = _connect_with_retry(username, password)
             product_dirs = self._discover_product_directory(sftp)
             if not product_dirs:
                 return []
             # Try every confidently-matched product directory in order
-            # (standard/ before nrt/, per _discover_product_directory), not
-            # just the first: the product directory itself typically
-            # exists under both trees on a real account, but nrt/'s
-            # ~1-week-retention tree may hold recent files not yet
-            # propagated to standard/'s Year/Month archive. Returning as
-            # soon as standard/ comes up empty would make nrt/ -- the
-            # whole reason this fallback exists -- structurally
-            # unreachable in its own motivating scenario (a recent date
-            # request that standard/ hasn't caught up to yet).
+            # (standard/ before nrt/) -- see _discover_product_directory for why.
             downloaded: list[Path] = []
             for product_dir in product_dirs:
                 downloaded = self._download_from_product_directory(
@@ -342,20 +301,13 @@ class GPortalAMSR2Downloader:
         name matches an AMSR2/soil-moisture heuristic.
 
         Returns every confidently-matched product directory found, in
-        top-level order (``standard`` before ``nrt``) -- not just the
-        first match. The product directory itself typically exists under
-        both trees on a real account; it's specific *files* for a recent
-        date that may only be in nrt/'s ~1-week-retention tree, not yet
-        propagated to standard/'s Year/Month archive. A caller that stops
-        at the first match would only ever consult nrt/ when standard/
-        has no AMSR2 product directory at all -- which isn't true on a
-        real account -- making the nrt/ fallback unreachable in the exact
-        scenario (a recent date past standard/'s archive lag) it exists
-        to serve. See ``download()`` for how callers use this list.
+        top-level order (``standard`` before ``nrt``), not just the first
+        match, since a recent date's files may only be in nrt/'s ~1-week
+        -retention tree, not yet propagated to standard/'s Year/Month archive.
+        See ``download()`` for how callers use this list.
 
-        Logs every directory name seen so a real run against a real
-        account leaves a usable trail even when the heuristic doesn't
-        match anywhere.
+        Logs every directory name seen, so a real run leaves a usable trail
+        even when the heuristic matches nothing.
         """
         found_listings: dict[str, list[str]] = {}
         product_dirs: list[str] = []
@@ -381,20 +333,15 @@ class GPortalAMSR2Downloader:
         directory found under top-level tree *top* (``"standard"`` or
         ``"nrt"``) -- not just the first.
 
-        A real G-Portal account can list MULTIPLE sensor directories
+        A real G-Portal account can list multiple sensor directories
         under one top-level tree that match ``_SENSOR_NAME_PATTERN``,
-        and not all of them are real AMSR2 data: confirmed on a real
-        account, ``standard/AQUA/AQUA.AMSR-E_AMSR2Format`` matches the
-        "amsr2" pattern via its own literal filename component, but it's
-        AMSR-E -- a different, retired-since-2011 instrument, reformatted
-        to look like AMSR2's file layout for cross-instrument continuity
-        -- and its ``L3.SMC_10`` archive only spans 2002-2011. Since the
-        server lists ``AQUA`` before the genuine ``GCOM-W`` project,
-        stopping at the first sensor match made
-        ``standard/GCOM-W/GCOM-W.AMSR2`` (which does have current data)
-        structurally unreachable for any date after 2011. Returning every
-        match instead lets ``download()``'s existing "try each until one
-        yields files" loop fall through the decoy to the real sensor.
+        without all of them being real AMSR2 data: e.g. 
+        ``standard/AQUA/AQUA.AMSR-E_AMSR2Format`` matches via its own 
+        literal filename component, but it is AMSR-E (a retired, different
+        instrument, reformatted to look like AMSR2's file layout), listed 
+        before the genuine ``standard/GCOM-W/GCOM-W.AMSR2``. Returning every
+        match lets ``download()``'s "try each until one yields files" 
+        loop fall through such decoys to the real sensor.
 
         Populates *found_listings* (mutated in place) with every
         directory listing seen along the way, for
@@ -492,27 +439,21 @@ class GPortalAMSR2Downloader:
     def _filter_by_orbit_overlap(
         self, matches: list[tuple[str, str]], min_lon: float, max_lon: float, min_lat: float, max_lat: float,
     ) -> list[tuple[str, str]]:
-        """Drop (dir_path, name) entries whose embedded date's whole-day
-        window shows no predicted orbit overlap with the requested bbox
-        -- see orbit_coverage.orbit_overlaps_bbox. Every entry here
-        already matched _FILENAME_DATE_RE by construction (see
-        _download_from_product_directory's matches-building loop), so
-        re-matching it is guaranteed to succeed.
+        """
+        Drop (dir_path, name) entries whose embedded date's whole-day window
+        shows no predicted orbit overlap with the requested bbox -- see
+        orbit_coverage.orbit_overlaps_bbox. Filenames embed only a date, not
+        a time of day, so the whole day [00:00:00Z, 23:59:59Z] is used as
+        the sensing window (kept for consistency with the other two
+        orbit-prefiltered sources; rarely filters anything out, given
+        AMSR2's near-global daily coverage).
 
-        Filenames only embed a date, not a time-of-day, so the whole day
-        [00:00:00Z, 23:59:59Z] is used as the sensing window -- expected
-        to rarely filter anything out, since AMSR2's near-global daily
-        coverage means most days overlap most bboxes. Kept for
-        consistency with the other two orbit-prefiltered sources.
-
-        _FILENAME_DATE_RE is just an 8-digit run, not a real-date check --
-        a string like "20260231" is lexicographically inside a requested
-        date range and passes the earlier start_date <= ... <= end_date
-        filter, but isn't a real calendar date, so strptime is wrapped in
-        its own try/except: on a ValueError, keep the file without
-        applying the orbit filter to it (matching this module's own
-        fail-open philosophy) rather than letting the exception propagate
-        and abort the whole AMSR2 download over a single bad filename."""
+        _FILENAME_DATE_RE matches an 8-digit run, not a valid calendar date
+        -- e.g. "20260231" passes the earlier lexicographic date-range
+        filter but is not real. strptime is wrapped in its own try/except:
+        on a ValueError, the file is kept unfiltered (fail-open) rather than
+        aborting the whole download over one malformed filename.
+        """
         from datetime import datetime, timedelta, timezone
 
         from ..core.orbit_coverage import orbit_overlaps_bbox
@@ -542,7 +483,7 @@ class GPortalAMSR2Downloader:
         """
         standard/ nests Version/Year/Month below the product directory.
         Version is unknown ahead of time (per the manual's diagram) --
-        list whatever's there and descend into every version found,
+        list whatever is there and descend into every version found,
         restricting Year/Month to the requested window.
         """
         start_year = int(start_dt[:4])

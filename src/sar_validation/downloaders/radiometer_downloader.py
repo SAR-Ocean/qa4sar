@@ -10,7 +10,7 @@ one file per sensor per day covers the whole globe. Two passes (ascending /
 descending) are stored per file, and every grid cell carries its own
 measurement time.
 
-Format landscape (verified against the live site)
+Format landscape 
 -------------------------------------------------
 - **AMSR2** publishes modern **NetCDF** L3 files:
     ``amsr2/ocean/L3/v08.2/daily/{YYYY}/RSS_AMSR2_ocean_L3_daily_{date}_v08.2.nc``

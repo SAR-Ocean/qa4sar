@@ -5,14 +5,10 @@ Data source: INSITU_GLO_PHYBGCWAV_DISCRETE_MYNRT_013_030
     Dataset ID: cmems_obs-ins_glo_phybgcwav_mynrt_na_irr
     dataset_part: "<latest|monthly>-radar-total--<Region>"
 
-The dataset's plain "latest"/"monthly" parts are a *sparse per-platform*
-in-situ feed (moorings/buoys/drifters/ferrybox/tide gauges) that carries no
-HF-radar rows at all — verified empty for any bbox/time/variable combination
-tried on 2026-07-15. HF-radar current data is delivered separately, as a
-regular (time, lat, lon) grid per named coastal region, via
-"<latest|monthly>-radar-total--<Region>" dataset_parts. This downloader
-resolves the request bbox to one of those named regions and subsets that
-grid directly.
+HF-radar current data is delivered as a regular (time, lat, lon) 
+grid per named coastal region, via "<latest|monthly>-radar-total--<Region>" 
+dataset_parts. This downloader resolves the request bbox to one of 
+those named regions and subsets that grid directly.
 
 Library usage::
 
@@ -71,7 +67,7 @@ class HFRadarDownloader:
     min_depth, max_depth : float
         Accepted for interface compatibility with the orchestrator's
         recipe-level depth-resolution machinery. The HF-radar-total grid has
-        no depth axis (it's a fixed near-surface radar measurement), so
+        no depth axis (it is a fixed near-surface radar measurement), so
         these are unused.
     """
 
@@ -260,10 +256,9 @@ class HFRadarDownloader:
         start_dt, end_dt, dest_path,
     ) -> None:
         # No `variables=` filter: omitting it makes copernicusmarine return
-        # every variable in the dataset_part (verified live — 14 vars for
-        # *-radar-total--<Region>, including EWCS/NSCS standard deviations
-        # and all *_QC/QCflag fields), so the converter (Task 3) always has
-        # the full ancillary set to pick from on disk.
+        # every variable in the dataset_part (14 vars for *-radar-total--<Region>, 
+        # including EWCS/NSCS standard deviations and all *_QC/QCflag fields), 
+        # so the converter always has the full ancillary set to pick from on disk.
         copernicusmarine.subset(
             dataset_id=DATASET_ID,
             dataset_part=dataset_part,

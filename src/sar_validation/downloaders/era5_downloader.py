@@ -2,11 +2,8 @@
 Download ERA5 reanalysis data (wind, waves, soil moisture) via the
 Copernicus Climate Data Store (CDS) ``cdsapi`` client.
 
-Uses the gridded area/bbox CDS datasets -- NOT the single-point
-``-timeseries`` datasets -- since the collocation method in
-``sar_validation.core.model_collocation`` needs a spatial grid to
-bilinearly interpolate over (see
-docs/superpowers/specs/2026-08-06-era5-model-validation-design.md).
+Uses the gridded area/bbox CDS datasets needed for bilinear interpolation
+in ``sar_validation.core.model_collocation``.
 
 Credentials are read automatically from ``~/.cdsapirc`` (the standard CDS
 API key file), the same file already used by
@@ -53,32 +50,21 @@ _CDS_DATASET_BY_VARIABLE: dict[Era5Variable, str] = {
 }
 
 #: Base URL for the CDS catalogue's collection-metadata endpoint, used by
-#: check_availability_dry (see that method). Mirrors
-#: cds_soil_moisture_downloader.py's own ``_CDS_API_URL`` -- kept as a
-#: separate module-level constant rather than imported from that sibling
-#: module, since the two downloaders are otherwise independent and this
-#: is the one piece of shared infrastructure between them.
+#: check_availability_dry. Mirrors cds_soil_moisture_downloader.py's own
+#: ``_CDS_API_URL`` -- kept as a separate module-level constant since the
+#: two downloaders are otherwise independent.
 _CDS_API_URL = "https://cds.climate.copernicus.eu/api"
 
-#: CDS variable name(s) per ERA5 variable. NOTE: the ERA5-Land soil
-#: moisture variable is named "..._layer_1" (not "..._level_1") in the
-#: live CDS API's variable enum -- confirmed 2026-08-07 by querying
-#: cdsapi.Client().client.get_process("reanalysis-era5-land")'s schema
-#: after a "level_1" request failed with a CDS-side "MultiAdaptorNoDataError"
-#: (the mistyped name passes cdsapi's own request validation, since it's
-#: just a string, but the backend silently finds no matching data).
-#: "land_sea_mask" ("lsm" on the wire) is requested alongside u10/v10 for
-#: wind only, in the SAME CDS call (no extra download round-trip). It's
-#: used purely as a masking input by ModelLayerCollocation to skip ERA5
-#: grid cells whose own center is land -- ERA5's wind field is computed
-#: with different surface-roughness/friction physics over land vs. sea, so
-#: a land grid point's wind isn't meaningfully comparable to SAR ocean wind
-#: retrieval even when nearby SAR ocean pixels exist within its
-#: aggregation window. NOT added for waves (a real downloaded
-#: era5_waves_*.nc already has swh natively NaN'd over land -- ECMWF's
-#: ocean wave model, confirmed live 2026-08-10) or soil_moisture
-#: (reanalysis-era5-land is land-only by definition; a land-sea mask would
-#: be nonsensical there).
+#: CDS variable name(s) per ERA5 variable. The ERA5-Land soil moisture
+#: variable is named "..._layer_1" (not "..._level_1") in the live CDS
+#: API's variable enum. "land_sea_mask" ("lsm" on the wire) is requested
+#: alongside u10/v10 for wind only, in the SAME CDS call. It is used as
+#: a masking input by ModelLayerCollocation to skip ERA5 grid cells whose
+#: center is land, because ERA5's wind field is computed with different
+#: surface-roughness/friction physics over land vs. sea, making a land
+#: grid point's wind not meaningfully comparable to SAR ocean wind
+#: retrieval. "land_sea_mask" is not needed for waves, since a downloaded
+#: era5_waves_*.nc already has swh NaN'd over land.
 _CDS_VARIABLE_NAMES_BY_VARIABLE: dict[Era5Variable, list[str]] = {
     "wind": ["10m_u_component_of_wind", "10m_v_component_of_wind", "land_sea_mask"],
     "waves": ["significant_height_of_combined_wind_waves_and_swell"],
@@ -95,9 +81,9 @@ _GRID_PAD_DEG_BY_VARIABLE: dict[Era5Variable, float] = {
 }
 
 #: Default margin (hours) added on both sides of the requested temporal
-#: window before it's clipped to a calendar day, giving the hyperbolic
+#: window before it is clipped to a calendar day, giving the hyperbolic
 #: method room to find 3 consecutive bracketing hours even at the window's
-#: edges (2x ERA5's 1-hourly cadence -- mirrors hycom_downloader.py's
+#: edges (2x ERA5's 1-hourly cadence, this mirrors hycom_downloader.py's
 #: _BRACKET_BUFFER_HOURS derivation). Used only as
 #: :meth:`ERA5Downloader.__init__`'s ``time_tolerance_minutes`` default;
 #: a recipe-driven run passes the orchestrator's own resolved
@@ -119,8 +105,7 @@ def _hours_needed_for_day(
     Downloads only these hours instead of always requesting the full 24 --
     avoids over-downloading for narrow wind/wave recipe windows, while wide
     soil-moisture windows still naturally end up requesting most/all hours
-    of their interior days. No per-variable special-casing needed: the
-    same rule produces the right answer for both cases.
+    of their interior days.
     """
     padded_start = window_start - timedelta(hours=buffer_hours)
     padded_end = window_end + timedelta(hours=buffer_hours)
@@ -323,11 +308,13 @@ class ERA5Downloader:
         return self.output_dir / f"era5_{self.variable}_{day.strftime('%Y%m%d')}{suffix}.nc"
 
     def _build_area(self, min_lon: float, max_lon: float, min_lat: float, max_lat: float) -> list[float]:
-        """CDS ``area`` facet: ``[north, west, south, east]``, padded by one
+        """
+        CDS ``area`` facet: ``[north, west, south, east]``, padded by one
         native grid cell so bilinear interpolation never extrapolates at a
         SAR scene's edges -- clipped at +/-180 so a window that already
         touches the antimeridian (from split_antimeridian_bbox) is never
-        padded past it into an invalid CDS area value."""
+        padded past it into an invalid CDS area value.
+        """
         pad = _GRID_PAD_DEG_BY_VARIABLE[self.variable]
         west = max(min_lon - pad, -180.0)
         east = min(max_lon + pad, 180.0)
@@ -346,13 +333,6 @@ class ERA5Downloader:
             "time": [f"{h:02d}:00" for h in hours],
             "area": self._build_area(min_lon, max_lon, min_lat, max_lat),
             "data_format": "netcdf",
-            # Explicit, not left to the CDS backend's per-dataset default:
-            # confirmed live 2026-08-07 that omitting this facet made
-            # reanalysis-era5-land silently return a ZIP archive (saved with
-            # a misleading ".nc" extension, unreadable by xarray) for a
-            # request that otherwise had "data_format": "netcdf" set,
-            # whereas the exact same omission on reanalysis-era5-single-levels
-            # (wind/waves) already returned a plain, directly-readable file.
             "download_format": "unarchived",
         }
         # reanalysis-era5-land has no product_type facet; the atmospheric
@@ -382,11 +362,7 @@ class ERA5Downloader:
         dataset = _CDS_DATASET_BY_VARIABLE[self.variable]
 
         # print(), not just logger.info(): the CDS request below can take a
-        # long time and the CLI's root logger defaults to WARNING (cli.py),
-        # so an INFO-only message here would leave the terminal silent --
-        # every other downloader (scatterometer_ftp_downloader,
-        # altimeter_downloader, smos_downloader, ...) announces its fetch
-        # via print() for the same reason.
+        # long time and the CLI's root logger defaults to WARNING (cli.py).
         window_suffix = f" (window {window_idx})" if window_idx is not None else ""
         print(f"  Downloading ERA5 {self.variable} for {day.isoformat()}{window_suffix} …")
         try:

@@ -2,10 +2,25 @@
 Mapping from recipe ``variable`` field to (sar_var, val_var) pairs.
 
 This is the single source of truth used by both ``statistics.py`` and
-``visualization.py``.  The SAR variable names follow the ``owi*`` convention
-from Sentinel-1 L2 OCN products; the validation variable names match the
-column headers in Copernicus Marine in-situ CSV files and standard CF names
-used by the scatterometer / altimeter converters.
+``visualization.py``.
+
+sar_var names originate from Sentinel-1 L2 OCN's own product field
+names (``owi*``, ``osw*``, ``rvlRadVel``), but every SAR source's
+converter normalizes its output to these same canonical codes at
+conversion time -- e.g. RADARSAT-2 wind is renamed to
+``owiWindSpeed``, and NISAR SME2 soil moisture to ``sarSSM`` --
+rather than each source keeping its own raw field name:
+  wind          : ``owiWindSpeed``/``owiWindDirection``
+  waves         : ``osw*``
+  currents      : ``rvlRadVel``
+  soil_moisture : ``sarSSM`` 
+
+val_var names are likewise the codes every validation converter
+normalizes its own source to, not literal column headers from any
+one source -- e.g. CF-like codes (``WSPD``/``WDIR``), the CMEMS
+wave-height code (``VHM0``), a derived projection
+(``rvlRadVel_projection``), or a generic descriptive code
+(``SOIL_MOISTURE``).
 """
 
 from __future__ import annotations
@@ -26,7 +41,7 @@ __all__ = [
 
 VARIABLE_PAIRS: dict[str, List[Tuple[str, str]]] = {
     "wind": [
-        # WSPD covers in-situ, scatterometer AND altimeter wind speed: the
+        # WSPD covers in-situ, scatterometer and altimeter wind speed: the
         # converters rename the raw product names (OSI-SAF ``wind_speed``,
         # CMEMS altimeter ``WIND_SPEED``) to this single canonical code so
         # all sources land in one comparison section.
@@ -60,43 +75,37 @@ CIRCULAR_VAL_VARS: set[str] = {"WDIR"}
 
 #: Wave-height validation codes that get merged into one combined "SWH"
 #: comparison group, in precedence order (matches from_insitu_csv's own
-#: per-row precedence -- see docs/design-choices.md §5.8). VHM0 (spectral
-#: Hm0, from ERA5/some in-situ platforms) and VAVH (time-domain H1/3, from
-#: altimeters/some in-situ platforms) are correlated-but-distinct
-#: estimators of the same physical quantity; keeping them in separate
-#: report sections doubled the waves report's length and produced
-#: guaranteed-all-NaN geographic panels for whichever collocation type
-#: doesn't use that section's variable (e.g. ERA5's model_vs_layer under a
-#: VAVH-only section). See docs/design-choices.md §5.8 for the full
-#: rationale and the from_insitu_csv precedence fix this builds on.
+#: per-row precedence). VHM0 (spectral Hm0, from ERA5/some in-situ platforms) 
+#: and VAVH (time-domain H1/3, from altimeters/some in-situ platforms) 
+#: are correlated-but-distinct estimators of the same physical quantity.
+#: Merging them avoids a separate report section per code, some of which
+#: would otherwise show all-NaN geographic panels for collocation types
+#: that do not use that section's variable.
 WAVE_HEIGHT_VAL_VARS: Tuple[str, ...] = ("VHM0", "VAVH", "VGHS")
 
 #: Canonical merged val_var code standing in for any WAVE_HEIGHT_VAL_VARS
-#: member -- distinct from "VHM0" so a VAVH-only row's value is never
-#: reported under a column literally named "VHM0".
+#: member.
 WAVE_HEIGHT_MERGED_VAL_VAR = "SWH"
 
 
 def merge_wave_height_columns(collocation_ds) -> bool:
     """
     Combine ``val_VHM0``/``val_VAVH``/``val_VGHS`` into one
-    ``val_SWH`` column, in place, plus a ``val_var_code`` companion
-    recording which raw code each row's value came from.
+    ``val_SWH`` column in place, plus a ``val_var_code`` companion
+    column recording which of the three each row's value came from.
 
-    Each row has at most one of these populated by construction --
-    ``from_insitu_csv`` already nulls all but the highest-precedence one
-    per row (see docs/design-choices.md §5.8) and every other converter
-    (``from_altimeter``, ``from_era5``) only ever produces exactly one of
-    them -- so this is a simple per-row coalesce in
-    :data:`WAVE_HEIGHT_VAL_VARS` precedence order, not a value-choosing
-    decision; a row where more than one is somehow still populated keeps
-    the highest-precedence one, same as ``from_insitu_csv``.
+    At most one of the three is ever populated for a given row:
+    ``from_insitu_csv`` already nulls out all but the
+    highest-precedence one, and every other converter only ever
+    produces one of the three in the first place. So merging is just
+    taking whichever one is non-null per row, in
+    :data:`WAVE_HEIGHT_VAL_VARS` precedence order.
 
-    No-op (returns False) if none of :data:`WAVE_HEIGHT_VAL_VARS` are
-    present in *collocation_ds*, or ``val_SWH`` already exists (idempotent
-    -- safe to call more than once on the same Dataset, which
-    ``filter_variable_pairs`` does across its multiple call sites in
-    ``statistics.py``).
+    Returns False and makes no changes if none of
+    :data:`WAVE_HEIGHT_VAL_VARS` are present in *collocation_ds*.
+    Returns True without redoing the merge if ``val_SWH`` already
+    exists, so the function is safe to call more than once on the
+    same Dataset.
 
     Returns
     -------
@@ -189,9 +198,8 @@ def filter_variable_pairs(
        recipe with e.g. both ERA5 (VHM0) and altimeter (VAVH) gets one
        comparison group instead of a separate report section per code
     2. Picks the primary SAR wave variable by fallback (oswTotalHs, else
-       oswHs, based on which column actually exists in collocation_ds), and
-       additionally includes owiSignificantWaveHeight whenever that column
-       exists and has at least one non-NaN value
+       oswHs), and additionally includes owiSignificantWaveHeight whenever 
+       that column exists and has at least one non-NaN value
     3. Filters to only pairs where both SAR and validation variables exist
 
     For other variable types (wind, currents):
@@ -214,19 +222,12 @@ def filter_variable_pairs(
 
     # For waves: merge every available wave-height validation parameter
     # (VHM0/VAVH/VGHS) into one combined comparison group instead of a
-    # separate section per code -- see merge_wave_height_columns's
-    # docstring and docs/design-choices.md §5.8.
+    # separate section per code.
     if variable == "waves":
         merge_wave_height_columns(collocation_ds)
 
         # Primary SAR wave-height variable: single-winner fallback driven by
-        # which sar_<name> column actually exists in collocation_ds — NOT by
-        # recipe.config.sar_data.swath_mode, since a recipe can request
-        # multiple modes (e.g. [WV, SM]) while the downloader only ends up
-        # returning scenes for one of them. Using the requested mode to pick
-        # candidates caused real WV-only results to be silently dropped when
-        # a mixed mode was requested (see
-        # docs/superpowers/specs/2026-07-16-wave-sar-variable-fallback-design.md).
+        # which sar_<name> column exists in collocation_ds. 
         primary_candidates = ["oswTotalHs", "oswHs"]
         primary_var = next(
             (v for v in primary_candidates if f"sar_{v}" in collocation_ds),
@@ -235,12 +236,10 @@ def filter_variable_pairs(
 
         sar_vars = [primary_var] if primary_var is not None else []
 
-        # owiSignificantWaveHeight is additive, not a fallback: it's a
-        # genuinely different measurement (IW/EW grid product), so when it
-        # actually carries data it gets its own statistics alongside the
-        # primary variable rather than replacing it. In every real product
-        # seen so far this column is either absent or entirely NaN, in which
-        # case it must NOT be selected.
+        # owiSignificantWaveHeight is additive, not a fallback: it is a
+        # different measurement (IW/EW grid product) in principle not provided.
+        # When it carries data it gets its own statistics alongside the
+        # primary variable rather than replacing it. 
         owi_col = "sar_owiSignificantWaveHeight"
         if owi_col in collocation_ds and bool(collocation_ds[owi_col].notnull().any()):
             sar_vars.append("owiSignificantWaveHeight")

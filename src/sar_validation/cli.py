@@ -12,7 +12,7 @@ Usage
   # Create a recipe template (wind | currents | waves | soil_moisture)
   sar-validate --create-recipe wind
 
-  # Store credentials in the OS keyring (eumdac | osi_saf | gportal | smos | hsaf | space_track)
+  # Store credentials in the OS keyring (eumdac | osi_saf | gportal | smos | earthdata | hsaf | space_track)
   sar-validate --set-credential eumdac
 
   # Dry-run (see what would be downloaded)
@@ -31,10 +31,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    # Type-only import: binds ``xr`` for the string return annotations below
-    # (e.g. ``"xr.DataTree | None"``). This module imports xarray lazily inside
-    # the functions that use it rather than at module scope, so without this
-    # guard a type checker can't resolve ``xr`` in those annotations.
+    # Type-only import, binding ``xr`` for the string return annotations
+    # below (e.g. ``"xr.DataTree | None"``): this module imports xarray
+    # lazily inside the functions that use it, so a type checker cannot
+    # otherwise resolve ``xr`` in those annotations.
     import xarray as xr
 
     from .core.recipe import Recipe
@@ -45,12 +45,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# The ismn package's own file-collection logger (a plain 'ismn_meta_collector'
-# name, not a dotted child of 'ismn' -- see its own const.py/filecollection.py)
-# logs one INFO line per station file it reads while building ISMN_Interface's
-# metadata -- hundreds of lines for a real archive. Pinned to WARNING
-# unconditionally (not just outside --verbose, matching the "matplotlib" cap
-# below) since this per-file trace has no debugging value for this toolbox.
+# ismn's own file-collection logger ('ismn_meta_collector') logs one INFO line 
+# per station file while building ISMN_Interface's metadata -- hundreds of
+# lines for a real archive. Pinned to WARNING unconditionally (matching the 
+# "matplotlib" cap below).
 logging.getLogger("ismn_meta_collector").setLevel(logging.WARNING)
 
 
@@ -321,7 +319,8 @@ Examples:
 # ---------------------------------------------------------------------------
 
 def _set_credential(name: str) -> None:
-    """Prompt for a username/password and store them in the OS keyring.
+    """
+    Prompt for a username/password and store them in the OS keyring.
 
     Backs ``sar-validate --set-credential {eumdac,osi_saf,gportal,smos,earthdata,hsaf,space_track}``.
     """
@@ -363,7 +362,8 @@ def _build_currents_config(
     min_lat: Optional[float] = None,
     max_lat: Optional[float] = None,
 ):
-    """Build the 'currents' recipe template's RecipeConfig.
+    """
+    Build the 'currents' recipe template's RecipeConfig.
 
     Extracted from ``_create_recipe`` so the template content is
     unit-testable independent of the CLI's file-writing side effects.
@@ -456,8 +456,8 @@ def _build_currents_config(
             ValidationDataSource(source_type="argo_historical"),
             ValidationDataSource(source_type="drifter_historical"),
             ValidationDataSource(source_type="glider_historical"),
-            # HyCOM ocean model (surface currents) -- unconditional, unlike
-            # hf_radar_sources above: HyCOM has global coverage, so it
+            # HYCOM ocean model (surface currents) -- unconditional, unlike
+            # hf_radar_sources above: HYCOM has global coverage, so it
             # applies regardless of bbox (no NOAA-region-overlap branching
             # needed the way hf_radar_us/hf_radar differ).
             ValidationDataSource(source_type="hycom"),
@@ -471,9 +471,9 @@ def _build_currents_config(
                         "distance_weighting": "equal",
                         "dedup_nearest_in_time": True,
                     },
-                    # HyCOM ocean model -- tuning mirrors
+                    # HYCOM ocean model -- tuning mirrors
                     # DEFAULT_LAYER_TYPE_SPECS's "hycom" entry (recipe.py).
-                    # time_tolerance_minutes=360 (6h = 2x HyCOM's 3-hourly
+                    # time_tolerance_minutes=360 (6h = 2x HYCOM's 3-hourly
                     # cadence) is the minimum that guarantees
                     # ModelLayerCollocation always finds a bracketing pair
                     # of granules -- see recipe.MODEL_CADENCE_HOURS.
@@ -519,11 +519,7 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
         )
         # RADARSAT-2 has no SAR-retrieved direction component (see
         # description above), and swath_mode is Sentinel-1-specific
-        # terminology (SARDataSpec.swath_mode's own docstring: "ignored
-        # (harmless no-op) by every other source") -- both were
-        # previously hardcoded to the Sentinel-1 values regardless of
-        # sar_source, which was accurate for neither field's actual
-        # meaning for this source.
+        # terminology.
         components = ["speed"]
         swath_mode: list[str] = []
     else:
@@ -651,7 +647,8 @@ def _build_waves_config(
     sar_source: str = "sentinel1_l2_ocn",
     altimeter_freq: Optional[str] = None,
 ):
-    """Build the 'waves' recipe template's RecipeConfig.
+    """
+    Build the 'waves' recipe template's RecipeConfig.
 
     Extracted from ``_create_recipe`` so the template content is
     unit-testable independent of the CLI's file-writing side effects,
@@ -661,8 +658,8 @@ def _build_waves_config(
     generated recipe validates against: "1hz" (default), "5hz", or "both".
     1 Hz and 5 Hz sample the same ground track at different point spacing
     (~7km vs ~1.4km) — mixing both by default over-samples SAR pixels near
-    the ground track, skewing validation statistics toward them (see
-    docs/design-choices.md §3.3). ``None`` is treated as "1hz".
+    the ground track, skewing validation statistics toward them. ``None`` 
+    is treated as "1hz".
     """
     from .core.sar_sources import resolve_sar_source
     sar_source = resolve_sar_source(sar_source, "waves")
@@ -743,7 +740,8 @@ def _build_waves_config(
 
 
 def _build_soil_moisture_config(limit: Optional[int] = None, sar_source: str = "sentinel1_clms_ssm"):
-    """Build the 'soil_moisture' recipe template's RecipeConfig.
+    """
+    Build the 'soil_moisture' recipe template's RecipeConfig.
 
     Extracted from ``_create_recipe`` so the template content is
     unit-testable independent of the CLI's file-writing side effects,
@@ -768,9 +766,7 @@ def _build_soil_moisture_config(limit: Optional[int] = None, sar_source: str = "
     spec = SAR_SOURCES[sar_source]
     # SARSourceSpec's default_* fields are Optional[...] because sources
     # outside the "soil_moisture" variable set (e.g. sentinel1_l2_ocn)
-    # leave them unset; resolve_sar_source above already restricted
-    # sar_source to a "soil_moisture" entry, both of which (today:
-    # sentinel1_clms_ssm, nisar_sme2) populate every default_* field, so
+    # leave them unset; every "soil_moisture" source populates them, so
     # narrow the Optional types for mypy here.
     assert spec.default_time_tolerance_minutes is not None
     assert spec.default_aggregation_window_km is not None
@@ -890,12 +886,11 @@ def _create_recipe(
     }
     resolved_sar_source = sar_source if sar_source is not None else defaults.get(name, "sentinel1_l2_ocn")
 
-    # All four templates are built eagerly (existing behaviour predating this
-    # flag — see the `if name not in templates` check below), but an explicit
-    # --sar-source only applies to the *requested* category: e.g.
-    # `--create-recipe soil_moisture --sar-source sentinel1_clms_ssm` must
-    # not also try (and fail) to build the "wind" template with a source
-    # that's only valid for soil_moisture. Every other, unrequested category
+    # All four templates are built eagerly (see the `if name not in templates` 
+    # check below), but an explicit --sar-source only applies to the *requested* 
+    # category: e.g. `--create-recipe soil_moisture --sar-source sentinel1_clms_ssm` 
+    # must not also try (and fail) to build the "wind" template with a source
+    # that is only valid for soil_moisture. Every other, unrequested category
     # keeps building with its own default source.
     def _source_for(category: str) -> str:
         return resolved_sar_source if category == name else defaults[category]
@@ -1061,10 +1056,7 @@ def _execute_recipe(
 
     if convert:
         datatree_path = orchestrator.base_dir / "datatree.nc"
-        # Never skip when Step 1 actually did fresh download work this run
-        # (as opposed to being skipped itself) -- a previously-incomplete
-        # source (e.g. ISMN's shared archive finally showing up) means the
-        # existing datatree.nc no longer reflects everything on disk.
+        # Never skip when Step 1 did fresh download work this run.
         if download_step_ran or not datatree_path.exists():
             _convert_data(recipe, orchestrator.base_dir)
         else:
@@ -1117,67 +1109,20 @@ def _execute_recipe(
 
 
 def _is_already_downloaded(base_dir: Path, recipe: Optional["Recipe"] = None) -> bool:
-    """Return True if *base_dir* has a download_metadata.json with no
-    errors and no source still stuck "awaiting_manual_archive" (ISMN's
-    status when the shared archive hasn't been placed yet -- 0 files were
-    collected, but that's deliberately not an "error", so the top-level
-    errors list alone can't tell "genuinely fully downloaded" apart from
-    "silently missing a source forever" without this extra check).
+    """
+    Return True if *base_dir* has a download_metadata.json recording a
+    complete, reusable download for *recipe*.
 
-    Also returns False when *recipe* requests an ``era5`` validation source
-    and its ``variable`` differs from the recorded run's -- two recipes
-    with identical geographic/temporal bounds share ``base_dir`` (e.g.
-    ``wind_era5.yaml`` and ``waves_era5.yaml`` both cover the same bbox/
-    window to reuse the SAR download), but ERA5's downloaded file depends
-    on ``variable`` (``era5_<variable>_<day>.nc``, an entirely different
-    CDS dataset/variable set per variable) -- unlike SAR, whose L2 OCN
-    product already contains every OWI field regardless of which recipe
-    downloaded it. Without this check, Step 1 is skipped wholesale and the
-    new variable's ERA5 data is never fetched (confirmed live 2026-08-07:
-    waves_era5.yaml run right after wind_era5.yaml produced a DataTree with
-    zero era5 nodes). Falling through to ``orchestrator.download_all()``
-    here is safe/cheap: its own per-source ``_already_succeeded`` check
-    (see ``DataOrchestrator._load_previous_variable``) still skips
-    re-downloading SAR, only ERA5 actually re-dispatches.
-
-    This mismatch check is deliberately scoped to recipes that actually
-    request an ``era5`` source -- matching ``DataOrchestrator.
-    _already_succeeded``'s own ``source_type == "era5"`` scoping. Without
-    that scoping, ANY non-ERA5 recipe pair sharing a ``base_dir`` with a
-    differing ``variable`` (recorded once, globally, per run -- not
-    per-source) would have this fast path bypassed on every rerun, forcing
-    every ``_HISTORICAL_FIRST_TYPES`` source (hf_radar_historical,
-    adcp_historical, argo_historical, drifter_historical,
-    glider_historical) to redispatch unconditionally, since step 2 of
-    ``download_all()`` has no ``_already_succeeded`` gate of its own.
-
-    Also returns False when *recipe* requests a validation source_type
-    that is NOT present among the recorded run's ``downloads`` keys at
-    all -- e.g. ``recipes/wind_era5.yaml`` (validation_sources = [era5])
-    and ``recipes/wind_example.yaml`` (validation_sources = [mooring,
-    buoy, ..., scatterometer, ..., NOT era5]) share identical geographic/
-    temporal bounds and therefore the same auto-derived ``base_dir``.
-    Running ``wind_example.yaml`` first records ``downloads: {"sar":
-    ..., "scatterometer": ..., ...}`` with no ``"era5"`` key; running
-    ``wind_era5.yaml`` next would otherwise wrongly trust that recorded
-    run as "already downloaded" and skip the ERA5 download entirely,
-    silently producing a report with zero ERA5 data -- the same failure
-    mode as the era5-variable-mismatch case above, but triggered by a
-    difference in which source TYPES were requested rather than a
-    difference in era5's own ``variable``. This is a broader,
-    ADDITIONAL check on top of the era5-variable check (which still
-    catches its own narrower case: same source_type present in both, but
-    a different ``variable`` value -- a source_type-SET comparison alone
-    would miss that, since "era5" would appear in both sets).
-
-    ``DataOrchestrator._INSITU_TYPES`` (mooring/buoy/drifter/ferrybox/
-    tidal_gauge) are downloaded as one batched call and recorded under a
-    single ``"insitu"`` key (see ``DataOrchestrator._download_insitu``),
-    not one key per source_type -- normalized here via
-    ``_normalize_recorded_source_type`` before the set comparison so a
-    recipe requesting e.g. ``mooring`` alone isn't wrongly treated as
-    "not downloaded" just because the recorded key is ``"insitu"``, not
-    ``"mooring"``."""
+    Checks: no errors recorded; no source still stick ``awaiting_manual_archive``
+    (0 files collected without being an error); if *recipe* requests an 
+    ``era5`` source, its ``variable`` matches the recorded run's (ERA5's
+    downloaded file depends on ``variable``, unlike SAR's L2 OCN product
+    which contains every field regardless of which recipe downloaded it);
+    and every validation ``source_type`` *recipe* requests is present 
+    among the recorded run's ``downloads`` keys (normalized via 
+    ``_normalize_recorded_source_type`` so batched sources like ``mooring``/
+    ``buoy`` recorded under ``insitu`` still match).
+    """
     import json as _json
 
     from .core.orchestrator import _INSITU_TYPES
@@ -1197,7 +1142,7 @@ def _is_already_downloaded(base_dir: Path, recipe: Optional["Recipe"] = None) ->
         recorded_variable = meta.get("variable")
         # A real download_metadata.json (written by DataOrchestrator) always
         # has "variable" set -- only a synthetic/legacy file could omit it,
-        # in which case there's nothing to contradict *recipe* and the old
+        # in which case there is nothing to contradict *recipe* and the old
         # trust-it behavior applies (a minimal ``{"errors": [], ...}``
         # fixture, as several tests use to force this shortcut without
         # touching the network, must keep working).
@@ -1224,7 +1169,9 @@ def _is_already_downloaded(base_dir: Path, recipe: Optional["Recipe"] = None) ->
 
 
 def _convert_data(recipe, base_dir: Path) -> "xr.DataTree | None":
-    """Run step 2: convert downloaded files to a DataTree."""
+    """
+    Run step 2: convert downloaded files to a DataTree.
+    """
     from .core.datatree_converter import DataTreeConverter
 
     print("\nStep 2: Converting data to DataTree…")
@@ -1247,7 +1194,9 @@ def _collocate_data(
     layer_vs_layer_collocation_method: str = "cell-averaging",
     filename_suffix: str = "",
 ) -> None:
-    """Run step 3: load DataTree and run collocation."""
+    """
+    Run step 3: load DataTree and run collocation.
+    """
     import xarray as xr
 
     from .core.collocation import run_collocation
@@ -1255,7 +1204,6 @@ def _collocate_data(
 
     datatree_path = base_dir / "datatree.nc"
     if not datatree_path.exists():
-        # datatree wasn't produced yet (shouldn't happen since --collocate implies --convert)
         print("  DataTree not found — running conversion first.")
         tree = _convert_data(recipe, base_dir)
         if tree is None:
@@ -1302,7 +1250,9 @@ def _collocate_data(
 
 
 def _compute_stats(recipe, base_dir: Path, filename_suffix: str = "") -> None:
-    """Run step 4: compute validation statistics from collocation_results<suffix>.nc."""
+    """
+    Run step 4: compute validation statistics from collocation_results<suffix>.nc.
+    """
     import xarray as xr
 
     from .core.statistics import run_statistics, run_statistics_cds_ssm, run_statistics_native_units
@@ -1331,14 +1281,15 @@ def _compute_stats(recipe, base_dir: Path, filename_suffix: str = "") -> None:
 
 
 def _stats_already_computed(recipe, base_dir: Path, filename_suffix: str = "") -> bool:
-    """Return True if every ``validation_statistics_*<suffix>.nc`` file Step 4
+    """
+    Return True if every ``validation_statistics_*<suffix>.nc`` file Step 4
     would produce already exists on disk, so ``_execute_recipe`` can skip
     recomputation the same way Steps 1-3 skip their own already-done work.
 
     Opens ``collocation_results<suffix>.nc`` (Step 3's output) and applies
     the same dataset-aware ``filter_variable_pairs`` selection ``run_statistics``
     uses to decide *which* files it writes — reusing ``_load_precomputed_stats``
-    for the lookup so the pair-matching logic isn't duplicated. Also requires
+    for the lookup so the pair-matching logic is not duplicated. Also requires
     the ``_native_units`` companion file for soil_moisture recipes, since
     ``_compute_stats`` writes those too.
 
@@ -1376,7 +1327,8 @@ def _stats_already_computed(recipe, base_dir: Path, filename_suffix: str = "") -
 
 
 def _load_precomputed_stats(recipe, collocation_ds, base_dir: Path, filename_suffix: str = "") -> dict:
-    """Load ``validation_statistics_<sar_var>_vs_<val_var><suffix>.nc`` files already
+    """
+    Load ``validation_statistics_<sar_var>_vs_<val_var><suffix>.nc`` files already
     saved by step 4, keyed the same way ``run_statistics`` names them.
 
     Extracted from ``_generate_plots`` so the file-matching logic is
@@ -1407,7 +1359,9 @@ def _generate_plots(
     recipe, base_dir: Path, filename_suffix: str = "",
     layer_vs_layer_collocation_method: str = "cell-averaging",
 ) -> None:
-    """Run step 5: generate validation plots and save PDF to <base_dir>/, PNG to <base_dir>/plots/."""
+    """
+    Run step 5: generate validation plots and save PDF to <base_dir>/, PNG to <base_dir>/plots/.
+    """
     import xarray as xr
 
     from .core.visualization import validation_report
@@ -1427,9 +1381,7 @@ def _generate_plots(
     # them backed by lazy netCDF4 handles: report generation re-reads the
     # same collocation columns and SAR scenes from many different sections
     # (scatter, geographic, residuals, stats table), and repeated on-disk
-    # reads of small-enough-to-fit-in-memory files (collocation_results.nc,
-    # datatree.nc are tens of MB here) were a measured contributor to slow
-    # report generation on multi-source (soil moisture) recipes.
+    # reads add up for files that easily fit in memory (tens of MB here).
     collocation_ds = xr.open_dataset(str(coll_path)).load()
     datatree = xr.open_datatree(str(datatree_path), engine="netcdf4").load()
 
@@ -1462,12 +1414,14 @@ def _generate_plots(
 
 
 def _load_download_warnings(base_dir: Path) -> Optional[list[str]]:
-    """Read download_metadata.json's ``errors`` and ``notices`` lists, if
+    """
+    Read download_metadata.json's ``errors`` and ``notices`` lists, if
     present, for surfacing on the PDF cover page. ``notices`` are
     non-failure observations (e.g. "no data found for this window") that
     still deserve a durable, easy-to-find spot rather than only a
     console-log line that scrolls past during a long run. Returns None if
-    there's no metadata file, it can't be parsed, or it has neither."""
+    there's no metadata file, it cannot be parsed, or it has neither.
+    """
     import json as _json
 
     meta_path = base_dir / "download_metadata.json"

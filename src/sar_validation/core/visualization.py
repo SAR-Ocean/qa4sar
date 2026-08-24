@@ -1,5 +1,5 @@
 """
-Visualization — step 5b of the validation pipeline.
+Visualization — step 5 of the validation pipeline.
 
 Four public plot functions:
 
@@ -8,7 +8,13 @@ Four public plot functions:
 * :func:`plot_statistics`   — bar chart of bias / RMSE / correlation per source
 * :func:`plot_residuals`    — histogram / KDE of (SAR − validation) residuals
 
-Plus fallback and convenience wrappers:
+Each accepts an ``interactive=False`` keyword argument. When
+``interactive=True`` the function returns an hvplot / plotly / folium object
+instead of a matplotlib Figure. If the required optional library is not
+installed a :class:`ImportError` is raised with a friendly installation hint.
+
+Plus fallback and convenience wrappers, matplotlib-only (no ``interactive``
+option):
 
 * :func:`plot_collocation_diagnostics` — SAR scene bounds + matched/unmatched
   validation points (one category per validation source actually present),
@@ -16,11 +22,6 @@ Plus fallback and convenience wrappers:
   there are zero collocated pairs.
 * :func:`validation_report` — runs all four plots, infers variable pairs from the recipe,
   embeds plots in ``validation_report<suffix>.pdf``, and saves the collocation-diagnostics PNG to ``<out_dir>/plots/``
-
-All functions accept an ``interactive=False`` keyword argument.  When
-``interactive=True`` the function returns an hvplot / plotly / folium object
-instead of a matplotlib Figure.  If the required optional library is not
-installed a :class:`ImportError` is raised with a friendly installation hint.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 def _pad_degenerate_range(vmin: float, vmax: float) -> Tuple[float, float]:
     """Pad an all-identical (vmin == vmax) value range to a non-degenerate
-    one so set_xlim/set_ylim don't warn about singular limits."""
+    one so set_xlim/set_ylim do not warn about singular limits."""
     if vmin == vmax:
         pad = max(0.5, abs(vmin) * 0.05)
         return vmin - pad, vmax + pad
@@ -60,7 +61,8 @@ def _source_marker_handles(items, *, markersize: float = 6, markeredgecolor: str
 
 
 def _sparse_legend_corner(ax, transform, *lonlat_arrays) -> str:
-    """Pick the matplotlib legend ``loc`` corner with the fewest already-
+    """
+    Pick the matplotlib legend ``loc`` corner with the fewest already-
     plotted points, as a cheap stand-in for ``loc="best"``.
     Falls back to "upper right" if there's nothing to bin against.
     """
@@ -101,8 +103,10 @@ def _draw_colorbar(
     fig, right_margin: float, sar_sm, val_sm, single_colorbar: bool,
     collocation_ds, sar_var: str, val_var: Optional[str], sar_field_transform,
 ) -> None:
-    """Compute SAR/validation axis labels and draw the shared or two-colorbar
-    layout shared by plot_geographic's per-scene and grouped figure builders."""
+    """
+    Compute SAR/validation axis labels and draw the shared or two-colorbar
+    layout shared by plot_geographic's per-scene and grouped figure builders.
+    """
     sar_label = (
         _labeled_var(collocation_ds, f"val_{val_var}", sar_var)
         if sar_field_transform is not None
@@ -175,15 +179,13 @@ def _source_color_map(sources: List[str]) -> Dict[str, str]:
 
 def _canonical_source_order() -> List[str]:
     """
-    Fixed, append-only reference order for known validation source/platform
-    types.
+    Return the fixed, append-only reference order for known validation
+    source/platform types, so each source keeps a stable color/marker slot
+    across runs (see :func:`_source_style_map`).
 
-    Validates that ``_CANONICAL_SOURCE_ORDER`` still has exactly the same
-    *members* as the two canonical sets maintained elsewhere in the
-    codebase (``LAYER_DATA_TYPES`` in collocation.py and ``_INSITU_TYPES``
-    in orchestrator.py), so a new source type added to either set without
-    also being appended to ``_CANONICAL_SOURCE_ORDER`` fails here instead 
-    of silently reshuffling every other source's color.
+    Raises ``AssertionError`` if a source type exists elsewhere in the
+    codebase but is missing from this order, rather than silently
+    reshuffling every other source's color.
     """
     from .collocation import LAYER_DATA_TYPES  # noqa: PLC0415
     from .orchestrator import _INSITU_TYPES  # noqa: PLC0415
@@ -231,7 +233,9 @@ def _source_style_map(sources: List[str]) -> Dict[str, Tuple[str, str]]:
 
 
 def _require(package: str, extra: str = "plot") -> None:
-    """Raise a friendly ImportError if *package* is not installed."""
+    """
+    Raise an ImportError if *package* is not installed.
+    """
     try:
         __import__(package)
     except ImportError:
@@ -243,7 +247,9 @@ def _require(package: str, extra: str = "plot") -> None:
 
 
 def _filter_by_scene(collocation_ds, scene_name: str):
-    """Return rows where sar_scene_name matches *scene_name*."""
+    """
+    Return rows where sar_scene_name matches *scene_name*.
+    """
     if "sar_scene_name" not in collocation_ds:
         return collocation_ds   # old dataset without scene name — return all
     mask = collocation_ds["sar_scene_name"] == scene_name
@@ -270,9 +276,11 @@ def _drop_nondirectional_sources(coll_ds, val_var):
 
 
 def _land_coastline_features(scale: str = "10m"):
-    """Natural Earth land/coastline features at a finer resolution than
+    """
+    Natural Earth land/coastline features at a finer resolution than
     cartopy's default 110m — the default is too coarse on complex
-    coastlines (straits, bays) and visibly misaligns with SAR swath edges."""
+    coastlines (straits, bays) and visibly misaligns with SAR swath edges.
+    """
     import cartopy.feature as cfeature  # noqa: PLC0415
 
     land = cfeature.NaturalEarthFeature("physical", "land", scale, facecolor=cfeature.COLORS["land"])
@@ -281,42 +289,18 @@ def _land_coastline_features(scale: str = "10m"):
 
 
 def _set_lonlat_ticks(ax, gl):
-    """Cheap plain-matplotlib degree-labeled ticks for a PlateCarree
-    GeoAxes — replaces cartopy's gridliner label placement
-    (``draw_labels=True``), whose curved-projection label-positioning
-    logic is expensive to recompute across many subplots. Only valid for
-    rectangular projections (PlateCarree/Mercator), which is all this
-    module uses. Note: cartopy's GeoAxes ships with axis visibility disabled
-    by default (ax.xaxis.get_visible() == False), so re-enabled for the 
-    formatted ticks to be rendered to canvas.
+    """
+    Cheap plain-matplotlib degree-labeled ticks for a PlateCarree/Mercator
+    GeoAxes, replacing cartopy's gridliner label placement (expensive to
+    recompute across many subplots). Only valid for rectangular projections,
+    which is all this module uses.
 
-    ``gl`` is the Gridliner returned by the ``ax.gridlines(...)`` call that
-    drew the (unlabeled) grid lines for this axes. Grid *lines* are placed by
-    the gridliner's own locator, which is independent of matplotlib's default
-    tick auto-locator — for most extents they happen to coincide, but they
-    can diverge (different degree spacing), which would misalign the labels
-    against the grid lines they're meant to describe. To guarantee labels and
-    grid lines never drift apart, we read the gridliner's own locator-chosen
-    tick values and apply them explicitly instead of trusting matplotlib's
-    independent auto-locator. This is an eager computation — it depends on
-    ``ax.get_xlim()``/``ax.get_ylim()`` already reflecting the final data
-    extent — so callers must invoke this only after the axes' data (and thus
-    autoscale/extent) is finalized.
-
-    Both locators are first capped to a small ``nbins`` (see below) so
-    narrow-extent subplots never get an unreadable pile of closely-spaced
-    tick labels. ``nbins=2`` (not just a moderate cap like 4) is required
-    because cartopy's PlateCarree GeoAxes always renders at equal aspect
-    ratio: a WV-mode SAR scene's ground track is many degrees tall in
-    latitude but only a few degrees wide in longitude, so the actual
-    rendered map occupies a narrow vertical strip inside its subplot box
-    regardless of the subplot's nominal (wide) figure width — even 3-4
-    tick labels don't fit side by side in that strip without overlapping.
-
-    ``tick_params(length=0)`` suppresses the small perpendicular tick marks
-    that ``set_visible(True)`` would otherwise re-enable on the whole Axis
-    artist; the original gridliner-only rendering never drew those, so this
-    keeps pixel parity with the pre-fix appearance (labels only, no marks)."""
+    ``gl`` must be the Gridliner from the ``ax.gridlines(...)`` call that
+    drew this axes' (unlabeled) grid lines -- its locator-chosen tick values
+    are reused directly so labels cannot drift from the grid lines they
+    describe. Call only after the axes' data extent is finalized, since tick
+    placement depends on the current ``xlim``/``ylim``.
+    """
     from cartopy.mpl.ticker import LatitudeFormatter, LongitudeFormatter  # noqa: PLC0415
 
     ax.xaxis.set_major_formatter(LongitudeFormatter())
@@ -325,15 +309,11 @@ def _set_lonlat_ticks(ax, gl):
     ax.yaxis.set_visible(True)
     ax.tick_params(axis="both", which="both", length=0)
 
-    # Cap the locator to a small number of ticks regardless of extent
-    # width: the gridliner's default (nbins=8) picks tick counts oblivious
-    # to how narrow the subplot's actual extent is. A sub-1°-wide WV-mode
-    # SAR scene (narrow longitude, wide latitude) triggers many
-    # closely-spaced, high-decimal-precision ticks that pile up into
-    # unreadable overlapping labels; a wide overview map also reads more
-    # cleanly with fewer ticks. nbins=2 (rather than a milder cap) is what
-    # actually stops the overlap for tall/narrow WV-mode extents — see the
-    # docstring note above on equal-aspect rendering.
+    # Cap to a small nbins regardless of extent width -- the gridliner's
+    # default (nbins=8) ignores how narrow the actual extent is. Cartopy's
+    # equal-aspect rendering means a narrow-longitude, wide-latitude WV-mode
+    # scene renders as a thin vertical strip regardless of subplot width, so
+    # even a moderate cap still overlaps; nbins=2 is what actually stops it.
     gl.xlocator.set_params(nbins=2)
     gl.ylocator.set_params(nbins=2)
 
@@ -346,22 +326,16 @@ def _set_lonlat_ticks(ax, gl):
 
 
 def _pad_extent_to_min_aspect(ax, min_aspect: float = 1.0, bounds=None) -> None:
-    """Pad a geographic axes' latitude extent so height/width >= min_aspect.
+    """
+    Pad a geographic axes' latitude extent so height/width >= min_aspect.
 
-    Keeps every scene panel in a report portrait-or-square: without this,
-    a scene with a small latitude span (e.g. a handful of closely-spaced
-    vignettes) renders as a short, wide strip next to otherwise-portrait
-    satellite-track panels in the same figure.
+    Keeps every scene panel in a report portrait-or-square.
 
     Parameters
     ----------
     bounds : GeographicBounds, optional
         If given, the padded extent is re-clamped to
-        ``[bounds.min_lat, bounds.max_lat]`` after padding — otherwise a
-        bbox much wider than tall (e.g. a 40x25-degree recipe bbox) gets
-        padded past the very bounds it was already clamped to just before
-        this function runs, silently showing data outside what was
-        requested.
+        ``[bounds.min_lat, bounds.max_lat]`` after padding.
     """
     x0, x1 = ax.get_xlim()
     y0, y1 = ax.get_ylim()
@@ -385,8 +359,8 @@ def _fill_nan_nearest(a: np.ndarray) -> np.ndarray:
     Fill NaN cells in a 2D array with the value of their nearest finite cell.
 
     Used to repair geolocation (lon/lat) grids before ``pcolormesh``, which
-    rejects non-finite coordinates outright; S1 OCN products commonly carry
-    NaN lon/lat at swath-edge/invalid-retrieval cells.
+    rejects non-finite coordinates outright; gridded SAR products can carry
+    NaN lon/lat at swath-edge/invalid-retrieval cells (e.g. Sentinel-1 OCN).
     """
     invalid = ~np.isfinite(a)
     if not invalid.any():
@@ -396,7 +370,8 @@ def _fill_nan_nearest(a: np.ndarray) -> np.ndarray:
 
 
 def _downsample_grid(arr: np.ndarray, lon2d: np.ndarray, lat2d: np.ndarray, max_dim: int):
-    """Stride-decimate a gridded SAR field (and its lon/lat) for display.
+    """
+    Stride-decimate a gridded SAR field (and its lon/lat) for display.
 
     A rendering-time decimation -- statistics and every other output still
     use the full-resolution ``collocation_results.nc``/``datatree.nc``.
@@ -696,7 +671,8 @@ def plot_scatter(
 
 
 def _plot_scatter_small_multiples(df, sar_col, val_col, sar_var, val_var, collocation_ds):
-    """One scatter subplot per val_source -- used by plot_scatter when one
+    """
+    One scatter subplot per val_source -- used by plot_scatter when one
     source's point count dominates enough to visually bury the others in
     a single shared axes (see split_when_imbalanced), or when force_split
     requests a split regardless of imbalance.
@@ -707,7 +683,8 @@ def _plot_scatter_small_multiples(df, sar_col, val_col, sar_var, val_var, colloc
     that reports more than one code (e.g. a "mooring" group mixing
     VHM0-only and VAVH-only stations) gets one subplot per code rather
     than silently pooling two distinct estimators into one panel -- each
-    subplot's title states its code explicitly (e.g. "mooring [VHM0]")."""
+    subplot's title states its code explicitly (e.g. "mooring [VHM0]").
+    """
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
     has_var_code = "val_var_code" in df.columns
@@ -798,91 +775,68 @@ def plot_geographic(
     cmap : str
         Matplotlib colourmap for the SAR background field.
     val_cmap : str, optional
-        Matplotlib colourmap for the validation scatter points. Defaults to
-        the same colourmap as *cmap* (and always shares its colour limits),
-        so SAR and validation values are directly comparable by colour; the
-        two layers stay visually distinguishable by shape (continuous field
-        vs. black-edged markers) rather than by hue. Pass an explicit value
-        to opt back into a separate palette.
+        Matplotlib colourmap for validation points; defaults to *cmap* (sharing
+        its colour limits) so SAR and validation values are directly comparable
+        by colour, with shape (field vs. markers) distinguishing the two layers
+        instead of hue. Pass an explicit value to opt back into separate palettes.
     point_size : int or dict[str, int]
-        Scatter marker size in points² (matplotlib ``s`` argument). Pass a
-        dict keyed by ``collocation_type`` (e.g.
-        ``{"point_vs_layer": 15, "layer_vs_layer": 5}``) to size each type
-        independently -- a pair combining sparse in-situ points with dense
-        scatterometer/radiometer coverage (e.g. soil moisture's ISMN vs.
-        ASCAT/SMAP/SMOS) needs different sizes per type; one shared size
-        computed from the pooled point count is dominated by whichever
-        type has more points. A ``collocation_type`` value missing from
-        the dict falls back to 40.
+        Scatter marker size in points² (matplotlib ``s``). Pass a dict keyed by
+        ``collocation_type`` (e.g. ``{"point_vs_layer": 15, "layer_vs_layer": 5}``)
+        to size sparse in-situ vs. dense satellite coverage independently, since
+        one shared size is dominated by whichever type has more points. Missing
+        keys fall back to 40.
     max_points_per_panel : int
-        If a scene's deduplicated point count exceeds this, points are
-        randomly subsampled (fixed seed, for reproducible figures) for
-        *this plot only* — statistics and every other output still use
-        the full dataset. Keeps individual markers distinguishable in
-        very dense scenes (soil moisture's satellite sources can produce
-        thousands of matched points per scene) instead of a solid blob.
+        Randomly subsample (fixed seed) a scene's deduplicated points above this
+        count, for this plot only -- statistics and other outputs still use the
+        full dataset. Keeps markers distinguishable in very dense scenes (e.g.
+        soil moisture's satellite sources) instead of a solid blob.
     max_raster_dim : int
-        Gridded SAR background fields (e.g. CLMS SSM's ~4144x6832 CEURO
-        tiles) are stride-decimated to at most this many pixels per axis
-        before ``pcolormesh`` — full resolution is invisible at print size
-        and cartopy's non-affine transform is ~O(cells), so an un-decimated
-        multi-million-cell scene can dominate report generation time
-        (measured ~15s/panel at full res vs ~0.2s decimated). Statistics
-        and every other output still use the full-resolution data.
+        Stride-decimate gridded SAR fields to at most this many pixels per axis
+        before ``pcolormesh`` -- full resolution is invisible at print size and
+        cartopy's non-affine transform is ~O(cells), so a large un-decimated
+        scene can dominate report time (~15s/panel at full res vs ~0.2s
+        decimated). Statistics and other outputs still use full resolution.
     split_by : str or None
         Variable / coordinate to split collocations into separate figures.
         Default ``"collocation_type"`` creates one figure for in-situ
         (``point_vs_layer``) and one for scatterometer (``layer_vs_layer``).
         Pass ``None`` for a single combined figure.
+    scenes : sequence of str, optional
+        Restrict plotting to these SAR scene names. Falls back to every scene
+        in *datatree* if None, empty, or none of the given names match.
     interactive : bool
         Return a folium Map instead of matplotlib.
     geographic_bounds : GeographicBounds, optional
-        Clamp each static (non-interactive) subplot's extent to the
-        recipe's requested bounding box instead of the SAR field's full
-        native extent — e.g. CLMS Surface Soil Moisture's grid covers all
-        of mainland Europe regardless of what a recipe actually requested,
-        so without this every scene panel shows far more than was asked
-        for. Ignored when the bounding box itself crosses the antimeridian
-        (``min_lon > max_lon``) and the scene's own projection does not,
-        since a plain (non-recentred) axes can't cleanly represent that
-        span — the scene keeps its native extent in that case.
+        Clamp each static subplot's extent to the recipe's requested bounding
+        box instead of the SAR field's full native extent (e.g. CLMS SSM's grid
+        covers all of Europe regardless of what was requested). Ignored when
+        the box crosses the antimeridian but the scene's own projection does not,
+        since a plain axes cannot represent that span -- the scene keeps its
+        native extent in that case.
     two_column_by_type : bool
-        When True and split_by == "collocation_type": instead of one
-        Figure per collocation_type (each containing a grid of every
-        scene), build one Figure *per scene*, with one column per
-        collocation_type actually present in the data for that scene
-        (e.g. point_vs_layer, layer_vs_layer, and ERA5's model_vs_layer),
-        ordered point_vs_layer, layer_vs_layer, then any other type
-        alphabetically, falling back to a single column if a scene only
-        has one type present. Returns dict[scene_name, Figure] in this
-        mode instead of dict[collocation_type, Figure]. Ignored (no-op)
-        unless split_by == "collocation_type".
+        When True and split_by == "collocation_type": build one Figure per
+        scene instead of one per collocation_type, with one column per
+        collocation_type present for that scene (ordered point_vs_layer,
+        layer_vs_layer, then others alphabetically; falls back to a single
+        column if only one type is present). Returns dict[scene_name, Figure]
+        instead of dict[collocation_type, Figure]. No-op unless split_by ==
+        "collocation_type".
     on_figure : callable(scene_name, Figure), optional
         Only used when two_column_by_type is True. If given, each scene's
-        Figure is handed to this callback immediately after being built,
-        instead of being accumulated in the returned dict -- the caller
-        becomes responsible for the figure's lifecycle (writing + closing
-        it). Fixes a real bug: without this, a many-scene recipe (e.g.
-        NISAR's per-orbit granules) could have every scene's Figure open
-        simultaneously before this function ever returns, well past
-        matplotlib's 20-open-figure warning threshold. When on_figure is
-        given, the returned dict contains no entries for the scenes
-        handed to it.
+        Figure is handed to this callback immediately instead of being
+        accumulated in the returned dict, so the caller owns its lifecycle
+        (write + close) -- avoids holding every scene's Figure open at once
+        for many-scene recipes.
     skip_domain_harmonization : bool
-        When True, force ``domains_differ`` to False unconditionally,
-        skipping the whole SAR-vs-validation units-mismatch detection and
-        any associated field-transform fitting / point-level
-        harmonization. Intended for callers (e.g. validation_report's
-        native-units section) that have already row-filtered
-        *collocation_ds* down to val_source groups that share SAR's own
-        units family — in that case, *every* source actually present is
-        already domain-compatible with SAR by construction, even though
-        the val_<var> column's own ``units`` attrs may still carry a
-        stale "mixed — see val_units" sentinel inherited from the
-        original, unfiltered dataset (row-filtering doesn't recompute
-        column-level attrs). Relying on that stale string would
-        incorrectly trigger harmonization/two-colorbar fallback for a
-        case that needs neither.
+        When True, force ``domains_differ`` to False unconditionally, skipping
+        unit-mismatch detection and any harmonization. For callers (e.g.
+        validation_report's native-units section) that have already
+        row-filtered *collocation_ds* to sources sharing SAR's units family --
+        every present source is already domain-compatible in that case, even
+        though val_<var>'s own stale "mixed" units sentinel (inherited from
+        the unfiltered dataset, since row-filtering does not recompute column
+        attrs) would otherwise incorrectly trigger harmonization/two-colorbar
+        fallback.
 
     Returns
     -------
@@ -1004,35 +958,26 @@ def plot_geographic(
         and sar_units != val_units
     )
 
-    # Point-level rendering dataset. Defaults to the raw, un-harmonized
-    # collocation_ds (unchanged behavior); replaced below with a
-    # harmonized copy when domains_differ, so that point markers agree
-    # with what the field/statistics sections show — e.g. omitting
-    # entirely a val_source that _harmonize_percent_domain_sources
-    # couldn't harmonize (not enough reference-source data), instead of
-    # plotting its still-raw values under a colour scale calibrated for
-    # the harmonized domain. Deliberately a *separate* variable from
-    # collocation_ds itself (never reassigned) -- fit_sar_to_val_transform
-    # below still needs the true raw collocation_ds to pair a raw sar_col
-    # with the harmonized val_col for its own internal harmonize call;
-    # handing it an already-harmonized collocation_ds would harmonize a
-    # second time (by val_source label, not by value) and corrupt
-    # already-converted sources.
+    # Point-level rendering dataset -- defaults to raw collocation_ds,
+    # replaced below with a harmonized copy when domains_differ so markers
+    # agree with what the field/statistics show (e.g. omitting a val_source
+    # _harmonize_percent_domain_sources could not harmonize, rather than
+    # plotting its raw values under a harmonized colour scale). Kept as a
+    # separate variable (never reassigning collocation_ds itself) because
+    # fit_sar_to_val_transform below still needs the true raw collocation_ds;
+    # handing it an already-harmonized one would harmonize a second time (by
+    # label, not value) and corrupt already-converted sources.
     point_collocation_ds = collocation_ds
 
-    # When the SAR field and validation series live in different physical
-    # domains (e.g. soil_moisture: SAR's relative saturation index in "%"
-    # vs. ISMN's volumetric fraction in "1"), convert the SAR *field*
-    # itself into the validation domain before plotting, so the whole map
-    # (background + points) shares one meaningful colour scale — rather
-    # than showing two separate colorbars, which is confusing to read at
-    # a glance. This uses a single CDF-matching transform fit once from
-    # every collocated pair (pooled across groups, for display purposes
-    # only — statistics still use add_rescaled_sar_column's per-group
-    # rescaling) and applied to every scene's full grid, not just
-    # collocated pixels. Falls back to two separate colorbars (one per
-    # layer's own percentile range) if there isn't enough collocated data
-    # to fit a transform.
+    # When SAR and validation live in different physical domains (e.g. soil
+    # moisture: SAR's relative saturation "%" vs. ISMN's volumetric "1"),
+    # convert the SAR field into the validation domain so map + points share
+    # one colour scale instead of two confusing colorbars. Uses a single
+    # CDF-matching transform fit once across all collocated pairs (display
+    # only -- statistics still use add_rescaled_sar_column's per-group
+    # rescaling) and applied to the full grid, not just collocated pixels.
+    # Falls back to two separate colorbars if there is not enough data to fit
+    # a transform.
     sar_field_transform = None
     if domains_differ:
         assert val_var is not None   # implied by domains_differ requiring val_col_present
@@ -1042,15 +987,14 @@ def plot_geographic(
         )
         sar_field_transform = fit_sar_to_val_transform(collocation_ds, sar_var, val_var)
 
-        # Harmonize the *points*, independently of whether the field
-        # transform above succeeded: a val_source that couldn't be
-        # harmonized (e.g. ISMN too sparse to fit a reference transform)
-        # is identified via dropped_sources and removed entirely below --
-        # at real-world scale a dropped source can be the majority of all
-        # collocated points (e.g. ASCAT ~56% of a run), so treating it as
-        # per-point "No data" hatching would flood the map and bury the
-        # sources that DID harmonize successfully. Dropped sources remain
-        # fully visible in the separate native-units section.
+        # Harmonize the *points* independently of whether the field transform
+        # above succeeded: a val_source that could not be harmonized (e.g. ISMN
+        # too sparse to fit a reference transform) is identified via
+        # dropped_sources and removed entirely -- at real-world scale a dropped
+        # source can be the majority of all collocated points, so per-point "No
+        # data" hatching would flood the map and bury the sources that DID
+        # harmonize. Dropped sources remain visible in the separate native-units
+        # section.
         point_collocation_ds, _converted, dropped_sources = _harmonize_percent_domain_sources(
             collocation_ds, sar_var, val_var,
         )
@@ -1138,7 +1082,7 @@ def plot_geographic(
     # One shared colorbar when both layers use the same palette+scale
     # (the default, and also true once a units mismatch was resolved by
     # converting the field above); two if the caller opted into a
-    # distinct val_cmap, or if a units mismatch couldn't be converted.
+    # distinct val_cmap, or if a units mismatch could not be converted.
     single_colorbar = val_sm is not None and effective_val_cmap == cmap and not needs_separate_scale
     right_margin = 0.88 if (val_sm is None or single_colorbar) else 0.80
 
@@ -1147,11 +1091,8 @@ def plot_geographic(
     # e.g. an vignette with points at 179E and 179W. Such a scene must get
     # its own central_longitude=180 axes, otherwise a *shared*
     # central_longitude=0 projection autoscales it to a full [-180, 180]
-    # world map with the swath split across both edges (this is a distinct
-    # bug from the one already fixed in plot_collocation_diagnostics — that
-    # function draws one map for the whole recipe bbox, this one draws one
-    # subplot per scene). Scenes without lon/lat coords count as
-    # non-crossing (the "no coords" branch below hides the axes anyway).
+    # world map with the swath split across both edges. Scenes without 
+    # lon/lat coords count as non-crossing.
     scene_crosses_dateline: Dict[str, bool] = {}
     for scene_name in scene_names:
         crosses = False
@@ -1171,22 +1112,26 @@ def plot_geographic(
         return ccrs.PlateCarree()
 
     def _resolve_point_size(group_label) -> int:
-        """point_size may be a plain int (uniform) or a dict keyed by
+        """
+        point_size may be a plain int (uniform) or a dict keyed by
         collocation_type (per-type sizing, see plot_geographic's
-        docstring) -- resolve it to the scalar this call's group actually
+        docstring) -- resolve it to the scalar this call's group
         uses. group_label is the collocation_type value for a group
         already restricted to one type (the only case a dict is
-        meaningful for); falls back to 40 for an unlisted type."""
+        meaningful for); falls back to 40 for an unlisted type.
+        """
         if isinstance(point_size, dict):
             return point_size.get(group_label, 40)
         return point_size
 
     def _draw_scene_panel(ax, scene_name, group_coll_ds, pt_size):
-        """Draw one SAR scene's field + collocated validation points into
+        """
+        Draw one SAR scene's field + collocated validation points into
         *ax*. Extracted from _build_figure's per-scene loop (behavior
         unchanged) so both the by-group figure layout (_build_figure) and
         the two-column by-collocation-type layout
-        (_build_scene_pair_figure, added for soil_moisture) can share it."""
+        (_build_scene_pair_figure, added for soil_moisture) can share it.
+        """
         scene_ds = scene_ds_cache[scene_name]
 
         if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
@@ -1213,12 +1158,7 @@ def plot_geographic(
                 # to this panel's own validation-point size (pt_size) so
                 # the SAR marker forms a visible halo around each
                 # validation dot layered on top (zorder=5 below) instead
-                # of being fully hidden underneath it -- confirmed against
-                # a real waves report where a fixed s=20 was completely
-                # covered by pt_size=40 validation markers. +50 (not the
-                # original fix's +30): still not enough of a halo once the
-                # validation dots' own black edge (linewidths=0.9, bumped
-                # from 0.4 below) grew more visible too.
+                # of being fully hidden underneath it.
                 ax.scatter(
                     scene_ds["lon"].values, scene_ds["lat"].values, c=arr,
                     cmap=cmap, norm=sar_norm, s=pt_size + 50, edgecolors="none",
@@ -1316,35 +1256,25 @@ def plot_geographic(
 
                 # Fill color varies continuously with the validation
                 # value here (shared with the SAR colorbar), so a solid
-                # legend swatch would misrepresent what's on the map —
+                # legend swatch would misrepresent what is on the map —
                 # marker shape is the discriminator instead.
                 handles = []
                 if "val_source" in valid_pts.columns:
-                    # Built from valid_pts (rows actually drawn with their
-                    # real colored marker), not df_pts (every row,
-                    # including ones with a genuine per-point NaN, drawn
-                    # instead as the generic gray hatched "no data" marker
-                    # below) -- otherwise a source with zero actually-
-                    # colored points (e.g. every one of its retrievals
-                    # happening to be missing at these particular
-                    # locations/times) would still show its normal marker
-                    # in the legend even though nothing of that source
-                    # exists on the map. Note: a source dropped *entirely*
-                    # by _harmonize_percent_domain_sources (e.g. ASCAT when
-                    # ISMN is too sparse to harmonize against) never
-                    # reaches this function at all -- point_collocation_ds
-                    # above already excludes it, rows and all.
+                    # Built from valid_pts (rows drawn with their real colored marker), not
+                    # df_pts (every row, including per-point NaNs drawn as the generic gray
+                    # "no data" marker) -- otherwise a source with zero actually-colored
+                    # points here would still get a normal-marker legend entry despite
+                    # nothing of it appearing on the map. Sources dropped entirely upstream
+                    # by _harmonize_percent_domain_sources never reach this function at all
+                    # (point_collocation_ds above already excludes them).)
                     present = set(valid_pts["val_source"].astype(str))
                     if "val_var_code" in valid_pts.columns:
                         # Waves' merged VHM0/VAVH/VGHS "SWH" pair (see
-                        # merge_wave_height_columns): marker shape already
-                        # discriminates source and fill color already
-                        # discriminates value, so append the originating
-                        # code to the legend TEXT instead -- one entry per
-                        # code a source actually uses (almost always one,
-                        # e.g. "era5_waves [VHM0]"/"altimeter [VAVH]", but
-                        # two for a source like "mooring" that mixes
-                        # VHM0-only and VAVH-only stations).
+                        # merge_wave_height_columns): marker shape already discriminates source
+                        # and fill color already discriminates value, so append the originating
+                        # code to the legend text instead -- one entry per code a source
+                        # actually uses (usually one, e.g. "era5_waves [VHM0]", but two for a
+                        # source like "mooring" that mixes VHM0-only and VAVH-only stations).
                         codes_by_source = valid_pts.groupby("val_source")["val_var_code"].unique()
                         legend_items = []
                         for s, (_, mkr) in source_style.items():
@@ -1364,14 +1294,9 @@ def plot_geographic(
                                       markerfacecolor="lightgray", markeredgecolor="dimgray",
                                       markersize=5, label="No data (NaN)")
                     )
-                # loc="best" on a GeoAxes is catastrophically slow: matplotlib's
-                # placement search runs every plotted artist's vertices
-                # (including the whole-Europe SAR background field) through
-                # cartopy's non-affine projection transform once per candidate
-                # position — observed to hang for minutes with multi-GB memory
-                # growth on a real recipe. Picking the sparsest corner
-                # ourselves (_sparse_legend_corner) is effectively free by
-                # comparison and, unlike a fixed corner, doesn't collide with
+                # loc="best" on a GeoAxes is very slow. Picking the sparsest
+                # corner manually (_sparse_legend_corner) is effectively free by
+                # comparison and, unlike a fixed corner, does not collide with
                 # a dense point cluster that happens to sit in that corner.
                 if handles:
                     loc = _sparse_legend_corner(
@@ -1402,10 +1327,9 @@ def plot_geographic(
         )
         # Clamp to the recipe's requested bbox instead of the SAR
         # field's full native extent (e.g. CLMS SSM's grid covers all
-        # of mainland Europe regardless of what was actually
-        # requested). Applied before _pad_extent_to_min_aspect so the
-        # aspect padding below operates on the clamped box, not the
-        # unclamped one.
+        # of mainland Europe regardless of the recipe). Applied before 
+        # _pad_extent_to_min_aspect so the aspect padding below operates 
+        # on the clamped box, not the unclamped one.
         bounds_applied = (
             geographic_bounds is not None
             and geographic_bounds.min_lon <= geographic_bounds.max_lon
@@ -1423,18 +1347,13 @@ def plot_geographic(
                 ax.set_xlim(geographic_bounds.min_lon, geographic_bounds.max_lon)
                 ax.set_ylim(geographic_bounds.min_lat, geographic_bounds.max_lat)
         elif HAS_CARTOPY:
-            # Never rely on cartopy's own autoscale here: GeoAxes.pcolormesh
-            # silently falls back to the entire [-180, 180]x[-90, 90] globe
-            # (instead of the plotted cells' true extent) whenever any
-            # plotted longitude lies outside the canonical [-180, 180] range
-            # -- which SAR geolocation grids routinely do at swath edges near
-            # the dateline (e.g. an interpolated GCP at 180.3 deg instead of
-            # -179.7). _pad_extent_to_min_aspect below then reads that
-            # already-wrong global x-range back via get_xlim() and stretches
-            # the y-range to match, producing a full-world map. Compute the
-            # extent explicitly from the actual finite lon/lat instead, the
-            # same way the whole-bbox map (plot_collocation_diagnostics)
-            # already does.
+            # Cartopy's autoscale GeoAxes.pcolormesh silently falls back to the 
+            # full [-180, 180]x[-90, 90] globe, whenever a plotted longitude falls 
+            # outside the canonical range, which SAR geolocation grids routinely do 
+            # at swath edges near the dateline (e.g. 180.3 deg instead of -179.7).
+            # _pad_extent_to_min_aspect would then stretch that already-wrong global
+            # x-range into a full-world map. Compute the extent explicitly from the
+            # finite lon/lat instead, as plot_collocation_diagnostics already does.
             lon_parts = [np.asarray(scene_ds["lon"].values).ravel()]
             lat_parts = [np.asarray(scene_ds["lat"].values).ravel()]
             if n_pts > 0 and "val_lon" in sub_coll and "val_lat" in sub_coll:
@@ -1447,7 +1366,7 @@ def plot_geographic(
             if finite_lon.size and finite_lat.size:
                 # Match matplotlib's own default autoscale margin (5% of
                 # span on each side, axes.xmargin/ymargin) so switching from
-                # implicit autoscale to an explicit set_extent here doesn't
+                # implicit autoscale to an explicit set_extent here does not
                 # also change how tightly scenes are framed.
                 xmargin = plt.rcParams["axes.xmargin"]
                 ymargin = plt.rcParams["axes.ymargin"]
@@ -1484,35 +1403,28 @@ def plot_geographic(
                     lon_min = max(lon_min, -180.0)
                     lon_max = min(lon_max, 180.0)
                     ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=transform)
-        # Also deferred until now, for the same reason as _set_lonlat_ticks
-        # below: it needs the finalized autoscaled extent from
-        # ax.get_xlim()/get_ylim(). Applies to both the HAS_CARTOPY
-        # (GeoAxes) and plain-matplotlib fallback path — the helper itself
-        # branches on hasattr(ax, "set_extent").
         _pad_extent_to_min_aspect(ax, bounds=geographic_bounds if bounds_applied else None)
         if HAS_CARTOPY:
-            # Deferred until now (rather than right after ax.gridlines above):
-            # this reads the finalized data extent via ax.get_xlim()/get_ylim(),
-            # which only reflects this scene's plotted data after the
-            # pcolormesh/scatter calls above have run their autoscale.
             _set_lonlat_ticks(ax, gl)
 
     # Preferred left-to-right column order for _build_scene_pair_figure:
     # point_vs_layer, then layer_vs_layer, then any other collocation_type
-    # (e.g. ERA5's model_vs_layer) alphabetically -- keeps today's
-    # soil-moisture column order stable while still picking up whatever
-    # collocation_type values are actually present in the data.
+    # (e.g. ERA5's model_vs_layer) alphabetically -- keeps the soil-moisture
+    # column order stable while still picking up whatever collocation_type
+    # values are actually present in the data.
     _CTYPE_COLUMN_ORDER = {"point_vs_layer": 0, "layer_vs_layer": 1}
 
     def _build_scene_pair_figure(scene_name):
-        """Build one multi-column Figure for *scene_name*: one panel per
+        """
+        Build one multi-column Figure for *scene_name*: one panel per
         collocation_type actually present in the data (e.g. point_vs_layer,
         layer_vs_layer, and ERA5's model_vs_layer), or a single column if
         only one type has data for this scene. The set of columns is
         derived from what's actually present in
         ``point_collocation_ds["collocation_type"]`` rather than a fixed
         pair of hardcoded strings, so any collocation_type -- present or
-        future -- gets its own panel instead of being silently dropped."""
+        future -- gets its own panel instead of being silently dropped.
+        """
         if "collocation_type" not in point_collocation_ds:
             return None
 
@@ -1550,10 +1462,8 @@ def plot_geographic(
         )
         fig.tight_layout()
 
-        # _build_scene_pair_figure historically never drew a colorbar at
-        # all -- structurally absent, not intermittent. Add it now, reusing
-        # the exact same shared/two-colorbar objects _build_figure already
-        # computes once for the whole plot_geographic call.
+        # Reuses the exact same shared/two-colorbar objects _build_figure
+        # already computes once for the whole plot_geographic call.
         _draw_colorbar(
             fig, right_margin, sar_sm, val_sm, single_colorbar,
             collocation_ds, sar_var, val_var, sar_field_transform,
@@ -1562,7 +1472,9 @@ def plot_geographic(
         return fig
 
     def _build_figure(group_coll_ds, group_label):
-        """Build one Figure for a sub-set of collocations."""
+        """
+        Build one Figure for a sub-set of collocations.
+        """
         nrows = math.ceil(len(scene_names) / ncols)
         fig = plt.figure(figsize=(9 * ncols, 7 * nrows))
         axes = [
@@ -1782,7 +1694,9 @@ def plot_residuals(
     hist_range: Optional[Union[Tuple[float, float], Dict[str, Tuple[float, float]]]] = None,
 ):
     """
-    Histogram of (SAR − validation) residuals.
+    Histogram of (SAR − validation) residuals. Circular variables (e.g.
+    wind direction, ``WDIR``) use a ±180°-wrapped angular difference
+    instead of a plain subtraction; see :data:`CIRCULAR_VAL_VARS`.
 
     Parameters
     ----------
@@ -1794,8 +1708,8 @@ def plot_residuals(
         Validation variable name without ``val_`` prefix.
     by_source : bool
         Draw one subplot per ``val_source`` ("small multiples"), each with
-        its own y-axis but a shared x-range — so a source with a very
-        narrow residual spread (e.g. two tightly-clustered points) can't
+        its own y-axis (and, unless ``hist_range`` is a dict, a shared
+        x-range) -- so a source with a very narrow residual spread cannot
         produce a density spike that dwarfs every other source's bars, the
         way it would sharing one axes. When False, draw a single combined
         histogram instead (``ax`` honored in this case only).
@@ -1805,38 +1719,23 @@ def plot_residuals(
         Axes to draw into (static, ``by_source=False`` only — the
         small-multiples grid always creates its own figure).
     hist_range : tuple[float, float] or dict[str, tuple[float, float]], optional
-        Fixed (min, max) passed to the underlying histogram's ``range=``
-        and to ``set_xlim``, overriding the default data-driven range.
-        For CDF-matched pairs (e.g. soil moisture), a rare CDF-matching
-        edge artifact can produce one residual far outside the real
-        distribution's spread, ballooning the data-driven range until
-        the real distribution collapses into a single bar -- passing a
-        fixed range excludes such outliers from the density calculation
-        (not just the visible window), since ``range=`` drops
-        out-of-range values before binning.
-
-        A plain tuple applies uniformly to every source (``by_source=True``)
-        or to the single combined histogram (``by_source=False``). A
-        ``dict`` (``by_source=True`` only) maps ``val_source`` to its own
-        override range -- sources absent from the dict fall back to
-        their OWN per-source data-driven range, not one pooled across
-        every source. This is useful whenever a caller's ``pair_ds`` mixes
-        validation sources whose residuals genuinely live on different
-        scales (e.g. different unit families, or different instrument
-        noise floors) -- a single shared range across all of them would
-        only be meaningful within one such group; giving each source its
-        own range keeps a tight source's panel from inheriting a wider
-        source's spread just because they share one pair. (For the
-        soil-moisture CDF-matched pairs this module builds, every source
-        is harmonized into one common domain before ``plot_residuals``
-        is called -- see ``_volumetric_hist_range_overrides`` -- so in
-        that specific case the dict ends up mapping every source to the
-        same fixed range; the dict form itself remains general-purpose
-        for other callers with genuinely inconsistent per-source domains.)
+        Fixed (min, max) passed to the histogram's ``range=`` and to
+        ``set_xlim``, overriding the default data-driven range -- useful
+        when a rare CDF-matching outlier (e.g. soil moisture) balloons the
+        data-driven range until the real distribution collapses into a
+        single bar; ``range=`` excludes such outliers from the density
+        calculation itself, not just the visible window. A plain tuple
+        applies to every source (or the combined histogram) uniformly. A
+        dict (``by_source=True`` only) maps ``val_source`` to its own
+        override range, useful when sources' residuals live on genuinely
+        different scales -- sources absent from the dict fall back to
+        their own per-source data-driven range, not one pooled across
+        every source.
 
     Returns
     -------
-    matplotlib.figure.Figure or plotly.graph_objects.Figure
+    matplotlib.figure.Figure or plotly.graph_objects.Figure or None
+        None if *collocation_ds* has no valid (non-NaN) data for this pair.
     """
     sar_col = f"sar_{sar_var}"
     val_col = f"val_{val_var}"
@@ -1939,9 +1838,8 @@ def plot_residuals(
             if src in hist_range:
                 src_range = hist_range[src]
             else:
-                # No override for this source -- its OWN data-driven
-                # range, never the other sources' pooled data (that's
-                # exactly the bug this dict form exists to avoid).
+                # No override for this source -- its own data-driven
+                # range, never the other sources' pooled data.
                 src_min, src_max = float(sub.min()), float(sub.max())
                 if src_min == src_max:
                     src_min -= 0.5
@@ -1972,19 +1870,16 @@ def plot_residuals(
 # 4a. Collocation diagnostics plot
 # ---------------------------------------------------------------------------
 
-#: Target real-world spacing (degrees) between plotted SAR-footprint dots
-#: in the collocation-diagnostics plot. Calibrated against a real
-#: Sentinel-1 CLMS SSM daily mosaic's actual valid-pixel area (~503 deg^2)
-#: so that source keeps its historical ~3000-dot look; deriving each
-#: scene's own sampling stride from a nominal (not valid-masked) cell
-#: count (see :func:`_reference_cell_count` and
-#: :func:`_adaptive_footprint_stride`), rather than a single flat count
-#: for every scene, keeps this same visual spacing regardless of scene
-#: size or masked/water fraction. Without this, a small NISAR SME2
-#: per-orbit granule (confirmed against real converted data: ~217x
-#: smaller valid-pixel area than a real Sentinel-1 scene) got the same
-#: ~3000 dots as the huge Sentinel-1 mosaic, crammed ~18x closer
-#: together -- reading as a solid blob instead of discernible points.
+#: Target real-world spacing (degrees) between plotted SAR-footprint
+#: dots in the collocation-diagnostics plot, calibrated to Sentinel-1
+#: CLMS SSM's daily mosaic (~503 deg^2 valid-pixel area) so that source
+#: keeps its historical ~3000-dot look. Each scene's own sampling
+#: stride is derived from its nominal cell count (see
+#: :func:`_reference_cell_count`, :func:`_adaptive_footprint_stride`)
+#: rather than a flat dot count, so spacing stays constant regardless
+#: of scene size -- otherwise a much smaller granule (e.g. NISAR SME2,
+#: ~217x less valid-pixel area) would get the same dot count crammed
+#: much closer together, reading as a blob instead of discernible points.
 _FOOTPRINT_DOT_SPACING_DEG = 0.4
 #: Floor so a tiny scene still shows enough dots for its footprint shape
 #: to be recognizable, and ceiling matching the historical flat default
@@ -1997,16 +1892,16 @@ def _reference_cell_count(
     lons: np.ndarray, lats: np.ndarray,
     geographic_bounds: Optional["GeographicBounds"] = None,
 ) -> int:
-    """Nominal grid-cell count used as the area basis for
-    :func:`_adaptive_footprint_stride` -- deliberately NOT gated by data
+    """
+    Nominal grid-cell count used as the area basis for
+    :func:`_adaptive_footprint_stride` -- deliberately not gated by data
     validity (a masked/water-covered cell still counts, so a mostly-
-    masked scene isn't treated as physically smaller than a fully-valid
+    masked scene is not treated as physically smaller than a fully-valid
     one of the same footprint/resolution), and clipped to
     *geographic_bounds* (the recipe's bbox) when given, rather than the
     scene's full extent -- so a scene whose bbox-visible sliver is a
-    small fraction of its huge full extent (SAR grids are stored
-    uncropped, see design-choices.md §4.1) gets a density target sized
-    to what's actually visible, not the whole scene.
+    small fraction of its huge full extent gets a density target sized
+    to what is actually visible, not the whole scene.
     """
     if geographic_bounds is None:
         return int(lons.size)
@@ -2063,7 +1958,7 @@ def _downsampled_valid_pixel_coords(
     valid-masked) cell count -- optionally clipped to *geographic_bounds*
     -- rather than a flat count for every scene. This keeps dot spacing
     consistent both across scenes of different sizes/masked-fractions
-    within one plot, and within the portion of a scene that's actually
+    within one plot, and within the portion of a scene that is actually
     visible when only part of it falls inside the recipe's bbox.
     """
     total = int(valid_mask.sum())
@@ -2109,10 +2004,12 @@ def _subsample_matched_points(
 def _matched_point_alpha(
     base_alpha: float, n_points: int, max_points: Optional[int] = 1000,
 ) -> float:
-    """Cap alpha lower for a matched-point tier once it's dense enough to be
+    """
+    Cap alpha lower for a matched-point tier once it's dense enough to be
     subsampled (see :func:`_subsample_matched_points`) — the overlapping
     points that remain after thinning still need enough transparency to
-    stay distinguishable from each other. No-op when *max_points* is None."""
+    stay distinguishable from each other. No-op when *max_points* is None.
+    """
     if max_points is None:
         return base_alpha
     return min(base_alpha, 0.35) if n_points > max_points else base_alpha
@@ -2124,7 +2021,8 @@ def _diagnostics_zoom_extent(
     coverage_points: List[Tuple[float, float]],
     categories: List[dict],
 ) -> Optional[Tuple[float, float, float, float]]:
-    """Bounding box ``(lon_min, lon_max, lat_min, lat_max)`` of everything
+    """
+    Bounding box ``(lon_min, lon_max, lat_min, lat_max)`` of everything
     :func:`_plot_collocation_diagnostics_impl` actually draws — SAR scene
     boxes/footprints/coverage plus every validation point shown, matched or
     unmatched — or ``None`` if there's nothing to bound.
@@ -2177,7 +2075,7 @@ def plot_collocation_diagnostics(
     matches onto a single map makes individual passes visually
     indistinguishable, so each scene gets its own diagnostics PNG instead
     (returned as a list of Path). Every other source's scenes (e.g. NISAR
-    SME2's small, non-overlapping per-orbit granules) don't have that
+    SME2's small, non-overlapping per-orbit granules) do not have that
     problem and keep the original single combined-map behaviour (returned
     as one Path, or None) -- as does any soil_moisture recipe with only one
     scene, and every non-soil_moisture variable.
@@ -2237,7 +2135,9 @@ def _plot_collocation_diagnostics_impl(
     zero points are omitted).
 
     Creates a geographic map showing:
-    - SAR scene footprints (blue lines for each scene boundary)
+    - SAR coverage: a blue boundary line for grid-mode scenes, a blue circle
+      per footprint for WV-mode vignettes, or blue dots at the actual
+      valid-pixel coverage for soil moisture mosaics
     - Unmatched validation observations (red dots, drawn first) — restricted
       to points whose timestamp falls within a SAR scene's time range ±
       that source's collocation time tolerance, i.e. the same coarse
@@ -2321,7 +2221,7 @@ def _plot_collocation_diagnostics_impl(
     coverage_points: list[tuple[float, float]] = []
     # (time_min, time_max) per scene that has a usable time coordinate — used
     # to decide which validation points were even temporally eligible to
-    # match any SAR acquisition, before we get to spatial matching at all.
+    # match any SAR acquisition, before spatial matching.
     scene_time_windows: List[Tuple["pd.Timestamp", "pd.Timestamp"]] = []
     scene_names = list(sar_node.children.keys())
     # Footprint radius each sparse WV vignette actually matches within, so the
@@ -2404,24 +2304,20 @@ def _plot_collocation_diagnostics_impl(
     if not scene_bounds and not footprint_points and not coverage_points:
         logger.warning("plot_collocation_diagnostics: Could not extract SAR scene bounds.")
         return None
-
+    
     # ── Extract all validation data ─────────────────────────────────────
-    # No 'validation' node at all (e.g. a validation source collected zero
-    # files -- an unconfigured/awaiting ISMN archive, say) is a stricter
-    # case than "zero collocated pairs": there isn't even a validation
-    # point to mark unmatched. Still plot the SAR coverage rather than
-    # bailing out, so a recipe with real SAR data but no validation data
-    # yet still gets the diagnostic (and not a silently-missing plot).
+    # No 'validation' node at all (e.g. a source collected zero files) is
+    # stricter than "zero collocated pairs" -- there is no point to mark
+    # unmatched at all. Still plot SAR coverage rather than bailing out, so
+    # a recipe with SAR but no validation data yet still gets a diagnostic.
     #
-    # This also fires (harmlessly) whenever every validation source is
-    # grid-shaped (e.g. a recipe whose only source is ERA5 -- its node
-    # keeps native (time, lat, lon) dims, never flattened to "point", see
-    # _extract_validation_data_for_plot's own docstring) -- there's
-    # nothing misleading to warn about there: matched points still render
-    # correctly via the separate collocation_results.nc-driven "matched"
-    # tier below, this only empties the raw-datatree "unmatched" overlay,
-    # which is meaningless for gridded data anyway. Not logged, since it's
-    # an expected, already-correctly-handled case, not a real problem.
+    # Also fires harmlessly whenever every validation source is grid-shaped
+    # (e.g. ERA5, whose node keeps native (time, lat, lon) dims and is never
+    # flattened to "point" -- see _extract_validation_data_for_plot). This
+    # only empties the raw-datatree "unmatched" overlay, which is meaningless
+    # for gridded data anyway; matched points still render correctly via the
+    # separate collocation_results.nc-driven tier below. Not logged, since
+    # it is expected, not a real problem.
     all_val_data = _extract_validation_data_for_plot(datatree)
     if not all_val_data:
         all_val_lons = np.array([])
@@ -2450,8 +2346,8 @@ def _plot_collocation_diagnostics_impl(
         for key, spec in coll_cfg.layer_vs_layer.layer_type_specs.items():
             layer_vs_layer_specs[key] = {**layer_vs_layer_specs.get(key, {}), **spec}
     # Collapse altimeter_1hz/altimeter_5hz down to one "altimeter" key (the
-    # plot doesn't distinguish frequency), taking the max of the two so a
-    # point isn't hidden just because it misses the stricter of the pair.
+    # plot does not distinguish frequency), taking the max of the two so a
+    # point is not hidden just because it misses the stricter of the pair.
     layer_type_tol: Dict[str, float] = {}
     for key, spec in layer_vs_layer_specs.items():
         base = key.split("_")[0] if key.startswith("altimeter") else key
@@ -2465,8 +2361,8 @@ def _plot_collocation_diagnostics_impl(
 
     def _time_eligible(point_time, tol_minutes: float) -> bool:
         # Points with no timestamp, or when no scene has usable time
-        # metadata, can't be evaluated — never hide them on account of a
-        # check we can't actually perform.
+        # metadata, cannot be evaluated — never hide them on account of a
+        # check we cannot actually perform.
         if not scene_time_windows or point_time is None or pd.isnull(point_time):
             return True
         pt = pd.Timestamp(point_time)
@@ -2474,7 +2370,7 @@ def _plot_collocation_diagnostics_impl(
         return any(t_min - tol <= pt <= t_max + tol for t_min, t_max in scene_time_windows)
 
     # ── Split matched points (from collocation_ds) by their validation
-    # source — "In-situ" for anything that isn't a layer type, plus one
+    # source — "In-situ" for anything that is not a layer type, plus one
     # bucket per distinct layer source (altimeter/scatterometer/hf_radar).
     # This mirrors the unmatched classification below and is independent of
     # collocation_type, so point_vs_point / point_vs_layer / layer_vs_layer
@@ -2604,7 +2500,7 @@ def _plot_collocation_diagnostics_impl(
     # ── Create geographic plot ──────────────────────────────────────────
     # A crossing bbox (min_lon > max_lon, see GeographicBounds' antimeridian
     # convention) is centered on 180 deg instead of Greenwich, so the map
-    # itself doesn't get cut at the dateline.
+    # itself does not get cut at the dateline.
     crosses_dateline = bounds.min_lon > bounds.max_lon
     proj = ccrs.PlateCarree(central_longitude=180) if crosses_dateline else ccrs.PlateCarree()
     fig = plt.figure(figsize=(14, 10), dpi=100)
@@ -2661,7 +2557,7 @@ def _plot_collocation_diagnostics_impl(
 
     # ── SAR coverage (zorder=1): Grid scenes → bounding box; sparse WV
     # vignettes → one footprint circle each (radius = the collocation footprint
-    # radius), so it's visually clear that matches are only possible near each
+    # radius), so it is visually clear that matches are only possible near each
     # vignette, not across the whole bounding rectangle. ──────────────────────
     for i, sb in enumerate(scene_bounds):
         lons_box = [sb["lon_min"], sb["lon_max"], sb["lon_max"], sb["lon_min"], sb["lon_min"]]
@@ -2857,12 +2753,9 @@ def _plot_collocation_diagnostics_impl(
     )
     handles.append(explanation)
     labels.append(explanation.get_label())
-    # loc="best" is prohibitively expensive on a GeoAxes covering the full
-    # recipe bbox with thousands of collocated points — see the identical
-    # fix (and its rationale) in _draw_scene_panel above. Picking the
-    # sparsest corner ourselves (_sparse_legend_corner) is cheap and
+    # Picking the sparsest corner (_sparse_legend_corner) is cheap and
     # avoids the legend sitting on top of a dense cluster whenever the
-    # data isn't actually spread toward the NE (e.g. a single scene's
+    # data is not actually spread toward the NE (e.g. a single scene's
     # matched points bunched in one corner of a much larger recipe bbox).
     point_lonlat = [
         (np.asarray(cat["matched_lon"]), np.asarray(cat["matched_lat"])) for cat in categories
@@ -2889,8 +2782,14 @@ def _extract_validation_data_for_plot(datatree):
     """
     Extract all validation observations and their metadata from DataTree.
 
-    Includes in-situ data (mooring, buoy, altimeter, HF radar) and scatterometer
-    data (osi_saf_winds, etc.). Handles nested structures (e.g., osi_saf_winds/swath_name/).
+    Includes every validation source with a flat "point" dimension --
+    in-situ (mooring, buoy, drifter, tidal gauge) and layer sources
+    (scatterometer, altimeter, radiometer, HF radar, satellite soil
+    moisture) alike -- recursing into nested structures (e.g.
+    osi_saf_winds/swath_name/) to find them. Excludes gridded model sources
+    (ERA5/HYCOM): their native (time, lat, lon) dims are never flattened to
+    "point", and treating them as flattened per-observation points would
+    corrupt the extracted arrays -- see the inline "point" dim check below.
 
     Returns dict with structure:
     {
@@ -2921,25 +2820,15 @@ def _extract_validation_data_for_plot(datatree):
         """Recursively process a validation node."""
         ds = node.to_dataset()
 
-        # If this node has lon/lat, process it. Requires a "point"
-        # dimension -- true for every validation source EXCEPT ERA5's
-        # model nodes, whose DataTreeConverter.from_era5 deliberately
-        # keeps native (time, lat, lon) GRID dims (never flattened to
-        # "point" -- see that function's own docstring), so its lon and
-        # lat coords are two INDEPENDENT 1-D axes of different lengths,
-        # not paired per-observation coordinates. Without this guard,
-        # those mismatched-length axis arrays get treated as if they were
-        # flattened per-observation points, corrupting all_lons/all_lats/
-        # all_platform_types/all_times with bogus "observations" tagged
-        # with era5's platform_type -- confirmed live: they never match a
-        # real SAR-interpolated location, so they always land in the
-        # diagnostics plot's gray "unmatched" tier with era5's marker but
-        # no legend entry ("the era5 model data is invisible"). ERA5's
-        # actually-matched points are already represented correctly
-        # elsewhere (the "matched" tier reads collocation_results.nc /
-        # matched_lookup directly, not this raw-datatree scan), so
-        # skipping gridded nodes here only removes the bogus unmatched
-        # noise -- it does not affect era5's matched-point rendering.
+        # Requires a "point" dimension -- true for every validation source
+        # except ERA5/HYCOM's model nodes, whose DataTreeConverter.from_era5/
+        # from_hycom deliberately keep native (time, lat, lon) GRID dims. Their
+        # lon/lat are independent 1-D axes of different lengths, not paired
+        # per-observation coordinates, so flattening them here would corrupt
+        # all_lons/all_lats/etc. Safe to skip: these sources' matched points are
+        # rendered elsewhere from collocation_results.nc, not this raw-datatree
+        # scan -- this guard only keeps bogus entries out of the "unmatched"
+        # overlay.
         if "lon" in ds.coords and "lat" in ds.coords and "point" in ds.dims:
             lons = ds["lon"].values
             lats = ds["lat"].values
@@ -3001,7 +2890,7 @@ def _extract_validation_data_for_plot(datatree):
 
             source_to_data[source_name] = ds
         
-        # If this node doesn't have data but has children, recurse
+        # If this node does not have data but has children, recurse
         elif node.children:
             for child_name, child_node in node.children.items():
                 process_node(child_node, source_name)
@@ -3030,10 +2919,12 @@ def _extract_validation_data_for_plot(datatree):
 
 
 def _image_page_figure(img, dpi: int = 150):
-    """Build a throwaway Figure that exactly fills its canvas with *img* —
+    """
+    Build a throwaway Figure that exactly fills its canvas with *img* —
     used to embed an already-rendered PNG as a PDF page without drawing
     the original (often much more expensive, e.g. cartopy) figure a
-    second time."""
+    second time.
+    """
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
     img_h, img_w = img.shape[0], img.shape[1]
@@ -3045,10 +2936,12 @@ def _image_page_figure(img, dpi: int = 150):
 
 
 def _finalize_figure_for_report(fig, png_path: Optional[Path], dpi: int = 150):
-    """Render *fig* to PNG exactly once, optionally save it to *png_path*,
+    """
+    Render *fig* to PNG exactly once, optionally save it to *png_path*,
     close *fig*, and return a lightweight image-only Figure for embedding
     as a PDF page. Avoids drawing the same (often expensive) figure a
-    second time via ``PdfPages.savefig``."""
+    second time via ``PdfPages.savefig``.
+    """
     import io
 
     import matplotlib.pyplot as plt  # noqa: PLC0415
@@ -3065,17 +2958,19 @@ def _finalize_figure_for_report(fig, png_path: Optional[Path], dpi: int = 150):
 def _stamp_banner(
     fig: "Figure", text: str, color: str, description: Optional[str] = None,
 ) -> "Figure":
-    """Draw a small, visually distinct italic banner across the top of
+    """
+    Draw a small, visually distinct italic banner across the top of
     *fig*, identifying which report section this page belongs to. When
     *description* is given (only passed by callers stamping the first
     page of a section), a smaller one-sentence explanation is drawn just
     below the banner, so a reader unfamiliar with the section's method or
-    the underlying data product isn't left guessing. Adds overlay text
-    rather than touching the figure's own title/suptitle (set by
+    the underlying data product is not left guessing. Adds overlay text
+    rather than touching the figure's own title/subtitle (set by
     plot_scatter/plot_residuals/plot_statistics themselves), so those
     plotting functions stay unchanged. Called before the figure is
     finalized/rasterized for the report so the banner survives into the
-    saved PDF/PNG."""
+    saved PDF/PNG.
+    """
     fig.text(
         0.5, 1.07 if description else 1.04, text,
         ha="center", va="bottom", fontsize=9, style="italic", color=color,
@@ -3096,12 +2991,14 @@ _NATIVE_UNITS_DESCRIPTION = (
 
 
 def _mark_native_units(fig: "Figure", description: Optional[str] = None) -> "Figure":
-    """Stamp a "— native units —" banner across the top of *fig* so
+    """
+    Stamp a "— native units —" banner across the top of *fig* so
     native-units report pages can never be mistaken for the CDF-matched
     section's otherwise-identical-looking plots. *description*, given only
     for the section's first page, states these values are in their
     original units and have not been CDF-matched (unlike the main
-    section)."""
+    section).
+    """
     return _stamp_banner(fig, "— native units —", "darkred", description)
 
 
@@ -3109,11 +3006,9 @@ def _mark_native_units(fig: "Figure", description: Optional[str] = None) -> "Fig
 _CDS_PRODUCT_TYPE_LABELS = {"active": "ACTIVE", "passive": "PASSIVE", "combined": "COMBINED"}
 
 #: One-sentence summary of which satellites/sensors feed each C3S CDS
-#: product_type, for the section's opening page -- confirmed against real
-#: downloaded product NetCDF attrs (``raw.attrs["platform"]``): "active" is
-#: TU Wien's ASCAT scatterometer composite (ERS-1/ERS-2 + MetOp-A/B);
-#: "passive" merges many independent microwave radiometers; "combined"
-#: merges both.
+#: product_type, for the section's opening page: "active" is TU Wien's
+#: ASCAT scatterometer composite (ERS-1/ERS-2 + MetOp-A/B); "passive"
+#: merges many independent microwave radiometers; "combined" merges both.
 _CDS_PRODUCT_TYPE_DESCRIPTIONS = {
     "active": (
         "This product is derived from ASCAT scatterometer observations aboard the "
@@ -3133,9 +3028,11 @@ _CDS_PRODUCT_TYPE_DESCRIPTIONS = {
 
 
 def _cds_ssm_product_type(recipe) -> str:
-    """Return the ``product_type`` ("active"/"passive"/"combined")
+    """
+    Return the ``product_type`` ("active"/"passive"/"combined")
     configured for this recipe's ``cds_ssm`` validation source, defaulting
-    to "active" (matching ``_download_cds_ssm``'s own default) if absent."""
+    to "active" (matching ``_download_cds_ssm``'s own default) if absent.
+    """
     for src in recipe.config.validation_sources:
         if src.source_type == "cds_ssm":
             return str(src.download_kwargs.get("product_type", "active"))
@@ -3145,12 +3042,14 @@ def _cds_ssm_product_type(recipe) -> str:
 def _mark_cds_section(
     fig: "Figure", product_type: str = "active", description: Optional[str] = None,
 ) -> "Figure":
-    """Stamp a banner naming this the C3S CDS gridded Level-3 comparison
+    """
+    Stamp a banner naming this the C3S CDS gridded Level-3 comparison
     section — named after the underlying ESA Climate Change Initiative
     soil-moisture record that C3S continues operationally — to distinguish
     it from the CDF-matched and native-units sections. *description*,
     given only for the section's first page, states which satellites feed
-    *product_type*."""
+    *product_type*.
+    """
     label = _CDS_PRODUCT_TYPE_LABELS.get(product_type, product_type.upper())
     text = f"— Validation against ESA Climate Change Initiative gridded Level 3 {label} product —"
     return _stamp_banner(fig, text, "darkorange", description)
@@ -3166,29 +3065,30 @@ _CDF_MATCHED_DESCRIPTION = (
 
 
 def _mark_cdf_matched(fig: "Figure", description: Optional[str] = None) -> "Figure":
-    """Stamp a "(Cumulative Distribution Function-matched)" banner across
+    """
+    Stamp a "(Cumulative Distribution Function-matched)" banner across
     the top of *fig* so soil-moisture's main-section scatter/geographic/
     residuals pages (which plot the CDF-matched/rescaled SAR series, not
-    raw values) can't be mistaken for a units bug — mirrors
+    raw values) cannot be mistaken for a units bug — mirrors
     ``_mark_native_units`` but with a visually distinct color so the two
     banner types remain distinguishable. *description*, given only for the
-    section's first page, explains what CDF-matching does."""
+    section's first page, explains what CDF-matching does.
+    """
     return _stamp_banner(fig, "(Cumulative Distribution Function-matched)", "navy", description)
 
 
 def _cdf_matched_suffix(variable: str) -> str:
-    """Return ``" (CDF-matched)"`` for soil_moisture recipes, else ``""``.
+    """
+    Return ``" (CDF-matched)"`` for soil_moisture recipes, else ``""``.
 
     Soil moisture's main-section SAR series is CDF-matched/rescaled (via
     ``add_rescaled_sar_column``) before being plotted, not raw — unlike
-    every other variable's main section. Appended to the main section's
-    scatter/geographic/residuals page titles so that isn't mistaken for a
-    units bug during manual testing (the native-units section, which does
-    use raw values, is already labelled via ``_mark_native_units``).
+    every other variable's main section.
 
     Note: this suffix only affects the (currently unused-for-rendering)
     ``pdf_pages`` title strings. The actual visible page annotation is
-    ``_mark_cdf_matched``, stamped directly onto the figure."""
+    ``_mark_cdf_matched``, stamped directly onto the figure.
+    """
     return " (CDF-matched)" if variable == "soil_moisture" else ""
 
 
@@ -3196,7 +3096,7 @@ def _cdf_matched_suffix(variable: str) -> str:
 #: (unmatched path, generic category token, set by datatree_converter.py
 #: via DEFAULT_LAYER_TYPE_SPECS) -> display category, for soil-moisture
 #: satellite sources specifically. LAYER_DATA_TYPES (collocation.py)
-#: alone isn't enough here because plot_collocation_diagnostics' matched
+#: alone is not enough here because plot_collocation_diagnostics' matched
 #: and unmatched code paths carry different string forms for the same
 #: physical source -- see _diagnostics_category's two call sites below.
 _SOIL_MOISTURE_SOURCE_CATEGORY: Dict[str, str] = {
@@ -3214,12 +3114,11 @@ def _diagnostics_category(value: str) -> str:
     Display category for a val_source (matched path) or platform_type/
     data_type (unmatched path) value in plot_collocation_diagnostics.
 
-    Checks the soil-moisture literal/generic-name mapping first (the
-    matched and unmatched paths disagree on which string form they
-    carry for these sources), then falls back to the pre-existing
-    LAYER_DATA_TYPES-based generic-category check (unchanged behavior
-    for every other variable's sources: wind's scatterometer/
-    radiometer/altimeter, currents' hf_radar, ...), then "In-situ".
+    Checks the soil-moisture name mapping first, since the matched and
+    unmatched paths disagree on which string form they carry for those
+    sources, then falls back to the generic LAYER_DATA_TYPES check used by
+    every other variable's sources (wind's scatterometer/radiometer/
+    altimeter, currents' hf_radar, ...), then "In-situ".
     """
     s = str(value)
     if s in _SOIL_MOISTURE_SOURCE_CATEGORY:
@@ -3229,28 +3128,26 @@ def _diagnostics_category(value: str) -> str:
 
 
 def _volumetric_hist_range_overrides(pair_ds) -> Dict[str, Tuple[float, float]]:
-    """Map every ``val_source`` present in *pair_ds* to a fixed ``(-1, 1)``
-    residuals x-axis range.
+    """
+    Map every ``val_source`` present in *pair_ds* to the same fixed
+    ``(-1, 1)`` residuals x-axis range, for use as ``plot_residuals``'s
+    per-source ``hist_range`` dict when plotting CDF-matched soil-moisture
+    pairs.
 
-    Used as ``plot_residuals``'s per-source ``hist_range`` dict for
-    CDF-matched soil-moisture pairs. By the time this function runs,
-    ``add_rescaled_sar_column`` has already harmonized every source in
-    *pair_ds* into one consistent volumetric (~0-1) domain via
-    ``_harmonize_percent_domain_sources`` -- a source that can't be
-    harmonized (e.g. ``ascat_ssm`` with no ``ismn`` reference present to
-    fit a transform against) has its rows dropped to NaN rather than left
-    in its native percent-scale domain, so there is no longer any source
-    left in *pair_ds* whose residuals could genuinely span far beyond
-    +-1. That means a single shared ``(-1, 1)`` range is safe for every
-    source uniformly -- no per-source unit-family lookup is needed
-    anymore (this function no longer imports or checks
-    ``_VAL_SOURCE_UNITS_FAMILY``). A source with all-NaN residuals
-    (dropped by the harmonize fallback) is harmless to still range at
-    ``(-1, 1)`` since there is no data to plot for it either way.
+    A single shared range is safe here specifically because, by the time
+    this function runs, ``add_rescaled_sar_column`` has already run
+    ``_harmonize_percent_domain_sources`` on *pair_ds*: every source that
+    could be harmonized now shares one common volumetric (~0-1) domain, and
+    every source that could not (e.g. ``ascat_ssm`` with no ``ismn``
+    reference to fit a transform against) has had its rows dropped to NaN
+    instead of being left in its own wider native domain. So no source in
+    *pair_ds* can have residuals that genuinely fall outside +-1 -- and a
+    source that is all-NaN is harmless to range at (-1, 1) too, since there
+    is nothing to plot for it either way.
 
-    Returns ``{}`` when ``val_source`` is absent or empty, which makes
-    ``plot_residuals`` fall back to its own per-source data-driven range
-    for every source (safe default, never a crash or a wrong guess).
+    Returns ``{}`` if *pair_ds* has no ``val_source`` column or no rows, so
+    ``plot_residuals`` falls back to its own per-source data-driven range
+    instead of guessing.
     """
     if "val_source" not in pair_ds or pair_ds.sizes.get("collocation", 0) == 0:
         return {}
@@ -3449,20 +3346,16 @@ def validation_report(
     # Union across all pairs of SAR scenes that matched at least one
     # validation point — used to drop scenes with no matches from the
     # geographic plots. collocation_ds holds only matched pairs, so every
-    # scene present here has >= 1 match. None => don't filter.
+    # scene present here has >= 1 match. None => do not filter.
     matched_scenes = (
         sorted(set(str(s) for s in collocation_ds["sar_scene_name"].values))
         if "sar_scene_name" in collocation_ds else None
     )
 
-    # PDF writer: opens lazily on the first page actually written (so, as
-    # before, no file is created at all if nothing ever gets added) and
-    # writes+closes each page's Figure immediately. Previously every
-    # lightweight page Figure (built by _finalize_figure_for_report /
-    # _image_page_figure) was accumulated in a list for the whole report
-    # and only closed in one final loop -- with several (sar_var, val_var)
-    # pairs that left 20+ figures open simultaneously, which crashed
-    # VSCode during real-data testing.
+    # PDF writer: opens lazily on the first page actually written (no 
+    # file is created if nothing is added) and writes+closes each page's 
+    # Figure immediately, rather than accumulating every page Figure for 
+    # the whole report.
     pdf_path = base_dir / f"validation_report{filename_suffix}.pdf" if base_dir is not None else None
     pdf_cm: Optional["PdfPages"] = None
     pdf_writer: Optional["PdfPages"] = None
@@ -3563,7 +3456,7 @@ def validation_report(
 
         # Direction-only sources for circular variables (WDIR): drop
         # non-directional instruments (altimeter/radiometer, all-NaN
-        # direction) so they don't clutter the direction plots. Speed
+        # direction) so they do not clutter the direction plots. Speed
         # pairs keep every source.
         pair_ds = (
             _drop_nondirectional_sources(collocation_ds, val_var)
@@ -3571,24 +3464,9 @@ def validation_report(
         )
 
         # Soil moisture: the raw SAR series lives in a different physical
-        # domain than the validation series (e.g. a relative SAR
-        # saturation index vs. ISMN's absolute volumetric content) —
-        # compute_statistics_soil_moisture already CDF-matches them before
-        # computing bias/RMSE, but that rescaled series was previously
-        # discarded, so every point-based plot below was comparing raw,
-        # non-comparable values. Substitute the rescaled series here once,
-        # so scatter/residuals/temporal-offset all compare like with like.
-        #
-        # plot_geographic is the one exception: it keeps the pre-rescale
-        # `pair_ds` (as `geo_pair_ds` below) deliberately, and fits its own
-        # whole-field transform internally (fit_sar_to_val_transform) from
-        # the *raw* sar_<var>/val_<var> pairs. If it were handed the
-        # already-rescaled column instead, it would fit a transform whose
-        # training "source" is already in the validation domain (~0.05-0.5)
-        # and then apply that transform to the real, raw SAR field
-        # (~0-100) — wildly out of the fitted range, producing nonsense
-        # (confirmed against real data: predicted values above 300 for a
-        # variable that should span roughly 0-1).
+        # domain than the validation series. Substitute the rescaled series 
+        # here once, so every point-based plot below compares harmonized
+        # values instead of raw, non-comparable ones.
         geo_pair_ds = pair_ds
         cdf_matched_suffix = _cdf_matched_suffix(variable)
         harmonized_sources: set = set()
@@ -3601,20 +3479,15 @@ def validation_report(
             pair_ds = add_rescaled_sar_column(pair_ds, sar_var, val_var)
 
         # cds_ssm gets its own dedicated section further below
-        # (run_statistics_cds_ssm — no CDF matching) and must not also leak
-        # into this main CDF-matched section's plots. run_statistics()
-        # already excludes it from the CDF-matched stats table/bar charts
-        # (stats_ds_map), but the geographic/scatter/residuals plots below
-        # build straight from the raw collocation rows, which still carry
-        # cds_ssm — confirmed missing against a real
-        # recipes/soil_moisture_cds_sentinel_test.yaml run (cds_ssm rows
-        # showed up as their own subplot in the "(CDF-matched)" scatter/
-        # residuals pages even though the stats table correctly omitted
-        # them). Must not reassign pair_ds/geo_pair_ds themselves: the
-        # native-units section below is already cds_ssm-free by
-        # construction (restricted to native_units_stats_ds_map's own
-        # source list), but the C3S CDS section further below needs the
-        # *unfiltered* geo_pair_ds to select its own cds_ssm rows from.
+        # and must not also leak into this main CDF-matched section's 
+        # plots. run_statistics() already excludes it, but the 
+        # geographic/scatter/residuals plots below build straight from 
+        # the raw collocation rows, which still carry cds_ssm. Must not 
+        # reassign pair_ds/geo_pair_ds themselves: the native-units section 
+        # below is already cds_ssm-free by construction (restricted to 
+        # native_units_stats_ds_map's own source list), but the C3S CDS 
+        # section further below needs the *unfiltered* geo_pair_ds to 
+        # select its own cds_ssm rows from.
         cdf_pair_ds, cdf_geo_pair_ds = pair_ds, geo_pair_ds
         if variable == "soil_moisture" and "val_source" in pair_ds \
                 and bool((pair_ds["val_source"] == "cds_ssm").any()):
@@ -3721,12 +3594,10 @@ def validation_report(
             logger.warning("plot_geographic failed for %s: %s", sar_var, exc, exc_info=True)
 
         # Scatter — split into per-source small multiples not only when one
-        # source dominates by point count (see plot_scatter's
-        # split_when_imbalanced), but also whenever harmonization actually
+        # source dominates by point count, but also whenever harmonization 
         # converted a source (e.g. ASCAT) into the reference domain: piling
         # every source into one shared axes at that point is too visually
-        # busy even when no single source dominates by point count
-        # (confirmed against real data, soil_moisture_satellite_example).
+        # busy even when no single source dominates by point count.
         force_split = bool(harmonized_sources)
         fig_scatter = plot_scatter(cdf_pair_ds, sar_var, val_var, force_split=force_split)
         if fig_scatter is not None:
@@ -3785,7 +3656,7 @@ def validation_report(
             nu_pair_ds = geo_pair_ds.where(nu_mask, drop=True)
 
             # Geographic first, matching the CDF-matched section's order
-            # above (§9.3) -- spatial context before the point-cloud
+            # above - spatial context before the point-cloud
             # comparison, for the same reason in both sections.
             try:
                 fig_nu_geo_result = plot_geographic(
@@ -3801,7 +3672,7 @@ def validation_report(
                     # though val_<var>'s column-level units attr may still
                     # read the stale "mixed — see val_units" sentinel
                     # inherited from the pre-filter geo_pair_ds (row
-                    # filtering via .where(..., drop=True) doesn't
+                    # filtering via .where(..., drop=True) does not
                     # recompute column attrs). Without this, plot_geographic
                     # would misread that stale attrs string as a genuine
                     # units mismatch and wrongly fall back to two separate
@@ -3956,9 +3827,7 @@ def validation_report(
         # lightweight image-page objects, not these same objects — so this
         # loop is a safe, idempotent no-op double-close in that case. When
         # base_dir IS None (no report written to disk), this is the only
-        # place these figures ever get closed -- previously guarded by
-        # `if base_dir is not None`, which meant every figure built during
-        # a base_dir=None call leaked for the life of the process.
+        # place these figures get closed.
         for fig in figs:
             plt.close(fig)
 

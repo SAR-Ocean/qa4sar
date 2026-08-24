@@ -10,9 +10,6 @@ Data source: NOAA/UCSD HFRnet Regional/National RTV, distributed via ERDDAP
 griddap on coastwatch.pfeg.noaa.gov. Variables ``water_u``/``water_v`` carry CF
 standard names ``surface_eastward/northward_sea_water_velocity``.
 
-Reference for the SAR-vs-HF-radar comparison this feeds:
-Martin, Gommenginger, Jacob & Staneva (2022), RSE 268:112758.
-
 CLI usage::
 
     python -m sar_validation.downloaders.noaa_hfradar_downloader \\
@@ -78,10 +75,11 @@ def _parse_das_time_range(das_text: str) -> Optional[tuple[datetime, datetime]]:
 
 
 def select_erddap_dataset(min_lon, max_lon, min_lat, max_lat, resolution_km: float) -> str:
-    """Choose the ERDDAP RTV dataset id from the request bbox and resolution.
+    """
+    Choose the ERDDAP RTV dataset id from the request bbox and resolution.
 
     Raises ``ValueError`` if the region is outside NOAA's coverage, has no
-    ERDDAP dataset at all (Great Lakes/Gulf of Alaska), or doesn't offer
+    ERDDAP dataset at all (Great Lakes/Gulf of Alaska), or does not offer
     the requested resolution.
     """
     name, region = match_noaa_hfr_region(min_lon, max_lon, min_lat, max_lat)
@@ -101,7 +99,8 @@ def select_erddap_dataset(min_lon, max_lon, min_lat, max_lat, resolution_km: flo
 
 
 def clamp_to_region_bbox(min_lon, max_lon, min_lat, max_lat) -> tuple[float, float, float, float]:
-    """Clamp a request bbox to the matched region's known grid extent.
+    """
+    Clamp a request bbox to the matched region's known grid extent.
 
     ERDDAP griddap rejects (HTTP 404) any axis constraint that starts or ends
     outside the dataset's actual coordinate axis, rather than clipping it —
@@ -120,7 +119,8 @@ def clamp_to_region_bbox(min_lon, max_lon, min_lat, max_lat) -> tuple[float, flo
 def build_erddap_subset_url(
     dataset_id: str, min_lon, max_lon, min_lat, max_lat, start: str, end: str
 ) -> str:
-    """Build an ERDDAP griddap NetCDF-subset URL for water_u/water_v.
+    """
+    Build an ERDDAP griddap NetCDF-subset URL for water_u/water_v.
 
     Dimension order is ``[time][latitude][longitude]``; ERDDAP accepts value
     selectors ``[(min):(max)]`` and returns the enclosing grid subset
@@ -142,7 +142,8 @@ def build_erddap_subset_url(
 
 
 def select_backend(end: str) -> str:
-    """Pick the download backend from the requested end date.
+    """
+    Pick the download backend from the requested end date.
 
     Dates within ERDDAP_WINDOW_DAYS use ERDDAP; older dates require the
     THREDDS archive backend (noaa_hfradar_thredds_downloader.py), which
@@ -160,7 +161,8 @@ def select_backend(end: str) -> str:
 
 
 class NOAAHFRadarDownloader:
-    """Download NOAA HFRnet gridded RTV currents via ERDDAP griddap.
+    """
+    Download NOAA HFRnet gridded RTV currents via ERDDAP griddap.
 
     Parameters
     ----------

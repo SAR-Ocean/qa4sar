@@ -3,11 +3,8 @@ Download ASCAT Soil Moisture (12.5 km Swath Grid) products from EUMETSAT
 via EUMDAC.
 
 Collection EO:EUM:DAT:METOP:SOMO12 ("ASCAT Soil Moisture at 12.5 km Swath
-Grid in NRT - Metop") stopped receiving new products on 2026-07-15 — this
-downloader is intended for HISTORICAL data only (requests for dates after
-that cutoff will simply return zero products; there is no special-casing
-for the cutoff here). Reuses the same EUMDAC credentials as the existing
-ASCAT wind downloader (scatterometer_downloader.py).
+Grid in NRT - Metop") (product ended on 2025-07-15; historical only).
+Uses the same EUMDAC credentials as scatterometer_downloader.py.
 
 Library usage::
 
@@ -40,8 +37,7 @@ __all__ = ["ASCATSoilMoistureDownloader", "COLLECTION_ID"]
 
 COLLECTION_ID = "EO:EUM:DAT:METOP:SOMO12"
 # Real SOMO12 product IDs use EUMETSAT's short satellite codes (e.g.
-# ASCA_SMR_02_M01_20240102204500Z_...), never the literal strings
-# "metopb"/"metopc" that the OSI-104 wind collection's product IDs use.
+# ASCA_SMR_02_M01_20240102204500Z_...).
 SATELLITES    = ["m01", "m02", "m03"]
 
 

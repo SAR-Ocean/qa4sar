@@ -1,11 +1,10 @@
 """
 General-purpose, satellite-agnostic orbit-based geographic pre-filter.
 
-Given a satellite name and a sensing time window, predicts whether that
-satellite's ground track/swath could have passed near a given bounding
-box -- so a downloader with no server-side bbox filter (e.g. H-SAF's FTP
-archive, see hsaf_downloader.py) can skip files whose orbit segment
-never came near the requested region, before downloading them.
+Given a satellite name and a sensing time window, predicts whether
+that satellite's ground track could have passed near a given
+bounding box, so a downloader with no server-side bbox filter can
+skip clearly irrelevant files before downloading them.
 
 Also provides a windowed, polygon-aware variant, orbit_overlap_windows,
 which returns every matching sub-window (instead of a single bool) and
@@ -13,14 +12,11 @@ can test against a true footprint polygon instead of just its bounding
 box -- needed for wide-window sources (e.g. AMSR2's whole-day window)
 where "yes, sometime today" alone isn't useful.
 
-Fails open throughout (returns True -- "could overlap, don't filter this
-file out") whenever prediction isn't possible or trustworthy: an
-unregistered satellite, a TLE that can't be fetched, or any propagation
-error. This is a pre-filter to reduce unnecessary downloads, never a
-substitute for the real geographic filtering domain-cropping already
-does downstream -- so it must never risk a false negative.
-
-See docs/superpowers/specs/2026-08-13-sar-scene-aware-download-narrowing-and-orbit-prefilter-design.md
+Fails open on any prediction failure (unregistered satellite,
+unavailable TLE, propagation error), since this is only a pre-filter
+to reduce unnecessary downloads, not a substitute for the real
+geographic filtering applied downstream, and must never risk a
+false negative.
 """
 
 from __future__ import annotations
@@ -57,82 +53,55 @@ _MAX_ACCEPTABLE_EPOCH_GAP_DAYS = 10.0
 _SPACE_TRACK_LOGIN_URL = "https://www.space-track.org/ajaxauth/login"
 _SPACE_TRACK_QUERY_BASE = "https://www.space-track.org/basicspacedata/query/class/gp_history"
 
-#: Matches this codebase's existing repo-relative shared-cache convention
-#: (see hf_radar_historical_downloader.py's _ARCHIVE_CACHE_DIR,
-#: ismn_downloader.py's _SHARED_ARCHIVE_CACHE_DIR) rather than a
-#: per-user home-directory cache.
 _DEFAULT_TLE_CACHE_DIR = Path("data") / "_archive_cache" / "tle"
 
 #: Authenticated Space-Track session, cached at module level and reused
-#: across every get_tle() call within this process instead of
-#: re-authenticating (a real login POST) on every single on-disk cache
-#: miss -- H-SAF's motivating scenario can mean hundreds of files (so
-#: hundreds of cache misses) per run.
+#: across every get_tle() call.
 _cached_space_track_session: Optional[requests.Session] = None
 
-#: Simple circuit breaker, scoped to the lifetime of this Python process
-#: (module-level; deliberately no expiry/reset/persistence -- see the
-#: design brief's bounded-scope instruction). Set the first time get_tle
-#: hits an exception while authenticating or establishing/using a
-#: Space-Track session -- NOT for a normal "no TLE found for this
-#: specific date" per-request outcome (handled separately below via the
-#: empty-``candidates`` check, which is expected on a per-request basis
-#: and must not trip this). Once set, every subsequent get_tle call
-#: fails open immediately (TleFetchError) without attempting any further
-#: network I/O, so a Space-Track outage doesn't block for the full
-#: request timeout on every remaining file in the run.
+#: Circuit breaker scoped to this process's lifetime (module-level,
+#: no expiry/reset/persistence). Set the first time get_tle hits an
+#: exception while authenticating or establishing/using a
+#: Space-Track session -- not for a normal "no TLE found for this
+#: date" outcome, which is handled separately via the
+#: empty-``candidates`` check and must not trip this. Once set, every
+#: subsequent get_tle call fails open immediately (TleFetchError)
+#: without further network I/O, so a Space-Track outage does not
+#: block for the full request timeout on every remaining file in the
+#: run.
 _space_track_unavailable: bool = False
 
 
 @dataclass(frozen=True)
 class SatelliteOrbitSpec:
-    """One satellite this module can predict ground-track/swath overlap
-    for. norad_id feeds the Space-Track TLE lookup (see get_tle);
-    swath_half_width_km is the outer edge of the satellite's real swath
-    from its ground track, in km -- e.g. ASCAT/MetOp's ~550-600km-wide
-    swath on each side of the ground track (the inner gap between the
-    two swaths is deliberately not modeled; treating both sides as one
-    continuous corridor out to the outer edge is a safe over-inclusion,
-    see the design doc)."""
+    """
+    One satellite this module can predict ground-track/swath overlap for.
+
+    ``norad_id`` feeds the Space-Track TLE lookup (see :func:`get_tle`). 
+    ``swath_half_width_km`` is the outer edge of the satellite's real 
+    swath from its ground track, in kilometers. For a satellite with 
+    two side-looking swaths, the inner gap between them is not modeled; 
+    treating both sides as one continuous corridor out to the outer edge 
+    is an over-inclusion.
+    """
 
     norad_id: int
     swath_half_width_km: float
 
-
-#: Real, live-confirmed NORAD catalog IDs (CelesTrak, 2026-08-13; Space-
-#: Track uses the same numbering). Add entries here (not in any
-#: per-source downloader file) to extend orbit pre-filtering to a new
-#: satellite -- MetOp-A is deliberately absent (not in CelesTrak's active
-#: weather-satellite list; every real H-SAF sample file this codebase
-#: has seen only ever shows METOPB/METOPC). A satellite absent here
-#: simply isn't pre-filtered -- see orbit_overlaps_bbox's fail-open
-#: behavior.
+#: NORAD catalog IDs (CelesTrak numbering; Space-Track uses the same
+#: scheme). Add entries here (not in any per-source downloader file)
+#: to extend orbit pre-filtering to a new satellite.
 SATELLITE_ORBIT_SPECS: Dict[str, SatelliteOrbitSpec] = {
     "metop-b": SatelliteOrbitSpec(norad_id=38771, swath_half_width_km=600.0),
     "metop-c": SatelliteOrbitSpec(norad_id=43689, swath_half_width_km=600.0),
     # HY-2B/HY-2C HSCAT (Ku-band rotating pencil-beam scatterometer).
-    # NORAD IDs live-confirmed via ILRS/N2YO, 2026-08-17. Swath width
-    # is reported anywhere from ~1300km (EUMETSAT NWP SAF monitoring
-    # page) to ~1800km (KNMI's OSI-SAF HY-2 winds Product User Manual,
-    # which gives the widest documented figure) -- the wider figure is
-    # used here (half of it per side), consistent with this module's
-    # fail-toward-inclusion principle (see the METOP-B/C comment
-    # above, and the module docstring's "never risk a false negative").
     "hy2b": SatelliteOrbitSpec(norad_id=43655, swath_half_width_km=900.0),
     "hy2c": SatelliteOrbitSpec(norad_id=46469, swath_half_width_km=900.0),
     # Oceansat-3/EOS-06 OSCAT-3 (Ku-band conical-scan scatterometer).
-    # NORAD ID live-confirmed via eoPortal/WMO OSCAR, 2026-08-17. Swath
-    # width 1440km (WMO OSCAR OSCAT-3 instrument page), half per side.
     "oceansat3": SatelliteOrbitSpec(norad_id=54361, swath_half_width_km=720.0),
     # GCOM-W1 "Shizuku" -- AMSR2's host satellite (conical scanner).
-    # NORAD ID live-confirmed via JAXA/Wikidata, 2026-08-17. Swath
-    # width reported as ~1450km nominal / >1600km effective (JAXA
-    # GCOM-W1 documentation); the wider effective figure is used here,
-    # half per side.
     "gcom-w1": SatelliteOrbitSpec(norad_id=38337, swath_half_width_km=800.0),
-    # SMOS (MIRAS interferometric radiometer, hexagonal FOV). NORAD ID
-    # live-confirmed via N2YO/CEOS, 2026-08-17. Swath width ~1050km
-    # (ESA eoPortal / CEOS instrument database), half per side.
+    # SMOS (MIRAS interferometric radiometer, hexagonal FOV).
     "smos": SatelliteOrbitSpec(norad_id=36036, swath_half_width_km=525.0),
     # Sentinel-1A/B/C (C-SAR, IW mode). NORAD IDs (SATCAT numbers)
     # live-confirmed via Wikipedia's Sentinel-1A/1B/1C pages, 2026-08-18:
@@ -153,16 +122,20 @@ SATELLITE_ORBIT_SPECS: Dict[str, SatelliteOrbitSpec] = {
 
 
 class TleFetchError(Exception):
-    """Raised when no usable historical TLE can be obtained for a given
+    """
+    Raised when no usable historical TLE can be obtained for a given
     satellite/time -- callers (orbit_overlaps_bbox and
     orbit_overlap_windows) must treat this as "cannot predict, fail
-    open", never propagate it as a hard error."""
+    open", never propagate it as a hard error.
+    """
 
 
 def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Initial great-circle bearing (degrees, 0-360, 0=north, clockwise)
+    """
+    Initial great-circle bearing (degrees, 0-360, 0=north, clockwise)
     from (lat1, lon1) to (lat2, lon2). Standard spherical-Earth forward-
-    azimuth formula (Movable Type Scripts' "Bearing" reference)."""
+    azimuth formula (Movable Type Scripts' "Bearing" reference).
+    """
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dlambda = math.radians(lon2 - lon1)
     y = math.sin(dlambda) * math.cos(phi2)
@@ -174,7 +147,8 @@ def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 def _destination_point(
     lat: float, lon: float, bearing_deg: float, distance_km: float,
 ) -> Tuple[float, float]:
-    """(lat, lon) reached by travelling distance_km along bearing_deg
+    """
+    (lat, lon) reached by travelling distance_km along bearing_deg
     (great-circle) from (lat, lon), spherical Earth. Standard "direct
     geodesic" formula (Movable Type Scripts' "Destination point given
     distance and bearing from start point"):
@@ -222,15 +196,16 @@ def _space_track_session(username: str, password: str) -> requests.Session:
 def _query_nearest_candidate(
     session: requests.Session, norad_id: int, target_time: datetime, before: bool,
 ) -> Optional[Dict[str, str]]:
-    """One gp_history record: the single nearest-EPOCH candidate strictly
-    before (before=True) or strictly after (before=False) target_time, or
-    None if the historical archive has nothing on that side.
+    """
+    One gp_history record: the single nearest-EPOCH candidate strictly
+    before (before=True) or strictly after (before=False) target_time,
+    or None if the historical archive has nothing on that side.
 
-    Uses a plain "<"/">" (not ">=") -- Space-Track's query parser rejects
-    the "=" character in a predicate value with an HTTP 400 ("The URI you
-    submitted has disallowed characters"), confirmed live against the
-    real API. This loses only the negligible edge case of a TLE epoch
-    landing on the exact microsecond of target_time.
+    Uses a plain "<"/">" rather than ">=": Space-Track's query parser
+    rejects the "=" character in a predicate value with an HTTP 400
+    ("The URI you submitted has disallowed characters"). This loses
+    only the negligible edge case of a TLE epoch landing on the exact
+    microsecond of target_time.
     """
     target_str = target_time.strftime("%Y-%m-%d %H:%M:%S")
     operator = "<" if before else ">"
@@ -257,28 +232,24 @@ def _epoch_gap_seconds(candidate: Dict[str, str], target_time: datetime) -> floa
 def get_tle(
     satellite: str, target_time: datetime, cache_dir: Optional[Path] = None,
 ) -> "tuple[str, str]":
-    """(line1, line2) for *satellite*, nearest in epoch to *target_time*.
+    """
+    (line1, line2) for *satellite*, nearest in epoch to *target_time*.
 
-    Cached on disk keyed by (satellite, target_time.date()) -- since the
+    Cached on disk keyed by (satellite, target_time.date()): since the
     result is "the historical TLE nearest this fixed past date", it never
-    changes once fetched, so the cache entry is permanent (many files
-    from the same day share one cache read, and one pair of Space-Track
-    queries on a cache miss, which matters given H-SAF's ~3-minute file
-    cadence and Space-Track's API rate limits).
+    changes once fetched, so the cache entry is permanent. 
 
-    On a cache miss: authenticates to Space-Track (credentials via
-    authenticate_space_track(), see downloaders/base.py), queries the
-    gp_history class for the NORAD ID nearest target_time (both before
-    and after, since target_time is always in the past for this design's
-    use case), and picks whichever candidate has the smaller
-    |epoch - target_time|.
+    On a cache miss, authenticates to Space-Track (credentials via
+    authenticate_space_track(), see downloaders/base.py), and queries the
+    gp_history class for the NORAD ID nearest target_time, both before
+    and after (target_time is always in the past for this use case), 
+    picking whichever candidate has the smaller |epoch - target_time|.
 
-    Raises TleFetchError (not a bare requests/auth exception) on any
+    Raises TleFetchError, not a bare requests/auth exception, on any
     failure -- unregistered satellite, missing credentials, network/auth
-    error, empty result, or a found candidate whose epoch is still more
-    than _MAX_ACCEPTABLE_EPOCH_GAP_DAYS away from target_time (a
-    defensive backstop for sparse tracking periods) -- so callers have
-    one exception type to catch and always fail open.
+    error, empty result, or a found candidate whose epoch is more than
+    _MAX_ACCEPTABLE_EPOCH_GAP_DAYS away from target_time (a
+    defensive backstop for sparse tracking periods).
     """
     if satellite not in SATELLITE_ORBIT_SPECS:
         raise TleFetchError(f"Unknown satellite {satellite!r} -- not in SATELLITE_ORBIT_SPECS.")
@@ -413,26 +384,20 @@ def orbit_overlaps_bbox(
     sample_interval_s: float = 15.0,
     cache_dir: Optional[Path] = None,
 ) -> bool:
-    """True if *satellite*'s predicted ground track/swath during
+    """
+    True if *satellite*'s predicted ground track/swath during
     [sensing_start, sensing_end] comes within margin_km of the given
-    bbox. Fails open (returns True -- never filters when uncertain) if
-    *satellite* isn't in SATELLITE_ORBIT_SPECS, the TLE can't be fetched
-    (TleFetchError), or orbit propagation raises for any reason -- this
-    is a download-time optimization, never a substitute for the real
-    domain-cropping that happens downstream, so it must never risk a
-    false negative.
+    bbox. Fails open (returns True) if *satellite* is unregistered, the
+    TLE cannot be fetched, or propagation raises for any reason -- this
+    is a download-time optimization, not a substitute for the real
+    domain-cropping applied downstream, and must never risk a false
+    negative.
 
-    Algorithm: fetch the TLE nearest sensing_start via get_tle(satellite,
-    sensing_start, cache_dir). Sample the sub-satellite point every
-    sample_interval_s across [sensing_start, sensing_end] via
-    Orbital.get_lonlatalt. At each sample, derive the instantaneous
-    heading via _bearing_deg against the adjacent sample (next sample if
-    available, else the previous one). At each sample, sweep both
-    perpendicular sides of that heading (bearing +/- 90) at increasing
-    distances up to swath_half_width_km + margin_km via
-    _destination_point, and check whether the sub-satellite point OR any
-    swept point falls within the bbox (antimeridian-aware). Returns True
-    on the first match found (short-circuits).
+    Algorithm: fetch the TLE nearest sensing_start, sample the
+    sub-satellite point every sample_interval_s across the window, and
+    at each sample sweep both sides of the instantaneous heading out to
+    swath_half_width_km + margin_km. Returns True on the first sample or
+    swept point found inside the bbox (antimeridian-aware).
     """
     spec = SATELLITE_ORBIT_SPECS.get(satellite)
     if spec is None:
@@ -456,15 +421,10 @@ def orbit_overlaps_bbox(
             samples.append((sensing_end, lat, lon))
 
         max_offset_km = spec.swath_half_width_km + margin_km
-        # Sweep every ~50km out to max_offset_km, not just a couple of
-        # fixed rings -- a bbox exactly between two widely-spaced sample
-        # rings would otherwise be silently missed even though it's well
-        # inside the real corridor. Recipe bboxes in this codebase are
-        # routinely thousands of km wide (see e.g. recipes/soil_moisture_
-        # hsaf_ascat.yaml's -10..30 lon span), so a 50km cross-track grid
-        # is dense relative to any bbox this filter is actually run
-        # against -- cheap to compute (pure arithmetic, no propagation),
-        # so there's no reason to sample coarser.
+        # Sweeps every ~50km out to max_offset_km, not just a couple of fixed
+        # rings, so a bbox falling between two widely-spaced rings is never
+        # silently missed. Cheap to compute (pure arithmetic, no propagation),
+        # so there is no reason to sample coarser.
         _CROSS_TRACK_STEP_KM = 50.0
         n_steps = max(1, math.ceil(max_offset_km / _CROSS_TRACK_STEP_KM))
         sweep_distances_km = [max_offset_km * (i / n_steps) for i in range(1, n_steps + 1)]
@@ -479,13 +439,12 @@ def orbit_overlaps_bbox(
                 _prev_t, prev_lat, prev_lon = samples[i - 1]
                 heading = _bearing_deg(prev_lat, prev_lon, lat, lon)
             else:
-                # Only one ground-track sample exists (a degenerate
-                # sensing_start == sensing_end window) -- no adjacent
-                # sample to derive a heading from, so the cross-track
-                # sweep can't be predicted. This module's whole contract
-                # is "never risk a false negative": failing to predict
-                # correctly must fail OPEN, not silently drop the file by
-                # falling through to `return False` below.
+                # A degenerate sensing_start == sensing_end window yields only one
+                # ground-track sample, with no adjacent sample to derive a heading
+                # from, so the cross-track sweep cannot be predicted. Per this
+                # module's "never risk a false negative" contract, failing to
+                # predict must fail open here, not silently fall through to
+                # `return False` below.
                 return True
             for side_bearing in (heading + 90.0, heading - 90.0):
                 for dist in sweep_distances_km:
