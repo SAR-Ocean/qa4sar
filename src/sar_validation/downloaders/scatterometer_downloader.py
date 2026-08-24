@@ -4,8 +4,8 @@ Download ASCAT scatterometer wind data from EUMETSAT via EUMDAC.
 Currently supports near-real-time data from MetOp-B and MetOp-C
 (EUMETSAT OSI-SAF, collection EO:EUM:DAT:METOP:OSI-104).
 
-NOTE: Historical scatterometer data for MetOp-A, HY-2B, HY-2C and
-other satellites is not yet supported. See TODO section below.
+Historical scatterometer data for MetOp-A, HY-2B, HY-2C and
+other satellites is currently not supported by this downloader.
 
 Library usage::
 
@@ -23,22 +23,6 @@ CLI usage::
 
 from __future__ import annotations
 
-# TODO: Historical scatterometer data
-#
-# The current implementation is limited to near-real-time data from
-# MetOp-B and MetOp-C via EUMETSAT EUMDAC (collection OSI-104).
-#
-# For historical data and additional satellites the following options
-# should be evaluated and implemented:
-#
-# - MetOp-A (historical): EUMDAC archive (same collection, earlier dates)
-# - HY-2B / HY-2C: NSOAS FTP  (ftp://ftp.nsoas.org.cn/)
-#   or EUMETSAT re-processed archive
-# - NASA PO.DAAC (OPeNDAP, no FTP): covers ASCAT, QuikSCAT, RapidScat
-#   https://podaac.jpl.nasa.gov/
-# - REMSS: https://www.remss.com/
-#
-# Until this is implemented, historic data must be obtained manually.
 import argparse
 import json
 import shutil

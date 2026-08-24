@@ -9,18 +9,18 @@ Supports the three sensor-class variants of the
 * ``"combined"`` — Merged active + passive, 0.25°, daily, [m³ m⁻³]
 
 Credentials are read automatically from ``~/.cdsapirc`` (the standard
-Copernicus CDS API key file). No OS-keyring wiring is needed — this
-differs from other downloaders intentionally, because CDS uses its own
-standard credential file. See README §Credentials for registration
-instructions.
+Copernicus CDS API key file); no OS-keyring wiring is needed, since
+CDS uses its own standard credential file. See README §Credentials
+for registration instructions.
 
-No server-side bbox filtering — the CDS delivers a global 0.25° grid per
-request; spatial sub-setting is performed downstream by
+No server-side bbox filtering — the CDS delivers a global 0.25° grid
+per request; spatial subsetting is performed downstream by
 ``DataTreeConverter.from_c3s_ssm()``.
 
-The downloader requests each day independently so partially-complete
-time ranges succeed without skipping any available days, and individual
-day failures can be logged without aborting the whole batch.
+The downloader requests each day independently, so partially-complete
+time ranges succeed without skipping any available days, and
+individual day failures can be logged without aborting the whole
+batch.
 
 Library usage::
 
@@ -58,8 +58,10 @@ __all__ = ["CDSSoilMoistureDownloader"]
 _CDS_DATASET = "satellite-soil-moisture"
 
 #: Every CDS product version this dataset has published for the
-#: icdr/daily facet combination this downloader requests. if CDS
-#: publishes a new version and old requests start failing.
+#: icdr/daily facet combination this downloader requests. Maintained
+#: by hand; if CDS publishes a new version and this list is not
+#: updated, requests for dates covered only by that new version will
+#: fail, since it is never submitted as a candidate.
 _CDS_VERSIONS: list[str] = [
     "v201706", "v201812", "deprecated_v201912", "v201912_1",
     "v202012", "v202212", "v202312", "v202505", "v202505_1",
@@ -212,8 +214,7 @@ class CDSSoilMoistureDownloader:
             "month": [f"{day.month:02d}"],
             "day": [f"{day.day:02d}"],
             # CDR ("Climate Data Record") is the finalized, fully
-            # quality-controlled product -- prefer it whenever it's been
-            # published for the requested day. ICDR ("Interim" CDR) is the
+            # quality-controlled product. ICDR ("Interim" CDR) is the
             # faster, near-real-time product published for the most recent
             # days before CDR catches up; _download_day() falls back to it
             # only when the CDR request itself fails (e.g. CDR not published
@@ -229,8 +230,7 @@ class CDSSoilMoistureDownloader:
         on failure.
 
         Requests the finalized CDR record first; if that request fails
-        (e.g. CDR hasn't been published yet for a very recent day), retries
-        once with ICDR, the faster near-real-time record.
+        retries once with ICDR, the faster near-real-time record.
         """
         try:
             import cdsapi  # noqa: PLC0415 — optional dependency, imported lazily

@@ -1,16 +1,15 @@
 """
 Download SMOS soil-moisture products from ESA's Online Dissemination
 service (smos-diss.eo.esa.int) via the OADS web portal (HTTPS +
-SAML2/WSO2 SSO login), not FTPS — FTPS was dropped after confirming the
-FTP server hangs indefinitely from this toolbox's network path.
+SAML2/WSO2 SSO login).
 
 Browses the NRT_Open product tree by date via OADS's tree-browse form.
 Unlike CATDS/CDN mirrors, this is ESA's own dissemination point serving
 the operational L2 SM product (SM_OPER_MIR_SMUDP2), volumetric units
 (m3/m3).
 
-No server-side bbox filtering — files are downloaded per day and cropped
-to the recipe domain downstream, in ``convert_downloaded_data``.
+No server-side bbox filtering: the files are downloaded per day and 
+cropped to the recipe domain downstream, in ``convert_downloaded_data``.
 
 Library usage::
 
@@ -49,36 +48,25 @@ OADS_LOGIN_URL = f"{OADS_BASE_URL}/login"
 #: OADS "Type" tree-form value for the NRT L2 Soil Moisture product.
 OADS_PRODUCT_TYPE = "MIR_SMNRT2"
 
-#: Real OADS NRT filename convention (live-confirmed 2026-08-17 against
-#: files actually downloaded from smos-diss.eo.esa.int for
-#: recipes/soil_moisture_example.yaml, e.g.
-#: "W_XX-ESA,SMOS,NRTNN_C_LEMM_20260102131619_20260102103700_20260102123603_o_v300_l2sm.nc")
+#: Real OADS NRT filename convention, e.g.
+#: "W_XX-ESA,SMOS,NRTNN_C_LEMM_20260102131619_20260102103700_20260102123603_o_v300_l2sm.nc"
 #: -- a WMO/EUMETCast-style name, the same "<created>_<sensing_start>_
 #: <sensing_end>" three-timestamp shape hsaf_downloader.py's H29/H122
-#: filenames use (there: "W_IT-HSAF-ROME,...,H29_C_LIIB_<created>_
-#: <start>_<end>____.nc"), just under ESA's own originator/product code
-#: ("W_XX-ESA,SMOS,NRTNN_C_LEMM_...") instead of H-SAF's. Confirmed by
-#: timestamp ordering across every real sample seen: start < end <
-#: created (created is a processing timestamp, always latest). The
-#: 4-letter production-center code ("LEMM" in every sample observed so
-#: far) is matched generically ([A-Z]{4}), not hardcoded, since only the
-#: NRT product type has been directly observed -- other SMOS product
-#: types this downloader doesn't currently fetch may use a different
-#: code. Does NOT match the standard ESA product-naming-convention guess
-#: this regex originally assumed ("SM_OPER_MIR_SMUDP2_<start>_<stop>_...",
-#: no plain-14-digit/no-"T"-separator, no <created> prefix) -- that
-#: assumption was live-verified wrong; real filenames never matched it,
-#: so every file silently fell back to the whole-day window until this
-#: fix. If a filename still doesn't match this pattern,
-#: _filter_by_orbit_overlap falls back to a whole-day window -- see that
-#: method.
+#: filenames use. Timestamp order is start < end < created. The 
+#: The 4-letter production-center code ("LEMM" in observed samples)
+#: is matched generically ([A-Z]{4}), not hardcoded, since other SMOS
+#: product types this downloader does not fetch may use a different
+#: code. If a filename does not match this pattern, _filter_by_orbit_overlap 
+#: falls back to a whole-day window -- see that method.
 _SENSING_WINDOW_RE = re.compile(r"_C_[A-Z]{4}_\d{14}_(\d{14})_(\d{14})_")
 
 
 def _parse_sensing_window(filename: str) -> "Optional[tuple[datetime, datetime]]":
-    """Extract the embedded (start, stop) sensing timestamps from a real
-    OADS SMOS filename, or None if the filename doesn't match the
-    expected convention."""
+    """
+    Extract the embedded (start, stop) sensing timestamps from a real
+    OADS SMOS filename, or None if the filename does not match the
+    expected convention.
+    """
     m = _SENSING_WINDOW_RE.search(filename)
     if not m:
         return None
@@ -149,15 +137,13 @@ class SMOSDownloader:
         products = []
         # Each product is a <h5 class="productTitle">filename</h5> followed
         # by a "Download Product" <a href="...">; matched non-greedily so
-        # multiple productContainer blocks don't bleed into each other.
+        # multiple productContainer blocks do not bleed into each other.
         # href's closing quote is followed by [^>]* (not immediately ">")
-        # because the *authenticated* page's real link carries an extra
-        # target="_blank" attribute in between -- confirmed against a real
-        # authenticated fetch, which also revealed the href itself differs
-        # from the unauthenticated page this was originally written
-        # against: authenticated hrefs are direct download links
-        # (/oads/data/NRT_Open/<filename>), not the login-gated redirect
-        # (/oads/access/login?...) an unauthenticated fetch sees.
+        # since the authenticated page's link carries an extra
+        # target="_blank" attribute in between. Authenticated hrefs are
+        # direct download links (/oads/data/NRT_Open/<filename>), not the
+        # login-gated redirect (/oads/access/login?...) an unauthenticated
+        # fetch sees.
         for title_match in re.finditer(
             r'class=["\']productTitle["\']>([^<]+)</h5>.*?<a href=["\']([^"\']+)["\'][^>]*>Download Product</a>',
             resp.text, re.DOTALL,
@@ -169,11 +155,10 @@ class SMOSDownloader:
             })
 
         if not products and "No products" not in resp.text:
-            # Zero matches but the page doesn't say "no products" either --
-            # the regex likely doesn't match this (possibly authenticated,
-            # possibly-different-from-unauthenticated) page's real layout.
-            # Save it so the mismatch can actually be diagnosed instead of
-            # silently reporting 0 downloads with no explanation.
+            # Zero matches, but the page does not say "no products" either --
+            # the regex likely does not match the page's actual layout.
+            # Save it so the mismatch can be diagnosed instead of silently 
+            # reporting 0 downloads with no explanation.
             debug_path = self.output_dir / f"smos_list_debug_{day.isoformat()}.html"
             try:
                 self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -195,11 +180,10 @@ class SMOSDownloader:
         "Download Product" links.
 
         Three-hop flow, matching the ``loginForm``/``samlsso`` pattern
-        served by ``eoiam-idp.eo.esa.int`` (confirmed live, unauthenticated,
-        against ``/oads/access/login``): (1) GET the OADS login URL, which
+        served by ``eoiam-idp.eo.esa.int`` (1) GET the OADS login URL, which
         redirects to the IdP and embeds a ``sessionDataKey`` in a hidden
         login form; (2) POST username/password plus that key to the IdP's
-        ``samlsso`` endpoint; (3) the IdP's response is itself an
+        ``samlsso`` endpoint; (3) the IdP's response itself is an
         auto-submitting HTML form carrying a ``SAMLResponse``/``RelayState``
         pair, which must be POSTed to the service provider's ACS endpoint
         to actually establish the authenticated session cookie.
@@ -208,15 +192,13 @@ class SMOSDownloader:
         resp.raise_for_status()
 
         # Match form with id="loginForm" and action in either order. Quotes
-        # are matched as ["'] rather than hardcoded to " — confirmed live
-        # against the real IdP response that attribute quoting is NOT
-        # consistent, not even within one page (action="..."/id="..." use
-        # double quotes, but the sessionDataKey <input>'s value='...' below
-        # uses single quotes) and not even for the same attribute name
-        # across different hops (this hop's "name=" happens to be
-        # double-quoted; the SAMLResponse hop's below is single-quoted) —
-        # so every quoted attribute in this method, "name=" included, is
-        # matched quote-agnostically rather than assuming any one style.
+        # are matched as ["'] rather than hardcoded to " since the IdP's
+        # attribute quoting is inconsistent -- not even within one page
+        # (action=/id= use double quotes, but the sessionDataKey <input>'s
+        # value='...' below uses single quotes) and not even for the same
+        # attribute name across hops (this hop's name= is double-quoted; the
+        # SAMLResponse hop's below is single-quoted). Every quoted attribute
+        # in this method is therefore matched quote-agnostically.
         action_match = re.search(
             r'<form[^>]*action=["\']([^"\']+)["\'][^>]*id="loginForm"'
             r'|<form[^>]*id="loginForm"[^>]*action=["\']([^"\']+)["\']',
@@ -230,11 +212,11 @@ class SMOSDownloader:
                 "layout may have changed."
             )
 
-        # Extract action URL from whichever group matched. The IdP serves
-        # this as a relative URL (confirmed live: action="../samlsso"), so
-        # it must be resolved against the actual post-redirect page URL
+        # Extract the action URL from whichever group matched. The IdP
+        # serves this as a relative URL (e.g. action="../samlsso"), so it
+        # must be resolved against the actual post-redirect page URL
         # (resp.url, populated by requests following the OADS_LOGIN_URL
-        # redirect chain) rather than posted as-is — passing a relative URL
+        # redirect chain) rather than posted as-is -- passing a relative URL
         # directly to session.post() raises requests.exceptions.MissingSchema.
         action_url = action_match.group(1) if action_match.group(1) else action_match.group(2)
         action_url = urljoin(resp.url, action_url)
@@ -287,14 +269,14 @@ class SMOSDownloader:
     def _filter_by_orbit_overlap(
         self, products: list, day, min_lon: float, max_lon: float, min_lat: float, max_lat: float,
     ) -> list:
-        """Drop products whose sensing window shows no predicted orbit
-        overlap with the requested bbox -- see
-        orbit_coverage.orbit_overlaps_bbox. Uses each filename's real
-        embedded start/stop timestamps when parseable (see
-        _parse_sensing_window); falls back to the whole day [00:00:00Z,
-        23:59:59Z] otherwise -- a real, expected fallback (not a
-        defensive "can't happen" branch), since the real OADS filename
-        format hasn't been directly confirmed by this codebase yet."""
+        """
+        Drop products whose sensing window shows no predicted orbit overlap
+        with the requested bbox -- see orbit_coverage.orbit_overlaps_bbox.
+        Uses each filename's real embedded start/stop timestamps when
+        parseable (see _parse_sensing_window); falls back to the whole day
+        [00:00:00Z, 23:59:59Z] otherwise, for a filename that does not match
+        the expected pattern.
+        """
         from ..core.orbit_coverage import orbit_overlaps_bbox
 
         kept = []
@@ -325,9 +307,7 @@ class SMOSDownloader:
     ) -> list[Path]:
         """
         Download SMOS SSM products for every day in ``[start, end]`` via
-        ESA's OADS web portal (see module docstring — FTPS was replaced
-        after confirming the FTP server hangs indefinitely from this
-        toolbox's network path, while OADS responds normally).
+        ESA's OADS web portal.
 
         Returns
         -------

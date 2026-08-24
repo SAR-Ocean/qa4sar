@@ -444,7 +444,7 @@ class TestModelLayerCollocationIndividualGrid:
         colloc = ModelLayerCollocation(method="individual", temporal_method="nearest")
         results = colloc.collocate(
             sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         assert len(results) == 4
         for r in results:
@@ -466,7 +466,7 @@ class TestModelLayerCollocationIndividualGrid:
         colloc = ModelLayerCollocation(method="individual", temporal_method="nearest")
         results = colloc.collocate(
             sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         assert results == []
 
@@ -485,7 +485,7 @@ class TestModelLayerCollocationIndividualGrid:
         colloc = ModelLayerCollocation(method="individual", temporal_method="nearest")
         results = colloc.collocate(
             sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         assert len(results) == 1
         assert "WSPD" in results[0].val_data and "WDIR" in results[0].val_data
@@ -512,7 +512,7 @@ class TestModelLayerCollocationIndividualPoints:
         colloc = ModelLayerCollocation(method="cell-averaging", temporal_method="nearest")
         results = colloc.collocate_points(
             sar_point_vars=sar_point_vars, sar_lons=sar_lons, sar_lats=sar_lats,
-            sar_times=sar_times, era5_ds=era5_ds, val_source="era5", sar_scene_name="wv1",
+            sar_times=sar_times, model_ds=era5_ds, val_source="era5", sar_scene_name="wv1",
         )
         assert len(results) == 2
         assert all(r.val_data["u10"] == pytest.approx(10.0) for r in results)
@@ -532,7 +532,7 @@ class TestModelLayerCollocationIndividualPoints:
         colloc = ModelLayerCollocation(method="individual", temporal_method="nearest")
         results = colloc.collocate_points(
             sar_point_vars=sar_point_vars, sar_lons=sar_lons, sar_lats=sar_lats,
-            sar_times=sar_times, era5_ds=era5_ds, val_source="era5", sar_scene_name="wv1",
+            sar_times=sar_times, model_ds=era5_ds, val_source="era5", sar_scene_name="wv1",
         )
         assert len(results) == 1
         assert "WSPD" in results[0].val_data and "WDIR" in results[0].val_data
@@ -557,7 +557,7 @@ class TestModelLayerCollocationCellAveraging:
         )
         results = colloc.collocate(
             sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         assert len(results) == 4  # one per ERA5 native cell
         for r in results:
@@ -582,7 +582,7 @@ class TestModelLayerCollocationCellAveraging:
         )
         results = colloc.collocate(
             sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         assert results == []
 
@@ -609,7 +609,7 @@ class TestModelLayerCollocationCellAveraging:
         )
         results = colloc.collocate(
             sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         # 4 native cells total, minus the 1 land cell -> 3 matches.
         assert len(results) == 3
@@ -639,7 +639,7 @@ class TestModelLayerCollocationCellAveraging:
         )
         results = colloc.collocate(
             sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         assert len(results) == 4
 
@@ -663,7 +663,7 @@ class TestModelLayerCollocationCellAveraging:
         )
         results = colloc.collocate(
             sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         assert len(results) == 4
 
@@ -686,7 +686,7 @@ class TestModelLayerCollocationCellAveraging:
         )
         results = colloc.collocate(
             sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         assert len(results) == 4
         for r in results:
@@ -708,7 +708,7 @@ class TestModelLayerCollocationCellAveraging:
         )
         results = colloc.collocate(
             sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         assert results == []
 
@@ -731,7 +731,7 @@ class TestModelLayerCollocationCellAveraging:
         )
         results = colloc.collocate(
             sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         assert len(results) == 4
         for r in results:
@@ -770,7 +770,7 @@ class TestModelLayerCollocationCellAveragingThreeHourlySpacing:
         )
         results = colloc.collocate(
             sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-            era5_ds=era5_ds, val_source="hycom", sar_scene_name="scene1",
+            model_ds=era5_ds, val_source="hycom", sar_scene_name="scene1",
         )
         assert len(results) == 4
         expected = 0.0 * (1 / 3) ** 2 + 10.0 * (1 / 3) + 10.0
@@ -800,7 +800,7 @@ class TestModelLayerCollocationCellAveragingThreeHourlySpacing:
         )
         results = colloc.collocate(
             sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-            era5_ds=era5_ds, val_source="hycom", sar_scene_name="scene1",
+            model_ds=era5_ds, val_source="hycom", sar_scene_name="scene1",
         )
         assert results == []
 
@@ -857,7 +857,7 @@ class TestModelLayerCollocationAntimeridian:
         colloc = ModelLayerCollocation(method="individual", temporal_method="nearest")
         results = colloc.collocate(
             sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-            era5_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
         )
         assert len(results) == 1
         # Field is spatially uniform (20.0 everywhere) so the interpolated

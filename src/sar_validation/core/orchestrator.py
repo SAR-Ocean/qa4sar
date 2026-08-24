@@ -1,13 +1,12 @@
 """
-DataOrchestrator — step 1 of the validation pipeline.
+DataOrchestrator -- step 1 of the validation pipeline.
 
-Reads a Recipe and drives all data downloads:
-  - SAR L2_OCN data
-  - In-situ observations (moorings, buoys, ferryboxes, …)
-  - HF radar
-  - Scatterometer (ASCAT MetOp-B/C)
-  - Altimeter (along-track SWH/wind, Copernicus Marine L3)
-  - Radiometer (RSS daily gridded ocean winds, e.g. AMSR2)
+Reads a Recipe and drives every download it requires: the recipe's
+SAR source (see sar_sources.SAR_SOURCES) and its validation sources --
+in-situ observations, HF radar, scatterometer, altimeter, radiometer,
+and model reanalysis for wind/waves/currents; in-situ stations and
+satellite retrievals for soil moisture. See README.md for the full
+list of supported sources.
 """
 
 from __future__ import annotations
@@ -33,7 +32,7 @@ __all__ = ["DataOrchestrator"]
 _INSITU_TYPES = {"mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"}
 
 # Delayed-mode ("historical") source_types, dispatched before any NRT
-# source so their actual results can inform whether the NRT counterpart is
+# source such that its results can inform whether the NRT counterpart is
 # still needed. hf_radar_historical/adcp_historical/argo_historical/
 # glider_historical have no NRT pairing entry below (glider/adcp/argo have
 # no NRT counterpart at all; hf_radar's pairing is expressed via
@@ -61,70 +60,55 @@ _CURRENTS_INSTRUMENT_TYPES = (
 )
 
 #: AMSR-E/2's combined coverage across NSIDC-0451 (ends 2023-12-31) and its
-#: replacement AU_Land (frozen 2025-09-01, per NSIDC's "AMSR2 SIPS stopped
-#: processing AMSR Unified data sets" notice; confirmed 2026-07-31 against
-#: NASA's live CMR catalog -- AU_Land's newest real granule is dated
-#: 2025-08-31T23:19) -- the later of the two, since _download_amsr_ssm
-#: switches datasets at 2023-12-31 (see Task 7). ISO date string, compared
-#: against the recipe's temporal_bounds.end.
-#:
-#: NOTE: "AU_Land_NRT_R02" (a differently-versioned, near-real-time variant
-#: of this collection) was used here until 2026-07-31 -- confirmed against
-#: CMR to hold only 3 granules total, all dated 2020-10-19 (an abandoned
-#: test batch), so every real recipe request against it silently returned
-#: 0 files and fell through to the G-Portal SFTP fallback. "AU_Land" (no
-#: suffix) is the real, actively-populated 237k+-granule archival
-#: collection and is what's actually queried now.
+#: replacement AU_Land (frozen 2025-09-01) ends 2025-08-31.
 _AMSR_COVERAGE_CUTOFF = "2025-09-01"
 
 #: NSIDC-0451's own coverage ends here; AU_Land picks up from roughly this
 #: point through _AMSR_COVERAGE_CUTOFF.
 _NSIDC_0451_CUTOFF = "2023-12-31"
 
-#: EUMETSAT's ASCAT NRT dissemination access this toolbox relies on
-#: stopped being populated for recent dates as of this cutoff -- a
-#: request ending after it returning 0 products is expected, not an
-#: error, and gets the same "coverage cutoff" notice AMSR2 gets above.
+#: EUMETSAT's ASCAT NRT dissemination access ended on 2025-07-15, not 
+#: providing any data for later days. The H-SAF ASCAT SSM product takes
+#: over this demand (only for the last 60 days).
 _ASCAT_COVERAGE_CUTOFF = "2025-07-15"
 
-# ASCAT's collocation spec lives under its data_type tag "scatterometer_ssm"
-# in DEFAULT_LAYER_TYPE_SPECS, not its own source_type "ascat_ssm" -- see
-# that dict's comment and collocation.py's _resolve_layer_type. Every other
-# soil-moisture/layer source_type matches its DEFAULT_LAYER_TYPE_SPECS key
-# directly, so only this one needs an alias.
+# ASCAT's EUMDAC and H-SAF downloaders both stamp
+# data_type="scatterometer_ssm" (not "ascat_ssm"), so its collocation
+# spec is keyed under that data_type in DEFAULT_LAYER_TYPE_SPECS --
+# see collocation.py's _resolve_layer_type. Every other source_type
+# matches its DEFAULT_LAYER_TYPE_SPECS key directly.
 _TOLERANCE_LOOKUP_ALIASES = {"ascat_ssm": "scatterometer_ssm"}
 
 
 def _resolve_temporal_padding_minutes(cfg, *source_types: str) -> float:
     """
-    Largest collocation time-tolerance, in minutes, that applies to any of
-    *source_types* -- mirrors collocation.py's own resolution order
+    Return the largest collocation time-tolerance, in minutes, across
+    *source_types*. Mirrors collocation.py's own resolution order
     (per-source override, then layer_vs_layer.layer_type_specs, then the
     point_vs_layer default/validation_temporal_averaging_minutes) closely
-    enough to safely pad a *download* request window, without needing a
-    live datatree/node (this runs before anything has been downloaded or
-    converted).
+    enough to safely pad a download request window, without requiring a
+    live datatree or node -- this runs before any data has been
+    downloaded or converted.
 
-    Used to pad each downloader's requested start/end so every SAR scene's
-    real collocation window is fully covered by downloaded data -- even
-    the first/last scene in a multi-day request, whose window extends past
-    the literal requested start/end. Without this, a source whose download
-    stops exactly at the requested boundary silently starves the outermost
-    SAR scenes of validation data relative to scenes further from the
-    range's edges (see the collocation-diagnostics plot's day-1/day-3 vs.
-    day-2 asymmetry this was written to fix).
+    Used to pad each downloader's requested start/end so every SAR
+    scene's collocation window is fully covered, including the first and
+    last scenes in a multi-day request, whose windows extend past the
+    literal requested boundaries. Without this padding, a source whose
+    download stops exactly at the requested boundary would leave the
+    outermost SAR scenes with less validation data than scenes nearer
+    the middle of the range.
     """
     from .recipe import DEFAULT_LAYER_TYPE_SPECS, min_safe_model_time_tolerance_minutes
 
     coll_cfg = cfg.collocation
     layer_specs = dict(DEFAULT_LAYER_TYPE_SPECS)
     if coll_cfg.layer_vs_layer is not None:
-        # Per-key deep merge (not layer_specs.update(...), which would
-        # replace a key's whole dict) -- a recipe overriding only e.g.
-        # "method" for "era5_wind" must not silently lose the default's
-        # "time_tolerance_minutes" in the process. Mirrors
-        # datatree_converter.py's _build_subset_kwargs, which already does
-        # this correctly.
+        # Per-key deep merge (not layer_specs.update(...), which would replace
+        # a key's whole dict): a recipe overriding only one field for a given
+        # layer_type (e.g. "method" for "era5_wind") must not silently lose
+        # the rest of that key's defaults (e.g. "time_tolerance_minutes") in
+        # the process. Mirrors datatree_converter.py's _build_subset_kwargs,
+        # which already does this correctly.
         for key, spec in coll_cfg.layer_vs_layer.layer_type_specs.items():
             layer_specs[key] = {**layer_specs.get(key, {}), **spec}
     pvl = coll_cfg.point_vs_layer
@@ -138,16 +122,15 @@ def _resolve_temporal_padding_minutes(cfg, *source_types: str) -> float:
 
     tolerances = []
     for st in source_types:
-        # "era5" (the ValidationDataSource.source_type actually used in
-        # every recipe/template) has no DEFAULT_LAYER_TYPE_SPECS entry of
-        # its own -- only the variable-specific "era5_wind"/"era5_waves"/
-        # "era5_soil_moisture" keys do (matching the data_type each
-        # DataTreeConverter.from_era5 node is actually stamped with; see
-        # visualization.py's own tolerance lookup, which reads that
-        # per-node data_type and so doesn't need this alias). Without this,
-        # every era5 download silently fell back to the generic
-        # point_vs_layer tolerance (30 min) instead of its own
-        # (bracket-safe) value.
+        # "era5" (the source_type every recipe actually declares) has no
+        # DEFAULT_LAYER_TYPE_SPECS entry of its own -- only the
+        # variable-specific "era5_wind"/"era5_waves"/"era5_soil_moisture" keys
+        # do, matching the data_type DataTreeConverter.from_era5 stamps on
+        # each node (visualization.py's own tolerance lookup reads that
+        # per-node data_type directly, so it does not need this alias).
+        # Omitting this special case would leave every ERA5 download using
+        # the generic point_vs_layer tolerance instead of its own
+        # bracket-safe value.
         key = "era5_" + cfg.variable if st == "era5" else _TOLERANCE_LOOKUP_ALIASES.get(st, st)
         if st in source_overrides:
             resolved = float(source_overrides[st])
@@ -174,11 +157,11 @@ def _sar_entry_found_data(
     sar_dir: Optional[Path] = None,
     file_glob: Optional[str] = None,
 ) -> bool:
-    """True if a recorded ``"sar"`` download-metadata entry represents at
-    least one product found for the window, a failed download attempt
-    (whose true "was there data" answer is unknown, so must not be
-    treated as empty), or the absence of any recorded entry at all (no
-    previous run to consult, so there's nothing to gate on).
+    """
+    True if a recorded ``"sar"`` download-metadata entry represents at
+    least one product found for the window, a failed attempt (whose data
+    status is unknown and must not be treated as empty), or no recorded
+    entry at all.
 
     Entries recorded before ``found_count`` existed can have an empty
     ``"files"`` list even though real products were found and downloaded:
@@ -187,12 +170,7 @@ def _sar_entry_found_data(
     that was already present on disk (skipped as a duplicate) is never
     appended. So a fully successful old-schema run where every matched
     product happened to already be cached ends up recording ``files: []``
-    despite real data being present -- confirmed live 2026-08-11: a
-    ``currents_useastcoast.yaml`` run's copied-over ``download_metadata.json``
-    (written before ``found_count`` existed, SAR genuinely downloaded but
-    every product already cached from an earlier run) was misread as "no
-    SAR data found," even though the SAR files were sitting right there in
-    ``S1_L2_OCN/``. For an entry with no ``found_count`` and an empty
+    despite real data being present. For an entry with no ``found_count`` and an empty
     ``"files"`` list, check *sar_dir* directly (matching *file_glob*, e.g.
     ``SARSourceSpec.file_glob``) instead of trusting that ambiguous empty
     list -- callers that can't supply *sar_dir*/*file_glob* keep the old
@@ -204,7 +182,8 @@ def _sar_entry_found_data(
     own metadata (e.g. ``download_all()``'s already-succeeded copy-forward
     path), so this heals a stale old-schema entry into a self-consistent
     one instead of leaving the gap to be silently re-read (and re-scanned)
-    on every future run."""
+    on every future run.
+    """
     if not entry or entry.get("status") == "failed":
         return True
     if "found_count" in entry:
@@ -246,22 +225,20 @@ class DataOrchestrator:
             "temporal_bounds":   recipe.config.temporal_bounds.to_dict(),
             "downloads": {},
             "errors":    [],
-            # Non-failure, user-facing observations (e.g. "no data found for
-            # this window") -- distinct from "errors", which
-            # _is_already_downloaded (cli.py) treats as "something went
-            # wrong, don't skip re-download next time". A notice must never
-            # trigger that.
+            # Non-failure, user-facing observations (e.g. "no data found for this
+            # window"), distinct from "errors": cli.py's _is_already_downloaded
+            # treats an error as "something went wrong, don't skip re-download
+            # next time," a behavior a notice must never trigger.
             "notices":   [],
         }
 
         # Populated by _compute_sar_scene_times() (see download_all()) from
-        # the real downloaded SAR files' own embedded timestamps, sorted
-        # ascending -- consumed by _padded_temporal_bounds to narrow every
-        # validation source's download window to what the actual SAR
-        # scene(s) need, not the recipe's full nominal temporal_bounds.
-        # None until then, and stays None on any extraction failure -- this
-        # is purely an optimization, never allowed to change what a
-        # download would do in its absence.
+        # the downloaded SAR files' embedded timestamps, sorted ascending, and
+        # consumed by _padded_temporal_bounds to narrow each validation
+        # source's download window to the actual SAR scenes rather than the
+        # recipe's full nominal temporal_bounds. Remains None until populated,
+        # or on extraction failure; this is purely an optimization and must
+        # never alter what a download would do in its absence.
         self._sar_scene_times: Optional[List[pd.Timestamp]] = None
 
     # ------------------------------------------------------------------
@@ -287,9 +264,11 @@ class DataOrchestrator:
         return base
 
     def _cleanup_if_empty(self, out_dir: Path) -> None:
-        """Remove out_dir if the download produced no files anywhere under
+        """
+        Remove out_dir if the download produced no files anywhere under
         it (including nested, otherwise-empty subdirectories). Directories
-        that already contain at least one file are left untouched."""
+        that already contain at least one file are left untouched.
+        """
         if out_dir.exists() and not any(p.is_file() for p in out_dir.rglob("*")):
             shutil.rmtree(out_dir)
 
@@ -297,42 +276,33 @@ class DataOrchestrator:
         self, key: str, out_dir: Path, build_dl, windows, build_kwargs, error_label: str,
         *, result_to_metadata=None,
     ) -> bool:
-        """Shared skeleton for the simple ``_download_*`` handlers: build
-        the downloader once, call ``.download()`` once per window in
-        *windows* (concatenating results across windows -- a
-        single-element windows list, the common case when SAR-scene
-        clustering isn't in effect, makes exactly one call, identical to
-        today's behavior), clean up an empty output dir, and record
-        success/failure metadata under *key*.
+        """
+        Shared skeleton for the simple ``_download_*`` handlers: build the
+        downloader once, call ``.download()`` once per window in *windows*
+        (concatenating results across windows), clean up an empty output
+        directory, and record success/failure metadata under *key*.
 
-        *build_dl* is a zero-arg callable returning the constructed
-        downloader (built once, reused across every window). *windows* is
+        *build_dl* is a zero-argument callable returning the constructed
+        downloader, built once and reused across every window. *windows* is
         a list of ``(start, end)`` ISO-string pairs, e.g. from
-        ``self._padded_temporal_bounds(...)``, or a literal single-element
-        list for a caller that doesn't window (e.g. SAR itself).
-        *build_kwargs* is a ``(start, end) -> dict`` callable returning
-        that window's ``download()`` keyword-argument dict (every other
-        kwarg, e.g. bbox, stays the same across windows -- only
-        start/end vary). *result_to_metadata*, if given, maps
-        ``(merged_result, downloader) -> dict`` merged into the success
-        entry; default is ``{"files": [str(p) for p in merged_result]}``.
+        ``self._padded_temporal_bounds(...)``, or a single-element list for
+        a caller that does not window (e.g. SAR itself). *build_kwargs* is a
+        ``(start, end) -> dict`` callable returning that window's
+        ``download()`` keyword arguments (only start/end vary across
+        windows). *result_to_metadata*, if given, maps
+        ``(merged_result, downloader) -> dict``, merged into the success
+        entry; the default is ``{"files": [str(p) for p in merged_result]}``.
 
-        A failure partway through *windows* (network error, bad kwargs,
-        etc.) does not discard whatever earlier windows already produced
-        -- the partial ``merged_result`` is still recorded under *key*
-        (so files already on disk stay tracked in metadata) -- but the
-        run as a whole is always recorded as a FAILURE when any window
-        fails, whether or not earlier windows already succeeded:
+        A failure partway through *windows* does not discard results already
+        produced by earlier windows -- the partial ``merged_result`` is
+        still recorded under *key* -- but the run as a whole is always
+        recorded as a failure if any window fails:
         ``{"status": "failed", "error": ..., "files": [...]}``, an error
         appended to ``self.metadata["errors"]``, and ``False`` returned.
-        This is deliberate, not an oversight: ``cli.py``'s
-        ``_is_already_downloaded`` gates purely on
-        ``metadata["errors"]`` being empty, so a partial failure must
-        stay visible as an error or the next run would silently skip
-        re-downloading the failed window's data forever. See
-        ``_download_ascat_ssm``'s own partial/hard-failure split for the
-        same "preserve partial results, still fail the run" philosophy
-        applied to its two named EUMDAC/H-SAF branches.
+        ``cli.py``'s ``_is_already_downloaded`` gates purely on
+        ``metadata["errors"]`` being empty, so a partial failure must remain
+        visible as an error, or the next run would silently skip
+        re-downloading the failed window's data.
         """
         try:
             dl = build_dl()
@@ -376,13 +346,14 @@ class DataOrchestrator:
         return True
 
     def _load_previous_downloads(self) -> Dict[str, Any]:
-        """Read the ``downloads`` section of a prior run's
+        """
+        Read the ``downloads`` section of a prior run's
         ``download_metadata.json`` in ``self.base_dir``, if present.
 
         Used by :meth:`_already_succeeded` so a rerun triggered by one
-        source's failure (e.g. SMOS) doesn't force every other,
+        source's failure (e.g. SMOS) does not force every other,
         already-succeeded source (e.g. ASCAT) to re-authenticate and
-        re-dispatch — see design-choices.md's per-source gating fix.
+        re-dispatch — see docs/design-choices.md.
         """
         meta_path = self.base_dir / "download_metadata.json"
         if not meta_path.exists():
@@ -394,24 +365,18 @@ class DataOrchestrator:
             return {}
 
     def _load_previous_variable(self) -> Optional[str]:
-        """Read the top-level ``variable`` field of a prior run's
+        """
+        Read the top-level ``variable`` field of a prior run's
         ``download_metadata.json`` in ``self.base_dir``, if present.
 
-        Used by :meth:`_already_succeeded` to detect the case where two
-        recipes with identical geographic/temporal bounds (so they share
-        ``base_dir``) request *different* ``recipe.config.variable``
-        values -- e.g. ``wind_era5.yaml`` and ``waves_era5.yaml`` in
-        ``recipes/`` both cover the same bbox/window to reuse the SAR
-        download. ERA5's downloaded file name/content depends on
-        ``variable`` (``era5_<variable>_<day>.nc``, requesting a
-        completely different CDS dataset/variable set), unlike SAR (whose
-        L2 OCN product contains both wind- and wave-relevant OWI fields
-        regardless of which recipe downloaded it) -- so a stale
-        ``era5: {"status": "success"}`` recorded under one variable must
-        NOT be trusted for another. Confirmed live 2026-08-07: running
-        waves_era5.yaml right after wind_era5.yaml (same bbox/window)
-        skipped the ERA5 download entirely, leaving zero era5 data in the
-        DataTree for "waves".
+        Used by :meth:`_already_succeeded` to detect when two recipes sharing
+        identical geographic/temporal bounds (and therefore the same
+        ``base_dir``) request different ``recipe.config.variable`` values.
+        ERA5's downloaded file depends on ``variable`` (each maps to a
+        distinct CDS dataset/variable set), unlike SAR, whose L2 OCN product
+        contains fields for every variable regardless of which recipe
+        downloaded it. A stale ``era5: {"status": "success"}`` entry recorded
+        under one variable must therefore not be trusted for another.
         """
         meta_path = self.base_dir / "download_metadata.json"
         if not meta_path.exists():
@@ -424,8 +389,10 @@ class DataOrchestrator:
             return None
 
     def _already_succeeded(self, source_type: str) -> bool:
-        """True if *source_type* succeeded in the previous run recorded in
-        ``self._previous_downloads`` and ``force_download`` isn't set."""
+        """
+        True if *source_type* succeeded in the previous run recorded in
+        ``self._previous_downloads`` and ``force_download`` is not set.
+        """
         if self.force_download:
             return False
         prev = self._previous_downloads.get(source_type)
@@ -445,38 +412,39 @@ class DataOrchestrator:
         return self.base_dir / spec.output_subdir, spec.file_glob
 
     def previous_sar_data_found(self) -> bool:
-        """True if a previous run's recorded SAR entry (if any) found at
+        """
+        True if a previous run's recorded SAR entry (if any) found at
         least one product for this window. Used by the CLI's "already
         downloaded" resume shortcut, which reuses a prior run's cached
-        metadata without calling :meth:`download_all` again."""
+        metadata without calling :meth:`download_all` again.
+        """
         sar_dir, file_glob = self._sar_dir_and_glob()
         return _sar_entry_found_data(
             self._previous_downloads.get("sar", {}), sar_dir=sar_dir, file_glob=file_glob,
         )
 
     def _padded_temporal_bounds(self, *source_types: str) -> List[Tuple[str, str]]:
-        """List of (start, end) ISO-string windows, padded symmetrically by
+        """
+        List of (start, end) ISO-string windows, padded symmetrically by
         :func:`_resolve_temporal_padding_minutes` on each side of
-        ``cfg.temporal_bounds`` -- for passing to a downloader's own
-        ``start``/``end`` arguments, once per window. Does not mutate
-        ``cfg.temporal_bounds`` itself, since other logic (output folder
-        naming, coverage-cutoff comparisons, metadata) must keep using the
+        ``cfg.temporal_bounds``, for passing to a downloader's ``start``/
+        ``end`` arguments once per window. Does not mutate
+        ``cfg.temporal_bounds``, since other logic (output folder naming, 
+        coverage-cutoff comparisons, metadata) must continue using the
         literal requested range.
 
         When ``self._sar_scene_times`` has been populated (see
         ``_compute_sar_scene_times``, called from ``download_all`` once
         real SAR files are on disk), the single nominal-padded window is
-        replaced by one *or more* narrower windows, clustered around the
-        real SAR scene(s): consecutive (sorted) scene times separated by
-        more than ``2 * pad`` start a new cluster -- that's exactly the
-        point at which their own ``+-pad`` windows stop overlapping, so a
-        genuine gap with nothing to collocate against sits between them.
-        Each cluster's own [min, max] is padded by the same ``pad`` and
-        clamped to the nominal padded window on both ends. The result can
-        only ever be a subset of the nominal-padded window's own span --
-        never wider -- and falls back to exactly today's single-window
-        behavior (a one-element list) whenever scene times aren't
-        available. See the design doc's Part 1.
+        replaced by one or more narrower windows clustered around the
+        real SAR scene(s): consecutive, sorted scene times separated by
+        more than ``2 * pad`` start a new cluster, since that is exactly the
+        point at which their own ``+-pad`` windows stop overlapping. Each 
+        cluster's own [min, max] is padded by the same amount and clamped 
+        to the nominal padded window on both ends. The result is therefore
+        always a subset of the nominal-padded window's own span, never wider, 
+        and falls back to the single-element list whenever scene times are
+        unavailable.
         """
         cfg = self.recipe.config
         pad = pd.Timedelta(minutes=_resolve_temporal_padding_minutes(cfg, *source_types))
@@ -489,11 +457,10 @@ class DataOrchestrator:
             return nominal_window
 
         try:
-            # Defensive copy, sorted locally -- this method's correctness
-            # must not depend on _compute_sar_scene_times having already
-            # sorted self._sar_scene_times (a load-bearing cross-method
-            # contract otherwise, see also _download_ascat_ssm's
-            # windows[0][0]/windows[-1][1] extraction). Does not mutate
+            # Defensive copy, sorted locally: this method's correctness must not
+            # depend on _compute_sar_scene_times having already sorted
+            # self._sar_scene_times, which would otherwise be a fragile,
+            # load-bearing cross-method contract. Does not mutate
             # self._sar_scene_times itself.
             scene_times = sorted(self._sar_scene_times)
 
@@ -515,13 +482,12 @@ class DataOrchestrator:
 
             return windows or nominal_window
         except Exception:
-            # _compute_sar_scene_times' own docstring promises "never
-            # allowed to block download_all()" -- that contract must hold
-            # here too, at the point self._sar_scene_times is actually
-            # read, not just at the point it's populated. Any unexpected
-            # failure in the clustering above (e.g. a scene time that
-            # somehow escaped normalization) falls back to exactly the
-            # same nominal window used when no scene times are available.
+            # _compute_sar_scene_times' own docstring guarantees this clustering
+            # is "never allowed to block download_all()"; that guarantee must
+            # hold here too, where self._sar_scene_times is actually read, not
+            # just where it is populated. Any unexpected failure in the
+            # clustering above therefore falls back to the same nominal window
+            # used when no scene times are available.
             logger.warning(
                 "_padded_temporal_bounds: clustering around SAR scene times "
                 "failed, falling back to the nominal padded window.",
@@ -530,17 +496,18 @@ class DataOrchestrator:
             return nominal_window
 
     def _compute_sar_scene_times(self) -> None:
-        """Populate self._sar_scene_times (sorted ascending) from the
-        just-downloaded SAR files' real embedded timestamps, reusing each
-        source's own .convert callable (see sar_sources.py's SAR_SOURCES
-        registry) -- never new parsing code, and works identically for
-        every SAR source type (sentinel1_l2_ocn, sentinel1_clms_ssm,
-        nisar_sme2, radarsat2, or any future entry), since SAR_SOURCES is
-        keyed dynamically by cfg.sar_data.source. Left as None (falls
-        back to today's nominal-window-only padding, see
-        _padded_temporal_bounds) on ANY failure -- this is purely an
-        optimization, never allowed to block download_all() or narrow a
-        window incorrectly.
+        """
+        Populate ``self._sar_scene_times`` (sorted ascending) from the
+        just-downloaded SAR files' embedded timestamps, reusing each source's
+        own ``.convert`` callable (see ``sar_sources.SAR_SOURCES``) rather
+        than new parsing code. Works identically for any SAR source type,
+        since ``SAR_SOURCES`` is keyed dynamically by
+        ``cfg.sar_data.source``.
+
+        Left as ``None`` on any failure, falling back to the
+        nominal-window-only padding in :meth:`_padded_temporal_bounds`; this
+        is purely an optimization and must never block ``download_all()`` or
+        narrow a window incorrectly.
         """
         from .sar_sources import SAR_SOURCES
 
@@ -562,12 +529,12 @@ class DataOrchestrator:
                         # Some SAR sources (e.g. NISAR SME2's
                         # from_nisar_sme2, which parses an ISO string with
                         # a UTC designator via pd.to_datetime) produce a
-                        # tz-AWARE index -- normalize to tz-naive here, at
-                        # population time, matching _domain_filter's
+                        # timezone-aware index. Normalize to timezone-naive here, 
+                        # at population time, matching _domain_filter's
                         # established pattern in datatree_converter.py, so
                         # every entry in self._sar_scene_times is
                         # comparable against the rest of this module's
-                        # (tz-naive) timestamps.
+                        # timezone-naive timestamps.
                         idx = idx.tz_localize(None)
                     times.extend(idx.tolist())
                 except Exception as exc:
@@ -576,17 +543,15 @@ class DataOrchestrator:
             if times:
                 self._sar_scene_times = sorted(times)
         except Exception:
-            # This method's own contract (see docstring) is "never
-            # allowed to block download_all() or narrow a window
-            # incorrectly" -- true for the per-file convert() failures
-            # above, but the final sorted(times) call (and anything else
-            # in this method) was previously NOT protected by any
-            # try/except. Any unexpected failure here must leave
-            # self._sar_scene_times as None (today's documented "scene
-            # times unavailable" fallback), not propagate and kill the
-            # whole run.
+            # This method's contract (see docstring) is "never allowed
+            # to block download_all() or narrow a window incorrectly". 
+            # The per-file convert() failures above already follow that, 
+            # but the final sorted(times) call, and anything else
+            # in this method, must also be guarded: any unexpected failure 
+            # here must leave self._sar_scene_times as None rather than 
+            # propagate and terminate the run.
             logger.warning(
-                "_compute_sar_scene_times failed unexpectedly -- falling "
+                "_compute_sar_scene_times failed unexpectedly, falling "
                 "back to the nominal temporal window.", exc_info=True,
             )
             self._sar_scene_times = None
@@ -661,8 +626,8 @@ class DataOrchestrator:
         if source_types:
             # Use the most permissive depth window across the in-situ
             # sources actually being requested (excludes any source dropped
-            # above, so an excluded source's depth override can't widen a
-            # batch it's no longer part of).
+            # above, so an excluded source's depth override cannot widen a
+            # batch it is no longer part of).
             min_depth = min(
                 s.resolved_min_depth for s in insitu_sources
                 if s.source_type in source_types
@@ -788,10 +753,12 @@ class DataOrchestrator:
             return False
 
     def _report_combined_currents_status(self) -> None:
-        """Log one combined warning for the four delayed-mode in-situ
+        """
+        Log one combined warning for the four delayed-mode in-situ
         current instruments (adcp/argo/drifter/glider) when every one of
         them present in this recipe produced zero files, instead of each
-        instrument logging its own near-identical warning."""
+        instrument logging its own near-identical warning.
+        """
         if self.dry_run:
             return
         attempted = [
@@ -812,9 +779,11 @@ class DataOrchestrator:
             self.metadata["notices"].append(msg)
 
     def _report_combined_hf_radar_us_status(self) -> None:
-        """Log one combined 'no data' notice for hf_radar_us, naming which
+        """
+        Log one combined 'no data' notice for hf_radar_us, naming which
         backends were tried, instead of the silent zero-message outcome
-        today's per-source status recording produces for an empty result."""
+        today's per-source status recording produces for an empty result.
+        """
         if self.dry_run:
             return
         entry = self.metadata["downloads"].get("hf_radar_us")
@@ -828,8 +797,10 @@ class DataOrchestrator:
         self.metadata["notices"].append(msg)
 
     def _report_combined_hf_radar_status(self) -> None:
-        """Log one combined 'no data' notice for the non-US hf_radar /
-        hf_radar_historical pair, mirroring _report_combined_currents_status."""
+        """
+        Log one combined 'no data' notice for the non-US hf_radar /
+        hf_radar_historical pair, mirroring _report_combined_currents_status.
+        """
         if self.dry_run:
             return
         attempted = [
@@ -922,22 +893,17 @@ class DataOrchestrator:
         hsaf_dir   = self.base_dir / "hsaf_ascat_ssm"
 
         # H-SAF's on-line archive (H122 default, H29 via
-        # download_kwargs.hsaf_product) only ever holds a rolling
-        # last-60-days window (confirmed by the user directly; the FTP
-        # directories' own names, e.g. /h29/h29_cur_mon_nc/, are
-        # misleading).
-        # Anything before that, down to the EUMDAC cutoff, is a genuine
-        # gap -- neither source can serve it (H-SAF's off-line/CDR
-        # archive is out of scope, see design doc) -- and is surfaced as
-        # a notice, not silently dropped.
+        # download_kwargs.hsaf_product) holds only a rolling
+        # last-60-days window. Anything before that, down to the 
+        # EUMDAC cutoff, is a coverage gap.
         today = datetime.now(timezone.utc).date()
         hsaf_window_start = (today - timedelta(days=60)).isoformat()
 
-        # windows is sorted ascending -- these are the overall requested
-        # span's start/end dates, used for the same branch-level
-        # attempted/coverage-cutoff logic as before Task 1. The per-window
-        # date checks below additionally skip any individual window that
-        # falls entirely outside a branch's own coverage.
+        # windows is sorted ascending; req_start/req_end are the overall 
+        # requested span's bounds, used for the branch-level
+        # attempted/coverage-cutoff logic. The per-window checks below
+        # additionally skip any individual window failing entirely 
+        # outside a branch's own coverage.
         req_start = windows[0][0][:10]
         req_end   = windows[-1][1][:10]
 
@@ -989,17 +955,14 @@ class DataOrchestrator:
         self._cleanup_if_empty(eumdac_dir)
         self._cleanup_if_empty(hsaf_dir)
 
-        # A branch that wasn't even attempted (out of its date range) is
-        # not a failure -- only treat this as a hard failure if every
-        # branch that WAS attempted failed. If exactly one attempted
-        # branch failed while another attempted branch succeeded (e.g. a
-        # transient FTP hiccup on one side of an overlap-range request
-        # spanning both the EUMDAC and H-SAF eras), that's a partial
-        # failure: the run still has real, usable data from the
-        # succeeding branch, so it must not be reported as a hard
-        # "download failed" (which would wrongly red-flag the PDF report
-        # cover page and force an unnecessary full re-download next run
-        # via _already_succeeded). Surface it as a notice instead.
+        # An unattempted branch (out of range) is not a failure; a hard
+        # failure occurs only if every attempted branch fails. Since
+        # EUMDAC/H-SAF coverage never overlaps, both are attempted only for
+        # an unusually wide request. If exactly one attempted branch fails,
+        # that is a partial failure, not a hard one: real data still exists,
+        # so a notice is reported instead of a hard "download failed" (which
+        # would incorrectly flag the report and trigger a full re-download
+        # via _already_succeeded).
         attempted_ok_flags = [
             ok_flag for attempted, ok_flag in (
                 (eumdac_attempted, eumdac_ok), (hsaf_attempted, hsaf_ok),
@@ -1027,11 +990,6 @@ class DataOrchestrator:
             ok and not files
             and req_start > _ASCAT_COVERAGE_CUTOFF and req_end < hsaf_window_start
         ):
-            # Unlike the generic "0 products found" notice below, this one
-            # is a structural fact about the requested range -- neither
-            # downloader branch above is even entered for a genuine gap
-            # range -- so it fires regardless of dry_run, not just on real
-            # runs that actually searched and came up empty.
             self.metadata["notices"].append(
                 f"ASCAT: requested range [{req_start}, {req_end}] falls entirely in "
                 f"the gap between the EUMDAC coverage cutoff ({_ASCAT_COVERAGE_CUTOFF}) "
@@ -1072,10 +1030,11 @@ class DataOrchestrator:
             self.metadata["downloads"][out_subdir] = {"status": "failed", "error": msg}
             return False
 
-        # Declared outside the per-window try (see _download_ascat_ssm's
-        # own "files" accumulator for the same pattern this mirrors) so a
-        # later window's exception can't discard an earlier window's
-        # already-collected results.
+        # `paths` is declared before the loop, not inside it, so that if a
+        # later window's download raises, the results already accumulated
+        # from earlier windows in this same call are preserved rather than
+        # lost when the loop breaks. Mirrors _download_ascat_ssm's own
+        # "files" accumulator, which uses the same pattern.
         paths: list = []
         failure_exc: Optional[Exception] = None
         for start, end in windows:
@@ -1090,11 +1049,10 @@ class DataOrchestrator:
                 break
 
         if failure_exc is not None:
-            # Preserve whatever earlier windows already produced, but
-            # still record this run as a FAILURE (not a partial success)
-            # so cli.py's _is_already_downloaded (which gates purely on
-            # metadata["errors"] being empty) retries the failed window's
-            # data next run instead of silently treating this as clean.
+            # Same partial-failure handling _run_download documents for
+            # its own windows loop: preserve earlier windows' results,
+            # but still record the run as a failure so cli.py's
+            # _is_already_downloaded retries it.
             msg = f"{dataset} download failed: {failure_exc}"
             logger.error(msg)
             self.metadata["errors"].append(msg)
@@ -1118,13 +1076,10 @@ class DataOrchestrator:
             dataset = "AU_Land"
         ok = self._download_earthdata_ssm(source, dataset=dataset, version=None, out_subdir="amsr_ssm")
         if ok and not self.metadata["downloads"].get("amsr_ssm", {}).get("files"):
-            # NASA Earthdata alone returning 0 files is not yet the final
-            # word -- G-Portal (below) is a real second source, and often
-            # succeeds when Earthdata doesn't. Only note the coverage
-            # cutoff once *both* have been tried and both found nothing
-            # (see _try_gportal_amsr_fallback) -- surfacing it here
-            # unconditionally previously fired even when G-Portal went on
-            # to find real files, confirmed against a real recipe run.
+            # If NASA Earthdata returns 0 files, G-Portal (below) is a 
+            # second source, and often succeeds when Earthdata does not. 
+            # Only note the coverage cutoff once *both* have been tried 
+            # and both found nothing (see _try_gportal_amsr_fallback).
             self._try_gportal_amsr_fallback()
         return ok
 
@@ -1134,8 +1089,7 @@ class DataOrchestrator:
         (frozen at _AMSR_COVERAGE_CUTOFF) returns zero files: try JAXA's
         own G-Portal SFTP archive for the same window. A failure here
         (missing credentials, discovery failure, connection error) is
-        recorded as a notice, not an error -- this is a best-effort
-        second attempt, not a required source.
+        recorded as a notice, not an error as it is not a required source.
         """
         from ..downloaders.gportal_downloader import GPortalAMSR2Downloader
 
@@ -1162,14 +1116,10 @@ class DataOrchestrator:
             entry["status"] = "dry_run" if self.dry_run else "success"
             entry["gportal_fallback"] = True
             if not paths and not self.dry_run:
-                # 0 files here is a normal, non-error outcome (e.g. no AMSR2
-                # coverage for this window at all) -- but reported entirely
-                # silently, "status": "success" with 0 files is otherwise
-                # indistinguishable from a genuine download, and no notice
-                # exists to explain it. Both NASA Earthdata AND G-Portal
-                # have now been tried and both found nothing, so this is
-                # the right (and only) point to mention the known
-                # coverage-cutoff explanation, if it applies.
+                # 0 files is a normal, non-error outcome (e.g. no AMSR2 coverage for
+                # this window), but "status": "success" with 0 files is otherwise
+                # indistinguishable from a genuine download -- add a notice
+                # explaining it, if the known coverage cutoff applies.
                 temp = cfg.temporal_bounds
                 if temp.end > _AMSR_COVERAGE_CUTOFF:
                     self.metadata["notices"].append(
@@ -1185,13 +1135,10 @@ class DataOrchestrator:
                         "either source."
                     )
         except Exception as exc:
-            # A fresh reconnect can fail on a purely transient blip (see
-            # _connect_with_retry) even though real AMSR2 files from an
-            # earlier successful run already sit in out_dir -- the
-            # pipeline still has good data to use, so this must not be
-            # surfaced as a failure in the report. Confirmed against a
-            # real run whose report showed this failure despite 4 real
-            # .h5 files already present in that exact run's amsr_ssm/.
+            # A fresh reconnect can fail on a purely transient blip even 
+            # though real AMSR2 files from an earlier successful run 
+            # already sit in out_dir. The pipeline then still has good data 
+            # to use, so this must not be surfaced as a failure in the report. 
             existing_files = sorted(p for p in out_dir.glob("*") if p.is_file())
             if existing_files:
                 logger.warning(
@@ -1261,11 +1208,10 @@ class DataOrchestrator:
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
         temp   = cfg.temporal_bounds
-        # ERA5Downloader now does its OWN bracket-margin widening (see its
-        # time_tolerance_minutes parameter), driven by this same resolved
-        # value -- so the literal recipe window is passed here, not a
-        # separately (and previously redundantly, since the downloader
-        # used to also apply its own fixed _HOUR_BUFFER on top) padded one.
+        # ERA5Downloader performs its own bracket-margin widening internally
+        # (via its time_tolerance_minutes parameter), driven by this same
+        # resolved value. So the literal, unpadded recipe window is passed
+        # here rather than a separately padded one.
         tolerance = _resolve_temporal_padding_minutes(cfg, source.source_type)
         out_dir = self.base_dir / "era5"
 
@@ -1291,9 +1237,9 @@ class DataOrchestrator:
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
         temp   = cfg.temporal_bounds
-        # HycomDownloader now does its OWN bracket-margin widening (see its
-        # time_tolerance_minutes parameter), driven by this same resolved
-        # value -- see the identical rationale in _download_era5 above.
+        # HycomDownloader performs its own bracket-margin widening internally
+        # (via its time_tolerance_minutes parameter), driven by this same
+        # resolved value -- see _download_era5's identical rationale above.
         tolerance = _resolve_temporal_padding_minutes(cfg, source.source_type)
         out_dir = self.base_dir / "hycom"
 
@@ -1431,10 +1377,10 @@ class DataOrchestrator:
         bounds = cfg.geographic_bounds
         windows = self._padded_temporal_bounds("hf_radar_grid")
         # Resolution is an optional per-source override, forwarded via the
-        # established ValidationDataSource.download_kwargs channel. None
-        # (the recipe didn't set it) lets HFRadarUSDownloader auto-pick the
-        # matched region's own default; "finest" and explicit floats are
-        # also forwarded as-is. Ignored on the Copernicus fallback path.
+        # established ValidationDataSource.download_kwargs channel: None
+        # (not set in the recipe) lets HFRadarUSDownloader auto-pick the
+        # matched region's own default, while "finest" and explicit floats
+        # are forwarded as-is. Ignored on the Copernicus fallback path.
         resolution_km = source.download_kwargs.get("resolution_km")
 
         try:
@@ -1453,7 +1399,7 @@ class DataOrchestrator:
 
         # Declared outside the per-window try (see _download_ascat_ssm's
         # own "files" accumulator for the same pattern this mirrors) so a
-        # later window's exception can't discard an earlier window's
+        # later window's exception cannot discard an earlier window's
         # already-collected results.
         downloaded: list = []
         failure_exc: Optional[Exception] = None
@@ -1469,11 +1415,10 @@ class DataOrchestrator:
                 break
 
         if failure_exc is not None:
-            # Preserve whatever earlier windows already produced, but
-            # still record this run as a FAILURE (not a partial success)
-            # so cli.py's _is_already_downloaded (which gates purely on
-            # metadata["errors"] being empty) retries the failed window's
-            # data next run instead of silently treating this as clean.
+            # Same partial-failure handling _run_download documents for
+            # its own windows loop: preserve earlier windows' results,
+            # but still record the run as a failure so cli.py's
+            # _is_already_downloaded retries it.
             msg = f"US HF-radar download failed: {failure_exc}"
             logger.error(msg)
             self.metadata["errors"].append(msg)
@@ -1539,14 +1484,11 @@ class DataOrchestrator:
 
     # Altimeter download frequencies, keyed by recipe variable. This is
     # only a fallback for a recipe whose altimeter ValidationDataSource
-    # omits "frequencies" from download_kwargs -- cli.py's
-    # _build_waves_config/_build_wind_config always set it explicitly, so
-    # this only matters for hand-edited recipes. Wind never needs 5 Hz (no
-    # WIND_SPEED there, and 5x the point density for no benefit); waves
-    # defaults to 1 Hz too -- co-downloading both by default over-samples
-    # SAR pixels near the ground track (see docs/design-choices.md §3.3).
-    # A recipe can still opt into 5 Hz or both via --altimeter-freq at
-    # creation time, or by editing download_kwargs directly.
+    # omits "frequencies" (hand-edited recipes). Wind never needs 5 Hz
+    # (no WIND_SPEED there); waves also defaults to 1 Hz, since 
+    # co-downloading both by default over-samples SAR pixels near the 
+    # ground track. A recipe can still opt into 5 Hz or both via 
+    # --altimeter-freq at creation time, or by editing download_kwargs manually.
     _ALTIMETER_FREQUENCIES_BY_VARIABLE = {
         "wind":  ["1hz"],
         "waves": ["1hz"],
@@ -1559,9 +1501,9 @@ class DataOrchestrator:
         bounds = cfg.geographic_bounds
         # DEFAULT_LAYER_TYPE_SPECS keys altimeter by frequency
         # ("altimeter_1hz"/"altimeter_5hz"), not the bare "altimeter"
-        # source_type -- pass both so the padding lookup finds their
+        # source_type; both are passed so the padding lookup finds their
         # (equal, 180min) tolerance regardless of which frequency this
-        # recipe's variable actually requests.
+        # recipe's variable requests.
         windows = self._padded_temporal_bounds("altimeter_1hz", "altimeter_5hz")
         out_dir = self.base_dir / "altimeter"
         kwargs = {
@@ -1627,7 +1569,7 @@ class DataOrchestrator:
 
         # Declared outside the per-window try (see _download_ascat_ssm's
         # own "files" accumulator for the same pattern this mirrors) so a
-        # later window's exception can't discard an earlier window's
+        # later window's exception cannot discard an earlier window's
         # already-collected results.
         paths: list = []
         failure_exc: Optional[Exception] = None
@@ -1646,11 +1588,10 @@ class DataOrchestrator:
                 break
 
         if failure_exc is not None:
-            # Preserve whatever earlier windows already produced, but
-            # still record this run as a FAILURE (not a partial success)
-            # so cli.py's _is_already_downloaded (which gates purely on
-            # metadata["errors"] being empty) retries the failed window's
-            # data next run instead of silently treating this as clean.
+            # Same partial-failure handling _run_download documents for
+            # its own windows loop: preserve earlier windows' results,
+            # but still record the run as a failure so cli.py's
+            # _is_already_downloaded retries it.
             msg = f"ISMN selection failed: {failure_exc}"
             logger.error(msg)
             self.metadata["errors"].append(msg)
@@ -1665,10 +1606,6 @@ class DataOrchestrator:
         elif paths:
             status = "success"
         else:
-            # Not a failure -- the manually-downloaded archive just
-            # isn't there yet (see ISMNDownloader's printed portal
-            # instructions). Reporting "success" here would hide that
-            # zero files were actually collected.
             status = "awaiting_manual_archive"
         self.metadata["downloads"]["ismn"] = {
             "status": status,

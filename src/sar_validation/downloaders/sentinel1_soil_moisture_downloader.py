@@ -30,16 +30,11 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["SoilMoistureDownloader", "DATASET_IDENTIFIER", "PRODUCT_EXTENT"]
 
-#: CLMS OData ``datasetIdentifier`` attribute value for the 1 km daily
-#: Europe Surface Soil Moisture product. CONFIRMED: a real recipe run
-#: (bbox lon[-10,30] lat[35,60], 2024-01-01..05) successfully queried and
-#: downloaded real CEURO SSM1km products with this identifier.
+#: Europe Surface Soil Moisture product identifier.
 DATASET_IDENTIFIER = "ssm_europe_1km_daily_v1"
 
-#: Documented geographic extent of the CLMS SSM 1 km Europe (CEURO) product
-#: (lon_min, lon_max, lat_min, lat_max). CONFIRMED from a real downloaded
-#: product's embedded GDAL tags (geospatial_lon_min/max,
-#: geospatial_lat_min/max): lon -11 to 50, lat 35 to 72.
+#: (lon_min, lon_max, lat_min, lat_max): lon -11 to 50, lat 35 to 72 as
+#: per the product's embedded GDAL geospatial tags.
 PRODUCT_EXTENT = (-11.0, 50.0, 35.0, 72.0)
 
 #: CDSE serves two container-format variants of this product per date/tile
@@ -49,10 +44,7 @@ PRODUCT_EXTENT = (-11.0, 50.0, 35.0, 72.0)
 _COG_NAME_SUFFIX = "_cog"
 
 #: Within an extracted COG product folder, the actual soil-moisture
-#: GeoTIFF's filename contains this substring (as opposed to the sibling
-#: ``-NOISE_`` uncertainty-layer GeoTIFF, which is not used) — confirmed
-#: from a real downloaded product's file names, e.g.
-#: ``c_gls_SSM1km-SSM_202401020000_CEURO_S1CSAR_V1.2.1.tiff``.
+#: GeoTIFF's filename contains this substring.
 _SSM_FILENAME_MARKER = "-SSM_"
 
 
@@ -141,7 +133,7 @@ class SoilMoistureDownloader:
         Query available CLMS Surface Soil Moisture products.
 
         Returns an empty DataFrame (with a logged warning, no network
-        call, no client authentication) if the request bbox doesn't
+        call, no client authentication) if the request bbox does not
         overlap the product's documented Europe extent. Results are
         filtered to the COG-format variant only (see ``_COG_NAME_SUFFIX``)
         — CDSE serves both a COG and a NetCDF product per date/tile, and

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import math
 import sys
 from datetime import datetime
@@ -275,10 +276,8 @@ class TestFromInsituCsv:
 
     def test_wave_height_precedence_when_platform_reports_both_vhm0_and_vavh(self, tmp_path):
         """A CMEMS in-situ platform can report both VHM0 (spectral Hm0) and
-        VAVH (time-domain H1/3) for the same observation -- confirmed live
-        2026-08-10 (mooring 6200442, VAVH=1.0/VHM0=1.1 in the same
-        collocation row). Left as-is, that single observation lands in BOTH
-        the oswTotalHs_vs_VAVH (paired with altimeter) and
+        VAVH (time-domain H1/3) for the same observation. The single observation 
+        lands in both the oswTotalHs_vs_VAVH (paired with altimeter) and
         oswTotalHs_vs_VHM0 (paired with era5) report sections --
         double-counting one physical reading across two comparisons.
         Only the highest-precedence column (VHM0 > VAVH > VGHS, matching
@@ -483,9 +482,7 @@ class TestFromSarL3SsmGeotiff:
 
 
 class TestFromNisarSme2:
-    """Tests for DataTreeConverter.from_nisar_sme2 -- fixture layout
-    confirmed 2026-07-31 against a real downloaded granule
-    (NISAR_L3_PR_SME2_003_005_A_014_..._001.h5): soilMoisture/longitude/
+    """Tests for DataTreeConverter.from_nisar_sme2 -- soilMoisture/longitude/
     latitude live directly under science/LSAR/SME2/grids (not a
     frequencyA subgroup); longitude/latitude are 1-D EASE-grid axes (not
     a 2-D meshgrid); the fill value is soilMoisture's own _FillValue
@@ -559,15 +556,12 @@ def _make_radarsat2_wind_nc(
     """Build a synthetic RADARSAT-2 wind granule.
 
     With include_quality_flags=True (new filename era), the grid
-    reproduces a real, live-confirmed (2026-08-05) finding: mask/icemask
-    alone are NOT a substitute for pixel_level_quality_flags. Cell (0,1)
+    reproduces a real finding: mask/icemask
+    alone are not a substitute for pixel_level_quality_flags. Cell (0,1)
     is water/water per mask/icemask (the same condition the old-era
     fallback below relies on) yet is flagged 4 ("valid wind in buffer
-    region" -- NOT the strict flag 5) and must still be dropped. An
-    earlier design draft assumed mask==-1 & icemask==1 implied flag==5;
-    this was checked directly against a real downloaded granule and
-    found false (the mask/icemask condition alone kept 115,267 pixels
-    vs. flag==5's 63,810) -- see design-choices.md Sec 10.
+    region" -- not the strict flag 5) and must still be dropped. An
+    earlier design draft assumed mask==-1 & icemask==1 implied flag==5.
 
     With include_quality_flags=False (old filename era, where this
     variable does not exist), the converter's mask/icemask fallback path
@@ -1261,9 +1255,6 @@ class TestFromRadiometerNc:
 # from_radiometer_bytemap (RSS binary bytemaps: GMI / SSMIS / WindSat)
 # ---------------------------------------------------------------------------
 
-import gzip as _gzip
-
-
 def _make_bytemap_gz(tmp_path: Path, sensor: str, filename: str, cells) -> Path:
     """Write a full-size RSS bytemap .gz (all-missing 255 except `cells`).
 
@@ -1275,7 +1266,7 @@ def _make_bytemap_gz(tmp_path: Path, sensor: str, filename: str, cells) -> Path:
     for (p, v, la, lo, val) in cells:
         arr[p, v, la, lo] = val
     path = tmp_path / filename
-    with _gzip.open(path, "wb") as fh:
+    with gzip.open(path, "wb") as fh:
         fh.write(arr.tobytes())
     return path
 
@@ -1327,7 +1318,7 @@ class TestFromRadiometerBytemap:
 
     def test_unresolvable_sensor_returns_none(self, tmp_path):
         p = tmp_path / "unknownprefix_20240601.gz"
-        with _gzip.open(p, "wb") as fh:
+        with gzip.open(p, "wb") as fh:
             fh.write(b"\x00" * 10)
         assert DataTreeConverter.from_radiometer_bytemap(p) is None
 
@@ -2347,8 +2338,7 @@ class TestFromAmsrSsm:
 
 
 class TestFromAmsrSsmAuLandFormat:
-    """The real AU_Land granule structure (confirmed 2026-08-07 via a live
-    NASA Earthdata download of AMSR_U2_L2_Land_B02_202312312326_D.he5):
+    """The real AU_Land granule structure:
     an HDF-EOS5 POINTS layout, not SWATHS -- a single compound dataset
     with named fields, including two independent soil-moisture retrievals
     (NPD, SCA) with no stated "primary" one. See
@@ -2394,7 +2384,7 @@ class TestFromAmsrSsmAuLandFormat:
 
     def test_time_uses_tai93_epoch_not_unix_epoch(self, tmp_path):
         """seconds-since-1993 (TAI93), not seconds-since-1970 (Unix) --
-        confirmed live: the real sample granule's Time field numerically
+        the real sample granule's Time field numerically
         matches its own filename-embedded acquisition timestamp only
         under the 1993 epoch."""
         from sar_validation.core.datatree_converter import DataTreeConverter

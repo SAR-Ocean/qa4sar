@@ -451,8 +451,8 @@ class TestLabeledVarMixedUnits:
         assert _labeled_var(ds, "val_SOIL_MOISTURE", "SOIL_MOISTURE") == "SOIL_MOISTURE (units vary by source)"
 
     def test_absent_val_units_falls_back_to_column_attrs_unchanged(self):
-        """No val_units companion (every non-soil-moisture recipe today) --
-        behavior identical to before this task."""
+        """No val_units companion (every non-soil-moisture recipe) --
+        no behavioral change."""
         import xarray as xr
 
         from sar_validation.core.visualization import _labeled_var
@@ -872,10 +872,7 @@ class TestCanonicalSourceOrderStability:
         (e.g. plot_collocation_diagnostics' non-waves matched-point
         tiers) explicitly pass linewidths=0, which makes an unfilled
         marker's matched points literally invisible regardless of color/
-        alpha/position. Confirmed live 2026-08-11: era5_soil_moisture's
-        "+" slot made 352 real, correctly-positioned matched points
-        render as zero visible pixels on soil_moisture_era5.yaml's
-        diagnostics plot. Every _SOURCE_MARKERS entry must stay one of
+        alpha/position. Every _SOURCE_MARKERS entry must stay one of
         matplotlib's filled markers so this can't recur for a future
         source appended to _CANONICAL_SOURCE_ORDER."""
         from matplotlib.markers import MarkerStyle
@@ -2822,8 +2819,8 @@ class TestPlotGeographicTwoColumnByType:
         plt.close("all")
 
     def test_two_column_disabled_by_default_keeps_dict_by_group(self, geo_datatree_and_collocation):
-        """Default (two_column_by_type=False) behavior is byte-identical to
-        before this task -- keyed by collocation_type, not scene."""
+        """Default (two_column_by_type=False) behavior: 
+        keyed by collocation_type, not scene."""
         from sar_validation.core.visualization import plot_geographic
 
         datatree, collocation_ds = geo_datatree_and_collocation
@@ -3975,8 +3972,8 @@ class TestPlotCollocationDiagnosticsSoilMoistureOverpassCoverage:
 
 class TestPlotCollocationDiagnosticsCoverageUsesBboxReference:
     """_plot_collocation_diagnostics_impl must pass recipe.config.geographic_bounds
-    through to _downsampled_valid_pixel_coords -- otherwise Task D1's bbox-aware
-    density fix never actually applies to the real diagnostics plot."""
+    through to _downsampled_valid_pixel_coords to apply the bbox-aware
+    density fix to the real diagnostics plot."""
 
     def test_coverage_points_call_receives_recipe_bbox(self, tmp_path, monkeypatch):
         import numpy as np
@@ -4683,7 +4680,7 @@ class TestValidationReportGeoFigureStreaming:
     """validation_report's soil-moisture geo section must not hold every
     NISAR scene's figure open simultaneously -- confirms the on_figure
     wiring from plot_geographic actually gets used end-to-end, not just
-    in plot_geographic's own isolated unit tests (Task B1)."""
+    in plot_geographic's own isolated unit tests."""
 
     def test_many_scene_soil_moisture_report_never_exceeds_a_few_open_figures(
         self, tmp_path, monkeypatch,
@@ -5199,7 +5196,7 @@ class TestValidationReportSoilMoistureGeographicSizing:
         that wiring on the produced page -- with two_column_by_type in
         effect, plot_geographic keys its dict by *scene name* and the
         resulting Figure's suptitle is tagged "[<scene_name>]"; without
-        it (the pre-task behavior), the geographic page would instead be
+        it, the geographic page would instead be
         keyed/tagged by collocation_type ("[point_vs_layer]"). Note: the
         plan brief's literal assertion here (``assert any("geographic" in
         k or True for k in result)``) was a vacuous smoke test that would
@@ -5846,8 +5843,7 @@ class TestValidationReportSensingDepths:
         # per-group CDF-matching (which requires >= 2 valid pairs per
         # val_source group, see statistics.add_rescaled_sar_column) doesn't
         # skip the group and leave every plot with no valid data — which
-        # would leave pdf_pages empty and no PDF written at all, unrelated
-        # to this task's sensing-depth feature.
+        # would leave pdf_pages empty and no PDF written at all.
         ascat_node = xr.Dataset(
             {"SOIL_MOISTURE": ("point", np.array([25.0, 30.0]))},
             coords={
@@ -5858,11 +5854,10 @@ class TestValidationReportSensingDepths:
             attrs={"platform_type": "ascat_ssm", "sensing_depth_cm": "0-5", "band": "C"},
         )
         # Also a minimal ismn group (>= 2 points, same rationale as above)
-        # -- _harmonize_percent_domain_sources (wired in by Tasks 1-3 of the
-        # current plan) requires an "ismn" val_source to be present so it
-        # can fit a SAR->ismn CDF-match transform and convert ascat_ssm's
-        # percent-scale rows into ismn's volumetric domain; without it,
-        # ascat_ssm's rows are dropped to NaN in the CDF-matched section,
+        # -- _harmonize_percent_domain_sources requires an "ismn" val_source 
+        # to be present so it can fit a SAR->ismn CDF-match transform and 
+        # convert ascat_ssm's percent-scale rows into ismn's volumetric domain; 
+        # without it, ascat_ssm's rows are dropped to NaN in the CDF-matched section,
         # leaving zero valid data for every CDF-matched plot and (since this
         # test passes no native_units_stats_ds_map fallback) no PDF at all.
         ismn_node = xr.Dataset(
@@ -5992,7 +5987,7 @@ class TestPlotCollocationDiagnosticsIndividualMethodAlpha:
 
 
 class TestMarkNativeUnits:
-    """Task 12: `_mark_native_units` stamps a "— native units —" banner
+    """`_mark_native_units` stamps a "— native units —" banner
     onto a figure via `fig.text(...)`, independent of any caller in
     `validation_report`."""
 
@@ -6009,7 +6004,7 @@ class TestMarkNativeUnits:
 
 
 class TestValidationReportNativeUnitsSection:
-    """Task 12: validation_report(..., native_units_stats_ds_map=...) adds a
+    """validation_report(..., native_units_stats_ds_map=...) adds a
     second, non-CDF-matched scatter/residuals/statistics page set per
     soil_moisture pair, restricted to the val_source groups that already
     share SAR's units — using the raw (non-rescaled) collocation data."""
@@ -6320,8 +6315,7 @@ class TestValidationReportNativeUnitsSection:
 class TestValidationReportMainSectionExcludesCdsSsm:
     """cds_ssm is deliberately excluded from run_statistics()'s CDF-matched
     pass and gets its own separate '— C3S CDS SSM —' section instead (see
-    run_statistics_cds_ssm) -- confirmed live against a real recipe run
-    that validation_statistics_*.nc (no suffix) correctly omits cds_ssm.
+    run_statistics_cds_ssm).
     But the main section's geographic/scatter/residuals plots build
     straight from the raw collocation_ds (unlike the summary
     table/statistics bar charts, which correctly read from the already-
@@ -6636,7 +6630,7 @@ class TestValidationReportCdsSection:
 
 
 class TestValidationReportNativeUnitsGeographic:
-    """Task 6 (B3): the native-units section (soil_moisture only) should
+    """The native-units section (soil_moisture only) should
     include a geographic page, alongside the existing native-units
     scatter/residuals/statistics pages."""
 
@@ -6720,7 +6714,7 @@ class TestValidationReportNativeUnitsGeographic:
 
 
 class TestCdfMatchedTitleSuffix:
-    """Task 6 (B3): the main section's scatter/geographic/residuals page
+    """The main section's scatter/geographic/residuals page
     titles get a " (CDF-matched)" suffix for soil_moisture recipes only —
     flagging that (unlike every other variable) that section's SAR values
     are rescaled, not raw, so it isn't mistaken for a units bug.
@@ -6755,9 +6749,8 @@ class TestCdfMatchedTitleSuffix:
     def test_soil_moisture_main_section_report_still_generates(
         self, geo_datatree_and_collocation, tmp_path,
     ):
-        """Smoke test (per the task brief's Step 7): the title-formatting
-        change doesn't break report generation end-to-end for a
-        soil_moisture recipe."""
+        """Smoke test: the title-formatting change does not break 
+        report generation end-to-end for a soil_moisture recipe."""
         from sar_validation.core.recipe import (
             GeographicBounds,
             Recipe,
@@ -7086,7 +7079,7 @@ class TestHycomCanonicalSourceOrder:
         # Raises internally if _CANONICAL_SOURCE_ORDER drifts out of sync
         # with LAYER_DATA_TYPES | _INSITU_TYPES -- this is the existing
         # loud-failure guard; this test just exercises it after hycom's
-        # addition to LAYER_DATA_TYPES (Task 5) and here.
+        # addition to LAYER_DATA_TYPES and here.
         order = _canonical_source_order()
         assert "hycom" in order
 
@@ -7106,11 +7099,9 @@ class TestHycomCanonicalSourceOrder:
         (e.g. plot_collocation_diagnostics' non-waves matched-point
         tiers) explicitly pass linewidths=0, which makes an unfilled
         marker's matched points literally invisible regardless of color/
-        alpha/position. Confirmed live 2026-08-11: hycom's "x" slot made
-        2538 real, correctly-positioned matched points render as zero
-        visible pixels on currents_useastcoast.yaml's diagnostics plot.
+        alpha/position.
         Every _SOURCE_MARKERS entry must stay one of matplotlib's filled
-        markers so this can't recur for a future source appended to
+        markers so this cannot recur for a future source appended to
         _CANONICAL_SOURCE_ORDER."""
         from matplotlib.markers import MarkerStyle
 

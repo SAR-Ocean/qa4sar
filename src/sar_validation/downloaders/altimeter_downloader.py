@@ -6,8 +6,8 @@ Data source: WAVE_GLO_PHY_SWH_L3_NRT_014_001
     One NetCDF dataset per satellite mission, at two possible frequencies:
         1 Hz  (~7km along-track resolution):   VAVH, VAVH_UNFILTERED, WIND_SPEED
         5 Hz  (~1.4km along-track resolution): VAVH, VAVH_UNFILTERED, VAVH_UNCERTAINTY
-    5 Hz is only produced for 6 of the missions, and only from 2026-03-09
-    onwards. 1 Hz is available for all missions from 2024-01-01 onwards.
+    5 Hz is only produced for 6 of the missions (2026-03-09 onwards)
+    1 Hz is available for all missions (2024-01-01 onwards).
 
 Library usage::
 
@@ -231,7 +231,7 @@ class AltimeterDownloader:
                             **copernicus_marine_download_kwargs(self.force_download),
                         )
                         if dest_path.is_dir():
-                            # copernicusmarine can't always merge the request
+                            # copernicusmarine cannot always merge the request
                             # into a single file (e.g. multiple platforms in
                             # one dataset_id) — it then writes a directory
                             # named after output_filename containing one .nc

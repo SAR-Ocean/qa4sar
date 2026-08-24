@@ -1,13 +1,9 @@
 """
 Collocation between SAR and gridded background-field ("model") validation
-sources -- currently ERA5 reanalysis. Ported from the proven bilinear
-spatial + nearest-hour/hyperbolic temporal interpolation method in
-``relevant_code_for_toolbox/s1_ocn_nwp_coloc/collocate_nwp_to_sat.py``,
-adapted to this toolbox's ``collocation.py`` architecture. See
-docs/superpowers/specs/2026-08-06-era5-model-validation-design.md and
-docs/design-choices.md's ERA5 section for the full rationale, including why
-this method is NOT extended to the existing observational layer_vs_layer
-sources (scatterometer/altimeter/radiometer/hf_radar_grid/satellite SSM).
+sources -- currently ERA5 reanalysis and HYCOM. Implements bilinear
+spatial + nearest-hour/hyperbolic temporal interpolation methods and keeps
+the models gridded (in contrast to the flattened approach in layer_vs_layer 
+collocation).
 """
 
 from __future__ import annotations
@@ -35,32 +31,25 @@ def build_spatial_interpolator(
     lat_ax: np.ndarray, lon_ax: np.ndarray, field: np.ndarray,
 ) -> RegularGridInterpolator:
     """
-    Build a bilinear ``RegularGridInterpolator`` over one ERA5 regional
-    grid slice, shape ``(n_lat, n_lon)``.
+    Build a bilinear ``RegularGridInterpolator`` over one model grid
+    slice (ERA5 or HYCOM), shape ``(n_lat, n_lon)``.
 
-    Unlike the reference NWP script's ``build_interpolator``, this
-    intentionally applies NO longitude wrap-around padding. That padding
-    exists there to handle the antimeridian for a GLOBAL NWP grid; ERA5
-    downloads in this toolbox always request a small regional bounding box
-    (see ``era5_downloader.py``), so padding a small regional extract with
-    data from its own opposite edge would fabricate values -- the box
-    isn't periodic. A recipe bbox that crosses the antimeridian is instead
-    handled upstream, before this function ever runs: the downloader
-    requests two non-crossing windows and the converter stitches them into
-    one contiguous (if >180-valued) axis -- see Task 14 and
-    docs/design-choices.md. This function itself doesn't need to know the
-    difference; it just needs a monotonically increasing *lon_ax*,
-    whatever its numeric range.
+    This function itself does not need to know the model source. It needs 
+    a monotonically increasing *lon_ax*. ERA5 downloads in this toolbox 
+    always request a small regional bounding box (see ``era5_downloader.py``); 
+    a recipe bbox that crosses the antimeridian is handled upstream, by 
+    requesting two non-crossing windows and stitching them into one 
+    contiguous (if >180-valued) axis -- see docs/design-choices.md. HYCOM
+    does not need this as it is served over a native 0-360 longitude grid,
 
-    *lat_ax*/*lon_ax* must be strictly monotonically increasing. CDS
-    itself always returns ERA5 latitude DESCENDING (north -> south); it is
-    ``DataTreeConverter.from_era5`` that establishes the ascending
-    invariant this function relies on (via an explicit ``raw.sortby
-    ("lat")`` before this Dataset is ever built) -- this function does not
-    re-sort itself. Longitude is naturally ascending already, including
-    the antimeridian-stitched case (see below). Returns NaN (via
-    ``bounds_error=False, fill_value=np.nan``) for any query point outside
-    the grid's coverage.
+    *lat_ax*/*lon_ax* must be strictly monotonically increasing. This
+    function does not re-sort either axis itself. For ERA5, CDS always 
+    returns latitude DESCENDING (north -> south); ``DataTreeConverter.from_era5``
+    establishes the ascending invariant via an explicit ``raw.sortby("lat")``. 
+    For HYCOM, THREDDS already provides latitude ascending, no sortby needed.
+    Longitude is naturally ascending already, including the antimeridian-
+    stitched ERA5 case (see below). Returns NaN (via ``bounds_error=False, 
+    fill_value=np.nan``) for any query point outside the grid's coverage.
     """
     return RegularGridInterpolator(
         (lat_ax, lon_ax), field, method="linear", bounds_error=False, fill_value=np.nan,
@@ -143,40 +132,23 @@ def _derive_currents_radial_projection(
     values: Dict[str, Any], heading_deg: Any,
 ) -> Dict[str, Any]:
     """
-    Add ``rvlRadVel_projection`` to *values* by projecting its ``EWCT``/
-    ``NSCT`` (eastward/northward current) components onto the SAR
-    line-of-sight, given the SAR platform heading *heading_deg* (degrees;
-    a scalar or an array matching every array in *values*).
+    Add ``rvlRadVel_projection`` to *values*, computed by projecting 
+    the ``EWCT``/``NSCT`` (eastward/northward current) components onto 
+    the SAR line-of-sight, given platform heading *heading_deg* (degrees;
+    a scalar or an array matching *values*).
 
-    *values* and *heading_deg* are typed ``Any`` (rather than a single
-    array/float type) because they genuinely hold different shapes
-    depending on the caller: whole numpy arrays at the
-    ``_collocate_individual_grid`` / ``collocate_points`` call sites
-    (projecting a full scene/points batch at once), or plain per-cell
-    scalars at the ``_collocate_cell_averaging_grid`` call site (called
-    once per already-aggregated cell) -- both flow through the same
-    reused ``_project_currents_to_radial`` formula unchanged (itself typed
-    ``float``-only for its own scalar-per-row call sites elsewhere in
-    ``collocation.py``; mypy can't express "array or scalar in, matching
-    shape out" without ``@overload``, which would be overkill here).
+    Returns *values* unchanged unless both ``"EWCT"`` and ``"NSCT"`` are
+    present, and *heading_deg* is not ``None``; HYCOM-family currents 
+    Datasets carry these keys, so wind, waves, and soil moisture model
+    Datasets are unaffected. 
 
-    No-op (returns *values* unchanged) unless both ``"EWCT"`` and
-    ``"NSCT"`` are present, and *heading_deg* is not None -- a
-    self-describing gate mirroring :func:`_derive_wind_wspd_wdir`, since
-    only HyCOM-family currents Datasets ever carry these keys
-    (wind/waves/soil_moisture model Datasets are untouched).
+    Uses the same ``_project_currents_to_radial`` formula applied to every
+    other currents validation source (e.g. HF-radar, in-situ), rather than
+    reimplementing it. Unlike :func:`_derive_wind_wspd_wdir`, ``EWCT``/
+    ``NSCT`` are retained in the output.
 
-    Reuses the EXISTING ``_project_currents_to_radial`` formula from
-    ``collocation.py`` -- the same one every other currents validation
-    source (HF-radar, in-situ) already uses to derive this quantity, not
-    reimplemented here. Unlike :func:`_derive_wind_wspd_wdir`, ``EWCT``/
-    ``NSCT`` are KEPT in the output (not dropped) -- every other currents
-    validation source exposes both the raw vector components and the
-    projection.
-
-    Callers must supply *heading_deg* from the SAR side themselves (this
-    function has no access to it) -- see the call sites in
-    ``ModelLayerCollocation``'s three collocation paths.
+    *heading_deg* must be supplied by the caller from the SAR side; see the 
+    three collocation paths in ``ModelLayerCollocation``.
     """
     if heading_deg is None or "EWCT" not in values or "NSCT" not in values:
         return values
@@ -192,23 +164,23 @@ def _hyperbolic_interp(
     val1: np.ndarray, val2: np.ndarray, val3: np.ndarray, t_prime: Union[float, np.ndarray],
 ) -> np.ndarray:
     """
-    KNMI quadratic temporal interpolation through three equally-spaced
-    values -- ported from ``collocate_nwp_to_sat.py``'s
-    ``_quadratic_interp``. This function itself is spacing-agnostic: it
-    has no notion of hours or any other physical unit, only the
-    normalized offset *t_prime*. It is up to the CALLER to normalize
-    *t_prime* against the ACTUAL measured spacing between its three
-    bracket points -- 1h for ERA5's hourly granules, 3h for HyCOM's
-    3-hourly granules, or whatever else a future model source uses (see
+    Quadratic (KNMI-style) temporal interpolation through three
+    equally-spaced values. 
+    
+    This function is spacing-agnostic: it has no notion of hours or any 
+    other physical unit, only the normalized offset *t_prime*. The caller
+    is responsible for normalizing *t_prime* against the actual measured 
+    spacing between its three bracket points -- 1 hour for ERA5's hourly 
+    granules, 3 hours for HYCOM's 3-hourly granules. See
     ``_model_values_at_points`` and
     ``ModelLayerCollocation._collocate_cell_averaging_grid``, and
     :func:`_regular_bracket_gap`, which both callers use to derive that
     spacing rather than assuming it).
 
-    *val1*/*val2*/*val3* are the (already spatially-resolved) field values
-    at ``t2 - dt`` / ``t2`` / ``t2 + dt``, for whatever bracket spacing
-    ``dt`` the caller normalized against. ``t_prime = (t_obs - t2) / dt``,
-    in ``[0, 1)``.
+    *val1*, *val2*, and *val3* are the already spatially-resolved field 
+    values at ``t2 - dt``, ``t2``, and ``t2 + dt``, respectively, for 
+    whatever bracket spacing ``dt`` the caller normalized against. 
+    ``t_prime = (t_obs - t2) / dt``, in ``[0, 1)``.
     """
     a = (val3 + val1 - 2.0 * val2) / 2.0
     b = (val3 - val1) / 2.0
@@ -217,29 +189,24 @@ def _hyperbolic_interp(
 
 
 def _regular_bracket_gap(
-    era5_times: np.ndarray, hour_idxs: List[int],
+    model_times: np.ndarray, hour_idxs: List[int],
 ) -> Optional[np.timedelta64]:
     """
     Return the spacing between the three bracket points
-    ``era5_times[hour_idxs]`` (``[idx2 - 1, idx2, idx2 + 1]``) used by
+    ``model_times[hour_idxs]`` (``[idx2 - 1, idx2, idx2 + 1]``) used by
     :func:`_hyperbolic_interp`'s callers to normalize ``t_prime`` -- or
     ``None`` if the backward gap (``t2 - t1``) and forward gap
     (``t3 - t2``) differ.
 
     :func:`_hyperbolic_interp`'s quadratic formula assumes its three
-    samples are EQUALLY spaced; this codebase's ERA5 data (genuinely
-    hourly) and HyCOM data (genuinely 3-hourly, per THREDDS) both satisfy
-    that in the common case. But HyCOM's own documentation describes
-    occasional real data gaps, which could make the two gaps around a
-    given bracket center unequal -- there is then no single spacing unit
-    to normalize ``t_prime`` against that the quadratic formula's
-    assumption still holds for. Returning ``None`` here (so callers skip
-    the pass / leave the result NaN with a debug-level log) is preferred
-    over fabricating an answer using an arbitrary choice of one gap or
-    the other -- a silently wrong value is worse than a missing one.
+    samples are equally spaced; both ERA5 data (hourly) and HYCOM data 
+    (3-hourly) satisfy this in the common case. However, HYCOM data could
+    contain data gaps, meaning that there is no single spacing to 
+    normalize ``t_prime`` against. Returning ``None`` in these cases, thus
+    resulting in NaN to avoid wrong use of the interpolation method. 
     """
-    forward = era5_times[hour_idxs[2]] - era5_times[hour_idxs[1]]
-    backward = era5_times[hour_idxs[1]] - era5_times[hour_idxs[0]]
+    forward = model_times[hour_idxs[2]] - model_times[hour_idxs[1]]
+    backward = model_times[hour_idxs[1]] - model_times[hour_idxs[0]]
     if forward != backward:
         return None
     return forward
@@ -251,20 +218,18 @@ def _regular_bracket_gap(
 
 def _model_values_at_points(
     lons: np.ndarray, lats: np.ndarray, times: np.ndarray,
-    era5_ds: xr.Dataset, temporal_method: str,
+    model_ds: xr.Dataset, temporal_method: str,
 ) -> Dict[str, np.ndarray]:
     """
     Bilinear-spatial + nearest-hour/hyperbolic-temporal interpolate every
-    model variable in *era5_ds* at each of ``len(lons)`` query points
+    model variable in *model_ds* at each of ``len(lons)`` query points
     ``(lons[i], lats[i], times[i])``.
 
-    Efficient for the common case where many points share the same (or
-    very few distinct) observation times -- always true for a SAR scene,
-    whose whole IW/EW grid shares one scalar acquisition time, or whose
-    WV-mode vignettes share only a handful of per-vignette times: each
-    hour's spatial interpolator is built once and queried in one
-    vectorized batch per group of points sharing that hour-bracket,
-    instead of rebuilding an interpolator per point.
+    Efficient when many points share the same (or few distinct) 
+    observation times -- always true for a SAR scene, whose IW/EW grid 
+    shares one acquisition time and whose WV-mode vignettes share only a 
+    handful: each hour's spatial interpolator is built once and queried 
+    in a vectorized batch per group time, rather than rebuilt per point.
 
     Returns
     -------
@@ -274,10 +239,10 @@ def _model_values_at_points(
         available).
     """
     n = len(lons)
-    model_vars: list[str] = [str(v) for v in era5_ds.data_vars]
-    era5_times = pd.to_datetime(era5_ds["time"].values).to_numpy()
-    lat_ax = era5_ds["lat"].values
-    lon_ax = era5_ds["lon"].values
+    model_vars: list[str] = [str(v) for v in model_ds.data_vars]
+    model_times = pd.to_datetime(model_ds["time"].values).to_numpy()
+    lat_ax = model_ds["lat"].values
+    lon_ax = model_ds["lon"].values
     lons = _normalize_query_lon(np.asarray(lons, dtype=float), lon_ax)
 
     out: Dict[str, np.ndarray] = {var: np.full(n, np.nan, dtype=np.float64) for var in model_vars}
@@ -286,20 +251,19 @@ def _model_values_at_points(
     valid_mask = np.isfinite(lons) & np.isfinite(lats)
     unique_times = np.unique(times_np[valid_mask]) if np.any(valid_mask) else np.array([], dtype=times_np.dtype)
 
-    # Interpolation-contamination guard (companion to the cell-averaging
-    # land-skip above): land_sea_mask ("lsm", present only for wind -- see
-    # DataTreeConverter.from_era5) is time-invariant, so it's bilinearly
-    # interpolated ONCE here (no per-hour rebuild needed, unlike the
-    # per-variable interpolators below) at every query point. A point
-    # whose interpolated lsm exceeds 0.5 is close enough to a land grid
-    # cell that its bilinearly-interpolated ERA5 wind value is itself
-    # meaningfully blended with land-physics wind -- masked to NaN for
-    # every model variable, same threshold/rationale as the cell-averaging
-    # skip. `None` (not just all-zero) when era5_ds has no lsm at all, so
-    # waves/soil_moisture/pre-fix wind Datasets are unaffected.
+    # land_sea_mask ("lsm", present only for ERA5 wind) is time-invariant
+    # and is therefore interpolated once here, rather than rebuilt per hour
+    # as the per-variable interpolators below are. A point whose
+    # interpolated lsm value exceeds 0.5 is considered close enough to
+    # land that its bilinearly-interpolated wind value is contaminated by
+    # land-physics wind; such points are masked to NaN for every model
+    # variable, mirroring the cell-averaging land-skip above. The mask is
+    # `None`, rather than all-zero, when model_ds has no lsm variable,
+    # leaving waves and soil-moisture Datasets unaffected.
+
     land_mask = None
-    if "lsm" in era5_ds.variables and np.any(valid_mask):
-        lsm_interp = build_spatial_interpolator(lat_ax, lon_ax, era5_ds["lsm"].values)
+    if "lsm" in model_ds.variables and np.any(valid_mask):
+        lsm_interp = build_spatial_interpolator(lat_ax, lon_ax, model_ds["lsm"].values)
         lsm_at_points = np.full(n, np.nan, dtype=np.float64)
         lsm_at_points[valid_mask] = lsm_interp(
             np.column_stack([lats[valid_mask], lons[valid_mask]])
@@ -311,7 +275,7 @@ def _model_values_at_points(
     def _get_interp(var: str, hour_idx: int) -> RegularGridInterpolator:
         key = (var, hour_idx)
         if key not in interp_cache:
-            field = era5_ds[var].isel(time=hour_idx).values
+            field = model_ds[var].isel(time=hour_idx).values
             interp_cache[key] = build_spatial_interpolator(lat_ax, lon_ax, field)
         return interp_cache[key]
 
@@ -321,19 +285,19 @@ def _model_values_at_points(
 
         floor_hour = t.astype("datetime64[h]")
         if temporal_method == "nearest":
-            hour_idxs = [int(np.argmin(np.abs(era5_times - t)))]
+            hour_idxs = [int(np.argmin(np.abs(model_times - t)))]
         else:
-            idx2 = int(np.searchsorted(era5_times, floor_hour))
-            if idx2 >= len(era5_times) or era5_times[idx2] != floor_hour:
+            idx2 = int(np.searchsorted(model_times, floor_hour))
+            if idx2 >= len(model_times) or model_times[idx2] != floor_hour:
                 idx2 -= 1
-            if idx2 < 1 or idx2 + 1 >= len(era5_times):
+            if idx2 < 1 or idx2 + 1 >= len(model_times):
                 continue  # no bracketing hour for this time group -- leave NaN
             hour_idxs = [idx2 - 1, idx2, idx2 + 1]
 
         t_prime: Optional[float] = None
         if temporal_method != "nearest":
-            t2 = era5_times[hour_idxs[1]]
-            gap = _regular_bracket_gap(era5_times, hour_idxs)
+            t2 = model_times[hour_idxs[1]]
+            gap = _regular_bracket_gap(model_times, hour_idxs)
             if gap is None:
                 logger.debug(
                     "ModelLayerCollocation: irregular bracket spacing around %s "
@@ -358,10 +322,11 @@ def _model_values_at_points(
         for var in model_vars:
             out[var][land_mask] = np.nan
 
-    # Derive WSPD/WDIR from the now-FINAL, interpolated u10/v10 values --
-    # must happen here, AFTER all spatial/temporal interpolation above, not
-    # before (see C1 fix / _derive_wind_wspd_wdir's docstring). No-op for
-    # waves/soil_moisture (no u10/v10 keys).
+    # Derive WSPD/WDIR from the now-final, interpolated u10/v10 values.
+    # This must occur after all spatial/temporal interpolation above, not
+    # before -- see _derive_wind_wspd_wdir's docstring for why. A no-op
+    # for waves/soil-moisture, which carry no u10/v10 keys.
+
     return _derive_wind_wspd_wdir(out)
 
 
@@ -371,30 +336,30 @@ def _model_values_at_points(
 
 class ModelLayerCollocation:
     """
-    Collocate a gridded background-field model source (currently only
-    ERA5) against a SAR scene, using bilinear spatial interpolation plus
-    nearest-hour or hyperbolic (KNMI quadratic) temporal interpolation.
+    Collocate a gridded background-field model source (ERA5 or HYCOM) 
+    against a SAR scene, using bilinear spatial interpolation together
+    with nearest-hour or hyperbolic (KNMI quadratic) temporal interpolation.
 
     Unlike ``PointLayerCollocation``/``LayerLayerCollocation``, this class
-    consumes the validation source as a raw GRIDDED ``xr.Dataset`` (dims:
-    ``time``, ``lat``, ``lon``), not a flattened point ``DataFrame`` -- the
-    whole point is to interpolate the model field onto arbitrary SAR
+    consumes the validation source as a raw gridded ``xr.Dataset`` (dims:
+    ``time``, ``lat``, ``lon``), rather than a flattened point ``DataFrame``:
+    its purpose is to interpolate the model field onto arbitrary SAR
     locations, not to match against pre-existing rows.
 
     Parameters
     ----------
     method : str
-        ``"individual"`` -- interpolate ERA5 directly onto every SAR
-        pixel/point (dense). ``"cell-averaging"`` -- one match per ERA5
-        native grid cell, averaging the SAR pixels within it (sparse,
-        model-scale). Only affects grid-mode (IW/EW) scenes;
+        ``"individual"`` interpolates the model directly onto every SAR
+        pixel or point (dense). ``"cell-averaging"`` produces one match
+        per native model grid cell, averaging the SAR pixels within it 
+        (sparse, model-scale). This only affects grid-mode (IW/EW) scenes;
         :meth:`collocate_points` (WV mode) always uses direct
         interpolation regardless of this setting.
     temporal_method : str
         ``"nearest"`` or ``"hyperbolic"`` (KNMI quadratic).
     time_tolerance_minutes, aggregation_window_km, distance_weighting,
-    gaussian_sigma_km : see ``PointLayerCollocation`` -- only used by the
-        ``"cell-averaging"`` grid-mode path (Task 9).
+    gaussian_sigma_km : see ``PointLayerCollocation``; used only by the
+        ``"cell-averaging"`` grid-mode path.
     """
 
     collocation_type: str = "model_vs_layer"
@@ -429,7 +394,7 @@ class ModelLayerCollocation:
         sar_lon: np.ndarray,
         sar_lat: np.ndarray,
         sar_time: np.ndarray,
-        era5_ds: xr.Dataset,
+        model_ds: xr.Dataset,
         val_source: str,
         sar_scene_name: str = "",
     ) -> List[CollocatedPoint]:
@@ -438,10 +403,10 @@ class ModelLayerCollocation:
         Dispatches to :attr:`method`."""
         if self.method == "individual":
             return self._collocate_individual_grid(
-                sar_data, sar_lon, sar_lat, sar_time, era5_ds, val_source, sar_scene_name,
+                sar_data, sar_lon, sar_lat, sar_time, model_ds, val_source, sar_scene_name,
             )
         return self._collocate_cell_averaging_grid(
-            sar_data, sar_lon, sar_lat, sar_time, era5_ds, val_source, sar_scene_name,
+            sar_data, sar_lon, sar_lat, sar_time, model_ds, val_source, sar_scene_name,
         )
 
     def collocate_points(
@@ -450,21 +415,21 @@ class ModelLayerCollocation:
         sar_lons: np.ndarray,
         sar_lats: np.ndarray,
         sar_times: np.ndarray,
-        era5_ds: xr.Dataset,
+        model_ds: xr.Dataset,
         val_source: str,
         sar_scene_name: str = "",
     ) -> List[CollocatedPoint]:
         """
-        WV-mode (sparse vignette points) SAR scene, all arrays shape
-        ``(n_points,)``. Always interpolates ERA5 directly at each point
-        regardless of :attr:`method` -- WV vignettes are already sparse
-        SAR-anchor points (~200 km apart), so there is no dense SAR grid
-        within one ERA5 cell to aggregate the way cell-averaging does for
-        grid-mode scenes; interpolating ERA5 exactly at each point is the
-        natural match here. See docs/design-choices.md.
+        WV-mode (sparse vignette points) SAR scene; all arrays have shape
+        ``(n_points,)``. The model is always interpolated directly at each
+        point regardless of :attr:`method`: WV vignettes are already sparse
+        SAR-anchor points (~200 km apart), so there is no dense SAR grid 
+        within a single model cell to aggregate, as cell-averaging does 
+        for grid-mode scenes. Interpolating the model directly at each 
+        point is the appropriate approach here. See docs/design-choices.md.
         """
         times_np = pd.to_datetime(sar_times).to_numpy()
-        model_values = _model_values_at_points(sar_lons, sar_lats, times_np, era5_ds, self.temporal_method)
+        model_values = _model_values_at_points(sar_lons, sar_lats, times_np, model_ds, self.temporal_method)
         if "rvlHeading" in sar_point_vars:
             model_values = _derive_currents_radial_projection(
                 model_values, sar_point_vars["rvlHeading"],
@@ -504,7 +469,7 @@ class ModelLayerCollocation:
         sar_lon: np.ndarray,
         sar_lat: np.ndarray,
         sar_time: np.ndarray,
-        era5_ds: xr.Dataset,
+        model_ds: xr.Dataset,
         val_source: str,
         sar_scene_name: str,
     ) -> List[CollocatedPoint]:
@@ -514,7 +479,7 @@ class ModelLayerCollocation:
         obs_time = pd.Timestamp(np.atleast_1d(sar_time)[0]).to_pydatetime()
         times_flat = np.full(lons_flat.shape, np.datetime64(obs_time), dtype="datetime64[ns]")
 
-        model_values = _model_values_at_points(lons_flat, lats_flat, times_flat, era5_ds, self.temporal_method)
+        model_values = _model_values_at_points(lons_flat, lats_flat, times_flat, model_ds, self.temporal_method)
         if "rvlHeading" in sar_data:
             model_values = _derive_currents_radial_projection(
                 model_values, sar_data["rvlHeading"][0].ravel(),
@@ -560,35 +525,34 @@ class ModelLayerCollocation:
         sar_lon: np.ndarray,
         sar_lat: np.ndarray,
         sar_time: np.ndarray,
-        era5_ds: xr.Dataset,
+        model_ds: xr.Dataset,
         val_source: str,
         sar_scene_name: str,
     ) -> List[CollocatedPoint]:
         """
-        For each native ERA5 grid cell overlapping the SAR scene:
-        interpolate ERA5 TEMPORALLY (nearest-hour or hyperbolic) to the
-        scene's acquisition time -- no spatial interpolation is needed
-        here, since the match point IS the grid's own native cell centre
-        -- then average every SAR pixel within ``aggregation_window_km``
-        of that cell centre, reusing the exact same distance-weighted
-        aggregation machinery ``PointLayerCollocation`` already uses for
-        every other layer source (``_nearby_cells_with_distances`` +
-        ``_compute_aggregated_sar_value``).
+        For each native model grid cell overlapping the SAR scene, the model
+        is interpolated temporally (nearest-hour or hyperbolic) to the
+        scene's acquisition time; spatial interpolation is required, since
+        the match point is the grid cell's own native centre. Every SAR pixel 
+        within ``aggregation_window_km`` of that cell centre is then averaged, 
+        reusing the exact same distance-weighted aggregation machinery that
+        ``PointLayerCollocation`` uses for every other layer source. See
+        (``_nearby_cells_with_distances`` + ``_compute_aggregated_sar_value``).
         """
         obs_time = pd.Timestamp(np.atleast_1d(sar_time)[0]).to_pydatetime()
         obs_np = np.datetime64(obs_time)
-        era5_times = pd.to_datetime(era5_ds["time"].values).to_numpy()
+        model_times = pd.to_datetime(model_ds["time"].values).to_numpy()
         floor_hour = obs_np.astype("datetime64[h]")
 
         if self.temporal_method == "nearest":
-            hour_idxs = [int(np.argmin(np.abs(era5_times - obs_np)))]
+            hour_idxs = [int(np.argmin(np.abs(model_times - obs_np)))]
         else:
-            idx2 = int(np.searchsorted(era5_times, floor_hour))
-            if idx2 >= len(era5_times) or era5_times[idx2] != floor_hour:
+            idx2 = int(np.searchsorted(model_times, floor_hour))
+            if idx2 >= len(model_times) or model_times[idx2] != floor_hour:
                 idx2 -= 1
-            if idx2 < 1 or idx2 + 1 >= len(era5_times):
+            if idx2 < 1 or idx2 + 1 >= len(model_times):
                 logger.warning(
-                    "ModelLayerCollocation: no bracketing ERA5 hour for scene '%s' at %s "
+                    "ModelLayerCollocation: no bracketing model hour for scene '%s' at %s "
                     "-- skipping cell-averaging pass.", sar_scene_name, obs_time,
                 )
                 return []
@@ -596,46 +560,45 @@ class ModelLayerCollocation:
 
         bracket_gap: Optional[np.timedelta64] = None
         if self.temporal_method == "hyperbolic":
-            bracket_gap = _regular_bracket_gap(era5_times, hour_idxs)
+            bracket_gap = _regular_bracket_gap(model_times, hour_idxs)
             if bracket_gap is None:
                 logger.warning(
                     "ModelLayerCollocation: irregular bracket spacing around %s for "
                     "scene '%s' (backward gap != forward gap) -- skipping "
                     "cell-averaging pass instead of fabricating an interpolated value.",
-                    era5_times[hour_idxs[1]], sar_scene_name,
+                    model_times[hour_idxs[1]], sar_scene_name,
                 )
                 return []
 
-        lat_ax = era5_ds["lat"].values
-        lon_ax = era5_ds["lon"].values
+        lat_ax = model_ds["lat"].values
+        lon_ax = model_ds["lon"].values
         lon2d, lat2d = np.meshgrid(lon_ax, lat_ax)
 
-        # land_sea_mask ("lsm", present only for wind -- see
-        # DataTreeConverter.from_era5 / era5_downloader.py): a (lat, lon)
-        # coordinate, not a data_var, so `era5_ds.data_vars` below never
-        # sees it. Guarded with getattr/`.get` semantics via `in
-        # era5_ds.variables` so waves/soil_moisture Datasets (which never
-        # had lsm added) fall through unchanged -- no land-skip applied
-        # when there's no data to skip on.
-        lsm_grid = era5_ds["lsm"].values if "lsm" in era5_ds.variables else None
+        # land_sea_mask ("lsm", present only for ERA5 wind -- see
+        # DataTreeConverter.from_era5 / era5_downloader.py) is a (lat, lon)
+        # coordinate rather than a data_var, so it is never included in
+        # `model_ds.data_vars` below. Its absence from waves and
+        # soil-moisture Datasets means no land-skip is applied to those
+        # sources.
+        lsm_grid = model_ds["lsm"].values if "lsm" in model_ds.variables else None
 
-        model_vars: List[str] = [str(v) for v in era5_ds.data_vars]
+        model_vars: List[str] = [str(v) for v in model_ds.data_vars]
         cell_values: Dict[str, np.ndarray] = {}
         for var in model_vars:
-            fields = [era5_ds[var].isel(time=h).values for h in hour_idxs]
+            fields = [model_ds[var].isel(time=h).values for h in hour_idxs]
             if self.temporal_method == "nearest":
                 cell_values[var] = fields[0]
             else:
-                t2 = era5_times[hour_idxs[1]]
+                t2 = model_times[hour_idxs[1]]
                 t_prime = float((obs_np - t2) / bracket_gap)
                 cell_values[var] = _hyperbolic_interp(fields[0], fields[1], fields[2], t_prime)
 
-        # Derive WSPD/WDIR from the now-FINAL, per-cell interpolated
-        # u10/v10 values -- see C1 fix / _derive_wind_wspd_wdir's
-        # docstring for why this must happen AFTER temporal interpolation,
-        # not before. No-op for waves/soil_moisture. `model_vars` is
-        # refreshed to match the (possibly renamed) keys so the val_point
-        # comprehension below iterates the right set.
+        # Derive WSPD/WDIR from the now-final, per-cell interpolated u10/v10
+        # values -- see _derive_wind_wspd_wdir's docstring for why this must
+        # occur after temporal interpolation, not before. A no-op for
+        # waves/soil-moisture. `model_vars` is refreshed to reflect the
+        # (possibly renamed) keys, so the val_point comprehension below
+        # iterates the correct set.
         cell_values = _derive_wind_wspd_wdir(cell_values)
         model_vars = list(cell_values.keys())
 
@@ -650,14 +613,13 @@ class ModelLayerCollocation:
         n_lat, n_lon = lat2d.shape
         for cy in range(n_lat):
             for cx in range(n_lon):
-                # Cheap early skip, before any SAR-pixel aggregation work:
-                # a cell whose own center is over land (lsm > 0.5, standard
-                # ECMWF/oceanographic threshold) is skipped entirely, even
-                # if valid ocean SAR pixels exist nearby -- ERA5's wind
-                # field uses different surface-roughness/friction physics
-                # over land vs. sea, so a land grid point's wind isn't
-                # comparable to SAR ocean wind retrieval regardless of
-                # proximity to the coast.
+                # An early, inexpensive skip performed before any SAR-pixel
+                # aggregation work: a cell whose own centre lies over land (lsm > 0.5,
+                # the standard ECMWF/oceanographic threshold) is skipped entirely,
+                # even if valid ocean SAR pixels exist nearby. ERA5's wind field uses
+                # different surface-roughness and friction physics over land than
+                # over sea, so a land grid point's wind value is not comparable to a
+                # SAR ocean wind retrieval, regardless of its proximity to the coast.
                 if lsm_grid is not None and lsm_grid[cy, cx] > 0.5:
                     continue
                 cell_lon = _wrap_lon_to_pm180(float(lon2d[cy, cx]))

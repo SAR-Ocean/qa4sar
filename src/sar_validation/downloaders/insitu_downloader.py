@@ -21,7 +21,8 @@ CLI usage::
 
     python -m sar_validation.downloaders.insitu_downloader \\
         --min-lon -20 --max-lon 0 --min-lat 35 --max-lat 60 \\
-        --start 2026-01-01 --end 2026-01-02
+        --start 2026-01-01 --end 2026-01-02 \\
+        --source-types mooring,buoy,tidal_gauge
 """
 
 from __future__ import annotations
@@ -56,10 +57,7 @@ ALL_VARIABLES = ["WSPD", "WDIR", "VAVH", "VGHS", "VHM0", "HCDT", "HCSP", "EWCT",
 
 # Mapping from recipe source types to Copernicus platform codes.
 # "drifter" resolves to both "DB" (drifting buoy) and "AD" (autonomous
-# drifter) since a recipe's drifter source is meant to cover both platform
-# kinds. This makes "DB" inherently shared between "buoy" and "drifter" —
-# see PLATFORM_CODE_TO_SOURCE_TYPE below for how that ambiguity is resolved
-# when labeling individual observations.
+# drifter).
 SOURCE_TYPE_TO_PLATFORM = {
     "mooring":     ["MO"],
     "buoy":        ["DB"],
@@ -83,7 +81,7 @@ PLATFORM_CODE_TO_SOURCE_TYPE = {
 
 
 def _resolve_platform_codes(source_types: list[str]) -> list[str]:
-    """Map source-type names to Copernicus platform codes (deduplicated)."""
+    """Map source-type names to Copernicus platform codes."""
     codes: list[str] = []
     for st in source_types:
         source_codes = SOURCE_TYPE_TO_PLATFORM.get(st.lower())
@@ -213,7 +211,9 @@ class InSituDownloader:
         source_types: Optional[list[str]],
         dataset_part: Optional[str],
     ) -> Optional[Path]:
-        """Download and save one CSV for a single (non-crossing) window."""
+        """
+        Download and save one CSV for a single (non-crossing) window.
+        """
         expected_filename = _build_csv_filename(
             min_lon, max_lon, min_lat, max_lat,
             start_dt, end_dt, self.min_depth, self.max_depth,
@@ -268,12 +268,6 @@ class InSituDownloader:
                     )
                     resolved_part = alt_dataset_part
                 except Exception as e2:
-                    # Both dataset_parts failed. Raising e2 alone is
-                    # misleading: it only carries whichever part's coverage
-                    # was tried *second*, e.g. the "latest" part's rolling
-                    # ~30-day window, which makes the dataset look far more
-                    # limited than it is. Surface both parts' own
-                    # (dynamically reported) coverage messages together.
                     raise RuntimeError(
                         f"In-situ data unavailable for [{start_dt}, {end_dt}] in either "
                         f"CMEMS dataset_part of {DATASET_ID}:\n"
@@ -297,15 +291,6 @@ class InSituDownloader:
                 shutil.move(str(candidates[0]), str(dest_path))
                 print(f"  Saved to {dest_path}")
             else:
-                # copernicusmarine.subset() doesn't raise when a request
-                # genuinely matches zero rows -- it reports
-                # "successful"/"DOWNLOADED" and simply writes no file at
-                # all (confirmed live against a real remote bbox with no
-                # CMEMS in-situ platforms for the requested period). Same
-                # "no data" outcome insitu_currents_historical_downloader.py
-                # already treats this way: not a real failure, so don't
-                # raise -- the caller's download() loop treats a None
-                # return as "no data for this window" and moves on.
                 logger.debug(
                     "No in-situ observations in [%s, %s]; copernicusmarine "
                     "wrote no output file.", start_dt, end_dt,

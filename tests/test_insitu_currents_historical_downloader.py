@@ -140,8 +140,8 @@ class TestSubsetCall:
         assert any("drifter" in r.message and "No" in r.message for r in caplog.records)
 
     def test_no_file_written_at_all_is_treated_as_no_data_not_a_failure(self, tmp_path, caplog):
-        """Real-world Copernicus Marine behaviour (confirmed 2026-07-23 by a
-        live DeltaEbro run): for a genuinely empty result, subset() sometimes
+        """Real-world Copernicus Marine behaviour: for a genuinely empty 
+        result, subset() sometimes
         writes no output file at all -- not even a header-only CSV -- rather
         than always producing the empty-CSV case covered by
         test_empty_subset_result_returns_empty_and_removes_file above. This

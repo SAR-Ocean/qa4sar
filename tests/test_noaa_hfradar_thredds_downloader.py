@@ -421,8 +421,7 @@ class TestNoaaThreddsHfRadarDownloaderDownload:
     def test_bounded_timeout(self, tmp_path, url_predicate, start, end, needs_granule_bytes):
         """Regression test: urlretrieve (the original implementation) has no
         timeout parameter at all, and a stalled connection would hang the
-        download indefinitely (observed live: a TCP socket stuck in
-        SYN-SENT for many minutes). The fix moved to urlopen(..., timeout=...)
+        download indefinitely. The fix moved to urlopen(..., timeout=...)
         for granule fetches specifically so a hung connection is bounded.
         Lowered from 60 to 15: combined with prefer_ipv4_dns(), a genuinely
         broken IPv6 path now fails fast per address instead of eating up to
