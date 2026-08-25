@@ -6,8 +6,15 @@ Data source: WAVE_GLO_PHY_SWH_L3_NRT_014_001
     One NetCDF dataset per satellite mission, at two possible frequencies:
         1 Hz  (~7km along-track resolution):   VAVH, VAVH_UNFILTERED, WIND_SPEED
         5 Hz  (~1.4km along-track resolution): VAVH, VAVH_UNFILTERED, VAVH_UNCERTAINTY
-    5 Hz is only produced for 6 of the missions (2026-03-09 onwards)
-    1 Hz is available for all missions (2024-01-01 onwards).
+    5 Hz is only produced for 6 of the missions, each from its own date in
+    early March 2026 (see AVAILABILITY_START). 1 Hz is available for all
+    missions, each from its own date in late 2023 (see AVAILABILITY_START).
+    These are the earliest dates the ARCO/zarr store behind
+    ``copernicusmarine.subset()`` (what this downloader calls) has data for
+    -- Copernicus Marine also holds a separate, older native-file archive
+    for most missions back to 2021, but that's a different service
+    (``original-files``) that ``subset()`` doesn't query, so it's out of
+    reach for this downloader.
 
 Library usage::
 
@@ -76,9 +83,31 @@ VARIABLES = {
     "5hz": ["VAVH", "VAVH_UNFILTERED", "VAVH_UNCERTAINTY"],
 }
 
+# Earliest sensing date each satellite's ARCO/zarr store has data for, per
+# the WAVE_GLO_PHY_SWH_L3_NRT_014_001 catalogue metadata (queried via
+# `copernicusmarine describe -i <dataset_id>`, "arco-geo-series" service).
+# Varies by mission by a few weeks -- there is no single global cutoff.
 AVAILABILITY_START = {
-    "1hz": "2024-01-01T00:00:00",
-    "5hz": "2026-03-09T00:00:00",
+    "1hz": {
+        "al":   "2023-12-28T00:00:00",
+        "c2":   "2023-12-28T00:00:00",
+        "cfo":  "2023-12-28T00:00:00",
+        "h2b":  "2023-12-26T00:00:00",
+        "h2c":  "2023-11-21T00:00:00",
+        "j3":   "2023-12-28T00:00:00",
+        "s3a":  "2023-12-27T00:00:00",
+        "s3b":  "2023-12-27T00:00:00",
+        "s6a":  "2023-12-28T00:00:00",
+        "swon": "2023-12-28T00:00:00",
+    },
+    "5hz": {
+        "al":  "2026-03-09T00:00:00",
+        "c2":  "2026-03-07T00:00:00",
+        "j3":  "2026-03-09T00:00:00",
+        "s3a": "2026-03-09T00:00:00",
+        "s3b": "2026-03-09T00:00:00",
+        "s6a": "2026-03-07T00:00:00",
+    },
 }
 
 VALID_FREQUENCIES = ("1hz", "5hz")
@@ -166,10 +195,6 @@ class AltimeterDownloader:
         for freq in frequencies:
             if freq not in VALID_FREQUENCIES:
                 continue
-            avail_start = AVAILABILITY_START[freq]
-            if end_dt < avail_start:
-                continue
-            eff_start_dt = max(start_dt, avail_start)
 
             sat_map = _satellite_map(freq)
             if satellites:
@@ -182,6 +207,11 @@ class AltimeterDownloader:
             template = DATASET_ID_TEMPLATE[freq]
 
             for sat_code in sat_codes:
+                avail_start = AVAILABILITY_START[freq][sat_code]
+                if end_dt < avail_start:
+                    continue
+                eff_start_dt = max(start_dt, avail_start)
+
                 dataset_id = template.format(sat=sat_code)
                 for win_min_lon, win_max_lon in split_antimeridian_bbox(min_lon, max_lon):
                     any_attempted = True
@@ -270,16 +300,6 @@ class AltimeterDownloader:
         downloaded: list[Path] = []
 
         for freq in frequencies:
-            avail_start = AVAILABILITY_START[freq]
-            if end_dt < avail_start:
-                print(
-                    f"  Skipping {freq.upper()} altimeter data: requested window "
-                    f"ends {end_dt}, before {freq.upper()} availability starts "
-                    f"({avail_start})."
-                )
-                continue
-            eff_start_dt = max(start_dt, avail_start)
-
             sat_map = _satellite_map(freq)
             if satellites:
                 requested = {s.lower() for s in satellites}
@@ -297,6 +317,16 @@ class AltimeterDownloader:
             template = DATASET_ID_TEMPLATE[freq]
 
             for sat_code in sat_codes:
+                avail_start = AVAILABILITY_START[freq][sat_code]
+                if end_dt < avail_start:
+                    print(
+                        f"  Skipping {freq.upper()} {sat_map[sat_code]}: requested "
+                        f"window ends {end_dt}, before its availability starts "
+                        f"({avail_start})."
+                    )
+                    continue
+                eff_start_dt = max(start_dt, avail_start)
+
                 dataset_id = template.format(sat=sat_code)
                 start_d = eff_start_dt.split("T")[0]
                 end_d = end_dt.split("T")[0]
