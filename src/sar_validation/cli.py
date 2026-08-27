@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -45,11 +46,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ismn's own file-collection logger ('ismn_meta_collector') logs one INFO line 
+# ismn's own file-collection logger ('ismn_meta_collector') logs one INFO line
 # per station file while building ISMN_Interface's metadata -- hundreds of
-# lines for a real archive. Pinned to WARNING unconditionally (matching the 
+# lines for a real archive. Pinned to WARNING unconditionally (matching the
 # "matplotlib" cap below).
 logging.getLogger("ismn_meta_collector").setLevel(logging.WARNING)
+
+# copernicusmarine's own client logs "Selected dataset version"/"Selected
+# dataset part"/"No data found..." at INFO for every single subset/
+# read_dataframe/open_dataset call, with no indication of which dataset,
+# bbox, or time window it's about -- pure noise at the volume this
+# toolbox's downloaders call it (one query per SAR footprint in the
+# worst case). Each downloader's own print()/logger call around its
+# copernicusmarine call is the actually useful progress signal.
+#
+# Simply calling logging.getLogger("copernicusmarine").setLevel(WARNING)
+# here is NOT enough: copernicusmarine is imported lazily (inside this
+# toolbox's downloaders, at first real use, not at startup), and its own
+# copernicusmarine/logger.py module calls logging.config.dictConfig(...)
+# at import time, which resets the "copernicusmarine" logger back to
+# INFO and attaches its own duplicate console handler -- running well
+# after this point, silently undoing a setLevel() call made before that
+# import. Importing copernicusmarine here first forces its dictConfig to
+# run now (a no-op on every later import, since Python caches the
+# module), so the setLevel() below is the one that actually sticks.
+try:
+    import copernicusmarine  # noqa: F401
+except ImportError:
+    pass
+logging.getLogger("copernicusmarine").setLevel(logging.WARNING)
+
+# pyorbital's own dt2np() helper (used on every single orbit-propagation
+# sample -- see core/orbit_coverage.py's sample_ground_track, called
+# heavily by altimeter/ASCAT/HY-2/AMSR2/SMOS's dry-collocation
+# predicates) converts a tz-aware datetime to np.datetime64 via
+# np.datetime64(utc_time), which numpy warns about since datetime64 has
+# no timezone concept -- harmless here (every timestamp this toolbox
+# feeds it is already UTC), but at orbit-propagation volume this floods
+# the terminal with an identical warning thousands of times over. Only
+# this exact, narrow message is silenced -- any other UserWarning still
+# surfaces normally.
+warnings.filterwarnings(
+    "ignore",
+    message="no explicit representation of timezones available for np.datetime64",
+    category=UserWarning,
+)
 
 
 def main(argv=None) -> None:
@@ -197,7 +238,23 @@ Examples:
         help=(
             "Predict which validation sources would collocate with this "
             "recipe's SAR data, without downloading anything from any "
-            "source. Prints a report and writes dry_collocation_report.json."
+            "source. Prints a report and writes dry_collocation_report.json. "
+            "Fast by default (stops probing each source at the first "
+            "confirmed match) -- pass --dry-collocation-detail for an "
+            "exhaustive per-footprint count instead."
+        ),
+    )
+    parser.add_argument(
+        "--dry-collocation-detail",
+        action="store_true",
+        help=(
+            "With --dry-collocation, check every SAR footprint instead of "
+            "stopping at the first confirmed match, so the report includes "
+            "a real count/window list per source (e.g. 'N of M SAR "
+            "footprint(s)') rather than just collocated/none-predicted. "
+            "Slower for well-covered sources -- an in-situ source with many "
+            "real matches makes one network call per footprint instead of "
+            "stopping at the first hit."
         ),
     )
     parser.add_argument(
@@ -298,7 +355,12 @@ Examples:
         _execute_recipe(
             args.recipe,
             dry_run=args.dry_run,
-            dry_collocation=args.dry_collocation,
+            # --dry-collocation-detail only modifies --dry-collocation's own
+            # behavior -- without this, passing it alone would silently
+            # skip the whole dry-collocation preview (including the console
+            # table) and fall through to a real run instead.
+            dry_collocation=args.dry_collocation or args.dry_collocation_detail,
+            dry_collocation_detail=args.dry_collocation_detail,
             output_dir=args.output_dir,
             force_download=args.force_download,
             download_all_in_bbox=args.download_all_in_bbox,
@@ -545,7 +607,7 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
             ValidationDataSource(source_type="ferrybox"),
             ValidationDataSource(source_type="drifter"),
             ValidationDataSource(source_type="tidal_gauge"),
-            ValidationDataSource(source_type="scatterometer"),
+            ValidationDataSource(source_type="scatterometer_ascat"),
             ValidationDataSource(source_type="altimeter"),
             ValidationDataSource(source_type="radiometer"),
             # KNMI OSI-SAF FTP, recent-only (3-day window), 25 km.
@@ -955,6 +1017,7 @@ def _execute_recipe(
     recipe_path: str,
     dry_run: bool = False,
     dry_collocation: bool = False,
+    dry_collocation_detail: bool = False,
     output_dir: Optional[str] = None,
     force_download: bool = False,
     download_all_in_bbox: bool = False,
@@ -991,7 +1054,10 @@ def _execute_recipe(
         from .downloaders.base import build_output_dir
 
         sar_footprints = discover_sar_footprints_dry(recipe.config.sar_data, recipe.config)
-        report = predict_collocation(recipe.config, sar_footprints, recipe_path=recipe_path)
+        report = predict_collocation(
+            recipe.config, sar_footprints, recipe_path=recipe_path,
+            stop_on_first_match=not dry_collocation_detail,
+        )
         print(render_console_table(report))
         if recipe.config.output_dir:
             output_base = Path(recipe.config.output_dir)

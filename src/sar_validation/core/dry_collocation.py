@@ -1,14 +1,6 @@
 """
 Predict collocation between a recipe's SAR data and its configured
 validation sources, before downloading anything from either side.
-
-See docs/superpowers/specs/2026-08-18-dry-collocation-design.md.
-
-This module is built up across four sequential implementation plans:
-  1. orbit_coverage.py foundation (orbit_overlap_windows, _point_in_polygon)
-  2. This file's SarFootprint model + SAR-side discovery (this plan)
-  3. Per-validation-source-type predicates (SourcePrediction, predict_source)
-  4. Orchestrator/CLI wiring (predict_collocation, CollocationReport)
 """
 
 from __future__ import annotations
@@ -30,7 +22,6 @@ import pandas as pd
 from ..downloaders import radarsat2_wind_downloader as _rs2
 from ..downloaders._hf_radar_regions import HFR_REGIONS
 from ..downloaders._noaa_hfr_regions import NOAA_HFR_REGIONS
-from ..downloaders.altimeter_downloader import AltimeterDownloader
 from ..downloaders.ascat_soil_moisture_downloader import ASCATSoilMoistureDownloader
 from ..downloaders.base import (
     CopernicusODataClient,
@@ -53,7 +44,7 @@ from ..downloaders.ismn_downloader import ISMNDownloader
 from ..downloaders.noaa_hfradar_downloader import NOAAHFRadarDownloader
 from ..downloaders.radiometer_downloader import RadiometerDownloader
 from ..downloaders.scatterometer_downloader import ScatterometerDownloader
-from ..downloaders.scatterometer_ftp_downloader import ScatterometerFTPDownloader
+from ..downloaders.scatterometer_ftp_downloader import MAX_AGE_DAYS, ScatterometerFTPDownloader
 from ..downloaders.smos_downloader import SMOSDownloader
 from . import orbit_coverage
 from .collocation import _haversine_distance
@@ -90,8 +81,7 @@ class SarFootprint:
 
     kind="polygon": Sentinel-1 OCN (non-WV) / NISAR SME2 -- polygon holds
     real vertices when the source's catalog provides them (RADARSAT-2
-    doesn't -- see this plan's "Correction found during planning" note --
-    so its footprints leave polygon=None despite kind="polygon").
+    doesn't, so its footprints leave polygon=None despite kind="polygon").
 
     kind="wv_points": Sentinel-1 WV mode -- points holds one (lat, lon)
     per sparse ~20x20km vignette; polygon is always None.
@@ -113,7 +103,19 @@ class SarFootprint:
 def _query_sentinel1_ocn_dry(cfg) -> "list[dict]":
     """Query CDSE for Sentinel-1 OCN products matching cfg's bbox/window,
     without downloading anything -- reuses SARDownloader's exact
-    collection/product_type values (see sentinel1_l2_ocn_downloader.py)."""
+    collection/product_type values (see sentinel1_l2_ocn_downloader.py).
+
+    Splits an antimeridian-crossing bbox via split_antimeridian_bbox
+    first, one query per resulting (non-wrapping) range, mirroring
+    SARDownloader.query's identical pattern: query_products builds a WKT
+    POLYGON directly from min_lon/max_lon with no antimeridian awareness
+    of its own, so passing it a wrapping bbox unsplit (min_lon > max_lon)
+    produces a self-intersecting/inverted polygon -- CDSE then returns
+    geographically wrong results (observed: unrelated regions on the
+    opposite side of the globe from the requested bbox), not the
+    Pacific-spanning region actually requested. De-duplicated by Id,
+    since a product whose own footprint happens to straddle both split
+    ranges could otherwise be returned twice."""
     username, password = authenticate_cdse()
     client = CopernicusODataClient(username, password)
     # CDSE's OData $filter rejects anything but full ISO-8601 with a Z
@@ -122,16 +124,21 @@ def _query_sentinel1_ocn_dry(cfg) -> "list[dict]":
     # value ever reaches query_products.
     start_norm = normalize_datetime(cfg.temporal_bounds.start) + ".000Z"
     end_norm = normalize_datetime(cfg.temporal_bounds.end) + ".000Z"
-    return client.query_products(
-        collection="SENTINEL-1",
-        product_type="OCN",
-        start_date=start_norm,
-        end_date=end_norm,
-        min_lon=cfg.geographic_bounds.min_lon,
-        max_lon=cfg.geographic_bounds.max_lon,
-        min_lat=cfg.geographic_bounds.min_lat,
-        max_lat=cfg.geographic_bounds.max_lat,
-    )
+
+    records_by_id: "dict[object, dict]" = {}
+    for lo, hi in split_antimeridian_bbox(cfg.geographic_bounds.min_lon, cfg.geographic_bounds.max_lon):
+        for record in client.query_products(
+            collection="SENTINEL-1",
+            product_type="OCN",
+            start_date=start_norm,
+            end_date=end_norm,
+            min_lon=lo,
+            max_lon=hi,
+            min_lat=cfg.geographic_bounds.min_lat,
+            max_lat=cfg.geographic_bounds.max_lat,
+        ):
+            records_by_id[record.get("Id")] = record
+    return list(records_by_id.values())
 
 
 def _fallback_bbox_from_cfg(cfg) -> "tuple[float, float, float, float]":
@@ -165,10 +172,43 @@ def _polygon_and_bbox_from_geofootprint(
         polygon = [(lat, lon) for lon, lat in ring]
         lons = [lon for lon, _lat in ring]
         lats = [lat for _lon, lat in ring]
-        bbox = (min(lons), max(lons), min(lats), max(lats))
+        min_lon, max_lon = _antimeridian_aware_lon_bounds(lons)
+        bbox = (min_lon, max_lon, min(lats), max(lats))
         return polygon, bbox
     except (KeyError, IndexError, TypeError, ValueError):
         return None, fallback_bbox_fn()
+
+
+def _antimeridian_aware_lon_bounds(lons: "list[float]") -> "tuple[float, float]":
+    """(min_lon, max_lon) spanning every longitude in *lons*, in this
+    codebase's own wrap convention (min_lon > max_lon signals a region
+    crossing the antimeridian -- see split_antimeridian_bbox/_point_in_
+    bbox). A naive min()/max() over raw longitudes is only correct when
+    the true span doesn't cross +/-180: a set of points actually
+    clustered near the dateline (e.g. lon=179.9 and lon=-179.9, physically
+    ~20km apart) would otherwise produce min=-179.9, max=179.9 -- read as
+    a normal (non-wrapping) bbox, that's backwards, covering almost the
+    entire globe instead of the narrow true region.
+
+    Detects this the same way _point_in_polygon already does elsewhere in
+    this module: a raw span exceeding 180 degrees is treated as wrapping
+    rather than genuinely that wide (no real SAR/validation footprint or
+    footprint union is that wide). Shifts every negative longitude by
+    +360 into a continuous [0, 360) frame, takes min/max there (now a
+    valid non-wrapping span in that frame), then maps each back into
+    [-180, 180] -- if the result still has min_lon <= max_lon, the span
+    genuinely didn't wrap after all (a false positive from clustering
+    right at 0 degrees longitude on both sides is the only realistic
+    case -- exactly the point of translating instead of assuming)."""
+    if not lons:
+        raise ValueError("_antimeridian_aware_lon_bounds: lons must be non-empty")
+    if max(lons) - min(lons) <= 180.0:
+        return min(lons), max(lons)
+    shifted = [lon + 360.0 if lon < 0 else lon for lon in lons]
+    min_shifted, max_shifted = min(shifted), max(shifted)
+    min_lon = min_shifted - 360.0 if min_shifted > 180.0 else min_shifted
+    max_lon = max_shifted - 360.0 if max_shifted > 180.0 else max_shifted
+    return min_lon, max_lon
 
 
 def _vignette_points_and_bbox_from_geofootprint(
@@ -233,7 +273,8 @@ def _vignette_points_and_bbox_from_geofootprint(
             return [], fallback_bbox_fn()
         centroid_lons = [lon for _lat, lon in points]
         centroid_lats = [lat for lat, _lon in points]
-        bbox = (min(centroid_lons), max(centroid_lons), min(centroid_lats), max(centroid_lats))
+        min_lon, max_lon = _antimeridian_aware_lon_bounds(centroid_lons)
+        bbox = (min_lon, max_lon, min(centroid_lats), max(centroid_lats))
         return points, bbox
     except (KeyError, IndexError, TypeError, ValueError):
         return [], fallback_bbox_fn()
@@ -248,7 +289,16 @@ def _discover_sentinel1_wv_footprints_dry(cfg) -> "list[SarFootprint]":
     (a WV product's own catalog envelope only guarantees it touches the
     recipe's requested bbox, not that most -- or any -- of its individual
     vignettes fall inside it). Non-WV granules are excluded here -- see
-    _discover_sentinel1_ocn_footprints_dry."""
+    _discover_sentinel1_ocn_footprints_dry.
+
+    Skips the catalog search entirely (returns []) when "WV" isn't in
+    cfg.sar_data.swath_mode: a recipe that only wants IW/EW/SM must never
+    get WV footprints predicted against it -- mirrors
+    _discover_sentinel1_ocn_footprints_dry's identical swath_mode
+    restriction."""
+    if "WV" not in cfg.sar_data.swath_mode:
+        return []
+
     records = _query_sentinel1_ocn_dry(cfg)
     footprints = []
     for record in records:
@@ -335,8 +385,7 @@ def _discover_radarsat2_footprints_dry(cfg) -> "list[SarFootprint]":
     """RADARSAT-2 footprints from a dry THREDDS/NCML search. polygon is
     always None -- RADARSAT-2's NCML metadata only exposes a bounding
     box (geospatial_lon_min/max, geospatial_lat_min/max), never real
-    vertices, unlike CDSE's GeoFootprint (see this plan's correction
-    note at the top of this document). Falls back to the recipe's own
+    vertices, unlike CDSE's GeoFootprint. Falls back to the recipe's own
     requested bbox (cfg.geographic_bounds) when a candidate's NCML bbox
     is unavailable -- cfg is only consulted for that fallback lazily,
     mirroring _polygon_and_bbox_from_geofootprint's fallback_bbox_fn
@@ -454,13 +503,34 @@ def _discover_nisar_sme2_footprints_dry(cfg) -> "list[SarFootprint]":
 
 
 def _discover_sentinel1_ocn_footprints_dry(cfg) -> "list[SarFootprint]":
-    """Non-WV (IW/EW/SM) Sentinel-1 OCN footprints from a dry CDSE
-    catalog search. WV-mode granules are excluded here -- see
-    _discover_sentinel1_wv_footprints_dry."""
+    """Non-WV Sentinel-1 OCN footprints from a dry CDSE catalog search,
+    restricted to cfg.sar_data.swath_mode (e.g. IW/EW/SM). WV-mode
+    granules are excluded here regardless of swath_mode -- see
+    _discover_sentinel1_wv_footprints_dry, the sibling that owns WV
+    specifically (its own points-based footprint kind needs different
+    geometry handling than a bbox/polygon).
+
+    Mirrors SARDownloader.query's own post-catalog regex mode filter
+    (sentinel1_l2_ocn_downloader.py's ``"^S1[ABCD]_(" + "|".join(modes)
+    + "_)"`` pattern), which the real (non-dry) download path already
+    applies -- CDSE's own OData query has no server-side instrumentMode
+    filter, so the catalog search itself always returns every mode
+    regardless of what's requested. Without this, --dry-collocation would
+    predict against every non-WV mode CDSE returns, regardless of what
+    the recipe's own sar_data.swath_mode actually restricts to, in turn
+    inflating every downstream validation-source prediction checked
+    against those phantom footprints."""
+    non_wv_modes = [m for m in cfg.sar_data.swath_mode if m != "WV"]
+    if not non_wv_modes:
+        return []
+    mode_re = re.compile("^S1[A-D]_(" + "|".join(non_wv_modes) + ")_")
+
     records = _query_sentinel1_ocn_dry(cfg)
     footprints = []
     for record in records:
         if _WV_MODE_RE.match(record["Name"]):
+            continue
+        if not mode_re.match(record["Name"]):
             continue
         polygon, bbox = _polygon_and_bbox_from_geofootprint(
             record.get("GeoFootprint"), lambda: _fallback_bbox_from_cfg(cfg),
@@ -505,16 +575,31 @@ def _discover_clms_ssm_footprints_dry(cfg) -> "list[SarFootprint]":
     region (e.g. all of Europe), not real per-day coverage -- propagate
     Sentinel-1's own orbit across the tile's day (via
     orbit_coverage.orbit_overlap_windows) to predict which part of the
-    tile was actually overpassed, producing kind="orbit_swath"
+    day was actually overpassed, producing kind="orbit_swath"
     footprints (polygon is always None -- only a predicted bbox is
     available here, never real vertices).
 
     Each candidate tile could have been covered by any of Sentinel-1A/B/C
     (_CLMS_SSM_SATELLITES), so all three are tried and their matched
-    windows unioned -- deduplicated by (start, end) value, since more
-    than one satellite reporting the exact same window (or a fail-open
-    "whole day" window from more than one of them) must not produce one
-    redundant footprint per satellite."""
+    windows unioned. One footprint is produced per catalog record (i.e.
+    per real daily mosaic file this source actually downloads/converts
+    -- see sar_sources.py's own "scenes are daily, ... continent-wide
+    mosaics" comment), spanning the earliest matched window's start to
+    the latest matched window's end, rather than one footprint per
+    individual orbit pass: a europe-wide bbox is typically crossed by
+    Sentinel-1 more than a dozen times a day across three satellites, so
+    the naive one-footprint-per-pass approach previously inflated a
+    3-day recipe's real 3 scenes into 40+ "SAR footprint(s)" -- a count
+    that never matched what a real run treats as its own scene count,
+    and multiplied every exhaustive per-footprint dry-collocation check
+    (--dry-collocation-detail) by the same factor for no real gain,
+    since this source's own downstream conversion
+    (_clms_ssm_footprint_from_downloaded) already collapses a whole
+    day's mosaic to one scene. A record with no matched window at all
+    (Sentinel-1 genuinely never crossed the bbox that day, distinct from
+    a fail-open "whole window" match -- see orbit_overlap_windows' own
+    docstring) produces no footprint, since there would be no real SAR
+    data in the requested area to validate against."""
     records = _query_clms_ssm_dry(cfg)
     bounds = cfg.geographic_bounds
     bbox = (bounds.min_lon, bounds.max_lon, bounds.min_lat, bounds.max_lat)
@@ -532,18 +617,19 @@ def _discover_clms_ssm_footprints_dry(cfg) -> "list[SarFootprint]":
             )
             matched_windows.update(windows)
 
-        for w_start, w_end in sorted(matched_windows):
-            footprints.append(
-                SarFootprint(
-                    kind="orbit_swath",
-                    bbox=bbox,
-                    polygon=None,
-                    points=None,
-                    sensing_start=w_start,
-                    sensing_end=w_end,
-                    source_file=record["Name"],
-                )
+        if not matched_windows:
+            continue
+        footprints.append(
+            SarFootprint(
+                kind="orbit_swath",
+                bbox=bbox,
+                polygon=None,
+                points=None,
+                sensing_start=min(w_start for w_start, _w_end in matched_windows),
+                sensing_end=max(w_end for _w_start, w_end in matched_windows),
+                source_file=record["Name"],
             )
+        )
     return footprints
 
 
@@ -814,6 +900,23 @@ def predict_source(
     return predicate(source, cfg, sar_footprints)
 
 
+def _predict_source_or_unknown(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool,
+) -> SourcePrediction:
+    """predict_source, with a raised exception turned into an "unknown"
+    verdict for that source alone -- factored out of predict_collocation
+    so both the sequential and thread-pool execution paths share the
+    exact same per-source error handling."""
+    try:
+        return predict_source(source, cfg, sar_footprints, stop_on_first_match=stop_on_first_match)
+    except Exception:
+        logger.debug("predict_collocation: predict_source failed for %s", source.source_type, exc_info=True)
+        return SourcePrediction(
+            source_type=source.source_type, bucket="unregistered", verdict="unknown",
+            detail=f"Prediction raised an exception for {source.source_type}.",
+        )
+
+
 def predict_collocation(
     cfg, sar_footprints: "list[SarFootprint]", recipe_path: str = "", *, stop_on_first_match: bool = False,
 ) -> CollocationReport:
@@ -822,22 +925,32 @@ def predict_collocation(
     raising is caught and turned into an "unknown" verdict for that
     source alone -- never aborts the whole report.
 
+    Runs every source's predict_source call on its own thread: most
+    predicates spend the bulk of their time waiting on network I/O
+    (copernicusmarine, FTP, catalog searches) or CPU-bound orbit
+    propagation, both of which release the GIL, so N sources overlap
+    instead of running back-to-back -- the wall-clock cost of the whole
+    report becomes roughly that of its single slowest source, not the
+    sum of all of them. A single-source cfg (or one predicate raising)
+    behaves identically to the old sequential loop; ThreadPoolExecutor.map
+    preserves input order, so the report's own source ordering is
+    unaffected by which thread happens to finish first.
+
     stop_on_first_match is forwarded to predict_source per source -- see
     its docstring."""
-    predictions = []
-    for source in cfg.validation_sources:
-        try:
-            predictions.append(
-                predict_source(source, cfg, sar_footprints, stop_on_first_match=stop_on_first_match)
-            )
-        except Exception:
-            logger.debug("predict_collocation: predict_source failed for %s", source.source_type, exc_info=True)
-            predictions.append(
-                SourcePrediction(
-                    source_type=source.source_type, bucket="unregistered", verdict="unknown",
-                    detail=f"Prediction raised an exception for {source.source_type}.",
-                )
-            )
+    if not cfg.validation_sources:
+        return CollocationReport(recipe_path=recipe_path, sar_footprint_count=len(sar_footprints), predictions=[])
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=len(cfg.validation_sources)) as executor:
+        predictions = list(executor.map(
+            lambda source: _predict_source_or_unknown(
+                source, cfg, sar_footprints, stop_on_first_match=stop_on_first_match,
+            ),
+            cfg.validation_sources,
+        ))
+
     return CollocationReport(
         recipe_path=recipe_path, sar_footprint_count=len(sar_footprints), predictions=predictions,
     )
@@ -957,6 +1070,189 @@ def _windows_overlap(
     return a_start <= b_end and b_start <= a_end
 
 
+def _stop_early_suffix(stop_on_first_match: bool) -> str:
+    """Appended to a "collocated" verdict's detail text whenever
+    stop_on_first_match caused the predicate to stop probing at the
+    first confirmed match: the printed count is then a lower bound (at
+    least one), not the true total, so the message says so and points
+    at --dry-collocation-detail for the exhaustive count."""
+    if not stop_on_first_match:
+        return ""
+    return " (stopped at first match -- pass --dry-collocation-detail for the full count)"
+
+
+def _count_prefix(stop_on_first_match: bool) -> str:
+    """Prefixed onto a "collocated" verdict's own leading "N of M SAR
+    footprint(s)" count whenever stop_on_first_match caused the
+    predicate to stop probing at the first confirmed match, so the
+    count itself reads as the lower bound it actually is rather than
+    an exact total -- relying on _stop_early_suffix's trailing
+    parenthetical alone is easy to miss, since it comes after the
+    count a reader has already taken at face value."""
+    return "at least " if stop_on_first_match else ""
+
+
+def _orbit_corridor_target(
+    footprint: "SarFootprint", point: "Optional[tuple[float, float]]",
+) -> "tuple[tuple[float, float, float, float], Optional[list[tuple[float, float]]], Optional[tuple[float, float]]]":
+    """(target_bbox, target_polygon, target_point) for one orbit-corridor
+    check: the footprint's own bbox/polygon (target_point=None) when
+    point is None, or target_point=point itself otherwise -- a WV
+    vignette is a genuine point, not an area, so it must be matched via
+    match_ground_track/orbit_overlap_windows's target_point (a direct
+    distance check), never a zero-width bbox (which can only ever match
+    on an exact floating-point coordinate equality, i.e. never in
+    practice). Shared by both of _predict_orbit_corridor_source's
+    execution paths so they resolve a target identically. The bbox
+    returned alongside target_point is a placeholder, unused whenever
+    target_point is not None."""
+    if point is None:
+        return footprint.bbox, footprint.polygon, None
+    lat, lon = point
+    return (lon, lon, lat, lat), None, point
+
+
+#: One independent unit of match_ground_track work for
+#: _predict_orbit_corridor_source's exhaustive path: which satellite's
+#: (already-propagated, shared) samples to match against, plus everything
+#: match_ground_track itself needs, plus the footprint's own padded window
+#: to filter the result against.
+_OrbitMatchJob = Tuple[
+    str, datetime, datetime,
+    "Tuple[float, float, float, float]", "Optional[list[tuple[float, float]]]", "Optional[Tuple[float, float]]",
+    datetime, datetime, int,
+]
+
+#: Below this many independent match_ground_track jobs, ProcessPoolExecutor's
+#: own spawn/IPC overhead costs more than it saves -- _run_orbit_match_jobs
+#: runs sequentially in-process instead below this count, same result either
+#: way. IMPORTANT for tests: a worker process gets a fresh import of this
+#: module, so a test that monkeypatches orbit_coverage.match_ground_track
+#: and pushes the job count to/past this threshold would silently run the
+#: REAL implementation in the worker, not the mock -- every existing
+#: orbit-corridor test uses a small handful of footprints/candidates/points,
+#: comfortably under this, but a future test adding many of any of those
+#: must keep the total under this threshold (or call _orbit_match_job
+#: directly) to keep monkeypatching honored.
+_ORBIT_MATCH_PARALLEL_MIN_JOBS = 20
+
+#: Set once per worker process by _orbit_match_pool_initializer (the main
+#: process's own copy, used by _run_orbit_match_jobs' sequential fallback,
+#: is set directly rather than through the initializer). Read-only after
+#: that: every worker only ever looks up its own satellite's samples,
+#: never mutates this.
+_orbit_match_samples: "dict[str, list[tuple[datetime, float, float]]]" = {}
+
+#: Set alongside _orbit_match_samples -- the margin_km every job in one
+#: _predict_orbit_corridor_source call shares (see that function's own
+#: margin_km parameter). Default mirrors match_ground_track's own.
+_orbit_match_margin_km: float = 100.0
+
+
+def _orbit_match_pool_initializer(
+    samples_by_satellite: "dict[str, list[tuple[datetime, float, float]]]", margin_km: float,
+) -> None:
+    """ProcessPoolExecutor initializer: runs once per worker process at
+    pool startup, broadcasting every satellite's shared samples array
+    (plus the shared margin_km) to that worker exactly once -- instead of
+    pickling/sending the (much larger) samples array again with every
+    individual job, only each job's own small (satellite key, target
+    region, window) tuple travels per-task."""
+    global _orbit_match_samples, _orbit_match_margin_km
+    _orbit_match_samples = samples_by_satellite
+    _orbit_match_margin_km = margin_km
+
+
+def _orbit_match_job_with_samples(
+    job: "_OrbitMatchJob",
+    samples_by_satellite: "dict[str, list[tuple[datetime, float, float]]]",
+    margin_km: float,
+) -> "list[tuple[int, datetime, datetime]]":
+    """Runs one match_ground_track call against samples_by_satellite (the
+    job's own satellite's already-propagated samples), and filters the
+    result against the job's own padded footprint window. Matches
+    _orbit_overlap_windows' fail-open contract as a defensive backstop,
+    though match_ground_track itself should never actually raise.
+
+    Takes samples_by_satellite/margin_km as plain arguments rather than
+    through the module-level globals _orbit_match_job (below) reads --
+    this is the version safe to call from _run_orbit_match_jobs' own
+    in-process sequential fallback, where multiple _predict_orbit_
+    corridor_source calls can be running concurrently on separate
+    threads (predict_collocation's own ThreadPoolExecutor runs every
+    validation source's predicate at once, and several can be
+    orbit-corridor sources checked in the same recipe run, e.g. altimeter
+    alongside scatterometer_hy2b/hy2c/oceansat3) -- threads share one
+    process's memory, so writing samples_by_satellite/margin_km to a
+    module global there would let one source's own call clobber
+    another's mid-flight. ProcessPoolExecutor's own workers don't have
+    this problem (genuinely separate processes, separate memory), so
+    _orbit_match_job's globals-based version stays safe to use there.
+
+    Each returned window carries the job's own footprint_index alongside
+    it, so a caller checking many points from the same wv_points footprint
+    (many jobs, one footprint_index) can tell how many DISTINCT footprints
+    matched, not just how many individual (candidate, vignette) hits."""
+    satellite, cand_start, cand_end, target_bbox, target_polygon, target_point, padded_start, padded_end, fp_idx = job
+    try:
+        samples = samples_by_satellite[satellite]
+        windows = orbit_coverage.match_ground_track(
+            samples, satellite, cand_start, cand_end,
+            target_bbox[0], target_bbox[1], target_bbox[2], target_bbox[3],
+            polygon=target_polygon, margin_km=margin_km, target_point=target_point,
+        )
+    except Exception:
+        windows = [(cand_start, cand_end)]  # fail open
+    return [
+        (fp_idx, w_start, w_end) for w_start, w_end in windows
+        if _windows_overlap(w_start, w_end, padded_start, padded_end)
+    ]
+
+
+def _orbit_match_job(job: "_OrbitMatchJob") -> "list[tuple[int, datetime, datetime]]":
+    """ProcessPoolExecutor-only wrapper around _orbit_match_job_with_
+    samples, reading samples_by_satellite/margin_km from the module
+    globals _orbit_match_pool_initializer sets once per worker process at
+    pool startup -- safe there (each worker is a separate process, so
+    nothing else can write these globals concurrently), unlike
+    _run_orbit_match_jobs' own in-process sequential fallback, which
+    calls _orbit_match_job_with_samples directly instead. Module-level
+    (not a closure) so ProcessPoolExecutor can pickle a reference to it."""
+    return _orbit_match_job_with_samples(job, _orbit_match_samples, _orbit_match_margin_km)
+
+
+def _run_orbit_match_jobs(
+    jobs: "list[_OrbitMatchJob]",
+    samples_by_satellite: "dict[str, list[tuple[datetime, float, float]]]",
+    margin_km: float,
+) -> "list[tuple[int, datetime, datetime]]":
+    """Runs every job from _predict_orbit_corridor_source's exhaustive
+    path and flattens the matched (footprint_index, window) results. Each
+    job is an independent, pure computation (geographic matching against
+    already-propagated samples -- no network, no shared mutable state),
+    so above _ORBIT_MATCH_PARALLEL_MIN_JOBS jobs this fans out across a
+    process pool instead of the single core a plain sequential loop would
+    use -- this is what makes altimeter's up-to-thousands-of-(footprint,
+    satellite, WV-vignette-point) job count for a large recipe tractable."""
+    if not jobs:
+        return []
+    if len(jobs) < _ORBIT_MATCH_PARALLEL_MIN_JOBS:
+        return [
+            w for job in jobs
+            for w in _orbit_match_job_with_samples(job, samples_by_satellite, margin_km)
+        ]
+
+    from concurrent.futures import ProcessPoolExecutor
+
+    matched: "list[tuple[int, datetime, datetime]]" = []
+    with ProcessPoolExecutor(
+        initializer=_orbit_match_pool_initializer, initargs=(samples_by_satellite, margin_km),
+    ) as executor:
+        for result in executor.map(_orbit_match_job, jobs):
+            matched.extend(result)
+    return matched
+
+
 def _predict_orbit_corridor_source(
     source,
     cfg,
@@ -965,11 +1261,13 @@ def _predict_orbit_corridor_source(
     satellite_resolver: "Callable[[str], str]",
     list_candidates_dry: "Callable[..., list[tuple[str, datetime, datetime]]]",
     source_type: str,
+    tolerance_source_types: "Optional[tuple[str, ...]]" = None,
+    margin_km: float = 100.0,
     stop_on_first_match: bool = False,
 ) -> SourcePrediction:
     """Shared predicate for every orbit-corridor-bucket source (ASCAT SSM
-    via H-SAF/EUMDAC, HY-2B/HY-2C/Oceansat-3, AMSR2, SMOS): a coarse
-    dry-listing per footprint's padded time window, then
+    via H-SAF/EUMDAC, HY-2B/HY-2C/Oceansat-3, AMSR2, SMOS, altimeter): a
+    coarse dry-listing per footprint's padded time window, then
     orbit_overlap_windows as the fine refinement. Each candidate's own
     satellite is resolved independently via satellite_resolver rather
     than assuming one fixed satellite for the whole call, since a single
@@ -982,6 +1280,22 @@ def _predict_orbit_corridor_source(
     box, since a vignette is a small area far smaller than the
     footprint's overall bbox.
 
+    tolerance_source_types overrides which key(s) resolve the time
+    tolerance via _resolve_temporal_padding_minutes, for a caller whose
+    source_type doesn't itself carry a DEFAULT_LAYER_TYPE_SPECS entry
+    (e.g. altimeter, keyed there as "altimeter_1hz"/"altimeter_5hz") --
+    mirrors _predict_catalog_precise_source's identical parameter.
+    Defaults to (source_type,), matching every other caller.
+
+    margin_km is forwarded to orbit_overlap_windows/match_ground_track,
+    defaulting to their own 100km default (appropriate for a genuine
+    wide-swath instrument's orbit/TLE uncertainty buffer -- ASCAT, HY-2,
+    AMSR2, SMOS all keep this default). A caller checking a much narrower
+    instrument (e.g. altimeter's ~8km nadir footprint) should override
+    this down to something sized for that instrument instead, since the
+    100km default alone over-predicts collocations by roughly an order
+    of magnitude for a narrow instrument.
+
     stop_on_first_match: the --dry-collocation preview path (the default,
     False) keeps scanning every footprint/candidate/point so matched_windows
     accumulates a real count for the report's own "N matched window(s)"
@@ -989,8 +1303,26 @@ def _predict_orbit_corridor_source(
     predictions, via predict_collocation(..., stop_on_first_match=True))
     only ever needs a yes/no verdict, so it opts into stopping at the
     first confirmed match instead -- this is what bounds this predicate's
-    live-probe cost (list_candidates_dry / orbit_overlap_windows calls) on
-    the default path of every real recipe run.
+    live-probe cost (list_candidates_dry / propagation calls) on the
+    default path of every real recipe run. This path still propagates
+    each satellite's ground track (sample_ground_track) at most once per
+    distinct (satellite, cand_start, cand_end) candidate, via a local
+    cache: a wv_points footprint's many vignette points all share the
+    same candidate list, so without this cache a footprint with N points
+    would re-propagate the identical pass N times before ever getting to
+    compare a single point -- the dominant cost whenever no match is
+    found early (nothing to break out on), which is the common case for
+    a narrow-swath instrument like altimeter checked against sparse WV
+    vignettes.
+
+    The exhaustive path's own "N candidate pass(es)" detail count is a
+    predicted-window count, not a real measurement count: one matched
+    window is one continuous stretch of a satellite's predicted ground
+    track, which -- once actually downloaded -- typically contains many
+    individual along-track samples (e.g. altimeter's ~7km 1Hz spacing).
+    It will always be much smaller than a real validation report's own
+    point-level collocation count for the same recipe; that's expected,
+    not a sign this predicate under-counted.
     """
     if not sar_footprints:
         return SourcePrediction(
@@ -998,67 +1330,169 @@ def _predict_orbit_corridor_source(
             detail="No SAR footprints supplied -- cannot predict.",
         )
 
-    tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, source_type))
+    tolerance = timedelta(
+        minutes=_resolve_temporal_padding_minutes(cfg, *(tolerance_source_types or (source_type,)))
+    )
     matched_windows: "list[tuple[datetime, datetime]]" = []
+    # Every vignette point within one wv_points footprint is checked
+    # independently, so a single real satellite pass grazing several
+    # nearby vignettes in a row produces several matched_windows entries
+    # for what is physically one crossing -- this tracks distinct
+    # FOOTPRINTS instead, which the detail text below reports.
+    matched_footprint_indices: "set[int]" = set()
 
-    for footprint in sar_footprints:
-        if stop_on_first_match and matched_windows:
-            break
-        padded_start = footprint.sensing_start - tolerance
-        padded_end = footprint.sensing_end + tolerance
-        try:
-            candidates = list_candidates_dry(
-                footprint.bbox[0], footprint.bbox[1], footprint.bbox[2], footprint.bbox[3],
-                padded_start.isoformat(), padded_end.isoformat(),
-            )
-        except Exception:
-            logger.debug("_predict_orbit_corridor_source: list_candidates_dry failed", exc_info=True)
-            return SourcePrediction(
-                source_type=source_type, bucket="orbit-corridor", verdict="unknown",
-                detail=f"Candidate listing failed for {source_type}.",
-            )
+    if stop_on_first_match:
+        samples_cache: "dict[tuple[str, datetime, datetime], Optional[list[tuple[datetime, float, float]]]]" = {}
 
-        points: "list[Optional[tuple[float, float]]]" = (
-            list(footprint.points or []) if footprint.kind == "wv_points" else [None]
-        )
-        for candidate_name, cand_start, cand_end in candidates:
-            if stop_on_first_match and matched_windows:
-                break
-            try:
-                satellite = satellite_resolver(candidate_name)
-            except Exception:
-                logger.debug("_predict_orbit_corridor_source: satellite_resolver failed", exc_info=True)
-                matched_windows.append((cand_start, cand_end))  # fail open
-                continue
-            for point in points:
-                if stop_on_first_match and matched_windows:
-                    break
-                if point is None:
-                    target_bbox = footprint.bbox
-                    target_polygon = footprint.polygon
+        def _cached_samples(satellite: str, cand_start: datetime, cand_end: datetime):
+            key = (satellite, cand_start, cand_end)
+            if key not in samples_cache:
+                if satellite not in orbit_coverage.SATELLITE_ORBIT_SPECS:
+                    samples_cache[key] = None
                 else:
-                    lat, lon = point
-                    target_bbox = (lon, lon, lat, lat)
-                    target_polygon = None
+                    try:
+                        samples_cache[key] = orbit_coverage.sample_ground_track(satellite, cand_start, cand_end)
+                    except Exception:
+                        logger.debug(
+                            "_predict_orbit_corridor_source: propagation failed for %s, failing open.",
+                            satellite, exc_info=True,
+                        )
+                        samples_cache[key] = None
+            return samples_cache[key]
+
+        for fp_idx, footprint in enumerate(sar_footprints):
+            if matched_windows:
+                break
+            padded_start = footprint.sensing_start - tolerance
+            padded_end = footprint.sensing_end + tolerance
+            try:
+                candidates = list_candidates_dry(
+                    footprint.bbox[0], footprint.bbox[1], footprint.bbox[2], footprint.bbox[3],
+                    padded_start.isoformat(), padded_end.isoformat(),
+                )
+            except Exception:
+                logger.debug("_predict_orbit_corridor_source: list_candidates_dry failed", exc_info=True)
+                return SourcePrediction(
+                    source_type=source_type, bucket="orbit-corridor", verdict="unknown",
+                    detail=f"Candidate listing failed for {source_type}.",
+                )
+
+            points: "list[Optional[tuple[float, float]]]" = (
+                list(footprint.points or []) if footprint.kind == "wv_points" else [None]
+            )
+            for candidate_name, cand_start, cand_end in candidates:
+                if matched_windows:
+                    break
                 try:
-                    windows = orbit_coverage.orbit_overlap_windows(
-                        satellite, cand_start, cand_end,
-                        target_bbox[0], target_bbox[1], target_bbox[2], target_bbox[3],
-                        polygon=target_polygon,
-                    )
+                    satellite = satellite_resolver(candidate_name)
                 except Exception:
-                    logger.debug("_predict_orbit_corridor_source: orbit_overlap_windows failed", exc_info=True)
-                    windows = [(cand_start, cand_end)]  # fail open
-                for w_start, w_end in windows:
-                    if _windows_overlap(w_start, w_end, padded_start, padded_end):
-                        matched_windows.append((w_start, w_end))
-                        if stop_on_first_match:
+                    logger.debug("_predict_orbit_corridor_source: satellite_resolver failed", exc_info=True)
+                    matched_windows.append((cand_start, cand_end))  # fail open
+                    matched_footprint_indices.add(fp_idx)
+                    continue
+                samples = _cached_samples(satellite, cand_start, cand_end)
+                if samples is None:
+                    matched_windows.append((cand_start, cand_end))  # fail open
+                    matched_footprint_indices.add(fp_idx)
+                    continue
+                for point in points:
+                    if matched_windows:
+                        break
+                    target_bbox, target_polygon, target_point = _orbit_corridor_target(footprint, point)
+                    try:
+                        windows = orbit_coverage.match_ground_track(
+                            samples, satellite, cand_start, cand_end,
+                            target_bbox[0], target_bbox[1], target_bbox[2], target_bbox[3],
+                            polygon=target_polygon, margin_km=margin_km, target_point=target_point,
+                        )
+                    except Exception:
+                        logger.debug("_predict_orbit_corridor_source: match_ground_track failed", exc_info=True)
+                        windows = [(cand_start, cand_end)]  # fail open
+                    for w_start, w_end in windows:
+                        if _windows_overlap(w_start, w_end, padded_start, padded_end):
+                            matched_windows.append((w_start, w_end))
+                            matched_footprint_indices.add(fp_idx)
                             break
+    else:
+        # Exhaustive path: resolve every (footprint, candidate, point) job
+        # up front, then group by satellite and propagate each satellite's
+        # ground track ONCE over the union of that satellite's own jobs --
+        # see sample_ground_track's docstring. Matching (which depends on
+        # each job's own target region, so can't be shared) still runs
+        # once per job, against the shared samples.
+        jobs_by_satellite: "dict[str, list[tuple]]" = {}
+        for fp_idx, footprint in enumerate(sar_footprints):
+            padded_start = footprint.sensing_start - tolerance
+            padded_end = footprint.sensing_end + tolerance
+            try:
+                candidates = list_candidates_dry(
+                    footprint.bbox[0], footprint.bbox[1], footprint.bbox[2], footprint.bbox[3],
+                    padded_start.isoformat(), padded_end.isoformat(),
+                )
+            except Exception:
+                logger.debug("_predict_orbit_corridor_source: list_candidates_dry failed", exc_info=True)
+                return SourcePrediction(
+                    source_type=source_type, bucket="orbit-corridor", verdict="unknown",
+                    detail=f"Candidate listing failed for {source_type}.",
+                )
+
+            points = list(footprint.points or []) if footprint.kind == "wv_points" else [None]
+            for candidate_name, cand_start, cand_end in candidates:
+                try:
+                    satellite = satellite_resolver(candidate_name)
+                except Exception:
+                    logger.debug("_predict_orbit_corridor_source: satellite_resolver failed", exc_info=True)
+                    matched_windows.append((cand_start, cand_end))  # fail open
+                    matched_footprint_indices.add(fp_idx)
+                    continue
+                for point in points:
+                    target_bbox, target_polygon, target_point = _orbit_corridor_target(footprint, point)
+                    jobs_by_satellite.setdefault(satellite, []).append(
+                        (
+                            cand_start, cand_end, target_bbox, target_polygon, target_point,
+                            padded_start, padded_end, fp_idx,
+                        )
+                    )
+
+        # Propagate each satellite's ground track once (sequential -- this
+        # is already cheap and, more importantly, TLE fetches share disk
+        # cache across satellites, so nothing is gained by parallelizing
+        # this part). Matching each job against its own satellite's
+        # already-propagated samples is the CPU-bound part worth spreading
+        # across a process pool -- see _run_orbit_match_jobs.
+        samples_by_satellite: "dict[str, list[tuple[datetime, float, float]]]" = {}
+        match_jobs: "list[_OrbitMatchJob]" = []
+        for satellite, sat_jobs in jobs_by_satellite.items():
+            union_start = min(j[0] for j in sat_jobs)
+            union_end = max(j[1] for j in sat_jobs)
+            try:
+                samples_by_satellite[satellite] = orbit_coverage.sample_ground_track(
+                    satellite, union_start, union_end,
+                )
+            except Exception:
+                logger.debug(
+                    "_predict_orbit_corridor_source: sample_ground_track failed for %s", satellite, exc_info=True,
+                )
+                for cand_start, cand_end, _bbox, _poly, _point, _ps, _pe, sat_job_fp_idx in sat_jobs:
+                    matched_windows.append((cand_start, cand_end))  # fail open
+                    matched_footprint_indices.add(sat_job_fp_idx)
+                continue
+
+            match_jobs.extend((satellite, *job) for job in sat_jobs)
+
+        for match_fp_idx, w_start, w_end in _run_orbit_match_jobs(match_jobs, samples_by_satellite, margin_km):
+            matched_windows.append((w_start, w_end))
+            matched_footprint_indices.add(match_fp_idx)
 
     if matched_windows:
         return SourcePrediction(
             source_type=source_type, bucket="orbit-corridor", verdict="collocated",
-            detail=f"{len(matched_windows)} matched window(s) across {len(sar_footprints)} SAR footprint(s).",
+            detail=(
+                f"{_count_prefix(stop_on_first_match)}{len(matched_footprint_indices)} of "
+                f"{len(sar_footprints)} SAR footprint(s) with a predicted overlap "
+                f"(up to {len(matched_windows)} candidate pass(es) total)."
+                f"{_stop_early_suffix(stop_on_first_match)}"
+            ),
             matched_windows=matched_windows,
         )
     return SourcePrediction(
@@ -1099,6 +1533,14 @@ def _predict_catalog_precise_source(
     parameter -- False (the default) preserves the --dry-collocation
     preview path's exhaustive matched_windows count; the real-run gating
     path opts into True to bound this predicate's live listing-call cost.
+
+    The exhaustive path's own "N candidate file(s)" detail count is a
+    product-file count, not a real measurement count: one candidate is
+    one listed granule (e.g. one ASCAT swath), which -- once actually
+    downloaded -- typically contains many individual grid cells/pixels.
+    It will always be much smaller than a real validation report's own
+    point-level collocation count for the same recipe; that's expected,
+    not a sign this predicate under-counted.
     """
     if not sar_footprints:
         return SourcePrediction(
@@ -1110,8 +1552,14 @@ def _predict_catalog_precise_source(
         minutes=_resolve_temporal_padding_minutes(cfg, *(tolerance_source_types or (source_type,)))
     )
     matched_windows: "list[tuple[datetime, datetime]]" = []
+    # Same rationale as _predict_orbit_corridor_source's identical field:
+    # a wv_points footprint's many vignette points are each queried
+    # independently, so one real overpass grazing several nearby
+    # vignettes produces several matched_windows entries for what is
+    # physically one footprint's worth of coverage.
+    matched_footprint_indices: "set[int]" = set()
 
-    for footprint in sar_footprints:
+    for fp_idx, footprint in enumerate(sar_footprints):
         if stop_on_first_match and matched_windows:
             break
         padded_start = footprint.sensing_start - tolerance
@@ -1136,13 +1584,19 @@ def _predict_catalog_precise_source(
                 )
             for _name, cand_start, cand_end in candidates:
                 matched_windows.append((cand_start, cand_end))
+                matched_footprint_indices.add(fp_idx)
                 if stop_on_first_match:
                     break
 
     if matched_windows:
         return SourcePrediction(
             source_type=source_type, bucket="catalog-precise", verdict="collocated",
-            detail=f"{len(matched_windows)} candidate(s) across {len(sar_footprints)} SAR footprint(s).",
+            detail=(
+                f"{_count_prefix(stop_on_first_match)}{len(matched_footprint_indices)} of "
+                f"{len(sar_footprints)} SAR footprint(s) with a predicted candidate "
+                f"(up to {len(matched_windows)} candidate file(s) total)."
+                f"{_stop_early_suffix(stop_on_first_match)}"
+            ),
             matched_windows=matched_windows,
         )
     return SourcePrediction(
@@ -1338,20 +1792,61 @@ def _oceansat3_list_candidates_dry(
     return _scatterometer_ftp_list_candidates_dry("oceansat3", min_lon, max_lon, min_lat, max_lat, start, end)
 
 
+def _predict_scatterometer_ftp_source(
+    source, cfg, sar_footprints: "list[SarFootprint]", *,
+    satellite: str, label: str, source_type: str,
+    list_candidates_dry: "Callable[..., list[tuple[str, datetime, datetime]]]",
+    stop_on_first_match: bool = False,
+) -> SourcePrediction:
+    """Shared orbit-corridor predicate for HY-2B/HY-2C/Oceansat-3's
+    OSI-SAF wind FTP source_types -- each listing (see
+    scatterometer_ftp_downloader.py) only ever contains that one
+    satellite's own data, so satellite_resolver is a fixed constant
+    rather than parsed per candidate.
+
+    Checked upfront, before the generic orbit-corridor scan: the FTP
+    server only retains a rolling MAX_AGE_DAYS-day history (see
+    scatterometer_ftp_downloader.py's own module docstring). A recipe
+    whose every SAR footprint's own padded window falls entirely before
+    that cutoff has no candidates to find not because the satellite's
+    ground track never crossed the target area (what a plain "no
+    predicted overlap" implies -- a geographic non-match), but because
+    the archive itself doesn't reach back that far -- a materially
+    different, more actionable thing to tell a user than the generic
+    message _predict_orbit_corridor_source would otherwise produce (an
+    empty list_candidates_dry result looks geometrically identical to it
+    from inside that shared predicate)."""
+    if not sar_footprints:
+        return SourcePrediction(
+            source_type=source_type, bucket="orbit-corridor", verdict="unknown",
+            detail="No SAR footprints supplied -- cannot predict.",
+        )
+    tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, source_type))
+    cutoff = _to_naive_utc(datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS))
+    if all(_to_naive_utc(fp.sensing_end) + tolerance < cutoff for fp in sar_footprints):
+        return SourcePrediction(
+            source_type=source_type, bucket="orbit-corridor", verdict="unknown",
+            detail=(
+                f"SAR footprints outside {label}'s download window "
+                f"(OSI-SAF FTP server retains only a rolling {MAX_AGE_DAYS}-day history)."
+            ),
+        )
+    return _predict_orbit_corridor_source(
+        source, cfg, sar_footprints,
+        satellite_resolver=lambda name: satellite,
+        list_candidates_dry=list_candidates_dry,
+        source_type=source_type,
+        stop_on_first_match=stop_on_first_match,
+    )
+
+
 def _predict_scatterometer_hy2b(
     source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
 ) -> SourcePrediction:
-    """Orbit-corridor predicate for source_type="scatterometer_hy2b" --
-    HY-2B's OSI-SAF wind FTP listing (see scatterometer_ftp_downloader.py)
-    only ever contains HY-2B's own data, so satellite_resolver is a fixed
-    constant rather than parsed per candidate. stop_on_first_match is
-    forwarded straight through -- see _predict_orbit_corridor_source's
-    docstring."""
-    return _predict_orbit_corridor_source(
+    return _predict_scatterometer_ftp_source(
         source, cfg, sar_footprints,
-        satellite_resolver=lambda name: "hy2b",
+        satellite="hy2b", label="HY-2B", source_type="scatterometer_hy2b",
         list_candidates_dry=_hy2b_list_candidates_dry,
-        source_type="scatterometer_hy2b",
         stop_on_first_match=stop_on_first_match,
     )
 
@@ -1359,13 +1854,10 @@ def _predict_scatterometer_hy2b(
 def _predict_scatterometer_hy2c(
     source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
 ) -> SourcePrediction:
-    """Orbit-corridor predicate for source_type="scatterometer_hy2c" --
-    see _predict_scatterometer_hy2b."""
-    return _predict_orbit_corridor_source(
+    return _predict_scatterometer_ftp_source(
         source, cfg, sar_footprints,
-        satellite_resolver=lambda name: "hy2c",
+        satellite="hy2c", label="HY-2C", source_type="scatterometer_hy2c",
         list_candidates_dry=_hy2c_list_candidates_dry,
-        source_type="scatterometer_hy2c",
         stop_on_first_match=stop_on_first_match,
     )
 
@@ -1373,13 +1865,10 @@ def _predict_scatterometer_hy2c(
 def _predict_scatterometer_oceansat3(
     source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
 ) -> SourcePrediction:
-    """Orbit-corridor predicate for source_type="scatterometer_oceansat3"
-    -- see _predict_scatterometer_hy2b."""
-    return _predict_orbit_corridor_source(
+    return _predict_scatterometer_ftp_source(
         source, cfg, sar_footprints,
-        satellite_resolver=lambda name: "oceansat3",
+        satellite="oceansat3", label="Oceansat-3", source_type="scatterometer_oceansat3",
         list_candidates_dry=_oceansat3_list_candidates_dry,
-        source_type="scatterometer_oceansat3",
         stop_on_first_match=stop_on_first_match,
     )
 
@@ -1431,21 +1920,32 @@ def _scatterometer_list_candidates_dry(
     return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
 
 
-def _predict_scatterometer(
+def _predict_scatterometer_ascat(
     source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
 ) -> SourcePrediction:
-    """Catalog-precise predicate for source_type="scatterometer" (ASCAT
-    winds via EUMDAC) -- EUMDAC's own collection.search(bbox=...) is
-    already a real geometrically-precise server-side query."""
+    """Catalog-precise predicate for source_type="scatterometer_ascat"
+    (ASCAT winds via EUMDAC) -- EUMDAC's own collection.search(bbox=...)
+    is already a real geometrically-precise server-side query.
+
+    Named "scatterometer_ascat" (not the bare "scatterometer" this
+    source_type used before) for consistency with the sibling
+    scatterometer_hy2b/_hy2c/_oceansat3 source_types -- this is the only
+    one of the four that only ever downloads ASCAT data. The shared
+    val_source/data_type "scatterometer" label every one of the four
+    still gets stamped with at conversion time (see from_scatterometer_nc
+    in datatree_converter.py) is unaffected by this rename: that label is
+    what drives the combined scatterometer grouping in reports and
+    visualizations, deliberately independent of which recipe source_type
+    triggered the download."""
     return _predict_catalog_precise_source(
         source, cfg, sar_footprints,
         list_candidates_dry=_scatterometer_list_candidates_dry,
-        source_type="scatterometer",
+        source_type="scatterometer_ascat",
         stop_on_first_match=stop_on_first_match,
     )
 
 
-_PREDICATES["scatterometer"] = _predict_scatterometer
+_PREDICATES["scatterometer_ascat"] = _predict_scatterometer_ascat
 
 
 def _smap_ssm_list_candidates_dry(
@@ -1475,39 +1975,141 @@ def _predict_smap_ssm(
 _PREDICATES["smap_ssm"] = _predict_smap_ssm
 
 
-def _altimeter_list_candidates_dry(
+#: AltimeterDownloader's own SATELLITES_1HZ/5HZ codes -> orbit_coverage.py's
+#: SATELLITE_ORBIT_SPECS keys. HaiYang-2B/2C map to their own dedicated
+#: "hy2b-altimeter"/"hy2c-altimeter" entries, NOT the plain "hy2b"/"hy2c"
+#: ones -- those model that same satellite's much wider HSCAT
+#: *scatterometer* payload (900km half-width), a different instrument
+#: from the narrow (~8km) altimeter payload this predicate actually
+#: checks.
+_ALTIMETER_SATELLITE_MAP = {
+    "al": "saral",
+    "c2": "cryosat-2",
+    "cfo": "cfosat",
+    "h2b": "hy2b-altimeter",
+    "h2c": "hy2c-altimeter",
+    "j3": "jason-3",
+    "s3a": "sentinel-3a",
+    "s3b": "sentinel-3b",
+    "s6a": "sentinel-6a",
+    "swon": "swot",
+}
+
+
+def _altimeter_satellite_resolver(candidate_name: str) -> str:
+    """satellite_resolver adapter for altimeter: candidate_name is one of
+    AltimeterDownloader's own satellite codes (e.g. "j3"), mapped to
+    orbit_coverage.py's SATELLITE_ORBIT_SPECS keys. An unrecognized code
+    still reaches orbit_overlap_windows, which itself fails open (whole
+    candidate window kept) on any key absent from SATELLITE_ORBIT_SPECS --
+    mirrors _hsaf_satellite_resolver's identical contract."""
+    return _ALTIMETER_SATELLITE_MAP.get(candidate_name, "unknown")
+
+
+def _altimeter_orbit_candidates_dry(
     min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
 ) -> "list[tuple[str, datetime, datetime]]":
-    """Thin wrapper: constructs an AltimeterDownloader and calls its
-    list_candidates_dry (every mission/frequency it covers, default
-    selection -- matching orchestrator.py's _download_altimeter default
-    of frequencies=["1hz"] would require plumbing the recipe's own
-    download_kwargs through here, which dry-collocation prediction has
-    no access to; querying every mission/frequency is the conservative
-    (fail-toward-inclusion) choice instead)."""
-    dl = AltimeterDownloader(output_dir=Path("/dev/null"))
-    return dl.list_candidates_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+    """Coarse candidate list for altimeter's orbit-corridor predicate.
+
+    Unlike every other orbit-corridor source (ASCAT/H-SAF/HY-2/Oceansat-3/
+    AMSR2/SMOS), which lists real product granules from a live catalog or
+    FTP server, every altimeter mission here (see AltimeterDownloader's
+    own SATELLITES_1HZ + AVAILABILITY_START/AVAILABILITY_END) is
+    continuously active between its documented start date and (if it has
+    one) end date -- there is no per-orbit catalog to query, so "is this
+    mission even in scope for this window" is answerable purely from
+    local static tables, with no network call at all. orbit_overlap_windows
+    (the fine refinement _predict_orbit_corridor_source applies to each
+    candidate this returns) is what actually determines whether the
+    satellite's real ground track crosses the target footprint -- this
+    coarse step only narrows down *which missions* are worth propagating.
+    This is what replaces the up-to-67-footprint x up-to-16-satellite live
+    copernicusmarine query storm the old catalog-precise predicate made
+    on every --dry-collocation run.
+
+    A satellite past AVAILABILITY_END (e.g. a decommissioned mission) is
+    still a physically real orbiting object -- SGP4 can correctly predict
+    where its ground track is -- but that predicted crossing has no real
+    observation behind it once the mission has stopped producing data.
+    Excluding it here (not just relying on margin_km tuning) is the only
+    way to avoid a real, otherwise-unexplainable false positive: the
+    predicted crossing can be geometrically closer than genuine matches
+    from still-active missions, so no margin_km value could separate them.
+
+    Iterates SATELLITES_1HZ only (not SATELLITES_5HZ too): 5Hz's 6
+    missions are a strict subset of 1Hz's 10, and this step's only job is
+    "which satellites are in scope", not which data frequency -- that
+    distinction only matters for the real download path. Every 5Hz
+    availability date is on or after its own mission's 1Hz date, so
+    keying off 1Hz's (earlier) start date is the conservative,
+    fail-toward-inclusion choice, consistent with this module's usual
+    bias -- AVAILABILITY_END has no such asymmetry to worry about (a
+    mission's 1Hz and 5Hz products end together, since both stop the
+    moment the satellite itself stops producing data).
+
+    bbox is accepted for interface consistency with every other
+    list_candidates_dry here but unused: altimeter mission activity has
+    no geographic dependency, only a temporal one -- geography is handled
+    entirely by orbit_overlap_windows downstream.
+    """
+    from ..downloaders.altimeter_downloader import AVAILABILITY_END, AVAILABILITY_START, SATELLITES_1HZ
+
+    start_dt = datetime.fromisoformat(start)
+    end_dt = datetime.fromisoformat(end)
+    start_str = normalize_datetime(start)
+    end_str = normalize_datetime(end)
+
+    candidates: "list[tuple[str, datetime, datetime]]" = []
+    for sat_code in SATELLITES_1HZ:
+        if end_str < AVAILABILITY_START["1hz"][sat_code]:
+            continue
+        avail_end = AVAILABILITY_END["1hz"].get(sat_code)
+        if avail_end is not None and start_str > avail_end:
+            continue
+        candidates.append((sat_code, start_dt, end_dt))
+    return candidates
+
+
+#: match_ground_track/orbit_overlap_windows' own margin_km default (100km)
+#: is sized for a genuine wide-swath instrument's orbit/TLE uncertainty --
+#: applied to altimeter's ~8km nadir footprint, it over-predicts
+#: collocations by roughly an order of magnitude. This value keeps a real
+#: safety margin against genuinely missing a collocation (SGP4/TLE
+#: propagation error, the footprint's own bbox coarseness) without the
+#: wide-swath-sized buffer dominating a narrow instrument's effective
+#: search corridor.
+_ALTIMETER_ORBIT_MARGIN_KM = 12.0
 
 
 def _predict_altimeter(
     source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
 ) -> SourcePrediction:
-    """Catalog-precise predicate for source_type="altimeter" -- Copernicus
-    Marine's along-track datasets are opened bbox/time-filtered via
-    copernicusmarine.open_dataset(), already a real geometrically-precise
-    server-side query.
+    """Orbit-corridor predicate for source_type="altimeter": a coarse,
+    network-free candidate list of every in-scope mission
+    (_altimeter_orbit_candidates_dry), refined by real SGP4 orbit
+    propagation (orbit_overlap_windows) against each SAR footprint --
+    the same pattern ASCAT/H-SAF/HY-2/AMSR2/SMOS already use, and TLEs
+    are cached per (satellite, date), so a 67-footprint recipe reduces to
+    at most ~10 real network lookups (one per mission, first use only),
+    not one live copernicusmarine query per footprint per mission.
 
     tolerance_source_types passes ("altimeter_1hz", "altimeter_5hz")
     rather than the bare "altimeter" source_type, mirroring
     orchestrator.py's _download_altimeter -- DEFAULT_LAYER_TYPE_SPECS has
     no "altimeter" entry, only per-frequency ones (both 180 minutes), so
     using the bare key would silently fall back to the generic 30-minute
-    default."""
-    return _predict_catalog_precise_source(
+    default.
+
+    margin_km overrides _predict_orbit_corridor_source's own 100km
+    default down to _ALTIMETER_ORBIT_MARGIN_KM -- see that constant's
+    own comment."""
+    return _predict_orbit_corridor_source(
         source, cfg, sar_footprints,
-        list_candidates_dry=_altimeter_list_candidates_dry,
+        satellite_resolver=_altimeter_satellite_resolver,
+        list_candidates_dry=_altimeter_orbit_candidates_dry,
         source_type="altimeter",
         tolerance_source_types=("altimeter_1hz", "altimeter_5hz"),
+        margin_km=_ALTIMETER_ORBIT_MARGIN_KM,
         stop_on_first_match=stop_on_first_match,
     )
 
@@ -1573,12 +2175,28 @@ def _predict_amsr_ssm(
     the label describes the source, not which internal path happened to
     answer.
 
-    stop_on_first_match is forwarded to each branch's own shared-predicate
-    call (see _predict_orbit_corridor_source's docstring) and, when True,
-    also skips the G-Portal branch entirely once Earthdata alone already
-    confirmed "collocated" -- a real-run gating caller only needs one
-    confirmed hit across either source.
+    stop_on_first_match is forwarded to both Earthdata's and G-Portal's
+    own shared-predicate calls (see _predict_orbit_corridor_source's
+    docstring) and, when True, also skips the G-Portal branch entirely
+    once Earthdata alone already confirmed "collocated" -- a real-run
+    gating caller only needs one confirmed hit across either source.
+
+    The G-Portal branch itself is additionally gated by a cheap,
+    no-network orbit pre-check (orbit_coverage.orbit_overlaps_bbox
+    against GCOM-W1's own orbit, over the union bbox/window of every
+    supplied footprint, mirroring _predict_insitu's identical union
+    pre-filter) before ever opening an SFTP connection: G-Portal's own
+    directory-tree walk is real, sequential network I/O with no
+    server-side spatial query (see gportal_downloader.py), so a
+    footprint GCOM-W1's orbit provably never passes over is worth
+    skipping outright regardless of stop_on_first_match.
     """
+    if not sar_footprints:
+        return SourcePrediction(
+            source_type="amsr_ssm", bucket="catalog-precise", verdict="unknown",
+            detail="No SAR footprints supplied -- cannot predict.",
+        )
+
     # Explicit branching rather than a **kwargs spread: mypy can't verify
     # a spread dict's value type against every one of these shared
     # predicates' differently-typed keyword parameters (e.g.
@@ -1601,7 +2219,24 @@ def _predict_amsr_ssm(
         )
     if stop_on_first_match and earthdata_prediction.verdict == "collocated":
         return earthdata_prediction
-    if stop_on_first_match:
+
+    tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, "amsr_ssm"))
+    union_min_lon, union_max_lon = _antimeridian_aware_lon_bounds(
+        [lon for fp in sar_footprints for lon in (fp.bbox[0], fp.bbox[1])]
+    )
+    union_min_lat = min(fp.bbox[2] for fp in sar_footprints)
+    union_max_lat = max(fp.bbox[3] for fp in sar_footprints)
+    union_start = min(fp.sensing_start for fp in sar_footprints) - tolerance
+    union_end = max(fp.sensing_end for fp in sar_footprints) + tolerance
+
+    if not orbit_coverage.orbit_overlaps_bbox(
+        "gcom-w1", union_start, union_end, union_min_lon, union_max_lon, union_min_lat, union_max_lat,
+    ):
+        gportal_prediction = SourcePrediction(
+            source_type="amsr_ssm", bucket="catalog-precise", verdict="none-predicted",
+            detail="No predicted GCOM-W1 orbit overlap -- G-Portal not queried.",
+        )
+    elif stop_on_first_match:
         gportal_prediction = _predict_orbit_corridor_source(
             source, cfg, sar_footprints,
             satellite_resolver=lambda name: "gcom-w1",
@@ -1617,11 +2252,17 @@ def _predict_amsr_ssm(
         )
 
     predictions = [earthdata_prediction, gportal_prediction]
-    if any(p.verdict == "collocated" for p in predictions):
-        matched = [w for p in predictions for w in (p.matched_windows or [])]
+    collocated = [p for p in predictions if p.verdict == "collocated"]
+    if collocated:
+        # Only the branch(es) that actually found something contribute
+        # to the message -- joining in a "none-predicted"/"unknown"
+        # sibling's own detail here (e.g. Earthdata's "no candidates
+        # found") next to a genuine match reads as contradictory, even
+        # though the overall verdict is unambiguous.
+        matched = [w for p in collocated for w in (p.matched_windows or [])]
         return SourcePrediction(
             source_type="amsr_ssm", bucket="catalog-precise", verdict="collocated",
-            detail=" / ".join(p.detail for p in predictions),
+            detail=" / ".join(p.detail for p in collocated),
             matched_windows=matched,
         )
     if any(p.verdict == "unknown" for p in predictions):
@@ -1679,8 +2320,9 @@ def _predict_ismn(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePr
     dl = _build_ismn_downloader(cfg)
     tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, "ismn"))
 
-    union_min_lon = min(fp.bbox[0] for fp in sar_footprints)
-    union_max_lon = max(fp.bbox[1] for fp in sar_footprints)
+    union_min_lon, union_max_lon = _antimeridian_aware_lon_bounds(
+        [lon for fp in sar_footprints for lon in (fp.bbox[0], fp.bbox[1])]
+    )
     union_min_lat = min(fp.bbox[2] for fp in sar_footprints)
     union_max_lat = max(fp.bbox[3] for fp in sar_footprints)
 
@@ -1728,20 +2370,52 @@ def _predict_ismn(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePr
 _PREDICATES["ismn"] = _predict_ismn
 
 
-def _predict_insitu(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+def _predict_insitu(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
     """Predicate for the five real Copernicus Marine in-situ source
     types (mooring, buoy, drifter, ferrybox, tidal_gauge) -- see
     orchestrator.py's _INSITU_TYPES. Unlike those five types' real
     (non-dry) download path, which batches every requested platform type
     into one InSituDownloader.download(source_types=[...]) call,
     predict_source is called once per individual validation source, so
-    this predicate filters its own check_availability_dry call down to
+    this predicate filters its own station_ranges_dry call down to
     just the single source.source_type it was invoked for.
 
-    This bucket stays bbox-only (no _point_in_footprint refinement):
-    check_availability_dry is a single aggregate "does any data exist"
-    boolean from the Copernicus Marine service itself, with no per-station
-    coordinates to check further -- unlike ISMN's local station index.
+    Uses InSituDownloader.station_ranges_dry (real per-station
+    coordinates) rather than check_availability_dry's boolean, so
+    _point_in_footprint can apply the same real point-vs-footprint-shape
+    refinement _predict_ismn already does -- see station_ranges_dry's own
+    docstring. A wv_points footprint's bbox is the bounding envelope of
+    dozens of vignette points scattered across up to ~30 minutes of orbit
+    track, so checking a station against that whole box rather than the
+    real vignette locations badly over-matches.
+
+    Also restricts the query to variables_for_recipe(cfg.variable) --
+    e.g. VHM0/VAVH/VGHS for a "waves" recipe -- rather than every
+    variable this dataset carries: a platform reporting only variables
+    outside that set (e.g. a pure-currents drifter, EWCT/NSCT only, on a
+    "waves" recipe) has nothing comparable to validate against at all.
+    Narrower query -> fewer rows fetched/parsed too.
+
+    Called exactly once here, against the union bbox/time window of
+    every supplied footprint (mirroring _predict_ismn's own union
+    pre-filter): the union window is always a superset of each
+    footprint's own padded window, so a single call already carries every
+    station a per-footprint call would have found; _point_in_footprint
+    still restricts each footprint's own matches to its real shape. This
+    also means the whole predicate costs exactly one real network
+    round-trip regardless of footprint count, with nothing to race
+    against under concurrent calls to other validation sources.
+
+    stop_on_first_match: whether the per-footprint refinement loop below
+    stops at the first confirmed hit, matching every other predicate's
+    convention -- since refinement is now purely local (no more network
+    calls once station_ranges_dry has returned), this only trims a little
+    in-memory work, not network cost. False (the default) keeps checking
+    every footprint so the report's own matched_windows/count reflects
+    how many footprints actually have in-situ data nearby, not just "at
+    least one".
     """
     if not sar_footprints:
         return SourcePrediction(
@@ -1749,34 +2423,70 @@ def _predict_insitu(source, cfg, sar_footprints: "list[SarFootprint]") -> Source
             detail="No SAR footprints supplied -- cannot predict.",
         )
 
-    from ..downloaders.insitu_downloader import InSituDownloader
+    from ..downloaders.insitu_downloader import InSituDownloader, variables_for_recipe
 
     dl = InSituDownloader(output_dir=Path("."))
     tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, source.source_type))
-    any_available = False
 
+    union_min_lon, union_max_lon = _antimeridian_aware_lon_bounds(
+        [lon for fp in sar_footprints for lon in (fp.bbox[0], fp.bbox[1])]
+    )
+    union_min_lat = min(fp.bbox[2] for fp in sar_footprints)
+    union_max_lat = max(fp.bbox[3] for fp in sar_footprints)
+    union_start = min(fp.sensing_start for fp in sar_footprints) - tolerance
+    union_end = max(fp.sensing_end for fp in sar_footprints) + tolerance
+
+    try:
+        ranges = dl.station_ranges_dry(
+            union_min_lon, union_max_lon, union_min_lat, union_max_lat,
+            union_start.isoformat(), union_end.isoformat(),
+            source_types=[source.source_type],
+            variables=variables_for_recipe(cfg.variable),
+        )
+    except Exception:
+        logger.debug("_predict_insitu: availability check failed", exc_info=True)
+        return SourcePrediction(
+            source_type=source.source_type, bucket="ground-point", verdict="unknown",
+            detail="In-situ availability check failed.",
+        )
+
+    if not ranges:
+        return SourcePrediction(
+            source_type=source.source_type, bucket="ground-point", verdict="none-predicted",
+            detail="In-situ data not found in predicted window(s).",
+        )
+
+    matched_windows: "list[tuple[datetime, datetime]]" = []
+    matched_stations: "set[str]" = set()
     for footprint in sar_footprints:
+        if stop_on_first_match and matched_windows:
+            break
         padded_start = footprint.sensing_start - tolerance
         padded_end = footprint.sensing_end + tolerance
-        try:
-            if dl.check_availability_dry(
-                footprint.bbox[0], footprint.bbox[1], footprint.bbox[2], footprint.bbox[3],
-                padded_start.isoformat(), padded_end.isoformat(),
-                source_types=[source.source_type],
-            ):
-                any_available = True
-                break  # one confirmed hit is enough -- see _predict_model_source's identical short-circuit
-        except Exception:
-            logger.debug("_predict_insitu: availability check failed", exc_info=True)
-            return SourcePrediction(
-                source_type=source.source_type, bucket="ground-point", verdict="unknown",
-                detail="In-situ availability check failed.",
-            )
+        footprint_matched = False
+        for platform_id, (lat, lon, earliest, latest) in ranges.items():
+            if not _point_in_footprint(lat, lon, footprint, cfg.collocation.sar_footprint_radius_km):
+                continue
+            if _windows_overlap(earliest, latest, padded_start, padded_end):
+                matched_stations.add(platform_id)
+                footprint_matched = True
+        if footprint_matched:
+            matched_windows.append((padded_start, padded_end))
 
-    verdict: Verdict = "collocated" if any_available else "none-predicted"
+    if matched_windows:
+        return SourcePrediction(
+            source_type=source.source_type, bucket="ground-point", verdict="collocated",
+            detail=(
+                f"{_count_prefix(stop_on_first_match)}{len(matched_windows)} of "
+                f"{len(sar_footprints)} SAR footprint(s) with in-situ data nearby "
+                f"({len(matched_stations)} station(s))."
+                f"{_stop_early_suffix(stop_on_first_match)}"
+            ),
+            matched_windows=matched_windows, matched_stations=sorted(matched_stations),
+        )
     return SourcePrediction(
-        source_type=source.source_type, bucket="ground-point", verdict=verdict,
-        detail=f"In-situ data {'found' if any_available else 'not found'} in predicted window(s).",
+        source_type=source.source_type, bucket="ground-point", verdict="none-predicted",
+        detail="In-situ data not found in predicted window(s).",
     )
 
 
@@ -1784,7 +2494,9 @@ for _insitu_type in ("mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"):
     _PREDICATES[_insitu_type] = _predict_insitu
 
 
-def _predict_insitu_currents_historical(source, cfg, sar_footprints: "list[SarFootprint]") -> SourcePrediction:
+def _predict_insitu_currents_historical(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
     """Predicate for the four real delayed-mode in-situ currents source
     types (adcp_historical, argo_historical, drifter_historical,
     glider_historical) -- see orchestrator.py's
@@ -1809,10 +2521,23 @@ def _predict_insitu_currents_historical(source, cfg, sar_footprints: "list[SarFo
     a SarFootprint's sensing_start/sensing_end are not guaranteed
     timezone-aware.
 
-    This bucket stays bbox-only (no _point_in_footprint refinement) for
-    the same reason _predict_insitu does: check_availability_dry is a
-    single aggregate "does any data exist" boolean, with no per-platform
-    coordinates to check further.
+    Uses InSituCurrentsHistoricalDownloader.station_ranges_dry (real
+    per-station coordinates) rather than check_availability_dry's
+    boolean, so _point_in_footprint can apply the same real
+    point-vs-footprint-shape refinement _predict_insitu / _predict_ismn
+    already do -- see InSituDownloader.station_ranges_dry's own
+    docstring for why a bbox-only check over-matches.
+
+    Called exactly once here, against the union bbox/time window of
+    every eligible footprint -- see _predict_insitu's identical union
+    call for the rationale. This also means the whole predicate costs
+    exactly one real network round-trip regardless of footprint count.
+
+    stop_on_first_match: see _predict_insitu's identical parameter --
+    refinement is now purely local, so this only trims a little in-memory
+    work, not network cost. False (the default) keeps checking every
+    eligible footprint so matched_windows reflects how many actually have
+    delayed-mode currents data nearby.
     """
     from ..downloaders.insitu_currents_historical_downloader import (
         _MIN_AGE_DAYS,
@@ -1837,31 +2562,68 @@ def _predict_insitu_currents_historical(source, cfg, sar_footprints: "list[SarFo
         )
 
     dl = InSituCurrentsHistoricalDownloader(instrument=instrument, output_dir=Path("."))
-    any_available = False
+    padded_windows = [
+        (footprint, footprint.sensing_start - tolerance, footprint.sensing_end + tolerance)
+        for footprint in eligible_footprints
+    ]
 
-    for footprint in eligible_footprints:
-        padded_start = footprint.sensing_start - tolerance
-        padded_end = footprint.sensing_end + tolerance
-        try:
-            if dl.check_availability_dry(
-                footprint.bbox[0], footprint.bbox[1], footprint.bbox[2], footprint.bbox[3],
-                padded_start.isoformat(), padded_end.isoformat(),
-            ):
-                any_available = True
-                break  # one confirmed hit is enough -- see _predict_model_source's identical short-circuit
-        except Exception:
-            logger.debug(
-                "_predict_insitu_currents_historical: availability check failed", exc_info=True,
-            )
-            return SourcePrediction(
-                source_type=source.source_type, bucket="ground-point", verdict="unknown",
-                detail="Delayed-mode currents availability check failed.",
-            )
+    union_min_lon, union_max_lon = _antimeridian_aware_lon_bounds(
+        [lon for fp in eligible_footprints for lon in (fp.bbox[0], fp.bbox[1])]
+    )
+    union_min_lat = min(fp.bbox[2] for fp in eligible_footprints)
+    union_max_lat = max(fp.bbox[3] for fp in eligible_footprints)
+    union_start = min(w[1] for w in padded_windows)
+    union_end = max(w[2] for w in padded_windows)
 
-    verdict: Verdict = "collocated" if any_available else "none-predicted"
+    try:
+        ranges = dl.station_ranges_dry(
+            union_min_lon, union_max_lon, union_min_lat, union_max_lat,
+            union_start.isoformat(), union_end.isoformat(),
+        )
+    except Exception:
+        logger.debug(
+            "_predict_insitu_currents_historical: availability check failed", exc_info=True,
+        )
+        return SourcePrediction(
+            source_type=source.source_type, bucket="ground-point", verdict="unknown",
+            detail="Delayed-mode currents availability check failed.",
+        )
+
+    if not ranges:
+        return SourcePrediction(
+            source_type=source.source_type, bucket="ground-point", verdict="none-predicted",
+            detail="Delayed-mode currents data not found in predicted window(s).",
+        )
+
+    matched_windows: "list[tuple[datetime, datetime]]" = []
+    matched_stations: "set[str]" = set()
+    for footprint, padded_start, padded_end in padded_windows:
+        if stop_on_first_match and matched_windows:
+            break
+        footprint_matched = False
+        for platform_id, (lat, lon, earliest, latest) in ranges.items():
+            if not _point_in_footprint(lat, lon, footprint, cfg.collocation.sar_footprint_radius_km):
+                continue
+            if _windows_overlap(earliest, latest, padded_start, padded_end):
+                matched_stations.add(platform_id)
+                footprint_matched = True
+        if footprint_matched:
+            matched_windows.append((padded_start, padded_end))
+
+    if matched_windows:
+        return SourcePrediction(
+            source_type=source.source_type, bucket="ground-point", verdict="collocated",
+            detail=(
+                f"{_count_prefix(stop_on_first_match)}{len(matched_windows)} of "
+                f"{len(eligible_footprints)} eligible SAR footprint(s) with delayed-mode currents "
+                f"data nearby ({len(matched_stations)} station(s))."
+                f"{_stop_early_suffix(stop_on_first_match)}"
+            ),
+            matched_windows=matched_windows, matched_stations=sorted(matched_stations),
+        )
     return SourcePrediction(
-        source_type=source.source_type, bucket="ground-point", verdict=verdict,
-        detail=f"Delayed-mode currents data {'found' if any_available else 'not found'} in predicted window(s).",
+        source_type=source.source_type, bucket="ground-point", verdict="none-predicted",
+        detail="Delayed-mode currents data not found in predicted window(s).",
     )
 
 

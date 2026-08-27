@@ -1381,7 +1381,7 @@ class TestScatterometerHandlerCleansUpEmptyOutputDir:
             mock_instance.download.side_effect = fake_download
             mock_cls.return_value = mock_instance
 
-            ok = orchestrator._download_scatterometer(None)
+            ok = orchestrator._download_scatterometer_ascat(None)
 
         assert ok is True
         if expect_dir_removed:
@@ -2028,7 +2028,7 @@ class TestSarEmptyStopsPipeline:
             geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
             temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
             sar_data=SARDataSpec(source="sentinel1_l2_ocn"),
-            validation_sources=[ValidationDataSource(source_type="scatterometer")],
+            validation_sources=[ValidationDataSource(source_type="scatterometer_ascat")],
         )
         return Recipe(cfg)
 

@@ -76,7 +76,7 @@ class ValidationDataSource:
       in-situ (historical)  : adcp_historical, argo_historical,
                                drifter_historical, glider_historical
       in-situ (soil moisture): ismn
-      satellite (wind/waves) : scatterometer, scatterometer_hy2b,
+      satellite (wind/waves) : scatterometer_ascat, scatterometer_hy2b,
                                scatterometer_hy2c,
                                scatterometer_oceansat3, altimeter,
                                radiometer
@@ -89,7 +89,7 @@ class ValidationDataSource:
 
     # Optional depth filter (only used for sources downloaded via Copernicus 
     # Marine (in-situ and HF radar). None means "use DEFAULT_MIN_DEPTH/DEFAULT_MAX_DEPTH". 
-    # Left as None for source types that do not use depth (e.g. scatterometer).
+    # Left as None for source types that do not use depth (e.g. scatterometer_ascat).
     min_depth: Optional[float] = None
     max_depth: Optional[float] = None
 

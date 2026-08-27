@@ -910,7 +910,7 @@ class DataOrchestrator:
 
     def _dispatch_source(self, source) -> bool:
         handlers = {
-            "scatterometer": self._download_scatterometer,
+            "scatterometer_ascat": self._download_scatterometer_ascat,
             "scatterometer_hy2b": self._download_scatterometer_hy2b,
             "scatterometer_hy2c": self._download_scatterometer_hy2c,
             "scatterometer_oceansat3": self._download_scatterometer_oceansat3,
@@ -941,19 +941,30 @@ class DataOrchestrator:
             return False
         return handler(source)
 
-    def _download_scatterometer(self, source) -> bool:
+    def _download_scatterometer_ascat(self, source) -> bool:
         from ..downloaders.scatterometer_downloader import ScatterometerDownloader
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        # Fixed literal, not source.source_type: this handler is only ever
-        # dispatched for source_type "scatterometer" (see _dispatch_source),
-        # and some existing tests call it directly with source=None.
+        # "scatterometer", not source.source_type ("scatterometer_ascat"):
+        # this is the layer_type key (DEFAULT_LAYER_TYPE_SPECS in
+        # recipe.py), not the recipe source_type -- ASCAT's own 12.5km
+        # tolerance stays keyed "scatterometer" regardless of what the
+        # recipe-facing source_type is named, since every one of the four
+        # scatterometer source_types (ASCAT here, HY-2B/HY-2C/Oceansat-3
+        # elsewhere) is stamped with the same shared
+        # data_type="scatterometer" at conversion time (see
+        # from_scatterometer_nc in datatree_converter.py) and
+        # _resolve_layer_type only refines that into a more specific key
+        # for the three FTP-sourced satellites, never for ASCAT. This
+        # handler is only ever dispatched for source_type
+        # "scatterometer_ascat" (see _dispatch_source), and some existing
+        # tests call it directly with source=None.
         windows = self._padded_temporal_bounds("scatterometer")
         out_dir = self.base_dir / "osi_saf_winds"
 
         return self._run_download(
-            "scatterometer", out_dir,
+            "scatterometer_ascat", out_dir,
             lambda: ScatterometerDownloader(
                 output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
             ),
