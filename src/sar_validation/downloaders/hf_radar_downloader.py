@@ -165,6 +165,11 @@ class HFRadarDownloader:
         use_latest = HFR_REGIONS[region]["has_latest"] and is_date_recent(end_dt)
         dataset_part = f"{'latest' if use_latest else 'monthly'}-radar-total--{region}"
 
+        print(
+            f"  Checking HF-radar availability: region={region}  "
+            f"bbox=[{min_lon:.2f}, {max_lon:.2f}, {min_lat:.2f}, {max_lat:.2f}]  "
+            f"window={start_dt} → {end_dt}  dataset_part={dataset_part}"
+        )
         ds = copernicusmarine.open_dataset(
             dataset_id=DATASET_ID,
             dataset_part=dataset_part,

@@ -11,12 +11,24 @@ import pytest
 paramiko = pytest.importorskip("paramiko")
 
 from sar_validation.core.orbit_coverage import TleFetchError  # noqa: E402
+from sar_validation.downloaders import gportal_downloader  # noqa: E402
 from sar_validation.downloaders.gportal_downloader import (  # noqa: E402
     GPortalAMSR2Downloader,
     _connect_with_retry,
 )
 
 _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT = -10.0, 10.0, 40.0, 55.0
+
+
+@pytest.fixture(autouse=True)
+def _reset_list_candidates_cache():
+    gportal_downloader._list_candidates_cache.clear()
+    gportal_downloader._list_candidates_locks.clear()
+    gportal_downloader._product_dirs_cache.clear()
+    yield
+    gportal_downloader._list_candidates_cache.clear()
+    gportal_downloader._list_candidates_locks.clear()
+    gportal_downloader._product_dirs_cache.clear()
 
 
 class TestGPortalAMSR2DownloaderDryRun:
@@ -211,6 +223,75 @@ class TestGPortalAMSR2DownloaderDiscovery:
         mock_create_connection.assert_called_once()
         assert len(downloaded) == 2
         assert all(p.exists() for p in downloaded)
+
+    def test_amsr_e_decoy_never_listed_for_dates_after_retirement(self, tmp_path):
+        """A query entirely after _AMSR_E_RETIREMENT_DATE must never even
+        list the AMSR-E decoy directory, not just skip past it once found
+        -- saving the wasted listdir() round trip."""
+        listing = {
+            "standard": ["AQUA", "GCOM-W"],
+            "standard/AQUA": ["AQUA.AMSR-E_AMSR2Format"],
+            "standard/AQUA/AQUA.AMSR-E_AMSR2Format": ["L3.SMC_10"],
+            "standard/GCOM-W": ["GCOM-W.AMSR2"],
+            "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2026"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026": ["07"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/07": [
+                "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",
+            ],
+        }
+        sftp = self._mock_sftp(listing)
+        sftp.get.side_effect = lambda remote, local: Path(local).write_bytes(b"data")
+
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
+             patch("socket.create_connection", return_value=MagicMock()):
+            mock_transport_cls.return_value = MagicMock()
+            downloaded = dl.download(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        assert len(downloaded) == 1
+        listed_paths = [call.args[0] for call in sftp.listdir.call_args_list]
+        assert "standard/AQUA/AQUA.AMSR-E_AMSR2Format" not in listed_paths
+
+    def test_amsr_e_decoy_still_reachable_for_dates_before_retirement(self, tmp_path):
+        """A genuinely historical query (entirely before
+        _AMSR_E_RETIREMENT_DATE) must still be able to reach the AMSR-E
+        decoy directory, since it may hold real pre-retirement data."""
+        listing = {
+            "standard": ["AQUA"],
+            "standard/AQUA": ["AQUA.AMSR-E_AMSR2Format"],
+            "standard/AQUA/AQUA.AMSR-E_AMSR2Format": ["L3.SMC_10"],
+            "standard/AQUA/AQUA.AMSR-E_AMSR2Format/L3.SMC_10": ["8"],
+            "standard/AQUA/AQUA.AMSR-E_AMSR2Format/L3.SMC_10/8": ["2010"],
+            "standard/AQUA/AQUA.AMSR-E_AMSR2Format/L3.SMC_10/8/2010": ["06"],
+            "standard/AQUA/AQUA.AMSR-E_AMSR2Format/L3.SMC_10/8/2010/06": [
+                "GW1AM2_20100601_01D_EQMA_L3SGSMCLQ_2210.h5",
+            ],
+        }
+        sftp = self._mock_sftp(listing)
+        sftp.get.side_effect = lambda remote, local: Path(local).write_bytes(b"data")
+
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
+        with patch("paramiko.Transport") as mock_transport_cls, \
+             patch("paramiko.SFTPClient.from_transport", return_value=sftp), \
+             patch("socket.create_connection", return_value=MagicMock()):
+            mock_transport_cls.return_value = MagicMock()
+            downloaded = dl.download(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2010-06-01", end="2010-06-02",
+            )
+
+        assert len(downloaded) == 1
+        assert "20100601" in downloaded[0].name
 
     def test_no_confident_match_prints_listing_and_returns_empty(self, tmp_path, capsys):
         listing = {
@@ -515,6 +596,211 @@ class TestGPortalAMSR2DownloaderListCandidatesDry:
                 )
 
         mock_transport_cls.assert_not_called()  # never even attempted a connection
+
+
+class TestGPortalAMSR2DownloaderListCandidatesDryCache:
+    """list_candidates_dry's SFTP discovery is shared across calls whose
+    start/end fall in the same calendar month(s) -- see
+    _list_candidates_cache's own module-level comment. Without this, the
+    --dry-collocation-detail exhaustive per-footprint loop reconnects and
+    re-walks the whole product-directory tree once per SAR footprint."""
+
+    def _mock_sftp(self, listing_by_path: "dict[str, list[str]]"):
+        sftp = MagicMock()
+        sftp.listdir.side_effect = lambda path: listing_by_path.get(path, [])
+        return sftp
+
+    _LISTING = {
+        "standard": ["GCOM-W"],
+        "standard/GCOM-W": ["GCOM-W.AMSR2"],
+        "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+        "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
+        "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2026"],
+        "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026": ["07"],
+        "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210/2026/07": [
+            "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",
+            "GW1AM2_20260702_01D_EQMA_L3SGSMCLQ_2210.h5",
+        ],
+    }
+
+    def test_stops_at_first_directory_with_any_candidates_leaving_nrt_unqueried(self, tmp_path):
+        """Mirrors download()'s own "try each until one yields files"
+        loop: once standard/'s archive has any candidate in the cached
+        window, nrt/'s ~1-week-retention tree is never even listed for
+        that call."""
+        listing = {
+            **self._LISTING,
+            "nrt": ["GCOM-W"],
+            "nrt/GCOM-W": ["GCOM-W.AMSR2"],
+            "nrt/GCOM-W/GCOM-W.AMSR2": ["L2.SMC"],
+            "nrt/GCOM-W/GCOM-W.AMSR2/L2.SMC": [
+                "GW1AM2_20260703_01D_EQMA_L3SGSMCLQ_2210.h5",
+            ],
+        }
+        sftp = self._mock_sftp(listing)
+
+        def fake_connect(username, password):
+            return MagicMock(), sftp
+
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
+        with patch("sar_validation.downloaders.gportal_downloader._connect_with_retry", side_effect=fake_connect):
+            candidates = dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        assert len(candidates) == 2
+        listed_paths = [call.args[0] for call in sftp.listdir.call_args_list]
+        assert "nrt/GCOM-W/GCOM-W.AMSR2/L2.SMC" not in listed_paths
+
+    def test_falls_through_to_nrt_when_standard_has_no_candidates_in_window(self, tmp_path):
+        """The flip side of the "stop early" test above: when standard/'s
+        archive has nothing at all for the cached window, nrt/ must still
+        be reached, not silently skipped."""
+        listing = {
+            "standard": ["GCOM-W"],
+            "standard/GCOM-W": ["GCOM-W.AMSR2"],
+            "standard/GCOM-W/GCOM-W.AMSR2": ["L3.SM_STD"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD": ["2210"],
+            "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD/2210": ["2025"],
+            "nrt": ["GCOM-W"],
+            "nrt/GCOM-W": ["GCOM-W.AMSR2"],
+            "nrt/GCOM-W/GCOM-W.AMSR2": ["L2.SMC"],
+            "nrt/GCOM-W/GCOM-W.AMSR2/L2.SMC": [
+                "GW1AM2_20260701_01D_EQMA_L3SGSMCLQ_2210.h5",
+            ],
+        }
+        sftp = self._mock_sftp(listing)
+
+        def fake_connect(username, password):
+            return MagicMock(), sftp
+
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
+        with patch("sar_validation.downloaders.gportal_downloader._connect_with_retry", side_effect=fake_connect):
+            candidates = dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        assert len(candidates) == 1
+        assert candidates[0][0].startswith("nrt/")
+
+    def test_two_callers_with_identical_month_share_one_real_discovery(self, tmp_path):
+        sftp = self._mock_sftp(self._LISTING)
+        connect_calls = []
+
+        def fake_connect(username, password):
+            connect_calls.append((username, password))
+            return MagicMock(), sftp
+
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
+        with patch("sar_validation.downloaders.gportal_downloader._connect_with_retry", side_effect=fake_connect):
+            first = dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-01", end="2026-07-02",
+            )
+            second = dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        assert len(connect_calls) == 1
+        assert len(first) == 2
+        assert first == second
+
+    def test_different_months_are_not_shared(self, tmp_path):
+        sftp = self._mock_sftp(self._LISTING)
+        connect_calls = []
+
+        def fake_connect(username, password):
+            connect_calls.append((username, password))
+            return MagicMock(), sftp
+
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
+        with patch("sar_validation.downloaders.gportal_downloader._connect_with_retry", side_effect=fake_connect):
+            dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-01", end="2026-07-02",
+            )
+            dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-08-01", end="2026-08-02",
+            )
+
+        assert len(connect_calls) == 2
+
+    def test_product_directory_discovery_is_shared_across_different_months(self, tmp_path):
+        """_discover_product_directory's own result (which Project/Sensor/
+        Product directories hold AMSR2 data) does not depend on the
+        requested start/end at all -- it must run at most once per
+        process even though the per-month raw-candidate cache itself is
+        legitimately not shared across different calendar months (see
+        test_different_months_are_not_shared)."""
+        sftp = self._mock_sftp(self._LISTING)
+        discover_calls = []
+
+        def fake_connect(username, password):
+            return MagicMock(), sftp
+
+        real_discover = GPortalAMSR2Downloader._discover_product_directory
+
+        def counting_discover(self, sftp, exclude_amsr_e=False):
+            discover_calls.append(1)
+            return real_discover(self, sftp, exclude_amsr_e=exclude_amsr_e)
+
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
+        with patch("sar_validation.downloaders.gportal_downloader._connect_with_retry", side_effect=fake_connect), \
+             patch.object(GPortalAMSR2Downloader, "_discover_product_directory", counting_discover):
+            dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-01", end="2026-07-02",
+            )
+            dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-08-01", end="2026-08-02",
+            )
+
+        assert len(discover_calls) == 1
+
+    def test_concurrent_callers_with_identical_month_still_share_one_discovery(self, tmp_path):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        sftp = self._mock_sftp(self._LISTING)
+        connect_calls = []
+        start_barrier = threading.Barrier(2)
+
+        def fake_connect(username, password):
+            connect_calls.append((username, password))
+            return MagicMock(), sftp
+
+        def call_with_synced_start():
+            start_barrier.wait(timeout=5)
+            return dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-07-01", end="2026-07-02",
+            )
+
+        dl = GPortalAMSR2Downloader(
+            output_dir=tmp_path, username="u", password="p", orbit_prefilter=False,
+        )
+        with patch("sar_validation.downloaders.gportal_downloader._connect_with_retry", side_effect=fake_connect):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(call_with_synced_start) for _ in range(2)]
+                results = [f.result(timeout=5) for f in futures]
+
+        assert len(connect_calls) == 1
+        assert results[0] == results[1]
 
 
 class TestGPortalAMSR2DownloaderForceDownload:

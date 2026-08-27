@@ -453,6 +453,36 @@ class TestCDSSoilMoistureDownloaderCheckAvailabilityDry:
         with pytest.raises(RuntimeError, match="temporal extent"):
             dl.check_availability_dry(date(2026, 3, 15))
 
+    def test_suppresses_the_api_key_missing_warning(self, monkeypatch, tmp_path):
+        """The real ecmwf.datastores.Client warns "The API key is missing"
+        on construction regardless of whether the call that follows needs
+        one -- get_collection() is an unauthenticated metadata lookup (see
+        this method's own docstring), so that warning is just noise here,
+        not a sign anything is misconfigured."""
+        import warnings as warnings_module
+
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        fake_collection = MagicMock(
+            begin_datetime=datetime(1978, 11, 1, tzinfo=timezone.utc),
+            end_datetime=datetime(2026, 8, 10, tzinfo=timezone.utc),
+        )
+        fake_client_instance = MagicMock()
+        fake_client_instance.get_collection.return_value = fake_collection
+
+        def warning_raising_client_cls(url):
+            warnings_module.warn("The API key is missing", UserWarning)
+            return fake_client_instance
+
+        self._patch_datastores(monkeypatch, client_cls=warning_raising_client_cls)
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        with warnings_module.catch_warnings(record=True) as caught:
+            warnings_module.simplefilter("always")
+            dl.check_availability_dry(date(2026, 3, 15))
+
+        assert not any("API key is missing" in str(w.message) for w in caught)
+
 
 class TestCDSSoilMoistureDownloaderExtractNc:
     def test_extract_nc_renames_to_stable_filename(self, tmp_path):

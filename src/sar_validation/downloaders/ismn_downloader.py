@@ -41,9 +41,11 @@ import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import pandas as pd
+
+from .base import split_antimeridian_bbox
 
 logger = logging.getLogger(__name__)
 
@@ -294,6 +296,34 @@ def _extracted_subset_dir(
     fingerprint = f"{archive_path.stem}_{stat.st_size}_{int(stat.st_mtime)}"
     bbox_key = f"{min_lon:.2f}_{max_lon:.2f}_{min_lat:.2f}_{max_lat:.2f}"
     return _STATION_INDEX_CACHE_DIR / "extracted" / f"{fingerprint}_{bbox_key}"
+
+
+def _first_parseable_timestamp(lines: "Iterable[str]") -> "Optional[datetime]":
+    """The timestamp of the first line in *lines* that parses as a real
+    ISMN data row ("{date} {time} {value} {flag1} {flag2}", tab/space
+    separated), or None if none do.
+
+    ISMN's .stm format is a single station/sensor's time series written
+    in chronological order, one reading per line -- station_date_ranges_dry
+    calls this once forwards (earliest) and once on a reversed line list
+    (latest) per file, instead of parsing every single row's timestamp
+    just to take min()/max() over all of them: a real .stm file can carry
+    tens of thousands of rows (years of hourly readings), so parsing every
+    row for a bbox that matches hundreds of stations turns into millions
+    of unnecessary datetime.strptime calls. Skipping a malformed line at
+    either end (rather than stopping at the very first/last line
+    unconditionally) keeps this safe even if a file has a stray blank or
+    corrupted row at its boundary.
+    """
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            return datetime.strptime(f"{parts[0]} {parts[1]}", "%Y/%m/%d %H:%M")
+        except ValueError:
+            continue
+    return None
 
 
 def _sensor_depth_from(meta: pd.Series, default: float) -> float:
@@ -562,12 +592,19 @@ class ISMNDownloader:
         if index_df.empty:
             return {}
 
+        # An antimeridian-crossing bbox (min_lon > max_lon, this codebase's
+        # own wrap convention) needs split_antimeridian_bbox's two
+        # non-wrapping ranges OR'd together -- a plain
+        # (lon >= min_lon) & (lon <= max_lon) mask can never be True for
+        # any row when min_lon > max_lon (no value is both >= a larger
+        # number and <= a smaller one), silently matching zero stations
+        # instead of the true wrapping region.
+        lon_in_bbox = pd.Series(False, index=index_df.index)
+        for win_min_lon, win_max_lon in split_antimeridian_bbox(min_lon, max_lon):
+            lon_in_bbox |= (index_df["lon"] >= win_min_lon) & (index_df["lon"] <= win_max_lon)
         in_bbox_idx = (
             index_df["lat"].isna() | index_df["lon"].isna()
-            | (
-                (index_df["lon"] >= min_lon) & (index_df["lon"] <= max_lon)
-                & (index_df["lat"] >= min_lat) & (index_df["lat"] <= max_lat)
-            )
+            | (lon_in_bbox & (index_df["lat"] >= min_lat) & (index_df["lat"] <= max_lat))
         )
         matched = index_df.loc[in_bbox_idx]
         # One (lat, lon) per dir_prefix -- first row wins on the rare
@@ -596,20 +633,20 @@ class ISMNDownloader:
 
             ranges: "dict[str, tuple[float, float, datetime, datetime]]" = {}
             for dir_prefix, stm_names in names_by_prefix.items():
-                timestamps = []
+                earliest_per_file: "list[datetime]" = []
+                latest_per_file: "list[datetime]" = []
                 for name in stm_names:
                     with zf.open(name) as f:
                         lines = f.read().decode("utf-8", errors="replace").splitlines()
-                    for line in lines[1:]:  # skip the one header line
-                        parts = line.split()
-                        if len(parts) < 2:
-                            continue
-                        try:
-                            timestamps.append(datetime.strptime(f"{parts[0]} {parts[1]}", "%Y/%m/%d %H:%M"))
-                        except ValueError:
-                            continue
-                if timestamps:
+                    data_lines = lines[1:]  # skip the one header line
+                    earliest = _first_parseable_timestamp(data_lines)
+                    latest = _first_parseable_timestamp(reversed(data_lines))
+                    if earliest is not None:
+                        earliest_per_file.append(earliest)
+                    if latest is not None:
+                        latest_per_file.append(latest)
+                if earliest_per_file and latest_per_file:
                     lat = float(coords_by_prefix.loc[dir_prefix, "lat"])
                     lon = float(coords_by_prefix.loc[dir_prefix, "lon"])
-                    ranges[dir_prefix] = (lat, lon, min(timestamps), max(timestamps))
+                    ranges[dir_prefix] = (lat, lon, min(earliest_per_file), max(latest_per_file))
         return ranges

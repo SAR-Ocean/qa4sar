@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import warnings
 import zipfile
 from datetime import date, timedelta
 from pathlib import Path
@@ -325,8 +326,15 @@ class CDSSoilMoistureDownloader:
             ) from exc
 
         try:
-            client = ecmwf.datastores.Client(url=_CDS_API_URL)
-            collection = client.get_collection(_CDS_DATASET)
+            # get_collection() is an unauthenticated metadata lookup (see
+            # this method's own docstring), but ecmwf.datastores.Client
+            # warns "The API key is missing" on construction regardless of
+            # whether the call that follows needs one -- suppressed here
+            # since no credentials are required for this specific call.
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="The API key is missing", category=UserWarning)
+                client = ecmwf.datastores.Client(url=_CDS_API_URL)
+                collection = client.get_collection(_CDS_DATASET)
             begin = collection.begin_datetime
             end = collection.end_datetime
         except Exception:

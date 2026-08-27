@@ -31,6 +31,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -41,6 +42,17 @@ import requests
 from .base import authenticate_smos_ftp, build_output_dir, normalize_datetime
 
 __all__ = ["SMOSDownloader"]
+
+#: list_candidates_dry's own shared cache of the authenticated OADS
+#: session _login produces, keyed by (username, password). The SAML2/
+#: WSO2 SSO handshake _login performs is a real three-hop network round
+#: trip against an external identity provider, not something local or
+#: cheap to repeat -- --dry-collocation-detail's own per-footprint
+#: exhaustive scan (_predict_orbit_corridor_source) would otherwise log
+#: in from scratch once per SAR footprint in the recipe, each one an
+#: independent multi-second round trip to ESA's own IdP.
+_session_cache: "dict[tuple[str, str], requests.Session]" = {}
+_session_cache_lock = threading.Lock()
 
 OADS_BASE_URL = "https://smos-diss.eo.esa.int/oads/access"
 OADS_TREE_URL = f"{OADS_BASE_URL}/collection/NRT_Open/tree"
@@ -317,6 +329,11 @@ class SMOSDownloader:
         not used here either (see module docstring); a caller wanting
         geographic refinement should apply its own orbit-overlap check
         against the returned windows (see dry_collocation.py).
+
+        The authenticated session _login produces is shared across every
+        caller with the same (username, password) via _session_cache --
+        see that cache's own module-level comment for why this matters
+        for --dry-collocation specifically.
         """
         start_dt = normalize_datetime(start)
         end_dt = normalize_datetime(end)
@@ -326,8 +343,13 @@ class SMOSDownloader:
         day = datetime.fromisoformat(start_dt).date()
         last = datetime.fromisoformat(end_dt).date()
 
-        session = requests.Session()
-        self._login(session, username, password)
+        cache_key = (username, password)
+        with _session_cache_lock:
+            session = _session_cache.get(cache_key)
+            if session is None:
+                session = requests.Session()
+                self._login(session, username, password)
+                _session_cache[cache_key] = session
 
         candidates: "list[tuple[str, datetime, datetime]]" = []
         while day <= last:

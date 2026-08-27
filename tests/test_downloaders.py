@@ -1485,6 +1485,28 @@ class TestAltimeterDownloaderAntimeridian:
         assert kwargs["output_filename"] == "cmems_obs-wave_glo_phy-swh_nrt_al-l3_PT1S_2026-06-01_2026-06-02.nc"
         assert len(paths) == 1
 
+    def test_satellite_whose_availability_ended_before_the_window_is_skipped(self, tmp_path, capsys):
+        """h2c stopped producing data 2026-05-20 (see AVAILABILITY_END) --
+        a window entirely after that must never call subset() for it."""
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.altimeter_downloader import AltimeterDownloader
+
+        dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
+        fake_module = self._patch_subset()
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            paths = dl.download(
+                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+                start="2026-07-01", end="2026-07-02",
+                frequencies=["1hz"], satellites=["h2c"],
+            )
+
+        fake_module.subset.assert_not_called()
+        assert paths == []
+        out = capsys.readouterr().out
+        assert "Skipping" in out and "availability ended" in out
+
 
 # ---------------------------------------------------------------------------
 # InSituDownloader — antimeridian crossing

@@ -64,7 +64,7 @@ SATELLITES_1HZ = {
     "c2":   "CryoSat-2",
     "cfo":  "CFOSAT",
     "h2b":  "HaiYang-2B",
-    "h2c":  "HaiYang-2C",   # frozen since 2026-05-20; historical data still queryable
+    "h2c":  "HaiYang-2C",   # frozen -- see AVAILABILITY_END
     "j3":   "Jason-3",
     "s3a":  "Sentinel-3A",
     "s3b":  "Sentinel-3B",
@@ -108,6 +108,20 @@ AVAILABILITY_START = {
         "s3b": "2026-03-09T00:00:00",
         "s6a": "2026-03-07T00:00:00",
     },
+}
+
+# Last sensing date each satellite's ARCO/zarr store has data for -- absent
+# entries are still active (no known end date). A satellite missing here
+# is still a physically real orbiting object an orbit-based pre-filter can
+# correctly predict a ground-track crossing for, but that crossing has no
+# real observation behind it once the mission itself has stopped
+# producing data: AVAILABILITY_START alone (an inclusive lower bound) does
+# not express that upper bound.
+AVAILABILITY_END = {
+    "1hz": {
+        "h2c": "2026-05-20T00:00:00",  # frozen; historical data still queryable
+    },
+    "5hz": {},
 }
 
 VALID_FREQUENCIES = ("1hz", "5hz")
@@ -210,11 +224,20 @@ class AltimeterDownloader:
                 avail_start = AVAILABILITY_START[freq][sat_code]
                 if end_dt < avail_start:
                     continue
+                avail_end = AVAILABILITY_END[freq].get(sat_code)
+                if avail_end is not None and start_dt > avail_end:
+                    continue
                 eff_start_dt = max(start_dt, avail_start)
+                eff_end_dt = min(end_dt, avail_end) if avail_end is not None else end_dt
 
                 dataset_id = template.format(sat=sat_code)
                 for win_min_lon, win_max_lon in split_antimeridian_bbox(min_lon, max_lon):
                     any_attempted = True
+                    print(
+                        f"  Checking altimeter availability: {sat_map[sat_code]} ({freq.upper()})  "
+                        f"bbox=[{win_min_lon:.2f}, {win_max_lon:.2f}, {min_lat:.2f}, {max_lat:.2f}]  "
+                        f"window={eff_start_dt} → {eff_end_dt}  dataset={dataset_id}"
+                    )
                     try:
                         df = copernicusmarine.read_dataframe(
                             dataset_id=dataset_id,
@@ -224,7 +247,7 @@ class AltimeterDownloader:
                             minimum_latitude=min_lat,
                             maximum_latitude=max_lat,
                             start_datetime=eff_start_dt,
-                            end_datetime=end_dt,
+                            end_datetime=eff_end_dt,
                             disable_progress_bar=True,
                         )
                     except Exception:
@@ -325,11 +348,20 @@ class AltimeterDownloader:
                         f"({avail_start})."
                     )
                     continue
+                avail_end = AVAILABILITY_END[freq].get(sat_code)
+                if avail_end is not None and start_dt > avail_end:
+                    print(
+                        f"  Skipping {freq.upper()} {sat_map[sat_code]}: requested "
+                        f"window starts {start_dt}, after its availability ended "
+                        f"({avail_end})."
+                    )
+                    continue
                 eff_start_dt = max(start_dt, avail_start)
+                eff_end_dt = min(end_dt, avail_end) if avail_end is not None else end_dt
 
                 dataset_id = template.format(sat=sat_code)
                 start_d = eff_start_dt.split("T")[0]
-                end_d = end_dt.split("T")[0]
+                end_d = eff_end_dt.split("T")[0]
 
                 windows = split_antimeridian_bbox(min_lon, max_lon)
                 for i, (win_min_lon, win_max_lon) in enumerate(windows):
@@ -348,7 +380,7 @@ class AltimeterDownloader:
                     print(f"Downloading {freq.upper()} altimeter data ({sat_map[sat_code]}) …")
                     print(f"  Dataset: {dataset_id}")
                     print(f"  Region:  lon [{win_min_lon}, {win_max_lon}] lat [{min_lat}, {max_lat}]")
-                    print(f"  Time:    {eff_start_dt} → {end_dt}")
+                    print(f"  Time:    {eff_start_dt} → {eff_end_dt}")
 
                     try:
                         copernicusmarine.subset(
@@ -359,7 +391,7 @@ class AltimeterDownloader:
                             minimum_latitude=min_lat,
                             maximum_latitude=max_lat,
                             start_datetime=eff_start_dt,
-                            end_datetime=end_dt,
+                            end_datetime=eff_end_dt,
                             minimum_depth=0,
                             maximum_depth=0,
                             output_directory=self.output_dir,

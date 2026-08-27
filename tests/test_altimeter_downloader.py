@@ -105,6 +105,23 @@ class TestListCandidatesDry:
         fake_module.read_dataframe.assert_not_called()
         assert candidates == []
 
+    def test_satellite_whose_availability_ended_before_the_window_is_skipped(self, tmp_path):
+        """h2c stopped producing data 2026-05-20 (see AVAILABILITY_END) --
+        a window entirely after that must never even query it."""
+        dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
+
+        fake_module = MagicMock()
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            candidates = dl.list_candidates_dry(
+                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+                start="2026-07-01", end="2026-07-02",
+                frequencies=["1hz"], satellites=["h2c"],
+            )
+
+        fake_module.read_dataframe.assert_not_called()
+        assert candidates == []
+
     def test_raises_when_every_candidate_raises(self, tmp_path):
         """A network/auth error on every single candidate is not the same
         as a definitive "no data" answer -- unlike the legitimate

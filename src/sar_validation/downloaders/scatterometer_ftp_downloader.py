@@ -45,7 +45,7 @@ from .base import authenticate_osi_saf_ftp, build_output_dir, normalize_datetime
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ScatterometerFTPDownloader"]
+__all__ = ["ScatterometerFTPDownloader", "MAX_AGE_DAYS"]
 
 FTP_HOST = "ftppro.knmi.nl"
 
@@ -57,7 +57,7 @@ _SATELLITE_PATHS = {
 }
 
 # The FTP server only retains this many days of data.
-_MAX_AGE_DAYS = 3
+MAX_AGE_DAYS = 3
 
 _TIMESTAMP_RE = re.compile(r"(\d{8})_(\d{6})")
 
@@ -179,13 +179,13 @@ class ScatterometerFTPDownloader:
         """
         end_dt = _parse_iso_dt(normalize_datetime(end))
 
-        cutoff = datetime.now(timezone.utc) - timedelta(days=_MAX_AGE_DAYS)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
         if end_dt < cutoff:
             logger.warning(
                 "Skipping %s FTP scatterometer download: end date %s is more than "
                 "%d days old. The OSI-SAF wind FTP server only retains a rolling "
                 "%d-day window.",
-                self.satellite, end, _MAX_AGE_DAYS, _MAX_AGE_DAYS,
+                self.satellite, end, MAX_AGE_DAYS, MAX_AGE_DAYS,
             )
             return []
 
@@ -294,7 +294,7 @@ class ScatterometerFTPDownloader:
         """
         end_dt = _parse_iso_dt(normalize_datetime(end))
 
-        cutoff = datetime.now(timezone.utc) - timedelta(days=_MAX_AGE_DAYS)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
         if end_dt < cutoff:
             return []
 
