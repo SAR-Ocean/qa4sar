@@ -582,38 +582,60 @@ class PointLayerCollocation:
             pd.api.types.is_numeric_dtype(val_data_filtered[col])
         ]
 
-        # Time-sorted view used to forward-fill a NaN reading: when a
-        # validation observation is missing a value for some column, look at
-        # later observations (still within ``time_tolerance_minutes`` of the
-        # original reading) for the next one that has a valid value.
-        val_data_sorted = val_data_filtered.sort_values("time").reset_index(drop=True)
-        sorted_times_ns = pd.to_datetime(val_data_sorted["time"].values)
-        if sorted_times_ns.tz is not None:
-            sorted_times_ns = sorted_times_ns.tz_localize(None)
-        sorted_times_ns = sorted_times_ns.values.astype("datetime64[ns]")
-        n_sorted = len(val_data_sorted)
+        # Time-sorted, per-platform groups used to forward-fill a NaN
+        # reading: when a validation observation is missing a value for
+        # some column, look at THAT SAME PLATFORM's later observations
+        # (still within ``time_tolerance_minutes`` of the original
+        # reading) for the next one that has a valid value -- e.g. a
+        # mooring's own wind sensor had a brief gap, use its own next
+        # reading. Scoped to platform_id (when the column exists) rather
+        # than searched across the whole spatial+temporal window: without
+        # this, a validation point whose own platform never reports a
+        # given variable at all (e.g. a tidal gauge, which only measures
+        # water level, never wind) would silently borrow a DIFFERENT
+        # nearby platform's own reading of that variable just because it
+        # happens to fall within the same time tolerance -- corrupting
+        # the collocation with a real value from the wrong instrument
+        # rather than correctly leaving it unmatched.
+        has_platform_id = "platform_id" in val_data_filtered.columns
+        if has_platform_id:
+            _platform_groups: Dict[Any, pd.DataFrame] = {
+                platform_id: group.sort_values("time").reset_index(drop=True)
+                for platform_id, group in val_data_filtered.groupby("platform_id", sort=False)
+            }
+        else:
+            _platform_groups = {None: val_data_filtered.sort_values("time").reset_index(drop=True)}
 
-        # Per column: index of the first row at-or-after each position that
-        # holds a valid (non-NaN) value, so each lookup is a binary search
-        # instead of an O(n) scan.
-        _next_valid_idx: Dict[str, np.ndarray] = {}
+        _group_times: Dict[Any, np.ndarray] = {}
+        _next_valid_idx: Dict[Tuple[Any, str], np.ndarray] = {}
 
-        def _next_valid_value(col: str, after_time) -> Optional[float]:
-            if col not in _next_valid_idx:
-                valid = val_data_sorted[col].notna().values
-                idx = np.where(valid, np.arange(n_sorted), n_sorted)
-                _next_valid_idx[col] = np.minimum.accumulate(idx[::-1])[::-1]
+        def _next_valid_value(col: str, after_time, platform_id: Any = None) -> Optional[float]:
+            group = _platform_groups.get(platform_id)
+            if group is None or group.empty or col not in group.columns:
+                return None
+            if platform_id not in _group_times:
+                group_times = pd.to_datetime(group["time"].values)
+                if group_times.tz is not None:
+                    group_times = group_times.tz_localize(None)
+                _group_times[platform_id] = group_times.values.astype("datetime64[ns]")
+            group_times_ns = _group_times[platform_id]
+            n_group = len(group)
+            key = (platform_id, col)
+            if key not in _next_valid_idx:
+                valid = group[col].notna().values
+                idx = np.where(valid, np.arange(n_group), n_group)
+                _next_valid_idx[key] = np.minimum.accumulate(idx[::-1])[::-1]
             after_ns = np.datetime64(pd.Timestamp(after_time))
-            pos = int(np.searchsorted(sorted_times_ns, after_ns, side="right"))
-            if pos >= n_sorted:
+            pos = int(np.searchsorted(group_times_ns, after_ns, side="right"))
+            if pos >= n_group:
                 return None
-            j = int(_next_valid_idx[col][pos])
-            if j >= n_sorted:
+            j = int(_next_valid_idx[key][pos])
+            if j >= n_group:
                 return None
-            gap_min = (sorted_times_ns[j] - after_ns) / np.timedelta64(1, "m")
+            gap_min = (group_times_ns[j] - after_ns) / np.timedelta64(1, "m")
             if gap_min > self.time_tolerance_minutes:
                 return None
-            return float(val_data_sorted[col].values[j])
+            return float(group[col].values[j])
 
         # KD-tree over the SAR grid cells (unit-sphere Cartesian coordinates,
         # see _lonlat_to_unit_xyz): each validation point then queries only
@@ -634,6 +656,7 @@ class PointLayerCollocation:
             v_lon = float(val_row["lon"])
             v_lat = float(val_row["lat"])
             v_time = _to_datetime_array([val_row["time"]])[0]
+            v_platform_id = val_row["platform_id"] if has_platform_id else None
 
             # Find nearby SAR cells within aggregation window
             nearby_cells_with_dist = self._nearby_cells_with_distances(
@@ -685,7 +708,7 @@ class PointLayerCollocation:
                     if pd.notna(raw_val):
                         val_aggregated[col] = float(raw_val)
                         continue
-                    filled_val = _next_valid_value(col, v_time)
+                    filled_val = _next_valid_value(col, v_time, v_platform_id)
                     if filled_val is not None:
                         val_aggregated[col] = filled_val
 
