@@ -398,7 +398,13 @@ class GPortalAMSR2Downloader:
                 else:
                     dir_candidates = self._standard_tree_candidates(sftp, product_dir, start_dt, end_dt)
                 if dir_candidates:
+                    print(
+                        f"G-Portal: {product_dir} has {len(dir_candidates)} candidate(s) "
+                        f"for {start_dt[:7]}..{end_dt[:7]} -- stopping here, not querying "
+                        "any other discovered directory."
+                    )
                     return dir_candidates
+                print(f"G-Portal: {product_dir} has no candidates for {start_dt[:7]}..{end_dt[:7]} -- trying next.")
             return []
         finally:
             if sftp is not None:

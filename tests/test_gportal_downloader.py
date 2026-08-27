@@ -623,11 +623,14 @@ class TestGPortalAMSR2DownloaderListCandidatesDryCache:
         ],
     }
 
-    def test_stops_at_first_directory_with_any_candidates_leaving_nrt_unqueried(self, tmp_path):
+    def test_stops_at_first_directory_with_any_candidates_leaving_nrt_unqueried(self, tmp_path, capsys):
         """Mirrors download()'s own "try each until one yields files"
         loop: once standard/'s archive has any candidate in the cached
         window, nrt/'s ~1-week-retention tree is never even listed for
-        that call."""
+        that call. Also prints an explicit "stopping here" message, so
+        the discovery phase's own "discovered ... nrt/..." line (printed
+        for every matching directory regardless of whether it is later
+        queried) is never mistaken for evidence that nrt was searched."""
         listing = {
             **self._LISTING,
             "nrt": ["GCOM-W"],
@@ -655,7 +658,12 @@ class TestGPortalAMSR2DownloaderListCandidatesDryCache:
         listed_paths = [call.args[0] for call in sftp.listdir.call_args_list]
         assert "nrt/GCOM-W/GCOM-W.AMSR2/L2.SMC" not in listed_paths
 
-    def test_falls_through_to_nrt_when_standard_has_no_candidates_in_window(self, tmp_path):
+        captured = capsys.readouterr().out
+        assert "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD has 2 candidate(s)" in captured
+        assert "stopping here" in captured
+        assert "nrt/GCOM-W/GCOM-W.AMSR2/L2.SMC has" not in captured
+
+    def test_falls_through_to_nrt_when_standard_has_no_candidates_in_window(self, tmp_path, capsys):
         """The flip side of the "stop early" test above: when standard/'s
         archive has nothing at all for the cached window, nrt/ must still
         be reached, not silently skipped."""
@@ -688,6 +696,11 @@ class TestGPortalAMSR2DownloaderListCandidatesDryCache:
 
         assert len(candidates) == 1
         assert candidates[0][0].startswith("nrt/")
+
+        captured = capsys.readouterr().out
+        assert "standard/GCOM-W/GCOM-W.AMSR2/L3.SM_STD has no candidates" in captured
+        assert "trying next" in captured
+        assert "nrt/GCOM-W/GCOM-W.AMSR2/L2.SMC has 1 candidate(s)" in captured
 
     def test_two_callers_with_identical_month_share_one_real_discovery(self, tmp_path):
         sftp = self._mock_sftp(self._LISTING)
