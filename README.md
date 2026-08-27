@@ -41,8 +41,8 @@ Step 3 — Collocation + store collocated pairs
           │  layer vs. layer    (scatterometer / altimeter / radiometer / HF-radar vs. SAR)
           |  model vs. layer    (ERA5 / HYCOM vs. SAR)
           |  create a collocation diagnostics plot
-          |  --dry-collocation previews this step's predicted collocation before 
-          |  running steps 1-2 (download/convert)
+          |  --dry-collocation and --dry-collocation-detail preview the predicted collocation 
+          |  before running steps 1-2 (download/convert)
           │  store collocated data + spatial/temporal offset metadata
           ▼
 Step 4 — Compute statistics
@@ -130,13 +130,26 @@ sar-validate --create-recipe soil_moisture
 This writes a YAML recipe to `recipes/<name>_validation.yaml`.  
 Edit the file to adjust the geographic region, time window, and validation sources.
 
-### 3. Dry-run (check what will be downloaded)
+### 3a. Dry-run (check what will be downloaded)
 
 ```bash
 sar-validate --recipe recipes/wind_validation.yaml --dry-run
 ```
 
-### 4. Execute (download all data)
+### 3b. Dry-collocation (check whether there would be any collocation prior to downloading)
+
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --dry-collocation
+```
+
+To get more details on the number of collocated pairs predicted, run
+
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --dry-collocation-detail
+```
+
+### 4. Execute
+To only download the data:
 
 ```bash
 sar-validate --recipe recipes/wind_validation.yaml
@@ -144,39 +157,50 @@ sar-validate --recipe recipes/wind_validation.yaml
 
 Downloads are saved under `data/<timerange>_<bounds>/`.
 
-### 5. Convert, collocate, and analyse (Python)
+To run all steps of the toolbox at once:
 
-```python
-from sar_validation.core.datatree_converter import DataTreeConverter
-from sar_validation.core.collocation import PointLayerCollocation
-import xarray as xr
-import pandas as pd
-
-# --- Step 2: convert ---
-converter = DataTreeConverter()
-ds_sar    = converter.from_sar_l2_ocn_safe("data/.../S1_L2_OCN/S1A_IW_OCN_...SAFE", product_type="wind")
-ds_insitu = converter.from_insitu_csv("data/.../copernicus_insitu_data/obs.csv", source_type="buoy")
-
-# --- Step 3: collocate and store as DataFrame ---
-colloc = PointLayerCollocation(spatial_tolerance_km=50, time_tolerance_minutes=60)
-results = colloc.collocate(
-    sar_data={"wind_speed": sar_ws_array},
-    sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-    val_data=df_insitu,
-    val_source="buoy",
-)
-df = DataTreeConverter.to_dataframe(results)
-df.to_csv("data/.../collocations_wind_buoy.csv", index=False)
-
-# --- Step 4: calculate statistics ---
-
-# --- Step 5: visualize and create PDF report ---
-import matplotlib.pyplot as plt
-plt.scatter(df["val_wind_speed"], df["sar_wind_speed"])
-plt.xlabel("Buoy wind speed (m/s)")
-plt.ylabel("SAR wind speed (m/s)")
-plt.show()
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --plot
 ```
+
+### 5. Convert, collocate, and analyse
+
+**Step 2 — convert and store as a DataTree:**
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --convert
+```
+The datatree is saved under `data/<timerange>_<bounds>/datatree.nc`.
+
+**Step 3 — collocate and store as a Dataset:**
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --collocate
+```
+
+Standard layer-vs-layer collocation method uses cell-averaging for SAR data. If you want each individual SAR cell to be linked to validation data, use:
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --collocate --layer-vs-layer-collocation-method individual
+```
+
+or to include both options:
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --collocate --layer-vs-layer-collocation-method both
+```
+
+The collocation results are saved under `data/<timerange>_<bounds>/collocation_results.nc` and/or `data/<timerange>_<bounds>/collocation_results_individual.nc`.
+
+**Step 4 — calculate statistics:**
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --stats
+```
+
+The statistics are saved under `data/<timerange>_<bounds>/validation_statistics_<sar_var>_vs_<val_var>.nc/.csv`.
+
+**Step 5 — visualize and create PDF report:**
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --plot
+```
+
+The validation report is saved under `data/<timerange>_<bounds>/validation_report.pdf`.
 
 ---
 
