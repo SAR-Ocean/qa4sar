@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import xarray as xr
 
-from sar_validation.core._cf_metadata import annotate_collocation_ds, INSITU_VARIABLE_ATTRS
+from sar_validation.core._cf_metadata import INSITU_VARIABLE_ATTRS, annotate_collocation_ds
 from sar_validation.core.datatree_converter import DataTreeConverter
 
 
