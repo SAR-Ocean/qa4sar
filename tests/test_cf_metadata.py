@@ -5,8 +5,19 @@ from __future__ import annotations
 import numpy as np
 import xarray as xr
 
-from sar_validation.core._cf_metadata import annotate_collocation_ds
+from sar_validation.core._cf_metadata import annotate_collocation_ds, INSITU_VARIABLE_ATTRS
 from sar_validation.core.datatree_converter import DataTreeConverter
+
+
+class TestInsituQcVariableAttrs:
+    def test_every_qc_bearing_parameter_has_registered_attrs(self):
+        for code in ("WSPD", "WDIR", "EWCT", "NSCT", "HCSP", "HCDT", "VHM0", "VAVH", "VGHS"):
+            qc_key = f"{code}_QC"
+            assert qc_key in INSITU_VARIABLE_ATTRS, f"missing CF attrs for {qc_key}"
+            attrs = INSITU_VARIABLE_ATTRS[qc_key]
+            assert attrs["standard_name"] == "status_flag"
+            assert attrs["flag_values"] == "0 1 2 3 4 5 6 7 8 9"
+            assert len(attrs["flag_meanings"].split()) == 10
 
 
 def _datatree_with_mixed_units_sources():

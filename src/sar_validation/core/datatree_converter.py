@@ -47,6 +47,14 @@ _ASCAT_REJECT_FLAGS = {
     "distance_to_gmf_too_large",
 }
 
+# The Copernicus Marine In Situ TAC quality-control scale is 0-9; a value
+# is considered usable when its QC code is 1 ("good data"), 2 ("probably
+# good data"), 5 ("value changed", still good), 7 ("nominal value"), or 8
+# ("interpolated value"). Every other code -- including a missing one --
+# marks the value as unusable. Shared by from_insitu_csv (per-parameter
+# value_qc) and from_hf_radar_grid (the overall QCflag).
+_VALID_QC_CODES = frozenset({1, 2, 5, 7, 8})
+
 #: ERA5 variable metadata per recipe variable -- raw CDS/NetCDF short
 #: names, the data_type tag stamped on the result, and CF-ish attrs. Kept
 #: gridded since ModelLayerCollocation interpolates it directly onto SAR
