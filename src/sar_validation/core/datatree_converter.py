@@ -710,20 +710,49 @@ class DataTreeConverter:
                 c for c in ("platform_id", "platform_type", "time", "lon", "lat", "depth")
                 if c in df.columns
             ]
+            has_qc = "value_qc" in df.columns
             df = (
                 df.pivot_table(
                     index=pivot_id_cols,
                     columns="variable",
-                    values="value",
+                    values=["value", "value_qc"] if has_qc else "value",
                     aggfunc="first",
+                    # A variable whose QC code is entirely missing (NaN)
+                    # must still surface an all-NaN "<code>_QC" column so
+                    # the filter below can reject it; pivot_table's default
+                    # of dropping all-NaN columns would otherwise hide that
+                    # a QC code was never present.
+                    dropna=not has_qc,
                 )
                 .reset_index()
             )
-            df.columns.name = None  # remove the "variable" MultiIndex label
+            if has_qc:
+                # Flatten the two-level ("value"|"value_qc", <code>) columns
+                # to "<code>" and "<code>_QC"; id columns keep their name
+                # (their second level is empty).
+                df.columns = [
+                    top if var == "" else (var if top == "value" else f"{var}_QC")
+                    for top, var in df.columns
+                ]
+            else:
+                df.columns.name = None  # remove the "variable" MultiIndex label
             logger.debug(
                 "Pivoted in-situ CSV to wide format; variable columns: %s",
                 [c for c in df.columns if c not in pivot_id_cols],
             )
+
+        # A parameter is only usable when its own QC code is one CMEMS
+        # defines as valid (see _VALID_QC_CODES); anything else -- including
+        # a missing QC code -- nulls the value and its QC column together,
+        # so a value is never shown without a trustworthy QC code, and no
+        # QC code is left next to a missing value. Applies to every
+        # parameter that has a "<code>_QC" companion column, whatever that
+        # parameter is (wind, currents, waves, ...).
+        for qc_col in [c for c in df.columns if c.endswith("_QC") and c[:-3] in df.columns]:
+            col = qc_col[:-3]
+            bad = ~df[qc_col].isin(_VALID_QC_CODES)
+            df.loc[bad, col] = np.nan
+            df.loc[bad, qc_col] = np.nan
 
         # Derive eastward/northward current components from speed + direction
         # when the direct components are absent or all-NaN.

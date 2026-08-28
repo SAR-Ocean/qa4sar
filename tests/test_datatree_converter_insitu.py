@@ -93,3 +93,59 @@ class TestEwctNsctDerivation:
         ewct = ds["EWCT"].values
         assert ewct[0] == pytest.approx(0.5, abs=1e-9)
         assert math.isnan(ewct[1])
+
+
+class TestDerivationRespectsInputQc:
+    def test_bad_hcsp_qc_blocks_derivation(self, tmp_path):
+        df = pd.DataFrame({
+            "longitude": [0.0],
+            "latitude": [50.0],
+            "time": ["2026-01-01T00:00:00"],
+            "HCSP": [1.0],
+            "HCSP_QC": [4],
+            "HCDT": [90.0],
+            "HCDT_QC": [1],
+        })
+        path = _write_csv(tmp_path, df)
+
+        ds = DataTreeConverter.from_insitu_csv(path, source_type="mooring")
+
+        assert ds is not None
+        assert np.isnan(ds["EWCT"].values[0])
+        assert np.isnan(ds["NSCT"].values[0])
+
+    def test_bad_hcdt_qc_blocks_derivation(self, tmp_path):
+        df = pd.DataFrame({
+            "longitude": [0.0],
+            "latitude": [50.0],
+            "time": ["2026-01-01T00:00:00"],
+            "HCSP": [1.0],
+            "HCSP_QC": [1],
+            "HCDT": [90.0],
+            "HCDT_QC": [4],
+        })
+        path = _write_csv(tmp_path, df)
+
+        ds = DataTreeConverter.from_insitu_csv(path, source_type="mooring")
+
+        assert ds is not None
+        assert np.isnan(ds["EWCT"].values[0])
+        assert np.isnan(ds["NSCT"].values[0])
+
+    def test_good_hcsp_and_hcdt_qc_allows_derivation(self, tmp_path):
+        df = pd.DataFrame({
+            "longitude": [0.0],
+            "latitude": [50.0],
+            "time": ["2026-01-01T00:00:00"],
+            "HCSP": [1.0],
+            "HCSP_QC": [1],
+            "HCDT": [90.0],
+            "HCDT_QC": [2],
+        })
+        path = _write_csv(tmp_path, df)
+
+        ds = DataTreeConverter.from_insitu_csv(path, source_type="mooring")
+
+        assert ds is not None
+        assert ds["EWCT"].values[0] == pytest.approx(1.0, abs=1e-9)
+        assert ds["NSCT"].values[0] == pytest.approx(0.0, abs=1e-9)
