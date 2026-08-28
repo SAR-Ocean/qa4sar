@@ -3508,15 +3508,17 @@ class DataTreeConverter:
                 else np.full_like(owi_windspeed, np.nan)
             )
 
+            has_owi_wind_quality = "owiWindQuality" in ds_raw
             owi_windquality = (
                 ds_raw["owiWindQuality"].values
-                if "owiWindQuality" in ds_raw
+                if has_owi_wind_quality
                 else np.full_like(owi_windspeed, np.nan)
             )
 
+            has_owi_inversion_quality = "owiInversionQuality" in ds_raw
             owi_inversion_quality = (
                 ds_raw["owiInversionQuality"].values
-                if "owiInversionQuality" in ds_raw
+                if has_owi_inversion_quality
                 else np.full_like(owi_windspeed, np.nan)
             )
 
@@ -3548,6 +3550,35 @@ class DataTreeConverter:
                         safe_dir.name, owi_land_pixel_count, land_mask.size,
                         100 * owi_land_pixel_fraction,
                     )
+
+            # Quality-flag masking. owiWindQuality (0-3) and
+            # owiInversionQuality (0-2) each rate the wind retrieval; 0/1
+            # (good/medium) are trusted, 2/3 (low/poor) are not. A flag
+            # missing from the product entirely never rejects a cell. When
+            # both flags are present, a NaN in only one of them is judged
+            # by the other; a cell NaN in both is rejected.
+            quality_reject = np.zeros(owi_windspeed.shape, dtype=bool)
+            if has_owi_wind_quality:
+                quality_reject |= owi_windquality >= 2
+            if has_owi_inversion_quality:
+                quality_reject |= owi_inversion_quality >= 2
+            if has_owi_wind_quality and has_owi_inversion_quality:
+                quality_reject |= np.isnan(owi_windquality) & np.isnan(owi_inversion_quality)
+
+            owi_quality_masked_pixel_count = int(np.sum(quality_reject))
+            owi_quality_masked_pixel_fraction = (
+                owi_quality_masked_pixel_count / quality_reject.size
+            )
+            if owi_quality_masked_pixel_count > 0:
+                owi_windspeed = np.where(quality_reject, np.nan, owi_windspeed)
+                owi_winddir = np.where(quality_reject, np.nan, owi_winddir)
+                logger.warning(
+                    "scene %s: %d/%d OWI cells quality-flagged (%.1f%%) via "
+                    "owiWindQuality/owiInversionQuality -- owiWindSpeed/"
+                    "owiWindDirection NaN'd out",
+                    safe_dir.name, owi_quality_masked_pixel_count,
+                    quality_reject.size, 100 * owi_quality_masked_pixel_fraction,
+                )
 
             # Get acquisition time (scalar for grid)
             time_str = ds_raw.attrs.get("firstMeasurementTime")
@@ -3600,6 +3631,8 @@ class DataTreeConverter:
             ds.attrs["swath_mode"] = "IW/EW/SM"
             ds.attrs["owi_land_pixel_count"] = owi_land_pixel_count
             ds.attrs["owi_land_pixel_fraction"] = owi_land_pixel_fraction
+            ds.attrs["owi_quality_masked_pixel_count"] = owi_quality_masked_pixel_count
+            ds.attrs["owi_quality_masked_pixel_fraction"] = owi_quality_masked_pixel_fraction
 
             logger.info(
                 "Extracted OWI data from product %s (grid shape: %s)",

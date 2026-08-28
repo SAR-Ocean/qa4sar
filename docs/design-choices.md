@@ -627,6 +627,8 @@ see Task 14.
   where an ocean/land mask would be nonsensical (the whole point of that
   request is land).
 
+**`owiWindQuality`/`owiInversionQuality` gate OWI wind retrievals, independently of `owiMask`.** `_extract_owi_grid_data` NaNs out `owiWindSpeed`/`owiWindDirection` wherever either flag reports low/poor quality (`owiWindQuality` >= 2, `owiInversionQuality` >= 2), on top of the land masking above. A flag that is simply missing for one cell (present in the product but NaN there) does not reject that cell by itself — the other flag governs, since a real-data check across every cached OCN product found approximately 135,000 valid, non-land cells where `owiWindQuality` is NaN but the retrieval itself is fine (the metric was simply never computed for that cell). A cell is only rejected on NaN grounds when both flags are present in the product and both are NaN for that cell. A flag that is entirely absent from the product (not the "some cells are NaN" case, but the variable does not exist at all) never contributes to rejection, so older products carrying only one flag, or neither, are handled the same way regardless of when this masking was added. Counts and fractions are tracked separately from land masking, as `owi_quality_masked_pixel_count`/`owi_quality_masked_pixel_fraction`.
+
 **`u10`/`v10` stay raw through conversion; `WSPD`/`WDIR` are derived only
 after interpolation.** Every other validation source is renamed to the
 canonical `WSPD`/`WDIR` codes at conversion time (§2). ERA5 wind is the
