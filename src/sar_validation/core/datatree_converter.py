@@ -3514,6 +3514,12 @@ class DataTreeConverter:
                 else np.full_like(owi_windspeed, np.nan)
             )
 
+            owi_inversion_quality = (
+                ds_raw["owiInversionQuality"].values
+                if "owiInversionQuality" in ds_raw
+                else np.full_like(owi_windspeed, np.nan)
+            )
+
             owi_mask = (
                 ds_raw["owiMask"].values
                 if "owiMask" in ds_raw
@@ -3571,6 +3577,7 @@ class DataTreeConverter:
                 "owiIncidenceAngle": (dims, owi_incidence),
                 "owiHeading": (dims, owi_heading),
                 "owiWindQuality": (dims, owi_windquality),
+                "owiInversionQuality": (dims, owi_inversion_quality),
                 "owiMask": (dims, owi_mask),
             }
 

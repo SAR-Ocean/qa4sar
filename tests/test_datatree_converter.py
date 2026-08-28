@@ -1736,6 +1736,62 @@ class TestOwiMaskLandFiltering:
         assert ds.attrs["owi_land_pixel_count"] == 0
 
 
+class TestOwiInversionQualityPassthrough:
+    def test_inversion_quality_extracted_and_passed_through(self, tmp_path):
+        ny, nx = 2, 2
+        rng = np.random.default_rng(3)
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        raw_iq = np.array([[0.0, 1.0], [1.0, 0.0]], dtype="float32")
+        ds_raw = xr.Dataset(
+            {
+                "owiWindSpeed": (odims, rng.uniform(2, 15, (ny, nx)).astype("float32")),
+                "owiWindDirection": (odims, rng.uniform(0, 360, (ny, nx)).astype("float32")),
+                "owiLon": (odims, rng.uniform(-20.0, -19.0, (ny, nx)).astype("float32")),
+                "owiLat": (odims, rng.uniform(50.0, 51.0, (ny, nx)).astype("float32")),
+                "owiInversionQuality": (odims, raw_iq),
+            },
+            attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
+        )
+        ds_raw.to_netcdf(
+            meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+
+        assert ds is not None
+        assert "owiInversionQuality" in ds.data_vars
+        np.testing.assert_array_equal(ds["owiInversionQuality"].values, raw_iq)
+
+    def test_inversion_quality_absent_defaults_to_nan(self, tmp_path):
+        ny, nx = 2, 2
+        rng = np.random.default_rng(4)
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        ds_raw = xr.Dataset(
+            {
+                "owiWindSpeed": (odims, rng.uniform(2, 15, (ny, nx)).astype("float32")),
+                "owiWindDirection": (odims, rng.uniform(0, 360, (ny, nx)).astype("float32")),
+                "owiLon": (odims, rng.uniform(-20.0, -19.0, (ny, nx)).astype("float32")),
+                "owiLat": (odims, rng.uniform(50.0, 51.0, (ny, nx)).astype("float32")),
+            },
+            attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
+        )
+        ds_raw.to_netcdf(
+            meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+
+        assert ds is not None
+        assert "owiInversionQuality" in ds.data_vars
+        assert np.isnan(ds["owiInversionQuality"].values).all()
+
+
 # ---------------------------------------------------------------------------
 # from_sar_l2_ocn_safe (WV product type routing)
 # ---------------------------------------------------------------------------
