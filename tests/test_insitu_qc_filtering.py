@@ -103,3 +103,31 @@ class TestCsvWithoutValueQcColumnIsUnaffected:
         assert ds is not None
         assert ds["WSPD"].values[0] == pytest.approx(12.3)
         assert "WSPD_QC" not in ds
+
+
+class TestWaveHeightPrecedenceAfterQcFiltering:
+    def test_qc_bad_higher_precedence_column_falls_back_to_next(self, tmp_path):
+        path = _write_long_csv(tmp_path, [
+            _row("VHM0", 1.1, 4),
+            _row("VAVH", 1.0, 1),
+        ])
+
+        ds = DataTreeConverter.from_insitu_csv(path, source_type="buoy")
+
+        assert ds is not None
+        assert np.isnan(ds["VHM0"].values[0])
+        assert ds["VAVH"].values[0] == pytest.approx(1.0)
+        assert ds["VAVH_QC"].values[0] == 1
+
+    def test_qc_good_higher_precedence_column_still_wins(self, tmp_path):
+        path = _write_long_csv(tmp_path, [
+            _row("VHM0", 1.1, 1),
+            _row("VAVH", 1.0, 1),
+        ])
+
+        ds = DataTreeConverter.from_insitu_csv(path, source_type="buoy")
+
+        assert ds is not None
+        assert ds["VHM0"].values[0] == pytest.approx(1.1)
+        assert np.isnan(ds["VAVH"].values[0])
+        assert np.isnan(ds["VAVH_QC"].values[0])

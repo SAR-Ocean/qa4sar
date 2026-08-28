@@ -778,7 +778,11 @@ class DataTreeConverter:
             claimed = pd.Series(False, index=df.index)
             for col in wave_height_cols:
                 has_val = df[col].notna()
-                df.loc[claimed & has_val, col] = np.nan
+                overridden = claimed & has_val
+                df.loc[overridden, col] = np.nan
+                qc_col = f"{col}_QC"
+                if qc_col in df.columns:
+                    df.loc[overridden, qc_col] = np.nan
                 claimed = claimed | has_val
 
         coord_cols = {"lon", "lat", "time", "platform_id", "platform_type"}
