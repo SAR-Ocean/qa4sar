@@ -65,6 +65,7 @@ Thumbs.db
 docs/*
 !docs/design-choices.md
 !docs/rvlHeading_considerations.md   
+!docs/QC_flags_implementation.md
 
 # Superpowers documentation
 AGENTS.md
