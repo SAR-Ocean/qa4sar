@@ -232,16 +232,63 @@ Copernicus's incomplete re-ingestion of it), and a later, separate decision
 that stopped at ERDDAP-only NOAA coverage (superseded once the THREDDS
 archive backend was added) — see `docs/superpowers/specs/` for that
 reasoning's full history. Separately, and independent of which backend is
-used, all Copernicus HF-radar data (US or not) now drops cells where the
-overall `QCflag == 4` ("bad") — Copernicus ships them unfiltered, and this
-toolbox previously retained them uncritically; per-parameter flags
-(`CSPD_QC` etc.) remain retained but unused.
+used, all Copernicus HF-radar data (US or not) now keeps only cells whose
+overall `QCflag` is one of `{1, 2, 5, 7, 8}` — CMEMS's own definition of a
+valid QC code, shared with the in-situ filter in §3.7 — since Copernicus
+ships every code unfiltered; per-parameter flags (`CSPD_QC` etc.) remain
+retained but unused.
 
 > Code: `downloaders/hf_radar_us_downloader.py` (`HFRadarUSDownloader.download()`),
 > `downloaders/noaa_hfradar_thredds_downloader.py`
 > (`NOAATHREDDSHFRadarDownloader`), `core/orchestrator.py`
 > (`_download_hf_radar_us`), `core/datatree_converter.py`
 > (`from_hf_radar_grid`'s `QCflag` filter).
+
+---
+
+### 3.7 In-situ and HF-radar QC-flag filtering
+
+Copernicus Marine's In Situ TAC ships a `value_qc` code (0–9) alongside
+every observation, and CMEMS's own QC Procedure document defines a valid
+value as one whose code is 1 ("good data"), 2 ("probably good data"), 5
+("value changed", still good), 7 ("nominal value"), or 8 ("interpolated
+value"); the remaining codes (0 "no QC performed", 3 "bad, potentially
+correctable", 4 "bad", 6 "unused", 9 "missing") mark a value unusable.
+`from_insitu_csv` applies this set, `{1, 2, 5, 7, 8}`, to every parameter
+that carries a `_QC` companion column — currently WSPD, WDIR, EWCT, NSCT,
+HCSP, HCDT, VHM0, VAVH, and VGHS — rather than a hardcoded per-family list,
+so a value and its QC code are always nulled together and never appear one
+without the other.
+
+**Why wind is included:** CMEMS's own product documentation
+(`CMEMS-INS-QUID-013-030-036`) states that the In Situ TAC applies no
+additional quality control of its own to meteorological parameters like
+wind — it preserves whatever the original data provider reported.
+Provider-sourced quality control values are nonetheless real rather than
+placeholders, and can include bad codes for wind speed and direction.
+Since the same generic filter already covers every `_QC`-bearing column,
+wind receives this benefit without any additional code.
+
+**Derivation gating:** `EWCT`/`NSCT` derived from `HCSP`+`HCDT` (when the
+direct components are absent) inherit their inputs' QC state automatically
+— once a bad-QC `HCSP` or `HCDT` value is nulled, the derivation's own
+arithmetic (`HCSP * sin/cos(HCDT)`) propagates that `NaN` into the derived
+component without any extra gating logic.
+
+**Wave-height precedence interacts with QC:** the existing
+VHM0-over-VAVH-over-VGHS precedence rule (§5.8) runs after QC filtering, so
+a QC-bad `VHM0` no longer blocks a QC-good `VAVH` from being chosen for
+that observation; when precedence overrides a column, its `_QC` companion
+is nulled with it.
+
+**HF-radar:** the same `{1, 2, 5, 7, 8}` set widens `from_hf_radar_grid`'s
+overall `QCflag` filter (§3.6) from excluding only code 4 to keeping only
+the valid set — code 0 ("no QC performed") is common enough in practice
+that excluding only 4 let a meaningful share of untested cells through.
+
+> Code: `core/datatree_converter.py` (`_VALID_QC_CODES`, `from_insitu_csv`'s
+> per-column QC filter, `from_hf_radar_grid`'s `QCflag` filter),
+> `core/_cf_metadata.py` (`INSITU_VARIABLE_ATTRS`'s `_QC` entries).
 
 ---
 
