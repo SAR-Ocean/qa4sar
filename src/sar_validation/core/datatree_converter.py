@@ -2313,9 +2313,10 @@ class DataTreeConverter:
         (``CSPD_QC``, ``DDNS_QC``, ``GDOP_QC``, ``VART_QC``,
         ``POSITION_QC``) to its own ``hfr_qc_<param>`` field — these remain
         retained but unused. The overall ``QCflag`` is copied to ``hfr_qc``
-        AND used to drop cells where it equals 4 ("bad"); NOAA's product has
-        no equivalent flag (it filters upstream before publishing), so this
-        has no effect on NOAA-sourced files.
+        and used to keep only cells whose code is one of CMEMS's valid QC
+        codes (1, 2, 5, 7, or 8); NOAA's product has no equivalent flag (it
+        filters upstream before publishing), so this has no effect on
+        NOAA-sourced files.
 
         Returns
         -------
@@ -2428,12 +2429,12 @@ class DataTreeConverter:
             data_vars["hfr_qc"] = ("point", qc_flat)
             var_attrs["hfr_qc"] = {
                 "long_name": "HF-radar overall QC flag",
-                "comment": "Cells where this equals 4 (\"bad\") are excluded below.",
+                "comment": "Cells whose code is not 1, 2, 5, 7, or 8 are excluded below.",
             }
         # Per-parameter QC flags (Copernicus radar-total product): each one
-        # is retained under its own field rather than folded into hfr_qc, so
-        # a future QC phase can filter per-parameter instead of only on the
-        # overall flag.
+        # is retained under its own field rather than folded into hfr_qc,
+        # for reference. Only the overall QCflag (below) is currently used
+        # to exclude cells.
         for src, param in (
             ("CSPD_QC", "cspd"), ("DDNS_QC", "ddns"), ("GDOP_QC", "gdop"),
             ("VART_QC", "vart"), ("POSITION_QC", "position"),
@@ -2443,15 +2444,16 @@ class DataTreeConverter:
                 data_vars[dst] = ("point", _flat(src))
                 var_attrs[dst] = {
                     "long_name": f"HF-radar {param} QC flag",
-                    "comment": "Retained for a future HF-radar QC filter (design §3.7).",
+                    "comment": "Not currently used to exclude cells.",
                 }
 
         # Drop points where both current components are NaN (masked
-        # land/gaps), or where the overall QCflag marks the cell "bad" (4).
-        # Per-parameter QC flags (CSPD_QC etc.) remain retained but unused.
+        # land/gaps), or where the overall QCflag is not one of CMEMS's
+        # valid QC codes. Per-parameter QC flags (CSPD_QC etc.) remain
+        # retained but unused.
         valid = np.isfinite(ewct) | np.isfinite(nsct)
         if qc_flat is not None:
-            valid &= qc_flat != 4
+            valid &= np.isin(qc_flat, list(_VALID_QC_CODES))
         if not np.any(valid):
             logger.warning("from_hf_radar_grid: all cells NaN or QC-bad in %s.", nc_path.name)
             raw.close()

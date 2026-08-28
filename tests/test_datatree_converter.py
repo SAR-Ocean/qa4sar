@@ -2784,6 +2784,32 @@ class TestFromHfRadarGridQCFlagFilter:
         assert sorted(np.round(result["EWCT"].values, 1).tolist()) == [1.0, 4.0, 5.0, 6.0]
         assert all(q != 4 for q in result["hfr_qc"].values)
 
+    def test_drops_qcflag_untested_cells(self, tmp_path):
+        times = pd.date_range("2026-06-01", periods=1, freq="1h")
+        lats = np.array([10.0, 11.0])
+        lons = np.array([20.0, 21.0])
+        ewct = np.array([[[1.0, 2.0], [3.0, 4.0]]])
+        nsct = np.array([[[0.1, 0.2], [0.3, 0.4]]])
+        # QCflag=0 ("no QC performed") is not one of CMEMS's valid codes
+        # (1, 2, 5, 7, 8) even though it is not 4 ("bad") either.
+        qcflag = np.array([[[0.0, 1.0], [2.0, 5.0]]])
+        ds = xr.Dataset(
+            {
+                "EWCT": (("time", "latitude", "longitude"), ewct),
+                "NSCT": (("time", "latitude", "longitude"), nsct),
+                "QCflag": (("time", "latitude", "longitude"), qcflag),
+            },
+            coords={"time": times, "latitude": lats, "longitude": lons},
+        )
+        path = tmp_path / "cop_qc_untested_test.nc"
+        ds.to_netcdf(path)
+
+        result = DataTreeConverter.from_hf_radar_grid(path, u_var="EWCT", v_var="NSCT")
+
+        assert result is not None
+        assert result.sizes["point"] == 3
+        assert 0.0 not in result["hfr_qc"].values
+
     def test_noaa_style_file_without_qcflag_is_unaffected(self, tmp_path):
         times = pd.date_range("2026-06-01", periods=1, freq="1h")
         lats = np.array([10.0, 11.0])
