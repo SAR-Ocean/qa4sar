@@ -44,7 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -291,6 +291,79 @@ class RadiometerDownloader:
 
         print(f"  {sensor} {day.isoformat()}: no file available (404), skipped.")
         return None
+
+    def check_exists_dry(self, day: date, sensors: Optional[Iterable[str]] = None) -> bool:
+        """
+        Whether any requested sensor's daily file exists for *day*, without
+        downloading it.
+
+        Mirrors :meth:`download`'s own per-day candidate-URL construction
+        (dated file, then the ``rt_file`` near-real-time fallback), but
+        issues a HEAD request per candidate instead of a streamed GET.
+        ``allow_redirects=True`` is passed explicitly since ``requests``
+        itself defaults HEAD to no redirect-following -- without it, a
+        future RSS server redirect would silently look like "not found".
+
+        A candidate raising ``requests.RequestException`` (DNS failure,
+        connection refused, timeout) is not a definitive "doesn't exist"
+        answer, unlike a real HTTP response (200 or 404) -- if every
+        attempted candidate across every requested sensor raises, this
+        method can't tell whether the data exists or not, so it raises
+        rather than returning a false ``False``. Callers must treat an
+        exception here as "couldn't determine", never as "no data".
+
+        Parameters
+        ----------
+        day : date
+            The single day to check (no date range).
+        sensors : iterable of str, optional
+            Restrict to these sensor keys (see :data:`SENSORS`). None
+            (default) means every currently-supported sensor.
+
+        Returns
+        -------
+        bool
+            True as soon as any candidate URL, for any requested sensor,
+            responds with HTTP 200.
+        """
+        requested = list(sensors) if sensors else list(SUPPORTED_SENSORS)
+        any_attempted = False
+        any_definitive = False
+        for sensor in requested:
+            cfg = SENSORS.get(sensor)
+            if cfg is None or not cfg.get("url_path"):
+                continue
+
+            avail_start = cfg.get("availability_start")
+            if avail_start and datetime.fromisoformat(avail_start).date() > day:
+                continue
+
+            fields = {"Y": f"{day.year:04d}", "m": f"{day.month:02d}", "d": f"{day.day:02d}"}
+            candidates = [
+                f"{BASE_URL}/{cfg['url_path'].format(**fields)}/{cfg['file'].format(**fields)}",
+            ]
+            if cfg.get("rt_url_path"):
+                candidates.append(
+                    f"{BASE_URL}/{cfg['rt_url_path'].format(**fields)}/{cfg['rt_file'].format(**fields)}",
+                )
+
+            for url in candidates:
+                any_attempted = True
+                try:
+                    resp = requests.head(url, timeout=30, allow_redirects=True)
+                except requests.RequestException:
+                    continue
+                any_definitive = True
+                if resp.status_code == 200:
+                    return True
+
+        if any_attempted and not any_definitive:
+            raise RuntimeError(
+                f"check_exists_dry: every candidate URL request failed for "
+                f"{day.isoformat()} -- couldn't determine radiometer availability "
+                f"(network/DNS/timeout error on every attempt)."
+            )
+        return False
 
 
 # ---------------------------------------------------------------------------

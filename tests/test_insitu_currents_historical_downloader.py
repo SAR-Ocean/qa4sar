@@ -6,14 +6,37 @@ import logging
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
 import pytest
 
 from sar_validation.downloaders.insitu_currents_historical_downloader import (
     _DATASET_IDS,
+    _VARIABLES,
     InSituCurrentsHistoricalDownloader,
 )
 
 _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT = -20.0, 0.0, 35.0, 60.0
+
+
+class _FakeCopernicusMarineModule:
+    """Minimal stand-in for the copernicusmarine module, exposing just
+    the read_dataframe() call _fetch_stations_dry uses -- mirrors
+    InSituDownloader's own test fixture of the same name
+    (test_insitu_downloader.py). rows (a list of dicts, one per
+    observation row) overrides the plain EWCT/NSCT default entirely, for
+    station_ranges_dry tests needing real platform_id/time/lat/lon
+    columns."""
+
+    def __init__(self, has_data: bool, rows: "list[dict] | None" = None):
+        self._has_data = has_data
+        self._rows = rows
+
+    def read_dataframe(self, **kwargs):
+        if not self._has_data:
+            return pd.DataFrame()
+        if self._rows is not None:
+            return pd.DataFrame(self._rows)
+        return pd.DataFrame({"EWCT": [0.1], "NSCT": [0.2]})
 
 
 class TestConstruction:
@@ -193,6 +216,132 @@ class TestForceDownload:
 
         fake_module.subset.assert_not_called()
         assert out == [dest_path]
+
+
+class TestCheckAvailabilityDry:
+    def test_returns_true_when_data_exists(self, tmp_path):
+        fake_module = _FakeCopernicusMarineModule(has_data=True)
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="adcp", output_dir=tmp_path)
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            result = dl.check_availability_dry(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2024-01-01T00:00:00", "2024-01-02T00:00:00",
+            )
+
+        assert result is True
+
+    def test_returns_false_when_no_data(self, tmp_path):
+        fake_module = _FakeCopernicusMarineModule(has_data=False)
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="argo", output_dir=tmp_path)
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            result = dl.check_availability_dry(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2024-01-01T00:00:00", "2024-01-02T00:00:00",
+            )
+
+        assert result is False
+
+    def test_queries_correct_dataset_id_and_variables(self, tmp_path):
+        fake_module = MagicMock()
+        fake_module.read_dataframe.return_value = pd.DataFrame({"EWCT": [0.1]})
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="glider", output_dir=tmp_path)
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            dl.check_availability_dry(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2024-01-01T00:00:00", "2024-01-02T00:00:00",
+            )
+
+        kwargs = fake_module.read_dataframe.call_args.kwargs
+        assert kwargs["dataset_id"] == _DATASET_IDS["glider"]
+        assert kwargs["variables"] == _VARIABLES
+
+    def test_no_file_written_to_disk(self, tmp_path):
+        """check_availability_dry must not create anything under
+        output_dir -- it's a pure in-memory existence check."""
+        fake_module = _FakeCopernicusMarineModule(has_data=True)
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="drifter", output_dir=tmp_path)
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            dl.check_availability_dry(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2024-01-01T00:00:00", "2024-01-02T00:00:00",
+            )
+
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestStationRangesDry:
+    """station_ranges_dry keeps real per-station coordinates instead of
+    check_availability_dry's boolean collapse -- see
+    InSituDownloader.station_ranges_dry's identical rationale
+    (test_insitu_downloader.py)."""
+
+    def test_empty_result_returns_empty_dict(self, tmp_path):
+        fake_module = _FakeCopernicusMarineModule(has_data=False)
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="adcp", output_dir=tmp_path)
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            ranges = dl.station_ranges_dry(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2024-01-01T00:00:00", "2024-01-02T00:00:00",
+            )
+
+        assert ranges == {}
+
+    def test_single_station_single_observation(self, tmp_path):
+        fake_module = _FakeCopernicusMarineModule(has_data=True, rows=[
+            {"platform_id": "P1", "longitude": -10.0, "latitude": 45.0, "time": "2024-01-01T06:00:00"},
+        ])
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="adcp", output_dir=tmp_path)
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            ranges = dl.station_ranges_dry(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2024-01-01T00:00:00", "2024-01-02T00:00:00",
+            )
+
+        assert list(ranges.keys()) == ["P1"]
+        lat, lon, earliest, latest = ranges["P1"]
+        assert (lat, lon) == (45.0, -10.0)
+        assert earliest == latest
+
+    def test_multiple_observations_for_one_station_collapse_to_its_own_range(self, tmp_path):
+        fake_module = _FakeCopernicusMarineModule(has_data=True, rows=[
+            {"platform_id": "P1", "longitude": -10.0, "latitude": 45.0, "time": "2024-01-01T00:00:00"},
+            {"platform_id": "P1", "longitude": -10.0, "latitude": 45.0, "time": "2024-01-01T12:00:00"},
+        ])
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="argo", output_dir=tmp_path)
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            ranges = dl.station_ranges_dry(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2024-01-01T00:00:00", "2024-01-02T00:00:00",
+            )
+
+        assert list(ranges.keys()) == ["P1"]
+        _lat, _lon, earliest, latest = ranges["P1"]
+        assert earliest.isoformat() == "2024-01-01T00:00:00"
+        assert latest.isoformat() == "2024-01-01T12:00:00"
+
+    def test_multiple_distinct_stations_each_get_their_own_entry(self, tmp_path):
+        fake_module = _FakeCopernicusMarineModule(has_data=True, rows=[
+            {"platform_id": "P1", "longitude": -10.0, "latitude": 45.0, "time": "2024-01-01T00:00:00"},
+            {"platform_id": "P2", "longitude": -5.0, "latitude": 50.0, "time": "2024-01-01T06:00:00"},
+        ])
+
+        dl = InSituCurrentsHistoricalDownloader(instrument="drifter", output_dir=tmp_path)
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            ranges = dl.station_ranges_dry(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2024-01-01T00:00:00", "2024-01-02T00:00:00",
+            )
+
+        assert set(ranges.keys()) == {"P1", "P2"}
+        assert ranges["P1"][:2] == (45.0, -10.0)
+        assert ranges["P2"][:2] == (50.0, -5.0)
 
 
 class TestDryRun:

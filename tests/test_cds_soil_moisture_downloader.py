@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 import zipfile
-from datetime import date
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -338,6 +338,150 @@ class TestCDSSoilMoistureDownloaderCdrIcdrFallback:
         assert result is None
         assert fake_client.retrieve.call_count == 2
         assert dl._had_request_failure is True
+
+
+class TestCDSSoilMoistureDownloaderCheckAvailabilityDry:
+    """check_availability_dry is a fast, unauthenticated existence probe for
+    dry-collocation prediction -- queries the CDS catalogue's live
+    collection-metadata endpoint (``ecmwf.datastores.Client.get_collection``)
+    for this dataset's real temporal extent, rather than submitting a real
+    CDR/ICDR processing job the way ``_download_day`` does."""
+
+    @staticmethod
+    def _patch_datastores(monkeypatch, begin=None, end=None, client_cls=None):
+        """Install a fake ``ecmwf.datastores`` module in sys.modules whose
+        Client(...).get_collection(...) returns a fake Collection exposing
+        begin_datetime/end_datetime. Returns (fake_client_cls,
+        fake_client_instance) so tests can assert on construction/calls."""
+        fake_collection = MagicMock(begin_datetime=begin, end_datetime=end)
+        fake_client_instance = MagicMock()
+        fake_client_instance.get_collection.return_value = fake_collection
+        fake_client_cls = client_cls or MagicMock(return_value=fake_client_instance)
+
+        fake_datastores_module = MagicMock()
+        fake_datastores_module.Client = fake_client_cls
+
+        fake_ecmwf_module = MagicMock()
+        fake_ecmwf_module.datastores = fake_datastores_module
+
+        monkeypatch.setitem(sys.modules, "ecmwf", fake_ecmwf_module)
+        monkeypatch.setitem(sys.modules, "ecmwf.datastores", fake_datastores_module)
+        return fake_client_cls, fake_client_instance
+
+    def test_true_when_day_falls_within_live_extent(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        self._patch_datastores(
+            monkeypatch,
+            begin=datetime(1978, 11, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 10, tzinfo=timezone.utc),
+        )
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        assert dl.check_availability_dry(date(2026, 3, 15)) is True
+
+    def test_false_when_day_falls_outside_live_extent(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        self._patch_datastores(
+            monkeypatch,
+            begin=datetime(1978, 11, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 10, tzinfo=timezone.utc),
+        )
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        assert dl.check_availability_dry(date(2026, 9, 1)) is False
+
+    def test_queries_the_right_dataset_and_never_downloads(self, monkeypatch, tmp_path):
+        from sar_validation.downloaders.cds_soil_moisture_downloader import (
+            _CDS_DATASET,
+            CDSSoilMoistureDownloader,
+        )
+
+        _fake_cls, fake_client = self._patch_datastores(
+            monkeypatch,
+            begin=datetime(1978, 11, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 8, 10, tzinfo=timezone.utc),
+        )
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        dl.check_availability_dry(date(2026, 3, 15))
+
+        fake_client.get_collection.assert_called_once_with(_CDS_DATASET)
+        # No blocking CDR/ICDR processing job is ever submitted.
+        fake_client.retrieve.assert_not_called()
+
+    def test_raises_when_catalogue_lookup_fails(self, monkeypatch, tmp_path):
+        """A network/auth/API error while querying the catalogue (e.g. no
+        connectivity, or the endpoint itself erroring) must propagate --
+        never be swallowed into False -- so _predict_global_composite's own
+        exception handling is what converts it to an 'unknown' verdict,
+        never a false 'none-predicted'."""
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        failing_client_cls = MagicMock(side_effect=RuntimeError("connection refused"))
+        self._patch_datastores(monkeypatch, client_cls=failing_client_cls)
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        with pytest.raises(RuntimeError, match="connection refused"):
+            dl.check_availability_dry(date(2026, 3, 15))
+
+    def test_raises_when_ecmwf_datastores_not_installed(self, monkeypatch, tmp_path):
+        """Previously, a missing cdsapi/ecmwf-datastores-client dependency,
+        or any cdsapi auth/connection failure (e.g. no ~/.cdsapirc
+        configured -- the single most likely real-world case), was swallowed
+        into a false 'no data' result. It must now propagate as an
+        ImportError so the caller's own exception handling produces
+        'unknown', never a false 'none-predicted'."""
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        monkeypatch.setitem(sys.modules, "ecmwf.datastores", None)
+
+        with pytest.raises(ImportError):
+            dl.check_availability_dry(date(2026, 3, 15))
+
+    def test_raises_when_catalogue_extent_is_missing(self, monkeypatch, tmp_path):
+        """A malformed/incomplete catalogue response (no usable
+        begin/end datetime) can't answer the "does data exist" question
+        either -- this must raise, not silently return False."""
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        self._patch_datastores(monkeypatch, begin=None, end=None)
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        with pytest.raises(RuntimeError, match="temporal extent"):
+            dl.check_availability_dry(date(2026, 3, 15))
+
+    def test_suppresses_the_api_key_missing_warning(self, monkeypatch, tmp_path):
+        """The real ecmwf.datastores.Client warns "The API key is missing"
+        on construction regardless of whether the call that follows needs
+        one -- get_collection() is an unauthenticated metadata lookup (see
+        this method's own docstring), so that warning is just noise here,
+        not a sign anything is misconfigured."""
+        import warnings as warnings_module
+
+        from sar_validation.downloaders.cds_soil_moisture_downloader import CDSSoilMoistureDownloader
+
+        fake_collection = MagicMock(
+            begin_datetime=datetime(1978, 11, 1, tzinfo=timezone.utc),
+            end_datetime=datetime(2026, 8, 10, tzinfo=timezone.utc),
+        )
+        fake_client_instance = MagicMock()
+        fake_client_instance.get_collection.return_value = fake_collection
+
+        def warning_raising_client_cls(url):
+            warnings_module.warn("The API key is missing", UserWarning)
+            return fake_client_instance
+
+        self._patch_datastores(monkeypatch, client_cls=warning_raising_client_cls)
+
+        dl = CDSSoilMoistureDownloader(product_type="active", output_dir=tmp_path)
+        with warnings_module.catch_warnings(record=True) as caught:
+            warnings_module.simplefilter("always")
+            dl.check_availability_dry(date(2026, 3, 15))
+
+        assert not any("API key is missing" in str(w.message) for w in caught)
 
 
 class TestCDSSoilMoistureDownloaderExtractNc:

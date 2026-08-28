@@ -6,6 +6,12 @@ that satellite's ground track could have passed near a given
 bounding box, so a downloader with no server-side bbox filter can
 skip clearly irrelevant files before downloading them.
 
+Also provides a windowed, polygon-aware variant, orbit_overlap_windows,
+which returns every matching sub-window (instead of a single bool) and
+can test against a true footprint polygon instead of just its bounding
+box -- needed for wide-window sources (e.g. AMSR2's whole-day window)
+where "yes, sometime today" alone isn't useful.
+
 Fails open on any prediction failure (unregistered satellite,
 unavailable TLE, propagation error), since this is only a pre-filter
 to reduce unnecessary downloads, not a substitute for the real
@@ -18,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,6 +41,9 @@ __all__ = [
     "TleFetchError",
     "get_tle",
     "orbit_overlaps_bbox",
+    "orbit_overlap_windows",
+    "sample_ground_track",
+    "match_ground_track",
 ]
 
 _EARTH_RADIUS_KM = 6371.0
@@ -96,14 +106,54 @@ SATELLITE_ORBIT_SPECS: Dict[str, SatelliteOrbitSpec] = {
     "gcom-w1": SatelliteOrbitSpec(norad_id=38337, swath_half_width_km=800.0),
     # SMOS (MIRAS interferometric radiometer, hexagonal FOV).
     "smos": SatelliteOrbitSpec(norad_id=36036, swath_half_width_km=525.0),
+    # Sentinel-1A/B/C (C-SAR, IW mode). 1B is kept registered even though
+    # deactivated, since a recipe can validate SAR data from before its
+    # deactivation date. Swath width: IW mode's documented 250km --
+    # Sentinel-1's SAR instrument images one side of the ground track
+    # only (unlike ASCAT/HY-2's genuinely two-sided swaths), so treating
+    # 250km as the per-side half-width (checking both sides via this
+    # module's existing bearing +/- 90 sweep) is a deliberate,
+    # conservative over-inclusion, consistent with every other entry in
+    # this dict.
+    "sentinel-1a": SatelliteOrbitSpec(norad_id=39634, swath_half_width_km=250.0),
+    "sentinel-1b": SatelliteOrbitSpec(norad_id=41456, swath_half_width_km=250.0),
+    "sentinel-1c": SatelliteOrbitSpec(norad_id=62261, swath_half_width_km=250.0),
+    # Along-track altimeters (WAVE_GLO_PHY_SWH_L3_NRT_014_001 -- see
+    # altimeter_downloader.py's SATELLITES_1HZ). Nadir-pointing, not a real
+    # wide swath like ASCAT/HY-2/Sentinel-1 above: the actual pulse-limited
+    # footprint is only a few km across, so swath_half_width_km models that
+    # narrow footprint rather than a genuine swath. dry_collocation.py's
+    # altimeter predicate overrides match_ground_track's own margin_km
+    # default down from 100 (a wide-swath-appropriate buffer) to a value
+    # sized for this narrow instrument instead -- see
+    # _predict_altimeter's own docstring.
+    "jason-3": SatelliteOrbitSpec(norad_id=41240, swath_half_width_km=8.0),
+    "cryosat-2": SatelliteOrbitSpec(norad_id=36508, swath_half_width_km=8.0),
+    "saral": SatelliteOrbitSpec(norad_id=39086, swath_half_width_km=8.0),
+    "cfosat": SatelliteOrbitSpec(norad_id=43662, swath_half_width_km=8.0),
+    "sentinel-3a": SatelliteOrbitSpec(norad_id=41335, swath_half_width_km=8.0),
+    "sentinel-3b": SatelliteOrbitSpec(norad_id=43437, swath_half_width_km=8.0),
+    "sentinel-6a": SatelliteOrbitSpec(norad_id=46984, swath_half_width_km=8.0),
+    "swot": SatelliteOrbitSpec(norad_id=54754, swath_half_width_km=8.0),
+    # HaiYang-2B/2C's own *altimeter* payload -- a separate, much narrower
+    # instrument from the "hy2b"/"hy2c" entries above, which model that
+    # same satellite's HSCAT *scatterometer* payload (900km half-width).
+    # Reusing "hy2b"/"hy2c" for the altimeter predicate would silently
+    # treat every altimeter pass as if it had a ~1000km-wide search
+    # corridor instead of ~8km, hence these separate keys. Same NORAD ID
+    # as "hy2b"/"hy2c" (same physical satellite, orbit propagation
+    # doesn't depend on which payload is being modeled).
+    "hy2b-altimeter": SatelliteOrbitSpec(norad_id=43655, swath_half_width_km=8.0),
+    "hy2c-altimeter": SatelliteOrbitSpec(norad_id=46469, swath_half_width_km=8.0),
 }
 
 
 class TleFetchError(Exception):
     """
     Raised when no usable historical TLE can be obtained for a given
-    satellite/time -- callers (orbit_overlaps_bbox) must treat this as
-    "cannot predict, fail open", never propagate it as a hard error.
+    satellite/time -- callers (orbit_overlaps_bbox and
+    orbit_overlap_windows) must treat this as "cannot predict, fail
+    open", never propagate it as a hard error.
     """
 
 
@@ -149,6 +199,72 @@ def _destination_point(
     )
     lon2 = (math.degrees(lambda2) + 540.0) % 360.0 - 180.0  # normalize to [-180, 180)
     return math.degrees(phi2), lon2
+
+
+def _haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance (km, spherical Earth) between two points.
+    Used for target_point matching -- a genuine point target (a single WV
+    vignette) has zero area, so the bbox/polygon containment sweep
+    _region_contains relies on can never match it (it would need an
+    exact floating-point coordinate equality); a direct distance
+    comparison against max_offset_km is both correct and, since it skips
+    the cross-track sweep's own repeated _destination_point calls
+    entirely, cheaper."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * _EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+
+
+def _point_to_great_circle_segment_distance_km(
+    lat: float, lon: float, lat1: float, lon1: float, lat2: float, lon2: float,
+) -> float:
+    """Distance (km) from (lat, lon) to the great-circle *segment* from
+    (lat1, lon1) to (lat2, lon2) -- not the infinite great circle through
+    both points, the finite stretch between them, spherical Earth.
+
+    Two consecutive propagated ground-track samples are far enough apart
+    (seconds to tens of seconds at orbital speed, tens to a hundred+ km)
+    that a target point's true closest approach to the continuous track
+    routinely falls between them, not at either sample itself -- checking
+    only distance-to-sample (_haversine_distance_km at each sample) can
+    miss a real crossing entirely if it happens between samples, however
+    finely samples are spaced. This checks distance to the whole segment
+    a pair of consecutive samples approximates, which is what a caller
+    matching against a narrow-margin point target (e.g. altimeter) needs
+    to avoid that gap without increasing propagation density.
+
+    Standard cross-track/along-track-distance construction (Aviation
+    Formulary / Movable Type Scripts' "Cross-track distance" reference):
+    if the closest point on the *infinite* great circle through (lat1,
+    lon1)/(lat2, lon2) falls beyond either endpoint, the true minimum to
+    the *segment* is the distance to whichever endpoint is nearer
+    instead.
+    """
+    d13 = _haversine_distance_km(lat1, lon1, lat, lon)
+    d12 = _haversine_distance_km(lat1, lon1, lat2, lon2)
+    if d12 == 0.0:
+        return d13
+    theta13 = math.radians(_bearing_deg(lat1, lon1, lat, lon))
+    theta12 = math.radians(_bearing_deg(lat1, lon1, lat2, lon2))
+    if math.cos(theta13 - theta12) < 0:
+        # The point's closest approach to the infinite great circle falls
+        # behind (lat1, lon1), opposite the (lat1,lon1)->(lat2,lon2)
+        # direction -- outside the segment, so the segment's own nearer
+        # endpoint (lat1, lon1) is the true minimum.
+        return d13
+    delta13 = d13 / _EARTH_RADIUS_KM
+    dxt = math.asin(
+        max(-1.0, min(1.0, math.sin(delta13) * math.sin(theta13 - theta12)))
+    ) * _EARTH_RADIUS_KM
+    cos_dat = math.cos(delta13) / math.cos(dxt / _EARTH_RADIUS_KM)
+    dat = math.acos(max(-1.0, min(1.0, cos_dat))) * _EARTH_RADIUS_KM
+    if dat > d12:
+        # Closest approach falls beyond (lat2, lon2) -- that endpoint is
+        # the true minimum instead.
+        return _haversine_distance_km(lat2, lon2, lat, lon)
+    return abs(dxt)
 
 
 def _cache_path(cache_dir: Path, satellite: str, day) -> Path:
@@ -304,6 +420,51 @@ def _point_in_bbox(
     return any(lo <= lon <= hi for lo, hi in split_antimeridian_bbox(min_lon, max_lon))
 
 
+def _point_in_polygon(lat: float, lon: float, polygon: "list[tuple[float, float]]") -> bool:
+    """Standard even-odd ray-casting point-in-polygon test. *polygon* is a
+    list of (lat, lon) vertices; it does not need to be explicitly closed
+    (the last vertex need not repeat the first).
+
+    Antimeridian-crossing polygons (a real case in this codebase -- see
+    the antimeridian-crossing support already in downloaders/base.py's
+    split_antimeridian_bbox) are handled by shifting every negative
+    longitude -- both the polygon's own vertices and the test point -- by
+    +360 degrees first, whenever the polygon's own longitude span exceeds
+    180 degrees (the signal that it wraps through the seam rather than
+    genuinely spanning most of the globe, since no real SAR/validation
+    footprint is that wide). This runs the ray-casting math in one
+    continuous, unwrapped frame instead of jumping across +/-180.
+
+    Fails open (returns True) on degenerate input -- fewer than 3
+    vertices isn't a real polygon, and this module's convention
+    throughout is to fail OPEN (assume overlap) rather than closed
+    whenever something can't be genuinely evaluated. This matters
+    because callers outside this module may call _point_in_polygon
+    directly with no surrounding try/except of their own.
+    """
+    if len(polygon) < 3:
+        return True
+
+    lons = [v[1] for v in polygon]
+    if (max(lons) - min(lons)) > 180.0:
+        polygon = [(plat, plon + 360.0 if plon < 0.0 else plon) for plat, plon in polygon]
+        if lon < 0.0:
+            lon = lon + 360.0
+
+    inside = False
+    n = len(polygon)
+    j = n - 1
+    for i in range(n):
+        lat_i, lon_i = polygon[i]
+        lat_j, lon_j = polygon[j]
+        if (lat_i > lat) != (lat_j > lat):
+            lon_intercept = (lon_j - lon_i) * (lat - lat_i) / (lat_j - lat_i) + lon_i
+            if lon < lon_intercept:
+                inside = not inside
+        j = i
+    return inside
+
+
 def orbit_overlaps_bbox(
     satellite: str,
     sensing_start: datetime,
@@ -391,3 +552,290 @@ def orbit_overlaps_bbox(
             "orbit_overlaps_bbox: propagation failed for %s, failing open.", satellite, exc_info=True,
         )
         return True
+
+
+def _region_contains(
+    lat: float, lon: float,
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    polygon: "Optional[list[tuple[float, float]]]",
+) -> bool:
+    """bbox is always checked first (a cheap O(1) reject). Only when the
+    bbox check passes is polygon (if supplied) checked too.
+
+    IMPORTANT: the bbox is a superset of polygon (and so never causes a
+    false negative) ONLY when min_lon/max_lon use the same wrap
+    convention _point_in_bbox/split_antimeridian_bbox require -- i.e.
+    min_lon > max_lon signals a region that crosses the antimeridian.
+    _point_in_polygon detects wrapping completely differently (whether
+    the polygon's OWN vertices span more than 180 degrees of longitude).
+    A bbox derived the "obvious" way -- min(lons), max(lons) taken
+    directly over a wrapping polygon's vertices -- does NOT use the wrap
+    convention and produces the WRONG region: points genuinely inside
+    the polygon can test as outside the AND'd (bbox and polygon) region,
+    a real false negative. Callers passing a polygon that may cross the
+    antimeridian must derive min_lon/max_lon using the wrap convention,
+    not a naive min/max over the polygon's vertices."""
+    if not _point_in_bbox(lat, lon, min_lon, max_lon, min_lat, max_lat):
+        return False
+    if polygon is not None:
+        return _point_in_polygon(lat, lon, polygon)
+    return True
+
+
+def sample_ground_track(
+    satellite: str,
+    sensing_start: datetime,
+    sensing_end: datetime,
+    sample_interval_s: float = 15.0,
+    cache_dir: Optional[Path] = None,
+) -> "list[tuple[datetime, float, float]]":
+    """(time, lat, lon) for *satellite*'s predicted ground track, sampled
+    every sample_interval_s across [sensing_start, sensing_end] (plus one
+    trailing sample exactly at sensing_end).
+
+    Pure propagation -- no target region, and no fail-open behavior:
+    raises TleFetchError (no usable historical TLE) or whatever pyorbital
+    itself raises on a genuine propagation failure. Deliberately a
+    separate step from match_ground_track's target-matching logic: SGP4
+    propagation depends only on (satellite, time), never on the target
+    region, so a caller checking many different target regions against
+    the same satellite over an overlapping time range (e.g. many SAR
+    footprints whose padded windows all fall on the same day) can call
+    this once over the union of those windows and reuse the result via
+    match_ground_track, instead of re-propagating per target the way a
+    naive per-footprint orbit_overlap_windows loop would. Propagation is
+    the dominant cost of a single orbit_overlap_windows call, so sharing
+    it this way is what makes a large-footprint-count caller (e.g.
+    altimeter's dry-collocation predicate, checking up to ~10 missions
+    against every SAR footprint) tractable.
+    """
+    from pyorbital.orbital import Orbital
+
+    line1, line2 = get_tle(satellite, sensing_start, cache_dir=cache_dir)
+    orb = Orbital(satellite.upper(), line1=line1, line2=line2)
+
+    samples: "list[tuple[datetime, float, float]]" = []
+    t = sensing_start
+    step = timedelta(seconds=sample_interval_s)
+    while t <= sensing_end:
+        lon, lat, _alt = orb.get_lonlatalt(t)
+        samples.append((t, lat, lon))
+        t = t + step
+    if not samples or samples[-1][0] < sensing_end:
+        lon, lat, _alt = orb.get_lonlatalt(sensing_end)
+        samples.append((sensing_end, lat, lon))
+    return samples
+
+
+def match_ground_track(
+    samples: "list[tuple[datetime, float, float]]",
+    satellite: str,
+    sensing_start: datetime,
+    sensing_end: datetime,
+    min_lon: float,
+    max_lon: float,
+    min_lat: float,
+    max_lat: float,
+    polygon: "Optional[list[tuple[float, float]]]" = None,
+    margin_km: float = 100.0,
+    sample_interval_s: float = 15.0,
+    target_point: "Optional[tuple[float, float]]" = None,
+) -> "list[tuple[datetime, datetime]]":
+    """Every sub-window within [sensing_start, sensing_end] where
+    *samples* (see sample_ground_track) falls within *satellite*'s swath
+    of the given target region -- the matching half of what a single
+    orbit_overlap_windows call does, split out so many different target
+    regions can reuse one shared, already-propagated samples array
+    instead of each re-running SGP4 for their own narrower window.
+
+    *samples* must cover at least [sensing_start, sensing_end]; only
+    samples falling within that sub-window are ever reported as part of
+    a matched window (samples strictly outside it -- e.g. from a wider
+    shared array spanning many callers' own windows -- are used only to
+    derive a heading at the boundary, via the same one-neighbor lookup
+    orbit_overlap_windows itself uses, never reported as a match
+    themselves).
+
+    target_point, when given, checks each sample's distance to that
+    single (lat, lon) directly (via _haversine_distance_km) instead of
+    the bbox/polygon containment sweep, and min_lon/max_lon/min_lat/
+    max_lat/polygon are ignored -- a genuine point target has zero area,
+    so the containment sweep (built for area targets) would need an
+    exact floating-point coordinate match to ever succeed. Use this for
+    a single WV vignette or other point-like target; use the bbox/
+    polygon arguments for anything with real spatial extent.
+
+    Same fail-open contract as orbit_overlap_windows: an unregistered
+    satellite, or too few in-range (plus immediate neighbor) samples to
+    derive a heading from, returns the whole [sensing_start, sensing_end]
+    window unfiltered -- see its docstring for the full rationale
+    (matched-window padding, antimeridian precondition on min_lon/max_lon).
+    """
+    spec = SATELLITE_ORBIT_SPECS.get(satellite)
+    if spec is None:
+        return [(sensing_start, sensing_end)]
+
+    lo = bisect_left(samples, sensing_start, key=lambda s: s[0])
+    hi = bisect_right(samples, sensing_end, key=lambda s: s[0])
+    window_samples = samples[max(0, lo - 1):min(len(samples), hi + 1)]
+
+    if len(window_samples) < 2:
+        # Degenerate window -- no adjacent sample to derive a heading
+        # from, matching orbit_overlaps_bbox's fail-open behavior for
+        # this same case.
+        return [(sensing_start, sensing_end)]
+
+    max_offset_km = spec.swath_half_width_km + margin_km
+
+    if target_point is not None:
+        # Checking distance-to-sample alone would miss a real crossing
+        # that happens between two consecutive samples (seconds apart in
+        # time, tens to a hundred+ km apart at orbital speed) -- also
+        # checking distance to the great-circle segment each consecutive
+        # pair approximates closes that gap without denser propagation.
+        target_lat, target_lon = target_point
+        matched = [False] * len(window_samples)
+        for i, (_t, lat, lon) in enumerate(window_samples):
+            if _haversine_distance_km(lat, lon, target_lat, target_lon) <= max_offset_km:
+                matched[i] = True
+            if i + 1 < len(window_samples):
+                _next_t, next_lat, next_lon = window_samples[i + 1]
+                seg_dist = _point_to_great_circle_segment_distance_km(
+                    target_lat, target_lon, lat, lon, next_lat, next_lon,
+                )
+                if seg_dist <= max_offset_km:
+                    matched[i] = True
+                    matched[i + 1] = True
+    else:
+        # Mirrors orbit_overlaps_bbox's sampling/sweep; keep in sync.
+        _CROSS_TRACK_STEP_KM = 50.0
+        n_steps = max(1, math.ceil(max_offset_km / _CROSS_TRACK_STEP_KM))
+        sweep_distances_km = [max_offset_km * (i / n_steps) for i in range(1, n_steps + 1)]
+
+        matched = [False] * len(window_samples)
+        for i, (_t, lat, lon) in enumerate(window_samples):
+            if _region_contains(lat, lon, min_lon, max_lon, min_lat, max_lat, polygon):
+                matched[i] = True
+                continue
+            if i + 1 < len(window_samples):
+                _next_t, next_lat, next_lon = window_samples[i + 1]
+                heading = _bearing_deg(lat, lon, next_lat, next_lon)
+            else:
+                _prev_t, prev_lat, prev_lon = window_samples[i - 1]
+                heading = _bearing_deg(prev_lat, prev_lon, lat, lon)
+            for side_bearing in (heading + 90.0, heading - 90.0):
+                for dist in sweep_distances_km:
+                    swept_lat, swept_lon = _destination_point(lat, lon, side_bearing, dist)
+                    if _region_contains(swept_lat, swept_lon, min_lon, max_lon, min_lat, max_lat, polygon):
+                        matched[i] = True
+                        break
+                if matched[i]:
+                    break
+
+    # Context samples (kept only so an in-range sample at the very edge
+    # still has a neighbor to derive a heading from) must never
+    # themselves start or end a reported window.
+    for i, (t, _lat, _lon) in enumerate(window_samples):
+        if t < sensing_start or t > sensing_end:
+            matched[i] = False
+
+    windows: "list[tuple[datetime, datetime]]" = []
+    i = 0
+    n = len(window_samples)
+    while i < n:
+        if not matched[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and matched[j + 1]:
+            j += 1
+        window_start = max(sensing_start, window_samples[i][0] - timedelta(seconds=sample_interval_s))
+        window_end = min(sensing_end, window_samples[j][0] + timedelta(seconds=sample_interval_s))
+        windows.append((window_start, window_end))
+        i = j + 1
+    return windows
+
+
+def orbit_overlap_windows(
+    satellite: str,
+    sensing_start: datetime,
+    sensing_end: datetime,
+    min_lon: float,
+    max_lon: float,
+    min_lat: float,
+    max_lat: float,
+    polygon: "Optional[list[tuple[float, float]]]" = None,
+    margin_km: float = 100.0,
+    sample_interval_s: float = 15.0,
+    cache_dir: Optional[Path] = None,
+    target_point: "Optional[tuple[float, float]]" = None,
+) -> "list[tuple[datetime, datetime]]":
+    """Like orbit_overlaps_bbox, but returns every matching sub-window
+    (grouping consecutive overlapping samples) instead of a single bool,
+    and optionally tests against a true footprint polygon instead of just
+    its bounding box.
+
+    Needed because orbit_overlaps_bbox only answers "did the ground track
+    cross the bbox at *some* point in this window" -- for a source whose
+    window is already narrow (H-SAF's ~3-minute real sensing window,
+    HY-2/Oceansat-3's padded single timestamp), that's equivalent. But
+    AMSR2 (and SMOS, when it falls back to a whole-day window) uses a
+    WHOLE-DAY window, where "yes, sometime today" is true almost always
+    and tells a caller nothing about *when* -- which is exactly what's
+    needed to compare against a SAR scene's own
+    [sensing_start, sensing_end] +/- a time tolerance.
+
+    Empty list if no sample crosses the target region (equivalent to
+    orbit_overlaps_bbox returning False); the whole window as a
+    single-element list on any fail-open condition (unregistered
+    satellite, TleFetchError, propagation exception, or a degenerate
+    single-sample window) -- same fail-open contract as
+    orbit_overlaps_bbox, extended to "assume the whole window overlaps"
+    since which sub-window can't be known when failing open.
+
+    Each returned window is padded by sample_interval_s on each side
+    (clamped to [sensing_start, sensing_end]) before being returned: the
+    bounds of the matching SAMPLES are not the true underlying crossing,
+    which can begin/end anywhere between two samples, so returning the
+    raw sample timestamps would under-cover the true overlap by up to
+    sample_interval_s at each edge -- the opposite of this module's
+    fail-toward-inclusion principle. Without padding, a single matching
+    sample would even produce a zero-duration window.
+
+    PRECONDITION when passing a polygon that may cross the antimeridian:
+    min_lon/max_lon must use the wrap convention _point_in_bbox and
+    split_antimeridian_bbox require (min_lon > max_lon signals a
+    wrapping region) -- NOT a bbox derived by taking min(lons), max(lons)
+    over the polygon's own vertices. See _region_contains's docstring
+    for why the naive derivation produces false negatives.
+
+    A thin wrapper over sample_ground_track + match_ground_track: a
+    caller checking a single target region against a single window (the
+    common case, and every existing caller of this function) gets
+    exactly the same behavior either way. A caller checking many target
+    regions against the same satellite over overlapping windows should
+    call those two functions directly instead, to share one propagation
+    across all of them -- see sample_ground_track's own docstring.
+
+    target_point, when given, forwards straight to match_ground_track --
+    see its own docstring for why a point target needs this instead of
+    the bbox/polygon arguments.
+    """
+    if satellite not in SATELLITE_ORBIT_SPECS:
+        return [(sensing_start, sensing_end)]
+
+    try:
+        samples = sample_ground_track(satellite, sensing_start, sensing_end, sample_interval_s, cache_dir)
+    except TleFetchError:
+        return [(sensing_start, sensing_end)]
+    except Exception:
+        logger.debug(
+            "orbit_overlap_windows: propagation failed for %s, failing open.", satellite, exc_info=True,
+        )
+        return [(sensing_start, sensing_end)]
+
+    return match_ground_track(
+        samples, satellite, sensing_start, sensing_end,
+        min_lon, max_lon, min_lat, max_lat, polygon=polygon,
+        margin_km=margin_km, sample_interval_s=sample_interval_s, target_point=target_point,
+    )

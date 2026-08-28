@@ -210,10 +210,14 @@ class DataOrchestrator:
         If True, print download commands without executing them.
     """
 
-    def __init__(self, recipe: Recipe, dry_run: bool = False, force_download: bool = False) -> None:
+    def __init__(
+        self, recipe: Recipe, dry_run: bool = False, force_download: bool = False,
+        download_all_in_bbox: bool = False,
+    ) -> None:
         self.recipe   = recipe
         self.dry_run  = dry_run
         self.force_download = force_download
+        self.download_all_in_bbox = download_all_in_bbox
         self.base_dir = self._setup_base_dir()
         self._previous_downloads: Dict[str, Any] = self._load_previous_downloads()
         self._previous_variable: Optional[str] = self._load_previous_variable()
@@ -240,6 +244,11 @@ class DataOrchestrator:
         # or on extraction failure; this is purely an optimization and must
         # never alter what a download would do in its absence.
         self._sar_scene_times: Optional[List[pd.Timestamp]] = None
+
+        # Populated lazily by _collocation_predictions() (see download_all())
+        # on first use, keyed by validation source_type -- None until then,
+        # matching _sar_scene_times's own established laziness pattern.
+        self._collocation_predictions_cache: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # Setup
@@ -556,6 +565,59 @@ class DataOrchestrator:
             )
             self._sar_scene_times = None
 
+    def _collocation_predictions(self) -> "Dict[str, Any]":
+        """Predicted collocation per validation source_type, computed
+        once (cached) from the real downloaded+converted SAR files --
+        empty dict if download_all_in_bbox is set (gating disabled, never
+        even compute this) or if footprint derivation/prediction itself
+        fails (fail open -- an empty dict means every source's lookup
+        below falls through to its own default, no gating)."""
+        if self.download_all_in_bbox:
+            return {}
+        if self._collocation_predictions_cache is not None:
+            return self._collocation_predictions_cache
+
+        from .dry_collocation import predict_collocation, sar_footprints_from_downloaded
+        from .sar_sources import SAR_SOURCES
+
+        try:
+            sar_entry = self.metadata["downloads"].get("sar", {})
+            sar_files = [Path(f) for f in sar_entry.get("files", [])]
+            sar_source_spec = SAR_SOURCES[self.recipe.config.sar_data.source]
+            sar_footprints = sar_footprints_from_downloaded(
+                sar_files, sar_source_spec, self.recipe.config.variable,
+            )
+            logger.info(
+                "Predicting collocation for %d validation source(s)...",
+                len(self.recipe.config.validation_sources),
+            )
+            # stop_on_first_match=True: this real-run gating path only ever
+            # needs a yes/no verdict per source, unlike the --dry-collocation
+            # preview path (predict_collocation's own default, False), which
+            # needs every predicate's exhaustive matched_windows count for
+            # its report. See predict_source's docstring.
+            report = predict_collocation(self.recipe.config, sar_footprints, stop_on_first_match=True)
+            self._collocation_predictions_cache = {p.source_type: p for p in report.predictions}
+        except Exception:
+            logger.debug(
+                "_collocation_predictions: prediction failed, disabling "
+                "gating for this run", exc_info=True,
+            )
+            self._collocation_predictions_cache = {}
+        return self._collocation_predictions_cache
+
+    def _should_skip_for_collocation(self, source_type: str) -> bool:
+        """True only for a CONFIRMED none-predicted verdict -- unknown
+        (including "no prediction computed at all") never skips, per this
+        feature's fail-open contract. Short-circuits on download_all_in_bbox
+        before even calling _collocation_predictions(), so gating truly
+        never runs (not just "runs and returns nothing") when it's
+        disabled."""
+        if self.download_all_in_bbox:
+            return False
+        prediction = self._collocation_predictions().get(source_type)
+        return prediction is not None and prediction.verdict == "none-predicted"
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -603,6 +665,12 @@ class DataOrchestrator:
         for source in self.recipe.config.validation_sources:
             if source.source_type not in _HISTORICAL_FIRST_TYPES:
                 continue
+            if self._should_skip_for_collocation(source.source_type):
+                self.metadata["downloads"][source.source_type] = {
+                    "status": "skipped", "reason": "no predicted collocation with SAR data",
+                }
+                logger.info("Skipping %s: no predicted collocation.", source.source_type)
+                continue
             if not self._dispatch_source(source):
                 ok = False
             file_count = self.metadata["downloads"].get(
@@ -622,6 +690,7 @@ class DataOrchestrator:
         source_types = [
             s.source_type for s in insitu_sources
             if not historical_had_data.get(_HISTORICAL_FIRST_PAIRS.get(s.source_type, ""))
+            and not self._should_skip_for_collocation(s.source_type)
         ]
         if source_types:
             # Use the most permissive depth window across the in-situ
@@ -667,6 +736,12 @@ class DataOrchestrator:
                     "Skipping %s: already succeeded in a previous run.",
                     source.source_type,
                 )
+                continue
+            if self._should_skip_for_collocation(source.source_type):
+                self.metadata["downloads"][source.source_type] = {
+                    "status": "skipped", "reason": "no predicted collocation with SAR data",
+                }
+                logger.info("Skipping %s: no predicted collocation.", source.source_type)
                 continue
             if not self._dispatch_source(source):
                 ok = False
@@ -764,6 +839,10 @@ class DataOrchestrator:
         attempted = [
             t for t in _CURRENTS_INSTRUMENT_TYPES
             if any(s.source_type == t for s in self.recipe.config.validation_sources)
+            # A "skipped" status means collocation-based gating never even
+            # attempted this source_type's download -- it must not count
+            # toward "we tried and got nothing", which this warning implies.
+            and self.metadata["downloads"].get(t, {}).get("status") != "skipped"
         ]
         if not attempted:
             return
@@ -787,7 +866,10 @@ class DataOrchestrator:
         if self.dry_run:
             return
         entry = self.metadata["downloads"].get("hf_radar_us")
-        if entry is None or entry.get("status") == "failed":
+        # "skipped" means collocation-based gating never even attempted
+        # this download -- it must not be reported as "no data found",
+        # which implies a real, empty download attempt.
+        if entry is None or entry.get("status") in ("failed", "skipped"):
             return
         if entry.get("file_count", 0) > 0:
             return
@@ -813,7 +895,10 @@ class DataOrchestrator:
         any_non_failed = False
         for t in attempted:
             entry = self.metadata["downloads"].get(t, {})
-            if entry.get("status") == "failed":
+            # "skipped" (collocation-based gating never even attempted
+            # this download) must not count toward "we tried and got
+            # nothing" any more than "failed" does.
+            if entry.get("status") in ("failed", "skipped"):
                 continue
             any_non_failed = True
             total_files += entry.get("file_count", 0)
@@ -825,7 +910,7 @@ class DataOrchestrator:
 
     def _dispatch_source(self, source) -> bool:
         handlers = {
-            "scatterometer": self._download_scatterometer,
+            "scatterometer_ascat": self._download_scatterometer_ascat,
             "scatterometer_hy2b": self._download_scatterometer_hy2b,
             "scatterometer_hy2c": self._download_scatterometer_hy2c,
             "scatterometer_oceansat3": self._download_scatterometer_oceansat3,
@@ -856,19 +941,30 @@ class DataOrchestrator:
             return False
         return handler(source)
 
-    def _download_scatterometer(self, source) -> bool:
+    def _download_scatterometer_ascat(self, source) -> bool:
         from ..downloaders.scatterometer_downloader import ScatterometerDownloader
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        # Fixed literal, not source.source_type: this handler is only ever
-        # dispatched for source_type "scatterometer" (see _dispatch_source),
-        # and some existing tests call it directly with source=None.
+        # "scatterometer", not source.source_type ("scatterometer_ascat"):
+        # this is the layer_type key (DEFAULT_LAYER_TYPE_SPECS in
+        # recipe.py), not the recipe source_type -- ASCAT's own 12.5km
+        # tolerance stays keyed "scatterometer" regardless of what the
+        # recipe-facing source_type is named, since every one of the four
+        # scatterometer source_types (ASCAT here, HY-2B/HY-2C/Oceansat-3
+        # elsewhere) is stamped with the same shared
+        # data_type="scatterometer" at conversion time (see
+        # from_scatterometer_nc in datatree_converter.py) and
+        # _resolve_layer_type only refines that into a more specific key
+        # for the three FTP-sourced satellites, never for ASCAT. This
+        # handler is only ever dispatched for source_type
+        # "scatterometer_ascat" (see _dispatch_source), and some existing
+        # tests call it directly with source=None.
         windows = self._padded_temporal_bounds("scatterometer")
         out_dir = self.base_dir / "osi_saf_winds"
 
         return self._run_download(
-            "scatterometer", out_dir,
+            "scatterometer_ascat", out_dir,
             lambda: ScatterometerDownloader(
                 output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
             ),

@@ -31,6 +31,36 @@ def _recipe(source: str) -> Recipe:
     return Recipe(cfg)
 
 
+def _orchestrator_with_source(tmp_path, source_type: str) -> DataOrchestrator:
+    """A minimal DataOrchestrator wired for one non-historical, non-in-situ
+    validation source_type, exercising download_all() end-to-end -- shared
+    by TestCollocationSkipGating's tests below."""
+    cfg = RecipeConfig(
+        name="test", variable="wind",
+        geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+        temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        validation_sources=[ValidationDataSource(source_type=source_type)],
+    )
+    recipe = Recipe(cfg)
+    orchestrator = DataOrchestrator(recipe, dry_run=False)
+    orchestrator.base_dir = tmp_path
+    return orchestrator
+
+
+class _FakePrediction:
+    def __init__(self, verdict: str) -> None:
+        self.verdict = verdict
+
+
+def test_download_all_in_bbox_defaults_to_false(tmp_path):
+    """Default (no flag) means collocation-based skip-gating IS active --
+    download_all_in_bbox=False is the new default, inverted from a plain
+    opt-in flag."""
+    orchestrator = DataOrchestrator(_recipe("sentinel1_l2_ocn"), dry_run=True)
+
+    assert orchestrator.download_all_in_bbox is False
+
+
 class TestCleanupIfEmpty:
     def test_removes_dir_with_no_files_including_nested_empty_subdirs(self, tmp_path):
         recipe = _recipe("sentinel1_l2_ocn")
@@ -1351,7 +1381,7 @@ class TestScatterometerHandlerCleansUpEmptyOutputDir:
             mock_instance.download.side_effect = fake_download
             mock_cls.return_value = mock_instance
 
-            ok = orchestrator._download_scatterometer(None)
+            ok = orchestrator._download_scatterometer_ascat(None)
 
         assert ok is True
         if expect_dir_removed:
@@ -1478,6 +1508,28 @@ class TestCombinedCurrentsHistoricalStatusMessage:
             "No delayed-mode in-situ current data found" in r.message for r in caplog.records
         )
 
+    def test_skipped_by_collocation_gating_does_not_trigger_no_data_warning(self, caplog):
+        """A source_type whose download was skipped by collocation-based
+        gating (metadata status="skipped", never even attempted) must not
+        be folded into the "no data found" warning -- that message implies
+        a real, empty download attempt, which a skip is not."""
+        recipe = self._recipe_with("adcp_historical", "argo_historical")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.metadata["downloads"]["adcp_historical"] = {
+            "status": "skipped", "reason": "no predicted collocation with SAR data",
+        }
+        orchestrator.metadata["downloads"]["argo_historical"] = {
+            "status": "skipped", "reason": "no predicted collocation with SAR data",
+        }
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_currents_status()
+
+        assert not any(
+            "No delayed-mode in-situ current data found" in r.message for r in caplog.records
+        )
+        assert orchestrator.metadata["notices"] == []
+
 
 class TestCombinedHfRadarUsStatusMessage:
     def _recipe(self) -> Recipe:
@@ -1529,6 +1581,22 @@ class TestCombinedHfRadarUsStatusMessage:
         orchestrator = DataOrchestrator(recipe, dry_run=dry_run)
         if downloads_entry is not None:
             orchestrator.metadata["downloads"]["hf_radar_us"] = downloads_entry
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_hf_radar_us_status()
+
+        assert not any("No US HF-radar data found" in r.message for r in caplog.records)
+        assert orchestrator.metadata["notices"] == []
+
+    def test_skipped_by_collocation_gating_does_not_trigger_no_data_warning(self, caplog):
+        """hf_radar_us's own download skipped entirely by collocation
+        gating (metadata status="skipped") must not be reported as "no
+        data found" -- it was never attempted."""
+        recipe = self._recipe()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.metadata["downloads"]["hf_radar_us"] = {
+            "status": "skipped", "reason": "no predicted collocation with SAR data",
+        }
 
         with caplog.at_level(logging.WARNING):
             orchestrator._report_combined_hf_radar_us_status()
@@ -1593,6 +1661,25 @@ class TestCombinedHfRadarStatusMessage:
         fired = any("No HF-radar data found" in r.message for r in caplog.records)
         assert fired is expected_fires
 
+    def test_both_skipped_by_collocation_gating_does_not_trigger_no_data_warning(self, caplog):
+        """Both hf_radar and hf_radar_historical skipped entirely by
+        collocation gating (never attempted) must not be reported as "no
+        data found" -- that warning implies a real, empty download
+        attempt."""
+        recipe = self._recipe_with("hf_radar", "hf_radar_historical")
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.metadata["downloads"]["hf_radar"] = {
+            "status": "skipped", "reason": "no predicted collocation with SAR data",
+        }
+        orchestrator.metadata["downloads"]["hf_radar_historical"] = {
+            "status": "skipped", "reason": "no predicted collocation with SAR data",
+        }
+
+        with caplog.at_level(logging.WARNING):
+            orchestrator._report_combined_hf_radar_status()
+
+        assert not any("No HF-radar data found" in r.message for r in caplog.records)
+        assert orchestrator.metadata["notices"] == []
 
 
 class TestPerSourceDownloadGating:
@@ -1941,7 +2028,7 @@ class TestSarEmptyStopsPipeline:
             geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
             temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
             sar_data=SARDataSpec(source="sentinel1_l2_ocn"),
-            validation_sources=[ValidationDataSource(source_type="scatterometer")],
+            validation_sources=[ValidationDataSource(source_type="scatterometer_ascat")],
         )
         return Recipe(cfg)
 
@@ -2409,3 +2496,213 @@ class TestDownloadAscatSsmWaterfall:
             "partial" in n.lower() or "one of the eumdac" in n.lower()
             for n in orch.metadata["notices"]
         )
+
+
+class TestCollocationSkipGating:
+    """download_all() gates every non-SAR source dispatch on a predicted
+    collocation verdict (default on), consulting _collocation_predictions()
+    at each of the three points identified during Plan 4's own
+    investigation: the historical-first loop, the in-situ batch's
+    source_types filter, and the "other sources" loop below it. Only a
+    CONFIRMED "none-predicted" verdict skips -- everything else (including
+    "unknown", and the case where prediction wasn't even computed) falls
+    through to the existing dispatch behaviour, matching this feature's
+    fail-open contract. download_all_in_bbox=True disables gating entirely,
+    without even computing a prediction, reproducing today's download_all()
+    exactly."""
+
+    def test_none_predicted_source_is_skipped_with_metadata_reason(self, tmp_path, monkeypatch):
+        """A source_type whose collocation prediction is a confirmed
+        none-predicted verdict must be skipped, recorded in metadata
+        exactly like the existing paired_historical skip pattern."""
+        orchestrator = _orchestrator_with_source(tmp_path, "era5")
+
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: {"era5": _FakePrediction(verdict="none-predicted")},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(orchestrator, "_dispatch_source", lambda source: (_ for _ in ()).throw(
+            AssertionError("must not dispatch a none-predicted source")
+        ))
+
+        orchestrator.download_all()
+
+        assert orchestrator.metadata["downloads"]["era5"]["status"] == "skipped"
+        assert "collocation" in orchestrator.metadata["downloads"]["era5"]["reason"]
+
+    def test_unknown_verdict_does_not_skip(self, tmp_path, monkeypatch):
+        orchestrator = _orchestrator_with_source(tmp_path, "era5")
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: {"era5": _FakePrediction(verdict="unknown")},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        dispatched = {"n": 0}
+
+        def _fake_dispatch(source):
+            dispatched["n"] += 1
+            return True
+
+        monkeypatch.setattr(orchestrator, "_dispatch_source", _fake_dispatch)
+
+        orchestrator.download_all()
+
+        assert dispatched["n"] >= 1  # era5 (and any other configured source) was still attempted
+
+    def test_download_all_in_bbox_disables_gating_entirely(self, tmp_path, monkeypatch):
+        orchestrator = _orchestrator_with_source(tmp_path, "era5")
+        orchestrator.download_all_in_bbox = True
+        predictions_called = {"n": 0}
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: predictions_called.__setitem__("n", predictions_called["n"] + 1) or {},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(orchestrator, "_dispatch_source", lambda source: True)
+
+        orchestrator.download_all()
+
+        assert predictions_called["n"] == 0  # never even computed -- true no-op, matching today's behavior exactly
+
+    def test_none_predicted_source_is_skipped_in_historical_first_loop(self, tmp_path, monkeypatch):
+        """Same skip contract as the generic "other sources" loop, but
+        exercised at the historical-first loop (source_type in
+        _HISTORICAL_FIRST_TYPES) -- this loop dispatches before the
+        "other sources" loop even runs, so it needs its own proof the
+        wiring is in place there too."""
+        orchestrator = _orchestrator_with_source(tmp_path, "drifter_historical")
+
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: {"drifter_historical": _FakePrediction(verdict="none-predicted")},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(orchestrator, "_dispatch_source", lambda source: (_ for _ in ()).throw(
+            AssertionError("must not dispatch a none-predicted source")
+        ))
+
+        orchestrator.download_all()
+
+        assert orchestrator.metadata["downloads"]["drifter_historical"]["status"] == "skipped"
+        assert "collocation" in orchestrator.metadata["downloads"]["drifter_historical"]["reason"]
+
+    def test_unknown_verdict_does_not_skip_historical_first_loop(self, tmp_path, monkeypatch):
+        orchestrator = _orchestrator_with_source(tmp_path, "drifter_historical")
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: {"drifter_historical": _FakePrediction(verdict="unknown")},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        dispatched = {"n": 0}
+
+        def _fake_dispatch(source):
+            dispatched["n"] += 1
+            return True
+
+        monkeypatch.setattr(orchestrator, "_dispatch_source", _fake_dispatch)
+
+        orchestrator.download_all()
+
+        assert dispatched["n"] == 1
+
+    def test_none_predicted_source_is_excluded_from_insitu_batch(self, tmp_path, monkeypatch):
+        """The in-situ batch loop filters a none-predicted source_type out
+        of source_types before it ever reaches _download_insitu -- unlike
+        the other two skip points, this loop records no per-source
+        "skipped" metadata entry (there's nothing to write once the type
+        has been dropped from the batch list), so the only observable
+        proof is that _download_insitu itself is never invoked."""
+        orchestrator = _orchestrator_with_source(tmp_path, "mooring")
+
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: {"mooring": _FakePrediction(verdict="none-predicted")},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(orchestrator, "_download_insitu", lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("must not batch-download a none-predicted in-situ source")
+        ))
+
+        orchestrator.download_all()
+
+        assert "mooring" not in orchestrator.metadata["downloads"]
+
+    def test_unknown_verdict_does_not_skip_insitu_batch(self, tmp_path, monkeypatch):
+        orchestrator = _orchestrator_with_source(tmp_path, "mooring")
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: {"mooring": _FakePrediction(verdict="unknown")},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        insitu_calls = []
+        monkeypatch.setattr(
+            orchestrator, "_download_insitu",
+            lambda source_types, min_depth, max_depth: insitu_calls.append(source_types) or True,
+        )
+
+        orchestrator.download_all()
+
+        assert insitu_calls == [["mooring"]]
+
+
+class TestCollocationPredictionsStopOnFirstMatch:
+    """_collocation_predictions() is the real-run gating path's own call
+    site into predict_collocation -- unlike the --dry-collocation CLI
+    preview path (which needs predict_collocation's exhaustive default,
+    for its own matched-window counts), this path only ever needs a
+    yes/no verdict per source, so it must request
+    stop_on_first_match=True to bound a live predicate's per-footprint
+    probing cost (see the final whole-branch review's Important #1). It
+    must also log before the (potentially multi-minute) probe starts, so
+    a real run isn't silently hanging with zero visibility."""
+
+    def _orchestrator(self, tmp_path):
+        cfg = RecipeConfig(
+            name="test", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            sar_data=SARDataSpec(source="sentinel1_l2_ocn"),
+            validation_sources=[
+                ValidationDataSource(source_type="era5"), ValidationDataSource(source_type="ismn"),
+            ],
+        )
+        orchestrator = DataOrchestrator(Recipe(cfg), dry_run=False)
+        orchestrator.base_dir = tmp_path
+        orchestrator.metadata["downloads"]["sar"] = {"files": []}
+        return orchestrator
+
+    def test_predict_collocation_called_with_stop_on_first_match_true(self, tmp_path, monkeypatch):
+        from sar_validation.core import dry_collocation as dc
+
+        orchestrator = self._orchestrator(tmp_path)
+        monkeypatch.setattr(dc, "sar_footprints_from_downloaded", lambda *a, **k: [])
+
+        captured = {}
+
+        def _fake_predict_collocation(cfg_arg, sar_footprints, **kwargs):
+            captured.update(kwargs)
+            return dc.CollocationReport(recipe_path="", sar_footprint_count=0, predictions=[])
+
+        monkeypatch.setattr(dc, "predict_collocation", _fake_predict_collocation)
+
+        orchestrator._collocation_predictions()
+
+        assert captured.get("stop_on_first_match") is True
+
+    def test_logs_before_predicting(self, tmp_path, monkeypatch, caplog):
+        from sar_validation.core import dry_collocation as dc
+
+        orchestrator = self._orchestrator(tmp_path)
+        monkeypatch.setattr(dc, "sar_footprints_from_downloaded", lambda *a, **k: [])
+        monkeypatch.setattr(
+            dc, "predict_collocation",
+            lambda cfg_arg, sar_footprints, **kwargs: dc.CollocationReport(
+                recipe_path="", sar_footprint_count=0, predictions=[],
+            ),
+        )
+
+        with caplog.at_level(logging.INFO, logger="sar_validation.core.orchestrator"):
+            orchestrator._collocation_predictions()
+
+        assert any("2" in r.message and "validation source" in r.message for r in caplog.records)

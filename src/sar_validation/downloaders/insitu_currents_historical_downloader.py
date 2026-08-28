@@ -141,6 +141,124 @@ class InSituCurrentsHistoricalDownloader:
                 downloaded.append(path)
         return downloaded
 
+    def _fetch_stations_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+    ) -> "pd.DataFrame":
+        """
+        Shared fetch behind check_availability_dry and station_ranges_dry:
+        the real in-situ dataframe for this instrument's bbox/time window,
+        without writing anything to disk.
+
+        Uses ``copernicusmarine.read_dataframe()`` rather than ``subset()``
+        (the real download path's call above) -- the same choice
+        ``InSituDownloader._fetch_stations_dry`` makes for the sibling
+        aggregate in-situ dataset, since this product line's storage
+        format doesn't support lazy ``xarray`` loading either.
+
+        An antimeridian-crossing bbox (min_lon > max_lon, this codebase's
+        own wrap convention) is split into one query per non-wrapping
+        range via ``split_antimeridian_bbox`` first -- passed straight
+        through unsplit, ``copernicusmarine.read_dataframe`` has no
+        concept of a wrapping bbox, so min_lon > max_lon there is simply
+        an empty/invalid range, not "wrap through 180". Concatenated with
+        duplicates dropped, since a station whose position matches both
+        split ranges' rounding could otherwise appear twice.
+        """
+        try:
+            import copernicusmarine
+        except ImportError as exc:
+            raise ImportError(
+                "copernicusmarine is required for delayed-mode currents downloads.\n"
+                "Install it with:  pip install copernicusmarine"
+            ) from exc
+
+        dataset_id = _DATASET_IDS[self.instrument]
+        start_dt = normalize_datetime(start)
+        end_dt = normalize_datetime(end)
+
+        frames = []
+        for win_min_lon, win_max_lon in split_antimeridian_bbox(min_lon, max_lon):
+            print(
+                f"  Checking {self.instrument} delayed-mode currents availability: "
+                f"bbox=[{win_min_lon:.2f}, {win_max_lon:.2f}, {min_lat:.2f}, {max_lat:.2f}]  "
+                f"window={start_dt} → {end_dt}  dataset={dataset_id}"
+            )
+            frames.append(copernicusmarine.read_dataframe(
+                dataset_id=dataset_id,
+                variables=_VARIABLES,
+                minimum_longitude=win_min_lon,
+                maximum_longitude=win_max_lon,
+                minimum_latitude=min_lat,
+                maximum_latitude=max_lat,
+                start_datetime=start_dt,
+                end_datetime=end_dt,
+                minimum_depth=self.min_depth,
+                maximum_depth=self.max_depth,
+                disable_progress_bar=True,
+            ))
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        return df if df.empty else df.drop_duplicates().reset_index(drop=True)
+
+    def check_availability_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+    ) -> bool:
+        """
+        Whether any delayed-mode current observation for this instrument
+        exists in this bbox/time window, without writing anything to disk.
+        See _fetch_stations_dry's own docstring for the underlying query
+        this collapses to a boolean; station_ranges_dry is the same query
+        kept as real per-station coordinates.
+        """
+        df = self._fetch_stations_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+        return not df.empty
+
+    def station_ranges_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+    ) -> "dict[str, tuple[float, float, datetime, datetime]]":
+        """
+        platform_id -> (lat, lon, earliest, latest) for every real
+        delayed-mode station reporting data in this bbox/time window.
+
+        Mirrors InSituDownloader.station_ranges_dry's exact return shape
+        (see dry_collocation.py's _predict_insitu_currents_historical),
+        so a caller can apply the same real point-vs-footprint-shape
+        refinement (dry_collocation._point_in_footprint) this dataset's
+        boolean-only check_availability_dry can't offer -- see that
+        sibling method's own docstring for why a WV-mode footprint's own
+        bbox badly over-matches without it.
+        """
+        df = self._fetch_stations_dry(min_lon, max_lon, min_lat, max_lat, start, end)
+        if df.empty:
+            return {}
+
+        df = df.copy()
+        df["time"] = pd.to_datetime(df["time"])
+        ranges: "dict[str, tuple[float, float, datetime, datetime]]" = {}
+        for platform_id, group in df.groupby("platform_id"):
+            ranges[str(platform_id)] = (
+                float(group["latitude"].iloc[0]), float(group["longitude"].iloc[0]),
+                group["time"].min().to_pydatetime(), group["time"].max().to_pydatetime(),
+            )
+        return ranges
+
     def _download_window(
         self,
         min_lon: float,

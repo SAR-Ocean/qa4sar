@@ -31,6 +31,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -41,6 +42,17 @@ import requests
 from .base import authenticate_smos_ftp, build_output_dir, normalize_datetime
 
 __all__ = ["SMOSDownloader"]
+
+#: list_candidates_dry's own shared cache of the authenticated OADS
+#: session _login produces, keyed by (username, password). The SAML2/
+#: WSO2 SSO handshake _login performs is a real three-hop network round
+#: trip against an external identity provider, not something local or
+#: cheap to repeat -- --dry-collocation-detail's own per-footprint
+#: exhaustive scan (_predict_orbit_corridor_source) would otherwise log
+#: in from scratch once per SAR footprint in the recipe, each one an
+#: independent multi-second round trip to ESA's own IdP.
+_session_cache: "dict[tuple[str, str], requests.Session]" = {}
+_session_cache_lock = threading.Lock()
 
 OADS_BASE_URL = "https://smos-diss.eo.esa.int/oads/access"
 OADS_TREE_URL = f"{OADS_BASE_URL}/collection/NRT_Open/tree"
@@ -295,6 +307,67 @@ class SMOSDownloader:
         if dropped:
             print(f"Orbit pre-filter: skipped {dropped} file(s) with no predicted overlap.")
         return kept
+
+    def list_candidates_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+    ) -> "list[tuple[str, datetime, datetime]]":
+        """(filename, sensing_start, sensing_end) for every candidate
+        product in [start, end] -- the same day-by-day OADS tree-browse
+        download() does, without the orbit prefilter and without
+        downloading anything. sensing_start/sensing_end come from each
+        filename's own embedded timestamps when parseable (see
+        _parse_sensing_window); a filename that doesn't match the
+        expected convention falls back to the whole day [00:00:00Z,
+        23:59:59Z], mirroring _filter_by_orbit_overlap's own fallback.
+        bbox is accepted for interface consistency with download() but
+        not used here either (see module docstring); a caller wanting
+        geographic refinement should apply its own orbit-overlap check
+        against the returned windows (see dry_collocation.py).
+
+        The authenticated session _login produces is shared across every
+        caller with the same (username, password) via _session_cache --
+        see that cache's own module-level comment for why this matters
+        for --dry-collocation specifically.
+        """
+        start_dt = normalize_datetime(start)
+        end_dt = normalize_datetime(end)
+
+        username, password = authenticate_smos_ftp(self._username, self._password)
+
+        day = datetime.fromisoformat(start_dt).date()
+        last = datetime.fromisoformat(end_dt).date()
+
+        cache_key = (username, password)
+        with _session_cache_lock:
+            session = _session_cache.get(cache_key)
+            if session is None:
+                session = requests.Session()
+                self._login(session, username, password)
+                _session_cache[cache_key] = session
+
+        candidates: "list[tuple[str, datetime, datetime]]" = []
+        while day <= last:
+            products = self._list_products_for_day(session, day)
+            for product in products:
+                fname = product["filename"]
+                if not fname.endswith((".nc", ".tgz")):
+                    continue
+                window = _parse_sensing_window(fname)
+                if window is not None:
+                    sensing_start, sensing_end = window
+                else:
+                    sensing_start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+                    sensing_end = sensing_start + timedelta(hours=23, minutes=59, seconds=59)
+                candidates.append((fname, sensing_start, sensing_end))
+            day += timedelta(days=1)
+
+        return candidates
 
     def download(
         self,

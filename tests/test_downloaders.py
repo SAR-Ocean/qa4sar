@@ -47,6 +47,24 @@ class TestNormalizeDatetime:
             pytest.param("  2026-01-01  ", "2026-01-01T00:00:00", id="whitespace_stripped"),
             pytest.param("2026-01-01 120000", "2026-01-01T12:00:00", id="space_and_hhmmss"),
             pytest.param("2026-01-01T120000Z", "2026-01-01T12:00:00", id="iso_hhmmss_with_z"),
+            # Regression: a tz-aware datetime's own .isoformat() (e.g. a
+            # dry-collocation SarFootprint's sensing_start/sensing_end,
+            # always aware) renders as "...+00:00", never "Z" -- the
+            # offset must be stripped the same way "Z" already is, or
+            # downstream fromisoformat(normalize_datetime(...)) callers
+            # that compare against a naive "now" raise "can't compare
+            # offset-naive and offset-aware datetimes". Found live against
+            # noaa_hfradar_downloader.select_backend().
+            pytest.param(
+                "2026-01-01T12:34:56+00:00", "2026-01-01T12:34:56", id="utc_offset_removed",
+            ),
+            pytest.param(
+                "2026-01-01T12:34:56.123456+00:00", "2026-01-01T12:34:56",
+                id="utc_offset_and_microseconds_removed",
+            ),
+            pytest.param(
+                "2026-01-01T12:34:56-05:00", "2026-01-01T12:34:56", id="negative_offset_removed",
+            ),
         ],
     )
     def test_normalizes_various_formats(self, raw, expected):
@@ -1267,15 +1285,23 @@ class TestSARDownloaderForceDownload:
         fake_client = MagicMock()
         fake_client.query_products.return_value = [self._fake_record()]
         dl._client = fake_client
-        (tmp_path / "S1A_IW_OCN__2SDV_20260702T000000").mkdir()
+        product_dir = tmp_path / "S1A_IW_OCN__2SDV_20260702T000000"
+        product_dir.mkdir()
 
-        dl.download(
+        result = dl.download(
             min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
             start="2026-07-02", end="2026-07-03",
         )
 
         fake_client.download_product.assert_not_called()
         assert "Already downloaded" in capsys.readouterr().out
+        # An already-on-disk product must still be reported back -- not
+        # just a freshly-downloaded one -- since orchestrator.py writes
+        # this return value straight into download_metadata.json's
+        # "sar"."files", which dry_collocation.py's real (non-dry)
+        # collocation-gating check reads to find the real SAR footprints
+        # to predict against.
+        assert result == [product_dir]
 
     def test_force_download_redownloads_existing_product(self, tmp_path):
         from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
@@ -1295,6 +1321,64 @@ class TestSARDownloaderForceDownload:
         )
 
         fake_client.download_product.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# SARDownloader — zip-branch extraction
+# ---------------------------------------------------------------------------
+
+class TestSARDownloaderZipExtraction:
+    def test_extracted_product_directory_is_returned(self, tmp_path):
+        """CDSE always delivers a Sentinel-1 SAFE product as a .zip whose
+        sole top-level member is the product's own <name>.SAFE directory.
+        The extracted product directory must be appended to the returned
+        list (and hence written into download_metadata.json's
+        "sar"."files") -- not silently dropped after extraction, the way
+        TestASCATSoilMoistureDownloaderZipExtraction already covers for
+        the (differently-shaped, flat-file) ASCAT SSM case. Silently
+        dropping it here is what made the real (non-dry) collocation-
+        gating path in orchestrator.py/dry_collocation.py always operate
+        on zero real SAR footprints, since it reads this same file list."""
+        import io
+        import zipfile
+
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
+
+        product_name = "S1C_IW_OCN__2SDV_20260712T185023_20260712T185048_008514_010DB0_276D.SAFE"
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr(f"{product_name}/manifest.safe", b"fake manifest bytes")
+            zf.writestr(f"{product_name}/measurement/owi.nc", b"fake measurement bytes")
+        zip_bytes = buf.getvalue()
+
+        dl = SARDownloader(output_dir=tmp_path, dry_run=False)
+        fake_client = MagicMock()
+        fake_client.query_products.return_value = [{
+            "Id": "abc", "Name": product_name,
+            "ContentDate_Start": "2026-07-12T18:50:23Z",
+            "ContentDate_End": "2026-07-12T18:50:48Z",
+            "ContentLength_GB": 1.0, "Online": True,
+        }]
+        dl._client = fake_client
+
+        def _fake_download_product(product_id, output_dir, product_name_arg=""):
+            zip_path = output_dir / f"{product_name}.zip"
+            zip_path.write_bytes(zip_bytes)
+            return zip_path
+
+        fake_client.download_product.side_effect = _fake_download_product
+
+        result = dl.download(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2026-07-12", end="2026-07-13",
+        )
+
+        expected_dir = tmp_path / product_name
+        assert result == [expected_dir]
+        assert expected_dir.is_dir()
+        assert (expected_dir / "manifest.safe").exists()
+        assert not (tmp_path / f"{product_name}.zip").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1400,6 +1484,28 @@ class TestAltimeterDownloaderAntimeridian:
         kwargs = fake_module.subset.call_args.kwargs
         assert kwargs["output_filename"] == "cmems_obs-wave_glo_phy-swh_nrt_al-l3_PT1S_2026-06-01_2026-06-02.nc"
         assert len(paths) == 1
+
+    def test_satellite_whose_availability_ended_before_the_window_is_skipped(self, tmp_path, capsys):
+        """h2c stopped producing data 2026-05-20 (see AVAILABILITY_END) --
+        a window entirely after that must never call subset() for it."""
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.altimeter_downloader import AltimeterDownloader
+
+        dl = AltimeterDownloader(output_dir=tmp_path, dry_run=False)
+        fake_module = self._patch_subset()
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            paths = dl.download(
+                min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+                start="2026-07-01", end="2026-07-02",
+                frequencies=["1hz"], satellites=["h2c"],
+            )
+
+        fake_module.subset.assert_not_called()
+        assert paths == []
+        out = capsys.readouterr().out
+        assert "Skipping" in out and "availability ended" in out
 
 
 # ---------------------------------------------------------------------------
@@ -2285,6 +2391,117 @@ class TestNOAAHFRadarDownload:
         assert "[(-126.0):(-115.8056)]" in called_url
 
 
+_DAS_RANGE_START = (datetime.now(timezone.utc) - timedelta(days=30)).replace(microsecond=0)
+_DAS_RANGE_END = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0)
+
+
+def _fake_das_text(range_start: datetime, range_end: datetime) -> str:
+    return f"""Attributes {{
+ time {{
+  String _CoordinateAxisType "Time";
+  Float64 actual_range {range_start.timestamp()}, {range_end.timestamp()};
+  String axis "T";
+  String ioos_category "Time";
+  String standard_name "time";
+  String time_origin "01-JAN-1970 00:00:00";
+  String units "seconds since 1970-01-01T00:00:00Z";
+ }}
+ latitude {{
+  String _CoordinateAxisType "Lat";
+  Float64 actual_range 30.25, 49.98;
+ }}
+ water_u {{
+  Float64 colorBarMaximum 0.5;
+  String ioos_category "Currents";
+ }}
+ NC_GLOBAL {{
+  String title "HFRnet RTV";
+ }}
+}}
+"""
+
+
+_FAKE_DAS_TEXT = _fake_das_text(_DAS_RANGE_START, _DAS_RANGE_END)
+
+
+class TestNoaaHfRadarParseDasTimeRange:
+    def test_parses_actual_range_to_utc_datetimes(self):
+        from sar_validation.downloaders.noaa_hfradar_downloader import _parse_das_time_range
+
+        result = _parse_das_time_range(_FAKE_DAS_TEXT)
+        assert result == (
+            _DAS_RANGE_START.replace(tzinfo=None), _DAS_RANGE_END.replace(tzinfo=None),
+        )
+
+    def test_missing_time_block_returns_none(self):
+        from sar_validation.downloaders.noaa_hfradar_downloader import _parse_das_time_range
+
+        assert _parse_das_time_range("Attributes {\n latitude { }\n}\n") is None
+
+
+class TestNOAAHFRadarCheckAvailabilityDry:
+    def test_true_when_requested_window_overlaps_das_time_range(self, tmp_path):
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            _configure_fake_download_response(m, data=_FAKE_DAS_TEXT.encode())
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is True
+        called_url = m.call_args[0][0]
+        assert called_url.endswith("ucsdHfrW6.das")
+
+    def test_false_when_requested_window_outside_das_time_range(self, tmp_path):
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        # A window entirely before the .das-reported coverage, but still
+        # inside ERDDAP's own ~90-day rolling window (so select_backend
+        # itself doesn't short-circuit this to False for the wrong reason).
+        before_start = (datetime.now(timezone.utc) - timedelta(days=89)).strftime("%Y-%m-%d")
+        before_end = (datetime.now(timezone.utc) - timedelta(days=88)).strftime("%Y-%m-%d")
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            _configure_fake_download_response(m, data=_FAKE_DAS_TEXT.encode())
+            result = dl.check_availability_dry(-125, -119, 33, 38, before_start, before_end)
+
+        assert result is False
+
+    def test_true_when_das_has_no_parseable_time_range(self, tmp_path):
+        """Fail-open: an unparseable .das response must not rule out
+        availability."""
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            _configure_fake_download_response(m, data=b"Attributes { }\n")
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is True
+
+    def test_false_when_end_date_outside_erddap_window(self, tmp_path):
+        old = (datetime.now(timezone.utc) - timedelta(days=200)).strftime("%Y-%m-%d")
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            result = dl.check_availability_dry(-125, -119, 33, 38, old, old)
+
+        assert result is False
+        m.assert_not_called()
+
+    def test_false_when_resolution_unavailable_for_region(self, tmp_path):
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=0.5)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            # 0.5km isn't available for US-EastGulfCoast.
+            result = dl.check_availability_dry(-80, -70, 35, 42, _RECENT_START, _RECENT_END)
+
+        assert result is False
+        m.assert_not_called()
+
+
 class TestNOAAHFRadarDownload500m:
     def test_select_erddap_dataset_accepts_500m_for_us_west(self):
         from sar_validation.downloaders.noaa_hfradar_downloader import select_erddap_dataset
@@ -2843,6 +3060,73 @@ class TestHFRadarDownloaderGrid:
                 dl.download(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")
 
 
+class _FakeGridDataset:
+    """Minimal stand-in for the xarray.Dataset copernicusmarine.open_dataset
+    returns -- just enough surface (.sizes) for check_availability_dry to
+    read, matching test_altimeter_downloader.py's _FakeDataset convention."""
+
+    def __init__(self, time_size: int):
+        self.sizes = {"time": time_size}
+
+
+class TestHFRadarDownloaderCheckAvailabilityDry:
+    def test_true_when_time_coordinate_non_empty(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        dl = HFRadarDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+        fake_module.open_dataset.return_value = _FakeGridDataset(3)
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            result = dl.check_availability_dry(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")
+
+        assert result is True
+        fake_module.subset.assert_not_called()
+        _, kwargs = fake_module.open_dataset.call_args
+        assert kwargs["dataset_part"] == "monthly-radar-total--US-EastGulfCoast"
+
+    def test_false_when_time_coordinate_empty(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        dl = HFRadarDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+        fake_module.open_dataset.return_value = _FakeGridDataset(0)
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            result = dl.check_availability_dry(-90.0, -60.0, 30.0, 40.0, "2026-01-01", "2026-01-02")
+
+        assert result is False
+
+    def test_false_when_no_region_overlaps_bbox(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        dl = HFRadarDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            result = dl.check_availability_dry(0.0, 5.0, 0.0, 5.0, "2026-01-01", "2026-01-02")
+
+        assert result is False
+        fake_module.open_dataset.assert_not_called()
+
+    def test_recent_date_uses_latest_part_when_region_has_one(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        recent_end = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+        recent_start = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%d")
+        dl = HFRadarDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+        fake_module.open_dataset.return_value = _FakeGridDataset(1)
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            dl.check_availability_dry(-125.0, -119.0, 33.0, 38.0, recent_start, recent_end)
+
+        _, kwargs = fake_module.open_dataset.call_args
+        assert kwargs["dataset_part"] == "latest-radar-total--US-WestCoast"
+
+
 class TestHFRadarDownloaderGridAntimeridian:
     def test_crossing_bbox_with_no_covering_region_on_either_side_raises(self, tmp_path):
         # lat 0-5 doesn't overlap any HFR_REGIONS entry on either side of
@@ -3111,6 +3395,64 @@ class TestHFRadarHistoricalDownloader:
         assert len(out) == 1
         result = xr.open_dataset(out[0])
         assert result.sizes["time"] == 4
+
+
+class TestHFRadarHistoricalDownloaderCheckAvailabilityDry:
+    def test_true_for_recent_enough_region_year_with_known_archive(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        old_end = (datetime.now(timezone.utc) - timedelta(days=200)).strftime("%Y-%m-%d")
+        old_start = (datetime.now(timezone.utc) - timedelta(days=201)).strftime("%Y-%m-%d")
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path)
+        assert dl.check_availability_dry(-121.0, -120.0, 33.0, 34.0, old_start, old_end) is True
+
+    def test_false_when_end_is_too_recent(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path)
+        # Well within the _MIN_AGE_DAYS=182 recency guard.
+        assert dl.check_availability_dry(-121.0, -120.0, 33.0, 34.0, "2026-08-01", "2026-08-02") is False
+
+    def test_false_when_no_region_overlaps_bbox(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path)
+        assert dl.check_availability_dry(0.0, 5.0, 0.0, 5.0, "2021-01-01", "2021-01-02") is False
+
+    def test_false_when_region_has_no_historical_archive_at_all(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path)
+        # GoS (Italy) has an NRT feed but no delayed-mode archive.
+        assert dl.check_availability_dry(13.5, 15.5, 40.0, 41.0, "2021-01-01", "2021-01-02") is False
+
+    def test_false_when_split_by_year_region_year_out_of_range(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path)
+        # US-EastGulfCoast's split-by-year archive only covers 2019-2024.
+        assert dl.check_availability_dry(-90.0, -60.0, 30.0, 40.0, "2018-01-01", "2018-01-02") is False
+
+    def test_multi_year_request_raises_not_implemented(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_historical_downloader import (
+            HFRadarHistoricalDownloader,
+        )
+
+        dl = HFRadarHistoricalDownloader(output_dir=tmp_path)
+        with pytest.raises(NotImplementedError, match="single calendar year"):
+            dl.check_availability_dry(-90.0, -60.0, 30.0, 40.0, "2020-12-30", "2021-01-02")
 
 
 class TestHFRadarHistoricalDownloaderAntimeridian:
@@ -4371,3 +4713,153 @@ class TestHFRadarUSDownloaderWaterfall:
             dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
 
         assert any("already contains cached" in rec.message for rec in caplog.records)
+
+
+class TestHFRadarUSDownloaderCheckAvailabilityDry:
+    """check_availability_dry mirrors download()'s own waterfall try-order
+    exactly, but delegates to the four wrapped downloaders' own
+    check_availability_dry methods instead of re-deriving any
+    region-resolution/dataset-selection logic."""
+
+    def test_erddap_true_short_circuits_thredds_and_copernicus(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_erddap.return_value.check_availability_dry.return_value = True
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is True
+        m_thredds.return_value.check_availability_dry.assert_not_called()
+        m_cop.return_value.check_availability_dry.assert_not_called()
+        m_cop_hist.return_value.check_availability_dry.assert_not_called()
+
+    def test_erddap_false_falls_through_to_thredds(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_erddap.return_value.check_availability_dry.return_value = False
+            m_thredds.return_value.check_availability_dry.return_value = True
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is True
+        m_cop.return_value.check_availability_dry.assert_not_called()
+        m_cop_hist.return_value.check_availability_dry.assert_not_called()
+
+    def test_erddap_and_thredds_false_falls_through_to_copernicus_historical_then_nrt(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_erddap.return_value.check_availability_dry.return_value = False
+            m_thredds.return_value.check_availability_dry.return_value = False
+            m_cop_hist.return_value.check_availability_dry.return_value = False
+            m_cop.return_value.check_availability_dry.return_value = True
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is True
+        m_cop_hist.return_value.check_availability_dry.assert_called_once()
+        m_cop.return_value.check_availability_dry.assert_called_once()
+
+    def test_historical_true_short_circuits_nrt(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_erddap.return_value.check_availability_dry.return_value = False
+            m_thredds.return_value.check_availability_dry.return_value = False
+            m_cop_hist.return_value.check_availability_dry.return_value = True
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is True
+        m_cop.return_value.check_availability_dry.assert_not_called()
+
+    def test_non_us_bbox_skips_erddap_and_thredds_entirely(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_cop_hist.return_value.check_availability_dry.return_value = False
+            m_cop.return_value.check_availability_dry.return_value = False
+            dl.check_availability_dry(2.0, 8.0, 53.0, 55.0, _RECENT_START, _RECENT_END)
+
+        m_erddap.return_value.check_availability_dry.assert_not_called()
+        m_thredds.return_value.check_availability_dry.assert_not_called()
+
+    def test_great_lakes_region_skips_erddap_entirely(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds:
+            m_thredds.return_value.check_availability_dry.return_value = True
+            # US_GREAT_LAKES bbox center: lon ~-84.8, lat ~45.8
+            result = dl.check_availability_dry(-85.3, -84.2, 45.6, 46.05, "2024-01-31", "2024-01-31")
+
+        assert result is True
+        m_erddap.return_value.check_availability_dry.assert_not_called()
+
+    def test_false_when_no_backend_finds_anything(self, tmp_path):
+        from sar_validation.downloaders.hf_radar_us_downloader import HFRadarUSDownloader
+
+        dl = HFRadarUSDownloader(output_dir=tmp_path)
+        with patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAAHFRadarDownloader"
+        ) as m_erddap, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.NOAATHREDDSHFRadarDownloader"
+        ) as m_thredds, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarDownloader"
+        ) as m_cop, patch(
+            "sar_validation.downloaders.hf_radar_us_downloader.HFRadarHistoricalDownloader"
+        ) as m_cop_hist:
+            m_erddap.return_value.check_availability_dry.return_value = False
+            m_thredds.return_value.check_availability_dry.return_value = False
+            m_cop_hist.return_value.check_availability_dry.return_value = False
+            m_cop.return_value.check_availability_dry.return_value = False
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is False

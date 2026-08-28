@@ -191,17 +191,33 @@ class SARDownloader:
 
         for i, (_, row) in enumerate(df.iterrows(), start=1):
             product_name = row["Name"]
-            if not self.force_download and (self.output_dir / product_name).exists():
+            product_dir = self.output_dir / product_name
+            if not self.force_download and product_dir.exists():
                 print(f"[{i}/{len(df)}] Already downloaded: {product_name}")
+                downloaded.append(product_dir)
                 continue
             print(f"[{i}/{len(df)}] Downloading {product_name} …")
             try:
                 path = client.download_product(row["Id"], self.output_dir, product_name)
-                # Unzip if needed
+                # Unzip if needed -- CDSE always delivers a Sentinel-1 SAFE
+                # product as a .zip whose sole top-level member is the
+                # product's own <product_name>.SAFE directory, so that's
+                # what gets appended below (not the discarded .zip path,
+                # and not left off entirely): downstream callers --
+                # notably dry_collocation.py's sar_footprints_from_downloaded,
+                # which orchestrator.py's own real (non-dry) collocation
+                # gating depends on -- read this return value to find the
+                # actual downloaded products. Silently dropping every
+                # unzipped product here (the pre-fix behavior) made
+                # download_metadata.json's "sar"."files" always empty
+                # despite a nonzero found_count, which in turn made
+                # the from-downloaded gating check operate on zero SAR
+                # footprints and never skip anything.
                 if path.suffix == ".zip":
                     with zipfile.ZipFile(path, "r") as zf:
                         zf.extractall(self.output_dir)
                     path.unlink()
+                    downloaded.append(product_dir)
                     print(f"  Unzipped to {self.output_dir}")
                 else:
                     downloaded.append(path)

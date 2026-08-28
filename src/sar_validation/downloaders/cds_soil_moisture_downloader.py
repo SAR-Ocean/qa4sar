@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import warnings
 import zipfile
 from datetime import date, timedelta
 from pathlib import Path
@@ -56,6 +57,17 @@ __all__ = ["CDSSoilMoistureDownloader"]
 
 #: CDS dataset identifier for the satellite soil moisture product.
 _CDS_DATASET = "satellite-soil-moisture"
+
+#: Base URL for the CDS catalogue's collection-metadata endpoint, used by
+#: check_availability_dry (see that method). Deliberately a fixed constant
+#: rather than read from ~/.cdsapirc: unlike cdsapi.Client (whose __new__
+#: calls get_url_key_verify and raises immediately if no credential file
+#: exists, before it even decides which API version to talk to -- see
+#: cdsapi.api.get_url_key_verify), the catalogue endpoint this URL points
+#: at is unauthenticated, so requiring a credential file just to build the
+#: URL would defeat the point of using it as the no-credentials-needed
+#: existence check.
+_CDS_API_URL = "https://cds.climate.copernicus.eu/api"
 
 #: Every CDS product version this dataset has published for the
 #: icdr/daily facet combination this downloader requests. Maintained
@@ -272,6 +284,77 @@ class CDSSoilMoistureDownloader:
         nc_path = self._extract_nc(zip_path, day)
         zip_path.unlink(missing_ok=True)
         return nc_path
+
+    def check_availability_dry(self, day: date) -> bool:
+        """
+        Whether CDS has data for *day*, without downloading it.
+
+        Queries the CDS catalogue's collection-metadata endpoint (via
+        ``ecmwf.datastores.Client.get_collection`` -- a ``cdsapi``
+        dependency) for this dataset's real, live temporal coverage extent
+        (``begin_datetime``/``end_datetime``) and checks whether *day*
+        falls within it. Unlike ``_download_day``, this never submits a
+        real CDR/ICDR processing job -- ``cdsapi.Client.retrieve()`` blocks
+        on genuine server-side processing, which is far too slow for a
+        dry-collocation preview. The catalogue endpoint is a fast,
+        unauthenticated, sub-second metadata lookup instead.
+
+        This is extent-level precision, not a guarantee that a granule
+        exists for this exact day (CDS's real per-day product can have
+        gaps within its published extent) -- but it's a fast, safe
+        existence signal for a *prediction* feature.
+
+        Any failure to determine the extent (missing dependency, network
+        error, unexpected response shape) is raised rather than swallowed
+        into ``False`` -- callers must treat an exception here as
+        "couldn't determine", never as "no data".
+
+        Returns
+        -------
+        bool
+            True if *day* falls within the dataset's live-queried
+            begin/end temporal extent.
+        """
+        try:
+            import ecmwf.datastores  # noqa: PLC0415 — optional dependency, imported lazily
+        except ImportError as exc:
+            logger.debug("check_availability_dry: ecmwf.datastores unavailable: %s", exc)
+            raise ImportError(
+                "ecmwf-datastores-client (installed automatically alongside cdsapi) is "
+                "required for CDS soil moisture availability checks. Install it with: "
+                "pip install 'sar-l2-validation-toolbox[soil_moisture]'"
+            ) from exc
+
+        try:
+            # get_collection() is an unauthenticated metadata lookup (see
+            # this method's own docstring), but ecmwf.datastores.Client
+            # warns "The API key is missing" on construction regardless of
+            # whether the call that follows needs one -- suppressed here
+            # since no credentials are required for this specific call.
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="The API key is missing", category=UserWarning)
+                client = ecmwf.datastores.Client(url=_CDS_API_URL)
+                collection = client.get_collection(_CDS_DATASET)
+            begin = collection.begin_datetime
+            end = collection.end_datetime
+        except Exception:
+            logger.debug(
+                "check_availability_dry: catalogue lookup failed for %s (%s)",
+                _CDS_DATASET, day.isoformat(), exc_info=True,
+            )
+            raise
+
+        if begin is None or end is None:
+            logger.debug(
+                "check_availability_dry: catalogue reported no usable temporal extent "
+                "for %s (begin=%r, end=%r)", _CDS_DATASET, begin, end,
+            )
+            raise RuntimeError(
+                f"CDS catalogue returned no usable temporal extent for {_CDS_DATASET!r} "
+                f"(begin={begin!r}, end={end!r})."
+            )
+
+        return begin.date() <= day <= end.date()
 
     def _extract_nc(self, zip_path: Path, day: date) -> Optional[Path]:
         """Extract the first .nc file from *zip_path* to :attr:`output_dir`."""

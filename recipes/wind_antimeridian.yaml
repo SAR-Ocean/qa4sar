@@ -42,7 +42,7 @@ validation_sources:
 - source_type: tidal_gauge
   download_kwargs: {}
   collocation_kwargs: {}
-- source_type: scatterometer
+- source_type: scatterometer_ascat
   download_kwargs: {}
   collocation_kwargs: {}
 - source_type: altimeter

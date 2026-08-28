@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -794,3 +795,50 @@ class TestISMNDownloaderBboxPreFilterWiring:
 
         assert result == []
         fake_interface.ISMN_Interface.assert_not_called()
+
+
+class TestStationDateRangesDry:
+    def test_station_date_ranges_dry_reads_first_and_last_timestamp(self, tmp_path):
+        # Build a minimal fake archive: a real .zip (matching the real
+        # archive format -- ISMN has no download API, so the toolbox
+        # always reads a manually-downloaded zip export, never an
+        # extracted directory tree) containing one network/station's
+        # .stm file with a header line + two data rows.
+        # Header line follows the real CEOP layout confirmed against a
+        # live ISMN archive (see _build_station_index's own docstring):
+        # NETWORK SUBNETWORK STATION LAT LON ELEV DEPTH_FROM DEPTH_TO
+        # 'SENSOR' -- lat/lon are tokens[3]/tokens[4].
+        archive_path = tmp_path / "fake_ismn.zip"
+        with zipfile.ZipFile(archive_path, "w") as zf:
+            zf.writestr(
+                "FakeNetwork/FakeStation/FakeNetwork_FakeStation_sm_0.000_0.050_sensor_20260101_20260105.stm",
+                "FakeNetwork FakeNetwork FakeStation 45.0 10.0 100 0.000 0.050 'sensor'\n"
+                "2026/01/01 00:00 0.25 U\n"
+                "2026/01/05 23:00 0.30 U\n",
+            )
+
+        dl = ISMNDownloader(output_dir=tmp_path / "out")
+        ranges = dl.station_date_ranges_dry(
+            min_lon=0.0, max_lon=20.0, min_lat=40.0, max_lat=50.0, archive_path=str(archive_path),
+        )
+
+        assert ranges is not None
+        # Exact dir_prefix key format follows _build_station_index's own
+        # convention (network/station/, matching the zip's directory
+        # structure) -- the (lat, lon, earliest, latest) tuple shape is
+        # the load-bearing part. lat=45.0, lon=10.0 come from the .stm
+        # header line's own embedded coordinates (matching
+        # _build_station_index's existing lat/lon extraction, reused
+        # here -- not re-parsed from the header a second time).
+        (only_entry,) = ranges.values()
+        assert only_entry == (45.0, 10.0, datetime(2026, 1, 1, 0, 0), datetime(2026, 1, 5, 23, 0))
+
+    def test_station_date_ranges_dry_returns_none_when_no_archive_present(self, tmp_path, monkeypatch):
+        import sar_validation.downloaders.ismn_downloader as ismn_module
+
+        monkeypatch.setattr(ismn_module, "_SHARED_ARCHIVE_CACHE_DIR", tmp_path / "nonexistent")
+
+        dl = ISMNDownloader(output_dir=tmp_path / "out")
+        ranges = dl.station_date_ranges_dry(min_lon=0.0, max_lon=20.0, min_lat=40.0, max_lat=50.0)
+
+        assert ranges is None

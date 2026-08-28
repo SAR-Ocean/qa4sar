@@ -511,6 +511,59 @@ class TestExecuteRecipePassesForceDownloadToOrchestrator:
         assert mock_cls.call_args.kwargs["force_download"] is True
 
 
+class TestExecuteRecipePassesDownloadAllInBboxToOrchestrator:
+    def test_download_all_in_bbox_flag_reaches_orchestrator_constructor(self, tmp_path):
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        with patch("sar_validation.core.orchestrator.DataOrchestrator") as mock_cls:
+            mock_cls.return_value.download_all.return_value = True
+            mock_cls.return_value.base_dir = tmp_path / "run"
+            cli._execute_recipe(str(recipe_path), download_all_in_bbox=True)
+
+        assert mock_cls.call_args.kwargs["download_all_in_bbox"] is True
+
+    def test_unflagged_run_passes_download_all_in_bbox_false(self, tmp_path):
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        with patch("sar_validation.core.orchestrator.DataOrchestrator") as mock_cls:
+            mock_cls.return_value.download_all.return_value = True
+            mock_cls.return_value.base_dir = tmp_path / "run"
+            cli._execute_recipe(str(recipe_path))
+
+        assert mock_cls.call_args.kwargs["download_all_in_bbox"] is False
+
+    def test_download_all_in_bbox_cli_flag_threads_through_main(self, tmp_path):
+        from unittest.mock import patch
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        with patch("sar_validation.core.orchestrator.DataOrchestrator") as mock_cls:
+            mock_cls.return_value.download_all.return_value = True
+            mock_cls.return_value.base_dir = tmp_path / "run"
+            cli.main(["--recipe", str(recipe_path), "--download-all-in-bbox"])
+
+        assert mock_cls.call_args.kwargs["download_all_in_bbox"] is True
+
+
 class TestExecuteRecipeSkipsStatsWhenAlreadyComputed:
     """Step 4 (compute statistics) should be resumable just like steps 1-3:
     if validation_statistics_*.nc files for every pair already exist on
@@ -1320,3 +1373,142 @@ class TestExecuteRecipeStopsWhenNoSarData:
         mock_convert.assert_not_called()
         out = capsys.readouterr().out
         assert "No SAR data found" in out
+
+
+class TestDryCollocationFlag:
+    def test_flag_prints_report_and_returns_before_downloading(self, tmp_path, capsys, monkeypatch):
+        from sar_validation.core.dry_collocation import CollocationReport, SourcePrediction
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-dry-collocation", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        fake_report = CollocationReport(
+            recipe_path=str(recipe_path),
+            sar_footprint_count=0,
+            predictions=[
+                SourcePrediction(
+                    source_type="sentinel1_l2_ocn", bucket="orbit-corridor",
+                    verdict="none-predicted", detail="no SAR footprints discovered",
+                ),
+            ],
+        )
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.discover_sar_footprints_dry",
+            lambda spec, cfg: [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.predict_collocation",
+            lambda cfg, fps, recipe_path="", stop_on_first_match=False: fake_report,
+        )
+
+        download_called = {"n": 0}
+        monkeypatch.setattr(
+            "sar_validation.core.orchestrator.DataOrchestrator.download_all",
+            lambda self: download_called.__setitem__("n", download_called["n"] + 1) or True,
+        )
+
+        cli.main(["--recipe", str(recipe_path), "--dry-collocation"])
+
+        assert download_called["n"] == 0  # download_all was never reached
+        captured = capsys.readouterr().out
+        assert "source" in captured  # the console table header
+        assert "sentinel1_l2_ocn" in captured
+
+        report_path = tmp_path / "run" / "dry_collocation_report.json"
+        assert report_path.exists()
+        assert "sentinel1_l2_ocn" in report_path.read_text()
+
+    def test_fast_by_default_stops_at_first_match(self, tmp_path, monkeypatch):
+        """--dry-collocation alone must request stop_on_first_match=True
+        (fast: collocated/none-predicted only) -- --dry-collocation-detail
+        is what opts into the exhaustive per-footprint count instead."""
+        from sar_validation.core.dry_collocation import CollocationReport
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-dry-collocation", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        seen = {}
+
+        def _fake_predict_collocation(cfg, fps, recipe_path="", stop_on_first_match=False):
+            seen["stop_on_first_match"] = stop_on_first_match
+            return CollocationReport(recipe_path=str(recipe_path), sar_footprint_count=0, predictions=[])
+
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.discover_sar_footprints_dry", lambda spec, cfg: [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.predict_collocation", _fake_predict_collocation,
+        )
+
+        cli.main(["--recipe", str(recipe_path), "--dry-collocation"])
+
+        assert seen["stop_on_first_match"] is True
+
+    def test_detail_flag_requests_exhaustive_scan(self, tmp_path, monkeypatch):
+        from sar_validation.core.dry_collocation import CollocationReport
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-dry-collocation", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        seen = {}
+
+        def _fake_predict_collocation(cfg, fps, recipe_path="", stop_on_first_match=False):
+            seen["stop_on_first_match"] = stop_on_first_match
+            return CollocationReport(recipe_path=str(recipe_path), sar_footprint_count=0, predictions=[])
+
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.discover_sar_footprints_dry", lambda spec, cfg: [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.predict_collocation", _fake_predict_collocation,
+        )
+
+        cli.main(["--recipe", str(recipe_path), "--dry-collocation", "--dry-collocation-detail"])
+
+        assert seen["stop_on_first_match"] is False
+
+    def test_detail_flag_alone_still_triggers_the_preview(self, tmp_path, monkeypatch):
+        """--dry-collocation-detail only modifies --dry-collocation's own
+        behavior -- passed alone (without --dry-collocation itself) it
+        must still trigger the dry-collocation preview (exhaustively),
+        not silently fall through to a real run."""
+        from sar_validation.core.dry_collocation import CollocationReport
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+
+        recipe_path = tmp_path / "recipe.yaml"
+        Recipe(RecipeConfig(
+            name="test-dry-collocation", variable="wind", output_dir=str(tmp_path / "run"),
+        )).to_yaml(recipe_path)
+
+        seen = {}
+
+        def _fake_predict_collocation(cfg, fps, recipe_path="", stop_on_first_match=False):
+            seen["stop_on_first_match"] = stop_on_first_match
+            return CollocationReport(recipe_path=str(recipe_path), sar_footprint_count=0, predictions=[])
+
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.discover_sar_footprints_dry", lambda spec, cfg: [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.predict_collocation", _fake_predict_collocation,
+        )
+
+        download_called = {"n": 0}
+        monkeypatch.setattr(
+            "sar_validation.core.orchestrator.DataOrchestrator.download_all",
+            lambda self: download_called.__setitem__("n", download_called["n"] + 1) or True,
+        )
+
+        cli.main(["--recipe", str(recipe_path), "--dry-collocation-detail"])
+
+        assert seen["stop_on_first_match"] is False
+        assert download_called["n"] == 0  # never fell through to a real run

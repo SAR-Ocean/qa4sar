@@ -66,6 +66,82 @@ class TestQueryProductsDateFilterIsInclusive:
         assert "ContentDate/Start lt" not in filter_str
 
 
+class TestQueryProductsCapturesGeoFootprint:
+    """CDSE's /Products response includes a GeoFootprint GeoJSON-style
+    geometry object by default (no extra $expand/$select needed). Today
+    query_products discards it -- it must survive into the returned
+    record dict so a later SAR-side discovery step (dry-collocation) can
+    build a real polygon SarFootprint instead of falling back to a bbox."""
+
+    def test_query_products_captures_geofootprint(self):
+        client = _make_client()
+        fake_footprint = {
+            "type": "Polygon",
+            "coordinates": [[[-10.0, 35.0], [10.0, 35.0], [10.0, 55.0], [-10.0, 55.0], [-10.0, 35.0]]],
+        }
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "value": [
+                {
+                    "Id": "abc-123",
+                    "Name": (
+                        "S1A_IW_OCN__2SDV_20260801T000000_20260801T000030_"
+                        "000000_000000_0000.SAFE"
+                    ),
+                    "ContentDate": {
+                        "Start": "2026-08-01T00:00:00.000Z",
+                        "End": "2026-08-01T00:00:30.000Z",
+                    },
+                    "ContentLength": 1073741824,
+                    "Online": True,
+                    "GeoFootprint": fake_footprint,
+                }
+            ]
+        }
+        with patch.object(client.session, "get", return_value=resp):
+            records = client.query_products(
+                collection="SENTINEL-1", product_type="OCN",
+                start_date="2026-08-01T00:00:00.000Z",
+                end_date="2026-08-02T00:00:00.000Z",
+                min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0,
+            )
+
+        assert records[0]["GeoFootprint"] == fake_footprint
+
+    def test_query_products_geofootprint_defaults_to_none(self):
+        client = _make_client()
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "value": [
+                {
+                    "Id": "abc-123",
+                    "Name": (
+                        "S1A_IW_OCN__2SDV_20260801T000000_20260801T000030_"
+                        "000000_000000_0000.SAFE"
+                    ),
+                    "ContentDate": {
+                        "Start": "2026-08-01T00:00:00.000Z",
+                        "End": "2026-08-01T00:00:30.000Z",
+                    },
+                    "ContentLength": 1073741824,
+                    "Online": True,
+                    # No GeoFootprint key present in this product record.
+                }
+            ]
+        }
+        with patch.object(client.session, "get", return_value=resp):
+            records = client.query_products(
+                collection="SENTINEL-1", product_type="OCN",
+                start_date="2026-08-01T00:00:00.000Z",
+                end_date="2026-08-02T00:00:00.000Z",
+                min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0,
+            )
+
+        assert records[0]["GeoFootprint"] is None
+
+
 class TestMonthsTouched:
     def test_single_month(self):
         from sar_validation.downloaders.base import months_touched

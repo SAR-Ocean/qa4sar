@@ -201,6 +201,47 @@ class TestHSAFDownloaderDownloadAll:
         assert _REAL_H122_FILENAME in capsys.readouterr().out
 
 
+class TestListCandidatesDry:
+    def test_returns_matches_without_fetching(self, tmp_path):
+        """Mirrors download()'s own FTP-listing/matching logic exactly, but
+        never touches self.dry_run and never calls _fetch_one."""
+        fake_ftp = MagicMock()
+        fake_ftp.nlst.return_value = [_REAL_H29_FILENAME, _METOPA_H29_FILENAME]
+
+        with patch("ftplib.FTP", return_value=fake_ftp), patch(
+            "sar_validation.downloaders.hsaf_downloader.authenticate_hsaf_ftp",
+            return_value=("user", "pass"),
+        ):
+            dl = HSAFDownloader(output_dir=tmp_path, product="h29", orbit_prefilter=False)
+            candidates = dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-06-09", end="2026-06-09",
+            )
+
+        assert not fake_ftp.retrbinary.called
+        assert len(candidates) == 1
+        name, sensing_start, sensing_end = candidates[0]
+        assert name == _METOPA_H29_FILENAME
+        assert sensing_start == datetime(2026, 6, 9, 23, 12, 0, tzinfo=timezone.utc)
+        assert sensing_end == datetime(2026, 6, 9, 23, 14, 59, tzinfo=timezone.utc)
+
+    def test_no_matches_returns_empty(self, tmp_path):
+        fake_ftp = MagicMock()
+        fake_ftp.nlst.return_value = ["readme.txt"]
+
+        with patch("ftplib.FTP", return_value=fake_ftp), patch(
+            "sar_validation.downloaders.hsaf_downloader.authenticate_hsaf_ftp",
+            return_value=("user", "pass"),
+        ):
+            dl = HSAFDownloader(output_dir=tmp_path, orbit_prefilter=False)
+            candidates = dl.list_candidates_dry(
+                min_lon=_MIN_LON, max_lon=_MAX_LON, min_lat=_MIN_LAT, max_lat=_MAX_LAT,
+                start="2026-06-08", end="2026-06-09",
+            )
+
+        assert candidates == []
+
+
 class TestParseSatellite:
     @pytest.mark.parametrize(
         "filename,expected",

@@ -6,7 +6,7 @@ Supports validation of **wind** (speed + direction), **ocean currents**, **signi
 
 Supported SAR products:
 - Sentinel-1 L2_OCN (Level 2 Ocean): wind/waves/currents
-- Sentinel1 clms ssm (Surface Soil Moisture; Europe; daily): soil moisture
+- Sentinel1 clms ssm (Surface Soil Moisture; Europe; daily): soil_moisture
 - NISAR SME2 (beta & provisional): soil_moisture 
 - RADARSAT-2 (NOAA NCEI SAR-derived ocean wind, speed only): wind
 
@@ -18,14 +18,17 @@ The toolbox is structured around 6 sequential steps that together form a complet
 
 ```
 Step 0 — Create recipe (.yaml)
-          │  define validation variable (wind / currents / waves) --> selects the validation data sources
+          │  define validation variable (wind / currents / waves / soil_moisture) --> selects the validation 
+          |  data sources. For wind and soil_moisture the SAR source of interest can be chosen.
           │  define geographic bounds (min/max lon/lat)
           │  define temporal bounds (start/end dates)
           ▼
 Step 1 — Download data
-          │  download SAR L2_OCN + all validation sources
+          │  download selected SAR data source + all validation sources
           │  for the recipe region and time window
           |  --dry-run available to check product availibility
+          |  default: only downloads validation-source data predicted to collocate with
+          |  the SAR data; --download-all-in-bbox downloads everything in the bbox/window.
           ▼
 Step 2 — Convert to xarray.DataTree
           │  standardize all formats + attach CF-convention metadata 
@@ -36,7 +39,10 @@ Step 3 — Collocation + store collocated pairs
           │  point vs. point    (mooring / buoy / drifter / ferrybox / tidal gauge vs. SAR wave parameter)
           │  point vs. layer    (mooring / buoy / drifter / ferrybox / tidal gauge vs. SAR)
           │  layer vs. layer    (scatterometer / altimeter / radiometer / HF-radar vs. SAR)
+          |  model vs. layer    (ERA5 / HYCOM vs. SAR)
           |  create a collocation diagnostics plot
+          |  --dry-collocation and --dry-collocation-detail preview the predicted collocation 
+          |  before running steps 1-2 (download/convert)
           │  store collocated data + spatial/temporal offset metadata
           ▼
 Step 4 — Compute statistics
@@ -124,13 +130,26 @@ sar-validate --create-recipe soil_moisture
 This writes a YAML recipe to `recipes/<name>_validation.yaml`.  
 Edit the file to adjust the geographic region, time window, and validation sources.
 
-### 3. Dry-run (check what will be downloaded)
+### 3a. Dry-run (check what will be downloaded)
 
 ```bash
 sar-validate --recipe recipes/wind_validation.yaml --dry-run
 ```
 
-### 4. Execute (download all data)
+### 3b. Dry-collocation (check whether there would be any collocation prior to downloading)
+
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --dry-collocation
+```
+
+To get more details on the number of collocated pairs predicted, run
+
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --dry-collocation-detail
+```
+
+### 4. Execute
+To only download the data:
 
 ```bash
 sar-validate --recipe recipes/wind_validation.yaml
@@ -138,39 +157,50 @@ sar-validate --recipe recipes/wind_validation.yaml
 
 Downloads are saved under `data/<timerange>_<bounds>/`.
 
-### 5. Convert, collocate, and analyse (Python)
+To run all steps of the toolbox at once:
 
-```python
-from sar_validation.core.datatree_converter import DataTreeConverter
-from sar_validation.core.collocation import PointLayerCollocation
-import xarray as xr
-import pandas as pd
-
-# --- Step 2: convert ---
-converter = DataTreeConverter()
-ds_sar    = converter.from_sar_l2_ocn_safe("data/.../S1_L2_OCN/S1A_IW_OCN_...SAFE", product_type="wind")
-ds_insitu = converter.from_insitu_csv("data/.../copernicus_insitu_data/obs.csv", source_type="buoy")
-
-# --- Step 3: collocate and store as DataFrame ---
-colloc = PointLayerCollocation(spatial_tolerance_km=50, time_tolerance_minutes=60)
-results = colloc.collocate(
-    sar_data={"wind_speed": sar_ws_array},
-    sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
-    val_data=df_insitu,
-    val_source="buoy",
-)
-df = DataTreeConverter.to_dataframe(results)
-df.to_csv("data/.../collocations_wind_buoy.csv", index=False)
-
-# --- Step 4: calculate statistics ---
-
-# --- Step 5: visualize and create PDF report ---
-import matplotlib.pyplot as plt
-plt.scatter(df["val_wind_speed"], df["sar_wind_speed"])
-plt.xlabel("Buoy wind speed (m/s)")
-plt.ylabel("SAR wind speed (m/s)")
-plt.show()
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --plot
 ```
+
+### 5. Convert, collocate, and analyse
+
+**Step 2 — convert and store as a DataTree:**
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --convert
+```
+The datatree is saved under `data/<timerange>_<bounds>/datatree.nc`.
+
+**Step 3 — collocate and store as a Dataset:**
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --collocate
+```
+
+Standard layer-vs-layer collocation method uses cell-averaging for SAR data. If you want each individual SAR cell to be linked to validation data, use:
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --collocate --layer-vs-layer-collocation-method individual
+```
+
+or to include both options:
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --collocate --layer-vs-layer-collocation-method both
+```
+
+The collocation results are saved under `data/<timerange>_<bounds>/collocation_results.nc` and/or `data/<timerange>_<bounds>/collocation_results_individual.nc`.
+
+**Step 4 — calculate statistics:**
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --stats
+```
+
+The statistics are saved under `data/<timerange>_<bounds>/validation_statistics_<sar_var>_vs_<val_var>.nc/.csv`.
+
+**Step 5 — visualize and create PDF report:**
+```bash
+sar-validate --recipe recipes/wind_validation.yaml --plot
+```
+
+The validation report is saved under `data/<timerange>_<bounds>/validation_report.pdf`.
 
 ---
 
@@ -190,6 +220,7 @@ plt.show()
 | ASCAT (MetOp-B/C) | wind | `scatterometer_downloader` | EUMETSAT EUMDAC | MetOp-B/C: 2012/2019 - present |
 | HY-2B / HY-2C / Oceansat-3 | wind | `scatterometer_ftp_downloader` | OSI-SAF FTP | last 3 days |
 | Radiometer — AMSR2 (NetCDF); GMI, SSMIS F16/F17/F18, WindSat (binary bytemaps) | wind (+ direction from WindSat) | `radiometer_downloader` | RSS `data.remss.com` (public HTTPS) | AMSR2/GMI/SSMIS F16/F17/F18: 2012-07-02/2014-03-04/2003-10-26/2006-11-04/2009-10-18 - present |
+| Altimeter (10 missions, along-track) | wind (1 Hz only) / significant wave height | `altimeter_downloader` | Copernicus Marine | 1 Hz: varies by mission, 2023-11-21 to 2023-12-28 - present; 5 Hz (6 of the missions): varies by mission, 2026-03-07/09 - present |
 | Sentinel-1 CLMS Surface Soil Moisture | soil moisture | `sentinel1_soil_moisture_downloader` | Copernicus Dataspace (CDSE) | 2014 - present (Europe only) |
 | ASCAT Soil Moisture (SOMO12) | soil moisture | `ascat_soil_moisture_downloader` | EUMETSAT EUMDAC | 2007 - 2025-07-15 |
 | ASCAT Soil Moisture NRT (H122/H29) | soil moisture | `hsaf_downloader` | H-SAF FTP | rolling last 60 days (⚠️ gap between 2025-07-15 and 60 days ago is not covered); H122 (6.25km) by default, H29 (12.5km) via `download_kwargs: {hsaf_product: h29}` |
@@ -213,6 +244,18 @@ wind, selectable via `sar-validate --create-recipe wind --sar-source
 radarsat2` (or `source: radarsat2` in the recipe YAML). It provides
 **wind speed only**. Coverage is global but concentrated over 
 Alaska/the North Pacific.
+
+Altimeter data (`WAVE_GLO_PHY_SWH_L3_NRT_014_001`) covers 10 satellite
+missions (Saral/AltiKa, CryoSat-2, CFOSAT, HaiYang-2B/2C, Jason-3,
+Sentinel-3A/3B, Sentinel-6A, SWOT nadir) at 1 Hz (~7 km along-track); 6 of
+these missions (AltiKa, CryoSat-2, Jason-3, Sentinel-3A/3B, Sentinel-6A)
+additionally provide 5 Hz (~1.4 km) data from March 2026. Wind recipes use
+1 Hz `WIND_SPEED` only; wave recipes use `VAVH`/`VAVH_UNFILTERED` at both
+frequencies. Coverage start dates are per-mission (see `AVAILABILITY_START`
+in `altimeter_downloader.py`) and reflect the ARCO/zarr store this
+downloader queries via `copernicusmarine.subset()`; Copernicus Marine also
+holds a separate native-file archive with most missions' raw data back to
+2021, but that's a different service this downloader doesn't fetch from.
 
 ### Collocation types
 

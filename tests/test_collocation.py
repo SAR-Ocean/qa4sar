@@ -177,6 +177,55 @@ class TestPointLayerCollocation:
         assert isinstance(r.sar_time, datetime)
         assert isinstance(r.val_time, datetime)
 
+    def test_forward_fill_never_borrows_from_a_different_platform(self):
+        """A validation point whose own platform never reports a given
+        variable at all (e.g. a tidal gauge, which only measures water
+        level, never wind) must not silently borrow a DIFFERENT nearby
+        platform's own reading of that variable just because it falls
+        within the same spatial+temporal tolerance -- that would corrupt
+        the collocation with a real value from the wrong instrument.
+        With nothing of its own to fall back to either, the tidal gauge's
+        own point must produce NO collocation at all (there being no
+        borrowed value is exactly the point -- before this fix, it would
+        have gotten one from the mooring instead)."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        val = _make_val_dataframe(
+            lons=[0.0, 0.05], lats=[52.0, 52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0), datetime(2026, 1, 1, 12, 5, 0)],
+            WSPD=[np.nan, 9.5], WDIR=[np.nan, 210.0],
+            platform_id=["TG_001", "MO_001"],
+        )
+
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "tidal_gauge")
+
+        assert [r for r in results if r.val_id == "TG_001"] == []
+        assert [r for r in results if r.val_id == "MO_001"]  # the real reading is unaffected
+
+    def test_forward_fill_still_works_within_the_same_platform(self):
+        """The intended case this mechanism exists for: the SAME platform
+        has a brief sensor gap (NaN at the reading closest to the SAR
+        time) but reports a real value shortly after, still within
+        time_tolerance_minutes -- that later reading of its OWN should
+        still fill the gap."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        val = _make_val_dataframe(
+            lons=[0.0, 0.0], lats=[52.0, 52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0), datetime(2026, 1, 1, 12, 30, 0)],
+            WSPD=[np.nan, 9.5],
+            platform_id=["MO_001", "MO_001"],
+        )
+
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100, dedup_nearest_in_time=True)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "mooring")
+
+        assert len(results) == 1  # dedup_nearest_in_time keeps only the 12:00:00 reading
+        assert results[0].val_data["WSPD"] == 9.5
+
     def test_nan_sar_pixels_excluded(self):
         """Grid cells with NaN SAR values should not produce collocations."""
         grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()

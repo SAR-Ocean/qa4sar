@@ -33,8 +33,10 @@ import logging
 import os
 import shutil
 import sys
+import threading
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import pandas as pd
 
@@ -54,6 +56,33 @@ logger = logging.getLogger(__name__)
 
 DATASET_ID = "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr"
 ALL_VARIABLES = ["WSPD", "WDIR", "VAVH", "VGHS", "VHM0", "HCDT", "HCSP", "EWCT", "NSCT"]
+
+#: Recipe cfg.variable -> the ALL_VARIABLES subset actually comparable to
+#: that physical quantity. "waves" mirrors core/_variable_map.py's own
+#: WAVE_HEIGHT_VAL_VARS precedence set (VHM0/VAVH/VGHS -- see
+#: DataTreeConverter.from_insitu_csv, the single source of truth for
+#: which raw column wins when a station reports more than one). A
+#: platform reporting only variables outside its recipe's own set (e.g.
+#: a pure-currents drifter, EWCT/NSCT only, on a "waves" recipe) has
+#: nothing to actually validate against and must not be treated as a
+#: real collocation candidate at all -- see dry_collocation.py's
+#: _predict_insitu, which uses this to filter both the query itself
+#: (fewer irrelevant rows fetched/parsed, so faster too) and, in turn,
+#: which stations even reach its own point-vs-footprint refinement.
+RECIPE_VARIABLE_TO_INSITU_VARIABLES: "dict[str, tuple[str, ...]]" = {
+    "waves": ("VHM0", "VAVH", "VGHS"),
+    "wind": ("WSPD", "WDIR"),
+    "currents": ("EWCT", "NSCT", "HCDT", "HCSP"),
+}
+
+
+def variables_for_recipe(variable: str) -> "tuple[str, ...]":
+    """The ALL_VARIABLES subset relevant to *variable* (a recipe's own
+    cfg.variable, e.g. "waves") -- falls back to the full ALL_VARIABLES
+    set for an unrecognized value (e.g. "soil_moisture", which this
+    dataset has no comparable variable for at all), fail-toward-inclusion
+    rather than silently returning nothing comparable."""
+    return RECIPE_VARIABLE_TO_INSITU_VARIABLES.get(variable, tuple(ALL_VARIABLES))
 
 # Mapping from recipe source types to Copernicus platform codes.
 # "drifter" resolves to both "DB" (drifting buoy) and "AD" (autonomous
@@ -78,6 +107,41 @@ PLATFORM_CODE_TO_SOURCE_TYPE = {
     "TG": "tidal_gauge",
     "AD": "drifter",
 }
+
+
+#: _fetch_stations_dry's own shared, per-process, network-fetch cache
+#: (unfiltered by source_types -- see _fetch_stations_dry's own docstring
+#: for why). Keyed by every query parameter that actually affects
+#: copernicusmarine's own server-side result (bbox, window, dataset_part,
+#: variables) -- deliberately NOT source_types, which is applied locally
+#: afterward.
+_fetch_stations_cache: "dict[tuple, pd.DataFrame]" = {}
+
+#: One lock per cache key (created lazily, guarded by
+#: _fetch_stations_locks_guard), not one lock for the whole cache: a
+#: predict_collocation run's own ThreadPoolExecutor checks --dry-collocation's
+#: five real in-situ source types (mooring/buoy/ferrybox/drifter/
+#: tidal_gauge) concurrently, and every one of them shares the exact same
+#: bbox/window/dataset_part/variables for a single recipe run (cfg.variable
+#: is recipe-wide, not per-source) -- without this cache, that concurrency
+#: turns into five simultaneous, otherwise-identical network requests
+#: (and five simultaneous auth.marine.copernicus.eu token requests)
+#: instead of one -- enough concurrent load to trip that server's own
+#: read timeout under real-world load. The first caller for a given key
+#: holds that key's own lock for the
+#: duration of the real fetch; concurrent callers for the SAME key block
+#: only on each other, never on a caller with a different key.
+_fetch_stations_locks: "dict[tuple, threading.Lock]" = {}
+_fetch_stations_locks_guard = threading.Lock()
+
+
+def _get_fetch_stations_lock(cache_key: tuple) -> "threading.Lock":
+    with _fetch_stations_locks_guard:
+        lock = _fetch_stations_locks.get(cache_key)
+        if lock is None:
+            lock = threading.Lock()
+            _fetch_stations_locks[cache_key] = lock
+        return lock
 
 
 def _resolve_platform_codes(source_types: list[str]) -> list[str]:
@@ -149,6 +213,19 @@ class InSituDownloader:
         self.max_depth = max_depth
         self.force_download = force_download
 
+    def _get_copernicusmarine(self):
+        """Lazy import of copernicusmarine, isolated into its own method
+        (rather than an inline ``import`` in each caller) so tests can
+        monkeypatch this one method instead of faking ``sys.modules``."""
+        try:
+            import copernicusmarine
+        except ImportError as exc:
+            raise ImportError(
+                "copernicusmarine is required for in-situ downloads.\n"
+                "Install it with:  pip install copernicusmarine"
+            ) from exc
+        return copernicusmarine
+
     def download(
         self,
         min_lon: float,
@@ -178,13 +255,7 @@ class InSituDownloader:
         list[Path]
             Paths to the downloaded CSVs (one per window that produced data).
         """
-        try:
-            import copernicusmarine
-        except ImportError as exc:
-            raise ImportError(
-                "copernicusmarine is required for in-situ downloads.\n"
-                "Install it with:  pip install copernicusmarine"
-            ) from exc
+        copernicusmarine = self._get_copernicusmarine()
 
         start_dt = normalize_datetime(start)
         end_dt   = normalize_datetime(end)
@@ -198,6 +269,197 @@ class InSituDownloader:
             if path is not None:
                 downloaded.append(path)
         return downloaded
+
+    def _fetch_stations_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+        source_types: Optional[list[str]] = None,
+        dataset_part: Optional[str] = None,
+        variables: Optional["Iterable[str]"] = None,
+    ) -> "pd.DataFrame":
+        """
+        Shared fetch behind check_availability_dry and station_ranges_dry:
+        the real, platform_type-filtered in-situ dataframe for this
+        bbox/time window, without writing anything to disk.
+
+        Uses ``copernicusmarine.read_dataframe()`` rather than ``subset()``
+        (the real download path's call) or ``open_dataset()`` (used by
+        this codebase's other Copernicus Marine sources): this dataset's
+        storage format doesn't support lazy ``xarray`` loading, so
+        ``read_dataframe()`` -- an in-memory, bbox/time-filtered fetch
+        with no local file written -- is the lightest real existence
+        check available for it. ``source_types`` filters the result the
+        same way ``download()``'s own post-hoc ``platform_type`` filter
+        does. ``variables`` narrows the query to just the physical
+        quantities relevant to the caller (see ``variables_for_recipe``)
+        rather than always querying the full ``ALL_VARIABLES`` set --
+        both a genuine availability question (a station reporting only
+        wind speed has nothing comparable to a "waves" recipe) and a
+        real speed win (fewer irrelevant rows fetched/parsed). Defaults
+        to ``ALL_VARIABLES`` for a caller with no recipe-specific
+        variable in scope (e.g. the real ``download()`` path, which
+        historically wants every variable a platform might report).
+
+        An antimeridian-crossing bbox (min_lon > max_lon, this codebase's
+        own wrap convention) is split into one query per non-wrapping
+        range via ``split_antimeridian_bbox`` first, mirroring
+        ``download()``'s own identical handling -- passed straight
+        through unsplit, ``copernicusmarine.read_dataframe`` has no
+        concept of a wrapping bbox, so min_lon > max_lon there is simply
+        an empty/invalid range, not "wrap through 180". Concatenated
+        with duplicates dropped, since a station whose position matches
+        both split ranges' rounding could otherwise appear twice.
+
+        The real network fetch (everything except the final
+        ``source_types`` filter) is shared via ``_fetch_stations_cache``
+        across every caller requesting the same bbox/window/dataset_part/
+        variables/depth -- see that cache's own module-level comment for
+        why this matters for --dry-collocation specifically.
+        """
+        start_dt = normalize_datetime(start)
+        end_dt = normalize_datetime(end)
+        resolved_part = dataset_part or ("latest" if is_date_recent(end_dt) else "monthly")
+        resolved_variables = list(variables) if variables is not None else ALL_VARIABLES
+
+        cache_key = (
+            min_lon, max_lon, min_lat, max_lat, start_dt, end_dt,
+            resolved_part, tuple(resolved_variables), self.min_depth, self.max_depth,
+        )
+        lock = _get_fetch_stations_lock(cache_key)
+        with lock:
+            df = _fetch_stations_cache.get(cache_key)
+            if df is None:
+                df = self._fetch_stations_uncached(
+                    min_lon, max_lon, min_lat, max_lat, start_dt, end_dt, resolved_part, resolved_variables,
+                )
+                _fetch_stations_cache[cache_key] = df
+
+        if df.empty:
+            return df
+
+        if source_types:
+            platform_codes = _resolve_platform_codes(source_types)
+            if platform_codes and "platform_type" in df.columns:
+                df = df[df["platform_type"].isin(platform_codes)]
+
+        return df
+
+    def _fetch_stations_uncached(
+        self,
+        min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+        start_dt: str, end_dt: str, resolved_part: str, resolved_variables: "list[str]",
+    ) -> "pd.DataFrame":
+        """The actual copernicusmarine.read_dataframe() call(s)
+        _fetch_stations_dry shares via its own cache -- split out so the
+        cache-hit path never re-imports copernicusmarine or repeats this
+        method's own logging for a request another caller already
+        satisfied."""
+        copernicusmarine = self._get_copernicusmarine()
+
+        frames = []
+        for win_min_lon, win_max_lon in split_antimeridian_bbox(min_lon, max_lon):
+            print(
+                f"  Checking in-situ availability: bbox=[{win_min_lon:.2f}, {win_max_lon:.2f}, "
+                f"{min_lat:.2f}, {max_lat:.2f}]  window={start_dt} → {end_dt}  "
+                f"dataset={DATASET_ID} ({resolved_part})  variables={resolved_variables}"
+            )
+            frames.append(copernicusmarine.read_dataframe(
+                dataset_id=DATASET_ID,
+                dataset_part=resolved_part,
+                variables=resolved_variables,
+                minimum_longitude=win_min_lon,
+                maximum_longitude=win_max_lon,
+                minimum_latitude=min_lat,
+                maximum_latitude=max_lat,
+                start_datetime=start_dt,
+                end_datetime=end_dt,
+                minimum_depth=self.min_depth,
+                maximum_depth=self.max_depth,
+                disable_progress_bar=True,
+            ))
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if df.empty:
+            return df
+        return df.drop_duplicates().reset_index(drop=True)
+
+    def check_availability_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+        source_types: Optional[list[str]] = None,
+        dataset_part: Optional[str] = None,
+        variables: Optional["Iterable[str]"] = None,
+    ) -> bool:
+        """
+        Whether any in-situ observation exists in this bbox/time window,
+        without writing anything to disk. See _fetch_stations_dry's own
+        docstring for the underlying query this collapses to a boolean
+        (including what ``variables`` narrows); station_ranges_dry is the
+        same query kept as real per-station coordinates, for a caller
+        wanting to refine against a real SAR footprint shape rather than
+        just its bbox (see dry_collocation.py's _predict_insitu, which
+        does exactly this).
+        """
+        df = self._fetch_stations_dry(
+            min_lon, max_lon, min_lat, max_lat, start, end, source_types, dataset_part, variables,
+        )
+        return not df.empty
+
+    def station_ranges_dry(
+        self,
+        min_lon: float,
+        max_lon: float,
+        min_lat: float,
+        max_lat: float,
+        start: str,
+        end: str,
+        source_types: Optional[list[str]] = None,
+        dataset_part: Optional[str] = None,
+        variables: Optional["Iterable[str]"] = None,
+    ) -> "dict[str, tuple[float, float, datetime, datetime]]":
+        """
+        platform_id -> (lat, lon, earliest, latest) for every real in-situ
+        station reporting data in this bbox/time window.
+
+        Mirrors ISMNDownloader.station_date_ranges_dry's exact return
+        shape (see dry_collocation.py's _predict_ismn), so a caller can
+        apply the same real point-vs-footprint-shape refinement
+        (dry_collocation._point_in_footprint) this dataset's boolean-only
+        check_availability_dry can't offer: a WV-mode SAR footprint's own
+        bbox is the bounding envelope of dozens of small vignette points
+        scattered across up to ~30 minutes of orbit track, sometimes
+        thousands of km wide -- checking a station against that whole
+        bbox, rather than against the real vignette locations, badly
+        over-matches. Uses the same _fetch_stations_dry() call
+        check_availability_dry makes, just keeping the real
+        per-observation coordinates instead of collapsing them to a
+        boolean. See _fetch_stations_dry's own docstring for what
+        ``variables`` narrows and why.
+        """
+        df = self._fetch_stations_dry(
+            min_lon, max_lon, min_lat, max_lat, start, end, source_types, dataset_part, variables,
+        )
+        if df.empty:
+            return {}
+
+        df = df.copy()
+        df["time"] = pd.to_datetime(df["time"])
+        ranges: "dict[str, tuple[float, float, datetime, datetime]]" = {}
+        for platform_id, group in df.groupby("platform_id"):
+            ranges[str(platform_id)] = (
+                float(group["latitude"].iloc[0]), float(group["longitude"].iloc[0]),
+                group["time"].min().to_pydatetime(), group["time"].max().to_pydatetime(),
+            )
+        return ranges
 
     def _download_window(
         self,

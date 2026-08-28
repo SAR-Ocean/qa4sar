@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -102,6 +103,47 @@ class EarthdataSoilMoistureDownloader:
             self._candidates = list(dataset)
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
+
+    def list_candidates_dry(
+        self, min_lon: float, max_lon: float, min_lat: float, max_lat: float, start: str, end: str,
+    ) -> "list[tuple[str, datetime, datetime]]":
+        """(granule_id, begin_time, end_time) for every granule download()
+        would find across every configured ``(short_name, version)``
+        candidate -- the same ``earthaccess.search_data()`` calls,
+        without fetching anything. begin_time/end_time are parsed from
+        each granule's own ``umm.TemporalExtent.RangeDateTime``, the same
+        UMM-G access pattern dry_collocation._search_nisar_sme2_dry uses.
+        A granule missing/malformed TemporalExtent data is skipped rather
+        than raising, since one bad granule must not abort the whole
+        listing.
+        """
+        import earthaccess
+
+        from .base import authenticate_earthdata
+
+        authenticate_earthdata()
+
+        start_dt = normalize_datetime(start)
+        end_dt = normalize_datetime(end)
+
+        candidates: "list[tuple[str, datetime, datetime]]" = []
+        for short_name, version in self._candidates:
+            results = earthaccess.search_data(
+                short_name=short_name,
+                version=version,
+                bounding_box=(min_lon, min_lat, max_lon, max_lat),
+                temporal=(start_dt, end_dt),
+            )
+            for granule in results:
+                try:
+                    temporal = granule["umm"]["TemporalExtent"]["RangeDateTime"]
+                    begin = datetime.fromisoformat(temporal["BeginningDateTime"].replace("Z", "+00:00"))
+                    end_ts = datetime.fromisoformat(temporal["EndingDateTime"].replace("Z", "+00:00"))
+                    granule_id = granule["meta"]["native-id"]
+                except (KeyError, TypeError, ValueError):
+                    continue
+                candidates.append((granule_id, begin, end_ts))
+        return candidates
 
     def download(
         self,
