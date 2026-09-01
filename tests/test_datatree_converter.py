@@ -1941,13 +1941,19 @@ class TestWvSafeProductTypeRouting:
         assert "rvlRadVel" in ds.data_vars
         assert ds.attrs.get("swath_mode") == "WV"
 
-    def _make_wv_waves_safe(self, tmp_path, *, osw_hs, osw_total_hs=None):
+    def _make_wv_waves_safe(
+        self, tmp_path, *, osw_hs, osw_total_hs=None,
+        osw_land_flag=None, osw_quality_flag=None,
+    ):
         """
         Build a WV SAFE whose vignette measurement file carries partitioned
-        ``oswHs`` and optionally an integrated ``oswTotalHs``.
+        ``oswHs`` and optionally an integrated ``oswTotalHs``, plus
+        ``oswLandFlag``/``oswQualityFlag`` when given.
 
         ``osw_hs`` is the per-partition Hs array (dims oswAzSize, oswRaSize,
         oswPartitions = 1, 1, N); ``-1`` entries mimic the product fill code.
+        Pass ``np.nan`` for a scalar QC kwarg to simulate a present-but-fill
+        value (matching how xarray decodes a real product's fill code).
         """
         safe = tmp_path / "S1A_WV_OCN.SAFE"
         meas = safe / "measurement"
@@ -1962,6 +1968,16 @@ class TestWvSafeProductTypeRouting:
             data["oswTotalHs"] = (
                 ("oswAzSize", "oswRaSize"),
                 np.array([[osw_total_hs]], "float32"),
+            )
+        if osw_land_flag is not None:
+            data["oswLandFlag"] = (
+                ("oswAzSize", "oswRaSize"),
+                np.array([[osw_land_flag]], "float32"),
+            )
+        if osw_quality_flag is not None:
+            data["oswQualityFlag"] = (
+                ("oswAzSize", "oswRaSize"),
+                np.array([[osw_quality_flag]], "float32"),
             )
         ds_raw = xr.Dataset(data)
         ds_raw.to_netcdf(
@@ -1996,6 +2012,35 @@ class TestWvSafeProductTypeRouting:
         assert out is not None
         assert "oswTotalHs" in out.data_vars
         assert float(out["oswTotalHs"].values[0]) == pytest.approx(0.80, abs=1e-4)
+
+    def test_wv_land_flag_rejects_point(self, tmp_path):
+        safe = self._make_wv_waves_safe(
+            tmp_path, osw_hs=[1.2], osw_total_hs=2.0, osw_land_flag=1,
+        )
+        out = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert out is not None
+        assert np.isnan(out["oswTotalHs"].values[0])
+        assert out.attrs["osw_land_pixel_count"] == 1
+        assert out.attrs["osw_land_pixel_fraction"] == pytest.approx(1.0)
+
+    def test_wv_land_flag_zero_keeps_point(self, tmp_path):
+        safe = self._make_wv_waves_safe(
+            tmp_path, osw_hs=[1.2], osw_total_hs=2.0, osw_land_flag=0,
+        )
+        out = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert out is not None
+        assert float(out["oswTotalHs"].values[0]) == pytest.approx(2.0, abs=1e-4)
+        assert out.attrs["osw_land_pixel_count"] == 0
+
+    def test_wv_land_flag_absent_keeps_point(self, tmp_path):
+        # No oswLandFlag in the product at all -- must not be treated as land.
+        safe = self._make_wv_waves_safe(tmp_path, osw_hs=[1.2], osw_total_hs=2.0)
+        out = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert out is not None
+        assert float(out["oswTotalHs"].values[0]) == pytest.approx(2.0, abs=1e-4)
+        assert out.attrs["osw_land_pixel_count"] == 0
+        assert "oswLandFlag" in out.data_vars
+        assert np.isnan(out["oswLandFlag"].values[0])
 
 
 # ---------------------------------------------------------------------------

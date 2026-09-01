@@ -2945,6 +2945,8 @@ class DataTreeConverter:
         point_hs = []
         point_times = []
         file_names = []
+        point_land_flag = []
+        n_land_reject = 0
         osw_attrs: Dict[str, Dict] = {}
 
         for nc_path in wv_files:
@@ -2958,6 +2960,11 @@ class DataTreeConverter:
                 # Extract coordinates as scalars (1×1 grid)
                 lon = float(ds_raw["oswLon"].values.item())
                 lat = float(ds_raw["oswLat"].values.item())
+
+                land_flag = (
+                    float(ds_raw["oswLandFlag"].values.item())
+                    if "oswLandFlag" in ds_raw else np.nan
+                )
 
                 # Wave height to validate against VHM0 = the product's
                 # integrated total significant wave height (oswTotalHs), which
@@ -2988,6 +2995,20 @@ class DataTreeConverter:
                         "partitions", nc_path.name, valid.size,
                     )
 
+                if "oswLandFlag" not in osw_attrs and "oswLandFlag" in ds_raw:
+                    osw_attrs["oswLandFlag"] = dict(ds_raw["oswLandFlag"].attrs)
+
+                # oswLandFlag masks a vignette regardless of whether hs came
+                # from oswTotalHs directly or the oswHs-partition fallback.
+                # Expected to matter little for WV mode, which is used
+                # almost exclusively over open ocean.
+                land_reject = False
+                if np.isfinite(hs):
+                    land_reject = np.isfinite(land_flag) and land_flag == 1
+                    if land_reject:
+                        hs = np.nan
+                n_land_reject += int(land_reject)
+
                 # Acquisition time from filename (format: YYYYMMDDtHHMMSS)
                 m = re.search(r"(\d{8}t\d{6})", nc_path.stem, re.IGNORECASE)
                 if m:
@@ -3005,6 +3026,7 @@ class DataTreeConverter:
                         acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
                     ))
                     file_names.append(nc_path.name)
+                    point_land_flag.append(land_flag)
 
             except Exception as exc:
                 logger.debug("Could not extract oswHs from %s: %s", nc_path.name, exc)
@@ -3015,9 +3037,13 @@ class DataTreeConverter:
             logger.warning("No valid oswTotalHs data extracted from %s", measurement_dir)
             return None
 
+        n_points = len(point_hs)
+        osw_land_pixel_fraction = n_land_reject / n_points
+
         # Create Dataset with point dimension
         data_vars = {
             "oswTotalHs": (["point"], point_hs),
+            "oswLandFlag": (["point"], point_land_flag),
         }
 
         coords = {
@@ -3034,12 +3060,21 @@ class DataTreeConverter:
         ds.attrs["safe_dir"] = safe_dir.name
         ds.attrs["swath_mode"] = "WV"
         ds.attrs["measurement_type"] = "oswTotalHs"
-        ds.attrs["num_points"] = len(point_hs)
+        ds.attrs["num_points"] = n_points
+        ds.attrs["osw_land_pixel_count"] = n_land_reject
+        ds.attrs["osw_land_pixel_fraction"] = osw_land_pixel_fraction
 
         logger.info(
             "Extracted %d oswTotalHs points from WV product %s",
-            len(point_hs), safe_dir.name
+            n_points, safe_dir.name
         )
+        if n_land_reject:
+            logger.warning(
+                "scene %s: %d/%d OSW points land-flagged (%.1f%%) via "
+                "oswLandFlag",
+                safe_dir.name, n_land_reject, n_points,
+                100 * osw_land_pixel_fraction,
+            )
         return ds
 
     @staticmethod
