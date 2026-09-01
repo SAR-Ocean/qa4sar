@@ -2947,6 +2947,8 @@ class DataTreeConverter:
         file_names = []
         point_land_flag = []
         n_land_reject = 0
+        point_quality_flag = []
+        n_quality_reject = 0
         osw_attrs: Dict[str, Dict] = {}
 
         for nc_path in wv_files:
@@ -2964,6 +2966,11 @@ class DataTreeConverter:
                 land_flag = (
                     float(ds_raw["oswLandFlag"].values.item())
                     if "oswLandFlag" in ds_raw else np.nan
+                )
+
+                quality_flag = (
+                    float(ds_raw["oswQualityFlag"].values.item())
+                    if "oswQualityFlag" in ds_raw else np.nan
                 )
 
                 # Wave height to validate against VHM0 = the product's
@@ -2998,14 +3005,23 @@ class DataTreeConverter:
                 if "oswLandFlag" not in osw_attrs and "oswLandFlag" in ds_raw:
                     osw_attrs["oswLandFlag"] = dict(ds_raw["oswLandFlag"].attrs)
 
-                # oswLandFlag masks a vignette regardless of whether hs came
-                # from oswTotalHs directly or the oswHs-partition fallback.
-                # Expected to matter little for WV mode, which is used
-                # almost exclusively over open ocean.
+                if "oswQualityFlag" not in osw_attrs and "oswQualityFlag" in ds_raw:
+                    osw_attrs["oswQualityFlag"] = dict(ds_raw["oswQualityFlag"].attrs)
+
+                # oswLandFlag and oswQualityFlag mask a vignette
+                # regardless of whether hs came from oswTotalHs directly
+                # or the oswHs-partition fallback. Independent checks -- a
+                # point failing both increments both counters (no dedup).
                 land_reject = False
+                quality_reject = False
                 if np.isfinite(hs):
                     land_reject = np.isfinite(land_flag) and land_flag == 1
-                    if land_reject:
+                    # oswQualityFlag is never populated in real WV OCN
+                    # products today (confirmed empirically). NaN/fill is
+                    # treated as "no opinion", not a rejection, so this is
+                    # a documented no-op until ESA starts filling it.
+                    quality_reject = np.isfinite(quality_flag) and quality_flag >= 2
+                    if land_reject or quality_reject:
                         hs = np.nan
 
                 # Acquisition time from filename (format: YYYYMMDDtHHMMSS)
@@ -3027,6 +3043,8 @@ class DataTreeConverter:
                     file_names.append(nc_path.name)
                     point_land_flag.append(land_flag)
                     n_land_reject += int(land_reject)
+                    point_quality_flag.append(quality_flag)
+                    n_quality_reject += int(quality_reject)
 
             except Exception as exc:
                 logger.debug("Could not extract oswHs from %s: %s", nc_path.name, exc)
@@ -3039,11 +3057,13 @@ class DataTreeConverter:
 
         n_points = len(point_hs)
         osw_land_pixel_fraction = n_land_reject / n_points
+        osw_quality_masked_pixel_fraction = n_quality_reject / n_points
 
         # Create Dataset with point dimension
         data_vars = {
             "oswTotalHs": (["point"], point_hs),
             "oswLandFlag": (["point"], point_land_flag),
+            "oswQualityFlag": (["point"], point_quality_flag),
         }
 
         coords = {
@@ -3063,17 +3083,20 @@ class DataTreeConverter:
         ds.attrs["num_points"] = n_points
         ds.attrs["osw_land_pixel_count"] = n_land_reject
         ds.attrs["osw_land_pixel_fraction"] = osw_land_pixel_fraction
+        ds.attrs["osw_quality_masked_pixel_count"] = n_quality_reject
+        ds.attrs["osw_quality_masked_pixel_fraction"] = osw_quality_masked_pixel_fraction
 
         logger.info(
             "Extracted %d oswTotalHs points from WV product %s",
             n_points, safe_dir.name
         )
-        if n_land_reject:
+        if n_land_reject or n_quality_reject:
             logger.warning(
-                "scene %s: %d/%d OSW points land-flagged (%.1f%%) via "
-                "oswLandFlag",
-                safe_dir.name, n_land_reject, n_points,
-                100 * osw_land_pixel_fraction,
+                "scene %s: OSW points masked -- land=%d/%d (%.1f%%), "
+                "quality=%d/%d (%.1f%%)",
+                safe_dir.name,
+                n_land_reject, n_points, 100 * osw_land_pixel_fraction,
+                n_quality_reject, n_points, 100 * osw_quality_masked_pixel_fraction,
             )
         return ds
 
