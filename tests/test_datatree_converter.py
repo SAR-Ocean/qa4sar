@@ -2061,8 +2061,8 @@ class TestWvSafeProductTypeRouting:
         assert out.attrs["osw_quality_masked_pixel_count"] == 0
 
     def test_wv_quality_flag_fill_is_noop(self, tmp_path):
-        # oswQualityFlag is NaN/fill in every real product observed so far --
-        # this must not reject the point (a no-op today, not a rejection).
+        # oswQualityFlag is unpopulated in real WV OCN products -- this
+        # must not reject the point (a no-op today, not a rejection).
         safe = self._make_wv_waves_safe(
             tmp_path, osw_hs=[1.2], osw_total_hs=2.0, osw_quality_flag=np.nan,
         )

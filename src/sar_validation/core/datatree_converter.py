@@ -3016,8 +3016,8 @@ class DataTreeConverter:
                 quality_reject = False
                 if np.isfinite(hs):
                     land_reject = np.isfinite(land_flag) and land_flag == 1
-                    # oswQualityFlag is never populated in real WV OCN
-                    # products today (confirmed empirically). NaN/fill is
+                    # oswQualityFlag is unpopulated in Sentinel-1 WV OCN
+                    # products today (always the fill value). NaN/fill is
                     # treated as "no opinion", not a rejection, so this is
                     # a documented no-op until ESA starts filling it.
                     quality_reject = np.isfinite(quality_flag) and quality_flag >= 2
