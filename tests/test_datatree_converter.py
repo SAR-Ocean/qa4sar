@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import math
 import sys
 from datetime import datetime
@@ -275,10 +276,8 @@ class TestFromInsituCsv:
 
     def test_wave_height_precedence_when_platform_reports_both_vhm0_and_vavh(self, tmp_path):
         """A CMEMS in-situ platform can report both VHM0 (spectral Hm0) and
-        VAVH (time-domain H1/3) for the same observation -- confirmed live
-        2026-08-10 (mooring 6200442, VAVH=1.0/VHM0=1.1 in the same
-        collocation row). Left as-is, that single observation lands in BOTH
-        the oswTotalHs_vs_VAVH (paired with altimeter) and
+        VAVH (time-domain H1/3) for the same observation. The single observation 
+        lands in both the oswTotalHs_vs_VAVH (paired with altimeter) and
         oswTotalHs_vs_VHM0 (paired with era5) report sections --
         double-counting one physical reading across two comparisons.
         Only the highest-precedence column (VHM0 > VAVH > VGHS, matching
@@ -483,9 +482,7 @@ class TestFromSarL3SsmGeotiff:
 
 
 class TestFromNisarSme2:
-    """Tests for DataTreeConverter.from_nisar_sme2 -- fixture layout
-    confirmed 2026-07-31 against a real downloaded granule
-    (NISAR_L3_PR_SME2_003_005_A_014_..._001.h5): soilMoisture/longitude/
+    """Tests for DataTreeConverter.from_nisar_sme2 -- soilMoisture/longitude/
     latitude live directly under science/LSAR/SME2/grids (not a
     frequencyA subgroup); longitude/latitude are 1-D EASE-grid axes (not
     a 2-D meshgrid); the fill value is soilMoisture's own _FillValue
@@ -559,15 +556,12 @@ def _make_radarsat2_wind_nc(
     """Build a synthetic RADARSAT-2 wind granule.
 
     With include_quality_flags=True (new filename era), the grid
-    reproduces a real, live-confirmed (2026-08-05) finding: mask/icemask
-    alone are NOT a substitute for pixel_level_quality_flags. Cell (0,1)
+    reproduces a real finding: mask/icemask
+    alone are not a substitute for pixel_level_quality_flags. Cell (0,1)
     is water/water per mask/icemask (the same condition the old-era
     fallback below relies on) yet is flagged 4 ("valid wind in buffer
-    region" -- NOT the strict flag 5) and must still be dropped. An
-    earlier design draft assumed mask==-1 & icemask==1 implied flag==5;
-    this was checked directly against a real downloaded granule and
-    found false (the mask/icemask condition alone kept 115,267 pixels
-    vs. flag==5's 63,810) -- see design-choices.md Sec 10.
+    region" -- not the strict flag 5) and must still be dropped. An
+    earlier design draft assumed mask==-1 & icemask==1 implied flag==5.
 
     With include_quality_flags=False (old filename era, where this
     variable does not exist), the converter's mask/icemask fallback path
@@ -1261,9 +1255,6 @@ class TestFromRadiometerNc:
 # from_radiometer_bytemap (RSS binary bytemaps: GMI / SSMIS / WindSat)
 # ---------------------------------------------------------------------------
 
-import gzip as _gzip
-
-
 def _make_bytemap_gz(tmp_path: Path, sensor: str, filename: str, cells) -> Path:
     """Write a full-size RSS bytemap .gz (all-missing 255 except `cells`).
 
@@ -1275,7 +1266,7 @@ def _make_bytemap_gz(tmp_path: Path, sensor: str, filename: str, cells) -> Path:
     for (p, v, la, lo, val) in cells:
         arr[p, v, la, lo] = val
     path = tmp_path / filename
-    with _gzip.open(path, "wb") as fh:
+    with gzip.open(path, "wb") as fh:
         fh.write(arr.tobytes())
     return path
 
@@ -1327,7 +1318,7 @@ class TestFromRadiometerBytemap:
 
     def test_unresolvable_sensor_returns_none(self, tmp_path):
         p = tmp_path / "unknownprefix_20240601.gz"
-        with _gzip.open(p, "wb") as fh:
+        with gzip.open(p, "wb") as fh:
             fh.write(b"\x00" * 10)
         assert DataTreeConverter.from_radiometer_bytemap(p) is None
 
@@ -1743,6 +1734,198 @@ class TestOwiMaskLandFiltering:
         assert np.isfinite(ds["owiWindSpeed"].values).all()
         assert np.isfinite(ds["owiWindDirection"].values).all()
         assert ds.attrs["owi_land_pixel_count"] == 0
+
+
+class TestOwiInversionQualityPassthrough:
+    def test_inversion_quality_extracted_and_passed_through(self, tmp_path):
+        ny, nx = 2, 2
+        rng = np.random.default_rng(3)
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        raw_iq = np.array([[0.0, 1.0], [1.0, 0.0]], dtype="float32")
+        ds_raw = xr.Dataset(
+            {
+                "owiWindSpeed": (odims, rng.uniform(2, 15, (ny, nx)).astype("float32")),
+                "owiWindDirection": (odims, rng.uniform(0, 360, (ny, nx)).astype("float32")),
+                "owiLon": (odims, rng.uniform(-20.0, -19.0, (ny, nx)).astype("float32")),
+                "owiLat": (odims, rng.uniform(50.0, 51.0, (ny, nx)).astype("float32")),
+                "owiInversionQuality": (odims, raw_iq),
+            },
+            attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
+        )
+        ds_raw.to_netcdf(
+            meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+
+        assert ds is not None
+        assert "owiInversionQuality" in ds.data_vars
+        np.testing.assert_array_equal(ds["owiInversionQuality"].values, raw_iq)
+
+    def test_inversion_quality_absent_defaults_to_nan(self, tmp_path):
+        ny, nx = 2, 2
+        rng = np.random.default_rng(4)
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        ds_raw = xr.Dataset(
+            {
+                "owiWindSpeed": (odims, rng.uniform(2, 15, (ny, nx)).astype("float32")),
+                "owiWindDirection": (odims, rng.uniform(0, 360, (ny, nx)).astype("float32")),
+                "owiLon": (odims, rng.uniform(-20.0, -19.0, (ny, nx)).astype("float32")),
+                "owiLat": (odims, rng.uniform(50.0, 51.0, (ny, nx)).astype("float32")),
+            },
+            attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
+        )
+        ds_raw.to_netcdf(
+            meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+
+        assert ds is not None
+        assert "owiInversionQuality" in ds.data_vars
+        assert np.isnan(ds["owiInversionQuality"].values).all()
+
+
+class TestOwiQualityFlagMasking:
+    @staticmethod
+    def _build_quality_grid_safe(
+        tmp_path, wq_values, iq_values, *, include_wq=True, include_iq=True
+    ):
+        ny, nx = len(wq_values), 1
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        owi_speed = (np.arange(ny, dtype="float32") + 10.0).reshape(ny, nx)
+        owi_dir = (np.arange(ny, dtype="float32") + 200.0).reshape(ny, nx)
+        data = {
+            "owiWindSpeed": (odims, owi_speed),
+            "owiWindDirection": (odims, owi_dir),
+            "owiLon": (odims, np.full((ny, nx), -19.5, dtype="float32")),
+            "owiLat": (odims, np.full((ny, nx), 50.5, dtype="float32")),
+        }
+        if include_wq:
+            data["owiWindQuality"] = (odims, np.array(wq_values, dtype="float32").reshape(ny, nx))
+        if include_iq:
+            data["owiInversionQuality"] = (odims, np.array(iq_values, dtype="float32").reshape(ny, nx))
+        ds_raw = xr.Dataset(data, attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"})
+        ds_raw.to_netcdf(
+            meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+        return safe, meas, owi_speed, owi_dir
+
+    def test_reject_truth_table(self, tmp_path):
+        nan = float("nan")
+        # index:            0     1     2     3     4     5     6     7    8
+        wq_values = [0,    1,    2,    0,    nan,  nan,  nan,  1,   3]
+        iq_values = [0,    1,    0,    2,    0,    nan,  1,    nan, 1]
+        expected_reject = np.array(
+            [False, False, True, True, False, True, False, False, True]
+        )
+        safe, meas, owi_speed, owi_dir = self._build_quality_grid_safe(
+            tmp_path, wq_values, iq_values
+        )
+
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+
+        assert ds is not None
+        reject_col = expected_reject.reshape(-1, 1)
+        np.testing.assert_array_equal(
+            ds["owiWindSpeed"].values, np.where(reject_col, np.nan, owi_speed)
+        )
+        np.testing.assert_array_equal(
+            ds["owiWindDirection"].values, np.where(reject_col, np.nan, owi_dir)
+        )
+        # Flags themselves pass through unmodified, even at rejected cells.
+        np.testing.assert_array_equal(
+            ds["owiWindQuality"].values.ravel(), np.array(wq_values, dtype="float32")
+        )
+        np.testing.assert_array_equal(
+            ds["owiInversionQuality"].values.ravel(), np.array(iq_values, dtype="float32")
+        )
+
+        expected_count = int(expected_reject.sum())
+        assert ds.attrs["owi_quality_masked_pixel_count"] == expected_count
+        assert ds.attrs["owi_quality_masked_pixel_fraction"] == pytest.approx(expected_count / 9)
+
+    def test_quality_masking_is_logged(self, tmp_path, caplog):
+        safe, meas, _, _ = self._build_quality_grid_safe(tmp_path, [0, 2], [0, 0])
+        with caplog.at_level("WARNING"):
+            ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+        assert ds is not None
+        assert any(
+            "quality-flagged" in r.message
+            and "owiWindQuality" in r.message
+            and "owiInversionQuality" in r.message
+            for r in caplog.records
+        )
+
+    def test_no_quality_flags_present_no_rejection(self, tmp_path):
+        safe, meas, owi_speed, owi_dir = self._build_quality_grid_safe(
+            tmp_path, [0, 1, 2], [0, 1, 2], include_wq=False, include_iq=False
+        )
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+        assert ds is not None
+        np.testing.assert_array_equal(ds["owiWindSpeed"].values, owi_speed)
+        np.testing.assert_array_equal(ds["owiWindDirection"].values, owi_dir)
+        assert ds.attrs["owi_quality_masked_pixel_count"] == 0
+
+    def test_only_wind_quality_present_governs_alone(self, tmp_path):
+        nan = float("nan")
+        wq_values = [0, 2, nan]
+        safe, meas, owi_speed, owi_dir = self._build_quality_grid_safe(
+            tmp_path, wq_values, [0, 0, 0], include_iq=False
+        )
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+        assert ds is not None
+        reject_col = np.array([False, True, False]).reshape(-1, 1)
+        np.testing.assert_array_equal(
+            ds["owiWindSpeed"].values, np.where(reject_col, np.nan, owi_speed)
+        )
+        assert ds.attrs["owi_quality_masked_pixel_count"] == 1
+
+    def test_combination_with_land_masking(self, tmp_path):
+        # Row 0: land + quality-bad. Row 1: land only. Row 2: quality-bad
+        # only. Row 3: neither.
+        ny, nx = 4, 1
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        owi_speed = (np.arange(ny, dtype="float32") + 10.0).reshape(ny, nx)
+        owi_dir = (np.arange(ny, dtype="float32") + 200.0).reshape(ny, nx)
+        owi_mask = np.array([1, 1, 0, 0], dtype="int8").reshape(ny, nx)
+        owi_wq = np.array([2, 0, 2, 0], dtype="float32").reshape(ny, nx)
+        ds_raw = xr.Dataset(
+            {
+                "owiWindSpeed": (odims, owi_speed),
+                "owiWindDirection": (odims, owi_dir),
+                "owiLon": (odims, np.full((ny, nx), -19.5, dtype="float32")),
+                "owiLat": (odims, np.full((ny, nx), 50.5, dtype="float32")),
+                "owiMask": (odims, owi_mask),
+                "owiWindQuality": (odims, owi_wq),
+            },
+            attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
+        )
+        ds_raw.to_netcdf(
+            meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+
+        assert ds is not None
+        reject_col = np.array([True, True, True, False]).reshape(-1, 1)
+        np.testing.assert_array_equal(
+            ds["owiWindSpeed"].values, np.where(reject_col, np.nan, owi_speed)
+        )
+        assert ds.attrs["owi_land_pixel_count"] == 2
+        assert ds.attrs["owi_quality_masked_pixel_count"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2434,8 +2617,7 @@ class TestFromAmsrSsm:
 
 
 class TestFromAmsrSsmAuLandFormat:
-    """The real AU_Land granule structure (confirmed 2026-08-07 via a live
-    NASA Earthdata download of AMSR_U2_L2_Land_B02_202312312326_D.he5):
+    """The real AU_Land granule structure:
     an HDF-EOS5 POINTS layout, not SWATHS -- a single compound dataset
     with named fields, including two independent soil-moisture retrievals
     (NPD, SCA) with no stated "primary" one. See
@@ -2481,7 +2663,7 @@ class TestFromAmsrSsmAuLandFormat:
 
     def test_time_uses_tai93_epoch_not_unix_epoch(self, tmp_path):
         """seconds-since-1993 (TAI93), not seconds-since-1970 (Unix) --
-        confirmed live: the real sample granule's Time field numerically
+        the real sample granule's Time field numerically
         matches its own filename-embedded acquisition timestamp only
         under the 1993 epoch."""
         from sar_validation.core.datatree_converter import DataTreeConverter
@@ -2880,6 +3062,32 @@ class TestFromHfRadarGridQCFlagFilter:
         assert result.sizes["point"] == 4
         assert sorted(np.round(result["EWCT"].values, 1).tolist()) == [1.0, 4.0, 5.0, 6.0]
         assert all(q != 4 for q in result["hfr_qc"].values)
+
+    def test_drops_qcflag_untested_cells(self, tmp_path):
+        times = pd.date_range("2026-06-01", periods=1, freq="1h")
+        lats = np.array([10.0, 11.0])
+        lons = np.array([20.0, 21.0])
+        ewct = np.array([[[1.0, 2.0], [3.0, 4.0]]])
+        nsct = np.array([[[0.1, 0.2], [0.3, 0.4]]])
+        # QCflag=0 ("no QC performed") is not one of CMEMS's valid codes
+        # (1, 2, 5, 7, 8) even though it is not 4 ("bad") either.
+        qcflag = np.array([[[0.0, 1.0], [2.0, 5.0]]])
+        ds = xr.Dataset(
+            {
+                "EWCT": (("time", "latitude", "longitude"), ewct),
+                "NSCT": (("time", "latitude", "longitude"), nsct),
+                "QCflag": (("time", "latitude", "longitude"), qcflag),
+            },
+            coords={"time": times, "latitude": lats, "longitude": lons},
+        )
+        path = tmp_path / "cop_qc_untested_test.nc"
+        ds.to_netcdf(path)
+
+        result = DataTreeConverter.from_hf_radar_grid(path, u_var="EWCT", v_var="NSCT")
+
+        assert result is not None
+        assert result.sizes["point"] == 3
+        assert 0.0 not in result["hfr_qc"].values
 
     def test_noaa_style_file_without_qcflag_is_unaffected(self, tmp_path):
         times = pd.date_range("2026-06-01", periods=1, freq="1h")
