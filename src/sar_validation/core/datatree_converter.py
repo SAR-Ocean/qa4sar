@@ -3007,7 +3007,6 @@ class DataTreeConverter:
                     land_reject = np.isfinite(land_flag) and land_flag == 1
                     if land_reject:
                         hs = np.nan
-                n_land_reject += int(land_reject)
 
                 # Acquisition time from filename (format: YYYYMMDDtHHMMSS)
                 m = re.search(r"(\d{8}t\d{6})", nc_path.stem, re.IGNORECASE)
@@ -3027,6 +3026,7 @@ class DataTreeConverter:
                     ))
                     file_names.append(nc_path.name)
                     point_land_flag.append(land_flag)
+                    n_land_reject += int(land_reject)
 
             except Exception as exc:
                 logger.debug("Could not extract oswHs from %s: %s", nc_path.name, exc)
