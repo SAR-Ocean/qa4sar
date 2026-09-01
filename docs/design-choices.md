@@ -474,6 +474,32 @@ single partition, giving a representative total. This is why the WV waves pair
 in `_variable_map` is `("oswTotalHs", "VHM0")` with `("oswHs", "VHM0")` kept only
 as a legacy fallback.
 
+#### WV wave quality-flag masking
+
+`from_sar_l2_ocn_wv_safe` gates `oswTotalHs` on two independent checks,
+straight from ESA's own product flags, neither deduplicated against the
+other (a point failing both is counted by each):
+
+- **`oswLandFlag`** — set where land coverage exceeds 10% of the
+  vignette. Expected to matter little in practice: WV mode is used
+  almost exclusively over open ocean.
+- **`oswQualityFlag`** (the product's own total-quality flag, 0=good to
+  3=poor, same dims as `oswTotalHs`) — rejects at ≥2. This field is never
+  populated by ESA's processor today (always its `-128` fill value), so
+  the check is currently a documented no-op — implemented anyway so it
+  activates automatically if a future processor version starts populating
+  it, the same precedent as NOAA HF-radar's `QCflag` (§3.6).
+
+Deliberately not implemented: any threshold derived from
+`oswTotalHsStdev` or `oswQualityFlagPartition`. Both were investigated
+as candidates, but neither is an ESA-defined rejection criterion for
+`oswTotalHs` — using either would mean inventing this toolbox's own OSW
+quality-control rule rather than applying one ESA already publishes.
+Masking here is intentionally limited to what `oswLandFlag` and
+`oswQualityFlag` themselves say.
+
+> Code: `core/datatree_converter.py` (`from_sar_l2_ocn_wv_safe`).
+
 ### 5.6 Smaller collocation choices
 
 - **Missing-reading forward-fill:** if an in-situ observation has a NaN for
