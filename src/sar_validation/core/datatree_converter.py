@@ -363,6 +363,46 @@ def _parse_ascat_resolution_km(filename: str) -> float:
         return 12.5
 
 
+def _parse_acquisition_time(
+    ds_raw: xr.Dataset,
+    file_stem: str,
+    prefer_filename: bool = False,
+) -> Optional[np.datetime64]:
+    """
+    Resolve one SAR L2 OCN measurement file's acquisition time from either
+    its firstMeasurementTime attribute or its filename timestamp (format
+    YYYYMMDDtHHMMSS), returning None if neither resolves.
+
+    prefer_filename reverses which source is tried first: the WV point
+    path favors the filename timestamp, the RVL/OWI/OSW grid paths favor
+    the product attribute.
+    """
+    def _from_attr() -> Optional[np.datetime64]:
+        time_str = ds_raw.attrs.get("firstMeasurementTime")
+        if not time_str:
+            return None
+        acq_time = pd.to_datetime(time_str)
+        return np.datetime64(
+            acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
+        )
+
+    def _from_filename() -> Optional[np.datetime64]:
+        m = re.search(r"(\d{8}t\d{6})", file_stem, re.IGNORECASE)
+        if not m:
+            return None
+        acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S")
+        return np.datetime64(
+            acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
+        )
+
+    sources = (_from_filename, _from_attr) if prefer_filename else (_from_attr, _from_filename)
+    for source in sources:
+        result = source()
+        if result is not None:
+            return result
+    return None
+
+
 class DataTreeConverter:
     """
     Convert various data formats to standardised xarray objects.
@@ -3024,22 +3064,15 @@ class DataTreeConverter:
                     if land_reject or quality_reject:
                         hs = np.nan
 
-                # Acquisition time from filename (format: YYYYMMDDtHHMMSS)
-                m = re.search(r"(\d{8}t\d{6})", nc_path.stem, re.IGNORECASE)
-                if m:
-                    acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S")
-                else:
-                    # Fallback to global attribute
-                    time_str = ds_raw.attrs.get("firstMeasurementTime")
-                    acq_time = pd.to_datetime(time_str) if time_str else None
+                # Acquisition time from filename (format: YYYYMMDDtHHMMSS),
+                # falling back to the product attribute.
+                acq_time_ns = _parse_acquisition_time(ds_raw, nc_path.stem, prefer_filename=True)
 
-                if acq_time is not None:
+                if acq_time_ns is not None:
                     point_lons.append(lon)
                     point_lats.append(lat)
                     point_hs.append(hs)
-                    point_times.append(np.datetime64(
-                        acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
-                    ))
+                    point_times.append(acq_time_ns)
                     file_names.append(nc_path.name)
                     point_land_flag.append(land_flag)
                     n_land_reject += int(land_reject)
@@ -3227,21 +3260,12 @@ class DataTreeConverter:
                         )
 
                 # Get acquisition time (scalar for grid)
-                time_str = ds_raw.attrs.get("firstMeasurementTime")
-                if time_str:
-                    acq_time = pd.to_datetime(time_str)
-                    acq_time_ns = np.datetime64(
-                        acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
-                    )
-                else:
-                    m = re.search(r"(\d{8}t\d{6})", rvl_files[0].stem, re.IGNORECASE)
-                    if m:
-                        acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S")
-                        acq_time_ns = np.datetime64(
-                            acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
-                        )
-                    else:
-                        acq_time_ns = np.datetime64("NaT", "ns")
+                parsed_acq_time_ns = _parse_acquisition_time(ds_raw, rvl_files[0].stem)
+                acq_time_ns: np.datetime64 = (
+                    parsed_acq_time_ns
+                    if parsed_acq_time_ns is not None
+                    else np.datetime64("NaT", "ns")
+                )
 
                 # Standard (y, x) naming to mirror the OWI grid, so is_wv_mode
                 # detection and the grid collocation path treat RVL and OWI
@@ -3639,21 +3663,9 @@ class DataTreeConverter:
                 )
 
             # Get acquisition time (scalar for grid)
-            time_str = ds_raw.attrs.get("firstMeasurementTime")
-            if time_str:
-                acq_time = pd.to_datetime(time_str)
-                acq_time_ns = np.datetime64(
-                    acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
-                )
-            else:
-                m = re.search(r"(\d{8}t\d{6})", owi_files[0].stem, re.IGNORECASE)
-                if m:
-                    acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S")
-                    acq_time_ns = np.datetime64(
-                        acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
-                    )
-                else:
-                    acq_time_ns = np.datetime64("NaT", "ns")
+            acq_time_ns = _parse_acquisition_time(ds_raw, owi_files[0].stem)
+            if acq_time_ns is None:
+                acq_time_ns = np.datetime64("NaT", "ns")
 
             # Standard (y, x) naming for the flattened OWI grid.
             dims = ("y", "x")
@@ -3719,7 +3731,7 @@ class DataTreeConverter:
         grid (oswAzSize x oswRaSize), each cell close to WV's own ~20x20 km
         footprint but tiled edge-to-edge across the whole strip instead of
         sampled every ~200 km. This keeps that native grid (renamed to
-        y x x) rather than the coarser owi*-grid-shaped oswHs/owiWl copies
+        y, x) rather than the coarser owi*-grid-shaped oswHs/owiWl copies
         the product also ships, since only the native osw grid carries
         oswTotalHs.
 
@@ -3772,21 +3784,9 @@ class DataTreeConverter:
             needs_fallback = ~np.isfinite(osw_total_hs)
             osw_total_hs = np.where(needs_fallback, partition_mean, osw_total_hs)
 
-            time_str = ds_raw.attrs.get("firstMeasurementTime")
-            if time_str:
-                acq_time = pd.to_datetime(time_str)
-                acq_time_ns = np.datetime64(
-                    acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
-                )
-            else:
-                m = re.search(r"(\d{8}t\d{6})", osw_files[0].stem, re.IGNORECASE)
-                if m:
-                    acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S")
-                    acq_time_ns = np.datetime64(
-                        acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
-                    )
-                else:
-                    acq_time_ns = np.datetime64("NaT", "ns")
+            acq_time_ns = _parse_acquisition_time(ds_raw, osw_files[0].stem)
+            if acq_time_ns is None:
+                acq_time_ns = np.datetime64("NaT", "ns")
 
             dims = ("y", "x")
             data_vars = {
