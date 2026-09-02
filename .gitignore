@@ -41,6 +41,7 @@ recipes/*.yaml
 !recipes/soil_moisture_example.yaml
 !recipes/soil_moisture_era5.yaml
 !recipes/wind_radarsat2_example.yaml
+!recipes/sm_osw_verification_test.yaml
 
 # Jupyter notebooks checkpoints
 .ipynb_checkpoints/
