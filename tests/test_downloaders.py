@@ -1266,6 +1266,84 @@ class TestSARDownloaderAntimeridian:
 
 
 # ---------------------------------------------------------------------------
+# SARDownloader — mode filtering
+# ---------------------------------------------------------------------------
+
+class TestSARDownloaderModeFilter:
+    def _record(self, id_, name):
+        return {
+            "Id": id_, "Name": name,
+            "ContentDate_Start": "2019-06-05T17:19:13Z",
+            "ContentDate_End": "2019-06-05T17:19:43Z",
+            "ContentLength_GB": 1.0, "Online": True,
+        }
+
+    def test_sm_mode_matches_real_beam_named_product(self, tmp_path):
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
+
+        dl = SARDownloader(output_dir=tmp_path)
+        fake_client = MagicMock()
+        sm_name = "S1A_S3_OCN__2SDV_20190605T171913_20190605T171943_027547_031BCB_13DE.SAFE"
+        wv_name = "S1A_WV_OCN__2SSV_20190605T171913_20190605T171943_027547_031BCB_13DF"
+        iw_name = "S1A_IW_OCN__2SDV_20190605T171913_20190605T171943_027547_031BCB_13E0"
+        fake_client.query_products.return_value = [
+            self._record("sm", sm_name),
+            self._record("wv", wv_name),
+            self._record("iw", iw_name),
+        ]
+        dl._client = fake_client
+
+        df = dl.query(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2019-06-05", end="2019-06-06", modes=["SM"],
+        )
+
+        assert list(df["Id"]) == ["sm"]
+
+    def test_sm_mode_matches_all_six_beam_tokens(self, tmp_path):
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
+
+        dl = SARDownloader(output_dir=tmp_path)
+        fake_client = MagicMock()
+        beams = ["S1", "S2", "S3", "S4", "S5", "S6"]
+        fake_client.query_products.return_value = [
+            self._record(
+                beam,
+                f"S1A_{beam}_OCN__2SDV_20190605T171913_20190605T171943_027547_031BCB_13DE.SAFE",
+            )
+            for beam in beams
+        ]
+        dl._client = fake_client
+
+        df = dl.query(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2019-06-05", end="2019-06-06", modes=["SM"],
+        )
+
+        assert sorted(df["Id"]) == sorted(beams)
+
+    def test_wv_mode_excludes_sm_beam_named_product(self, tmp_path):
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
+
+        dl = SARDownloader(output_dir=tmp_path)
+        fake_client = MagicMock()
+        wv_name = "S1A_WV_OCN__2SSV_20190605T171913_20190605T171943_027547_031BCB_13DF"
+        sm_name = "S1A_S3_OCN__2SDV_20190605T171913_20190605T171943_027547_031BCB_13DE.SAFE"
+        fake_client.query_products.return_value = [
+            self._record("wv", wv_name),
+            self._record("sm", sm_name),
+        ]
+        dl._client = fake_client
+
+        df = dl.query(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2019-06-05", end="2019-06-06", modes=["WV"],
+        )
+
+        assert list(df["Id"]) == ["wv"]
+
+
+# ---------------------------------------------------------------------------
 # SARDownloader — per-product existence check
 # ---------------------------------------------------------------------------
 

@@ -38,6 +38,18 @@ __all__ = ["SARDownloader"]
 
 VALID_MODES = {"WV", "SM", "IW", "EW"}
 
+# Maps each requestable mode to the literal token(s) that appear in real
+# product names. WV/IW/EW embed their mode name directly (e.g.
+# "S1A_IW_OCN__..."), but Stripmap has no literal "SM" token -- it ships
+# as one of 6 fixed, mutually exclusive beam positions instead (e.g.
+# "S1A_S3_OCN__...").
+_MODE_NAME_TOKENS: dict[str, list[str]] = {
+    "WV": ["WV"],
+    "IW": ["IW"],
+    "EW": ["EW"],
+    "SM": ["S1", "S2", "S3", "S4", "S5", "S6"],
+}
+
 
 def _parse_modes(mode_str: str) -> list[str]:
     """Parse a comma-separated mode string. Returns [] for 'all'."""
@@ -128,9 +140,13 @@ class SARDownloader:
             return df
         df = df.drop_duplicates(subset="Id", keep="first").reset_index(drop=True)
 
-        # Filter by mode if specified
+        # Filter by mode if specified. SM has no literal "SM" token in real
+        # product names -- it ships as one of 6 fixed beam positions
+        # (S1-S6) instead, unlike WV/IW/EW which embed their mode name
+        # directly.
         if modes:
-            pattern = "^S1[ABCD]_(" + "|".join(modes) + ")_"
+            tokens = [tok for mode in modes for tok in _MODE_NAME_TOKENS[mode]]
+            pattern = "^S1[ABCD]_(" + "|".join(tokens) + ")_"
             df = df[df["Name"].str.match(pattern)].reset_index(drop=True)
 
         return df
