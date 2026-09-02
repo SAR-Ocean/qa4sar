@@ -3784,6 +3784,47 @@ class DataTreeConverter:
             needs_fallback = ~np.isfinite(osw_total_hs)
             osw_total_hs = np.where(needs_fallback, partition_mean, osw_total_hs)
 
+            osw_land_flag = (
+                np.asarray(ds_raw["oswLandFlag"].values, dtype=float)
+                if "oswLandFlag" in ds_raw else None
+            )
+            osw_quality_flag = (
+                np.asarray(ds_raw["oswQualityFlag"].values, dtype=float)
+                if "oswQualityFlag" in ds_raw else None
+            )
+            if osw_land_flag is not None:
+                osw_attrs["oswLandFlag"] = dict(ds_raw["oswLandFlag"].attrs)
+            if osw_quality_flag is not None:
+                osw_attrs["oswQualityFlag"] = dict(ds_raw["oswQualityFlag"].attrs)
+
+            # oswLandFlag and oswQualityFlag mask a cell regardless of
+            # whether its value came from oswTotalHs directly or the
+            # oswHs-partition fallback. Independent checks -- a cell
+            # failing both increments both counters (no dedup). Only a
+            # cell that was otherwise usable counts as "rejected" -- one
+            # already NaN before masking is not attributed to either flag.
+            was_finite = np.isfinite(osw_total_hs)
+
+            land_reject_mask = np.zeros(osw_total_hs.shape, dtype=bool)
+            if osw_land_flag is not None:
+                land_reject_mask = was_finite & np.isfinite(osw_land_flag) & (osw_land_flag == 1)
+
+            # oswQualityFlag is unpopulated in Sentinel-1 OSW products
+            # today (always the fill value, WV and SM alike). NaN/fill is
+            # treated as "no opinion", not a rejection, so this is a
+            # documented no-op until ESA starts filling it.
+            quality_reject_mask = np.zeros(osw_total_hs.shape, dtype=bool)
+            if osw_quality_flag is not None:
+                quality_reject_mask = was_finite & np.isfinite(osw_quality_flag) & (osw_quality_flag >= 2)
+
+            osw_total_hs = np.where(land_reject_mask | quality_reject_mask, np.nan, osw_total_hs)
+
+            n_cells = osw_total_hs.size
+            osw_land_pixel_count = int(np.sum(land_reject_mask))
+            osw_land_pixel_fraction = osw_land_pixel_count / n_cells
+            osw_quality_masked_pixel_count = int(np.sum(quality_reject_mask))
+            osw_quality_masked_pixel_fraction = osw_quality_masked_pixel_count / n_cells
+
             acq_time_ns = _parse_acquisition_time(ds_raw, osw_files[0].stem)
             if acq_time_ns is None:
                 acq_time_ns = np.datetime64("NaT", "ns")
@@ -3793,6 +3834,10 @@ class DataTreeConverter:
                 "oswTotalHs": (dims, osw_total_hs),
                 "oswHs": (dims + ("oswPartitions",), osw_hs),
             }
+            if osw_land_flag is not None:
+                data_vars["oswLandFlag"] = (dims, osw_land_flag)
+            if osw_quality_flag is not None:
+                data_vars["oswQualityFlag"] = (dims, osw_quality_flag)
             coords = {
                 "lon": (dims, osw_lons),
                 "lat": (dims, osw_lats),
@@ -3806,6 +3851,19 @@ class DataTreeConverter:
             ds.attrs["safe_dir"] = safe_dir.name
             ds.attrs["measurement_type"] = "osw"
             ds.attrs["swath_mode"] = "IW/EW/SM"
+            ds.attrs["osw_land_pixel_count"] = osw_land_pixel_count
+            ds.attrs["osw_land_pixel_fraction"] = osw_land_pixel_fraction
+            ds.attrs["osw_quality_masked_pixel_count"] = osw_quality_masked_pixel_count
+            ds.attrs["osw_quality_masked_pixel_fraction"] = osw_quality_masked_pixel_fraction
+
+            if osw_land_pixel_count or osw_quality_masked_pixel_count:
+                logger.warning(
+                    "scene %s: OSW cells masked -- land=%d/%d (%.1f%%), "
+                    "quality=%d/%d (%.1f%%)",
+                    safe_dir.name,
+                    osw_land_pixel_count, n_cells, 100 * osw_land_pixel_fraction,
+                    osw_quality_masked_pixel_count, n_cells, 100 * osw_quality_masked_pixel_fraction,
+                )
 
             logger.info(
                 "Extracted OSW grid from product %s (grid shape: %s)",

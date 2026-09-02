@@ -3089,6 +3089,68 @@ class TestExtractOswGridData:
         ds = DataTreeConverter._extract_osw_grid_data(meas, safe)
         assert ds is None
 
+    def test_land_flagged_cells_masked_to_nan(self, tmp_path):
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[1.5, -1.0, -1.0, -1.0, -1.0], [2.0, -1.0, -1.0, -1.0, -1.0]]],
+            osw_total_hs=[[1.5, 2.0]],
+            osw_land_flag=[[1, 0]],
+        )
+        ds = DataTreeConverter._extract_osw_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert np.isnan(ds["oswTotalHs"].values[0, 0])
+        assert ds["oswTotalHs"].values[0, 1] == pytest.approx(2.0)
+        assert ds.attrs["osw_land_pixel_count"] == 1
+        assert ds.attrs["osw_land_pixel_fraction"] == pytest.approx(0.5)
+        # Flag passes through even at the rejected cell, for downstream inspection.
+        assert ds["oswLandFlag"].values[0, 0] == 1
+
+    def test_quality_flag_all_nan_is_a_noop(self, tmp_path):
+        # oswQualityFlag is always its NaN fill value today, so this
+        # must not mask anything out.
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[1.5, -1.0, -1.0, -1.0, -1.0]]],
+            osw_total_hs=[[1.5]],
+            osw_quality_flag=[[np.nan]],
+        )
+        ds = DataTreeConverter._extract_osw_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert ds["oswTotalHs"].values[0, 0] == pytest.approx(1.5)
+        assert ds.attrs["osw_quality_masked_pixel_count"] == 0
+
+    def test_quality_flag_rejects_low_and_poor(self, tmp_path):
+        # flag_meanings: 0=good 1=medium 2=low 3=poor -- reject >= 2, so
+        # this activates automatically if a future processor populates it.
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[1.5, -1.0, -1.0, -1.0, -1.0], [2.0, -1.0, -1.0, -1.0, -1.0]]],
+            osw_total_hs=[[1.5, 2.0]],
+            osw_quality_flag=[[2, 1]],
+        )
+        ds = DataTreeConverter._extract_osw_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert np.isnan(ds["oswTotalHs"].values[0, 0])
+        assert ds["oswTotalHs"].values[0, 1] == pytest.approx(2.0)
+        assert ds.attrs["osw_quality_masked_pixel_count"] == 1
+        assert ds.attrs["osw_quality_masked_pixel_fraction"] == pytest.approx(0.5)
+
+    def test_land_and_quality_rejections_both_counted_independently(self, tmp_path):
+        # A cell failing both checks increments both counters -- no dedup,
+        # matching the WV path's documented behavior.
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[1.5, -1.0, -1.0, -1.0, -1.0]]],
+            osw_total_hs=[[1.5]],
+            osw_land_flag=[[1]],
+            osw_quality_flag=[[3]],
+        )
+        ds = DataTreeConverter._extract_osw_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert np.isnan(ds["oswTotalHs"].values[0, 0])
+        assert ds.attrs["osw_land_pixel_count"] == 1
+        assert ds.attrs["osw_quality_masked_pixel_count"] == 1
+
 
 class TestConvertDownloadedDataAscatSidecarFiles:
     """A real EUMDAC ASCAT SSM order (confirmed against a real download)
