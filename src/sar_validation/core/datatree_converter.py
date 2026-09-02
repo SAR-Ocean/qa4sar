@@ -3930,9 +3930,12 @@ class DataTreeConverter:
                 return ds_rvl
 
         elif product_type.lower() == "waves":
-            # Try OSW extraction for wave products (future implementation)
-            # For now, try OWI as fallback
-            logger.debug("OSW extraction not yet implemented for %s; trying OWI fallback", safe_dir.name)
+            ds = DataTreeConverter._extract_osw_grid_data(measurement_dir, safe_dir)
+            if ds is not None:
+                logger.info("Extracted OSW grid from IW/EW/SM product %s", safe_dir.name)
+                return ds
+            # Legacy/degenerate product with no OSW grid at all.
+            logger.debug("No OSW grid in %s; trying OWI fallback", safe_dir.name)
             ds = DataTreeConverter._extract_owi_grid_data(measurement_dir, safe_dir)
             if ds is not None:
                 ds.attrs["swath_mode"] = "IW/EW/SM"

@@ -3152,6 +3152,29 @@ class TestExtractOswGridData:
         assert ds.attrs["osw_quality_masked_pixel_count"] == 1
 
 
+class TestSmWavesDispatch:
+    def test_waves_prefers_osw_grid_over_owi_fallback(self, tmp_path):
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[0.6, 0.8, -1.0, -1.0, -1.0]]],
+            osw_total_hs=[[2.85]],
+            with_owi=True,
+        )
+        ds = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert ds is not None
+        assert "oswTotalHs" in ds.data_vars
+        assert "owiWindSpeed" not in ds.data_vars
+        assert float(ds["oswTotalHs"].values[0, 0]) == pytest.approx(2.85)
+
+    def test_waves_falls_back_to_owi_without_osw_grid(self, tmp_path):
+        # A legacy/degenerate product with no osw* variables at all must
+        # keep working exactly as before this change.
+        safe = _make_ocn_safe(tmp_path, "S1A_EW_OCN.SAFE", with_owi=True)
+        ds = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert ds is not None
+        assert "owiWindSpeed" in ds.data_vars
+
+
 class TestConvertDownloadedDataAscatSidecarFiles:
     """A real EUMDAC ASCAT SSM order (confirmed against a real download)
     delivers sidecar metadata files (EOPMetadata.xml, manifest.xml) sitting
