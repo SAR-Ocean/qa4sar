@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import math
 import sys
+import warnings
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -3104,6 +3105,14 @@ class TestExtractOswGridData:
         assert ds.attrs["osw_land_pixel_fraction"] == pytest.approx(0.5)
         # Flag passes through even at the rejected cell, for downstream inspection.
         assert ds["oswLandFlag"].values[0, 0] == 1
+        # The raw oswHs partitions at the rejected cell are also masked to
+        # NaN -- including fill-code (-1) slots, which NaN now overwrites
+        # unconditionally at rejected cells -- while the accepted cell's
+        # partitions are untouched.
+        assert np.all(np.isnan(ds["oswHs"].values[0, 0]))
+        np.testing.assert_allclose(
+            ds["oswHs"].values[0, 1], [2.0, -1.0, -1.0, -1.0, -1.0]
+        )
 
     def test_quality_flag_all_nan_is_a_noop(self, tmp_path):
         # oswQualityFlag is always its NaN fill value today, so this
@@ -3150,6 +3159,23 @@ class TestExtractOswGridData:
         assert np.isnan(ds["oswTotalHs"].values[0, 0])
         assert ds.attrs["osw_land_pixel_count"] == 1
         assert ds.attrs["osw_quality_masked_pixel_count"] == 1
+
+    def test_all_fill_partitions_yield_nan_without_runtime_warning(self, tmp_path):
+        # A cell whose oswHs partitions are entirely fill values (-1) has
+        # no valid partitions to average, exercising nanmean's
+        # empty-slice path. This must resolve to NaN, not raise
+        # numpy.nanmean's "Mean of empty slice" RuntimeWarning.
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[-1.0, -1.0, -1.0, -1.0, -1.0]]],
+            osw_total_hs=None,
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ds = DataTreeConverter._extract_osw_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert np.isnan(ds["oswTotalHs"].values[0, 0])
+        assert not any(issubclass(w.category, RuntimeWarning) for w in caught)
 
 
 class TestSmWavesDispatch:

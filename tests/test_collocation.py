@@ -984,6 +984,68 @@ class TestPointLayerCollocationAggregation:
             assert len(results) == 1, f"Failed for weighting method '{method}'"
             assert "wind_speed" in results[0].sar_data
 
+    def test_masked_grid_cells_with_finite_flags_produce_no_match(self):
+        """A grid cell whose measurement is all-NaN must not match on
+        auxiliary flags (oswLandFlag/oswQualityFlag) alone.
+
+        This mirrors test_masked_oswTotalHs_with_finite_flags_produces_no_match
+        in TestWvRvlProjection, but exercises the grid-aggregation path
+        (PointLayerCollocation.collocate) rather than the WV point path
+        (_collocate_wv_points).
+        """
+        grid_lon, grid_lat, sar_time, _ = _make_sar_grid()
+        shape = (1,) + grid_lon.shape
+        sar_data = {
+            "oswTotalHs": np.full(shape, np.nan),
+            "oswLandFlag": np.full(shape, 0.0),
+            "oswQualityFlag": np.full(shape, np.nan),
+        }
+
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            VHM0=[1.2],
+        )
+
+        colloc = PointLayerCollocation(
+            spatial_tolerance_km=200,
+            time_tolerance_minutes=60,
+            aggregation_window_km=50.0,
+            distance_weighting="gaussian",
+            gaussian_sigma_km=2.0,
+        )
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "test")
+        assert results == []
+
+    def test_finite_grid_measurement_with_flags_still_matches(self):
+        """A grid cell with a real measurement still matches, alongside
+        finite auxiliary flags."""
+        grid_lon, grid_lat, sar_time, _ = _make_sar_grid()
+        shape = (1,) + grid_lon.shape
+        sar_data = {
+            "oswTotalHs": np.full(shape, 2.5),
+            "oswLandFlag": np.full(shape, 0.0),
+            "oswQualityFlag": np.full(shape, np.nan),
+        }
+
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            VHM0=[1.2],
+        )
+
+        colloc = PointLayerCollocation(
+            spatial_tolerance_km=200,
+            time_tolerance_minutes=60,
+            aggregation_window_km=50.0,
+            distance_weighting="gaussian",
+            gaussian_sigma_km=2.0,
+        )
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "test")
+        assert len(results) == 1
+        assert results[0].sar_data["oswTotalHs"] == pytest.approx(2.5, abs=1e-6)
+        assert results[0].sar_data["oswLandFlag"] == pytest.approx(0.0, abs=1e-6)
+
 
 class TestWvRvlProjection:
     def test_projection_and_radvel_std_from_ewct_nsct(self):

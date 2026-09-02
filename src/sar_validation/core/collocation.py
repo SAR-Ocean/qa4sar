@@ -692,7 +692,12 @@ class PointLayerCollocation:
                     agg_window_km=self.aggregation_window_km,
                 )
 
-                if not sar_aggregated:
+                # Skip if every aggregated variable is an auxiliary flag (e.g.
+                # oswLandFlag/oswQualityFlag) -- those are diagnostic
+                # annotations, not measurements, and being finite on their
+                # own must not manufacture a match for a cell whose actual
+                # measurement was masked to NaN (see _AUXILIARY_FLAG_VARS).
+                if not any(var not in _AUXILIARY_FLAG_VARS for var in sar_aggregated):
                     logger.debug("No valid SAR values at t_idx=%d", t_idx)
                     continue
 
@@ -1291,10 +1296,12 @@ def _distance_weights(
     return _equal_weights(distances_km)
 
 
-# oswLandFlag/oswQualityFlag are diagnostic annotations on a WV vignette,
-# not measurements -- their being finite (e.g. oswLandFlag=0 over ocean)
-# must not by itself keep a vignette whose actual measurement is masked.
-_WV_AUXILIARY_FLAG_VARS = frozenset({"oswLandFlag", "oswQualityFlag"})
+# oswLandFlag/oswQualityFlag are diagnostic annotations on a SAR point or
+# grid cell, not measurements -- their being finite (e.g. oswLandFlag=0 over
+# ocean) must not by itself keep a point/cell whose actual measurement is
+# masked. Shared by both the WV point-anchored path (_collocate_wv_points,
+# below) and the grid-aggregation path (PointLayerCollocation.collocate, above).
+_AUXILIARY_FLAG_VARS = frozenset({"oswLandFlag", "oswQualityFlag"})
 
 
 def _collocate_wv_points(
@@ -1384,12 +1391,12 @@ def _collocate_wv_points(
 
         # SAR variables for this vignette (skip if all measurement vars are
         # NaN; the auxiliary flag vars alone don't count -- see
-        # _WV_AUXILIARY_FLAG_VARS).
+        # _AUXILIARY_FLAG_VARS).
         sar_aggregated = {
             var: float(arr[i]) for var, arr in sar_point_vars.items()
             if np.isfinite(arr[i])
         }
-        if not any(var not in _WV_AUXILIARY_FLAG_VARS for var in sar_aggregated):
+        if not any(var not in _AUXILIARY_FLAG_VARS for var in sar_aggregated):
             continue
 
         idx = tree.query_ball_point(

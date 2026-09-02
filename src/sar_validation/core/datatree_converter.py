@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
@@ -3767,6 +3768,12 @@ class DataTreeConverter:
             osw_lons = ds_raw["oswLon"].values
             osw_lats = ds_raw["oswLat"].values
             osw_hs = np.asarray(ds_raw["oswHs"].values, dtype=float)
+            if osw_hs.ndim != 3:
+                logger.debug(
+                    "Unexpected oswHs shape %s in %s; skipping OSW grid",
+                    osw_hs.shape, osw_files[0].name,
+                )
+                return None
 
             if "oswTotalHs" in ds_raw:
                 osw_total_hs = np.asarray(ds_raw["oswTotalHs"].values, dtype=float)
@@ -3786,7 +3793,8 @@ class DataTreeConverter:
             # absent for SM products, so this fallback is the normal path
             # here, not a legacy exception.
             valid_partitions = np.where(np.isfinite(osw_hs) & (osw_hs > 0), osw_hs, np.nan)
-            with np.errstate(invalid="ignore"):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
                 partition_mean = np.nanmean(valid_partitions, axis=-1)
             needs_fallback = ~np.isfinite(osw_total_hs)
             osw_total_hs = np.where(needs_fallback, partition_mean, osw_total_hs)
@@ -3814,7 +3822,11 @@ class DataTreeConverter:
 
             land_reject_mask = np.zeros(osw_total_hs.shape, dtype=bool)
             if osw_land_flag is not None:
-                land_reject_mask = was_finite & np.isfinite(osw_land_flag) & (osw_land_flag == _OSW_LAND_FLAG_REJECT_VALUE)
+                land_reject_mask = (
+                    was_finite
+                    & np.isfinite(osw_land_flag)
+                    & (osw_land_flag == _OSW_LAND_FLAG_REJECT_VALUE)
+                )
 
             # oswQualityFlag is unpopulated in Sentinel-1 OSW products
             # today (always the fill value, WV and SM alike). NaN/fill is
@@ -3822,9 +3834,18 @@ class DataTreeConverter:
             # documented no-op until ESA starts filling it.
             quality_reject_mask = np.zeros(osw_total_hs.shape, dtype=bool)
             if osw_quality_flag is not None:
-                quality_reject_mask = was_finite & np.isfinite(osw_quality_flag) & (osw_quality_flag >= _OSW_QUALITY_FLAG_REJECT_THRESHOLD)
+                quality_reject_mask = (
+                    was_finite
+                    & np.isfinite(osw_quality_flag)
+                    & (osw_quality_flag >= _OSW_QUALITY_FLAG_REJECT_THRESHOLD)
+                )
 
             osw_total_hs = np.where(land_reject_mask | quality_reject_mask, np.nan, osw_total_hs)
+            osw_hs = np.where(
+                (land_reject_mask | quality_reject_mask)[..., np.newaxis],
+                np.nan,
+                osw_hs,
+            )
 
             n_cells = osw_total_hs.size
             osw_land_pixel_count = int(np.sum(land_reject_mask))
@@ -3894,7 +3915,8 @@ class DataTreeConverter:
 
         Dispatches to the appropriate extraction function based on product_type:
         - "wind": Extracts OWI (Ocean Wind Index) 2D grid data
-        - "waves": Extracts OSW (Ocean Surface Waves) grid data, falling back to OWI or RVL grid data for products without an OSW grid
+        - "waves": Extracts OSW (Ocean Surface Waves) grid data, falling back to OWI or
+          RVL grid data for products without an OSW grid
         - "currents": Extracts RVL (Radial Velocity Linesight) 2D grid data
 
         All returned data maintains 2D grid structure (y, x) for collocation compatibility.
