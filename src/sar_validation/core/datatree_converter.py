@@ -3705,6 +3705,121 @@ class DataTreeConverter:
             ds_raw.close()
 
     @staticmethod
+    def _extract_osw_grid_data(
+        measurement_dir: Path,
+        safe_dir: Union[str, Path],
+    ) -> Optional[xr.Dataset]:
+        """
+        Extract OSW (Ocean Swell Wave) grid data from a SM/IW/EW-mode
+        measurement directory.
+
+        Unlike WV mode (one isolated ~20x20 km vignette per file, extracted
+        as a single point by from_sar_l2_ocn_wv_safe), a SM/IW/EW OCN
+        product is one continuous swath whose OSW data is itself a native
+        grid (oswAzSize x oswRaSize), each cell close to WV's own ~20x20 km
+        footprint but tiled edge-to-edge across the whole strip instead of
+        sampled every ~200 km. This keeps that native grid (renamed to
+        y x x) rather than the coarser owi*-grid-shaped oswHs/owiWl copies
+        the product also ships, since only the native osw grid carries
+        oswTotalHs.
+
+        Returns None if the file lacks an OSW grid entirely (legacy/
+        degenerate product), so the caller can fall back to OWI/RVL.
+        """
+        safe_dir = Path(safe_dir)
+
+        osw_files = sorted(
+            f for f in measurement_dir.glob("*.nc")
+            if "-ocn-" in f.name
+        )
+        if not osw_files:
+            return None
+
+        try:
+            ds_raw = xr.open_dataset(osw_files[0])
+        except Exception as exc:
+            logger.debug("Could not open %s: %s", osw_files[0], exc)
+            return None
+
+        try:
+            if "oswLon" not in ds_raw or "oswHs" not in ds_raw:
+                return None
+
+            osw_lons = ds_raw["oswLon"].values
+            osw_lats = ds_raw["oswLat"].values
+            osw_hs = np.asarray(ds_raw["oswHs"].values, dtype=float)
+
+            if "oswTotalHs" in ds_raw:
+                osw_total_hs = np.asarray(ds_raw["oswTotalHs"].values, dtype=float)
+                osw_attrs = {"oswTotalHs": dict(ds_raw["oswTotalHs"].attrs)}
+            else:
+                osw_total_hs = np.full(osw_lons.shape, np.nan)
+                osw_attrs = {"oswTotalHs": {
+                    "long_name": "total significant wave height "
+                                 "(mean of oswHs partitions; oswTotalHs absent)",
+                    "units": ds_raw["oswHs"].attrs.get("units", "m"),
+                }}
+
+            # Per-cell fallback: where oswTotalHs is NaN, use the mean of
+            # that cell's own valid (finite, non-fill) oswHs partitions,
+            # not a single grid-wide scalar, matching the per-vignette
+            # fallback in from_sar_l2_ocn_wv_safe. oswTotalHs is commonly
+            # absent for SM products, so this fallback is the normal path
+            # here, not a legacy exception.
+            valid_partitions = np.where(np.isfinite(osw_hs) & (osw_hs > 0), osw_hs, np.nan)
+            with np.errstate(invalid="ignore"):
+                partition_mean = np.nanmean(valid_partitions, axis=-1)
+            needs_fallback = ~np.isfinite(osw_total_hs)
+            osw_total_hs = np.where(needs_fallback, partition_mean, osw_total_hs)
+
+            time_str = ds_raw.attrs.get("firstMeasurementTime")
+            if time_str:
+                acq_time = pd.to_datetime(time_str)
+                acq_time_ns = np.datetime64(
+                    acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
+                )
+            else:
+                m = re.search(r"(\d{8}t\d{6})", osw_files[0].stem, re.IGNORECASE)
+                if m:
+                    acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S")
+                    acq_time_ns = np.datetime64(
+                        acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
+                    )
+                else:
+                    acq_time_ns = np.datetime64("NaT", "ns")
+
+            dims = ("y", "x")
+            data_vars = {
+                "oswTotalHs": (dims, osw_total_hs),
+                "oswHs": (dims + ("oswPartitions",), osw_hs),
+            }
+            coords = {
+                "lon": (dims, osw_lons),
+                "lat": (dims, osw_lats),
+                "time": acq_time_ns,
+            }
+
+            ds = xr.Dataset(data_vars, coords=coords)
+            apply_cf_metadata(ds, "sar_osw", osw_attrs)
+            ds.attrs["data_type"] = "sar_l2_ocn"
+            ds.attrs["source"] = "Sentinel-1"
+            ds.attrs["safe_dir"] = safe_dir.name
+            ds.attrs["measurement_type"] = "osw"
+            ds.attrs["swath_mode"] = "IW/EW/SM"
+
+            logger.info(
+                "Extracted OSW grid from product %s (grid shape: %s)",
+                safe_dir.name, osw_total_hs.shape
+            )
+            return ds
+
+        except Exception as exc:
+            logger.debug("Could not extract OSW grid from %s: %s", osw_files[0], exc)
+            return None
+        finally:
+            ds_raw.close()
+
+    @staticmethod
     def _from_sar_l2_ocn_iw_safe(
         safe_dir: Union[str, Path],
         product_type: str = "wind",

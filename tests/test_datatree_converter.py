@@ -2986,6 +2986,110 @@ class TestConvertDownloadedDataSmosTgzWarning:
         )
 
 
+def _make_sm_osw_safe(
+    tmp_path: Path,
+    *,
+    osw_hs,
+    osw_total_hs=None,
+    osw_land_flag=None,
+    osw_quality_flag=None,
+    with_owi: bool = False,
+    safe_name: str = "S1A_S3_OCN.SAFE",
+    seed: int = 0,
+) -> Path:
+    """
+    Build a SM/IW/EW-shaped *.SAFE dir with one '-ocn-' measurement NetCDF
+    carrying a native OSW grid (oswAzSize x oswRaSize x oswPartitions).
+
+    osw_hs: array-like, shape (ny, nx, n_partitions); -1/NaN entries mimic
+        the product's fill code for unused partition slots.
+    osw_total_hs: array-like, shape (ny, nx), or None to omit the variable
+        entirely, exercising the fallback path used when a product does
+        not carry it.
+    osw_land_flag / osw_quality_flag: array-like, shape (ny, nx), or None
+        to omit the variable entirely (a product that does not carry it).
+    with_owi: also write a full owi* wind grid alongside the OSW grid, to
+        test that OSW is preferred over the OWI fallback when both exist.
+    """
+    rng = np.random.default_rng(seed)
+    osw_hs = np.asarray(osw_hs, dtype="float32")
+    ny, nx, _n_partitions = osw_hs.shape
+
+    safe = tmp_path / safe_name
+    meas = safe / "measurement"
+    meas.mkdir(parents=True)
+
+    osw_lon = np.linspace(-178.5, -177.5, ny * nx).reshape(ny, nx).astype("float32")
+    osw_lat = np.linspace(-31.0, -29.0, ny * nx).reshape(ny, nx).astype("float32")
+
+    data: dict = {
+        "oswHs": (("oswAzSize", "oswRaSize", "oswPartitions"), osw_hs),
+        "oswLon": (("oswAzSize", "oswRaSize"), osw_lon),
+        "oswLat": (("oswAzSize", "oswRaSize"), osw_lat),
+    }
+    if osw_total_hs is not None:
+        data["oswTotalHs"] = (("oswAzSize", "oswRaSize"),
+                               np.asarray(osw_total_hs, dtype="float32"))
+    if osw_land_flag is not None:
+        data["oswLandFlag"] = (("oswAzSize", "oswRaSize"),
+                                np.asarray(osw_land_flag, dtype="int8"))
+    if osw_quality_flag is not None:
+        data["oswQualityFlag"] = (("oswAzSize", "oswRaSize"),
+                                   np.asarray(osw_quality_flag, dtype="float32"))
+
+    if with_owi:
+        odims = ("owiAzSize", "owiRaSize")
+        data["owiWindSpeed"] = (odims, rng.uniform(2, 15, (ny, nx)).astype("float32"))
+        data["owiWindDirection"] = (odims, rng.uniform(0, 360, (ny, nx)).astype("float32"))
+        data["owiLon"] = (odims, osw_lon)
+        data["owiLat"] = (odims, osw_lat)
+
+    ds = xr.Dataset(data, attrs={"firstMeasurementTime": "2019-06-05T17:19:13Z"})
+    fname = "s1a-s3-ocn-vv-20190605t171913-20190605t171943-027547-031bcb-001.nc"
+    ds.to_netcdf(meas / fname)
+    return safe
+
+
+class TestExtractOswGridData:
+    def test_extracts_real_total_hs_when_present(self, tmp_path):
+        # 1x2 grid, both cells have a real (non-NaN) oswTotalHs -> use it
+        # as-is, no fallback needed.
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[0.6, 0.8, -1.0, -1.0, -1.0], [1.0, -1.0, -1.0, -1.0, -1.0]]],
+            osw_total_hs=[[2.85, 1.95]],
+        )
+        ds = DataTreeConverter._extract_osw_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert ds["oswTotalHs"].dims == ("y", "x")
+        assert ds["oswTotalHs"].shape == (1, 2)
+        np.testing.assert_allclose(ds["oswTotalHs"].values, [[2.85, 1.95]])
+
+    def test_falls_back_to_per_cell_partition_mean(self, tmp_path):
+        # oswTotalHs entirely absent -> each cell independently falls back
+        # to the mean of its own valid partitions, not a single
+        # grid-wide scalar.
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[0.60, 0.80, 1.00, -1.0, -1.0], [2.0, -1.0, -1.0, -1.0, -1.0]]],
+            osw_total_hs=None,
+        )
+        ds = DataTreeConverter._extract_osw_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        np.testing.assert_allclose(ds["oswTotalHs"].values, [[0.80, 2.0]], atol=1e-4)
+
+    def test_returns_none_without_osw_grid(self, tmp_path):
+        # No osw* variables at all -> signals the caller to fall back to OWI/RVL.
+        safe = tmp_path / "S1A_S3_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        xr.Dataset(
+            {"owiWindSpeed": (("owiAzSize", "owiRaSize"), np.zeros((2, 2), "float32"))}
+        ).to_netcdf(meas / "s1a-s3-ocn-vv-20190605t171913-20190605t171943-027547-031bcb-001.nc")
+        ds = DataTreeConverter._extract_osw_grid_data(meas, safe)
+        assert ds is None
+
+
 class TestConvertDownloadedDataAscatSidecarFiles:
     """A real EUMDAC ASCAT SSM order (confirmed against a real download)
     delivers sidecar metadata files (EOPMetadata.xml, manifest.xml) sitting
