@@ -450,8 +450,30 @@ vignette:
 - **layer sources** (altimeter, scatterometer) use their own layer-type time
   tolerance and weighting — labelled `point_vs_layer`.
 
-This radius only affects WV/point-mode SAR; IW/EW grid collocation is
+This radius only affects WV/point-mode SAR; IW/EW/SM grid collocation is
 untouched.
+
+#### SM/IW/EW: the native OSW grid, not a WV-vignette-sized point
+
+Unlike WV, a SM/IW/EW OCN product is one continuous swath, but its OSW data
+is itself gridded at native resolution (`oswLon`/`oswLat`, shape
+`oswAzSize x oswRaSize`) — e.g. an 11x4 = 44-cell grid for a real ~169 x 81
+km SM subswath, each cell ~17-21 km apart, i.e. almost exactly WV's own
+~20x20 km vignette footprint, just tiled edge-to-edge across the whole
+strip instead of sampled every ~200 km. `_extract_osw_grid_data` extracts
+this native grid (renamed to `y`/`x` for collocation, same convention as
+`_extract_owi_grid_data`) rather than the coarser owi-grid-shaped
+`owiHs`/`owiWl` copies the product also ships alongside it, since only the
+native osw grid carries `oswTotalHs`.
+
+Real SM samples across different years and subswaths had `oswTotalHs` as
+NaN in every single cell — only the per-partition `oswHs` carried real
+numbers. So for SM, the fallback-to-partition-mean path below is the
+*normal* case, not a rare legacy exception, and is applied per grid cell
+independently (not one scalar for the whole grid). `_extract_osw_grid_data`
+applies the identical `oswLandFlag`/`oswQualityFlag` masking described
+below, sharing its reject thresholds with the WV path
+(`_OSW_LAND_FLAG_REJECT_VALUE`, `_OSW_QUALITY_FLAG_REJECT_THRESHOLD`).
 
 #### WV wave height: `oswTotalHs`, not an `oswHs` partition
 
@@ -498,7 +520,8 @@ quality-control rule rather than applying one ESA already publishes.
 Masking here is intentionally limited to what `oswLandFlag` and
 `oswQualityFlag` themselves say.
 
-> Code: `core/datatree_converter.py` (`from_sar_l2_ocn_wv_safe`).
+> Code: `core/datatree_converter.py` (`from_sar_l2_ocn_wv_safe`,
+> `_extract_osw_grid_data`).
 
 ### 5.6 Smaller collocation choices
 

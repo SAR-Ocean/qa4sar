@@ -7,7 +7,8 @@ by inspecting `src/sar_validation/core/datatree_converter.py` (where nearly
 all flag logic lives, not the downloaders) and, for sources whose format
 wasn't already documented in code, by inspecting real cached sample files
 under `data/` and, where no sample existed, official product documentation.
-Last updated 2026-09-02 to reflect Sentinel-1 OSW wave quality masking.
+Last updated 2026-09-02 to reflect SM/IW/EW OSW grid extraction closing
+the mode gap noted in the previous update.
 
 Sources are grouped SAR products first, then wind/wave/currents validation
 sources, then soil moisture — matching validation priority in this toolbox.
@@ -18,7 +19,7 @@ sources, then soil moisture — matching validation priority in this toolbox.
 |---|---|---|---|---|
 | Sentinel-1 OWI wind | Yes | `owiWindQuality`, `owiInversionQuality`, `owiMask` (land bit) | Land bit filtered; `owiWindQuality`/`owiInversionQuality` reject cells scoring 2 or 3, or both NaN | Done |
 | Sentinel-1 RVL currents | Yes (land only) | `rvlLandFlag` | Land-contaminated cells NaN'd | Done |
-| Sentinel-1 OSW waves | Yes | `oswLandFlag`, `oswQualityFlag` (`oswQualityFlagPartition`, `oswIconf`, `oswSnr`, `oswAmbiFac` deliberately not used) | WV mode only: `oswLandFlag==1` and `oswQualityFlag>=2` each independently reject a point's `oswTotalHs`; IW/EW/SM grid mode still falls back to OWI/RVL, OSW extraction not implemented there | Done for WV mode |
+| Sentinel-1 OSW waves | Yes | `oswLandFlag`, `oswQualityFlag` (`oswQualityFlagPartition`, `oswIconf`, `oswSnr`, `oswAmbiFac` deliberately not used) | `oswLandFlag==1` and `oswQualityFlag>=2` each independently reject a point (WV) or grid cell (SM/IW/EW), sharing the same reject thresholds; both modes fully implemented | Done |
 | RADARSAT-2 wind | Yes | `pixel_level_quality_flags` (+ `mask`/`icemask` fallback) | Filtered to flag==5 (valid wind, valid water) | Done |
 | NISAR L3 SME2 | Yes, verified redundant | `retrievalQualityFlag` | Deliberately unused — confirmed to flag the same cells as the fill value | Done (by design) |
 | Copernicus Marine HF-radar totals | Yes | Overall `QCflag`, per-parameter `*_QC` | Overall flag filtered to CMEMS's valid-code set (1, 2, 5, 7, 8); per-parameter flags unused | Done |
@@ -71,10 +72,10 @@ separate QC-code flag for RVL beyond the land flag — this source is
 considered complete.
 
 **Sentinel-1 OSW waves** (`from_sar_l2_ocn_wv_safe`, `datatree_converter.py:2899-3103`)
-Implemented for WV mode (sparse vignette points); IW/EW/SM grid mode still
-falls back to OWI/RVL instead, with a `logger.debug("OSW extraction not
-yet implemented...")` at `_from_sar_l2_ocn_iw_safe` (`:3708`). In the
-WV-mode path, `oswTotalHs`/`oswHs` are gated on two independent checks,
+Implemented for both WV mode (sparse vignette points, `from_sar_l2_ocn_wv_safe`)
+and SM/IW/EW grid mode (`_extract_osw_grid_data`), the latter extracting
+the product's native `oswAzSize x oswRaSize` OSW grid rather than falling
+back to OWI/RVL. Both paths gate `oswTotalHs`/`oswHs` on two independent checks,
 straight from ESA's own product flags: `oswLandFlag==1` rejects a point
 (land coverage exceeds 10% of the vignette), and `oswQualityFlag>=2`
 rejects a point (the product's own total-quality flag, 0=good to 3=poor).
@@ -91,14 +92,22 @@ would mean inventing this toolbox's own OSW quality-control rule rather
 than applying what ESA already publishes. Land-masking and
 quality-masking pixel counts are tracked independently via
 `osw_land_pixel_count`/`fraction` and
-`osw_quality_masked_pixel_count`/`fraction`. Both flags are also
-surfaced as point-level `oswLandFlag`/`oswQualityFlag` data variables for
-downstream inspection; `_collocate_wv_points`
-(`collocation.py:1294`) excludes both from its "does this vignette have
-usable data" check (`_WV_AUXILIARY_FLAG_VARS`, `collocation.py:1297`) so a
-masked `oswTotalHs` does not produce a phantom collocation match just
-because the always-finite flags are present. `docs/design-choices.md`
-§5.5 documents this under "WV wave quality-flag masking".
+`osw_quality_masked_pixel_count`/`fraction` in both paths, sharing the
+same reject thresholds (`_OSW_LAND_FLAG_REJECT_VALUE`,
+`_OSW_QUALITY_FLAG_REJECT_THRESHOLD`). Both flags are also surfaced as
+output data variables for downstream inspection. On the WV point path,
+`_collocate_wv_points` (`collocation.py:1294`) excludes both from its
+"does this vignette have usable data" check (`_WV_AUXILIARY_FLAG_VARS`,
+`collocation.py:1297`) so a masked `oswTotalHs` does not produce a
+phantom collocation match just because the always-finite flags are
+present. The SM/IW/EW grid path does not need an equivalent guard: grid
+collocation (`_compute_aggregated_sar_value`) aggregates each variable
+independently and simply omits a variable from a match when all its
+nearby cells are NaN, rather than gating a whole match on "any variable
+finite" — the same reason `_extract_owi_grid_data`'s own
+`owiMask`/`owiWindQuality`/`owiInversionQuality` passthrough needed no
+such guard. `docs/design-choices.md` §5.5 documents this under "WV wave
+quality-flag masking" and "SM/IW/EW: the native OSW grid".
 
 **RADARSAT-2 wind** (`from_radarsat2_wind`, `datatree_converter.py:548-620`)
 New-era files carry `pixel_level_quality_flags`; a cell is valid when the
