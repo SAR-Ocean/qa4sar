@@ -3167,8 +3167,8 @@ class TestSmWavesDispatch:
         assert float(ds["oswTotalHs"].values[0, 0]) == pytest.approx(2.85)
 
     def test_waves_falls_back_to_owi_without_osw_grid(self, tmp_path):
-        # A legacy/degenerate product with no osw* variables at all must
-        # keep working exactly as before this change.
+        # A legacy/degenerate product with no osw* variables at all falls
+        # back to OWI.
         safe = _make_ocn_safe(tmp_path, "S1A_EW_OCN.SAFE", with_owi=True)
         ds = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
         assert ds is not None

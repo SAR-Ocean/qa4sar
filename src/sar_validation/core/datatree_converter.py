@@ -3887,7 +3887,7 @@ class DataTreeConverter:
 
         Dispatches to the appropriate extraction function based on product_type:
         - "wind": Extracts OWI (Ocean Wind Index) 2D grid data
-        - "waves": Extracts OSW (Ocean Surface Waves) grid data (currently not implemented; tries OWI as fallback)
+        - "waves": Extracts OSW (Ocean Surface Waves) grid data, falling back to OWI or RVL grid data for products without an OSW grid
         - "currents": Extracts RVL (Radial Velocity Linesight) 2D grid data
 
         All returned data maintains 2D grid structure (y, x) for collocation compatibility.
