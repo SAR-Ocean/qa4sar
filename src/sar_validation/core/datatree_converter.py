@@ -403,6 +403,13 @@ def _parse_acquisition_time(
     return None
 
 
+# Sentinel-1 OSW quality control, shared by the WV point path
+# (from_sar_l2_ocn_wv_safe) and the SM/IW/EW grid path
+# (_extract_osw_grid_data) so the two cannot silently drift apart.
+_OSW_LAND_FLAG_REJECT_VALUE = 1
+_OSW_QUALITY_FLAG_REJECT_THRESHOLD = 2
+
+
 class DataTreeConverter:
     """
     Convert various data formats to standardised xarray objects.
@@ -3055,12 +3062,12 @@ class DataTreeConverter:
                 land_reject = False
                 quality_reject = False
                 if np.isfinite(hs):
-                    land_reject = np.isfinite(land_flag) and land_flag == 1
+                    land_reject = np.isfinite(land_flag) and land_flag == _OSW_LAND_FLAG_REJECT_VALUE
                     # oswQualityFlag is unpopulated in Sentinel-1 WV OCN
                     # products today (always the fill value). NaN/fill is
                     # treated as "no opinion", not a rejection, so this is
                     # a documented no-op until ESA starts filling it.
-                    quality_reject = np.isfinite(quality_flag) and quality_flag >= 2
+                    quality_reject = np.isfinite(quality_flag) and quality_flag >= _OSW_QUALITY_FLAG_REJECT_THRESHOLD
                     if land_reject or quality_reject:
                         hs = np.nan
 
@@ -3807,7 +3814,7 @@ class DataTreeConverter:
 
             land_reject_mask = np.zeros(osw_total_hs.shape, dtype=bool)
             if osw_land_flag is not None:
-                land_reject_mask = was_finite & np.isfinite(osw_land_flag) & (osw_land_flag == 1)
+                land_reject_mask = was_finite & np.isfinite(osw_land_flag) & (osw_land_flag == _OSW_LAND_FLAG_REJECT_VALUE)
 
             # oswQualityFlag is unpopulated in Sentinel-1 OSW products
             # today (always the fill value, WV and SM alike). NaN/fill is
@@ -3815,7 +3822,7 @@ class DataTreeConverter:
             # documented no-op until ESA starts filling it.
             quality_reject_mask = np.zeros(osw_total_hs.shape, dtype=bool)
             if osw_quality_flag is not None:
-                quality_reject_mask = was_finite & np.isfinite(osw_quality_flag) & (osw_quality_flag >= 2)
+                quality_reject_mask = was_finite & np.isfinite(osw_quality_flag) & (osw_quality_flag >= _OSW_QUALITY_FLAG_REJECT_THRESHOLD)
 
             osw_total_hs = np.where(land_reject_mask | quality_reject_mask, np.nan, osw_total_hs)
 
