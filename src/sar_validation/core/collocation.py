@@ -1291,6 +1291,12 @@ def _distance_weights(
     return _equal_weights(distances_km)
 
 
+# oswLandFlag/oswQualityFlag are diagnostic annotations on a WV vignette,
+# not measurements -- their being finite (e.g. oswLandFlag=0 over ocean)
+# must not by itself keep a vignette whose actual measurement is masked.
+_WV_AUXILIARY_FLAG_VARS = frozenset({"oswLandFlag", "oswQualityFlag"})
+
+
 def _collocate_wv_points(
     sar_lons: np.ndarray,
     sar_lats: np.ndarray,
@@ -1376,12 +1382,14 @@ def _collocate_wv_points(
         if not (np.isfinite(s_lon) and np.isfinite(s_lat)):
             continue
 
-        # SAR variables for this vignette (skip if all NaN)
+        # SAR variables for this vignette (skip if all measurement vars are
+        # NaN; the auxiliary flag vars alone don't count -- see
+        # _WV_AUXILIARY_FLAG_VARS).
         sar_aggregated = {
             var: float(arr[i]) for var, arr in sar_point_vars.items()
             if np.isfinite(arr[i])
         }
-        if not sar_aggregated:
+        if not any(var not in _WV_AUXILIARY_FLAG_VARS for var in sar_aggregated):
             continue
 
         idx = tree.query_ball_point(

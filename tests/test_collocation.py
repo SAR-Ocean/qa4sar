@@ -1017,6 +1017,60 @@ class TestWvRvlProjection:
         assert proj == pytest.approx(0.4, abs=1e-6)
         assert matches[0].sar_data["rvlRadVelStd"] == pytest.approx(0.15, abs=1e-6)
 
+    def test_masked_oswTotalHs_with_finite_flags_produces_no_match(self):
+        from sar_validation.core.collocation import _collocate_wv_points
+
+        sar_lons = np.array([-19.5])
+        sar_lats = np.array([50.5])
+        sar_times = np.array([np.datetime64("2026-06-20T19:15:00", "ns")])
+        sar_point_vars = {
+            "oswTotalHs": np.array([np.nan]),
+            "oswLandFlag": np.array([0.0]),
+            "oswQualityFlag": np.array([np.nan]),
+        }
+        val = pd.DataFrame({
+            "lon": [-19.5],
+            "lat": [50.5],
+            "time": [pd.Timestamp("2026-06-20T19:20:00")],
+            "VHM0": [1.2],
+        })
+        matches = _collocate_wv_points(
+            sar_lons=sar_lons, sar_lats=sar_lats, sar_times=sar_times,
+            sar_point_vars=sar_point_vars, val_data=val, val_source="mooring",
+            footprint_radius_km=14.0, time_tolerance_minutes=30,
+            distance_weighting="equal", gaussian_sigma_km=5.0,
+            collocation_type="point_vs_point",
+        )
+        assert matches == []
+
+    def test_finite_oswTotalHs_with_flags_still_matches(self):
+        from sar_validation.core.collocation import _collocate_wv_points
+
+        sar_lons = np.array([-19.5])
+        sar_lats = np.array([50.5])
+        sar_times = np.array([np.datetime64("2026-06-20T19:15:00", "ns")])
+        sar_point_vars = {
+            "oswTotalHs": np.array([2.5]),
+            "oswLandFlag": np.array([0.0]),
+            "oswQualityFlag": np.array([np.nan]),
+        }
+        val = pd.DataFrame({
+            "lon": [-19.5],
+            "lat": [50.5],
+            "time": [pd.Timestamp("2026-06-20T19:20:00")],
+            "VHM0": [1.2],
+        })
+        matches = _collocate_wv_points(
+            sar_lons=sar_lons, sar_lats=sar_lats, sar_times=sar_times,
+            sar_point_vars=sar_point_vars, val_data=val, val_source="mooring",
+            footprint_radius_km=14.0, time_tolerance_minutes=30,
+            distance_weighting="equal", gaussian_sigma_km=5.0,
+            collocation_type="point_vs_point",
+        )
+        assert len(matches) == 1
+        assert matches[0].sar_data["oswTotalHs"] == pytest.approx(2.5, abs=1e-6)
+        assert matches[0].sar_data["oswLandFlag"] == pytest.approx(0.0, abs=1e-6)
+
 
 class TestRunCollocationCurrentsFromDatatree:
     def _currents_recipe(self):
