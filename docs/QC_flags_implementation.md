@@ -45,7 +45,7 @@ sources, then soil moisture — matching validation priority in this toolbox.
 
 ### SAR products
 
-**Sentinel-1 OWI wind** (`_extract_owi_grid_data`, `datatree_converter.py:3485-3707`)
+**Sentinel-1 OWI wind** (`_extract_owi_grid_data`, `datatree_converter.py:3517-3726`)
 Three flags exist in the product: `owiWindQuality` (0=good, 1=medium,
 2=low, 3=poor), `owiInversionQuality` (0=good, 1=medium, 2=poor), and
 `owiMask` (a CF bitmask whose bit 0 is land). The land bit is applied first
@@ -62,8 +62,8 @@ Land-masking and quality-masking pixel counts are tracked independently
 via `owi_land_pixel_count`/`fraction` and
 `owi_quality_masked_pixel_count`/`fraction`.
 
-**Sentinel-1 RVL currents** (`_extract_rvl_grid_data`, `datatree_converter.py:3107-3230`
-grid path; `:3358-3370` WV-mode vignette path)
+**Sentinel-1 RVL currents** (`_extract_rvl_grid_data`, `datatree_converter.py:3145-3478`;
+`:3183-3323` grid path; `:3324-3478` WV-mode vignette path)
 `rvlLandFlag` is set to 1 where a cell's land coverage exceeds 10%.
 `rvlRadVel`/`rvlRadVelStd` are NaN'd where the flag is set; the pre-mask
 mean is retained as a QA statistic. `rvlHeading`/`rvlIncidenceAngle` are
@@ -71,7 +71,8 @@ left unmasked since they're geometry, not a measurement. There is no
 separate QC-code flag for RVL beyond the land flag — this source is
 considered complete.
 
-**Sentinel-1 OSW waves** (`from_sar_l2_ocn_wv_safe`, `datatree_converter.py:2899-3103`)
+**Sentinel-1 OSW waves** (`from_sar_l2_ocn_wv_safe`, `datatree_converter.py:2947-3143`;
+`_extract_osw_grid_data`, `datatree_converter.py:3728-3907`)
 Implemented for both WV mode (sparse vignette points, `from_sar_l2_ocn_wv_safe`)
 and SM/IW/EW grid mode (`_extract_osw_grid_data`), the latter extracting
 the product's native `oswAzSize x oswRaSize` OSW grid rather than falling
