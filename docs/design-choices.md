@@ -473,7 +473,10 @@ numbers. So for SM, the fallback-to-partition-mean path below is the
 independently (not one scalar for the whole grid). `_extract_osw_grid_data`
 applies the identical `oswLandFlag`/`oswQualityFlag` masking described
 below, sharing its reject thresholds with the WV path
-(`_OSW_LAND_FLAG_REJECT_VALUE`, `_OSW_QUALITY_FLAG_REJECT_THRESHOLD`).
+(`_OSW_LAND_FLAG_REJECT_VALUE`, `_OSW_QUALITY_FLAG_REJECT_THRESHOLD`). That
+masking is applied to both the derived `oswTotalHs` and the raw
+per-partition `oswHs` array, so no land- or quality-rejected cell exposes
+real-looking values or `-1` fill codes in either exported variable.
 
 #### WV wave height: `oswTotalHs`, not an `oswHs` partition
 

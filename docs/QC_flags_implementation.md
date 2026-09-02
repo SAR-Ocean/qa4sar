@@ -96,19 +96,26 @@ quality-masking pixel counts are tracked independently via
 `osw_quality_masked_pixel_count`/`fraction` in both paths, sharing the
 same reject thresholds (`_OSW_LAND_FLAG_REJECT_VALUE`,
 `_OSW_QUALITY_FLAG_REJECT_THRESHOLD`). Both flags are also surfaced as
-output data variables for downstream inspection. On the WV point path,
-`_collocate_wv_points` (`collocation.py:1294`) excludes both from its
-"does this vignette have usable data" check (`_WV_AUXILIARY_FLAG_VARS`,
-`collocation.py:1297`) so a masked `oswTotalHs` does not produce a
-phantom collocation match just because the always-finite flags are
-present. The SM/IW/EW grid path does not need an equivalent guard: grid
-collocation (`_compute_aggregated_sar_value`) aggregates each variable
-independently and simply omits a variable from a match when all its
-nearby cells are NaN, rather than gating a whole match on "any variable
-finite" — the same reason `_extract_owi_grid_data`'s own
-`owiMask`/`owiWindQuality`/`owiInversionQuality` passthrough needed no
-such guard. `docs/design-choices.md` §5.5 documents this under "WV wave
-quality-flag masking" and "SM/IW/EW: the native OSW grid".
+output data variables for downstream inspection. Both the WV point path and the
+SM/IW/EW grid path exclude these flags from their "does this match have usable
+data" check via the same shared constant, `_AUXILIARY_FLAG_VARS`
+(`collocation.py:1304`). On the WV point path, `_collocate_wv_points`
+(`collocation.py:1307`) uses it at `collocation.py:1399` so a masked
+`oswTotalHs` does not produce a phantom collocation match just because the
+always-finite flags are present. Grid collocation
+(`PointLayerCollocation.collocate`, `collocation.py:479`) applies the identical
+exclusion at `collocation.py:700`: after `_compute_aggregated_sar_value`
+aggregates each variable independently, a match is only kept if at least one
+aggregated variable is not in `_AUXILIARY_FLAG_VARS`; without this guard, an
+always-finite `oswLandFlag`/`oswQualityFlag` alone would satisfy that check
+even when the primary variable (e.g. `oswTotalHs`) was masked to NaN for every
+nearby cell. `_extract_owi_grid_data`'s own
+`owiMask`/`owiWindQuality`/`owiInversionQuality` passthrough needs no such
+guard only because those variable names are not in `_AUXILIARY_FLAG_VARS` and
+OWI grids always carry at least one non-auxiliary measurement variable — not
+because the grid collocation mechanism itself lacks the gate.
+`docs/design-choices.md` §5.5 documents this under "WV wave quality-flag
+masking" and "SM/IW/EW: the native OSW grid".
 
 **RADARSAT-2 wind** (`from_radarsat2_wind`, `datatree_converter.py:548-620`)
 New-era files carry `pixel_level_quality_flags`; a cell is valid when the
