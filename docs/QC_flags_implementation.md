@@ -7,6 +7,7 @@ by inspecting `src/sar_validation/core/datatree_converter.py` (where nearly
 all flag logic lives, not the downloaders) and, for sources whose format
 wasn't already documented in code, by inspecting real cached sample files
 under `data/` and, where no sample existed, official product documentation.
+Last updated 2026-09-02 to reflect Sentinel-1 OSW wave quality masking.
 
 Sources are grouped SAR products first, then wind/wave/currents validation
 sources, then soil moisture — matching validation priority in this toolbox.
@@ -15,14 +16,14 @@ sources, then soil moisture — matching validation priority in this toolbox.
 
 | Source | Flag in raw data? | Flag name(s) | Current handling | Status |
 |---|---|---|---|---|
-| Sentinel-1 OWI wind | Yes | `owiWindQuality`, `owiInversionQuality`, `owiMask` (land bit) | Land bit filtered; `owiWindQuality`/`owiInversionQuality` reject cells scoring 2 or 3, or both NaN | Done (on `qc-flag`, not yet merged) |
+| Sentinel-1 OWI wind | Yes | `owiWindQuality`, `owiInversionQuality`, `owiMask` (land bit) | Land bit filtered; `owiWindQuality`/`owiInversionQuality` reject cells scoring 2 or 3, or both NaN | Done |
 | Sentinel-1 RVL currents | Yes (land only) | `rvlLandFlag` | Land-contaminated cells NaN'd | Done |
-| Sentinel-1 OSW waves | Yes | `oswQualityFlag`, `oswQualityFlagPartition`, `oswLandFlag`, `oswIconf`, `oswSnr`, `oswAmbiFac` | None read or applied at all (WV mode only; IW/EW/SM grid mode falls back to OWI/RVL, OSW extraction not implemented there) | Not implemented |
+| Sentinel-1 OSW waves | Yes | `oswLandFlag`, `oswQualityFlag` (`oswQualityFlagPartition`, `oswIconf`, `oswSnr`, `oswAmbiFac` deliberately not used) | WV mode only: `oswLandFlag==1` and `oswQualityFlag>=2` each independently reject a point's `oswTotalHs`; IW/EW/SM grid mode still falls back to OWI/RVL, OSW extraction not implemented there | Done for WV mode |
 | RADARSAT-2 wind | Yes | `pixel_level_quality_flags` (+ `mask`/`icemask` fallback) | Filtered to flag==5 (valid wind, valid water) | Done |
 | NISAR L3 SME2 | Yes, verified redundant | `retrievalQualityFlag` | Deliberately unused — confirmed to flag the same cells as the fill value | Done (by design) |
-| Copernicus Marine HF-radar totals | Yes | Overall `QCflag`, per-parameter `*_QC` | Overall flag excludes only code 4 on `main`; widened to CMEMS's full valid-code set on `qc-flag`; per-parameter flags unused | Done (on `qc-flag`, not yet merged) |
+| Copernicus Marine HF-radar totals | Yes | Overall `QCflag`, per-parameter `*_QC` | Overall flag filtered to CMEMS's valid-code set (1, 2, 5, 7, 8); per-parameter flags unused | Done |
 | NOAA HF-radar | No | — | N/A — NOAA filters upstream before publishing | N/A |
-| Copernicus Marine in-situ (buoy/mooring/drifter/ferrybox/tide-gauge, incl. ADCP/Argo/glider) | Yes | `value_qc` (CMEMS 0-9 scale) | Not read on `main`; filtered by valid QC code on `qc-flag` | Done (on `qc-flag`, not yet merged) |
+| Copernicus Marine in-situ (buoy/mooring/drifter/ferrybox/tide-gauge, incl. ADCP/Argo/glider) | Yes | `value_qc` (CMEMS 0-9 scale) | Filtered to CMEMS's valid-code set (1, 2, 5, 7, 8); value and QC column nulled together otherwise | Done |
 | ISMN (soil moisture ground stations) | Yes, at source portal | ISMN's own "Good"/etc. scheme | Enforced only via unenforced manual portal instructions; no code-level filtering | Not implemented |
 | Altimeter (CMEMS L3 SWH) | No | — | N/A — filtered upstream (`VAVH` vs `VAVH_UNFILTERED` naming implies pre-filtering) | N/A |
 | ERA5 (reference model) | Land mask, not a QC flag | `land_sea_mask`/`lsm` | Applied at collocation time to exclude land points from wind comparisons | Done |
@@ -43,8 +44,7 @@ sources, then soil moisture — matching validation priority in this toolbox.
 
 ### SAR products
 
-**Sentinel-1 OWI wind** (`_extract_owi_grid_data`, `datatree_converter.py:3427-3606`,
-on worktree `qc-flag`)
+**Sentinel-1 OWI wind** (`_extract_owi_grid_data`, `datatree_converter.py:3485-3707`)
 Three flags exist in the product: `owiWindQuality` (0=good, 1=medium,
 2=low, 3=poor), `owiInversionQuality` (0=good, 1=medium, 2=poor), and
 `owiMask` (a CF bitmask whose bit 0 is land). The land bit is applied first
@@ -59,7 +59,7 @@ either — the present flag governs. Both flags pass through the output
 dataset unmodified, even at rejected cells, for downstream inspection.
 Land-masking and quality-masking pixel counts are tracked independently
 via `owi_land_pixel_count`/`fraction` and
-`owi_quality_masked_pixel_count`/`fraction`. Not yet merged to `main`.
+`owi_quality_masked_pixel_count`/`fraction`.
 
 **Sentinel-1 RVL currents** (`_extract_rvl_grid_data`, `datatree_converter.py:3107-3230`
 grid path; `:3358-3370` WV-mode vignette path)
@@ -70,22 +70,35 @@ left unmasked since they're geometry, not a measurement. There is no
 separate QC-code flag for RVL beyond the land flag — this source is
 considered complete.
 
-**Sentinel-1 OSW waves** (`from_sar_l2_ocn_wv_safe`, `datatree_converter.py:2960-3045`)
-Only implemented for WV mode (sparse vignette points); IW/EW/SM grid mode
+**Sentinel-1 OSW waves** (`from_sar_l2_ocn_wv_safe`, `datatree_converter.py:2899-3103`)
+Implemented for WV mode (sparse vignette points); IW/EW/SM grid mode still
 falls back to OWI/RVL instead, with a `logger.debug("OSW extraction not
-yet implemented...")` at `_from_sar_l2_ocn_iw_safe` (`:3722-3725`). Even in
-the WV-mode path, only `oswLon`/`oswLat` (`:3020-3021`) and
-`oswTotalHs`/`oswHs` (`:3032-3045`) are read, filtered with `np.isfinite`
-and, in the `oswHs`-partition fallback only, a `-1` fill-code drop
-(`:3039`). Confirmed by inspecting a real cached WV OCN file
-(`S1D_WV_OCN__.../measurement/s1d-wv1-ocn-vv-...-005.nc`) that the product
-also carries `oswQualityFlag`, `oswQualityFlagPartition`, `oswLandFlag`, an
-`oswIconf` confidence indicator, `oswSnr`, and `oswAmbiFac` — none of these
-are read anywhere in the repo (zero grep hits). This is a stricter gap
-than OWI: OWI at least reads its land flag and applies it; OSW reads no
-flag at all, including its own land flag. `docs/design-choices.md`
-discusses the `oswTotalHs` vs `oswHs`-partition choice (§5.5, lines
-397-415) but never mentions `oswQualityFlag`/`oswLandFlag`.
+yet implemented...")` at `_from_sar_l2_ocn_iw_safe` (`:3708`). In the
+WV-mode path, `oswTotalHs`/`oswHs` are gated on two independent checks,
+straight from ESA's own product flags: `oswLandFlag==1` rejects a point
+(land coverage exceeds 10% of the vignette), and `oswQualityFlag>=2`
+rejects a point (the product's own total-quality flag, 0=good to 3=poor).
+Both checks require the flag to be present and finite for that point — a
+missing or fill-value flag is a no-op, never a rejection — and neither is
+deduplicated against the other, so a point failing both is counted by
+each. `oswQualityFlag` is never populated by ESA's processor today (always its
+fill value), so that check is currently a documented no-op, kept in place
+so it activates automatically if a future processor version starts
+populating it — the same precedent as NOAA HF-radar's `QCflag` handling. `oswTotalHsStdev`,
+`oswQualityFlagPartition`, and `oswSnr` were deliberately not used: none
+is an ESA-defined rejection criterion for `oswTotalHs`, and using one
+would mean inventing this toolbox's own OSW quality-control rule rather
+than applying what ESA already publishes. Land-masking and
+quality-masking pixel counts are tracked independently via
+`osw_land_pixel_count`/`fraction` and
+`osw_quality_masked_pixel_count`/`fraction`. Both flags are also
+surfaced as point-level `oswLandFlag`/`oswQualityFlag` data variables for
+downstream inspection; `_collocate_wv_points`
+(`collocation.py:1294`) excludes both from its "does this vignette have
+usable data" check (`_WV_AUXILIARY_FLAG_VARS`, `collocation.py:1297`) so a
+masked `oswTotalHs` does not produce a phantom collocation match just
+because the always-finite flags are present. `docs/design-choices.md`
+§5.5 documents this under "WV wave quality-flag masking".
 
 **RADARSAT-2 wind** (`from_radarsat2_wind`, `datatree_converter.py:548-620`)
 New-era files carry `pixel_level_quality_flags`; a cell is valid when the
@@ -102,13 +115,12 @@ deliberate, verified decision not to apply it separately, not an oversight.
 ### Wind / wave / currents validation sources
 
 **Copernicus Marine HF-radar totals** (`from_hf_radar_grid`,
-`datatree_converter.py:2349-2517`)
-An overall `QCflag` (1=good … 4=bad) excludes only code 4 on `main`. On
-worktree `qc-flag`, the check is widened to keep only cells whose code is
-one of CMEMS's documented valid QC codes (1, 2, 5, 7, or 8). Per-parameter
-flags (`CSPD_QC`, `DDNS_QC`, `GDOP_QC`, `VART_QC`, `POSITION_QC`) are
-extracted into `hfr_qc_<param>` output fields but not used to filter
-anything, on either branch. Not yet merged to `main`.
+`datatree_converter.py:2288-2493`)
+An overall `QCflag` (1=good … 4=bad) is filtered to keep only cells whose
+code is one of CMEMS's documented valid QC codes (1, 2, 5, 7, or 8).
+Per-parameter flags (`CSPD_QC`, `DDNS_QC`, `GDOP_QC`, `VART_QC`,
+`POSITION_QC`) are extracted into `hfr_qc_<param>` output fields but not
+used to filter anything.
 
 **NOAA HF-radar** — confirmed via an explicit code comment that NOAA's
 product carries no equivalent flag; NOAA filters upstream before
@@ -117,18 +129,16 @@ is a documented no-op for NOAA files.
 
 **Copernicus Marine in-situ** (buoys, moorings, drifters, ferrybox,
 tide-gauges, plus ADCP/Argo/glider/drifter historical currents — all flow
-through `from_insitu_csv`, `datatree_converter.py:721-734` on `main`)
-The raw CSV carries a per-variable `value_qc` column (CMEMS 0-9 scale) that
-`from_insitu_csv` drops entirely during the pivot on `main`. On worktree
-`qc-flag`, the pivot keeps `value_qc`, flattens it to `<CODE>_QC` companion
-columns, and nulls both the value and its `_QC` column when the code is
-not one of CMEMS's valid codes (1, 2, 5, 7, or 8) — see
-`tests/test_insitu_qc_filtering.py` and the extensions to
-`tests/test_datatree_converter_insitu.py`/`tests/test_cf_metadata.py` in
-that worktree, and `docs/design-choices.md` §3.7. `EWCT`/`NSCT` derived
-from `HCSP`/`HCDT` inherit NaN from a bad-QC `HCSP`/`HCDT` through
-`sin`/`cos`/multiplication rather than through an explicit gate. Not yet
-merged to `main`.
+through `from_insitu_csv`, `datatree_converter.py:645-847`)
+The raw CSV carries a per-variable `value_qc` column (CMEMS 0-9 scale).
+The pivot keeps `value_qc`, flattens it to `<CODE>_QC` companion columns,
+and nulls both the value and its `_QC` column when the code is not one of
+CMEMS's valid codes (1, 2, 5, 7, or 8) (`:713-756`) — see
+`tests/test_insitu_qc_filtering.py`, the extensions to
+`tests/test_datatree_converter_insitu.py`/`tests/test_cf_metadata.py`, and
+`docs/design-choices.md` §3.7. `EWCT`/`NSCT` derived from `HCSP`/`HCDT`
+inherit NaN from a bad-QC `HCSP`/`HCDT` through `sin`/`cos`/multiplication
+rather than through an explicit gate.
 
 **ISMN** (`ismn_downloader.py:146-148`, `:513-538`)
 ISMN's own quality-flag scheme exists at the source portal, but
@@ -261,21 +271,14 @@ Whether a QC flag exists here is unknown until the format is verified.
 
 ## Prioritized gap list
 
-Ranked by group (SAR → wind/wave/currents → soil moisture), then within
-each group by risk of silently bad data reaching validation results —
-sources where a real, documented flag already exists in the data and is
-simply unread rank above sources whose format or flag existence is still
-unconfirmed.
-
-**SAR products**
-1. **Sentinel-1 OSW wave quality/land masking** — `oswQualityFlag`,
-   `oswQualityFlagPartition`, and `oswLandFlag` are real, present, and
-   completely unused, in the only mode (WV) where OSW extraction exists at
-   all; this is a stricter gap than OWI since not even a land flag is
-   applied. No spec exists yet for this one.
+Ranked by group (wind/wave/currents → soil moisture), then within each
+group by risk of silently bad data reaching validation results — sources
+where a real, documented flag already exists in the data and is simply
+unread rank above sources whose format or flag existence is still
+unconfirmed. No SAR-product gaps remain open.
 
 **Wind / wave / currents**
-2. **ISMN in-code QC enforcement** — currently relies entirely on an
+1. **ISMN in-code QC enforcement** — currently relies entirely on an
    unenforced manual portal step; converting that into a code-level
    guarantee (e.g. verifying selected quality flags at download/read time,
    or reading whatever flag the `ismn` package's reader exposes) would
@@ -284,25 +287,25 @@ unconfirmed.
    validation source, matching this toolbox's own category boundaries.)
 
 **Soil moisture**
-3. **CDS SSM (C3S) `flag` bitmask** — explicit, well-documented bitmask
+2. **CDS SSM (C3S) `flag` bitmask** — explicit, well-documented bitmask
    confirmed present and entirely unused; likely the most contained
    soil-moisture fix (single variable, already-known meanings).
-4. **SMAP `retrieval_qual_flag`** — confirmed present bitmask, entirely
+3. **SMAP `retrieval_qual_flag`** — confirmed present bitmask, entirely
    unused; NASA's official flag documentation would need a short lookup to
    pick the right bits to reject on, but the variable itself is already
    confirmed to exist and load cleanly.
-5. **ASCAT SSM (SOMO12) flag fields** — `agg_flag`/`proc_flag`/`corr_flag`
+4. **ASCAT SSM (SOMO12) flag fields** — `agg_flag`/`proc_flag`/`corr_flag`
    confirmed present and unused; the reader package is already a
    dependency, so no new parsing code is needed, only flag-based filtering
    logic.
-6. **AMSR AU_Land `RetrievalQualityFlagNPD`/`SCA`** — named in code but
+5. **AMSR AU_Land `RetrievalQualityFlagNPD`/`SCA`** — named in code but
    never opened; smaller in scope (one source variant) than the above.
-7. **H-SAF ASCAT SSM (H29) flag support** — real flag confirmed to exist
+6. **H-SAF ASCAT SSM (H29) flag support** — real flag confirmed to exist
    via product docs, but the file format itself is unconfirmed against a
    real download in this codebase; implementing this requires first
    obtaining and inspecting a genuine H29 file, so it carries more
    up-front research risk than the others above.
-8. **AMSR-E/AMSR2 NSIDC-0451 format confirmation** — lowest priority: even
+7. **AMSR-E/AMSR2 NSIDC-0451 format confirmation** — lowest priority: even
    the base file format (not just its QC flag) is unconfirmed against a
    real download.
 
@@ -312,19 +315,3 @@ product), AMSR G-Portal L3SGSMC (sentinel-code filtering already
 functionally equivalent), NISAR SME2 (verified redundant with fill-value
 masking), RVL, RADARSAT-2, CLMS SSM, scatterometer, radiometer wind — all
 already complete or genuinely not applicable.
-
-**Resolved on worktree `qc-flag`, not yet merged to `main`**: Copernicus
-Marine in-situ `value_qc` filtering, Copernicus HF-radar `QCflag` widening
-to CMEMS's valid-code set, and Sentinel-1 OWI wind quality masking
-(`owiWindQuality`/`owiInversionQuality`).
-
-## In-flight work status
-
-- **`.claude/worktrees/qc-flag`** (branch `worktree-qc-flag`, local only,
-  not pushed): implements `value_qc` filtering for Copernicus Marine
-  in-situ data, widens the Copernicus HF-radar `QCflag` check to CMEMS's
-  full valid-code set, and adds Sentinel-1 OWI wind quality masking via
-  `owiWindQuality`/`owiInversionQuality`. Covers both halves of the
-  2026-08-25 in-situ/HF-radar spec plus the full 2026-08-26 OWI spec,
-  including the `docs/design-choices.md` §3.7 write-up and the OWI
-  land-pixel-filtering entry.
