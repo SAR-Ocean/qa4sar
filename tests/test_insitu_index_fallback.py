@@ -216,6 +216,26 @@ def _write_argo_fixture(path):
     ds.to_netcdf(path)
 
 
+def _write_surface_only_fixture(path):
+    """Surface-only platform with no depth variable: only per-observation
+    LONGITUDE/LATITUDE and TIME-dimensioned data variables (no DEPTH
+    dimension, no DEPH, no PRES)."""
+    time = pd.date_range("2023-03-01", periods=2, freq="D")
+    ds = xr.Dataset(
+        data_vars={
+            "TEMP": ("TIME", [15.5, 16.2]),
+            "SALT": ("TIME", [35.1, 35.2]),
+        },
+        coords={
+            "TIME": time,
+            "LONGITUDE": ("TIME", [10.0, 10.1]),
+            "LATITUDE": ("TIME", [45.0, 45.1]),
+        },
+        attrs={"platform_code": "SURFACE_001", "institution": "Test Lab"},
+    )
+    ds.to_netcdf(path)
+
+
 def test_parse_platform_file_mooring_layout_uses_precise_coords_and_deph(tmp_path):
     nc_path = tmp_path / "mooring.nc"
     _write_mooring_fixture(nc_path)
@@ -270,6 +290,45 @@ def test_parse_platform_file_no_requested_variable_present_returns_empty(tmp_pat
         start=pd.Timestamp("2023-01-01"), end=pd.Timestamp("2023-01-02"),
         min_depth=-20.0, max_depth=20.0,
         platform_type_code="MO",
+    )
+
+    assert df.empty
+
+
+def test_parse_platform_file_surface_only_defaults_depth_to_zero(tmp_path):
+    """Platform with no depth variable (no DEPH, PRES, or DEPTH dimension)
+    must default all rows to depth=0.0."""
+    nc_path = tmp_path / "surface.nc"
+    _write_surface_only_fixture(nc_path)
+
+    df = parse_platform_file(
+        nc_path, wanted_variables={"TEMP", "SALT"},
+        min_lon=0.0, max_lon=20.0, min_lat=40.0, max_lat=50.0,
+        start=pd.Timestamp("2023-03-01"), end=pd.Timestamp("2023-03-03"),
+        min_depth=-5.0, max_depth=5.0,
+        platform_type_code="SU",
+    )
+
+    assert len(df) == 4  # 2 variables x 2 timestamps
+    assert set(df["variable"]) == {"TEMP", "SALT"}
+    assert (df["depth"] == 0.0).all()
+    assert (df["platform_id"] == "SURFACE_001").all()
+    assert (df["platform_type"] == "SU").all()
+    assert (df["institution"] == "Test Lab").all()
+
+
+def test_parse_platform_file_surface_only_depth_filter_excludes_zero(tmp_path):
+    """Depth filter that excludes 0.0 (e.g., min_depth=10, max_depth=20)
+    must drop all rows from a surface-only platform."""
+    nc_path = tmp_path / "surface.nc"
+    _write_surface_only_fixture(nc_path)
+
+    df = parse_platform_file(
+        nc_path, wanted_variables={"TEMP", "SALT"},
+        min_lon=0.0, max_lon=20.0, min_lat=40.0, max_lat=50.0,
+        start=pd.Timestamp("2023-03-01"), end=pd.Timestamp("2023-03-03"),
+        min_depth=10.0, max_depth=20.0,
+        platform_type_code="SU",
     )
 
     assert df.empty
