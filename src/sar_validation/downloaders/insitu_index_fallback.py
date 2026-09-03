@@ -136,3 +136,31 @@ def rows_matching_query(
             continue
         matched.append(row)
     return matched
+
+
+def download_index_files(
+    dataset_id: str, dataset_part: str, rows: list[IndexRow], work_dir: Path,
+    force_download: bool = False,
+) -> list[Path]:
+    """Download exactly the matched platform files (not the whole dataset)
+    via copernicusmarine's file_list option, and return their local
+    paths."""
+    if not rows:
+        return []
+
+    import copernicusmarine
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    file_list_path = work_dir / "_file_list.txt"
+    file_list_path.write_text("\n".join(row.file_name for row in rows) + "\n")
+
+    result = copernicusmarine.get(
+        dataset_id=dataset_id,
+        dataset_part=dataset_part,
+        file_list=str(file_list_path),
+        output_directory=str(work_dir),
+        no_directories=True,
+        disable_progress_bar=True,
+        **copernicus_marine_download_kwargs(force_download),
+    )
+    return [Path(f.file_path) for f in result.files]

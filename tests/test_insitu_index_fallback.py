@@ -5,9 +5,11 @@ part)."""
 from __future__ import annotations
 
 from datetime import datetime
+from unittest.mock import MagicMock, patch
 
 from sar_validation.downloaders.insitu_index_fallback import (
     IndexRow,
+    download_index_files,
     iter_index_rows,
     rows_matching_query,
 )
@@ -129,3 +131,37 @@ def test_rows_matching_query_with_nonwrapping_row_outside_wrapped_query_windows(
     )
 
     assert rows == []
+
+
+def test_download_index_files_writes_file_list_and_calls_get(tmp_path):
+    rows = [
+        IndexRow(
+            file_name="history/MO/AR_TS_MO_A-Sulafjorden.nc",
+            lat_min=62.4247, lat_max=62.4283, lon_min=6.0422, lon_max=6.049,
+            time_start=datetime(2022, 3, 1),
+            time_end=datetime(2024, 4, 2),
+            institution="x", parameters={"HCDT", "HCSP"},
+        ),
+    ]
+    downloaded_path = tmp_path / "AR_TS_MO_A-Sulafjorden.nc"
+
+    fake_module = MagicMock()
+    fake_file = MagicMock(file_status="DOWNLOADED", file_path=downloaded_path)
+    fake_module.get.return_value = MagicMock(files=[fake_file])
+
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        paths = download_index_files(
+            "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr", "history", rows, tmp_path,
+        )
+
+    assert paths == [downloaded_path]
+    call_kwargs = fake_module.get.call_args.kwargs
+    assert call_kwargs["dataset_id"] == "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr"
+    assert call_kwargs["dataset_part"] == "history"
+    assert call_kwargs["no_directories"] is True
+    file_list_path = tmp_path / "_file_list.txt"
+    assert file_list_path.read_text().strip() == "history/MO/AR_TS_MO_A-Sulafjorden.nc"
+
+
+def test_download_index_files_returns_empty_for_no_rows(tmp_path):
+    assert download_index_files("dataset", "history", [], tmp_path) == []
