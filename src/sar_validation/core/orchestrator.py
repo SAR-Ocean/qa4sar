@@ -159,9 +159,17 @@ def _sar_entry_found_data(
 ) -> bool:
     """
     True if a recorded ``"sar"`` download-metadata entry represents at
-    least one product found for the window, a failed attempt (whose data
-    status is unknown and must not be treated as empty), or no recorded
-    entry at all.
+    least one product found for the window, a failed attempt with no
+    ``found_count`` recorded (whose data status is unknown and must not
+    be treated as empty), or no recorded entry at all.
+
+    ``found_count`` is authoritative whenever present, even on a failed
+    entry: a total early failure (e.g. a THREDDS catalog request timing
+    out before any granule was ever matched) reliably records
+    ``found_count: 0``, confirmed live 2026-08-27 against a real
+    RADARSAT-2 THREDDS outage, and ``download_all()`` must skip
+    validation-data downloads in that case rather than proceed with
+    nothing to collocate against.
 
     Entries recorded before ``found_count`` existed can have an empty
     ``"files"`` list even though real products were found and downloaded:
@@ -184,10 +192,12 @@ def _sar_entry_found_data(
     one instead of leaving the gap to be silently re-read (and re-scanned)
     on every future run.
     """
-    if not entry or entry.get("status") == "failed":
+    if not entry:
         return True
     if "found_count" in entry:
         return entry["found_count"] > 0
+    if entry.get("status") == "failed":
+        return True
     if entry.get("files"):
         return True
     if sar_dir is not None and file_glob is not None and sar_dir.exists():
