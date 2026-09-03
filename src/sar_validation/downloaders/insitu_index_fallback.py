@@ -21,7 +21,7 @@ from typing import Iterator
 import pandas as pd
 import xarray as xr
 
-from .base import copernicus_marine_download_kwargs, split_antimeridian_bbox
+from .base import copernicus_marine_download_kwargs, normalize_datetime, split_antimeridian_bbox
 
 
 @dataclass
@@ -240,3 +240,55 @@ def parse_platform_file(
         id_vars=id_cols, value_vars=present_vars, var_name="variable", value_name="value",
     )
     return long_df.dropna(subset=["value"])[empty_columns].reset_index(drop=True)
+
+
+def download_via_index(
+    dataset_id: str,
+    dataset_part: str,
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    start_dt: str, end_dt: str,
+    min_depth: float, max_depth: float,
+    wanted_variables: set[str],
+    dest_path: Path,
+    work_dir: Path,
+    force_download: bool = False,
+) -> Path | None:
+    """Fetch the in-situ TAC index for one dataset/part, select the
+    platform files intersecting the requested bbox/time/variables,
+    download and parse just those, and write the combined long-format CSV
+    to *dest_path*. Returns None (no CSV written) when no platform file
+    matches the query, matching the "no data" convention already used by
+    the ARCO/subset() download path."""
+    start = pd.Timestamp(normalize_datetime(start_dt))
+    end = pd.Timestamp(normalize_datetime(end_dt))
+
+    index_path = fetch_index_file(dataset_id, dataset_part, work_dir, force_download)
+    rows = rows_matching_query(
+        index_path, min_lon, max_lon, min_lat, max_lat, start.to_pydatetime(),
+        end.to_pydatetime(), wanted_variables,
+    )
+    if not rows:
+        return None
+
+    nc_paths = download_index_files(dataset_id, dataset_part, rows, work_dir, force_download)
+    row_by_stem = {Path(row.file_name).stem: row for row in rows}
+
+    frames = []
+    for nc_path in nc_paths:
+        row = row_by_stem.get(nc_path.stem)
+        platform_type_code = Path(row.file_name).parent.name if row is not None else "unknown"
+        df = parse_platform_file(
+            nc_path, wanted_variables,
+            min_lon, max_lon, min_lat, max_lat, start, end,
+            min_depth, max_depth, platform_type_code,
+        )
+        if not df.empty:
+            frames.append(df)
+
+    if not frames:
+        return None
+
+    combined = pd.concat(frames, ignore_index=True)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(dest_path, index=False)
+    return dest_path

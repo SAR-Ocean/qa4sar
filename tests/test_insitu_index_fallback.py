@@ -14,6 +14,7 @@ import xarray as xr
 from sar_validation.downloaders.insitu_index_fallback import (
     IndexRow,
     download_index_files,
+    download_via_index,
     iter_index_rows,
     parse_platform_file,
     rows_matching_query,
@@ -332,3 +333,63 @@ def test_parse_platform_file_surface_only_depth_filter_excludes_zero(tmp_path):
     )
 
     assert df.empty
+
+
+def test_download_via_index_returns_none_when_no_rows_match(tmp_path):
+    index_path = tmp_path / "cache" / "index_history.txt"
+    index_path.parent.mkdir(parents=True)
+    index_path.write_text(_FIXTURE_INDEX)
+
+    fake_module = MagicMock()
+    fake_module.get.return_value = MagicMock(
+        files=[MagicMock(filename="index_history.txt", file_path=index_path)],
+    )
+
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        result = download_via_index(
+            dataset_id="cmems_obs-ins_glo_phybgcwav_mynrt_na_irr",
+            dataset_part="history",
+            min_lon=-170.0, max_lon=-160.0, min_lat=80.0, max_lat=85.0,
+            start_dt="2023-01-01T00:00:00", end_dt="2023-12-31T00:00:00",
+            min_depth=-20.0, max_depth=20.0,
+            wanted_variables={"WSPD", "WDIR"},
+            dest_path=tmp_path / "out.csv",
+            work_dir=tmp_path / "cache",
+        )
+
+    assert result is None
+    assert not (tmp_path / "out.csv").exists()
+
+
+def test_download_via_index_writes_combined_csv_from_matched_files(tmp_path):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    index_path = cache_dir / "index_history.txt"
+    index_path.write_text(_FIXTURE_INDEX)
+    mooring_nc = cache_dir / "AR_TS_MO_A-Sulafjorden.nc"
+    _write_mooring_fixture(mooring_nc)
+
+    fake_module = MagicMock()
+
+    def fake_get(**kwargs):
+        if kwargs.get("index_parts"):
+            return MagicMock(files=[MagicMock(filename="index_history.txt", file_path=index_path)])
+        return MagicMock(files=[MagicMock(file_path=mooring_nc)])
+
+    fake_module.get.side_effect = fake_get
+
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        result = download_via_index(
+            dataset_id="cmems_obs-ins_glo_phybgcwav_mynrt_na_irr",
+            dataset_part="history",
+            min_lon=0.0, max_lon=10.0, min_lat=60.0, max_lat=65.0,
+            start_dt="2023-01-01T00:00:00", end_dt="2023-01-02T00:00:00",
+            min_depth=-20.0, max_depth=20.0,
+            wanted_variables={"HCDT", "HCSP", "WSPD", "WDIR"},
+            dest_path=tmp_path / "out.csv",
+            work_dir=cache_dir,
+        )
+
+    assert result == tmp_path / "out.csv"
+    df = pd.read_csv(tmp_path / "out.csv")
+    assert set(df["variable"]) == {"HCDT", "HCSP"}
