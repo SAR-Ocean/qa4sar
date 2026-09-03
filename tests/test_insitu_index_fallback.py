@@ -22,6 +22,7 @@ _FIXTURE_INDEX = (  # noqa: E501
     "COP-AR-01,history/MO/AR_TS_MO_A-Sulafjorden.nc,62.4247,62.4283,6.0422,6.049,2022-03-01T00:00:00Z,2024-04-02T07:59:00Z,The Norwegian Public Roads Administration,2025-05-07T14:08:19Z,R,DEPH HCDT HCSP WSPD WDIR\n"  # noqa: E501
     "COP-GL-02,history/DC/GL_TS_DC_1301742.nc,-28.917,-11.368,-179.986,179.997,2023-05-15T17:00:00Z,2026-01-30T23:00:00Z,CLS,2026-05-05T21:19:02Z,D,EWCT NSCT EWCT_WS NSCT_WS\n"  # noqa: E501
     "COP-GLOBAL-01,history/BO/GL_PR_BO_58GS.nc,63.3516,64.84318,1.53416,4.04008,2021-06-23T02:38:02Z,2021-06-28T08:12:57Z,Institute of Marine Research,2025-05-05T02:40:04Z,M,BATH PRES NTRI NTRA\n"  # noqa: E501
+    "COP-TEST-01,test/TS_ANTIMERIDIAN_EAST.nc,30.0,35.0,174.5,178.5,2023-06-01T00:00:00Z,2023-06-30T23:59:00Z,Test Org,2026-01-01T00:00:00Z,R,TEMP SALT\n"  # noqa: E501
 )
 
 
@@ -31,7 +32,7 @@ def test_iter_index_rows_parses_data_lines_skipping_comment_header(tmp_path):
 
     rows = list(iter_index_rows(index_path))
 
-    assert len(rows) == 3
+    assert len(rows) == 4
     first = rows[0]
     assert first == IndexRow(
         file_name="history/MO/AR_TS_MO_A-Sulafjorden.nc",
@@ -90,6 +91,41 @@ def test_rows_matching_query_excludes_rows_outside_time_window(tmp_path):
         min_lon=0.0, max_lon=10.0, min_lat=60.0, max_lat=65.0,
         start=datetime(2010, 1, 1), end=datetime(2010, 12, 31),
         wanted_variables={"WSPD", "WDIR"},
+    )
+
+    assert rows == []
+
+
+def test_rows_matching_query_with_nonwrapping_row_inside_wrapped_query_window(tmp_path):
+    """A row whose own bbox does not wrap (lon_max - lon_min <= 180), positioned
+    near the antimeridian, should match when queried with a wrapping bbox that
+    spans the dateline. The _row_matches_bbox function should split the wrapping
+    query into two windows and check overlap against both."""
+    index_path = tmp_path / "index_history.txt"
+    index_path.write_text(_FIXTURE_INDEX)
+
+    rows = rows_matching_query(
+        index_path,
+        min_lon=170.0, max_lon=-170.0, min_lat=25.0, max_lat=40.0,
+        start=datetime(2023, 6, 1), end=datetime(2023, 6, 30),
+        wanted_variables={"TEMP", "SALT"},
+    )
+
+    assert [r.file_name for r in rows] == ["test/TS_ANTIMERIDIAN_EAST.nc"]
+
+
+def test_rows_matching_query_with_nonwrapping_row_outside_wrapped_query_windows(tmp_path):
+    """A row whose own bbox does not wrap, positioned far from the antimeridian
+    (lon 1.5-4.0), should not match when queried with a wrapping bbox that spans
+    the dateline (170 to -170). The row falls outside both split windows."""
+    index_path = tmp_path / "index_history.txt"
+    index_path.write_text(_FIXTURE_INDEX)
+
+    rows = rows_matching_query(
+        index_path,
+        min_lon=170.0, max_lon=-170.0, min_lat=60.0, max_lat=65.0,
+        start=datetime(2021, 6, 23), end=datetime(2021, 6, 28),
+        wanted_variables={"BATH", "PRES"},
     )
 
     assert rows == []
