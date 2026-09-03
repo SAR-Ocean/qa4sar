@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
-from .base import copernicus_marine_download_kwargs
+from .base import copernicus_marine_download_kwargs, split_antimeridian_bbox
 
 
 @dataclass
@@ -95,3 +95,44 @@ def iter_index_rows(index_path: Path) -> Iterator[IndexRow]:
                 )
             except (KeyError, ValueError):
                 continue
+
+
+def _row_matches_bbox(
+    row: IndexRow, min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+) -> bool:
+    """Check if a row's bbox overlaps the requested region, handling the
+    antimeridian correctly."""
+    if row.lat_max < min_lat or row.lat_min > max_lat:
+        return False
+    if row.lon_max - row.lon_min > 180:
+        # The row's own reported bbox wraps the antimeridian (a drifting
+        # platform crossed the dateline mid-deployment) rather than the
+        # platform having genuinely visited both far sides of the globe --
+        # treat it as a longitude match anywhere rather than mis-testing a
+        # wrapped interval against a non-wrapped query window.
+        return True
+    for win_min_lon, win_max_lon in split_antimeridian_bbox(min_lon, max_lon):
+        if row.lon_max >= win_min_lon and row.lon_min <= win_max_lon:
+            return True
+    return False
+
+
+def rows_matching_query(
+    index_path: Path,
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    start: datetime, end: datetime,
+    wanted_variables: set[str],
+) -> list[IndexRow]:
+    """Index rows whose parameters intersect wanted_variables, whose time
+    span overlaps [start, end], and whose bbox overlaps the requested
+    region."""
+    matched = []
+    for row in iter_index_rows(index_path):
+        if not (row.parameters & wanted_variables):
+            continue
+        if row.time_end < start or row.time_start > end:
+            continue
+        if not _row_matches_bbox(row, min_lon, max_lon, min_lat, max_lat):
+            continue
+        matched.append(row)
+    return matched

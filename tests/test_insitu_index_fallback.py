@@ -9,6 +9,7 @@ from datetime import datetime
 from sar_validation.downloaders.insitu_index_fallback import (
     IndexRow,
     iter_index_rows,
+    rows_matching_query,
 )
 
 _FIXTURE_INDEX = (  # noqa: E501
@@ -47,3 +48,48 @@ def test_iter_index_rows_on_missing_data_returns_empty(tmp_path):
     index_path.write_text("# Title : in-situ files catalog\n# just comments\n")
 
     assert list(iter_index_rows(index_path)) == []
+
+
+def test_rows_matching_query_filters_by_variable_time_and_bbox(tmp_path):
+    index_path = tmp_path / "index_history.txt"
+    index_path.write_text(_FIXTURE_INDEX)
+
+    rows = rows_matching_query(
+        index_path,
+        min_lon=0.0, max_lon=10.0, min_lat=60.0, max_lat=65.0,
+        start=datetime(2023, 1, 1), end=datetime(2023, 12, 31),
+        wanted_variables={"WSPD", "WDIR"},
+    )
+
+    assert [r.file_name for r in rows] == ["history/MO/AR_TS_MO_A-Sulafjorden.nc"]
+
+
+def test_rows_matching_query_treats_wrapped_bbox_row_as_matching_any_window(tmp_path):
+    """The drifter row's own bbox is [-179.986, 179.997] -- it crossed the
+    antimeridian, not the whole globe -- so it must match a query window
+    anywhere, the same way a genuinely wide platform track would."""
+    index_path = tmp_path / "index_history.txt"
+    index_path.write_text(_FIXTURE_INDEX)
+
+    rows = rows_matching_query(
+        index_path,
+        min_lon=170.0, max_lon=-170.0, min_lat=-30.0, max_lat=-10.0,
+        start=datetime(2023, 1, 1), end=datetime(2026, 12, 31),
+        wanted_variables={"EWCT", "NSCT"},
+    )
+
+    assert [r.file_name for r in rows] == ["history/DC/GL_TS_DC_1301742.nc"]
+
+
+def test_rows_matching_query_excludes_rows_outside_time_window(tmp_path):
+    index_path = tmp_path / "index_history.txt"
+    index_path.write_text(_FIXTURE_INDEX)
+
+    rows = rows_matching_query(
+        index_path,
+        min_lon=0.0, max_lon=10.0, min_lat=60.0, max_lat=65.0,
+        start=datetime(2010, 1, 1), end=datetime(2010, 12, 31),
+        wanted_variables={"WSPD", "WDIR"},
+    )
+
+    assert rows == []
