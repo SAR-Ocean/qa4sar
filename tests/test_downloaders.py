@@ -1665,7 +1665,7 @@ class TestInSituDownloaderDatasetPartFallbackErrorMessage:
     """When a requested date predates the CMEMS in-situ dataset's coverage,
     both the auto-selected dataset_part and its fallback fail. Raising the
     fallback's bare exception is misleading: for an old date (e.g. 2019),
-    the initial attempt is 'monthly' (whose own error correctly reports
+    the initial attempt is 'history' (whose own error correctly reports
     that part's ~2020-onwards coverage), then the retry against 'latest'
     fails too, but with 'latest's own ~30-day rolling-window bounds --
     those are the only bounds a caller ever sees if just e2 is raised,
@@ -1673,14 +1673,17 @@ class TestInSituDownloaderDatasetPartFallbackErrorMessage:
     combined message must surface both parts' own reported bounds."""
 
     def test_error_includes_both_dataset_parts_coverage_messages(self, tmp_path):
+        from copernicusmarine.core_functions.exceptions import NoServiceAvailable
+
         from sar_validation.downloaders.insitu_downloader import InSituDownloader
 
         dl = InSituDownloader(output_dir=tmp_path, dry_run=False, force_download=True)
         fake_module = MagicMock()
+        fake_module.core_functions.exceptions.NoServiceAvailable = NoServiceAvailable
 
         def fake_subset(**kwargs):
             part = kwargs["dataset_part"]
-            if part == "monthly":
+            if part == "history":
                 raise ValueError(
                     "Some of your subset selection [2019-02-01T16:30:00, "
                     "2019-02-01T19:30:00] for the time dimension exceed the "
@@ -1703,10 +1706,10 @@ class TestInSituDownloaderDatasetPartFallbackErrorMessage:
 
         assert fake_module.subset.call_count == 2
         msg = str(exc_info.value)
-        assert "monthly" in msg
+        assert "history" in msg
         assert "latest" in msg
         assert "2020-01-01T00:00:00" in msg, (
-            f"expected the monthly part's own reported lower bound in the "
+            f"expected the history part's own reported lower bound in the "
             f"combined error, got: {msg}"
         )
         assert "2026-06-30T00:00:00" in msg, (

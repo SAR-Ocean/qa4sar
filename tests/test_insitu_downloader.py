@@ -458,3 +458,71 @@ class TestVariablesForRecipe:
         for variable, codes in RECIPE_VARIABLE_TO_INSITU_VARIABLES.items():
             for code in codes:
                 assert code in ALL_VARIABLES, f"{variable!r} maps to {code!r}, not a real ALL_VARIABLES member"
+
+
+class TestIndexFallback:
+    """Copernicus Marine's ARCO/subset() service is currently unavailable
+    for this dataset's non-"latest" parts -- download() must fall back to
+    per-platform file download via the in-situ index (insitu_index_fallback
+    .download_via_index) instead of raising, but only for the parts where
+    that gap is actually known to exist."""
+
+    def test_no_service_available_on_historical_part_falls_back_to_index(self, tmp_path):
+        """When subset() reports NoServiceAvailable for the historical
+        part (the ARCO service Copernicus Marine currently does not
+        register for cmems_obs-ins_glo_phybgcwav_mynrt_na_irr's
+        "history"/"monthly" parts), download_via_index must be used
+        instead of raising."""
+        from copernicusmarine.core_functions.exceptions import NoServiceAvailable
+
+        dl = InSituDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+        fake_module.core_functions.exceptions.NoServiceAvailable = NoServiceAvailable
+
+        def fake_subset(**kwargs):
+            raise NoServiceAvailable("No service available for dataset with command subset")
+
+        fake_module.subset.side_effect = fake_subset
+
+        def fake_download_via_index(*, dest_path, **kwargs):
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            dest_path.write_text(
+                "variable,platform_id,platform_type,time,longitude,latitude,depth,value,institution\n"
+            )
+            return dest_path
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}), \
+             patch(
+                 "sar_validation.downloaders.insitu_downloader.download_via_index",
+                 side_effect=fake_download_via_index,
+             ) as mock_fallback:
+            out = dl.download(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2020-01-01", "2020-01-05",
+                dataset_part="history",
+            )
+
+        assert len(out) == 1
+        assert out[0].exists()
+        mock_fallback.assert_called_once()
+        assert mock_fallback.call_args.kwargs["dataset_part"] == "history"
+
+    def test_no_service_available_on_latest_part_still_raises(self, tmp_path):
+        """"latest" has always had a working ARCO service -- a
+        NoServiceAvailable there is unexpected and should surface, not be
+        silently swallowed into an index-fallback attempt that has no
+        "latest" index file to fetch."""
+        from copernicusmarine.core_functions.exceptions import NoServiceAvailable
+
+        dl = InSituDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+        fake_module.core_functions.exceptions.NoServiceAvailable = NoServiceAvailable
+        fake_module.subset.side_effect = NoServiceAvailable("boom")
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}), \
+             pytest.raises(NoServiceAvailable):
+            dl.download(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2026-06-01", "2026-06-05",
+                dataset_part="latest",
+            )

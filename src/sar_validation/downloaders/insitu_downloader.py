@@ -41,6 +41,7 @@ from typing import Iterable, Optional
 import pandas as pd
 
 from .base import build_output_dir, is_date_recent, normalize_datetime, split_antimeridian_bbox
+from .insitu_index_fallback import download_via_index
 
 __all__ = [
     "InSituDownloader",
@@ -247,7 +248,7 @@ class InSituDownloader:
             Filter by platform type(s): mooring, buoy, ferrybox, drifter, tidal_gauge.
             None or empty list means keep all platform types.
         dataset_part : str, optional
-            Which dataset part to use: "monthly" (historical) or "latest" (recent).
+            Which dataset part to use: "history" (historical) or "latest" (recent).
             If None, auto-detects based on whether end_date is within 30 days.
 
         Returns
@@ -323,7 +324,7 @@ class InSituDownloader:
         """
         start_dt = normalize_datetime(start)
         end_dt = normalize_datetime(end)
-        resolved_part = dataset_part or ("latest" if is_date_recent(end_dt) else "monthly")
+        resolved_part = dataset_part or ("latest" if is_date_recent(end_dt) else "history")
         resolved_variables = list(variables) if variables is not None else ALL_VARIABLES
 
         cache_key = (
@@ -497,7 +498,7 @@ class InSituDownloader:
         # Auto-detect dataset_part if not provided
         resolved_part = dataset_part
         if resolved_part is None:
-            resolved_part = "latest" if is_date_recent(end_dt) else "monthly"
+            resolved_part = "latest" if is_date_recent(end_dt) else "history"
 
         # Run the copernicusmarine subset call (downloads to CWD by default)
         print("Downloading in-situ data …")
@@ -506,7 +507,12 @@ class InSituDownloader:
         print(f"  Depth:  {self.min_depth} to {self.max_depth} m")
         print(f"  Dataset: {resolved_part}")
 
-        # Try initial dataset_part, with fallback if data not available
+        # Try initial dataset_part; ARCO subsetting is currently unavailable
+        # for any part other than "latest" on this dataset, so fall back to
+        # downloading and parsing the matched original files directly (see
+        # insitu_index_fallback.py) rather than treating that as a hard
+        # failure.
+        used_index_fallback = False
         try:
             self._download_with_part(
                 copernicusmarine,
@@ -514,12 +520,38 @@ class InSituDownloader:
                 min_lon, max_lon, min_lat, max_lat,
                 start_dt, end_dt,
             )
+        except copernicusmarine.core_functions.exceptions.NoServiceAvailable:
+            if resolved_part == "latest":
+                raise
+            print(
+                f"  dataset_part='{resolved_part}' has no ARCO service available "
+                "upstream right now; falling back to per-platform file download "
+                "via the in-situ index …"
+            )
+            found = download_via_index(
+                dataset_id=DATASET_ID,
+                dataset_part=resolved_part,
+                min_lon=min_lon, max_lon=max_lon, min_lat=min_lat, max_lat=max_lat,
+                start_dt=start_dt, end_dt=end_dt,
+                min_depth=self.min_depth, max_depth=self.max_depth,
+                wanted_variables=set(ALL_VARIABLES),
+                dest_path=dest_path,
+                work_dir=self.output_dir / "_insitu_index_cache",
+                force_download=self.force_download,
+            )
+            if found is None:
+                logger.debug(
+                    "No in-situ observations found via index fallback for "
+                    "[%s, %s].", start_dt, end_dt,
+                )
+                return None
+            used_index_fallback = True
         except Exception as e:
             error_msg = str(e)
             # Check if error is about data exceeding coordinates (date outside available range)
             if "exceed the dataset coordinates" in error_msg or "out of bounds" in error_msg.lower():
                 # Try the opposite dataset_part
-                alt_dataset_part = "monthly" if resolved_part == "latest" else "latest"
+                alt_dataset_part = "history" if resolved_part == "latest" else "latest"
                 print(f"  Retrying with dataset_part='{alt_dataset_part}' due to: {error_msg[:100]}…")
                 try:
                     self._download_with_part(
@@ -540,24 +572,25 @@ class InSituDownloader:
                 # Not a data availability error, re-raise original
                 raise
 
-        # Move the file (copernicusmarine writes it to CWD) to our output_dir
-        if Path(expected_filename).exists():
-            shutil.move(str(expected_filename), str(dest_path))
-            print(f"  Saved to {dest_path}")
-        elif dest_path.exists():
-            print(f"  Already at {dest_path}")
-        else:
-            # Try to find a recently-created CSV in CWD
-            candidates = sorted(Path(".").glob(f"{DATASET_ID}*.csv"), key=os.path.getmtime, reverse=True)
-            if candidates:
-                shutil.move(str(candidates[0]), str(dest_path))
+        if not used_index_fallback:
+            # Move the file (copernicusmarine writes it to CWD) to our output_dir
+            if Path(expected_filename).exists():
+                shutil.move(str(expected_filename), str(dest_path))
                 print(f"  Saved to {dest_path}")
+            elif dest_path.exists():
+                print(f"  Already at {dest_path}")
             else:
-                logger.debug(
-                    "No in-situ observations in [%s, %s]; copernicusmarine "
-                    "wrote no output file.", start_dt, end_dt,
-                )
-                return None
+                # Try to find a recently-created CSV in CWD
+                candidates = sorted(Path(".").glob(f"{DATASET_ID}*.csv"), key=os.path.getmtime, reverse=True)
+                if candidates:
+                    shutil.move(str(candidates[0]), str(dest_path))
+                    print(f"  Saved to {dest_path}")
+                else:
+                    logger.debug(
+                        "No in-situ observations in [%s, %s]; copernicusmarine "
+                        "wrote no output file.", start_dt, end_dt,
+                    )
+                    return None
 
         # Apply platform-type filter
         if source_types:
