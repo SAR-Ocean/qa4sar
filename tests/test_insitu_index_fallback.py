@@ -7,10 +7,15 @@ from __future__ import annotations
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+import pandas as pd
+import xarray as xr
+
 from sar_validation.downloaders.insitu_index_fallback import (
     IndexRow,
     download_index_files,
     iter_index_rows,
+    parse_platform_file,
     rows_matching_query,
 )
 
@@ -165,3 +170,106 @@ def test_download_index_files_writes_file_list_and_calls_get(tmp_path):
 
 def test_download_index_files_returns_empty_for_no_rows(tmp_path):
     assert download_index_files("dataset", "history", [], tmp_path) == []
+
+
+def _write_mooring_fixture(path):
+    """Mirrors AR_TS_MO_A-Sulafjorden.nc's real layout: scalar LONGITUDE/
+    LATITUDE plus per-observation PRECISE_LONGITUDE/PRECISE_LATITUDE, and a
+    (TIME, DEPTH) DEPH data variable."""
+    time = pd.date_range("2023-01-01", periods=3, freq="h")
+    ds = xr.Dataset(
+        data_vars={
+            "HCDT": (("TIME", "DEPTH"), [[10.0, 11.0], [12.0, 13.0], [14.0, 15.0]]),
+            "HCSP": (("TIME", "DEPTH"), [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]),
+        },
+        coords={
+            "TIME": time,
+            "PRECISE_LONGITUDE": ("TIME", [6.04, 6.05, 6.06]),
+            "PRECISE_LATITUDE": ("TIME", [62.42, 62.43, 62.44]),
+            "DEPH": (("TIME", "DEPTH"), [[5.0, 25.0], [5.0, 25.0], [5.0, 25.0]]),
+            "LONGITUDE": 6.045,
+            "LATITUDE": 62.43,
+        },
+        attrs={"platform_code": "A-Sulafjorden"},
+    )
+    ds.to_netcdf(path)
+
+
+def _write_argo_fixture(path):
+    """Mirrors GL_TS_PF_13857.nc's real layout: only per-observation
+    LONGITUDE/LATITUDE, and a (TIME, DEPTH) PRES data variable instead of
+    DEPH."""
+    time = pd.date_range("2023-06-01", periods=2, freq="D")
+    ds = xr.Dataset(
+        data_vars={
+            "EWCT": (("TIME", "DEPTH"), [[0.05], [0.07]]),
+            "NSCT": (("TIME", "DEPTH"), [[-0.02], [-0.01]]),
+        },
+        coords={
+            "TIME": time,
+            "LONGITUDE": ("TIME", [1.0, 1.2]),
+            "LATITUDE": ("TIME", [3.0, 3.1]),
+            "PRES": (("TIME", "DEPTH"), [[10.0], [10.0]]),
+        },
+        attrs={"platform_code": "13857"},
+    )
+    ds.to_netcdf(path)
+
+
+def test_parse_platform_file_mooring_layout_uses_precise_coords_and_deph(tmp_path):
+    nc_path = tmp_path / "mooring.nc"
+    _write_mooring_fixture(nc_path)
+
+    df = parse_platform_file(
+        nc_path, wanted_variables={"HCDT", "HCSP"},
+        min_lon=0.0, max_lon=10.0, min_lat=60.0, max_lat=65.0,
+        start=pd.Timestamp("2023-01-01"), end=pd.Timestamp("2023-01-02"),
+        min_depth=-20.0, max_depth=20.0,
+        platform_type_code="MO",
+    )
+
+    assert set(df.columns) == {
+        "variable", "platform_id", "platform_type", "time",
+        "longitude", "latitude", "depth", "value", "institution",
+    }
+    # DEPH=25.0 falls outside [-20, 20] and must be dropped; DEPH=5.0 kept,
+    # for both HCDT and HCSP, across all 3 timestamps.
+    assert len(df) == 6
+    assert set(df["variable"]) == {"HCDT", "HCSP"}
+    assert (df["depth"] == 5.0).all()
+    assert (df["platform_id"] == "A-Sulafjorden").all()
+    assert (df["platform_type"] == "MO").all()
+    assert np.isclose(df.loc[df["longitude"].round(2) == 6.04, "longitude"].iloc[0], 6.04)
+
+
+def test_parse_platform_file_argo_layout_uses_plain_coords_and_pres(tmp_path):
+    nc_path = tmp_path / "argo.nc"
+    _write_argo_fixture(nc_path)
+
+    df = parse_platform_file(
+        nc_path, wanted_variables={"EWCT", "NSCT"},
+        min_lon=0.0, max_lon=2.0, min_lat=0.0, max_lat=5.0,
+        start=pd.Timestamp("2023-06-01"), end=pd.Timestamp("2023-06-02"),
+        min_depth=0.0, max_depth=20.0,
+        platform_type_code="PF",
+    )
+
+    assert len(df) == 4  # 2 variables x 2 timestamps
+    assert set(df["variable"]) == {"EWCT", "NSCT"}
+    assert (df["platform_id"] == "13857").all()
+    assert (df["platform_type"] == "PF").all()
+
+
+def test_parse_platform_file_no_requested_variable_present_returns_empty(tmp_path):
+    nc_path = tmp_path / "mooring.nc"
+    _write_mooring_fixture(nc_path)
+
+    df = parse_platform_file(
+        nc_path, wanted_variables={"WSPD", "WDIR"},
+        min_lon=0.0, max_lon=10.0, min_lat=60.0, max_lat=65.0,
+        start=pd.Timestamp("2023-01-01"), end=pd.Timestamp("2023-01-02"),
+        min_depth=-20.0, max_depth=20.0,
+        platform_type_code="MO",
+    )
+
+    assert df.empty

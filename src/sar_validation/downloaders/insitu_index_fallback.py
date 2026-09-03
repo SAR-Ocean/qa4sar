@@ -18,6 +18,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
+import pandas as pd
+import xarray as xr
+
 from .base import copernicus_marine_download_kwargs, split_antimeridian_bbox
 
 
@@ -164,3 +167,76 @@ def download_index_files(
         **copernicus_marine_download_kwargs(force_download),
     )
     return [Path(f.file_path) for f in result.files]
+
+
+_LON_NAMES = ("PRECISE_LONGITUDE", "LONGITUDE")
+_LAT_NAMES = ("PRECISE_LATITUDE", "LATITUDE")
+_DEPTH_NAMES = ("DEPH", "PRES")
+
+
+def _first_present(ds: xr.Dataset, names: tuple[str, ...]) -> str | None:
+    for name in names:
+        if name in ds.variables:
+            return name
+    return None
+
+
+def parse_platform_file(
+    nc_path: Path,
+    wanted_variables: set[str],
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    start: pd.Timestamp, end: pd.Timestamp,
+    min_depth: float, max_depth: float,
+    platform_type_code: str,
+) -> pd.DataFrame:
+    """Read one in-situ TAC NetCDF file and return a long-format dataframe
+    (variable, platform_id, platform_type, time, longitude, latitude,
+    depth, value, institution), trimmed to the requested bbox/time/depth
+    window - matching the schema copernicusmarine.subset() itself
+    produces, so downstream code does not need to know which path
+    produced a given CSV."""
+    empty_columns = [
+        "variable", "platform_id", "platform_type", "time",
+        "longitude", "latitude", "depth", "value", "institution",
+    ]
+    with xr.open_dataset(nc_path) as ds:
+        lon_name = _first_present(ds, _LON_NAMES)
+        lat_name = _first_present(ds, _LAT_NAMES)
+        depth_name = _first_present(ds, _DEPTH_NAMES)
+        present_vars = [v for v in wanted_variables if v in ds.data_vars]
+        if lon_name is None or lat_name is None or "TIME" not in ds.variables or not present_vars:
+            return pd.DataFrame(columns=empty_columns)
+
+        platform_id = str(ds.attrs.get("platform_code", nc_path.stem))
+        institution = str(ds.attrs.get("institution", ""))
+
+        keep = {"TIME", lon_name, lat_name, *present_vars}
+        if depth_name is not None:
+            keep.add(depth_name)
+        df = ds[sorted(keep)].to_dataframe().reset_index()
+
+    rename = {"TIME": "time", lon_name: "longitude", lat_name: "latitude"}
+    if depth_name is not None:
+        rename[depth_name] = "depth"
+    df = df.rename(columns=rename)
+    if "depth" not in df.columns:
+        df["depth"] = 0.0
+
+    df = df[
+        (df["time"] >= start) & (df["time"] <= end)
+        & (df["longitude"] >= min_lon) & (df["longitude"] <= max_lon)
+        & (df["latitude"] >= min_lat) & (df["latitude"] <= max_lat)
+        & (df["depth"] >= min_depth) & (df["depth"] <= max_depth)
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=empty_columns)
+
+    df["platform_id"] = platform_id
+    df["platform_type"] = platform_type_code
+    df["institution"] = institution
+
+    id_cols = ["platform_id", "platform_type", "time", "longitude", "latitude", "depth", "institution"]
+    long_df = df.melt(
+        id_vars=id_cols, value_vars=present_vars, var_name="variable", value_name="value",
+    )
+    return long_df.dropna(subset=["value"])[empty_columns].reset_index(drop=True)
