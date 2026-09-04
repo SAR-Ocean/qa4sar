@@ -399,6 +399,16 @@ def parse_platform_file(
         platform_id = str(ds.attrs.get("platform_code", nc_path.stem))
         institution = str(ds.attrs.get("institution", ""))
 
+        # A platform's on-disk record can span years while the query
+        # window covers a few hours -- slicing TIME here, before
+        # to_dataframe() below, keeps a whole-archive file (which can be
+        # hundreds of MB to GBs once melted into a long-format dataframe)
+        # from ever being fully materialized in memory just to be
+        # discarded by the time/bbox filter that already runs afterward.
+        time_values = ds["TIME"].values
+        in_window = (time_values >= start.to_datetime64()) & (time_values <= end.to_datetime64())
+        ds = ds.isel(TIME=in_window)
+
         qc_names = {v: f"{v}_QC" for v in present_vars if f"{v}_QC" in ds.data_vars}
         keep = {"TIME", lon_name, lat_name, *present_vars, *qc_names.values()}
         if depth_name is not None:

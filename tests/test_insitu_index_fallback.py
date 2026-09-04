@@ -482,6 +482,54 @@ def test_parse_platform_file_surface_only_depth_filter_excludes_zero(tmp_path):
     assert df.empty
 
 
+def test_parse_platform_file_prefilters_time_before_materializing_dataframe(tmp_path, monkeypatch):
+    """A platform's on-disk record can span years while a query window
+    covers a few hours (e.g. a mooring active since 2010 queried for one
+    day in 2012). to_dataframe() must only be called on an already
+    time-sliced dataset -- calling it on the whole-archive dataset is what
+    physically loads every observation into memory before the time/bbox
+    filter below discards nearly all of them, and a whole-archive HF-radar
+    or long-running mooring file can be hundreds of MB to GBs once melted
+    into a long-format dataframe."""
+    nc_path = tmp_path / "long_record.nc"
+    time = pd.to_datetime(
+        ["2010-01-01", "2011-06-15", "2012-01-01", "2013-03-20", "2014-07-04"]
+    )
+    ds = xr.Dataset(
+        data_vars={"HCDT": (("TIME", "DEPTH"), [[10.0]] * 5)},
+        coords={
+            "TIME": time,
+            "PRECISE_LONGITUDE": ("TIME", [6.04] * 5),
+            "PRECISE_LATITUDE": ("TIME", [62.43] * 5),
+            "DEPH": (("TIME", "DEPTH"), [[5.0]] * 5),
+            "LONGITUDE": 6.045,
+            "LATITUDE": 62.43,
+        },
+        attrs={"platform_code": "LONG-RECORD"},
+    )
+    ds.to_netcdf(nc_path)
+
+    observed_time_sizes = []
+    original_to_dataframe = xr.Dataset.to_dataframe
+
+    def spy_to_dataframe(self, *args, **kwargs):
+        observed_time_sizes.append(self.sizes.get("TIME"))
+        return original_to_dataframe(self, *args, **kwargs)
+
+    monkeypatch.setattr(xr.Dataset, "to_dataframe", spy_to_dataframe)
+
+    df = parse_platform_file(
+        nc_path, wanted_variables={"HCDT"},
+        min_lon=0.0, max_lon=10.0, min_lat=60.0, max_lat=65.0,
+        start=pd.Timestamp("2011-12-31"), end=pd.Timestamp("2012-01-02"),
+        min_depth=-20.0, max_depth=20.0,
+        platform_type_code="MO",
+    )
+
+    assert observed_time_sizes == [1]
+    assert len(df) == 1
+
+
 def test_download_via_index_returns_none_when_no_rows_match(tmp_path):
     index_path = tmp_path / "cache" / "index_history.txt"
     index_path.parent.mkdir(parents=True)
