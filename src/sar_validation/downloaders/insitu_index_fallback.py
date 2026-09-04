@@ -67,7 +67,11 @@ def fetch_index_file(
     parameters have no effect in this mode) -- a real bandwidth cost
     (several hundred MB combined) but one this function limits to roughly
     once per day per dataset, not once per run, via the staleness check
-    above.
+    above. no_directories=True keeps the files directly under work_dir
+    (confirmed live to still work under index_parts=True) rather than
+    copernicusmarine's default nested product-id/version subdirectories,
+    which the staleness check below relies on to find the cached copy at
+    all.
     """
     import copernicusmarine
 
@@ -82,6 +86,7 @@ def fetch_index_file(
         dataset_id=dataset_id,
         dataset_part=dataset_part,
         index_parts=True,
+        no_directories=True,
         output_directory=str(work_dir),
         disable_progress_bar=True,
         overwrite=True,

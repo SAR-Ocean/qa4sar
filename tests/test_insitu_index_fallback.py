@@ -69,6 +69,12 @@ def test_fetch_index_file_refetches_a_stale_cached_copy(tmp_path):
     assert result == cached_path
     fake_module.get.assert_called_once()
     assert fake_module.get.call_args.kwargs["overwrite"] is True
+    # no_directories=True is what makes the staleness check above able to
+    # find the cached copy at work_dir/index_history.txt at all --
+    # copernicusmarine's default layout nests index files under a
+    # product-id/version subdirectory it does not otherwise expose to the
+    # caller, so a flat cached_path lookup without this would never hit.
+    assert fake_module.get.call_args.kwargs["no_directories"] is True
 
 
 def test_fetch_index_file_force_download_refetches_even_a_fresh_copy(tmp_path):
