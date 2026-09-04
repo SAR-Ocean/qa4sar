@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
+import numpy as np
 import pandas as pd
 import xarray as xr
 
@@ -119,6 +120,117 @@ def _row_matches_bbox(
         if row.lon_max >= win_min_lon and row.lon_min <= win_max_lon:
             return True
     return False
+
+
+def _observations_overlap_window(
+    times: "np.ndarray", lons: "np.ndarray", lats: "np.ndarray",
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    start: pd.Timestamp, end: pd.Timestamp,
+) -> bool:
+    """True if at least one (time, lon, lat) observation falls inside the
+    requested window. NaN coordinates/timestamps never match. Antimeridian
+    wrap (min_lon > max_lon) uses the same split_antimeridian_bbox
+    convention as the rest of this module."""
+    times = pd.to_datetime(times)
+    valid = ~(pd.isna(times) | np.isnan(lons) | np.isnan(lats))
+    if not valid.any():
+        return False
+
+    time_ok = (times >= start) & (times <= end) & valid
+
+    lon_ok = np.zeros_like(lons, dtype=bool)
+    for win_min_lon, win_max_lon in split_antimeridian_bbox(min_lon, max_lon):
+        lon_ok |= (lons >= win_min_lon) & (lons <= win_max_lon)
+    lat_ok = (lats >= min_lat) & (lats <= max_lat)
+
+    return bool(np.any(time_ok & lon_ok & lat_ok))
+
+
+#: A row whose own reported bbox spans less than this in both dimensions is
+#: treated as effectively stationary (an anchored mooring's index bbox is
+#: GPS-jitter-sized, well under this) and skips the overlap pre-check
+#: entirely -- rows_matching_query's own bbox/time match is already precise
+#: enough for a platform that does not move. A row spanning more than this
+#: (a genuinely moving platform, or a wide-coverage fixed network such as
+#: HF-radar) is exactly the case the pre-check exists for.
+_STATIONARY_BBOX_DEGREES = 0.1
+
+
+def _row_is_effectively_stationary(row: IndexRow, threshold_deg: float = _STATIONARY_BBOX_DEGREES) -> bool:
+    """True if *row*'s own reported bbox is tight enough that its
+    coordinates can be trusted as-is, without checking the platform's
+    actual per-observation track."""
+    return (
+        row.lat_max - row.lat_min < threshold_deg
+        and row.lon_max - row.lon_min < threshold_deg
+    )
+
+
+def _get_remote_url(
+    dataset_id: str, dataset_part: str, file_name: str, work_dir: Path,
+) -> str | None:
+    """Return the direct HTTPS URL of one index-listed file without
+    downloading it (copernicusmarine.get(..., dry_run=True)), or None if
+    the file cannot be located."""
+    import copernicusmarine
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    file_list_path = work_dir / f"_file_list_{uuid.uuid4().hex}.txt"
+    file_list_path.write_text(file_name + "\n")
+    try:
+        result = copernicusmarine.get(
+            dataset_id=dataset_id,
+            dataset_part=dataset_part,
+            file_list=str(file_list_path),
+            dry_run=True,
+            disable_progress_bar=True,
+        )
+    finally:
+        file_list_path.unlink(missing_ok=True)
+    return result.files[0].https_url if result.files else None
+
+
+def row_overlaps_window(
+    row: IndexRow,
+    dataset_id: str, dataset_part: str, work_dir: Path,
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    start: pd.Timestamp, end: pd.Timestamp,
+) -> bool:
+    """True if *row*'s platform has at least one real observation inside
+    the requested window. A row whose own reported bbox is effectively
+    stationary (see _row_is_effectively_stationary) skips the check
+    entirely -- rows_matching_query's own bbox/time match already is the
+    answer for a platform that does not move. Otherwise checks the local
+    cache (*work_dir*) first, falling back to a lazy remote open of the
+    file's own coordinate variables via its direct HTTPS URL -- never
+    downloading the file just to answer this question. Any failure to
+    complete the check (network, missing coordinates, unreadable file)
+    fails open: returns True, since this is an optimization that must
+    never cause data loss."""
+    if _row_is_effectively_stationary(row):
+        return True
+
+    local_path = work_dir / Path(row.file_name).name
+    try:
+        if local_path.exists():
+            source: "Path | str" = local_path
+        else:
+            url = _get_remote_url(dataset_id, dataset_part, row.file_name, work_dir)
+            if url is None:
+                return True
+            source = url
+
+        with xr.open_dataset(source, engine="h5netcdf") as ds:
+            lon_name = _first_present(ds, _LON_NAMES)
+            lat_name = _first_present(ds, _LAT_NAMES)
+            if lon_name is None or lat_name is None or "TIME" not in ds.variables:
+                return True
+            return _observations_overlap_window(
+                ds["TIME"].values, ds[lon_name].values, ds[lat_name].values,
+                min_lon, max_lon, min_lat, max_lat, start, end,
+            )
+    except Exception:
+        return True
 
 
 def rows_matching_query(
@@ -271,6 +383,16 @@ def download_via_index(
         index_path, min_lon, max_lon, min_lat, max_lat, start.to_pydatetime(),
         end.to_pydatetime(), wanted_variables,
     )
+    if not rows:
+        return None
+
+    rows = [
+        row for row in rows
+        if row_overlaps_window(
+            row, dataset_id, dataset_part, work_dir,
+            min_lon, max_lon, min_lat, max_lat, start, end,
+        )
+    ]
     if not rows:
         return None
 

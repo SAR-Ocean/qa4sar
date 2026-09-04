@@ -392,6 +392,184 @@ def test_download_via_index_returns_none_when_no_rows_match(tmp_path):
     assert not (tmp_path / "out.csv").exists()
 
 
+from sar_validation.downloaders.insitu_index_fallback import (
+    _observations_overlap_window,
+    _row_is_effectively_stationary,
+)
+
+
+def test_observations_overlap_window_true_when_any_point_matches():
+    times = pd.to_datetime(["2023-01-01", "2023-06-15", "2024-01-01"])
+    lons = np.array([6.04, 6.05, 170.0])
+    lats = np.array([62.42, 62.43, -20.0])
+
+    assert _observations_overlap_window(
+        times.values, lons, lats,
+        min_lon=6.0, max_lon=6.1, min_lat=62.4, max_lat=62.5,
+        start=pd.Timestamp("2023-01-01"), end=pd.Timestamp("2023-12-31"),
+    ) is True
+
+
+def test_observations_overlap_window_false_when_no_point_matches():
+    times = pd.to_datetime(["2001-01-01", "2025-09-01"])
+    lons = np.array([-53.9, 79.1])
+    lats = np.array([1e-5, 55.25])
+
+    assert _observations_overlap_window(
+        times.values, lons, lats,
+        min_lon=6.0, max_lon=6.1, min_lat=62.4, max_lat=62.5,
+        start=pd.Timestamp("2023-01-01"), end=pd.Timestamp("2023-12-31"),
+    ) is False
+
+
+def test_observations_overlap_window_handles_wrapped_query_bbox():
+    """A point at 175 deg E must match a query bbox that wraps the
+    antimeridian (min_lon=170, max_lon=-170), the same wrap convention
+    used everywhere else in this module."""
+    times = pd.to_datetime(["2023-06-01"])
+    lons = np.array([175.0])
+    lats = np.array([-25.0])
+
+    assert _observations_overlap_window(
+        times.values, lons, lats,
+        min_lon=170.0, max_lon=-170.0, min_lat=-30.0, max_lat=-10.0,
+        start=pd.Timestamp("2023-01-01"), end=pd.Timestamp("2023-12-31"),
+    ) is True
+
+
+def test_observations_overlap_window_ignores_nan_coordinates():
+    """Real in-situ files carry occasional NaN lon/lat/time at bad
+    observations -- these must not crash the check or count as a match."""
+    times = pd.to_datetime(["2023-06-01", "NaT"])
+    lons = np.array([np.nan, 6.05])
+    lats = np.array([62.42, np.nan])
+
+    assert _observations_overlap_window(
+        times.values, lons, lats,
+        min_lon=6.0, max_lon=6.1, min_lat=62.4, max_lat=62.5,
+        start=pd.Timestamp("2023-01-01"), end=pd.Timestamp("2023-12-31"),
+    ) is False
+
+
+def test_row_is_effectively_stationary_true_for_a_tight_mooring_bbox():
+    """A real anchored mooring's own reported index bbox (e.g.
+    AR_TS_MO_A-Sulafjorden.nc: lat 62.4247-62.4283, lon 6.0422-6.049) spans
+    well under a tenth of a degree -- GPS jitter, not real movement."""
+    row = IndexRow(
+        file_name="history/MO/AR_TS_MO_A-Sulafjorden.nc",
+        lat_min=62.4247, lat_max=62.4283, lon_min=6.0422, lon_max=6.049,
+        time_start=datetime(2022, 3, 1),
+        time_end=datetime(2024, 4, 2),
+        institution="x", parameters={"HCDT"},
+    )
+    assert _row_is_effectively_stationary(row) is True
+
+
+def test_row_is_effectively_stationary_false_for_a_wide_moving_track():
+    """A real research-vessel platform's reported bbox (e.g.
+    GL_PR_AD_FNCM.nc: lon -53.9 to 79.1, lat 1e-5 to 55.25 over a 24-year
+    deployment) spans most of an ocean basin -- genuinely moving, or wide
+    fixed-network coverage (e.g. HF-radar) -- either way, worth checking."""
+    row = IndexRow(
+        file_name="history/AD/GL_PR_AD_FNCM.nc",
+        lat_min=1e-5, lat_max=55.2521, lon_min=-53.90302, lon_max=79.13086,
+        time_start=datetime(2001, 1, 4),
+        time_end=datetime(2025, 9, 14),
+        institution="x", parameters={"EWCT", "NSCT"},
+    )
+    assert _row_is_effectively_stationary(row) is False
+
+
+def test_row_is_effectively_stationary_respects_a_custom_threshold():
+    row = IndexRow(
+        file_name="history/MO/example.nc",
+        lat_min=62.0, lat_max=62.2, lon_min=6.0, lon_max=6.2,
+        time_start=datetime(2022, 1, 1),
+        time_end=datetime(2022, 1, 2),
+        institution="x", parameters={"HCDT"},
+    )
+    assert _row_is_effectively_stationary(row, threshold_deg=0.1) is False
+    assert _row_is_effectively_stationary(row, threshold_deg=0.5) is True
+
+
+def test_row_overlaps_window_uses_local_cached_file_when_present(tmp_path):
+    """A row whose file is already in work_dir must be checked locally --
+    no copernicusmarine call at all."""
+    from sar_validation.downloaders.insitu_index_fallback import row_overlaps_window
+
+    row = IndexRow(
+        file_name="history/MO/AR_TS_MO_A-Sulafjorden.nc",
+        lat_min=62.4, lat_max=62.5, lon_min=6.0, lon_max=6.1,
+        time_start=datetime(2023, 1, 1),
+        time_end=datetime(2023, 12, 31),
+        institution="x", parameters={"HCDT"},
+    )
+    nc_path = tmp_path / "AR_TS_MO_A-Sulafjorden.nc"
+    _write_mooring_fixture(nc_path)
+
+    fake_module = MagicMock()  # must not be called
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        result = row_overlaps_window(
+            row, "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr", "history", tmp_path,
+            min_lon=6.0, max_lon=6.1, min_lat=62.4, max_lat=62.5,
+            start=pd.Timestamp("2023-01-01"), end=pd.Timestamp("2023-01-02"),
+        )
+
+    assert result is True
+    fake_module.get.assert_not_called()
+
+
+def test_row_overlaps_window_fails_open_on_any_error(tmp_path):
+    """A row whose remote check cannot be completed (here: dry_run itself
+    raises) must be treated as a match rather than silently dropped."""
+    from sar_validation.downloaders.insitu_index_fallback import row_overlaps_window
+
+    row = IndexRow(
+        file_name="history/MO/does_not_exist_locally.nc",
+        lat_min=1.0, lat_max=2.0, lon_min=1.0, lon_max=2.0,
+        time_start=datetime(2023, 1, 1),
+        time_end=datetime(2023, 12, 31),
+        institution="x", parameters={"HCDT"},
+    )
+
+    fake_module = MagicMock()
+    fake_module.get.side_effect = RuntimeError("network error")
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        result = row_overlaps_window(
+            row, "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr", "history", tmp_path,
+            min_lon=1.0, max_lon=2.0, min_lat=1.0, max_lat=2.0,
+            start=pd.Timestamp("2023-01-01"), end=pd.Timestamp("2023-01-02"),
+        )
+
+    assert result is True
+
+
+def test_row_overlaps_window_skips_check_entirely_for_a_stationary_row(tmp_path):
+    """A row with a tight (mooring-sized) reported bbox must skip the
+    check entirely -- no local file access, no copernicusmarine call --
+    trusting rows_matching_query's own bbox/time match directly."""
+    from sar_validation.downloaders.insitu_index_fallback import row_overlaps_window
+
+    row = IndexRow(
+        file_name="history/MO/does_not_exist_anywhere.nc",
+        lat_min=62.4247, lat_max=62.4283, lon_min=6.0422, lon_max=6.049,
+        time_start=datetime(2022, 3, 1),
+        time_end=datetime(2024, 4, 2),
+        institution="x", parameters={"HCDT"},
+    )
+
+    fake_module = MagicMock()  # must not be called
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        result = row_overlaps_window(
+            row, "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr", "history", tmp_path,
+            min_lon=6.0, max_lon=6.1, min_lat=62.4, max_lat=62.5,
+            start=pd.Timestamp("2023-01-01"), end=pd.Timestamp("2023-01-02"),
+        )
+
+    assert result is True
+    fake_module.get.assert_not_called()
+
+
 def test_download_via_index_writes_combined_csv_from_matched_files(tmp_path):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
@@ -424,3 +602,38 @@ def test_download_via_index_writes_combined_csv_from_matched_files(tmp_path):
     assert result == tmp_path / "out.csv"
     df = pd.read_csv(tmp_path / "out.csv")
     assert set(df["variable"]) == {"HCDT", "HCSP"}
+
+
+def test_download_via_index_skips_rows_that_do_not_overlap_the_window(tmp_path):
+    from sar_validation.downloaders.insitu_index_fallback import download_via_index
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    index_path = cache_dir / "index_history.txt"
+    index_path.write_text(_FIXTURE_INDEX)
+
+    fake_module = MagicMock()
+    fake_module.get.return_value = MagicMock(
+        files=[MagicMock(filename="index_history.txt", file_path=index_path)],
+    )
+
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}), patch(
+        "sar_validation.downloaders.insitu_index_fallback.row_overlaps_window",
+        return_value=False,
+    ) as mock_overlap, patch(
+        "sar_validation.downloaders.insitu_index_fallback.download_index_files",
+    ) as mock_download:
+        result = download_via_index(
+            dataset_id="cmems_obs-ins_glo_phybgcwav_mynrt_na_irr",
+            dataset_part="history",
+            min_lon=0.0, max_lon=10.0, min_lat=60.0, max_lat=65.0,
+            start_dt="2023-01-01T00:00:00", end_dt="2023-01-02T00:00:00",
+            min_depth=-20.0, max_depth=20.0,
+            wanted_variables={"HCDT", "HCSP"},
+            dest_path=tmp_path / "out.csv",
+            work_dir=cache_dir,
+        )
+
+    assert result is None
+    mock_overlap.assert_called_once()
+    mock_download.assert_not_called()
