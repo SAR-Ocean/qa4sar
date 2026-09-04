@@ -3516,8 +3516,12 @@ class TestPlotCollocationDiagnosticsSplitByScenePerSource:
         result = plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
         plt.close("all")
 
+        # Plus one additional non-NaN-only plot for the recipe's sarSSM vs
+        # SOIL_MOISTURE pair (see TestPlotCollocationDiagnosticsPerVariable)
+        # -- generated once for the whole recipe, not once per scene.
         assert isinstance(result, list)
-        assert len(result) == 2
+        scene_paths = [p for p in result if p.stem.endswith("_sceneA") or p.stem.endswith("_sceneB")]
+        assert sorted(p.stem[-6:] for p in scene_paths) == ["sceneA", "sceneB"]
 
     def test_nisar_sme2_keeps_one_combined_plot(
         self, two_scene_soil_moisture_datatree, tmp_path
@@ -3532,8 +3536,16 @@ class TestPlotCollocationDiagnosticsSplitByScenePerSource:
         result = plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
         plt.close("all")
 
-        assert not isinstance(result, list)
         assert result is not None
+        paths = result if isinstance(result, list) else [result]
+        # The base map stays a single combined plot (no per-scene split);
+        # any other paths are additional per-variable non-NaN-only plots
+        # (see TestPlotCollocationDiagnosticsPerVariable), not scene splits.
+        combined_paths = [
+            p for p in paths if not p.stem.endswith("_sceneA") and not p.stem.endswith("_sceneB")
+            and "_vs_" not in p.stem
+        ]
+        assert len(combined_paths) == 1
 
 
 class TestPlotCollocationDiagnosticsAutoZoom:
@@ -4231,7 +4243,7 @@ class TestPlotCollocationDiagnosticsRefinement:
         import matplotlib.axes
         import matplotlib.pyplot as plt
 
-        from sar_validation.core.visualization import plot_collocation_diagnostics
+        from sar_validation.core.visualization import _plot_collocation_diagnostics_impl
 
         datatree, collocation_ds = geo_datatree_and_collocation_mixed_layer_counts
 
@@ -4243,7 +4255,11 @@ class TestPlotCollocationDiagnosticsRefinement:
             return original_scatter(self, *args, **kwargs)
 
         monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
-        out_path = plot_collocation_diagnostics(
+        # Calls the single-plot impl directly (not the public dispatcher,
+        # which also adds one non-NaN-only plot per variable pair -- see
+        # TestPlotCollocationDiagnosticsPerVariable) since this test is
+        # about one plot's internal draw order, not dispatcher orchestration.
+        out_path = _plot_collocation_diagnostics_impl(
             datatree, collocation_ds, diagnostics_recipe, tmp_path,
         )
         plt.close("all")
@@ -4446,7 +4462,7 @@ class TestPlotCollocationDiagnosticsDensePointSubsampling:
         import matplotlib.pyplot as plt
 
         from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig
-        from sar_validation.core.visualization import plot_collocation_diagnostics
+        from sar_validation.core.visualization import _plot_collocation_diagnostics_impl
 
         n = 1500
         datatree, collocation_ds = self._dense_radiometer_scene(n, value_var=value_var, sar_var=sar_var)
@@ -4463,7 +4479,11 @@ class TestPlotCollocationDiagnosticsDensePointSubsampling:
             return original_scatter(self, *args, **kwargs)
 
         monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
-        out_path = plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
+        # Calls the single-plot impl directly -- see the draw-order test
+        # above for why (the public dispatcher would add a second,
+        # non-NaN-only plot for this same variable pair, doubling the
+        # recorded point count).
+        out_path = _plot_collocation_diagnostics_impl(datatree, collocation_ds, recipe, tmp_path)
         plt.close("all")
 
         assert out_path is not None
@@ -4493,7 +4513,12 @@ class TestPlotCollocationDiagnosticsTicks:
             return original(ax, gl)
 
         monkeypatch.setattr(viz, "_set_lonlat_ticks", spy)
-        viz.plot_collocation_diagnostics(
+        # Calls the single-plot impl directly -- the public dispatcher
+        # would also render a second, non-NaN-only plot for this recipe's
+        # owiWindSpeed vs WSPD pair (see
+        # TestPlotCollocationDiagnosticsPerVariable), each setting ticks
+        # on its own axes.
+        viz._plot_collocation_diagnostics_impl(
             datatree, collocation_ds, diagnostics_recipe, tmp_path,
         )
         plt.close("all")
@@ -5595,10 +5620,15 @@ class TestValidationReportRvlLandQaPage:
             f"diagnostics page was not rendered: {recorded_labels}"
         )
         assert "__qa_page__" in recorded_labels, f"QA page was not rendered: {recorded_labels}"
-        diag_idx = recorded_labels.index("__diagnostics_page__")
+        # This recipe's rvlRadVel vs rvlRadVel_projection pair also gets a
+        # second, non-NaN-only diagnostics page (see
+        # TestPlotCollocationDiagnosticsPerVariable) immediately after the
+        # base one -- the QA page must follow the LAST diagnostics page,
+        # not just the first.
+        diag_idx = max(i for i, label in enumerate(recorded_labels) if label == "__diagnostics_page__")
         qa_idx = recorded_labels.index("__qa_page__")
         assert qa_idx == diag_idx + 1, (
-            "QA page must immediately follow the diagnostics page; got diagnostics "
+            "QA page must immediately follow the last diagnostics page; got diagnostics "
             f"at index {diag_idx}, QA at index {qa_idx} (full order: {recorded_labels})"
         )
 
@@ -5678,7 +5708,16 @@ class TestValidationReportOnlyDiagnosticsPngSaved:
 
         plots_dir = tmp_path / "plots"
         png_files = sorted(p.name for p in plots_dir.glob("*.png"))
-        assert png_files == ["collocation_diagnostics_test_recipe.png"]
+        # The base diagnostics PNG, plus one non-NaN-only PNG for this
+        # fixture's owiWindSpeed vs WSPD pair (see
+        # TestPlotCollocationDiagnosticsPerVariable) -- both still
+        # "collocation-diagnostics" PNGs, not individual scatter/
+        # geographic/statistics PNGs, which is the invariant this test
+        # actually guards.
+        assert png_files == [
+            "collocation_diagnostics_test_recipe.png",
+            "collocation_diagnostics_test_recipe_owiWindSpeed_vs_WSPD_nonNaN.png",
+        ]
 
 
 class TestPlotCollocationDiagnosticsAntimeridian:
@@ -5696,7 +5735,10 @@ class TestPlotCollocationDiagnosticsAntimeridian:
             return original(ax, gl)
 
         monkeypatch.setattr(viz, "_set_lonlat_ticks", spy)
-        out_path = viz.plot_collocation_diagnostics(
+        # Calls the single-plot impl directly -- see
+        # TestPlotCollocationDiagnosticsPerVariable for why the public
+        # dispatcher would add a second plot invocation here.
+        out_path = viz._plot_collocation_diagnostics_impl(
             datatree, collocation_ds, diagnostics_recipe_dateline, tmp_path,
         )
 
@@ -5718,7 +5760,10 @@ class TestPlotCollocationDiagnosticsAntimeridian:
             return original(ax, gl)
 
         monkeypatch.setattr(viz, "_set_lonlat_ticks", spy)
-        viz.plot_collocation_diagnostics(
+        # Calls the single-plot impl directly -- see
+        # TestPlotCollocationDiagnosticsPerVariable for why the public
+        # dispatcher would add a second plot invocation here.
+        viz._plot_collocation_diagnostics_impl(
             datatree, collocation_ds, diagnostics_recipe, tmp_path,
         )
 
@@ -5745,7 +5790,7 @@ class TestPlotCollocationDiagnosticsAntimeridian:
         """
         import cartopy.mpl.geoaxes as cgeoaxes
 
-        from sar_validation.core.visualization import plot_collocation_diagnostics
+        from sar_validation.core.visualization import _plot_collocation_diagnostics_impl
 
         datatree, collocation_ds = geo_datatree_and_collocation_dateline
 
@@ -5764,7 +5809,10 @@ class TestPlotCollocationDiagnosticsAntimeridian:
 
         monkeypatch.setattr(cgeoaxes.GeoAxes, "plot", spy_plot)
 
-        out_path = plot_collocation_diagnostics(
+        # Calls the single-plot impl directly -- see
+        # TestPlotCollocationDiagnosticsPerVariable for why the public
+        # dispatcher would add a second plot invocation here.
+        out_path = _plot_collocation_diagnostics_impl(
             datatree, collocation_ds, diagnostics_recipe_dateline, tmp_path,
         )
 
@@ -5984,6 +6032,190 @@ class TestPlotCollocationDiagnosticsIndividualMethodAlpha:
 
         assert 0.15 not in captured_alphas
         assert 0.65 in captured_alphas
+
+
+@pytest.fixture
+def wind_two_pairs_datatree_and_collocation():
+    """Synthetic wind DataTree + collocation_ds with two matched mooring
+    points where each point has exactly one of its two variables QC-NaN'd
+    -- point A's WDIR is NaN (only WSPD survived QC), point B's WSPD is
+    NaN (only WDIR survived QC). Used to prove the per-variable diagnostics
+    plots filter independently per pair, and that a QC-NaN'd point
+    disappears from a plot entirely rather than reappearing as
+    "unmatched"."""
+    from sar_validation.core.datatree_converter import DataTreeConverter
+    from sar_validation.core.recipe import (
+        CollocationType,
+        GeographicBounds,
+        PointVsLayerCollocation,
+        Recipe,
+        RecipeConfig,
+        ValidationDataSource,
+    )
+
+    y, x = 4, 5
+    lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+    sar_ds = xr.Dataset(
+        {
+            "owiWindSpeed":     (("y", "x"), np.full((y, x), 6.5)),
+            "owiWindDirection": (("y", "x"), np.full((y, x), 195.0)),
+        },
+        coords={
+            "lon": (("y", "x"), lon2d),
+            "lat": (("y", "x"), lat2d),
+            "time": pd.Timestamp("2026-07-10T19:00:00"),
+        },
+    )
+
+    mooring_ds = xr.Dataset(
+        {
+            "WSPD": ("point", np.array([6.0, np.nan])),
+            "WDIR": ("point", np.array([np.nan, 200.0])),
+        },
+        coords={
+            "lon": ("point", np.array([-9.8, -9.6])),
+            "lat": ("point", np.array([50.2, 50.4])),
+            "time": ("point", pd.date_range("2026-07-10T19:05", periods=2, freq="5min")),
+        },
+        attrs={"platform_type": "mooring"},
+    )
+
+    datatree = DataTreeConverter.to_datatree({
+        "sar/sceneA": sar_ds,
+        "validation/mooring": mooring_ds,
+    })
+
+    collocation_ds = xr.Dataset({
+        "sar_owiWindSpeed":     ("collocation", np.array([6.1, 6.9])),
+        "sar_owiWindDirection": ("collocation", np.array([190.0, 205.0])),
+        "val_WSPD":             ("collocation", np.array([6.0, np.nan])),
+        "val_WDIR":             ("collocation", np.array([np.nan, 200.0])),
+        "val_source":           ("collocation", ["mooring", "mooring"]),
+        "sar_scene_name":       ("collocation", ["sceneA", "sceneA"]),
+        "val_lon":              ("collocation", np.array([-9.8, -9.6])),
+        "val_lat":              ("collocation", np.array([50.2, 50.4])),
+        "temporal_distance_minutes": ("collocation", np.array([10.0, 20.0])),
+    })
+
+    recipe = Recipe(config=RecipeConfig(
+        name="test_wind_two_pairs",
+        variable="wind",
+        geographic_bounds=GeographicBounds(min_lon=-11.0, max_lon=-7.0, min_lat=49.0, max_lat=53.0),
+        validation_sources=[ValidationDataSource(source_type="mooring")],
+        collocation=CollocationType(point_vs_layer=PointVsLayerCollocation(time_tolerance_minutes=30)),
+    ))
+    return datatree, collocation_ds, recipe
+
+
+class TestPlotCollocationDiagnosticsPerVariable:
+    def test_dispatcher_adds_one_plot_per_variable_pair_alongside_base_plot(
+        self, wind_two_pairs_datatree_and_collocation, tmp_path,
+    ):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, collocation_ds, recipe = wind_two_pairs_datatree_and_collocation
+        result = plot_collocation_diagnostics(datatree, collocation_ds, recipe, tmp_path)
+        plt.close("all")
+
+        assert isinstance(result, list)
+        stems = [p.stem for p in result]
+        assert len(stems) == 3, f"expected base + 2 per-variable plots, got: {stems}"
+        assert any("owiWindSpeed_vs_WSPD" in s for s in stems)
+        assert any("owiWindDirection_vs_WDIR" in s for s in stems)
+        # The base combined plot (no variable-pair suffix) must still exist.
+        assert any(
+            "owiWindSpeed_vs_WSPD" not in s and "owiWindDirection_vs_WDIR" not in s
+            for s in stems
+        )
+
+    def test_no_variable_pair_plots_added_when_collocation_ds_is_none(
+        self, wind_two_pairs_datatree_and_collocation, tmp_path,
+    ):
+        """Always generated even with zero collocated pairs (per the base
+        plot's own docstring) -- but there is no QC/NaN information to
+        filter on in that case, so no per-variable plots are added."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_collocation_diagnostics
+
+        datatree, _collocation_ds, recipe = wind_two_pairs_datatree_and_collocation
+        result = plot_collocation_diagnostics(datatree, None, recipe, tmp_path)
+        plt.close("all")
+
+        assert not isinstance(result, list)
+        assert result is not None
+
+    def test_variable_pair_plot_excludes_the_qc_nanned_point_entirely(
+        self, wind_two_pairs_datatree_and_collocation, tmp_path, monkeypatch,
+    ):
+        """The WSPD-specific plot must draw point A (-9.8, valid WSPD) and
+        must never draw point B (-9.6, WSPD QC-NaN'd) in ANY tier -- not as
+        matched (it has no valid WSPD) and not as unmatched (it did match
+        geographically/temporally; showing it as unmatched would wrongly
+        imply otherwise)."""
+        import matplotlib.axes
+        import matplotlib.pyplot as plt
+
+        import sar_validation.core.visualization as viz
+
+        datatree, collocation_ds, recipe = wind_two_pairs_datatree_and_collocation
+
+        recorded_lons = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def spy_scatter(self, *args, **kwargs):
+            if args:
+                recorded_lons.extend(np.atleast_1d(args[0]).tolist())
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", spy_scatter)
+        path = viz._plot_collocation_diagnostics_impl(
+            datatree, collocation_ds, recipe, tmp_path,
+            filename_suffix="_owiWindSpeed_vs_WSPD_nonNaN",
+            variable_pair=("owiWindSpeed", "WSPD"),
+        )
+        plt.close("all")
+
+        assert path is not None
+        assert any(np.isclose(lon, -9.8) for lon in recorded_lons), (
+            f"expected the valid-WSPD point (-9.8) to be drawn, got lons: {recorded_lons}"
+        )
+        assert not any(np.isclose(lon, -9.6) for lon in recorded_lons), (
+            f"the QC-NaN'd WSPD point (-9.6) must never be drawn, got lons: {recorded_lons}"
+        )
+
+    def test_variable_pair_plot_title_states_variable_and_non_nan(
+        self, wind_two_pairs_datatree_and_collocation, tmp_path, monkeypatch,
+    ):
+        import matplotlib.axes
+        import matplotlib.pyplot as plt
+
+        import sar_validation.core.visualization as viz
+
+        datatree, collocation_ds, recipe = wind_two_pairs_datatree_and_collocation
+
+        captured_titles = []
+        original_set_title = matplotlib.axes.Axes.set_title
+
+        def spy_set_title(self, title, *args, **kwargs):
+            captured_titles.append(title)
+            return original_set_title(self, title, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "set_title", spy_set_title)
+        viz._plot_collocation_diagnostics_impl(
+            datatree, collocation_ds, recipe, tmp_path,
+            filename_suffix="_owiWindSpeed_vs_WSPD_nonNaN",
+            variable_pair=("owiWindSpeed", "WSPD"),
+        )
+        plt.close("all")
+
+        assert len(captured_titles) == 1
+        title = captured_titles[0]
+        assert "owiWindSpeed" in title
+        assert "WSPD" in title
+        assert "non-NaN" in title.lower() or "non-nan" in title.lower()
 
 
 class TestMarkNativeUnits:

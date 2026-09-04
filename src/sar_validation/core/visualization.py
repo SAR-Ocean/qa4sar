@@ -2068,7 +2068,9 @@ def plot_collocation_diagnostics(
     Plot collocation diagnostics, dispatching to one plot per SAR file for
     soil_moisture recipes whose SAR source wants it (see
     ``sar_sources.SARSourceSpec.diagnostics_split_by_scene``) and have
-    multiple scenes.
+    multiple scenes, plus one additional non-NaN-only plot per variable
+    pair the recipe reports statistics for (see
+    :func:`_plot_collocation_diagnostics_per_variable`).
 
     Sentinel-1 CLMS SSM's SAR "scenes" are daily, mutually-overlapping,
     continent-wide overpass mosaics -- overlaying every day's coverage and
@@ -2092,7 +2094,7 @@ def plot_collocation_diagnostics(
     split_by_scene = sar_spec is not None and sar_spec.diagnostics_split_by_scene
 
     if recipe.config.variable == "soil_moisture" and split_by_scene and len(scene_names) > 1:
-        paths: List[Path] = []
+        base_paths: List[Path] = []
         for scene_name in scene_names:
             scene_tree = datatree.copy()
             for other in scene_names:
@@ -2108,14 +2110,77 @@ def plot_collocation_diagnostics(
                 scene_label=scene_name,
             )
             if path is not None:
-                paths.append(path)
-        return paths
+                base_paths.append(path)
+    else:
+        base_result = _plot_collocation_diagnostics_impl(
+            datatree, collocation_ds, recipe, output_dir,
+            filename_suffix=filename_suffix,
+            layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
+        )
+        base_paths = [base_result] if base_result is not None else []
 
-    return _plot_collocation_diagnostics_impl(
+    variable_paths = _plot_collocation_diagnostics_per_variable(
         datatree, collocation_ds, recipe, output_dir,
         filename_suffix=filename_suffix,
         layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
     )
+
+    all_paths = base_paths + variable_paths
+    if not all_paths:
+        return None
+    if len(all_paths) == 1:
+        return all_paths[0]
+    return all_paths
+
+
+def _plot_collocation_diagnostics_per_variable(
+    datatree,
+    collocation_ds,
+    recipe,
+    output_dir: Union[str, Path],
+    filename_suffix: str = "",
+    layer_vs_layer_collocation_method: str = "cell-averaging",
+) -> List[Path]:
+    """
+    One additional diagnostics plot per (sar_var, val_var) comparison the
+    recipe actually reports statistics for, restricted to points where
+    that specific pair's value survived QC (see
+    ``_plot_collocation_diagnostics_impl``'s ``variable_pair`` parameter)
+    -- so a platform whose reading was QC-NaN'd for one variable but not
+    another (e.g. a mooring with a valid WDIR but a rejected WSPD) is not
+    misleadingly shown as having validated the variable it failed. Added
+    alongside, not instead of, the main combined diagnostics plot.
+
+    Uses the same ``filter_variable_pairs`` selection ``run_statistics``
+    uses, so the pairs plotted here always match the pairs the statistics
+    section reports on.
+
+    Returns an empty list when there is no collocation data to filter on
+    (``collocation_ds`` is None, e.g. zero collocated pairs -- there is no
+    QC/NaN information to filter by in that case) or the recipe produces
+    no variable pairs.
+    """
+    if collocation_ds is None:
+        return []
+
+    from ._variable_map import filter_variable_pairs  # noqa: PLC0415
+
+    try:
+        pairs = filter_variable_pairs(recipe, collocation_ds)
+    except KeyError:
+        return []
+
+    paths: List[Path] = []
+    for sar_var, val_var in pairs:
+        path = _plot_collocation_diagnostics_impl(
+            datatree, collocation_ds, recipe, output_dir,
+            filename_suffix=f"{filename_suffix}_{sar_var}_vs_{val_var}_nonNaN",
+            layer_vs_layer_collocation_method=layer_vs_layer_collocation_method,
+            variable_pair=(sar_var, val_var),
+        )
+        if path is not None:
+            paths.append(path)
+    return paths
 
 
 def _plot_collocation_diagnostics_impl(
@@ -2126,6 +2191,7 @@ def _plot_collocation_diagnostics_impl(
     filename_suffix: str = "",
     layer_vs_layer_collocation_method: str = "cell-averaging",
     scene_label: Optional[str] = None,
+    variable_pair: Optional[Tuple[str, str]] = None,
 ) -> Union[Path, None]:
     """
     Plot collocation diagnostics: SAR scene bounds, and matched/unmatched
@@ -2181,6 +2247,19 @@ def _plot_collocation_diagnostics_impl(
         :func:`plot_collocation_diagnostics` when it splits a soil_moisture
         recipe into one plot per SAR file, so each PNG's own title (not
         just its filename) identifies which day/overpass it shows.
+    variable_pair : tuple[str, str], optional
+        ``(sar_var, val_var)``, e.g. ``("owiWindSpeed", "WSPD")``. When
+        given, a point otherwise counted as matched is only drawn/counted
+        as matched if both ``sar_<sar_var>`` and ``val_<val_var>`` are
+        non-NaN for it in *collocation_ds* — so a platform whose reading
+        was QC-NaN'd for this specific variable no longer appears to have
+        validated it. Such a point is not reclassified as unmatched either
+        (it did match geographically/temporally; showing it as unmatched
+        would wrongly imply otherwise) — it simply is not drawn. The title
+        and filename both state the variable pair and that this is the
+        non-NaN-only view. Set by :func:`plot_collocation_diagnostics` to
+        produce one such plot per variable pair alongside the main,
+        unfiltered plot.
 
     Returns
     -------
@@ -2391,19 +2470,51 @@ def _plot_collocation_diagnostics_impl(
 
     matched_labels_all = np.array([_diagnostics_category(src) for src in val_source_all])
 
-    matched_by_category: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    # matched_lookup must reflect every point that matched geographically/
+    # temporally at all -- built from the FULL, unfiltered set below,
+    # before any variable_pair narrowing -- so that a point whose value
+    # for this specific variable happens to be QC-NaN does not fall
+    # through to the unmatched classification loop and get drawn as a red
+    # "unmatched" dot, which would wrongly imply it failed geographic/
+    # temporal matching rather than QC for this one variable.
+    matched_lookup: Dict[str, set] = {}
     for label in sorted(set(matched_labels_all.tolist())) or ["In-situ"]:
         sel = matched_labels_all == label
+        matched_lookup[label] = set(
+            zip(np.round(val_lon_all[sel], 6), np.round(val_lat_all[sel], 6))
+        )
+    matched_lookup.setdefault("In-situ", set())
+
+    # The drawn/counted "matched" set for THIS plot: every geographic
+    # match by default, or -- when variable_pair is given -- narrowed to
+    # only the rows where that specific comparison's sar/val values are
+    # both non-NaN. A point dropped here for failing that check is simply
+    # not drawn (see matched_lookup above for why it also does not appear
+    # as unmatched).
+    if variable_pair is not None and has_matches:
+        sar_var, val_var = variable_pair
+        sar_key, val_key = f"sar_{sar_var}", f"val_{val_var}"
+        if sar_key in collocation_ds and val_key in collocation_ds:
+            pair_valid = (
+                pd.notna(np.asarray(collocation_ds[sar_key].values))
+                & pd.notna(np.asarray(collocation_ds[val_key].values))
+            )
+        else:
+            pair_valid = np.zeros(len(val_lon_all), dtype=bool)
+        drawn_lon, drawn_lat = val_lon_all[pair_valid], val_lat_all[pair_valid]
+        drawn_source, drawn_labels = val_source_all[pair_valid], matched_labels_all[pair_valid]
+    else:
+        drawn_lon, drawn_lat = val_lon_all, val_lat_all
+        drawn_source, drawn_labels = val_source_all, matched_labels_all
+
+    matched_by_category: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for label in sorted(set(drawn_labels.tolist())) or ["In-situ"]:
+        sel = drawn_labels == label
         matched_by_category[label] = (
-            val_lon_all[sel], val_lat_all[sel], val_source_all[sel],
+            drawn_lon[sel], drawn_lat[sel], drawn_source[sel],
         )
     # Guarantee an In-situ bucket exists so downstream code can assume it.
     matched_by_category.setdefault("In-situ", (np.array([]), np.array([]), np.array([])))
-
-    matched_lookup = {
-        label: set(zip(np.round(lons, 6), np.round(lats, 6)))
-        for label, (lons, lats, _) in matched_by_category.items()
-    }
 
     # ── Classify every validation point into the same categories, using
     # LAYER_DATA_TYPES (the same constant collocation.py uses to route
@@ -2736,6 +2847,9 @@ def _plot_collocation_diagnostics_impl(
     title = f"{recipe_name} Collocation Diagnostics"
     if scene_label is not None:
         title += f" — {scene_label}"
+    if variable_pair is not None:
+        sar_var, val_var = variable_pair
+        title += f" — {sar_var} vs {val_var} (non-NaN only)"
     ax.set_title(title, fontsize=12, fontweight="bold", pad=15)
 
     # ── Add legend with an explanatory entry ──────────────────────────────
