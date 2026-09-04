@@ -5,8 +5,10 @@ lightweight in-situ TAC index file for that part, select only the platform
 files that intersect the requested bbox/time/variables, download those
 original NetCDF files, and parse them into the same long-format
 (variable, platform_id, platform_type, time, longitude, latitude, depth,
-value, institution) schema that copernicusmarine.subset() itself produces,
-so downstream code does not need to know which path produced a CSV.
+value, value_qc, institution) schema that copernicusmarine.subset() itself
+produces, so downstream code does not need to know which path produced a
+CSV -- including from_insitu_csv's QC-code filtering, which only applies
+when a value_qc column is present.
 """
 
 from __future__ import annotations
@@ -307,13 +309,17 @@ def parse_platform_file(
 ) -> pd.DataFrame:
     """Read one in-situ TAC NetCDF file and return a long-format dataframe
     (variable, platform_id, platform_type, time, longitude, latitude,
-    depth, value, institution), trimmed to the requested bbox/time/depth
-    window - matching the schema copernicusmarine.subset() itself
-    produces, so downstream code does not need to know which path
-    produced a given CSV."""
+    depth, value, value_qc, institution), trimmed to the requested
+    bbox/time/depth window - matching the schema copernicusmarine.subset()
+    itself produces, so downstream code does not need to know which path
+    produced a given CSV. A variable whose own "<code>_QC" companion is
+    absent from the file gets an all-NaN value_qc, which from_insitu_csv's
+    QC filter already treats as unusable -- the same "no QC code, no
+    value" policy applied to every other in-situ source, not a fallback
+    QC-blindspot."""
     empty_columns = [
         "variable", "platform_id", "platform_type", "time",
-        "longitude", "latitude", "depth", "value", "institution",
+        "longitude", "latitude", "depth", "value", "value_qc", "institution",
     ]
     with xr.open_dataset(nc_path) as ds:
         lon_name = _first_present(ds, _LON_NAMES)
@@ -326,7 +332,8 @@ def parse_platform_file(
         platform_id = str(ds.attrs.get("platform_code", nc_path.stem))
         institution = str(ds.attrs.get("institution", ""))
 
-        keep = {"TIME", lon_name, lat_name, *present_vars}
+        qc_names = {v: f"{v}_QC" for v in present_vars if f"{v}_QC" in ds.data_vars}
+        keep = {"TIME", lon_name, lat_name, *present_vars, *qc_names.values()}
         if depth_name is not None:
             keep.add(depth_name)
         df = ds[sorted(keep)].to_dataframe().reset_index()
@@ -352,9 +359,17 @@ def parse_platform_file(
     df["institution"] = institution
 
     id_cols = ["platform_id", "platform_type", "time", "longitude", "latitude", "depth", "institution"]
-    long_df = df.melt(
-        id_vars=id_cols, value_vars=present_vars, var_name="variable", value_name="value",
-    )
+    # pd.melt only carries a single value column, so each variable's QC
+    # companion (when present) is stacked alongside it per-variable rather
+    # than via one combined melt.
+    parts = []
+    for var in present_vars:
+        part = df[id_cols].copy()
+        part["variable"] = var
+        part["value"] = df[var]
+        part["value_qc"] = df[qc_names[var]] if var in qc_names else np.nan
+        parts.append(part)
+    long_df = pd.concat(parts, ignore_index=True)
     return long_df.dropna(subset=["value"])[empty_columns].reset_index(drop=True)
 
 

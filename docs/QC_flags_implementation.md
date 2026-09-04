@@ -198,6 +198,15 @@ CMEMS's valid codes (1, 2, 5, 7, or 8) (`:713-756`) — see
 inherit NaN from a bad-QC `HCSP`/`HCDT` through `sin`/`cos`/multiplication
 rather than through an explicit gate.
 
+This is true regardless of which download path produced the CSV.
+`copernicusmarine.subset()` (the ARCO path, used when available) and the
+index-fallback path (`insitu_index_fallback.py:parse_platform_file`, used
+when a dataset part has no ARCO service) both emit `value_qc` per row —
+confirmed against a real cached fallback-path file
+(`AR_TS_MO_A-Sulafjorden.nc`): its `HCSP`/`HCDT` carry QC code 0 ("no QC
+performed", not valid) while `WSPD`/`WDIR`/`VGHS` carry code 1, and the
+filter above nulls the former while keeping the latter.
+
 **ISMN** (`ismn_downloader.py:146-148`, `:513-538`)
 ISMN's own quality-flag scheme exists at the source portal, but
 `ISMNDownloader` reads `ts["soil_moisture"]` with no flag column, and the

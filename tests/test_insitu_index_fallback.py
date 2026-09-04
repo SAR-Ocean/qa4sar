@@ -282,7 +282,7 @@ def test_parse_platform_file_mooring_layout_uses_precise_coords_and_deph(tmp_pat
 
     assert set(df.columns) == {
         "variable", "platform_id", "platform_type", "time",
-        "longitude", "latitude", "depth", "value", "institution",
+        "longitude", "latitude", "depth", "value", "value_qc", "institution",
     }
     # DEPH=25.0 falls outside [-20, 20] and must be dropped; DEPH=5.0 kept,
     # for both HCDT and HCSP, across all 3 timestamps.
@@ -310,6 +310,53 @@ def test_parse_platform_file_argo_layout_uses_plain_coords_and_pres(tmp_path):
     assert set(df["variable"]) == {"EWCT", "NSCT"}
     assert (df["platform_id"] == "13857").all()
     assert (df["platform_type"] == "PF").all()
+
+
+def _write_mooring_fixture_with_qc(path):
+    """Mirrors AR_TS_MO_A-Sulafjorden.nc's real layout, plus a "<VAR>_QC"
+    companion for HCDT only -- HCSP is left without one, as would happen
+    for a parameter whose QC code was never populated."""
+    time = pd.date_range("2023-01-01", periods=2, freq="h")
+    ds = xr.Dataset(
+        data_vars={
+            "HCDT": (("TIME", "DEPTH"), [[10.0], [12.0]]),
+            "HCDT_QC": (("TIME", "DEPTH"), [[1], [4]]),
+            "HCSP": (("TIME", "DEPTH"), [[0.1], [0.3]]),
+        },
+        coords={
+            "TIME": time,
+            "PRECISE_LONGITUDE": ("TIME", [6.04, 6.05]),
+            "PRECISE_LATITUDE": ("TIME", [62.42, 62.43]),
+            "DEPH": (("TIME", "DEPTH"), [[5.0], [5.0]]),
+            "LONGITUDE": 6.045,
+            "LATITUDE": 62.43,
+        },
+        attrs={"platform_code": "A-Sulafjorden"},
+    )
+    ds.to_netcdf(path)
+
+
+def test_parse_platform_file_carries_per_variable_qc_code(tmp_path):
+    """HCDT's own QC code must travel with its value row-for-row; HCSP has
+    no QC companion in the file, so its value_qc must be NaN rather than
+    silently reusing HCDT's or being dropped from the schema -- the same
+    "no QC code, no trustworthy value" convention from_insitu_csv already
+    applies to the ARCO/subset() path."""
+    nc_path = tmp_path / "mooring_qc.nc"
+    _write_mooring_fixture_with_qc(nc_path)
+
+    df = parse_platform_file(
+        nc_path, wanted_variables={"HCDT", "HCSP"},
+        min_lon=0.0, max_lon=10.0, min_lat=60.0, max_lat=65.0,
+        start=pd.Timestamp("2023-01-01"), end=pd.Timestamp("2023-01-02"),
+        min_depth=-20.0, max_depth=20.0,
+        platform_type_code="MO",
+    )
+
+    hcdt = df[df["variable"] == "HCDT"].sort_values("time")
+    assert list(hcdt["value_qc"]) == [1, 4]
+    hcsp = df[df["variable"] == "HCSP"]
+    assert hcsp["value_qc"].isna().all()
 
 
 def test_parse_platform_file_no_requested_variable_present_returns_empty(tmp_path):
