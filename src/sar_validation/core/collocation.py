@@ -1296,12 +1296,32 @@ def _distance_weights(
     return _equal_weights(distances_km)
 
 
-# oswLandFlag/oswQualityFlag are diagnostic annotations on a SAR point or
-# grid cell, not measurements -- their being finite (e.g. oswLandFlag=0 over
-# ocean) must not by itself keep a point/cell whose actual measurement is
-# masked. Shared by both the WV point-anchored path (_collocate_wv_points,
-# below) and the grid-aggregation path (PointLayerCollocation.collocate, above).
-_AUXILIARY_FLAG_VARS = frozenset({"oswLandFlag", "oswQualityFlag"})
+# Diagnostic/geometry annotations on a SAR point or grid cell, not
+# measurements -- their being finite (e.g. oswLandFlag=0 over ocean, or
+# owiIncidenceAngle always being populated regardless of retrieval success)
+# must not by itself keep a point/cell whose actual measurement is masked.
+# Confirmed as a real, not just theoretical, gap: inspecting a real
+# collocation_results.nc showed 274 OWI matches where owiWindSpeed and
+# owiWindDirection were both NaN, yet the match survived purely because
+# owiIncidenceAngle/owiHeading/owiMask (always finite -- geometry/mask
+# fields, never NaN'd by land or quality masking) or owiWindQuality (also
+# passed through unmodified even at rejected cells) were present. RVL
+# currents shares the identical grid-collocation path (its own extraction
+# code mirrors OWI's grid shape specifically so it reuses this mechanism
+# unchanged) and the same gap: a real cached currents run showed 2/37
+# matches with NaN rvlRadVel rescued by finite rvlHeading/rvlIncidenceAngle.
+# RADARSAT-2 wind and both SSM sources (CLMS, NISAR SME2) are immune --
+# each only ever produces a single data variable, so there is nothing left
+# to rescue a match once it goes NaN. Shared by the WV point-anchored path
+# (_collocate_wv_points, below), the grid-aggregation path
+# (PointLayerCollocation.collocate, above), and the SAR-anchored individual
+# path (LayerLayerCollocation._collocate_individual).
+_AUXILIARY_FLAG_VARS = frozenset({
+    "oswLandFlag", "oswQualityFlag",
+    "owiNrcs", "owiIncidenceAngle", "owiHeading", "owiMask",
+    "owiWindQuality", "owiInversionQuality",
+    "rvlHeading", "rvlIncidenceAngle",
+})
 
 
 def _collocate_wv_points(
@@ -2240,6 +2260,15 @@ class LayerLayerCollocation(PointLayerCollocation):
         # variables, so this must be excluded up front alongside has_data_mask.
         has_coord_mask = np.isfinite(sar_lon_flat) & np.isfinite(sar_lat_flat)
         var_names = list(sar_data.keys())
+        # Auxiliary vars (geometry/QC passthrough, always finite regardless
+        # of retrieval success) don't count towards "this cell has data" --
+        # see _AUXILIARY_FLAG_VARS. Falls back to every var if a product
+        # somehow carries only auxiliary ones, rather than pre-filtering
+        # every cell out before the per-match guard below gets a chance to
+        # log why.
+        measurement_var_idx = [
+            i for i, v in enumerate(var_names) if v not in _AUXILIARY_FLAG_VARS
+        ] or list(range(len(var_names)))
 
         # Process each SAR time
         rejected_spatial = 0
@@ -2251,7 +2280,10 @@ class LayerLayerCollocation(PointLayerCollocation):
             values_stack = np.stack(
                 [sar_data[var][t_idx].ravel() for var in var_names], axis=0
             )
-            has_data_mask = ~np.all(np.isnan(values_stack), axis=0) & has_coord_mask
+            has_data_mask = (
+                ~np.all(np.isnan(values_stack[measurement_var_idx]), axis=0)
+                & has_coord_mask
+            )
             rejected_no_data += int(np.sum(~has_data_mask))
 
             candidate_cells = np.where(has_data_mask)[0]
@@ -2317,6 +2349,21 @@ class LayerLayerCollocation(PointLayerCollocation):
                     for v_idx, var in enumerate(var_names)
                     if not np.isnan(values_stack[v_idx, cell_idx])
                 }
+
+                # A cell whose only finite variables are auxiliary
+                # (geometry/QC passthrough, e.g. owiIncidenceAngle or
+                # owiMask, always populated regardless of retrieval
+                # success) must not produce a phantom match when its real
+                # measurement(s) are NaN -- see _AUXILIARY_FLAG_VARS.
+                if not any(var not in _AUXILIARY_FLAG_VARS for var in sar_aggregated):
+                    rejected_no_data += 1
+                    if self.emit_diagnostics:
+                        logger.debug(
+                            "SAR cell (y=%d, x=%d): REJECTED (only auxiliary "
+                            "variables finite, no real measurement)",
+                            y_idx, x_idx,
+                        )
+                    continue
 
                 scat_idx = int(matched_scat_idx[k])
                 closest_row = val_data_filtered.iloc[scat_idx]

@@ -7,8 +7,15 @@ by inspecting `src/sar_validation/core/datatree_converter.py` (where nearly
 all flag logic lives, not the downloaders) and, for sources whose format
 wasn't already documented in code, by inspecting real cached sample files
 under `data/` and, where no sample existed, official product documentation.
-Last updated 2026-09-02 to reflect SM/IW/EW OSW grid extraction closing
-the mode gap noted in the previous update.
+Last updated 2026-09-03: fixed a collocation-level phantom-match gap
+(`_AUXILIARY_FLAG_VARS` in `collocation.py`) affecting OWI and RVL, where
+always-finite passthrough/geometry fields could keep a match alive even
+when the real measurement was NaN; audited RADARSAT-2 and both SSM sources
+and found them immune. Also: `owiWindQuality`/`owiInversionQuality`
+rejection now matches each flag's own CF category names at runtime instead
+of a hardcoded numeric threshold, since real archives show ESA changed
+`owiWindQuality`'s numeric encoding (and its severity direction) between
+IPF versions.
 
 Sources are grouped SAR products first, then wind/wave/currents validation
 sources, then soil moisture — matching validation priority in this toolbox.
@@ -17,7 +24,7 @@ sources, then soil moisture — matching validation priority in this toolbox.
 
 | Source | Flag in raw data? | Flag name(s) | Current handling | Status |
 |---|---|---|---|---|
-| Sentinel-1 OWI wind | Yes | `owiWindQuality`, `owiInversionQuality`, `owiMask` (land bit) | Land bit filtered; `owiWindQuality`/`owiInversionQuality` reject cells scoring 2 or 3, or both NaN | Done |
+| Sentinel-1 OWI wind | Yes | `owiWindQuality`, `owiInversionQuality`, `owiMask` (land bit) | Land bit filtered; the two quality flags reject by matching each file's own flag_meanings category names (no_data/bad/poor/low/suspect) rather than a fixed numeric threshold, since ESA changed the numeric encoding between IPF versions; either flag NaN-in-both also rejects | Done |
 | Sentinel-1 RVL currents | Yes (land only) | `rvlLandFlag` | Land-contaminated cells NaN'd | Done |
 | Sentinel-1 OSW waves | Yes | `oswLandFlag`, `oswQualityFlag` (`oswQualityFlagPartition`, `oswIconf`, `oswSnr`, `oswAmbiFac` deliberately not used) | `oswLandFlag==1` and `oswQualityFlag>=2` each independently reject a point (WV) or grid cell (SM/IW/EW), sharing the same reject thresholds; both modes fully implemented | Done |
 | RADARSAT-2 wind | Yes | `pixel_level_quality_flags` (+ `mask`/`icemask` fallback) | Filtered to flag==5 (valid wind, valid water) | Done |
@@ -45,17 +52,32 @@ sources, then soil moisture — matching validation priority in this toolbox.
 
 ### SAR products
 
-**Sentinel-1 OWI wind** (`_extract_owi_grid_data`, `datatree_converter.py:3517-3726`)
-Three flags exist in the product: `owiWindQuality` (0=good, 1=medium,
-2=low, 3=poor), `owiInversionQuality` (0=good, 1=medium, 2=poor), and
-`owiMask` (a CF bitmask whose bit 0 is land). The land bit is applied first
-— cells are NaN'd where `owiMask` marks land. `owiWindQuality` and
-`owiInversionQuality` are then read and used to reject cells: a cell is
-rejected, and `owiWindSpeed`/`owiWindDirection` NaN'd, when either flag is
-present in the product and scores 2 or 3 for that cell, or when both flags
-are present and both are NaN for that cell. A flag missing entirely from
-the product never contributes to rejection, and a flag that is NaN for a
-cell while the other flag is present and 0/1 does not reject that cell
+**Sentinel-1 OWI wind** (`_extract_owi_grid_data`, `datatree_converter.py`;
+`_owi_quality_reject_mask` module-level helper)
+Three flags exist in the product: `owiWindQuality`, `owiInversionQuality`,
+and `owiMask` (a CF bitmask whose bit 0 is land). The two quality flags'
+own CF `flag_values`/`flag_meanings` attributes were checked across every
+scene under `data/` (2018-2026, 268 scenes): `owiWindQuality`'s numeric
+encoding, and even its severity direction, changed with IPF 004.03
+(mid-2026 onward) — pre-004.03 scenes (2018-2025, S1A/S1B) carry
+`'good medium low poor'` (`0=good...3=poor`, lower is better), while
+004.03 scenes carry `'no_data bad suspect acceptable good'`
+(`0=no_data...4=good`, higher is better). `owiInversionQuality` stayed
+`good`/`medium`/`poor` throughout (one 2018 formatting variant embeds the
+code in the token itself: `'0:good 1:medium 2:poor'`). A single hardcoded
+numeric threshold is therefore correct for one era and silently backwards
+for the other, so rejection is driven by matching each file's own
+`flag_meanings` category names against a fixed reject-label set
+(`no_data`, `bad`, `poor`, `low`, `suspect`) rather than a numeric
+comparison. The land bit is applied first — cells are NaN'd where
+`owiMask` marks land. The quality flags are then read and used to reject
+cells: a cell is rejected, and `owiWindSpeed`/`owiWindDirection` NaN'd,
+when `owiWindQuality` is present and its value maps to a reject-labelled
+category, when `owiInversionQuality` is present and does the same, or when
+both flags are present and both are NaN for that cell. A flag missing
+entirely from the product, or whose `flag_values`/`flag_meanings` cannot be
+parsed, never contributes to rejection, and a flag that is NaN for a cell
+while the other flag is present and passing does not reject that cell
 either — the present flag governs. Both flags pass through the output
 dataset unmodified, even at rejected cells, for downstream inspection.
 Land-masking and quality-masking pixel counts are tracked independently
@@ -70,6 +92,17 @@ mean is retained as a QA statistic. `rvlHeading`/`rvlIncidenceAngle` are
 left unmasked since they're geometry, not a measurement. There is no
 separate QC-code flag for RVL beyond the land flag — this source is
 considered complete.
+RVL's own grid-extraction code deliberately mirrors OWI's grid shape so it
+reuses the same collocation code path -- which meant it also shared OWI's
+phantom-match gap (see the OWI entry above): `rvlHeading`/
+`rvlIncidenceAngle` being always-finite geometry could keep a match alive
+even when `rvlRadVel` was land-masked to NaN. Confirmed against real
+cached currents collocation data (2/37 matches with NaN `rvlRadVel`
+rescued by finite geometry fields) and fixed alongside OWI's by adding
+both to `_AUXILIARY_FLAG_VARS`. RADARSAT-2 wind and both SSM sources
+(Sentinel-1 CLMS, NISAR SME2) were audited too and found immune: each
+extraction function only ever produces a single data variable, so there is
+nothing left to rescue a match once it goes NaN.
 
 **Sentinel-1 OSW waves** (`from_sar_l2_ocn_wv_safe`, `datatree_converter.py:2947-3143`;
 `_extract_osw_grid_data`, `datatree_converter.py:3728-3907`)
@@ -109,11 +142,19 @@ aggregates each variable independently, a match is only kept if at least one
 aggregated variable is not in `_AUXILIARY_FLAG_VARS`; without this guard, an
 always-finite `oswLandFlag`/`oswQualityFlag` alone would satisfy that check
 even when the primary variable (e.g. `oswTotalHs`) was masked to NaN for every
-nearby cell. `_extract_owi_grid_data`'s own
-`owiMask`/`owiWindQuality`/`owiInversionQuality` passthrough needs no such
-guard only because those variable names are not in `_AUXILIARY_FLAG_VARS` and
-OWI grids always carry at least one non-auxiliary measurement variable — not
-because the grid collocation mechanism itself lacks the gate.
+nearby cell. `_extract_owi_grid_data`'s own passthrough fields
+(`owiNrcs`/`owiIncidenceAngle`/`owiHeading`/`owiMask`/`owiWindQuality`/
+`owiInversionQuality`) were previously believed not to need this guard — a
+belief proven wrong by inspecting a real `collocation_results.nc`: 274
+matches existed where `owiWindSpeed`/`owiWindDirection` were both NaN, kept
+alive purely by `owiIncidenceAngle`/`owiHeading`/`owiMask` (geometry/mask
+fields, always finite regardless of retrieval success) or `owiWindQuality`
+(passed through unmodified even at rejected cells). All six are now in
+`_AUXILIARY_FLAG_VARS` alongside OSW's two, and the same guard was added to
+`LayerLayerCollocation._collocate_individual` (`collocation.py`), which had
+no `_AUXILIARY_FLAG_VARS` check at all — it tested "is any variable in the
+whole product non-NaN" with no exclusion, the same phantom-match gap by a
+different mechanism.
 `docs/design-choices.md` §5.5 documents this under "WV wave quality-flag
 masking" and "SM/IW/EW: the native OSW grid".
 

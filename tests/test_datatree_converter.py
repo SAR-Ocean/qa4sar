@@ -1794,9 +1794,37 @@ class TestOwiInversionQualityPassthrough:
 
 
 class TestOwiQualityFlagMasking:
+    # IPF 004.03 (mid-2026 onward): higher is better.
+    _WQ_ATTRS_CURRENT = {
+        "flag_values": np.array([0, 1, 2, 3, 4], dtype="int8"),
+        "flag_meanings": "no_data bad suspect acceptable good",
+    }
+    # Pre-IPF-004.03 archive (2018-2025): lower is better.
+    _WQ_ATTRS_LEGACY = {
+        "flag_values": np.array([0, 1, 2, 3], dtype="int8"),
+        "flag_meanings": "good medium low poor",
+    }
+    _IQ_ATTRS_CURRENT = {
+        "flag_values": np.array([0, 1, 2], dtype="int8"),
+        "flag_meanings": "good medium poor",
+    }
+    # A handful of 2018 S1A/S1B files embed the code inside each token
+    # rather than relying on positional flag_values matching.
+    _IQ_ATTRS_LEGACY_2018 = {
+        "flag_values": np.array([0, 1, 2], dtype="int8"),
+        "flag_meanings": "0:good 1:medium 2:poor",
+    }
+
     @staticmethod
     def _build_quality_grid_safe(
-        tmp_path, wq_values, iq_values, *, include_wq=True, include_iq=True
+        tmp_path,
+        wq_values,
+        iq_values,
+        *,
+        include_wq=True,
+        include_iq=True,
+        wq_attrs=None,
+        iq_attrs=None,
     ):
         ny, nx = len(wq_values), 1
         safe = tmp_path / "S1A_EW_OCN.SAFE"
@@ -1812,9 +1840,17 @@ class TestOwiQualityFlagMasking:
             "owiLat": (odims, np.full((ny, nx), 50.5, dtype="float32")),
         }
         if include_wq:
-            data["owiWindQuality"] = (odims, np.array(wq_values, dtype="float32").reshape(ny, nx))
+            data["owiWindQuality"] = (
+                odims,
+                np.array(wq_values, dtype="float32").reshape(ny, nx),
+                dict(wq_attrs if wq_attrs is not None else TestOwiQualityFlagMasking._WQ_ATTRS_CURRENT),
+            )
         if include_iq:
-            data["owiInversionQuality"] = (odims, np.array(iq_values, dtype="float32").reshape(ny, nx))
+            data["owiInversionQuality"] = (
+                odims,
+                np.array(iq_values, dtype="float32").reshape(ny, nx),
+                dict(iq_attrs if iq_attrs is not None else TestOwiQualityFlagMasking._IQ_ATTRS_CURRENT),
+            )
         ds_raw = xr.Dataset(data, attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"})
         ds_raw.to_netcdf(
             meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
@@ -1822,9 +1858,12 @@ class TestOwiQualityFlagMasking:
         return safe, meas, owi_speed, owi_dir
 
     def test_reject_truth_table(self, tmp_path):
+        # owiWindQuality: 0=no_data, 1=bad, 2=suspect, 3=acceptable, 4=good
+        # (higher is better, rejected at <= 2). owiInversionQuality: 0=good,
+        # 1=medium, 2=poor (lower is better, rejected at >= 2).
         nan = float("nan")
         # index:            0     1     2     3     4     5     6     7    8
-        wq_values = [0,    1,    2,    0,    nan,  nan,  nan,  1,   3]
+        wq_values = [4,    3,    2,    4,    nan,  nan,  nan,  3,   1]
         iq_values = [0,    1,    0,    2,    0,    nan,  1,    nan, 1]
         expected_reject = np.array(
             [False, False, True, True, False, True, False, False, True]
@@ -1855,6 +1894,48 @@ class TestOwiQualityFlagMasking:
         assert ds.attrs["owi_quality_masked_pixel_count"] == expected_count
         assert ds.attrs["owi_quality_masked_pixel_fraction"] == pytest.approx(expected_count / 9)
 
+    def test_quality_log_breaks_down_land_overlap(self, tmp_path, caplog):
+        # Same layout as test_combination_with_land_masking: row 0 is both
+        # land- and quality-flagged, row 1 is land-only, row 2 is
+        # quality-only, row 3 is neither. The quality-flagged log line
+        # should report that 1 of its 2 flagged cells was already
+        # land-flagged and 1 is newly NaN'd on the quality flag's own
+        # account, rather than implying 2 previously-clean cells were lost.
+        ny, nx = 4, 1
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        owi_speed = (np.arange(ny, dtype="float32") + 10.0).reshape(ny, nx)
+        owi_dir = (np.arange(ny, dtype="float32") + 200.0).reshape(ny, nx)
+        owi_mask = np.array([1, 1, 0, 0], dtype="int8").reshape(ny, nx)
+        owi_wq = np.array([2, 4, 2, 4], dtype="float32").reshape(ny, nx)
+        ds_raw = xr.Dataset(
+            {
+                "owiWindSpeed": (odims, owi_speed),
+                "owiWindDirection": (odims, owi_dir),
+                "owiLon": (odims, np.full((ny, nx), -19.5, dtype="float32")),
+                "owiLat": (odims, np.full((ny, nx), 50.5, dtype="float32")),
+                "owiMask": (odims, owi_mask),
+                "owiWindQuality": (odims, owi_wq, dict(self._WQ_ATTRS_CURRENT)),
+            },
+            attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
+        )
+        ds_raw.to_netcdf(
+            meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+
+        with caplog.at_level("WARNING"):
+            ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+
+        assert ds is not None
+        quality_records = [r for r in caplog.records if "quality-flagged" in r.message]
+        assert len(quality_records) == 1
+        message = quality_records[0].message
+        assert "2/4" in message
+        assert "1 already" in message
+        assert "1 newly" in message
+
     def test_quality_masking_is_logged(self, tmp_path, caplog):
         safe, meas, _, _ = self._build_quality_grid_safe(tmp_path, [0, 2], [0, 0])
         with caplog.at_level("WARNING"):
@@ -1879,7 +1960,7 @@ class TestOwiQualityFlagMasking:
 
     def test_only_wind_quality_present_governs_alone(self, tmp_path):
         nan = float("nan")
-        wq_values = [0, 2, nan]
+        wq_values = [4, 2, nan]
         safe, meas, owi_speed, owi_dir = self._build_quality_grid_safe(
             tmp_path, wq_values, [0, 0, 0], include_iq=False
         )
@@ -1902,7 +1983,7 @@ class TestOwiQualityFlagMasking:
         owi_speed = (np.arange(ny, dtype="float32") + 10.0).reshape(ny, nx)
         owi_dir = (np.arange(ny, dtype="float32") + 200.0).reshape(ny, nx)
         owi_mask = np.array([1, 1, 0, 0], dtype="int8").reshape(ny, nx)
-        owi_wq = np.array([2, 0, 2, 0], dtype="float32").reshape(ny, nx)
+        owi_wq = np.array([2, 4, 2, 4], dtype="float32").reshape(ny, nx)
         ds_raw = xr.Dataset(
             {
                 "owiWindSpeed": (odims, owi_speed),
@@ -1910,7 +1991,7 @@ class TestOwiQualityFlagMasking:
                 "owiLon": (odims, np.full((ny, nx), -19.5, dtype="float32")),
                 "owiLat": (odims, np.full((ny, nx), 50.5, dtype="float32")),
                 "owiMask": (odims, owi_mask),
-                "owiWindQuality": (odims, owi_wq),
+                "owiWindQuality": (odims, owi_wq, dict(self._WQ_ATTRS_CURRENT)),
             },
             attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
         )
@@ -1927,6 +2008,63 @@ class TestOwiQualityFlagMasking:
         )
         assert ds.attrs["owi_land_pixel_count"] == 2
         assert ds.attrs["owi_quality_masked_pixel_count"] == 2
+
+    def test_legacy_pre_ipf_004_scale_is_read_correctly(self, tmp_path):
+        # Pre-IPF-004.03 archive: owiWindQuality is "good medium low poor"
+        # (0=good...3=poor, opposite direction from the current encoding).
+        # A hardcoded threshold tuned for one era silently breaks on the
+        # other; category-name matching should reject the same categories
+        # ("low", "poor") regardless of which numeric code they carry here.
+        wq_values = [0, 1, 2, 3]  # good, medium, low, poor
+        safe, meas, owi_speed, owi_dir = self._build_quality_grid_safe(
+            tmp_path,
+            wq_values,
+            [0, 0, 0, 0],
+            include_iq=False,
+            wq_attrs=self._WQ_ATTRS_LEGACY,
+        )
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+        assert ds is not None
+        reject_col = np.array([False, False, True, True]).reshape(-1, 1)
+        np.testing.assert_array_equal(
+            ds["owiWindSpeed"].values, np.where(reject_col, np.nan, owi_speed)
+        )
+        assert ds.attrs["owi_quality_masked_pixel_count"] == 2
+
+    def test_legacy_2018_embedded_code_format_is_parsed(self, tmp_path):
+        # A handful of 2018 owiInversionQuality files spell flag_meanings as
+        # "0:good 1:medium 2:poor" instead of "good medium poor".
+        safe, meas, owi_speed, owi_dir = self._build_quality_grid_safe(
+            tmp_path,
+            [4, 4, 4],
+            [0, 1, 2],
+            iq_attrs=self._IQ_ATTRS_LEGACY_2018,
+        )
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+        assert ds is not None
+        reject_col = np.array([False, False, True]).reshape(-1, 1)
+        np.testing.assert_array_equal(
+            ds["owiWindSpeed"].values, np.where(reject_col, np.nan, owi_speed)
+        )
+        assert ds.attrs["owi_quality_masked_pixel_count"] == 1
+
+    def test_unparseable_flag_meanings_does_not_reject(self, tmp_path):
+        # A flag present in the product but with missing/mismatched
+        # flag_values/flag_meanings should never reject a cell on its own
+        # account -- the same precedent as a flag missing from the product
+        # entirely, rather than guessing a direction.
+        broken_attrs = {"flag_values": np.array([0, 1, 2, 3], dtype="int8")}  # no flag_meanings
+        safe, meas, owi_speed, owi_dir = self._build_quality_grid_safe(
+            tmp_path,
+            [0, 1, 2, 3],
+            [0, 0, 0, 0],
+            include_iq=False,
+            wq_attrs=broken_attrs,
+        )
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+        assert ds is not None
+        np.testing.assert_array_equal(ds["owiWindSpeed"].values, owi_speed)
+        assert ds.attrs["owi_quality_masked_pixel_count"] == 0
 
 
 # ---------------------------------------------------------------------------

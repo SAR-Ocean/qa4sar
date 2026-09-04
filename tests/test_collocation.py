@@ -246,6 +246,75 @@ class TestPointLayerCollocation:
         results = colloc.collocate(sar_data_nan, grid_lon, grid_lat, sar_time, val, "buoy")
         assert results == []
 
+    def test_auxiliary_var_alone_does_not_produce_phantom_match(self):
+        """An OWI-style passthrough field (e.g. owiMask, always finite
+        regardless of retrieval success) must not by itself keep a match
+        alive when the real measurement (owiWindSpeed) is NaN everywhere in
+        the aggregation window -- see _AUXILIARY_FLAG_VARS."""
+        grid_lon, grid_lat, sar_time, _ = _make_sar_grid()
+        n_lat, n_lon = grid_lon.shape
+        sar_data = {
+            "owiWindSpeed": np.full((1, n_lat, n_lon), np.nan),
+            "owiMask": np.zeros((1, n_lat, n_lon)),
+        }
+
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            WSPD=[7.0],
+        )
+
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "buoy")
+        assert results == []
+
+    def test_auxiliary_var_present_does_not_block_a_real_match(self):
+        """Companion to the phantom-match test above: a real, non-NaN
+        measurement alongside an always-finite auxiliary field must still
+        produce a match (the fix must not over-reject)."""
+        grid_lon, grid_lat, sar_time, _ = _make_sar_grid()
+        n_lat, n_lon = grid_lon.shape
+        sar_data = {
+            "owiWindSpeed": np.full((1, n_lat, n_lon), 9.0),
+            "owiMask": np.zeros((1, n_lat, n_lon)),
+        }
+
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            WSPD=[7.0],
+        )
+
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "buoy")
+        assert len(results) == 1
+        assert results[0].sar_data["owiWindSpeed"] == pytest.approx(9.0)
+
+    def test_rvl_geometry_alone_does_not_produce_phantom_match(self):
+        """Same gap as OWI's, confirmed against real cached currents data:
+        rvlHeading/rvlIncidenceAngle are geometry, always finite regardless
+        of whether rvlRadVel was land-masked to NaN."""
+        grid_lon, grid_lat, sar_time, _ = _make_sar_grid()
+        n_lat, n_lon = grid_lon.shape
+        sar_data = {
+            "rvlRadVel": np.full((1, n_lat, n_lon), np.nan),
+            "rvlHeading": np.full((1, n_lat, n_lon), 90.0),
+            "rvlIncidenceAngle": np.full((1, n_lat, n_lon), 34.0),
+        }
+
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            EWCT=[0.2], NSCT=[0.1],
+        )
+
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "drifter")
+        assert results == []
+
     def test_multiple_validation_points(self):
         grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
 
@@ -566,6 +635,56 @@ class TestLayerLayerCollocation:
 
         assert len(results) > 0
         assert all(r.collocation_type == "layer_vs_layer" for r in results)
+
+    def test_individual_method_auxiliary_var_alone_does_not_produce_phantom_match(self):
+        """_collocate_individual had no _AUXILIARY_FLAG_VARS check at all --
+        it tested 'is any variable in the whole product non-NaN' with no
+        exclusion, so an always-finite passthrough field (e.g. owiMask)
+        alone kept a cell whose real measurement was NaN in the match set."""
+        grid_lon, grid_lat, sar_time, _ = _make_sar_grid()
+        n_lat, n_lon = grid_lon.shape
+        sar_data = {
+            "owiWindSpeed": np.full((1, n_lat, n_lon), np.nan),
+            "owiMask": np.zeros((1, n_lat, n_lon)),
+        }
+
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            wind_speed=[8.5],
+        )
+        colloc = LayerLayerCollocation(
+            spatial_tolerance_km=200, time_tolerance_minutes=60,
+            aggregation_window_km=100, method="individual",
+        )
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
+
+        assert results == []
+
+    def test_individual_method_real_measurement_still_matches(self):
+        """Companion to the phantom-match test above: a real, non-NaN
+        measurement alongside an always-finite auxiliary field must still
+        produce a match."""
+        grid_lon, grid_lat, sar_time, _ = _make_sar_grid()
+        n_lat, n_lon = grid_lon.shape
+        sar_data = {
+            "owiWindSpeed": np.full((1, n_lat, n_lon), 9.0),
+            "owiMask": np.zeros((1, n_lat, n_lon)),
+        }
+
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            wind_speed=[8.5],
+        )
+        colloc = LayerLayerCollocation(
+            spatial_tolerance_km=200, time_tolerance_minutes=60,
+            aggregation_window_km=100, method="individual",
+        )
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
+
+        assert len(results) > 0
+        assert all(r.sar_data.get("owiWindSpeed") == pytest.approx(9.0) for r in results)
 
 
 # ---------------------------------------------------------------------------

@@ -48,6 +48,21 @@ _ASCAT_REJECT_FLAGS = {
     "distance_to_gmf_too_large",
 }
 
+# Sentinel-1 OWI's owiWindQuality/owiInversionQuality category labels used
+# to reject a cell, keyed by name rather than numeric code or severity
+# direction. This matters because ESA changed owiWindQuality's own numeric
+# encoding -- and even its severity direction -- between IPF versions,
+# confirmed against real downloaded files spanning 2018-2026: pre-IPF-004.03
+# scenes carry flag_meanings "good medium low poor" (0=good...3=poor, lower
+# is better), while IPF 004.03 scenes (mid-2026 onward) carry "no_data bad
+# suspect acceptable good" (0=no_data...4=good, higher is better).
+# owiInversionQuality has stayed "good"/"medium"/"poor" throughout (only its
+# attribute-string formatting varied once, in 2018: "0:good 1:medium
+# 2:poor"). Matching category names read from each file's own flag_meanings
+# is stable across all of these, and any future encoding that keeps using
+# recognizable labels.
+_OWI_QUALITY_REJECT_LABELS = frozenset({"no_data", "bad", "poor", "low", "suspect"})
+
 # The Copernicus Marine In Situ TAC quality-control scale is 0-9; a value
 # is considered usable when its QC code is 1 ("good data"), 2 ("probably
 # good data"), 5 ("value changed", still good), 7 ("nominal value"), or 8
@@ -402,6 +417,38 @@ def _parse_acquisition_time(
         if result is not None:
             return result
     return None
+
+
+def _owi_quality_reject_mask(da: xr.DataArray) -> Optional[np.ndarray]:
+    """
+    Build a reject mask for a Sentinel-1 OWI quality flag from its own CF
+    flag_values/flag_meanings attributes, matched by category name rather
+    than a hardcoded numeric threshold (see _OWI_QUALITY_REJECT_LABELS for
+    why: the numeric encoding itself has changed between IPF versions).
+
+    Returns None -- never rejecting any cell on this flag's account -- when
+    flag_values/flag_meanings are missing or cannot be matched one-to-one,
+    the same "unusable metadata never rejects" precedent as a flag missing
+    from the product entirely.
+    """
+    meanings = da.attrs.get("flag_meanings")
+    values = da.attrs.get("flag_values")
+    if not meanings or values is None:
+        return None
+    tokens = str(meanings).split()
+    values = np.asarray(values)
+    if len(tokens) != len(values):
+        return None
+    # Some older files embed the numeric code inside the token itself
+    # (e.g. "0:good" rather than "good"); take whatever follows the last
+    # colon, or the whole token if there isn't one.
+    names = [tok.rsplit(":", 1)[-1] for tok in tokens]
+    reject_values = [
+        int(val) for val, name in zip(values, names) if name in _OWI_QUALITY_REJECT_LABELS
+    ]
+    if not reject_values:
+        return np.zeros(da.shape, dtype=bool)
+    return np.isin(da.values, reject_values)
 
 
 # Sentinel-1 OSW quality control, shared by the WV point path
@@ -3627,6 +3674,7 @@ class DataTreeConverter:
             # checked -- ice/no_data/rfi are intentionally left unfiltered.
             owi_land_pixel_count = 0
             owi_land_pixel_fraction = float("nan")
+            land_mask = np.zeros(owi_windspeed.shape, dtype=bool)
             if "owiMask" in ds_raw:
                 land_mask = (owi_mask & 1) != 0
                 owi_land_pixel_count = int(np.sum(land_mask))
@@ -3641,17 +3689,23 @@ class DataTreeConverter:
                         100 * owi_land_pixel_fraction,
                     )
 
-            # Quality-flag masking. owiWindQuality (0-3) and
-            # owiInversionQuality (0-2) each rate the wind retrieval; 0/1
-            # (good/medium) are trusted, 2/3 (low/poor) are not. A flag
-            # missing from the product entirely never rejects a cell. When
-            # both flags are present, a NaN in only one of them is judged
-            # by the other; a cell NaN in both is rejected.
+            # Quality-flag masking. Category names -- not a hardcoded
+            # numeric threshold -- drive rejection, because owiWindQuality's
+            # own numeric encoding (and even its severity direction) changes
+            # between IPF versions; see _OWI_QUALITY_REJECT_LABELS. A flag
+            # missing from the product entirely, or whose flag_meanings
+            # cannot be parsed, never rejects a cell by itself. When both
+            # flags are present, a NaN in only one of them is judged by the
+            # other; a cell NaN in both is rejected.
             quality_reject = np.zeros(owi_windspeed.shape, dtype=bool)
             if has_owi_wind_quality:
-                quality_reject |= owi_windquality >= 2
+                wq_reject = _owi_quality_reject_mask(ds_raw["owiWindQuality"])
+                if wq_reject is not None:
+                    quality_reject |= wq_reject
             if has_owi_inversion_quality:
-                quality_reject |= owi_inversion_quality >= 2
+                iq_reject = _owi_quality_reject_mask(ds_raw["owiInversionQuality"])
+                if iq_reject is not None:
+                    quality_reject |= iq_reject
             if has_owi_wind_quality and has_owi_inversion_quality:
                 quality_reject |= np.isnan(owi_windquality) & np.isnan(owi_inversion_quality)
 
@@ -3662,12 +3716,24 @@ class DataTreeConverter:
             if owi_quality_masked_pixel_count > 0:
                 owi_windspeed = np.where(quality_reject, np.nan, owi_windspeed)
                 owi_winddir = np.where(quality_reject, np.nan, owi_winddir)
+                # quality_reject is computed independently of land_mask (see
+                # above), so it commonly overlaps with it -- land cells
+                # routinely carry a "no retrieval" quality code too. Split
+                # the count into cells that were already going to be NaN'd
+                # for land, versus cells this flag newly NaNs, so the
+                # percentage in this message isn't read as if it were on
+                # top of a clean (non-land) grid.
+                newly_masked = quality_reject & ~land_mask
+                newly_masked_count = int(np.sum(newly_masked))
                 logger.warning(
                     "scene %s: %d/%d OWI cells quality-flagged (%.1f%%) via "
-                    "owiWindQuality/owiInversionQuality -- owiWindSpeed/"
+                    "owiWindQuality/owiInversionQuality (%d already "
+                    "land-flagged, %d newly NaN'd) -- owiWindSpeed/"
                     "owiWindDirection NaN'd out",
                     safe_dir.name, owi_quality_masked_pixel_count,
                     quality_reject.size, 100 * owi_quality_masked_pixel_fraction,
+                    owi_quality_masked_pixel_count - newly_masked_count,
+                    newly_masked_count,
                 )
 
             # Get acquisition time (scalar for grid)

@@ -680,20 +680,70 @@ see Task 14.
   request is land).
 
 **`owiWindQuality`/`owiInversionQuality` gate OWI wind retrievals,
-independently of `owiMask`.** `_extract_owi_grid_data` NaNs out
-`owiWindSpeed`/`owiWindDirection` wherever either flag reports low/poor
-quality (`owiWindQuality` >= 2, `owiInversionQuality` >= 2), on top of the
-land masking above. A flag that is simply missing for one cell (present in
-the product but NaN there) does not reject that cell by itself — the other
-flag governs, because a cell can be valid and non-land while one flag's
-metric was simply never computed for it. A cell is only rejected on NaN
-grounds when both flags are present in the product and both are NaN for
-that cell. A flag that is entirely absent from the product (not the "some
-cells are NaN" case, but the variable does not exist at all) never
-contributes to rejection, so a product carrying only one flag, or neither,
-is masked using only the flags actually present. Counts and fractions are
-tracked separately from land masking, as
+independently of `owiMask`, by matching each flag's own CF category names
+rather than a hardcoded numeric threshold.** `_extract_owi_grid_data` NaNs
+out `owiWindSpeed`/`owiWindDirection` wherever either flag reports a
+category in `_OWI_QUALITY_REJECT_LABELS` (`no_data`, `bad`, `poor`, `low`,
+`suspect`), on top of the land masking above. This is deliberately not a
+numeric threshold: real downloaded files spanning 2018-2026 show that ESA
+changed `owiWindQuality`'s own numeric encoding, and even its severity
+direction, between IPF versions — pre-IPF-004.03 scenes (2018-2025,
+S1A/S1B) carry `flag_meanings='good medium low poor'` (`0=good...3=poor`,
+lower is better), while IPF 004.03 scenes (mid-2026 onward) carry
+`flag_meanings='no_data bad suspect acceptable good'`
+(`0=no_data...4=good`, higher is better). A single hardcoded direction is
+correct for one era and silently backwards for the other, so
+`_owi_quality_reject_mask` (module-level helper) reads each file's own
+`flag_values`/`flag_meanings` and rejects whichever numeric codes map to a
+reject-labelled category name, however that file happens to number them.
+`owiInversionQuality` has stayed `good`/`medium`/`poor` throughout (only
+its attribute-string formatting varied once, in 2018, as
+`'0:good 1:medium 2:poor'` — the parser strips a leading `N:` token if
+present), so the same helper and label set cover both flags. When
+`flag_values`/`flag_meanings` are missing or cannot be matched one-to-one,
+the helper rejects nothing on that flag's account, the same precedent as a
+flag missing from the product entirely. A flag that is simply missing for
+one cell (present in the product but NaN there) does not reject that cell
+by itself — the other flag governs, because a cell can be valid and
+non-land while one flag's metric was simply never computed for it. A cell
+is only rejected on NaN grounds when both flags are present in the product
+and both are NaN for that cell. A flag that is entirely absent from the
+product (not the "some cells are NaN" case, but the variable does not
+exist at all) never contributes to rejection, so a product carrying only
+one flag, or neither, is masked using only the flags actually present.
+Counts and fractions are tracked separately from land masking, as
 `owi_quality_masked_pixel_count`/`owi_quality_masked_pixel_fraction`.
+
+**Collocation must exclude OWI's passthrough fields when deciding a match
+has real data, not just OSW's.** `owiNrcs`/`owiIncidenceAngle`/
+`owiHeading`/`owiMask`/`owiWindQuality`/`owiInversionQuality` all pass
+through conversion unmodified even at rejected cells (see above), so all
+six are always-or-usually finite regardless of whether `owiWindSpeed`/
+`owiWindDirection` were masked. Before this was added to
+`collocation.py`'s shared `_AUXILIARY_FLAG_VARS` set (previously scoped
+only to OSW's `oswLandFlag`/`oswQualityFlag`, see `docs/QC_flags_implementation.md`'s
+OWI section for the concrete evidence), a validation point whose entire
+aggregation window had NaN wind measurements could still produce a
+"collocated" match purely because one of these passthrough fields was
+finite — silently inflating collocation counts and diluting bias/RMSE with
+phantom matches carrying no actual wind comparison. `LayerLayerCollocation
+._collocate_individual` (the "individual" method's SAR-anchored path) had
+the same gap through a different mechanism: it checked "is any variable in
+the whole product non-NaN" with no `_AUXILIARY_FLAG_VARS` exclusion at
+all, so it needed its own guard added alongside the pre-filter fix.
+
+Auditing every other SAR product for the same gap: RVL currents shares it
+too (`rvlHeading`/`rvlIncidenceAngle` are geometry, left unmasked when
+`rvlRadVel` is land-masked to NaN — see the RVL currents entry above — and
+RVL's own extraction code deliberately mirrors OWI's grid shape "so ... the
+grid collocation path treat[s] RVL and OWI grids identically", meaning it
+reuses this exact mechanism). Confirmed against real cached currents data:
+2 of 37 collocated pairs had NaN `rvlRadVel` rescued by finite
+`rvlHeading`/`rvlIncidenceAngle`. Both now in `_AUXILIARY_FLAG_VARS`.
+RADARSAT-2 wind and both SSM sources (Sentinel-1 CLMS, NISAR SME2) are
+immune by construction — each of their extraction functions only ever
+produces a single data variable (`owiWindSpeed` or `sarSSM`), so when it
+goes NaN there is no other passthrough field left to rescue a match.
 
 **`u10`/`v10` stay raw through conversion; `WSPD`/`WDIR` are derived only
 after interpolation.** Every other validation source is renamed to the
