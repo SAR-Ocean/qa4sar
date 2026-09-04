@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import itertools
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -154,18 +155,21 @@ def download_index_files(
     import copernicusmarine
 
     work_dir.mkdir(parents=True, exist_ok=True)
-    file_list_path = work_dir / "_file_list.txt"
+    file_list_path = work_dir / f"_file_list_{uuid.uuid4().hex}.txt"
     file_list_path.write_text("\n".join(row.file_name for row in rows) + "\n")
 
-    result = copernicusmarine.get(
-        dataset_id=dataset_id,
-        dataset_part=dataset_part,
-        file_list=str(file_list_path),
-        output_directory=str(work_dir),
-        no_directories=True,
-        disable_progress_bar=True,
-        **copernicus_marine_download_kwargs(force_download),
-    )
+    try:
+        result = copernicusmarine.get(
+            dataset_id=dataset_id,
+            dataset_part=dataset_part,
+            file_list=str(file_list_path),
+            output_directory=str(work_dir),
+            no_directories=True,
+            disable_progress_bar=True,
+            **copernicus_marine_download_kwargs(force_download),
+        )
+    finally:
+        file_list_path.unlink(missing_ok=True)
     return [Path(f.file_path) for f in result.files]
 
 

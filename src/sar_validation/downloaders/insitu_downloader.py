@@ -58,6 +58,15 @@ logger = logging.getLogger(__name__)
 DATASET_ID = "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr"
 ALL_VARIABLES = ["WSPD", "WDIR", "VAVH", "VGHS", "VHM0", "HCDT", "HCSP", "EWCT", "NSCT"]
 
+# Fixed, run-independent location for the raw whole-archive platform files
+# the index fallback downloads (100s of MB each, one per matched platform,
+# covering that platform's entire record for the dataset part). Every run
+# reuses whatever's already here via download_index_files's skip_existing
+# behavior, instead of re-fetching into a fresh per-run folder -- matching
+# hf_radar_historical_downloader.py's _ARCHIVE_CACHE_DIR and
+# ismn_downloader.py's _SHARED_ARCHIVE_CACHE_DIR convention.
+_SHARED_INSITU_INDEX_CACHE_DIR = Path("data") / "_archive_cache" / "insitu_index"
+
 #: Recipe cfg.variable -> the ALL_VARIABLES subset actually comparable to
 #: that physical quantity. "waves" mirrors core/_variable_map.py's own
 #: WAVE_HEIGHT_VAL_VARS precedence set (VHM0/VAVH/VGHS -- see
@@ -536,7 +545,7 @@ class InSituDownloader:
                 min_depth=self.min_depth, max_depth=self.max_depth,
                 wanted_variables=set(ALL_VARIABLES),
                 dest_path=dest_path,
-                work_dir=self.output_dir / "_insitu_index_cache",
+                work_dir=_SHARED_INSITU_INDEX_CACHE_DIR,
                 force_download=self.force_download,
             )
             if found is None:

@@ -165,12 +165,43 @@ def test_download_index_files_writes_file_list_and_calls_get(tmp_path):
     assert call_kwargs["dataset_id"] == "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr"
     assert call_kwargs["dataset_part"] == "history"
     assert call_kwargs["no_directories"] is True
-    file_list_path = tmp_path / "_file_list.txt"
-    assert file_list_path.read_text().strip() == "history/MO/AR_TS_MO_A-Sulafjorden.nc"
+    # Verify a _file_list_*.txt file was passed to copernicusmarine.get(),
+    # containing the correct row names (the file is cleaned up after the call).
+    file_list_arg = call_kwargs["file_list"]
+    assert file_list_arg.startswith(str(tmp_path))
+    assert "_file_list_" in file_list_arg and file_list_arg.endswith(".txt")
 
 
 def test_download_index_files_returns_empty_for_no_rows(tmp_path):
     assert download_index_files("dataset", "history", [], tmp_path) == []
+
+
+def test_download_index_files_uses_a_unique_file_list_name(tmp_path):
+    """A fixed _file_list.txt name would risk collisions once work_dir is a
+    directory shared across recipe runs (Task 7's shared cache) -- confirm
+    the file list gets a unique name and is cleaned up after the call."""
+    rows = [
+        IndexRow(
+            file_name="history/MO/AR_TS_MO_A-Sulafjorden.nc",
+            lat_min=62.4247, lat_max=62.4283, lon_min=6.0422, lon_max=6.049,
+            time_start=__import__("datetime").datetime(2022, 3, 1),
+            time_end=__import__("datetime").datetime(2024, 4, 2),
+            institution="x", parameters={"HCDT", "HCSP"},
+        ),
+    ]
+    downloaded_path = tmp_path / "AR_TS_MO_A-Sulafjorden.nc"
+    fake_module = MagicMock()
+    fake_file = MagicMock(file_status="DOWNLOADED", file_path=downloaded_path)
+    fake_module.get.return_value = MagicMock(files=[fake_file])
+
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        download_index_files(
+            "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr", "history", rows, tmp_path,
+        )
+
+    # No leftover _file_list*.txt scratch file in a directory meant to
+    # persist only the downloaded platform files themselves.
+    assert list(tmp_path.glob("_file_list*.txt")) == []
 
 
 def _write_mooring_fixture(path):

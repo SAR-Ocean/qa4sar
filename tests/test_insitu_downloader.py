@@ -10,6 +10,7 @@ import pytest
 
 from sar_validation.downloaders import insitu_downloader
 from sar_validation.downloaders.insitu_downloader import (
+    _SHARED_INSITU_INDEX_CACHE_DIR,
     ALL_VARIABLES,
     InSituDownloader,
     variables_for_recipe,
@@ -506,6 +507,7 @@ class TestIndexFallback:
         assert out[0].exists()
         mock_fallback.assert_called_once()
         assert mock_fallback.call_args.kwargs["dataset_part"] == "history"
+        assert mock_fallback.call_args.kwargs["work_dir"] == _SHARED_INSITU_INDEX_CACHE_DIR
 
     def test_no_service_available_on_latest_part_still_raises(self, tmp_path):
         """"latest" has always had a working ARCO service -- a
