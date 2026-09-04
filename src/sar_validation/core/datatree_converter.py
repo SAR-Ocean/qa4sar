@@ -806,30 +806,34 @@ class DataTreeConverter:
                 if c in df.columns
             ]
             has_qc = "value_qc" in df.columns
-            df = (
-                df.pivot_table(
-                    index=pivot_id_cols,
-                    columns="variable",
-                    values=["value", "value_qc"] if has_qc else "value",
-                    aggfunc="first",
-                    # A variable whose QC code is entirely missing (NaN)
-                    # must still surface an all-NaN "<code>_QC" column so
-                    # the filter below can reject it; pivot_table's default
-                    # of dropping all-NaN columns would otherwise hide that
-                    # a QC code was never present.
-                    dropna=not has_qc,
-                )
-                .reset_index()
+            value_cols = ["value", "value_qc"] if has_qc else ["value"]
+            # pivot_table's internal MultiIndex.from_product builds the full
+            # Cartesian product of every id column's own unique values --
+            # lon/lat/time vary almost per-row for a moving or jittering
+            # platform -- rather than just the combinations that actually
+            # occur. For a real ~600-row, 94-platform in-situ CSV this
+            # exploded into ~800 million index tuples and tens of GB of
+            # memory. groupby+unstack only ever materializes combinations
+            # present in the data.
+            wide = (
+                df.groupby([*pivot_id_cols, "variable"], sort=False)[value_cols]
+                .first()
+                .unstack("variable")
             )
             if has_qc:
+                df = wide.reset_index()
                 # Flatten the two-level ("value"|"value_qc", <code>) columns
                 # to "<code>" and "<code>_QC"; id columns keep their name
-                # (their second level is empty).
+                # (their second level is empty). All-NaN "<code>_QC"
+                # columns are kept -- a variable whose QC code is entirely
+                # missing must still surface one so the filter below can
+                # reject it.
                 df.columns = [
                     top if var == "" else (var if top == "value" else f"{var}_QC")
                     for top, var in df.columns
                 ]
             else:
+                df = wide["value"].reset_index()
                 df.columns.name = None  # remove the "variable" MultiIndex label
             logger.debug(
                 "Pivoted in-situ CSV to wide format; variable columns: %s",

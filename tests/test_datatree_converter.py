@@ -308,6 +308,67 @@ class TestFromInsituCsv:
         assert ds["VHM0"].values[2] == pytest.approx(2.2)
         assert math.isnan(ds["VAVH"].values[2])
 
+    def test_pivot_does_not_explode_combinatorially_with_distinct_coords(self, tmp_path):
+        """Each timestamp of a moving/jittering platform (e.g. a mooring's
+        PRECISE_LONGITUDE/PRECISE_LATITUDE) has its own lon/lat, so naively
+        pivoting on (platform_id, platform_type, time, lon, lat) as a single
+        pandas MultiIndex -- as pivot_table's internal
+        MultiIndex.from_product does -- builds the full Cartesian product of
+        every column's own unique values rather than just the combinations
+        that actually occur. Against a real ~600-row, 94-platform in-situ
+        CSV this exploded into ~800 million index tuples and tens of GB of
+        memory; this test uses a much smaller (but still representative) set
+        of distinct coordinates so a regression is caught without the test
+        itself being slow or memory-heavy."""
+        n_groups = 25
+        rows = []
+        for i in range(n_groups):
+            base = {
+                "platform_id": "A-Sulafjorden",
+                "platform_type": "MO",
+                "time": pd.Timestamp("2026-01-01") + pd.Timedelta(hours=i),
+                "longitude": 6.0 + i * 0.001,
+                "latitude": 62.4 + i * 0.001,
+            }
+            rows.append({**base, "variable": "WSPD", "value": 5.0 + i})
+            rows.append({**base, "variable": "WDIR", "value": 100.0 + i})
+        df = pd.DataFrame(rows)
+        path = tmp_path / "jittering_mooring.csv"
+        df.to_csv(path, index=False)
+
+        ds = DataTreeConverter.from_insitu_csv(path, source_type="mooring")
+
+        assert ds is not None
+        assert ds.sizes["point"] == n_groups
+        assert set(ds["WSPD"].values) == {5.0 + i for i in range(n_groups)}
+
+    def test_pivot_with_qc_does_not_explode_combinatorially_with_distinct_coords(self, tmp_path):
+        """Same Cartesian-explosion hazard as above, but through the
+        has_qc=True branch (columns=["value", "value_qc"]), which is the
+        branch real Copernicus Marine in-situ CSVs -- which always carry a
+        value_qc column -- actually exercise."""
+        n_groups = 25
+        rows = []
+        for i in range(n_groups):
+            base = {
+                "platform_id": "A-Sulafjorden",
+                "platform_type": "MO",
+                "time": pd.Timestamp("2026-01-01") + pd.Timedelta(hours=i),
+                "longitude": 6.0 + i * 0.001,
+                "latitude": 62.4 + i * 0.001,
+            }
+            rows.append({**base, "variable": "WSPD", "value": 5.0 + i, "value_qc": 1})
+            rows.append({**base, "variable": "WDIR", "value": 100.0 + i, "value_qc": 1})
+        df = pd.DataFrame(rows)
+        path = tmp_path / "jittering_mooring_qc.csv"
+        df.to_csv(path, index=False)
+
+        ds = DataTreeConverter.from_insitu_csv(path, source_type="mooring")
+
+        assert ds is not None
+        assert ds.sizes["point"] == n_groups
+        assert set(ds["WSPD"].values) == {5.0 + i for i in range(n_groups)}
+
 
 # ---------------------------------------------------------------------------
 # from_scatterometer_nc
