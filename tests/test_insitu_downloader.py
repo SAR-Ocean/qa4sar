@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -508,6 +509,40 @@ class TestIndexFallback:
         mock_fallback.assert_called_once()
         assert mock_fallback.call_args.kwargs["dataset_part"] == "history"
         assert mock_fallback.call_args.kwargs["work_dir"] == _SHARED_INSITU_INDEX_CACHE_DIR
+        assert mock_fallback.call_args.kwargs["platform_codes"] is None
+
+    def test_index_fallback_narrows_to_requested_platform_codes(self, tmp_path):
+        """A moorings-only recipe (source_types=["mooring"]) must resolve
+        to platform_codes={"MO"} so download_via_index can skip an
+        irrelevant platform's whole-archive file before downloading it,
+        rather than only filtering the finished CSV afterward."""
+        from copernicusmarine.core_functions.exceptions import NoServiceAvailable
+
+        dl = InSituDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+        fake_module.core_functions.exceptions.NoServiceAvailable = NoServiceAvailable
+        fake_module.subset.side_effect = NoServiceAvailable("No service available")
+
+        def fake_download_via_index(*, dest_path, **kwargs):
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            dest_path.write_text(
+                "variable,platform_id,platform_type,time,longitude,latitude,depth,value,institution\n"
+            )
+            return dest_path
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}), \
+             patch(
+                 "sar_validation.downloaders.insitu_downloader.download_via_index",
+                 side_effect=fake_download_via_index,
+             ) as mock_fallback:
+            dl.download(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2020-01-01", "2020-01-05",
+                source_types=["mooring"],
+                dataset_part="history",
+            )
+
+        assert mock_fallback.call_args.kwargs["platform_codes"] == {"MO"}
 
     def test_no_service_available_on_latest_part_still_raises(self, tmp_path):
         """"latest" has always had a working ARCO service -- a
@@ -528,3 +563,36 @@ class TestIndexFallback:
                 "2026-06-01", "2026-06-05",
                 dataset_part="latest",
             )
+
+
+class TestMoveSubsetOutput:
+    """_move_subset_output moves copernicusmarine.subset()'s CWD-written
+    CSV into the run's own output_dir -- extracted out of _download_window
+    so its three "where did subset() actually put the file" branches, plus
+    the "it produced nothing" case, are each directly testable."""
+
+    def test_moves_the_expected_filename_from_cwd(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        expected_filename = "some_subset_output.csv"
+        Path(expected_filename).write_text("data")
+        dl = InSituDownloader(output_dir=tmp_path / "out")
+        dest_path = tmp_path / "out" / "renamed.csv"
+        dest_path.parent.mkdir(parents=True)
+
+        found = dl._move_subset_output(expected_filename, dest_path, "2020-01-01", "2020-01-02")
+
+        assert found is True
+        assert dest_path.read_text() == "data"
+        assert not Path(expected_filename).exists()
+
+    def test_returns_false_when_nothing_was_produced(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        dl = InSituDownloader(output_dir=tmp_path / "out")
+        dest_path = tmp_path / "out" / "renamed.csv"
+
+        found = dl._move_subset_output(
+            "nonexistent_expected.csv", dest_path, "2020-01-01", "2020-01-02",
+        )
+
+        assert found is False
+        assert not dest_path.exists()

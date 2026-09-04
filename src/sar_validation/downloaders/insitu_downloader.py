@@ -61,7 +61,7 @@ ALL_VARIABLES = ["WSPD", "WDIR", "VAVH", "VGHS", "VHM0", "HCDT", "HCSP", "EWCT",
 # Fixed, run-independent location for the raw whole-archive platform files
 # the index fallback downloads (100s of MB each, one per matched platform,
 # covering that platform's entire record for the dataset part). Every run
-# reuses whatever's already here via download_index_files's skip_existing
+# reuses whatever is already here via download_index_files's skip_existing
 # behavior, instead of re-fetching into a fresh per-run folder -- matching
 # hf_radar_historical_downloader.py's _ARCHIVE_CACHE_DIR and
 # ismn_downloader.py's _SHARED_ARCHIVE_CACHE_DIR convention.
@@ -547,6 +547,13 @@ class InSituDownloader:
                 dest_path=dest_path,
                 work_dir=_SHARED_INSITU_INDEX_CACHE_DIR,
                 force_download=self.force_download,
+                # Unlike the ARCO/subset() path, this path downloads one
+                # whole-archive file per matched platform -- filtering by
+                # platform type before any file is fetched, rather than
+                # only on the finished CSV below, avoids downloading (e.g.)
+                # an irrelevant HF-radar network's file for a moorings-only
+                # recipe.
+                platform_codes=set(_resolve_platform_codes(source_types)) if source_types else None,
             )
             if found is None:
                 logger.debug(
@@ -581,25 +588,10 @@ class InSituDownloader:
                 # Not a data availability error, re-raise original
                 raise
 
-        if not used_index_fallback:
-            # Move the file (copernicusmarine writes it to CWD) to our output_dir
-            if Path(expected_filename).exists():
-                shutil.move(str(expected_filename), str(dest_path))
-                print(f"  Saved to {dest_path}")
-            elif dest_path.exists():
-                print(f"  Already at {dest_path}")
-            else:
-                # Try to find a recently-created CSV in CWD
-                candidates = sorted(Path(".").glob(f"{DATASET_ID}*.csv"), key=os.path.getmtime, reverse=True)
-                if candidates:
-                    shutil.move(str(candidates[0]), str(dest_path))
-                    print(f"  Saved to {dest_path}")
-                else:
-                    logger.debug(
-                        "No in-situ observations in [%s, %s]; copernicusmarine "
-                        "wrote no output file.", start_dt, end_dt,
-                    )
-                    return None
+        if not used_index_fallback and not self._move_subset_output(
+            expected_filename, dest_path, start_dt, end_dt,
+        ):
+            return None
 
         # Apply platform-type filter
         if source_types:
@@ -612,6 +604,30 @@ class InSituDownloader:
                     print(f"  Filtered to {len(df)} rows ({', '.join(source_types)})")
 
         return dest_path
+
+    def _move_subset_output(
+        self, expected_filename: str, dest_path: Path, start_dt: str, end_dt: str,
+    ) -> bool:
+        """Move copernicusmarine.subset()'s CWD-written CSV into dest_path.
+        Returns False when subset() produced no file at all for this
+        window -- an empty result, not an error."""
+        if Path(expected_filename).exists():
+            shutil.move(str(expected_filename), str(dest_path))
+            print(f"  Saved to {dest_path}")
+            return True
+        if dest_path.exists():
+            print(f"  Already at {dest_path}")
+            return True
+        candidates = sorted(Path(".").glob(f"{DATASET_ID}*.csv"), key=os.path.getmtime, reverse=True)
+        if candidates:
+            shutil.move(str(candidates[0]), str(dest_path))
+            print(f"  Saved to {dest_path}")
+            return True
+        logger.debug(
+            "No in-situ observations in [%s, %s]; copernicusmarine wrote no output file.",
+            start_dt, end_dt,
+        )
+        return False
 
     def _download_with_part(
         self,

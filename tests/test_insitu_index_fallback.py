@@ -4,7 +4,10 @@ part)."""
 
 from __future__ import annotations
 
+import os
+import time
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -12,9 +15,11 @@ import pandas as pd
 import xarray as xr
 
 from sar_validation.downloaders.insitu_index_fallback import (
+    _INDEX_MAX_AGE,
     IndexRow,
     download_index_files,
     download_via_index,
+    fetch_index_file,
     iter_index_rows,
     parse_platform_file,
     rows_matching_query,
@@ -32,6 +37,53 @@ _FIXTURE_INDEX = (  # noqa: E501
     "COP-GLOBAL-01,history/BO/GL_PR_BO_58GS.nc,63.3516,64.84318,1.53416,4.04008,2021-06-23T02:38:02Z,2021-06-28T08:12:57Z,Institute of Marine Research,2025-05-05T02:40:04Z,M,BATH PRES NTRI NTRA\n"  # noqa: E501
     "COP-TEST-01,test/TS_ANTIMERIDIAN_EAST.nc,30.0,35.0,174.5,178.5,2023-06-01T00:00:00Z,2023-06-30T23:59:00Z,Test Org,2026-01-01T00:00:00Z,R,TEMP SALT\n"  # noqa: E501
 )
+
+
+def test_fetch_index_file_reuses_a_fresh_cached_copy_without_a_network_call(tmp_path):
+    cached_path = tmp_path / "index_history.txt"
+    cached_path.write_text(_FIXTURE_INDEX)
+
+    fake_module = MagicMock()
+
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        result = fetch_index_file("dataset", "history", tmp_path)
+
+    assert result == cached_path
+    fake_module.get.assert_not_called()
+
+
+def test_fetch_index_file_refetches_a_stale_cached_copy(tmp_path):
+    cached_path = tmp_path / "index_history.txt"
+    cached_path.write_text(_FIXTURE_INDEX)
+    stale_time = time.time() - (_INDEX_MAX_AGE.total_seconds() + 3600)
+    os.utime(cached_path, (stale_time, stale_time))
+
+    fake_module = MagicMock()
+    fake_module.get.return_value = MagicMock(
+        files=[MagicMock(filename="index_history.txt", file_path=cached_path)],
+    )
+
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        result = fetch_index_file("dataset", "history", tmp_path)
+
+    assert result == cached_path
+    fake_module.get.assert_called_once()
+    assert fake_module.get.call_args.kwargs["overwrite"] is True
+
+
+def test_fetch_index_file_force_download_refetches_even_a_fresh_copy(tmp_path):
+    cached_path = tmp_path / "index_history.txt"
+    cached_path.write_text(_FIXTURE_INDEX)
+
+    fake_module = MagicMock()
+    fake_module.get.return_value = MagicMock(
+        files=[MagicMock(filename="index_history.txt", file_path=cached_path)],
+    )
+
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        fetch_index_file("dataset", "history", tmp_path, force_download=True)
+
+    fake_module.get.assert_called_once()
 
 
 def test_iter_index_rows_parses_data_lines_skipping_comment_header(tmp_path):
@@ -106,9 +158,9 @@ def test_rows_matching_query_excludes_rows_outside_time_window(tmp_path):
 
 def test_rows_matching_query_with_nonwrapping_row_inside_wrapped_query_window(tmp_path):
     """A row whose own bbox does not wrap (lon_max - lon_min <= 180), positioned
-    near the antimeridian, should match when queried with a wrapping bbox that
-    spans the dateline. The _row_matches_bbox function should split the wrapping
-    query into two windows and check overlap against both."""
+    near the antimeridian, matches a query with a wrapping bbox that spans
+    the dateline, by overlapping one of the two windows the wrapping query
+    splits into."""
     index_path = tmp_path / "index_history.txt"
     index_path.write_text(_FIXTURE_INDEX)
 
@@ -153,7 +205,16 @@ def test_download_index_files_writes_file_list_and_calls_get(tmp_path):
 
     fake_module = MagicMock()
     fake_file = MagicMock(file_status="DOWNLOADED", file_path=downloaded_path)
-    fake_module.get.return_value = MagicMock(files=[fake_file])
+    captured_file_list_contents = {}
+
+    def fake_get(**kwargs):
+        # The real file list is unlinked in a `finally` right after this
+        # call returns, so its contents must be captured here rather than
+        # read back afterward.
+        captured_file_list_contents["text"] = Path(kwargs["file_list"]).read_text()
+        return MagicMock(files=[fake_file], files_not_found=None, total_size=1.23)
+
+    fake_module.get.side_effect = fake_get
 
     with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
         paths = download_index_files(
@@ -165,11 +226,13 @@ def test_download_index_files_writes_file_list_and_calls_get(tmp_path):
     assert call_kwargs["dataset_id"] == "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr"
     assert call_kwargs["dataset_part"] == "history"
     assert call_kwargs["no_directories"] is True
-    # Verify a _file_list_*.txt file was passed to copernicusmarine.get(),
-    # containing the correct row names (the file is cleaned up after the call).
+    # A _file_list_*.txt file was passed to copernicusmarine.get(),
+    # containing the correct row names, and cleaned up after the call.
     file_list_arg = call_kwargs["file_list"]
     assert file_list_arg.startswith(str(tmp_path))
     assert "_file_list_" in file_list_arg and file_list_arg.endswith(".txt")
+    assert captured_file_list_contents["text"] == "history/MO/AR_TS_MO_A-Sulafjorden.nc\n"
+    assert not Path(file_list_arg).exists()
 
 
 def test_download_index_files_returns_empty_for_no_rows(tmp_path):
@@ -177,9 +240,9 @@ def test_download_index_files_returns_empty_for_no_rows(tmp_path):
 
 
 def test_download_index_files_uses_a_unique_file_list_name(tmp_path):
-    """A fixed _file_list.txt name would risk collisions once work_dir is a
-    directory shared across recipe runs (Task 7's shared cache) -- confirm
-    the file list gets a unique name and is cleaned up after the call."""
+    """A fixed _file_list.txt name would risk collisions when work_dir is a
+    directory shared across concurrent recipe runs -- confirm the file
+    list gets a unique name and is cleaned up after the call."""
     rows = [
         IndexRow(
             file_name="history/MO/AR_TS_MO_A-Sulafjorden.nc",
@@ -192,7 +255,7 @@ def test_download_index_files_uses_a_unique_file_list_name(tmp_path):
     downloaded_path = tmp_path / "AR_TS_MO_A-Sulafjorden.nc"
     fake_module = MagicMock()
     fake_file = MagicMock(file_status="DOWNLOADED", file_path=downloaded_path)
-    fake_module.get.return_value = MagicMock(files=[fake_file])
+    fake_module.get.return_value = MagicMock(files=[fake_file], files_not_found=None, total_size=1.23)
 
     with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
         download_index_files(
@@ -630,7 +693,7 @@ def test_download_via_index_writes_combined_csv_from_matched_files(tmp_path):
     def fake_get(**kwargs):
         if kwargs.get("index_parts"):
             return MagicMock(files=[MagicMock(filename="index_history.txt", file_path=index_path)])
-        return MagicMock(files=[MagicMock(file_path=mooring_nc)])
+        return MagicMock(files=[MagicMock(file_path=mooring_nc)], files_not_found=None, total_size=1.23)
 
     fake_module.get.side_effect = fake_get
 
@@ -684,3 +747,82 @@ def test_download_via_index_skips_rows_that_do_not_overlap_the_window(tmp_path):
     assert result is None
     mock_overlap.assert_called_once()
     mock_download.assert_not_called()
+
+
+_TWO_PLATFORM_TYPES_INDEX = (
+    "# Title : in-situ files catalog\n"
+    "# product_id,file_name,geospatial_lat_min,geospatial_lat_max,geospatial_lon_min,geospatial_lon_max,time_coverage_start,time_coverage_end,institution,date_update,data_mode,parameters\n"  # noqa: E501
+    "COP-MO-01,history/MO/MOORING_1.nc,60.0,61.0,5.0,6.0,2023-01-01T00:00:00Z,2023-12-31T00:00:00Z,Org,2023-01-01T00:00:00Z,R,WSPD\n"  # noqa: E501
+    "COP-HF-01,history/HF/RADAR_1.nc,60.0,61.0,5.0,6.0,2023-01-01T00:00:00Z,2023-12-31T00:00:00Z,Org,2023-01-01T00:00:00Z,R,WSPD\n"  # noqa: E501
+)
+
+
+def test_download_via_index_filters_rows_by_platform_code_before_downloading(tmp_path):
+    """platform_codes must narrow which rows even reach
+    download_index_files -- unlike a post-hoc CSV filter, this is what
+    actually avoids fetching an irrelevant platform's whole-archive file."""
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    (cache_dir / "index_history.txt").write_text(_TWO_PLATFORM_TYPES_INDEX)
+
+    with patch.dict("sys.modules", {"copernicusmarine": MagicMock()}), patch(
+        "sar_validation.downloaders.insitu_index_fallback.row_overlaps_window",
+        return_value=True,
+    ), patch(
+        "sar_validation.downloaders.insitu_index_fallback.download_index_files",
+        return_value=[],
+    ) as mock_download:
+        download_via_index(
+            dataset_id="dataset",
+            dataset_part="history",
+            min_lon=0.0, max_lon=10.0, min_lat=55.0, max_lat=65.0,
+            start_dt="2023-06-01T00:00:00", end_dt="2023-06-02T00:00:00",
+            min_depth=-20.0, max_depth=20.0,
+            wanted_variables={"WSPD"},
+            dest_path=tmp_path / "out.csv",
+            work_dir=cache_dir,
+            platform_codes={"MO"},
+        )
+
+    downloaded_rows = mock_download.call_args.args[2]
+    assert [r.file_name for r in downloaded_rows] == ["history/MO/MOORING_1.nc"]
+
+
+def test_download_via_index_logs_a_warning_on_duplicate_file_stems(tmp_path, caplog):
+    """Two index rows resolving to the same on-disk file stem (from
+    different platform-type directories) must not silently collide --
+    row_by_stem keeps one, but the collision itself is now observable."""
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    index_text = (
+        "# Title : in-situ files catalog\n"
+        "# product_id,file_name,geospatial_lat_min,geospatial_lat_max,geospatial_lon_min,geospatial_lon_max,time_coverage_start,time_coverage_end,institution,date_update,data_mode,parameters\n"  # noqa: E501
+        "COP-1,history/MO/DUP.nc,60.0,61.0,5.0,6.0,2023-01-01T00:00:00Z,2023-12-31T00:00:00Z,Org,2023-01-01T00:00:00Z,R,WSPD\n"  # noqa: E501
+        "COP-2,history/AD/DUP.nc,60.0,61.0,5.0,6.0,2023-01-01T00:00:00Z,2023-12-31T00:00:00Z,Org,2023-01-01T00:00:00Z,R,WSPD\n"  # noqa: E501
+    )
+    (cache_dir / "index_history.txt").write_text(index_text)
+    dummy_nc = cache_dir / "DUP.nc"
+    dummy_nc.touch()
+
+    with patch.dict("sys.modules", {"copernicusmarine": MagicMock()}), patch(
+        "sar_validation.downloaders.insitu_index_fallback.row_overlaps_window",
+        return_value=True,
+    ), patch(
+        "sar_validation.downloaders.insitu_index_fallback.download_index_files",
+        return_value=[dummy_nc],
+    ), patch(
+        "sar_validation.downloaders.insitu_index_fallback.parse_platform_file",
+        return_value=pd.DataFrame(),
+    ), caplog.at_level("WARNING"):
+        download_via_index(
+            dataset_id="dataset",
+            dataset_part="history",
+            min_lon=0.0, max_lon=10.0, min_lat=55.0, max_lat=65.0,
+            start_dt="2023-06-01T00:00:00", end_dt="2023-06-02T00:00:00",
+            min_depth=-20.0, max_depth=20.0,
+            wanted_variables={"WSPD"},
+            dest_path=tmp_path / "out.csv",
+            work_dir=cache_dir,
+        )
+
+    assert "Duplicate platform file stem" in caplog.text

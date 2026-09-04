@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import csv
 import itertools
+import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
@@ -26,6 +27,8 @@ import pandas as pd
 import xarray as xr
 
 from .base import copernicus_marine_download_kwargs, normalize_datetime, split_antimeridian_bbox
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -41,12 +44,38 @@ class IndexRow:
     parameters: set[str]
 
 
+#: How long a locally cached index file is trusted before being re-fetched.
+#: Once work_dir is a persistent, cross-run shared cache (rather than a
+#: fresh per-run scratch dir), copernicusmarine's own skip_existing check
+#: is a bare "does the file exist" test with no staleness awareness -- a
+#: cached index would otherwise never be refreshed again, so a platform
+#: newly added or newly extended into a query's time window would
+#: silently stop matching with no error. The index's own "Date of update"
+#: header changes roughly daily in practice, so a day-old copy is stale
+#: enough to matter.
+_INDEX_MAX_AGE = timedelta(days=1)
+
+
 def fetch_index_file(
     dataset_id: str, dataset_part: str, work_dir: Path, force_download: bool = False,
 ) -> Path:
-    """Download (or reuse, via skip_existing) one dataset/part's in-situ TAC
-    index file and return its local path."""
+    """Download (or reuse, while younger than _INDEX_MAX_AGE) one
+    dataset/part's in-situ TAC index file and return its local path.
+
+    copernicusmarine.get(index_parts=True) always fetches all of a
+    dataset's index files together (confirmed live: its own filter/regex
+    parameters have no effect in this mode) -- a real bandwidth cost
+    (several hundred MB combined) but one this function limits to roughly
+    once per day per dataset, not once per run, via the staleness check
+    above.
+    """
     import copernicusmarine
+
+    cached_path = work_dir / f"index_{dataset_part}.txt"
+    if not force_download and cached_path.exists():
+        age = datetime.now() - datetime.fromtimestamp(cached_path.stat().st_mtime)
+        if age < _INDEX_MAX_AGE:
+            return cached_path
 
     work_dir.mkdir(parents=True, exist_ok=True)
     result = copernicusmarine.get(
@@ -55,7 +84,7 @@ def fetch_index_file(
         index_parts=True,
         output_directory=str(work_dir),
         disable_progress_bar=True,
-        **copernicus_marine_download_kwargs(force_download),
+        overwrite=True,
     )
     for f in result.files:
         if f.filename == f"index_{dataset_part}.txt":
@@ -86,6 +115,10 @@ def iter_index_rows(index_path: Path) -> Iterator[IndexRow]:
         reader = csv.reader(itertools.chain([first_data_line], f))
         for row in reader:
             if len(row) != len(fieldnames):
+                logger.debug(
+                    "Skipping index row in %s: expected %d fields, got %d.",
+                    index_path, len(fieldnames), len(row),
+                )
                 continue
             fields = dict(zip(fieldnames, row))
             try:
@@ -100,7 +133,11 @@ def iter_index_rows(index_path: Path) -> Iterator[IndexRow]:
                     institution=fields.get("institution", "").strip(),
                     parameters=set(fields.get("parameters", "").split()),
                 )
-            except (KeyError, ValueError):
+            except (KeyError, ValueError) as exc:
+                logger.debug(
+                    "Skipping unparseable index row for %r in %s: %s.",
+                    fields.get("file_name"), index_path, exc,
+                )
                 continue
 
 
@@ -166,6 +203,18 @@ def _row_is_effectively_stationary(row: IndexRow, threshold_deg: float = _STATIO
         row.lat_max - row.lat_min < threshold_deg
         and row.lon_max - row.lon_min < threshold_deg
     )
+
+
+_LON_NAMES = ("PRECISE_LONGITUDE", "LONGITUDE")
+_LAT_NAMES = ("PRECISE_LATITUDE", "LATITUDE")
+_DEPTH_NAMES = ("DEPH", "PRES")
+
+
+def _first_present(ds: xr.Dataset, names: tuple[str, ...]) -> str | None:
+    for name in names:
+        if name in ds.variables:
+            return name
+    return None
 
 
 def _get_remote_url(
@@ -268,6 +317,8 @@ def download_index_files(
 
     import copernicusmarine
 
+    print(f"  Downloading {len(rows)} matched platform file(s) via in-situ index …")
+
     work_dir.mkdir(parents=True, exist_ok=True)
     file_list_path = work_dir / f"_file_list_{uuid.uuid4().hex}.txt"
     file_list_path.write_text("\n".join(row.file_name for row in rows) + "\n")
@@ -279,24 +330,29 @@ def download_index_files(
             file_list=str(file_list_path),
             output_directory=str(work_dir),
             no_directories=True,
-            disable_progress_bar=True,
+            # Unlike the index/dry-run calls elsewhere in this module,
+            # these are whole-archive platform files that can individually
+            # run to hundreds of MB or more -- a real download bar here
+            # (rather than silence for however long that takes) is the
+            # difference between "working" and "looks hung".
+            disable_progress_bar=False,
             **copernicus_marine_download_kwargs(force_download),
         )
     finally:
         file_list_path.unlink(missing_ok=True)
+
+    if result.files_not_found:
+        # A non-empty files_not_found makes copernicusmarine fall back to
+        # listing every file on the remote server to find a match -- a real
+        # cost, so this is worth surfacing even though a missing platform
+        # file is not itself an error here.
+        logger.debug(
+            "%d requested file(s) not found on the remote server: %s",
+            len(result.files_not_found), result.files_not_found,
+        )
+    if result.total_size is not None:
+        print(f"  Downloaded {len(result.files)} file(s), {result.total_size:.1f} MB total.")
     return [Path(f.file_path) for f in result.files]
-
-
-_LON_NAMES = ("PRECISE_LONGITUDE", "LONGITUDE")
-_LAT_NAMES = ("PRECISE_LATITUDE", "LATITUDE")
-_DEPTH_NAMES = ("DEPH", "PRES")
-
-
-def _first_present(ds: xr.Dataset, names: tuple[str, ...]) -> str | None:
-    for name in names:
-        if name in ds.variables:
-            return name
-    return None
 
 
 def parse_platform_file(
@@ -316,7 +372,13 @@ def parse_platform_file(
     absent from the file gets an all-NaN value_qc, which from_insitu_csv's
     QC filter already treats as unusable -- the same "no QC code, no
     value" policy applied to every other in-situ source, not a fallback
-    QC-blindspot."""
+    QC-blindspot.
+
+    min_lon/max_lon are compared directly (min_lon <= longitude <=
+    max_lon), unlike every other bbox check in this module: the caller is
+    expected to have already split an antimeridian-crossing query into
+    non-wrapping windows (as InSituDownloader.download() does via
+    split_antimeridian_bbox) before reaching a single platform file."""
     empty_columns = [
         "variable", "platform_id", "platform_type", "time",
         "longitude", "latitude", "depth", "value", "value_qc", "institution",
@@ -383,13 +445,21 @@ def download_via_index(
     dest_path: Path,
     work_dir: Path,
     force_download: bool = False,
+    platform_codes: "set[str] | None" = None,
 ) -> Path | None:
     """Fetch the in-situ TAC index for one dataset/part, select the
     platform files intersecting the requested bbox/time/variables,
     download and parse just those, and write the combined long-format CSV
     to *dest_path*. Returns None (no CSV written) when no platform file
     matches the query, matching the "no data" convention already used by
-    the ARCO/subset() download path."""
+    the ARCO/subset() download path.
+
+    *platform_codes*, when given, narrows the matched rows to just those
+    platform-type directories (e.g. {"MO"} for moorings only) before any
+    file is downloaded -- unlike a post-hoc filter on the finished CSV,
+    this actually avoids fetching an irrelevant platform's whole-archive
+    file in the first place.
+    """
     start = pd.Timestamp(normalize_datetime(start_dt))
     end = pd.Timestamp(normalize_datetime(end_dt))
 
@@ -398,9 +468,12 @@ def download_via_index(
         index_path, min_lon, max_lon, min_lat, max_lat, start.to_pydatetime(),
         end.to_pydatetime(), wanted_variables,
     )
+    if platform_codes:
+        rows = [row for row in rows if Path(row.file_name).parent.name in platform_codes]
     if not rows:
         return None
 
+    matched_count = len(rows)
     rows = [
         row for row in rows
         if row_overlaps_window(
@@ -408,11 +481,26 @@ def download_via_index(
             min_lon, max_lon, min_lat, max_lat, start, end,
         )
     ]
+    skipped_count = matched_count - len(rows)
+    if skipped_count:
+        print(
+            f"  In-situ index: {matched_count} platform(s) matched by bbox/time/"
+            f"variable, {skipped_count} skipped (track does not overlap the "
+            f"query window) -- {len(rows)} remaining to download."
+        )
     if not rows:
         return None
 
     nc_paths = download_index_files(dataset_id, dataset_part, rows, work_dir, force_download)
-    row_by_stem = {Path(row.file_name).stem: row for row in rows}
+    row_by_stem: "dict[str, IndexRow]" = {}
+    for matched_row in rows:
+        stem = Path(matched_row.file_name).stem
+        if stem in row_by_stem:
+            logger.warning(
+                "Duplicate platform file stem %r in index rows; keeping %s over %s.",
+                stem, matched_row.file_name, row_by_stem[stem].file_name,
+            )
+        row_by_stem[stem] = matched_row
 
     frames = []
     for nc_path in nc_paths:
