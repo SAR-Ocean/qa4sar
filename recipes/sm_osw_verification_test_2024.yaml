@@ -1,0 +1,50 @@
+name: sm_osw_verification_test_2024
+description: 'Small SM-mode waves recipe around a real product
+  (S1A_S3_OCN__2SDV_20240602T171940_...381B.SAFE, south Pacific near the
+  dateline, 2024-06-02) chosen because it falls after every altimeter
+  mission''s availability_start date, unlike sm_osw_verification_test.yaml''s
+  2019 scene. Use this one to manually check --collocate does not produce a
+  phantom match from a masked oswTotalHs cell whose only finite SAR value is
+  an auxiliary flag.'
+version: '1.0'
+variable: waves
+variable_specs:
+  components:
+  - significant_wave_height
+geographic_bounds:
+  min_lon: -179.5
+  max_lon: -176.5
+  min_lat: -32.0
+  max_lat: -28.0
+temporal_bounds:
+  start: '2024-06-01'
+  end: '2024-06-04'
+sar_data:
+  source: sentinel1_l2_ocn
+  swath_mode:
+  - SM
+  max_downloads: null
+validation_sources:
+- source_type: altimeter
+  download_kwargs:
+    frequencies:
+    - 1hz
+  collocation_kwargs: {}
+collocation:
+  point_vs_layer:
+    time_tolerance_minutes: 30
+    spatial_tolerance_km: 25
+    interpolation_method: nearest
+    aggregation_window_km: 5.0
+    validation_temporal_averaging_minutes: 30
+    distance_weighting: gaussian
+    gaussian_sigma_km: 2.0
+  sar_footprint_radius_km: 14.0
+  layer_vs_layer:
+    layer_type_specs:
+      altimeter_1hz:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 7.0
+        distance_weighting: equal
+    method: cell-averaging
+output_dir: null

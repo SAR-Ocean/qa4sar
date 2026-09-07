@@ -1266,6 +1266,84 @@ class TestSARDownloaderAntimeridian:
 
 
 # ---------------------------------------------------------------------------
+# SARDownloader — mode filtering
+# ---------------------------------------------------------------------------
+
+class TestSARDownloaderModeFilter:
+    def _record(self, id_, name):
+        return {
+            "Id": id_, "Name": name,
+            "ContentDate_Start": "2019-06-05T17:19:13Z",
+            "ContentDate_End": "2019-06-05T17:19:43Z",
+            "ContentLength_GB": 1.0, "Online": True,
+        }
+
+    def test_sm_mode_matches_real_beam_named_product(self, tmp_path):
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
+
+        dl = SARDownloader(output_dir=tmp_path)
+        fake_client = MagicMock()
+        sm_name = "S1A_S3_OCN__2SDV_20190605T171913_20190605T171943_027547_031BCB_13DE.SAFE"
+        wv_name = "S1A_WV_OCN__2SSV_20190605T171913_20190605T171943_027547_031BCB_13DF"
+        iw_name = "S1A_IW_OCN__2SDV_20190605T171913_20190605T171943_027547_031BCB_13E0"
+        fake_client.query_products.return_value = [
+            self._record("sm", sm_name),
+            self._record("wv", wv_name),
+            self._record("iw", iw_name),
+        ]
+        dl._client = fake_client
+
+        df = dl.query(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2019-06-05", end="2019-06-06", modes=["SM"],
+        )
+
+        assert list(df["Id"]) == ["sm"]
+
+    def test_sm_mode_matches_all_six_beam_tokens(self, tmp_path):
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
+
+        dl = SARDownloader(output_dir=tmp_path)
+        fake_client = MagicMock()
+        beams = ["S1", "S2", "S3", "S4", "S5", "S6"]
+        fake_client.query_products.return_value = [
+            self._record(
+                beam,
+                f"S1A_{beam}_OCN__2SDV_20190605T171913_20190605T171943_027547_031BCB_13DE.SAFE",
+            )
+            for beam in beams
+        ]
+        dl._client = fake_client
+
+        df = dl.query(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2019-06-05", end="2019-06-06", modes=["SM"],
+        )
+
+        assert sorted(df["Id"]) == sorted(beams)
+
+    def test_wv_mode_excludes_sm_beam_named_product(self, tmp_path):
+        from sar_validation.downloaders.sentinel1_l2_ocn_downloader import SARDownloader
+
+        dl = SARDownloader(output_dir=tmp_path)
+        fake_client = MagicMock()
+        wv_name = "S1A_WV_OCN__2SSV_20190605T171913_20190605T171943_027547_031BCB_13DF"
+        sm_name = "S1A_S3_OCN__2SDV_20190605T171913_20190605T171943_027547_031BCB_13DE.SAFE"
+        fake_client.query_products.return_value = [
+            self._record("wv", wv_name),
+            self._record("sm", sm_name),
+        ]
+        dl._client = fake_client
+
+        df = dl.query(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2019-06-05", end="2019-06-06", modes=["WV"],
+        )
+
+        assert list(df["Id"]) == ["wv"]
+
+
+# ---------------------------------------------------------------------------
 # SARDownloader — per-product existence check
 # ---------------------------------------------------------------------------
 
@@ -1587,7 +1665,7 @@ class TestInSituDownloaderDatasetPartFallbackErrorMessage:
     """When a requested date predates the CMEMS in-situ dataset's coverage,
     both the auto-selected dataset_part and its fallback fail. Raising the
     fallback's bare exception is misleading: for an old date (e.g. 2019),
-    the initial attempt is 'monthly' (whose own error correctly reports
+    the initial attempt is 'history' (whose own error correctly reports
     that part's ~2020-onwards coverage), then the retry against 'latest'
     fails too, but with 'latest's own ~30-day rolling-window bounds --
     those are the only bounds a caller ever sees if just e2 is raised,
@@ -1595,14 +1673,17 @@ class TestInSituDownloaderDatasetPartFallbackErrorMessage:
     combined message must surface both parts' own reported bounds."""
 
     def test_error_includes_both_dataset_parts_coverage_messages(self, tmp_path):
+        from copernicusmarine.core_functions.exceptions import NoServiceAvailable
+
         from sar_validation.downloaders.insitu_downloader import InSituDownloader
 
         dl = InSituDownloader(output_dir=tmp_path, dry_run=False, force_download=True)
         fake_module = MagicMock()
+        fake_module.core_functions.exceptions.NoServiceAvailable = NoServiceAvailable
 
         def fake_subset(**kwargs):
             part = kwargs["dataset_part"]
-            if part == "monthly":
+            if part == "history":
                 raise ValueError(
                     "Some of your subset selection [2019-02-01T16:30:00, "
                     "2019-02-01T19:30:00] for the time dimension exceed the "
@@ -1625,10 +1706,10 @@ class TestInSituDownloaderDatasetPartFallbackErrorMessage:
 
         assert fake_module.subset.call_count == 2
         msg = str(exc_info.value)
-        assert "monthly" in msg
+        assert "history" in msg
         assert "latest" in msg
         assert "2020-01-01T00:00:00" in msg, (
-            f"expected the monthly part's own reported lower bound in the "
+            f"expected the history part's own reported lower bound in the "
             f"combined error, got: {msg}"
         )
         assert "2026-06-30T00:00:00" in msg, (

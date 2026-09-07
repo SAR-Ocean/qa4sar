@@ -109,6 +109,23 @@ INSITU_VARIABLE_ATTRS: Dict[str, Dict[str, str]] = {
 
 }
 
+#: Quality-control companion for every parameter code above that carries a
+#: Copernicus Marine QC flag. The scale (0-9) and meanings are CMEMS's own,
+#: shared across all In Situ TAC products.
+_QC_FLAG_MEANINGS = (
+    "no_qc_performed good_data probably_good_data "
+    "bad_data_potentially_correctable bad_data value_changed "
+    "below_detection_limit nominal_value interpolated_value missing_value"
+)
+for _qc_param in ("WSPD", "WDIR", "EWCT", "NSCT", "HCSP", "HCDT", "VHM0", "VAVH", "VGHS"):
+    INSITU_VARIABLE_ATTRS[f"{_qc_param}_QC"] = {
+        "standard_name": "status_flag",
+        "long_name": f"{_qc_param} quality control flag (Copernicus Marine In Situ TAC scale)",
+        "flag_values": "0 1 2 3 4 5 6 7 8 9",
+        "flag_meanings": _QC_FLAG_MEANINGS,
+    }
+del _qc_param
+
 #: Descriptive attrs, kept when copying from a raw product variable.
 _KEEP_RAW_ATTRS = ("standard_name", "long_name", "units", "comment")
 

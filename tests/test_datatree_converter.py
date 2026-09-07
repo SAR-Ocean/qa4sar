@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import math
 import sys
+import warnings
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -306,6 +307,67 @@ class TestFromInsituCsv:
         # Row 2: only VHM0 reported -- untouched.
         assert ds["VHM0"].values[2] == pytest.approx(2.2)
         assert math.isnan(ds["VAVH"].values[2])
+
+    def test_pivot_does_not_explode_combinatorially_with_distinct_coords(self, tmp_path):
+        """Each timestamp of a moving/jittering platform (e.g. a mooring's
+        PRECISE_LONGITUDE/PRECISE_LATITUDE) has its own lon/lat, so naively
+        pivoting on (platform_id, platform_type, time, lon, lat) as a single
+        pandas MultiIndex -- as pivot_table's internal
+        MultiIndex.from_product does -- builds the full Cartesian product of
+        every column's own unique values rather than just the combinations
+        that actually occur. Against a real ~600-row, 94-platform in-situ
+        CSV this exploded into ~800 million index tuples and tens of GB of
+        memory; this test uses a much smaller (but still representative) set
+        of distinct coordinates so a regression is caught without the test
+        itself being slow or memory-heavy."""
+        n_groups = 25
+        rows = []
+        for i in range(n_groups):
+            base = {
+                "platform_id": "A-Sulafjorden",
+                "platform_type": "MO",
+                "time": pd.Timestamp("2026-01-01") + pd.Timedelta(hours=i),
+                "longitude": 6.0 + i * 0.001,
+                "latitude": 62.4 + i * 0.001,
+            }
+            rows.append({**base, "variable": "WSPD", "value": 5.0 + i})
+            rows.append({**base, "variable": "WDIR", "value": 100.0 + i})
+        df = pd.DataFrame(rows)
+        path = tmp_path / "jittering_mooring.csv"
+        df.to_csv(path, index=False)
+
+        ds = DataTreeConverter.from_insitu_csv(path, source_type="mooring")
+
+        assert ds is not None
+        assert ds.sizes["point"] == n_groups
+        assert set(ds["WSPD"].values) == {5.0 + i for i in range(n_groups)}
+
+    def test_pivot_with_qc_does_not_explode_combinatorially_with_distinct_coords(self, tmp_path):
+        """Same Cartesian-explosion hazard as above, but through the
+        has_qc=True branch (columns=["value", "value_qc"]), which is the
+        branch real Copernicus Marine in-situ CSVs -- which always carry a
+        value_qc column -- actually exercise."""
+        n_groups = 25
+        rows = []
+        for i in range(n_groups):
+            base = {
+                "platform_id": "A-Sulafjorden",
+                "platform_type": "MO",
+                "time": pd.Timestamp("2026-01-01") + pd.Timedelta(hours=i),
+                "longitude": 6.0 + i * 0.001,
+                "latitude": 62.4 + i * 0.001,
+            }
+            rows.append({**base, "variable": "WSPD", "value": 5.0 + i, "value_qc": 1})
+            rows.append({**base, "variable": "WDIR", "value": 100.0 + i, "value_qc": 1})
+        df = pd.DataFrame(rows)
+        path = tmp_path / "jittering_mooring_qc.csv"
+        df.to_csv(path, index=False)
+
+        ds = DataTreeConverter.from_insitu_csv(path, source_type="mooring")
+
+        assert ds is not None
+        assert ds.sizes["point"] == n_groups
+        assert set(ds["WSPD"].values) == {5.0 + i for i in range(n_groups)}
 
 
 # ---------------------------------------------------------------------------
@@ -1736,6 +1798,336 @@ class TestOwiMaskLandFiltering:
         assert ds.attrs["owi_land_pixel_count"] == 0
 
 
+class TestOwiInversionQualityPassthrough:
+    def test_inversion_quality_extracted_and_passed_through(self, tmp_path):
+        ny, nx = 2, 2
+        rng = np.random.default_rng(3)
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        raw_iq = np.array([[0.0, 1.0], [1.0, 0.0]], dtype="float32")
+        ds_raw = xr.Dataset(
+            {
+                "owiWindSpeed": (odims, rng.uniform(2, 15, (ny, nx)).astype("float32")),
+                "owiWindDirection": (odims, rng.uniform(0, 360, (ny, nx)).astype("float32")),
+                "owiLon": (odims, rng.uniform(-20.0, -19.0, (ny, nx)).astype("float32")),
+                "owiLat": (odims, rng.uniform(50.0, 51.0, (ny, nx)).astype("float32")),
+                "owiInversionQuality": (odims, raw_iq),
+            },
+            attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
+        )
+        ds_raw.to_netcdf(
+            meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+
+        assert ds is not None
+        assert "owiInversionQuality" in ds.data_vars
+        np.testing.assert_array_equal(ds["owiInversionQuality"].values, raw_iq)
+
+    def test_inversion_quality_absent_defaults_to_nan(self, tmp_path):
+        ny, nx = 2, 2
+        rng = np.random.default_rng(4)
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        ds_raw = xr.Dataset(
+            {
+                "owiWindSpeed": (odims, rng.uniform(2, 15, (ny, nx)).astype("float32")),
+                "owiWindDirection": (odims, rng.uniform(0, 360, (ny, nx)).astype("float32")),
+                "owiLon": (odims, rng.uniform(-20.0, -19.0, (ny, nx)).astype("float32")),
+                "owiLat": (odims, rng.uniform(50.0, 51.0, (ny, nx)).astype("float32")),
+            },
+            attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
+        )
+        ds_raw.to_netcdf(
+            meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+
+        assert ds is not None
+        assert "owiInversionQuality" in ds.data_vars
+        assert np.isnan(ds["owiInversionQuality"].values).all()
+
+
+class TestOwiQualityFlagMasking:
+    # IPF 004.03 (mid-2026 onward): higher is better.
+    _WQ_ATTRS_CURRENT = {
+        "flag_values": np.array([0, 1, 2, 3, 4], dtype="int8"),
+        "flag_meanings": "no_data bad suspect acceptable good",
+    }
+    # Pre-IPF-004.03 archive (2018-2025): lower is better.
+    _WQ_ATTRS_LEGACY = {
+        "flag_values": np.array([0, 1, 2, 3], dtype="int8"),
+        "flag_meanings": "good medium low poor",
+    }
+    _IQ_ATTRS_CURRENT = {
+        "flag_values": np.array([0, 1, 2], dtype="int8"),
+        "flag_meanings": "good medium poor",
+    }
+    # A handful of 2018 S1A/S1B files embed the code inside each token
+    # rather than relying on positional flag_values matching.
+    _IQ_ATTRS_LEGACY_2018 = {
+        "flag_values": np.array([0, 1, 2], dtype="int8"),
+        "flag_meanings": "0:good 1:medium 2:poor",
+    }
+
+    @staticmethod
+    def _build_quality_grid_safe(
+        tmp_path,
+        wq_values,
+        iq_values,
+        *,
+        include_wq=True,
+        include_iq=True,
+        wq_attrs=None,
+        iq_attrs=None,
+    ):
+        ny, nx = len(wq_values), 1
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        owi_speed = (np.arange(ny, dtype="float32") + 10.0).reshape(ny, nx)
+        owi_dir = (np.arange(ny, dtype="float32") + 200.0).reshape(ny, nx)
+        data = {
+            "owiWindSpeed": (odims, owi_speed),
+            "owiWindDirection": (odims, owi_dir),
+            "owiLon": (odims, np.full((ny, nx), -19.5, dtype="float32")),
+            "owiLat": (odims, np.full((ny, nx), 50.5, dtype="float32")),
+        }
+        if include_wq:
+            data["owiWindQuality"] = (
+                odims,
+                np.array(wq_values, dtype="float32").reshape(ny, nx),
+                dict(wq_attrs if wq_attrs is not None else TestOwiQualityFlagMasking._WQ_ATTRS_CURRENT),
+            )
+        if include_iq:
+            data["owiInversionQuality"] = (
+                odims,
+                np.array(iq_values, dtype="float32").reshape(ny, nx),
+                dict(iq_attrs if iq_attrs is not None else TestOwiQualityFlagMasking._IQ_ATTRS_CURRENT),
+            )
+        ds_raw = xr.Dataset(data, attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"})
+        ds_raw.to_netcdf(
+            meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+        return safe, meas, owi_speed, owi_dir
+
+    def test_reject_truth_table(self, tmp_path):
+        # owiWindQuality: 0=no_data, 1=bad, 2=suspect, 3=acceptable, 4=good
+        # (higher is better, rejected at <= 2). owiInversionQuality: 0=good,
+        # 1=medium, 2=poor (lower is better, rejected at >= 2).
+        nan = float("nan")
+        # index:            0     1     2     3     4     5     6     7    8
+        wq_values = [4,    3,    2,    4,    nan,  nan,  nan,  3,   1]
+        iq_values = [0,    1,    0,    2,    0,    nan,  1,    nan, 1]
+        expected_reject = np.array(
+            [False, False, True, True, False, True, False, False, True]
+        )
+        safe, meas, owi_speed, owi_dir = self._build_quality_grid_safe(
+            tmp_path, wq_values, iq_values
+        )
+
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+
+        assert ds is not None
+        reject_col = expected_reject.reshape(-1, 1)
+        np.testing.assert_array_equal(
+            ds["owiWindSpeed"].values, np.where(reject_col, np.nan, owi_speed)
+        )
+        np.testing.assert_array_equal(
+            ds["owiWindDirection"].values, np.where(reject_col, np.nan, owi_dir)
+        )
+        # Flags themselves pass through unmodified, even at rejected cells.
+        np.testing.assert_array_equal(
+            ds["owiWindQuality"].values.ravel(), np.array(wq_values, dtype="float32")
+        )
+        np.testing.assert_array_equal(
+            ds["owiInversionQuality"].values.ravel(), np.array(iq_values, dtype="float32")
+        )
+
+        expected_count = int(expected_reject.sum())
+        assert ds.attrs["owi_quality_masked_pixel_count"] == expected_count
+        assert ds.attrs["owi_quality_masked_pixel_fraction"] == pytest.approx(expected_count / 9)
+
+    def test_quality_log_breaks_down_land_overlap(self, tmp_path, caplog):
+        # Same layout as test_combination_with_land_masking: row 0 is both
+        # land- and quality-flagged, row 1 is land-only, row 2 is
+        # quality-only, row 3 is neither. The quality-flagged log line
+        # should report that 1 of its 2 flagged cells was already
+        # land-flagged and 1 is newly NaN'd on the quality flag's own
+        # account, rather than implying 2 previously-clean cells were lost.
+        ny, nx = 4, 1
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        owi_speed = (np.arange(ny, dtype="float32") + 10.0).reshape(ny, nx)
+        owi_dir = (np.arange(ny, dtype="float32") + 200.0).reshape(ny, nx)
+        owi_mask = np.array([1, 1, 0, 0], dtype="int8").reshape(ny, nx)
+        owi_wq = np.array([2, 4, 2, 4], dtype="float32").reshape(ny, nx)
+        ds_raw = xr.Dataset(
+            {
+                "owiWindSpeed": (odims, owi_speed),
+                "owiWindDirection": (odims, owi_dir),
+                "owiLon": (odims, np.full((ny, nx), -19.5, dtype="float32")),
+                "owiLat": (odims, np.full((ny, nx), 50.5, dtype="float32")),
+                "owiMask": (odims, owi_mask),
+                "owiWindQuality": (odims, owi_wq, dict(self._WQ_ATTRS_CURRENT)),
+            },
+            attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
+        )
+        ds_raw.to_netcdf(
+            meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+
+        with caplog.at_level("WARNING"):
+            ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+
+        assert ds is not None
+        quality_records = [r for r in caplog.records if "quality-flagged" in r.message]
+        assert len(quality_records) == 1
+        message = quality_records[0].message
+        assert "2/4" in message
+        assert "1 already" in message
+        assert "1 newly" in message
+
+    def test_quality_masking_is_logged(self, tmp_path, caplog):
+        safe, meas, _, _ = self._build_quality_grid_safe(tmp_path, [0, 2], [0, 0])
+        with caplog.at_level("WARNING"):
+            ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+        assert ds is not None
+        assert any(
+            "quality-flagged" in r.message
+            and "owiWindQuality" in r.message
+            and "owiInversionQuality" in r.message
+            for r in caplog.records
+        )
+
+    def test_no_quality_flags_present_no_rejection(self, tmp_path):
+        safe, meas, owi_speed, owi_dir = self._build_quality_grid_safe(
+            tmp_path, [0, 1, 2], [0, 1, 2], include_wq=False, include_iq=False
+        )
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+        assert ds is not None
+        np.testing.assert_array_equal(ds["owiWindSpeed"].values, owi_speed)
+        np.testing.assert_array_equal(ds["owiWindDirection"].values, owi_dir)
+        assert ds.attrs["owi_quality_masked_pixel_count"] == 0
+
+    def test_only_wind_quality_present_governs_alone(self, tmp_path):
+        nan = float("nan")
+        wq_values = [4, 2, nan]
+        safe, meas, owi_speed, owi_dir = self._build_quality_grid_safe(
+            tmp_path, wq_values, [0, 0, 0], include_iq=False
+        )
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+        assert ds is not None
+        reject_col = np.array([False, True, False]).reshape(-1, 1)
+        np.testing.assert_array_equal(
+            ds["owiWindSpeed"].values, np.where(reject_col, np.nan, owi_speed)
+        )
+        assert ds.attrs["owi_quality_masked_pixel_count"] == 1
+
+    def test_combination_with_land_masking(self, tmp_path):
+        # Row 0: land + quality-bad. Row 1: land only. Row 2: quality-bad
+        # only. Row 3: neither.
+        ny, nx = 4, 1
+        safe = tmp_path / "S1A_EW_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        odims = ("owiAzSize", "owiRaSize")
+        owi_speed = (np.arange(ny, dtype="float32") + 10.0).reshape(ny, nx)
+        owi_dir = (np.arange(ny, dtype="float32") + 200.0).reshape(ny, nx)
+        owi_mask = np.array([1, 1, 0, 0], dtype="int8").reshape(ny, nx)
+        owi_wq = np.array([2, 4, 2, 4], dtype="float32").reshape(ny, nx)
+        ds_raw = xr.Dataset(
+            {
+                "owiWindSpeed": (odims, owi_speed),
+                "owiWindDirection": (odims, owi_dir),
+                "owiLon": (odims, np.full((ny, nx), -19.5, dtype="float32")),
+                "owiLat": (odims, np.full((ny, nx), 50.5, dtype="float32")),
+                "owiMask": (odims, owi_mask),
+                "owiWindQuality": (odims, owi_wq, dict(self._WQ_ATTRS_CURRENT)),
+            },
+            attrs={"firstMeasurementTime": "2026-06-20T19:15:21Z"},
+        )
+        ds_raw.to_netcdf(
+            meas / "s1a-ew-ocn-vv-20260620t191521-20260620t191626-065057-083333-001.nc"
+        )
+
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+
+        assert ds is not None
+        reject_col = np.array([True, True, True, False]).reshape(-1, 1)
+        np.testing.assert_array_equal(
+            ds["owiWindSpeed"].values, np.where(reject_col, np.nan, owi_speed)
+        )
+        assert ds.attrs["owi_land_pixel_count"] == 2
+        assert ds.attrs["owi_quality_masked_pixel_count"] == 2
+
+    def test_legacy_pre_ipf_004_scale_is_read_correctly(self, tmp_path):
+        # Pre-IPF-004.03 archive: owiWindQuality is "good medium low poor"
+        # (0=good...3=poor, opposite direction from the current encoding).
+        # A hardcoded threshold tuned for one era silently breaks on the
+        # other; category-name matching should reject the same categories
+        # ("low", "poor") regardless of which numeric code they carry here.
+        wq_values = [0, 1, 2, 3]  # good, medium, low, poor
+        safe, meas, owi_speed, owi_dir = self._build_quality_grid_safe(
+            tmp_path,
+            wq_values,
+            [0, 0, 0, 0],
+            include_iq=False,
+            wq_attrs=self._WQ_ATTRS_LEGACY,
+        )
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+        assert ds is not None
+        reject_col = np.array([False, False, True, True]).reshape(-1, 1)
+        np.testing.assert_array_equal(
+            ds["owiWindSpeed"].values, np.where(reject_col, np.nan, owi_speed)
+        )
+        assert ds.attrs["owi_quality_masked_pixel_count"] == 2
+
+    def test_legacy_2018_embedded_code_format_is_parsed(self, tmp_path):
+        # A handful of 2018 owiInversionQuality files spell flag_meanings as
+        # "0:good 1:medium 2:poor" instead of "good medium poor".
+        safe, meas, owi_speed, owi_dir = self._build_quality_grid_safe(
+            tmp_path,
+            [4, 4, 4],
+            [0, 1, 2],
+            iq_attrs=self._IQ_ATTRS_LEGACY_2018,
+        )
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+        assert ds is not None
+        reject_col = np.array([False, False, True]).reshape(-1, 1)
+        np.testing.assert_array_equal(
+            ds["owiWindSpeed"].values, np.where(reject_col, np.nan, owi_speed)
+        )
+        assert ds.attrs["owi_quality_masked_pixel_count"] == 1
+
+    def test_unparseable_flag_meanings_does_not_reject(self, tmp_path):
+        # A flag present in the product but with missing/mismatched
+        # flag_values/flag_meanings should never reject a cell on its own
+        # account -- the same precedent as a flag missing from the product
+        # entirely, rather than guessing a direction.
+        broken_attrs = {"flag_values": np.array([0, 1, 2, 3], dtype="int8")}  # no flag_meanings
+        safe, meas, owi_speed, owi_dir = self._build_quality_grid_safe(
+            tmp_path,
+            [0, 1, 2, 3],
+            [0, 0, 0, 0],
+            include_iq=False,
+            wq_attrs=broken_attrs,
+        )
+        ds = DataTreeConverter._extract_owi_grid_data(meas, safe)
+        assert ds is not None
+        np.testing.assert_array_equal(ds["owiWindSpeed"].values, owi_speed)
+        assert ds.attrs["owi_quality_masked_pixel_count"] == 0
+
+
 # ---------------------------------------------------------------------------
 # from_sar_l2_ocn_safe (WV product type routing)
 # ---------------------------------------------------------------------------
@@ -1749,13 +2141,19 @@ class TestWvSafeProductTypeRouting:
         assert "rvlRadVel" in ds.data_vars
         assert ds.attrs.get("swath_mode") == "WV"
 
-    def _make_wv_waves_safe(self, tmp_path, *, osw_hs, osw_total_hs=None):
+    def _make_wv_waves_safe(
+        self, tmp_path, *, osw_hs, osw_total_hs=None,
+        osw_land_flag=None, osw_quality_flag=None,
+    ):
         """
         Build a WV SAFE whose vignette measurement file carries partitioned
-        ``oswHs`` and optionally an integrated ``oswTotalHs``.
+        ``oswHs`` and optionally an integrated ``oswTotalHs``, plus
+        ``oswLandFlag``/``oswQualityFlag`` when given.
 
         ``osw_hs`` is the per-partition Hs array (dims oswAzSize, oswRaSize,
         oswPartitions = 1, 1, N); ``-1`` entries mimic the product fill code.
+        Pass ``np.nan`` for a scalar QC kwarg to simulate a present-but-fill
+        value (matching how xarray decodes a real product's fill code).
         """
         safe = tmp_path / "S1A_WV_OCN.SAFE"
         meas = safe / "measurement"
@@ -1770,6 +2168,16 @@ class TestWvSafeProductTypeRouting:
             data["oswTotalHs"] = (
                 ("oswAzSize", "oswRaSize"),
                 np.array([[osw_total_hs]], "float32"),
+            )
+        if osw_land_flag is not None:
+            data["oswLandFlag"] = (
+                ("oswAzSize", "oswRaSize"),
+                np.array([[osw_land_flag]], "float32"),
+            )
+        if osw_quality_flag is not None:
+            data["oswQualityFlag"] = (
+                ("oswAzSize", "oswRaSize"),
+                np.array([[osw_quality_flag]], "float32"),
             )
         ds_raw = xr.Dataset(data)
         ds_raw.to_netcdf(
@@ -1804,6 +2212,77 @@ class TestWvSafeProductTypeRouting:
         assert out is not None
         assert "oswTotalHs" in out.data_vars
         assert float(out["oswTotalHs"].values[0]) == pytest.approx(0.80, abs=1e-4)
+
+    def test_wv_land_flag_rejects_point(self, tmp_path):
+        safe = self._make_wv_waves_safe(
+            tmp_path, osw_hs=[1.2], osw_total_hs=2.0, osw_land_flag=1,
+        )
+        out = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert out is not None
+        assert np.isnan(out["oswTotalHs"].values[0])
+        assert out.attrs["osw_land_pixel_count"] == 1
+        assert out.attrs["osw_land_pixel_fraction"] == pytest.approx(1.0)
+
+    def test_wv_land_flag_zero_keeps_point(self, tmp_path):
+        safe = self._make_wv_waves_safe(
+            tmp_path, osw_hs=[1.2], osw_total_hs=2.0, osw_land_flag=0,
+        )
+        out = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert out is not None
+        assert float(out["oswTotalHs"].values[0]) == pytest.approx(2.0, abs=1e-4)
+        assert out.attrs["osw_land_pixel_count"] == 0
+
+    def test_wv_land_flag_absent_keeps_point(self, tmp_path):
+        # No oswLandFlag in the product at all -- must not be treated as land.
+        safe = self._make_wv_waves_safe(tmp_path, osw_hs=[1.2], osw_total_hs=2.0)
+        out = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert out is not None
+        assert float(out["oswTotalHs"].values[0]) == pytest.approx(2.0, abs=1e-4)
+        assert out.attrs["osw_land_pixel_count"] == 0
+        assert "oswLandFlag" in out.data_vars
+        assert np.isnan(out["oswLandFlag"].values[0])
+
+    def test_wv_quality_flag_low_rejects_point(self, tmp_path):
+        safe = self._make_wv_waves_safe(
+            tmp_path, osw_hs=[1.2], osw_total_hs=2.0, osw_quality_flag=2,
+        )
+        out = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert out is not None
+        assert np.isnan(out["oswTotalHs"].values[0])
+        assert out.attrs["osw_quality_masked_pixel_count"] == 1
+
+    def test_wv_quality_flag_good_keeps_point(self, tmp_path):
+        safe = self._make_wv_waves_safe(
+            tmp_path, osw_hs=[1.2], osw_total_hs=2.0, osw_quality_flag=0,
+        )
+        out = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert out is not None
+        assert float(out["oswTotalHs"].values[0]) == pytest.approx(2.0, abs=1e-4)
+        assert out.attrs["osw_quality_masked_pixel_count"] == 0
+
+    def test_wv_quality_flag_fill_is_noop(self, tmp_path):
+        # oswQualityFlag is unpopulated in real WV OCN products -- this
+        # must not reject the point (a no-op today, not a rejection).
+        safe = self._make_wv_waves_safe(
+            tmp_path, osw_hs=[1.2], osw_total_hs=2.0, osw_quality_flag=np.nan,
+        )
+        out = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert out is not None
+        assert float(out["oswTotalHs"].values[0]) == pytest.approx(2.0, abs=1e-4)
+        assert out.attrs["osw_quality_masked_pixel_count"] == 0
+
+    def test_wv_multi_check_reject_counts_independently(self, tmp_path):
+        # A point failing land AND quality must increment both counters,
+        # not just one -- checks are independent, never deduplicated.
+        safe = self._make_wv_waves_safe(
+            tmp_path, osw_hs=[3.0], osw_total_hs=3.0, osw_land_flag=1,
+            osw_quality_flag=3,
+        )
+        out = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert out is not None
+        assert np.isnan(out["oswTotalHs"].values[0])
+        assert out.attrs["osw_land_pixel_count"] == 1
+        assert out.attrs["osw_quality_masked_pixel_count"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2707,6 +3186,220 @@ class TestConvertDownloadedDataSmosTgzWarning:
         )
 
 
+def _make_sm_osw_safe(
+    tmp_path: Path,
+    *,
+    osw_hs,
+    osw_total_hs=None,
+    osw_land_flag=None,
+    osw_quality_flag=None,
+    with_owi: bool = False,
+    safe_name: str = "S1A_S3_OCN.SAFE",
+    seed: int = 0,
+) -> Path:
+    """
+    Build a SM/IW/EW-shaped *.SAFE dir with one '-ocn-' measurement NetCDF
+    carrying a native OSW grid (oswAzSize x oswRaSize x oswPartitions).
+
+    osw_hs: array-like, shape (ny, nx, n_partitions); -1/NaN entries mimic
+        the product's fill code for unused partition slots.
+    osw_total_hs: array-like, shape (ny, nx), or None to omit the variable
+        entirely, exercising the fallback path used when a product does
+        not carry it.
+    osw_land_flag / osw_quality_flag: array-like, shape (ny, nx), or None
+        to omit the variable entirely (a product that does not carry it).
+    with_owi: also write a full owi* wind grid alongside the OSW grid, to
+        test that OSW is preferred over the OWI fallback when both exist.
+    """
+    rng = np.random.default_rng(seed)
+    osw_hs = np.asarray(osw_hs, dtype="float32")
+    ny, nx, _n_partitions = osw_hs.shape
+
+    safe = tmp_path / safe_name
+    meas = safe / "measurement"
+    meas.mkdir(parents=True)
+
+    osw_lon = np.linspace(-178.5, -177.5, ny * nx).reshape(ny, nx).astype("float32")
+    osw_lat = np.linspace(-31.0, -29.0, ny * nx).reshape(ny, nx).astype("float32")
+
+    data: dict = {
+        "oswHs": (("oswAzSize", "oswRaSize", "oswPartitions"), osw_hs),
+        "oswLon": (("oswAzSize", "oswRaSize"), osw_lon),
+        "oswLat": (("oswAzSize", "oswRaSize"), osw_lat),
+    }
+    if osw_total_hs is not None:
+        data["oswTotalHs"] = (("oswAzSize", "oswRaSize"),
+                               np.asarray(osw_total_hs, dtype="float32"))
+    if osw_land_flag is not None:
+        data["oswLandFlag"] = (("oswAzSize", "oswRaSize"),
+                                np.asarray(osw_land_flag, dtype="int8"))
+    if osw_quality_flag is not None:
+        data["oswQualityFlag"] = (("oswAzSize", "oswRaSize"),
+                                   np.asarray(osw_quality_flag, dtype="float32"))
+
+    if with_owi:
+        odims = ("owiAzSize", "owiRaSize")
+        data["owiWindSpeed"] = (odims, rng.uniform(2, 15, (ny, nx)).astype("float32"))
+        data["owiWindDirection"] = (odims, rng.uniform(0, 360, (ny, nx)).astype("float32"))
+        data["owiLon"] = (odims, osw_lon)
+        data["owiLat"] = (odims, osw_lat)
+
+    ds = xr.Dataset(data, attrs={"firstMeasurementTime": "2019-06-05T17:19:13Z"})
+    fname = "s1a-s3-ocn-vv-20190605t171913-20190605t171943-027547-031bcb-001.nc"
+    ds.to_netcdf(meas / fname)
+    return safe
+
+
+class TestExtractOswGridData:
+    def test_extracts_real_total_hs_when_present(self, tmp_path):
+        # 1x2 grid, both cells have a real (non-NaN) oswTotalHs -> use it
+        # as-is, no fallback needed.
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[0.6, 0.8, -1.0, -1.0, -1.0], [1.0, -1.0, -1.0, -1.0, -1.0]]],
+            osw_total_hs=[[2.85, 1.95]],
+        )
+        ds = DataTreeConverter._extract_osw_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert ds["oswTotalHs"].dims == ("y", "x")
+        assert ds["oswTotalHs"].shape == (1, 2)
+        np.testing.assert_allclose(ds["oswTotalHs"].values, [[2.85, 1.95]])
+
+    def test_falls_back_to_per_cell_partition_mean(self, tmp_path):
+        # oswTotalHs entirely absent -> each cell independently falls back
+        # to the mean of its own valid partitions, not a single
+        # grid-wide scalar.
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[0.60, 0.80, 1.00, -1.0, -1.0], [2.0, -1.0, -1.0, -1.0, -1.0]]],
+            osw_total_hs=None,
+        )
+        ds = DataTreeConverter._extract_osw_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        np.testing.assert_allclose(ds["oswTotalHs"].values, [[0.80, 2.0]], atol=1e-4)
+
+    def test_returns_none_without_osw_grid(self, tmp_path):
+        # No osw* variables at all -> signals the caller to fall back to OWI/RVL.
+        safe = tmp_path / "S1A_S3_OCN.SAFE"
+        meas = safe / "measurement"
+        meas.mkdir(parents=True)
+        xr.Dataset(
+            {"owiWindSpeed": (("owiAzSize", "owiRaSize"), np.zeros((2, 2), "float32"))}
+        ).to_netcdf(meas / "s1a-s3-ocn-vv-20190605t171913-20190605t171943-027547-031bcb-001.nc")
+        ds = DataTreeConverter._extract_osw_grid_data(meas, safe)
+        assert ds is None
+
+    def test_land_flagged_cells_masked_to_nan(self, tmp_path):
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[1.5, -1.0, -1.0, -1.0, -1.0], [2.0, -1.0, -1.0, -1.0, -1.0]]],
+            osw_total_hs=[[1.5, 2.0]],
+            osw_land_flag=[[1, 0]],
+        )
+        ds = DataTreeConverter._extract_osw_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert np.isnan(ds["oswTotalHs"].values[0, 0])
+        assert ds["oswTotalHs"].values[0, 1] == pytest.approx(2.0)
+        assert ds.attrs["osw_land_pixel_count"] == 1
+        assert ds.attrs["osw_land_pixel_fraction"] == pytest.approx(0.5)
+        # Flag passes through even at the rejected cell, for downstream inspection.
+        assert ds["oswLandFlag"].values[0, 0] == 1
+        # The raw oswHs partitions at the rejected cell are also masked to
+        # NaN -- including fill-code (-1) slots, which NaN now overwrites
+        # unconditionally at rejected cells -- while the accepted cell's
+        # partitions are untouched.
+        assert np.all(np.isnan(ds["oswHs"].values[0, 0]))
+        np.testing.assert_allclose(
+            ds["oswHs"].values[0, 1], [2.0, -1.0, -1.0, -1.0, -1.0]
+        )
+
+    def test_quality_flag_all_nan_is_a_noop(self, tmp_path):
+        # oswQualityFlag is always its NaN fill value today, so this
+        # must not mask anything out.
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[1.5, -1.0, -1.0, -1.0, -1.0]]],
+            osw_total_hs=[[1.5]],
+            osw_quality_flag=[[np.nan]],
+        )
+        ds = DataTreeConverter._extract_osw_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert ds["oswTotalHs"].values[0, 0] == pytest.approx(1.5)
+        assert ds.attrs["osw_quality_masked_pixel_count"] == 0
+
+    def test_quality_flag_rejects_low_and_poor(self, tmp_path):
+        # flag_meanings: 0=good 1=medium 2=low 3=poor -- reject >= 2, so
+        # this activates automatically if a future processor populates it.
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[1.5, -1.0, -1.0, -1.0, -1.0], [2.0, -1.0, -1.0, -1.0, -1.0]]],
+            osw_total_hs=[[1.5, 2.0]],
+            osw_quality_flag=[[2, 1]],
+        )
+        ds = DataTreeConverter._extract_osw_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert np.isnan(ds["oswTotalHs"].values[0, 0])
+        assert ds["oswTotalHs"].values[0, 1] == pytest.approx(2.0)
+        assert ds.attrs["osw_quality_masked_pixel_count"] == 1
+        assert ds.attrs["osw_quality_masked_pixel_fraction"] == pytest.approx(0.5)
+
+    def test_land_and_quality_rejections_both_counted_independently(self, tmp_path):
+        # A cell failing both checks increments both counters -- no dedup,
+        # matching the WV path's documented behavior.
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[1.5, -1.0, -1.0, -1.0, -1.0]]],
+            osw_total_hs=[[1.5]],
+            osw_land_flag=[[1]],
+            osw_quality_flag=[[3]],
+        )
+        ds = DataTreeConverter._extract_osw_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert np.isnan(ds["oswTotalHs"].values[0, 0])
+        assert ds.attrs["osw_land_pixel_count"] == 1
+        assert ds.attrs["osw_quality_masked_pixel_count"] == 1
+
+    def test_all_fill_partitions_yield_nan_without_runtime_warning(self, tmp_path):
+        # A cell whose oswHs partitions are entirely fill values (-1) has
+        # no valid partitions to average, exercising nanmean's
+        # empty-slice path. This must resolve to NaN, not raise
+        # numpy.nanmean's "Mean of empty slice" RuntimeWarning.
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[-1.0, -1.0, -1.0, -1.0, -1.0]]],
+            osw_total_hs=None,
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ds = DataTreeConverter._extract_osw_grid_data(safe / "measurement", safe)
+        assert ds is not None
+        assert np.isnan(ds["oswTotalHs"].values[0, 0])
+        assert not any(issubclass(w.category, RuntimeWarning) for w in caught)
+
+
+class TestSmWavesDispatch:
+    def test_waves_prefers_osw_grid_over_owi_fallback(self, tmp_path):
+        safe = _make_sm_osw_safe(
+            tmp_path,
+            osw_hs=[[[0.6, 0.8, -1.0, -1.0, -1.0]]],
+            osw_total_hs=[[2.85]],
+            with_owi=True,
+        )
+        ds = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert ds is not None
+        assert "oswTotalHs" in ds.data_vars
+        assert "owiWindSpeed" not in ds.data_vars
+        assert float(ds["oswTotalHs"].values[0, 0]) == pytest.approx(2.85)
+
+    def test_waves_falls_back_to_owi_without_osw_grid(self, tmp_path):
+        # A legacy/degenerate product with no osw* variables at all falls
+        # back to OWI.
+        safe = _make_ocn_safe(tmp_path, "S1A_EW_OCN.SAFE", with_owi=True)
+        ds = DataTreeConverter.from_sar_l2_ocn_safe(safe, product_type="waves")
+        assert ds is not None
+        assert "owiWindSpeed" in ds.data_vars
+
+
 class TestConvertDownloadedDataAscatSidecarFiles:
     """A real EUMDAC ASCAT SSM order (confirmed against a real download)
     delivers sidecar metadata files (EOPMetadata.xml, manifest.xml) sitting
@@ -2783,6 +3476,32 @@ class TestFromHfRadarGridQCFlagFilter:
         assert result.sizes["point"] == 4
         assert sorted(np.round(result["EWCT"].values, 1).tolist()) == [1.0, 4.0, 5.0, 6.0]
         assert all(q != 4 for q in result["hfr_qc"].values)
+
+    def test_drops_qcflag_untested_cells(self, tmp_path):
+        times = pd.date_range("2026-06-01", periods=1, freq="1h")
+        lats = np.array([10.0, 11.0])
+        lons = np.array([20.0, 21.0])
+        ewct = np.array([[[1.0, 2.0], [3.0, 4.0]]])
+        nsct = np.array([[[0.1, 0.2], [0.3, 0.4]]])
+        # QCflag=0 ("no QC performed") is not one of CMEMS's valid codes
+        # (1, 2, 5, 7, 8) even though it is not 4 ("bad") either.
+        qcflag = np.array([[[0.0, 1.0], [2.0, 5.0]]])
+        ds = xr.Dataset(
+            {
+                "EWCT": (("time", "latitude", "longitude"), ewct),
+                "NSCT": (("time", "latitude", "longitude"), nsct),
+                "QCflag": (("time", "latitude", "longitude"), qcflag),
+            },
+            coords={"time": times, "latitude": lats, "longitude": lons},
+        )
+        path = tmp_path / "cop_qc_untested_test.nc"
+        ds.to_netcdf(path)
+
+        result = DataTreeConverter.from_hf_radar_grid(path, u_var="EWCT", v_var="NSCT")
+
+        assert result is not None
+        assert result.sizes["point"] == 3
+        assert 0.0 not in result["hfr_qc"].values
 
     def test_noaa_style_file_without_qcflag_is_unaffected(self, tmp_path):
         times = pd.date_range("2026-06-01", periods=1, freq="1h")

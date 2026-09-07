@@ -1360,8 +1360,13 @@ def _stats_already_computed(recipe, base_dir: Path, filename_suffix: str = "") -
     ``_compute_stats`` writes those too.
 
     Returns False (i.e. "recompute") whenever the collocation results are
-    missing, no variable pairs apply, or anything is still absent — a safe
-    default that falls through to the normal Step 4 behaviour.
+    missing, no variable pairs apply, anything is still absent, or any
+    expected statistics file is older than ``collocation_results<suffix>.nc``
+    — collocation can be regenerated (a rerun, a bug fix, a manual repair)
+    without this function's caller also having run Step 3 in the same
+    invocation, and a stats file older than the collocation results it was
+    supposedly computed from no longer reflects them. A safe default that
+    falls through to the normal Step 4 behaviour.
     """
     import xarray as xr
 
@@ -1370,6 +1375,7 @@ def _stats_already_computed(recipe, base_dir: Path, filename_suffix: str = "") -
     coll_path = base_dir / f"collocation_results{filename_suffix}.nc"
     if not coll_path.exists():
         return False
+    coll_mtime = coll_path.stat().st_mtime
 
     collocation_ds = xr.open_dataset(str(coll_path))
     try:
@@ -1380,13 +1386,19 @@ def _stats_already_computed(recipe, base_dir: Path, filename_suffix: str = "") -
         return False
 
     precomputed = _load_precomputed_stats(recipe, collocation_ds, base_dir, filename_suffix=filename_suffix)
-    if set(precomputed) != {f"{sar_var}_vs_{val_var}" for sar_var, val_var in pairs}:
+    expected_keys = {f"{sar_var}_vs_{val_var}" for sar_var, val_var in pairs}
+    if set(precomputed) != expected_keys:
         return False
+
+    for key in expected_keys:
+        stats_path = base_dir / f"validation_statistics_{key}{filename_suffix}.nc"
+        if stats_path.stat().st_mtime < coll_mtime:
+            return False
 
     if recipe.config.variable == "soil_moisture":
         for sar_var, val_var in pairs:
             native_path = base_dir / f"validation_statistics_{sar_var}_vs_{val_var}_native_units{filename_suffix}.nc"
-            if not native_path.exists():
+            if not native_path.exists() or native_path.stat().st_mtime < coll_mtime:
                 return False
 
     return True

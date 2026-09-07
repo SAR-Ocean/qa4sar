@@ -232,16 +232,63 @@ Copernicus's incomplete re-ingestion of it), and a later, separate decision
 that stopped at ERDDAP-only NOAA coverage (superseded once the THREDDS
 archive backend was added) — see `docs/superpowers/specs/` for that
 reasoning's full history. Separately, and independent of which backend is
-used, all Copernicus HF-radar data (US or not) now drops cells where the
-overall `QCflag == 4` ("bad") — Copernicus ships them unfiltered, and this
-toolbox previously retained them uncritically; per-parameter flags
-(`CSPD_QC` etc.) remain retained but unused.
+used, all Copernicus HF-radar data (US or not) now keeps only cells whose
+overall `QCflag` is one of `{1, 2, 5, 7, 8}` — CMEMS's own definition of a
+valid QC code, shared with the in-situ filter in §3.7 — since Copernicus
+ships every code unfiltered; per-parameter flags (`CSPD_QC` etc.) remain
+retained but unused.
 
 > Code: `downloaders/hf_radar_us_downloader.py` (`HFRadarUSDownloader.download()`),
 > `downloaders/noaa_hfradar_thredds_downloader.py`
 > (`NOAATHREDDSHFRadarDownloader`), `core/orchestrator.py`
 > (`_download_hf_radar_us`), `core/datatree_converter.py`
 > (`from_hf_radar_grid`'s `QCflag` filter).
+
+---
+
+### 3.7 In-situ and HF-radar QC-flag filtering
+
+Copernicus Marine's In Situ TAC ships a `value_qc` code (0–9) alongside
+every observation, and CMEMS's own QC Procedure document defines a valid
+value as one whose code is 1 ("good data"), 2 ("probably good data"), 5
+("value changed", still good), 7 ("nominal value"), or 8 ("interpolated
+value"); the remaining codes (0 "no QC performed", 3 "bad, potentially
+correctable", 4 "bad", 6 "unused", 9 "missing") mark a value unusable.
+`from_insitu_csv` applies this set, `{1, 2, 5, 7, 8}`, to every parameter
+that carries a `_QC` companion column — currently WSPD, WDIR, EWCT, NSCT,
+HCSP, HCDT, VHM0, VAVH, and VGHS — rather than a hardcoded per-family list,
+so a value and its QC code are always nulled together and never appear one
+without the other.
+
+**Why wind is included:** CMEMS's own product documentation
+(`CMEMS-INS-QUID-013-030-036`) states that the In Situ TAC applies no
+additional quality control of its own to meteorological parameters like
+wind — it preserves whatever the original data provider reported.
+Provider-sourced quality control values are nonetheless real rather than
+placeholders, and can include bad codes for wind speed and direction.
+Since the same generic filter already covers every `_QC`-bearing column,
+wind receives this benefit without any additional code.
+
+**Derivation gating:** `EWCT`/`NSCT` derived from `HCSP`+`HCDT` (when the
+direct components are absent) inherit their inputs' QC state automatically
+— once a bad-QC `HCSP` or `HCDT` value is nulled, the derivation's own
+arithmetic (`HCSP * sin/cos(HCDT)`) propagates that `NaN` into the derived
+component without any extra gating logic.
+
+**Wave-height precedence interacts with QC:** the existing
+VHM0-over-VAVH-over-VGHS precedence rule (§5.8) runs after QC filtering, so
+a QC-bad `VHM0` no longer blocks a QC-good `VAVH` from being chosen for
+that observation; when precedence overrides a column, its `_QC` companion
+is nulled with it.
+
+**HF-radar:** the same `{1, 2, 5, 7, 8}` set widens `from_hf_radar_grid`'s
+overall `QCflag` filter (§3.6) from excluding only code 4 to keeping only
+the valid set — code 0 ("no QC performed") is common enough in practice
+that excluding only 4 let a meaningful share of untested cells through.
+
+> Code: `core/datatree_converter.py` (`_VALID_QC_CODES`, `from_insitu_csv`'s
+> per-column QC filter, `from_hf_radar_grid`'s `QCflag` filter),
+> `core/_cf_metadata.py` (`INSITU_VARIABLE_ATTRS`'s `_QC` entries).
 
 ---
 
@@ -403,8 +450,33 @@ vignette:
 - **layer sources** (altimeter, scatterometer) use their own layer-type time
   tolerance and weighting — labelled `point_vs_layer`.
 
-This radius only affects WV/point-mode SAR; IW/EW grid collocation is
+This radius only affects WV/point-mode SAR; IW/EW/SM grid collocation is
 untouched.
+
+#### SM/IW/EW: the native OSW grid, not a WV-vignette-sized point
+
+Unlike WV, a SM/IW/EW OCN product is one continuous swath, but its OSW data
+is itself gridded at native resolution (`oswLon`/`oswLat`, shape
+`oswAzSize x oswRaSize`) — e.g. an 11x4 = 44-cell grid for a real ~169 x 81
+km SM subswath, each cell ~17-21 km apart, i.e. almost exactly WV's own
+~20x20 km vignette footprint, just tiled edge-to-edge across the whole
+strip instead of sampled every ~200 km. `_extract_osw_grid_data` extracts
+this native grid (renamed to `y`/`x` for collocation, same convention as
+`_extract_owi_grid_data`) rather than the coarser owi-grid-shaped
+`owiHs`/`owiWl` copies the product also ships alongside it, since only the
+native osw grid carries `oswTotalHs`.
+
+Real SM samples across different years and subswaths had `oswTotalHs` as
+NaN in every single cell — only the per-partition `oswHs` carried real
+numbers. So for SM, the fallback-to-partition-mean path below is the
+*normal* case, not a rare legacy exception, and is applied per grid cell
+independently (not one scalar for the whole grid). `_extract_osw_grid_data`
+applies the identical `oswLandFlag`/`oswQualityFlag` masking described
+below, sharing its reject thresholds with the WV path
+(`_OSW_LAND_FLAG_REJECT_VALUE`, `_OSW_QUALITY_FLAG_REJECT_THRESHOLD`). That
+masking is applied to both the derived `oswTotalHs` and the raw
+per-partition `oswHs` array, so no land- or quality-rejected cell exposes
+real-looking values or `-1` fill codes in either exported variable.
 
 #### WV wave height: `oswTotalHs`, not an `oswHs` partition
 
@@ -426,6 +498,33 @@ valid `oswHs` partitions** (dropping the `-1`/NaN fill codes) rather than a
 single partition, giving a representative total. This is why the WV waves pair
 in `_variable_map` is `("oswTotalHs", "VHM0")` with `("oswHs", "VHM0")` kept only
 as a legacy fallback.
+
+#### WV wave quality-flag masking
+
+`from_sar_l2_ocn_wv_safe` gates `oswTotalHs` on two independent checks,
+straight from ESA's own product flags, neither deduplicated against the
+other (a point failing both is counted by each):
+
+- **`oswLandFlag`** — set where land coverage exceeds 10% of the
+  vignette. Expected to matter little in practice: WV mode is used
+  almost exclusively over open ocean.
+- **`oswQualityFlag`** (the product's own total-quality flag, 0=good to
+  3=poor, same dims as `oswTotalHs`) — rejects at ≥2. This field is never
+  populated by ESA's processor today (always its `-128` fill value), so
+  the check is currently a documented no-op — implemented anyway so it
+  activates automatically if a future processor version starts populating
+  it, the same precedent as NOAA HF-radar's `QCflag` (§3.6).
+
+Deliberately not implemented: any threshold derived from
+`oswTotalHsStdev` or `oswQualityFlagPartition`. Both were investigated
+as candidates, but neither is an ESA-defined rejection criterion for
+`oswTotalHs` — using either would mean inventing this toolbox's own OSW
+quality-control rule rather than applying one ESA already publishes.
+Masking here is intentionally limited to what `oswLandFlag` and
+`oswQualityFlag` themselves say.
+
+> Code: `core/datatree_converter.py` (`from_sar_l2_ocn_wv_safe`,
+> `_extract_osw_grid_data`).
 
 ### 5.6 Smaller collocation choices
 
@@ -579,6 +678,72 @@ see Task 14.
   `soil_moisture` uses the land-only `reanalysis-era5-land` dataset,
   where an ocean/land mask would be nonsensical (the whole point of that
   request is land).
+
+**`owiWindQuality`/`owiInversionQuality` gate OWI wind retrievals,
+independently of `owiMask`, by matching each flag's own CF category names
+rather than a hardcoded numeric threshold.** `_extract_owi_grid_data` NaNs
+out `owiWindSpeed`/`owiWindDirection` wherever either flag reports a
+category in `_OWI_QUALITY_REJECT_LABELS` (`no_data`, `bad`, `poor`, `low`,
+`suspect`), on top of the land masking above. This is deliberately not a
+numeric threshold: real downloaded files spanning 2018-2026 show that ESA
+changed `owiWindQuality`'s own numeric encoding, and even its severity
+direction, between IPF versions — pre-IPF-004.03 scenes (2018-2025,
+S1A/S1B) carry `flag_meanings='good medium low poor'` (`0=good...3=poor`,
+lower is better), while IPF 004.03 scenes (mid-2026 onward) carry
+`flag_meanings='no_data bad suspect acceptable good'`
+(`0=no_data...4=good`, higher is better). A single hardcoded direction is
+correct for one era and silently backwards for the other, so
+`_owi_quality_reject_mask` (module-level helper) reads each file's own
+`flag_values`/`flag_meanings` and rejects whichever numeric codes map to a
+reject-labelled category name, however that file happens to number them.
+`owiInversionQuality` has stayed `good`/`medium`/`poor` throughout (only
+its attribute-string formatting varied once, in 2018, as
+`'0:good 1:medium 2:poor'` — the parser strips a leading `N:` token if
+present), so the same helper and label set cover both flags. When
+`flag_values`/`flag_meanings` are missing or cannot be matched one-to-one,
+the helper rejects nothing on that flag's account, the same precedent as a
+flag missing from the product entirely. A flag that is simply missing for
+one cell (present in the product but NaN there) does not reject that cell
+by itself — the other flag governs, because a cell can be valid and
+non-land while one flag's metric was simply never computed for it. A cell
+is only rejected on NaN grounds when both flags are present in the product
+and both are NaN for that cell. A flag that is entirely absent from the
+product (not the "some cells are NaN" case, but the variable does not
+exist at all) never contributes to rejection, so a product carrying only
+one flag, or neither, is masked using only the flags actually present.
+Counts and fractions are tracked separately from land masking, as
+`owi_quality_masked_pixel_count`/`owi_quality_masked_pixel_fraction`.
+
+**Collocation must exclude OWI's passthrough fields when deciding a match
+has real data, not just OSW's.** `owiNrcs`/`owiIncidenceAngle`/
+`owiHeading`/`owiMask`/`owiWindQuality`/`owiInversionQuality` all pass
+through conversion unmodified even at rejected cells (see above), so all
+six are always-or-usually finite regardless of whether `owiWindSpeed`/
+`owiWindDirection` were masked. Before this was added to
+`collocation.py`'s shared `_AUXILIARY_FLAG_VARS` set (previously scoped
+only to OSW's `oswLandFlag`/`oswQualityFlag`, see `docs/QC_flags_implementation.md`'s
+OWI section for the concrete evidence), a validation point whose entire
+aggregation window had NaN wind measurements could still produce a
+"collocated" match purely because one of these passthrough fields was
+finite — silently inflating collocation counts and diluting bias/RMSE with
+phantom matches carrying no actual wind comparison. `LayerLayerCollocation
+._collocate_individual` (the "individual" method's SAR-anchored path) had
+the same gap through a different mechanism: it checked "is any variable in
+the whole product non-NaN" with no `_AUXILIARY_FLAG_VARS` exclusion at
+all, so it needed its own guard added alongside the pre-filter fix.
+
+Auditing every other SAR product for the same gap: RVL currents shares it
+too (`rvlHeading`/`rvlIncidenceAngle` are geometry, left unmasked when
+`rvlRadVel` is land-masked to NaN — see the RVL currents entry above — and
+RVL's own extraction code deliberately mirrors OWI's grid shape "so ... the
+grid collocation path treat[s] RVL and OWI grids identically", meaning it
+reuses this exact mechanism). Confirmed against real cached currents data:
+2 of 37 collocated pairs had NaN `rvlRadVel` rescued by finite
+`rvlHeading`/`rvlIncidenceAngle`. Both now in `_AUXILIARY_FLAG_VARS`.
+RADARSAT-2 wind and both SSM sources (Sentinel-1 CLMS, NISAR SME2) are
+immune by construction — each of their extraction functions only ever
+produces a single data variable (`owiWindSpeed` or `sarSSM`), so when it
+goes NaN there is no other passthrough field left to rescue a match.
 
 **`u10`/`v10` stay raw through conversion; `WSPD`/`WDIR` are derived only
 after interpolation.** Every other validation source is renamed to the

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
@@ -46,6 +47,29 @@ _ASCAT_REJECT_FLAGS = {
     "not_enough_good_sigma0_for_wind_retrieval",
     "distance_to_gmf_too_large",
 }
+
+# Sentinel-1 OWI's owiWindQuality/owiInversionQuality category labels used
+# to reject a cell, keyed by name rather than numeric code or severity
+# direction. This matters because ESA changed owiWindQuality's own numeric
+# encoding -- and even its severity direction -- between IPF versions,
+# confirmed against real downloaded files spanning 2018-2026: pre-IPF-004.03
+# scenes carry flag_meanings "good medium low poor" (0=good...3=poor, lower
+# is better), while IPF 004.03 scenes (mid-2026 onward) carry "no_data bad
+# suspect acceptable good" (0=no_data...4=good, higher is better).
+# owiInversionQuality has stayed "good"/"medium"/"poor" throughout (only its
+# attribute-string formatting varied once, in 2018: "0:good 1:medium
+# 2:poor"). Matching category names read from each file's own flag_meanings
+# is stable across all of these, and any future encoding that keeps using
+# recognizable labels.
+_OWI_QUALITY_REJECT_LABELS = frozenset({"no_data", "bad", "poor", "low", "suspect"})
+
+# The Copernicus Marine In Situ TAC quality-control scale is 0-9; a value
+# is considered usable when its QC code is 1 ("good data"), 2 ("probably
+# good data"), 5 ("value changed", still good), 7 ("nominal value"), or 8
+# ("interpolated value"). Every other code -- including a missing one --
+# marks the value as unusable. Shared by from_insitu_csv (per-parameter
+# value_qc) and from_hf_radar_grid (the overall QCflag).
+_VALID_QC_CODES = frozenset({1, 2, 5, 7, 8})
 
 #: ERA5 variable metadata per recipe variable -- raw CDS/NetCDF short
 #: names, the data_type tag stamped on the result, and CF-ish attrs. Kept
@@ -353,6 +377,85 @@ def _parse_ascat_resolution_km(filename: str) -> float:
         return float(m.group(1))
     except ValueError:
         return 12.5
+
+
+def _parse_acquisition_time(
+    ds_raw: xr.Dataset,
+    file_stem: str,
+    prefer_filename: bool = False,
+) -> Optional[np.datetime64]:
+    """
+    Resolve one SAR L2 OCN measurement file's acquisition time from either
+    its firstMeasurementTime attribute or its filename timestamp (format
+    YYYYMMDDtHHMMSS), returning None if neither resolves.
+
+    prefer_filename reverses which source is tried first: the WV point
+    path favors the filename timestamp, the RVL/OWI/OSW grid paths favor
+    the product attribute.
+    """
+    def _from_attr() -> Optional[np.datetime64]:
+        time_str = ds_raw.attrs.get("firstMeasurementTime")
+        if not time_str:
+            return None
+        acq_time = pd.to_datetime(time_str)
+        return np.datetime64(
+            acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
+        )
+
+    def _from_filename() -> Optional[np.datetime64]:
+        m = re.search(r"(\d{8}t\d{6})", file_stem, re.IGNORECASE)
+        if not m:
+            return None
+        acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S")
+        return np.datetime64(
+            acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
+        )
+
+    sources = (_from_filename, _from_attr) if prefer_filename else (_from_attr, _from_filename)
+    for source in sources:
+        result = source()
+        if result is not None:
+            return result
+    return None
+
+
+def _owi_quality_reject_mask(da: xr.DataArray) -> Optional[np.ndarray]:
+    """
+    Build a reject mask for a Sentinel-1 OWI quality flag from its own CF
+    flag_values/flag_meanings attributes, matched by category name rather
+    than a hardcoded numeric threshold (see _OWI_QUALITY_REJECT_LABELS for
+    why: the numeric encoding itself has changed between IPF versions).
+
+    Returns None -- never rejecting any cell on this flag's account -- when
+    flag_values/flag_meanings are missing or cannot be matched one-to-one,
+    the same "unusable metadata never rejects" precedent as a flag missing
+    from the product entirely.
+    """
+    meanings = da.attrs.get("flag_meanings")
+    values = da.attrs.get("flag_values")
+    if not meanings or values is None:
+        return None
+    tokens = str(meanings).split()
+    values = np.asarray(values)
+    if len(tokens) != len(values):
+        return None
+    # Some older files embed the numeric code inside the token itself
+    # (e.g. "0:good" rather than "good"); take whatever follows the last
+    # colon, or the whole token if there isn't one.
+    names = [tok.rsplit(":", 1)[-1] for tok in tokens]
+    reject_values = [
+        int(val) for val, name in zip(values, names) if name in _OWI_QUALITY_REJECT_LABELS
+    ]
+    if not reject_values:
+        return np.zeros(da.shape, dtype=bool)
+    return np.isin(da.values, reject_values)
+
+
+# Sentinel-1 OSW quality control, shared by the WV point path
+# (from_sar_l2_ocn_wv_safe) and the SM/IW/EW grid path
+# (_extract_osw_grid_data) so the two cannot silently drift apart.
+_OSW_LAND_FLAG_REJECT_VALUE = 1
+_OSW_QUALITY_FLAG_REJECT_THRESHOLD = 2
 
 
 class DataTreeConverter:
@@ -702,20 +805,53 @@ class DataTreeConverter:
                 c for c in ("platform_id", "platform_type", "time", "lon", "lat", "depth")
                 if c in df.columns
             ]
-            df = (
-                df.pivot_table(
-                    index=pivot_id_cols,
-                    columns="variable",
-                    values="value",
-                    aggfunc="first",
-                )
-                .reset_index()
+            has_qc = "value_qc" in df.columns
+            value_cols = ["value", "value_qc"] if has_qc else ["value"]
+            # pivot_table's internal MultiIndex.from_product builds the full
+            # Cartesian product of every id column's own unique values --
+            # lon/lat/time vary almost per-row for a moving or jittering
+            # platform -- rather than just the combinations that actually
+            # occur. For a real ~600-row, 94-platform in-situ CSV this
+            # exploded into ~800 million index tuples and tens of GB of
+            # memory. groupby+unstack only ever materializes combinations
+            # present in the data.
+            wide = (
+                df.groupby([*pivot_id_cols, "variable"], sort=False)[value_cols]
+                .first()
+                .unstack("variable")
             )
-            df.columns.name = None  # remove the "variable" MultiIndex label
+            if has_qc:
+                df = wide.reset_index()
+                # Flatten the two-level ("value"|"value_qc", <code>) columns
+                # to "<code>" and "<code>_QC"; id columns keep their name
+                # (their second level is empty). All-NaN "<code>_QC"
+                # columns are kept -- a variable whose QC code is entirely
+                # missing must still surface one so the filter below can
+                # reject it.
+                df.columns = [
+                    top if var == "" else (var if top == "value" else f"{var}_QC")
+                    for top, var in df.columns
+                ]
+            else:
+                df = wide["value"].reset_index()
+                df.columns.name = None  # remove the "variable" MultiIndex label
             logger.debug(
                 "Pivoted in-situ CSV to wide format; variable columns: %s",
                 [c for c in df.columns if c not in pivot_id_cols],
             )
+
+        # A parameter is only usable when its own QC code is one CMEMS
+        # defines as valid (see _VALID_QC_CODES); anything else -- including
+        # a missing QC code -- nulls the value and its QC column together,
+        # so a value is never shown without a trustworthy QC code, and no
+        # QC code is left next to a missing value. Applies to every
+        # parameter that has a "<code>_QC" companion column, whatever that
+        # parameter is (wind, currents, waves, ...).
+        for qc_col in [c for c in df.columns if c.endswith("_QC") and c[:-3] in df.columns]:
+            col = qc_col[:-3]
+            bad = ~df[qc_col].isin(_VALID_QC_CODES)
+            df.loc[bad, col] = np.nan
+            df.loc[bad, qc_col] = np.nan
 
         # Derive eastward/northward current components from speed + direction
         # when the direct components are absent or all-NaN.
@@ -741,7 +877,11 @@ class DataTreeConverter:
             claimed = pd.Series(False, index=df.index)
             for col in wave_height_cols:
                 has_val = df[col].notna()
-                df.loc[claimed & has_val, col] = np.nan
+                overridden = claimed & has_val
+                df.loc[overridden, col] = np.nan
+                qc_col = f"{col}_QC"
+                if qc_col in df.columns:
+                    df.loc[overridden, qc_col] = np.nan
                 claimed = claimed | has_val
 
         coord_cols = {"lon", "lat", "time", "platform_id", "platform_type"}
@@ -2272,9 +2412,10 @@ class DataTreeConverter:
         (``CSPD_QC``, ``DDNS_QC``, ``GDOP_QC``, ``VART_QC``,
         ``POSITION_QC``) to its own ``hfr_qc_<param>`` field — these remain
         retained but unused. The overall ``QCflag`` is copied to ``hfr_qc``
-        AND used to drop cells where it equals 4 ("bad"); NOAA's product has
-        no equivalent flag (it filters upstream before publishing), so this
-        has no effect on NOAA-sourced files.
+        and used to keep only cells whose code is one of CMEMS's valid QC
+        codes (1, 2, 5, 7, or 8); NOAA's product has no equivalent flag (it
+        filters upstream before publishing), so this has no effect on
+        NOAA-sourced files.
 
         Returns
         -------
@@ -2387,12 +2528,12 @@ class DataTreeConverter:
             data_vars["hfr_qc"] = ("point", qc_flat)
             var_attrs["hfr_qc"] = {
                 "long_name": "HF-radar overall QC flag",
-                "comment": "Cells where this equals 4 (\"bad\") are excluded below.",
+                "comment": "Cells whose code is not 1, 2, 5, 7, or 8 are excluded below.",
             }
         # Per-parameter QC flags (Copernicus radar-total product): each one
-        # is retained under its own field rather than folded into hfr_qc, so
-        # a future QC phase can filter per-parameter instead of only on the
-        # overall flag.
+        # is retained under its own field rather than folded into hfr_qc,
+        # for reference. Only the overall QCflag (below) is currently used
+        # to exclude cells.
         for src, param in (
             ("CSPD_QC", "cspd"), ("DDNS_QC", "ddns"), ("GDOP_QC", "gdop"),
             ("VART_QC", "vart"), ("POSITION_QC", "position"),
@@ -2402,15 +2543,16 @@ class DataTreeConverter:
                 data_vars[dst] = ("point", _flat(src))
                 var_attrs[dst] = {
                     "long_name": f"HF-radar {param} QC flag",
-                    "comment": "Retained for a future HF-radar QC filter (design §3.7).",
+                    "comment": "Not currently used to exclude cells.",
                 }
 
         # Drop points where both current components are NaN (masked
-        # land/gaps), or where the overall QCflag marks the cell "bad" (4).
-        # Per-parameter QC flags (CSPD_QC etc.) remain retained but unused.
+        # land/gaps), or where the overall QCflag is not one of CMEMS's
+        # valid QC codes. Per-parameter QC flags (CSPD_QC etc.) remain
+        # retained but unused.
         valid = np.isfinite(ewct) | np.isfinite(nsct)
         if qc_flat is not None:
-            valid &= qc_flat != 4
+            valid &= np.isin(qc_flat, list(_VALID_QC_CODES))
         if not np.any(valid):
             logger.warning("from_hf_radar_grid: all cells NaN or QC-bad in %s.", nc_path.name)
             raw.close()
@@ -2902,6 +3044,10 @@ class DataTreeConverter:
         point_hs = []
         point_times = []
         file_names = []
+        point_land_flag = []
+        n_land_reject = 0
+        point_quality_flag = []
+        n_quality_reject = 0
         osw_attrs: Dict[str, Dict] = {}
 
         for nc_path in wv_files:
@@ -2915,6 +3061,16 @@ class DataTreeConverter:
                 # Extract coordinates as scalars (1×1 grid)
                 lon = float(ds_raw["oswLon"].values.item())
                 lat = float(ds_raw["oswLat"].values.item())
+
+                land_flag = (
+                    float(ds_raw["oswLandFlag"].values.item())
+                    if "oswLandFlag" in ds_raw else np.nan
+                )
+
+                quality_flag = (
+                    float(ds_raw["oswQualityFlag"].values.item())
+                    if "oswQualityFlag" in ds_raw else np.nan
+                )
 
                 # Wave height to validate against VHM0 = the product's
                 # integrated total significant wave height (oswTotalHs), which
@@ -2945,23 +3101,42 @@ class DataTreeConverter:
                         "partitions", nc_path.name, valid.size,
                     )
 
-                # Acquisition time from filename (format: YYYYMMDDtHHMMSS)
-                m = re.search(r"(\d{8}t\d{6})", nc_path.stem, re.IGNORECASE)
-                if m:
-                    acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S")
-                else:
-                    # Fallback to global attribute
-                    time_str = ds_raw.attrs.get("firstMeasurementTime")
-                    acq_time = pd.to_datetime(time_str) if time_str else None
+                if "oswLandFlag" not in osw_attrs and "oswLandFlag" in ds_raw:
+                    osw_attrs["oswLandFlag"] = dict(ds_raw["oswLandFlag"].attrs)
 
-                if acq_time is not None:
+                if "oswQualityFlag" not in osw_attrs and "oswQualityFlag" in ds_raw:
+                    osw_attrs["oswQualityFlag"] = dict(ds_raw["oswQualityFlag"].attrs)
+
+                # oswLandFlag and oswQualityFlag mask a vignette
+                # regardless of whether hs came from oswTotalHs directly
+                # or the oswHs-partition fallback. Independent checks -- a
+                # point failing both increments both counters (no dedup).
+                land_reject = False
+                quality_reject = False
+                if np.isfinite(hs):
+                    land_reject = np.isfinite(land_flag) and land_flag == _OSW_LAND_FLAG_REJECT_VALUE
+                    # oswQualityFlag is unpopulated in Sentinel-1 WV OCN
+                    # products today (always the fill value). NaN/fill is
+                    # treated as "no opinion", not a rejection, so this is
+                    # a documented no-op until ESA starts filling it.
+                    quality_reject = np.isfinite(quality_flag) and quality_flag >= _OSW_QUALITY_FLAG_REJECT_THRESHOLD
+                    if land_reject or quality_reject:
+                        hs = np.nan
+
+                # Acquisition time from filename (format: YYYYMMDDtHHMMSS),
+                # falling back to the product attribute.
+                acq_time_ns = _parse_acquisition_time(ds_raw, nc_path.stem, prefer_filename=True)
+
+                if acq_time_ns is not None:
                     point_lons.append(lon)
                     point_lats.append(lat)
                     point_hs.append(hs)
-                    point_times.append(np.datetime64(
-                        acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
-                    ))
+                    point_times.append(acq_time_ns)
                     file_names.append(nc_path.name)
+                    point_land_flag.append(land_flag)
+                    n_land_reject += int(land_reject)
+                    point_quality_flag.append(quality_flag)
+                    n_quality_reject += int(quality_reject)
 
             except Exception as exc:
                 logger.debug("Could not extract oswHs from %s: %s", nc_path.name, exc)
@@ -2972,9 +3147,15 @@ class DataTreeConverter:
             logger.warning("No valid oswTotalHs data extracted from %s", measurement_dir)
             return None
 
+        n_points = len(point_hs)
+        osw_land_pixel_fraction = n_land_reject / n_points
+        osw_quality_masked_pixel_fraction = n_quality_reject / n_points
+
         # Create Dataset with point dimension
         data_vars = {
             "oswTotalHs": (["point"], point_hs),
+            "oswLandFlag": (["point"], point_land_flag),
+            "oswQualityFlag": (["point"], point_quality_flag),
         }
 
         coords = {
@@ -2991,12 +3172,24 @@ class DataTreeConverter:
         ds.attrs["safe_dir"] = safe_dir.name
         ds.attrs["swath_mode"] = "WV"
         ds.attrs["measurement_type"] = "oswTotalHs"
-        ds.attrs["num_points"] = len(point_hs)
+        ds.attrs["num_points"] = n_points
+        ds.attrs["osw_land_pixel_count"] = n_land_reject
+        ds.attrs["osw_land_pixel_fraction"] = osw_land_pixel_fraction
+        ds.attrs["osw_quality_masked_pixel_count"] = n_quality_reject
+        ds.attrs["osw_quality_masked_pixel_fraction"] = osw_quality_masked_pixel_fraction
 
         logger.info(
             "Extracted %d oswTotalHs points from WV product %s",
-            len(point_hs), safe_dir.name
+            n_points, safe_dir.name
         )
+        if n_land_reject or n_quality_reject:
+            logger.warning(
+                "scene %s: OSW points masked -- land=%d/%d (%.1f%%), "
+                "quality=%d/%d (%.1f%%)",
+                safe_dir.name,
+                n_land_reject, n_points, 100 * osw_land_pixel_fraction,
+                n_quality_reject, n_points, 100 * osw_quality_masked_pixel_fraction,
+            )
         return ds
 
     @staticmethod
@@ -3126,21 +3319,12 @@ class DataTreeConverter:
                         )
 
                 # Get acquisition time (scalar for grid)
-                time_str = ds_raw.attrs.get("firstMeasurementTime")
-                if time_str:
-                    acq_time = pd.to_datetime(time_str)
-                    acq_time_ns = np.datetime64(
-                        acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
-                    )
-                else:
-                    m = re.search(r"(\d{8}t\d{6})", rvl_files[0].stem, re.IGNORECASE)
-                    if m:
-                        acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S")
-                        acq_time_ns = np.datetime64(
-                            acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
-                        )
-                    else:
-                        acq_time_ns = np.datetime64("NaT", "ns")
+                parsed_acq_time_ns = _parse_acquisition_time(ds_raw, rvl_files[0].stem)
+                acq_time_ns: np.datetime64 = (
+                    parsed_acq_time_ns
+                    if parsed_acq_time_ns is not None
+                    else np.datetime64("NaT", "ns")
+                )
 
                 # Standard (y, x) naming to mirror the OWI grid, so is_wv_mode
                 # detection and the grid collocation path treat RVL and OWI
@@ -3465,9 +3649,17 @@ class DataTreeConverter:
                 else np.full_like(owi_windspeed, np.nan)
             )
 
+            has_owi_wind_quality = "owiWindQuality" in ds_raw
             owi_windquality = (
                 ds_raw["owiWindQuality"].values
-                if "owiWindQuality" in ds_raw
+                if has_owi_wind_quality
+                else np.full_like(owi_windspeed, np.nan)
+            )
+
+            has_owi_inversion_quality = "owiInversionQuality" in ds_raw
+            owi_inversion_quality = (
+                ds_raw["owiInversionQuality"].values
+                if has_owi_inversion_quality
                 else np.full_like(owi_windspeed, np.nan)
             )
 
@@ -3486,6 +3678,7 @@ class DataTreeConverter:
             # checked -- ice/no_data/rfi are intentionally left unfiltered.
             owi_land_pixel_count = 0
             owi_land_pixel_fraction = float("nan")
+            land_mask = np.zeros(owi_windspeed.shape, dtype=bool)
             if "owiMask" in ds_raw:
                 land_mask = (owi_mask & 1) != 0
                 owi_land_pixel_count = int(np.sum(land_mask))
@@ -3500,22 +3693,57 @@ class DataTreeConverter:
                         100 * owi_land_pixel_fraction,
                     )
 
-            # Get acquisition time (scalar for grid)
-            time_str = ds_raw.attrs.get("firstMeasurementTime")
-            if time_str:
-                acq_time = pd.to_datetime(time_str)
-                acq_time_ns = np.datetime64(
-                    acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
+            # Quality-flag masking. Category names -- not a hardcoded
+            # numeric threshold -- drive rejection, because owiWindQuality's
+            # own numeric encoding (and even its severity direction) changes
+            # between IPF versions; see _OWI_QUALITY_REJECT_LABELS. A flag
+            # missing from the product entirely, or whose flag_meanings
+            # cannot be parsed, never rejects a cell by itself. When both
+            # flags are present, a NaN in only one of them is judged by the
+            # other; a cell NaN in both is rejected.
+            quality_reject = np.zeros(owi_windspeed.shape, dtype=bool)
+            if has_owi_wind_quality:
+                wq_reject = _owi_quality_reject_mask(ds_raw["owiWindQuality"])
+                if wq_reject is not None:
+                    quality_reject |= wq_reject
+            if has_owi_inversion_quality:
+                iq_reject = _owi_quality_reject_mask(ds_raw["owiInversionQuality"])
+                if iq_reject is not None:
+                    quality_reject |= iq_reject
+            if has_owi_wind_quality and has_owi_inversion_quality:
+                quality_reject |= np.isnan(owi_windquality) & np.isnan(owi_inversion_quality)
+
+            owi_quality_masked_pixel_count = int(np.sum(quality_reject))
+            owi_quality_masked_pixel_fraction = (
+                owi_quality_masked_pixel_count / quality_reject.size
+            )
+            if owi_quality_masked_pixel_count > 0:
+                owi_windspeed = np.where(quality_reject, np.nan, owi_windspeed)
+                owi_winddir = np.where(quality_reject, np.nan, owi_winddir)
+                # quality_reject is computed independently of land_mask (see
+                # above), so it commonly overlaps with it -- land cells
+                # routinely carry a "no retrieval" quality code too. Split
+                # the count into cells that were already going to be NaN'd
+                # for land, versus cells this flag newly NaNs, so the
+                # percentage in this message isn't read as if it were on
+                # top of a clean (non-land) grid.
+                newly_masked = quality_reject & ~land_mask
+                newly_masked_count = int(np.sum(newly_masked))
+                logger.warning(
+                    "scene %s: %d/%d OWI cells quality-flagged (%.1f%%) via "
+                    "owiWindQuality/owiInversionQuality (%d already "
+                    "land-flagged, %d newly NaN'd) -- owiWindSpeed/"
+                    "owiWindDirection NaN'd out",
+                    safe_dir.name, owi_quality_masked_pixel_count,
+                    quality_reject.size, 100 * owi_quality_masked_pixel_fraction,
+                    owi_quality_masked_pixel_count - newly_masked_count,
+                    newly_masked_count,
                 )
-            else:
-                m = re.search(r"(\d{8}t\d{6})", owi_files[0].stem, re.IGNORECASE)
-                if m:
-                    acq_time = pd.to_datetime(m.group(1), format="%Y%m%dT%H%M%S")
-                    acq_time_ns = np.datetime64(
-                        acq_time.tz_convert(None) if acq_time.tzinfo else acq_time, "ns"
-                    )
-                else:
-                    acq_time_ns = np.datetime64("NaT", "ns")
+
+            # Get acquisition time (scalar for grid)
+            acq_time_ns = _parse_acquisition_time(ds_raw, owi_files[0].stem)
+            if acq_time_ns is None:
+                acq_time_ns = np.datetime64("NaT", "ns")
 
             # Standard (y, x) naming for the flattened OWI grid.
             dims = ("y", "x")
@@ -3528,6 +3756,7 @@ class DataTreeConverter:
                 "owiIncidenceAngle": (dims, owi_incidence),
                 "owiHeading": (dims, owi_heading),
                 "owiWindQuality": (dims, owi_windquality),
+                "owiInversionQuality": (dims, owi_inversion_quality),
                 "owiMask": (dims, owi_mask),
             }
 
@@ -3550,6 +3779,8 @@ class DataTreeConverter:
             ds.attrs["swath_mode"] = "IW/EW/SM"
             ds.attrs["owi_land_pixel_count"] = owi_land_pixel_count
             ds.attrs["owi_land_pixel_fraction"] = owi_land_pixel_fraction
+            ds.attrs["owi_quality_masked_pixel_count"] = owi_quality_masked_pixel_count
+            ds.attrs["owi_quality_masked_pixel_fraction"] = owi_quality_masked_pixel_fraction
 
             logger.info(
                 "Extracted OWI data from product %s (grid shape: %s)",
@@ -3564,6 +3795,187 @@ class DataTreeConverter:
             ds_raw.close()
 
     @staticmethod
+    def _extract_osw_grid_data(
+        measurement_dir: Path,
+        safe_dir: Union[str, Path],
+    ) -> Optional[xr.Dataset]:
+        """
+        Extract OSW (Ocean Swell Wave) grid data from a SM/IW/EW-mode
+        measurement directory.
+
+        Unlike WV mode (one isolated ~20x20 km vignette per file, extracted
+        as a single point by from_sar_l2_ocn_wv_safe), a SM/IW/EW OCN
+        product is one continuous swath whose OSW data is itself a native
+        grid (oswAzSize x oswRaSize), each cell close to WV's own ~20x20 km
+        footprint but tiled edge-to-edge across the whole strip instead of
+        sampled every ~200 km. This keeps that native grid (renamed to
+        y, x) rather than the coarser owi*-grid-shaped oswHs/owiWl copies
+        the product also ships, since only the native osw grid carries
+        oswTotalHs.
+
+        Returns None if the file lacks an OSW grid entirely (legacy/
+        degenerate product), so the caller can fall back to OWI/RVL.
+        """
+        safe_dir = Path(safe_dir)
+
+        osw_files = sorted(
+            f for f in measurement_dir.glob("*.nc")
+            if "-ocn-" in f.name
+        )
+        if not osw_files:
+            return None
+
+        try:
+            ds_raw = xr.open_dataset(osw_files[0])
+        except Exception as exc:
+            logger.debug("Could not open %s: %s", osw_files[0], exc)
+            return None
+
+        try:
+            if "oswLon" not in ds_raw or "oswHs" not in ds_raw:
+                return None
+
+            osw_lons = ds_raw["oswLon"].values
+            osw_lats = ds_raw["oswLat"].values
+            osw_hs = np.asarray(ds_raw["oswHs"].values, dtype=float)
+            if osw_hs.ndim != 3:
+                logger.debug(
+                    "Unexpected oswHs shape %s in %s; skipping OSW grid",
+                    osw_hs.shape, osw_files[0].name,
+                )
+                return None
+
+            if "oswTotalHs" in ds_raw:
+                osw_total_hs = np.asarray(ds_raw["oswTotalHs"].values, dtype=float)
+                osw_attrs = {"oswTotalHs": dict(ds_raw["oswTotalHs"].attrs)}
+            else:
+                osw_total_hs = np.full(osw_lons.shape, np.nan)
+                osw_attrs = {"oswTotalHs": {
+                    "long_name": "total significant wave height "
+                                 "(mean of oswHs partitions; oswTotalHs absent)",
+                    "units": ds_raw["oswHs"].attrs.get("units", "m"),
+                }}
+
+            # Per-cell fallback: where oswTotalHs is NaN, use the mean of
+            # that cell's own valid (finite, non-fill) oswHs partitions,
+            # not a single grid-wide scalar, matching the per-vignette
+            # fallback in from_sar_l2_ocn_wv_safe. oswTotalHs is commonly
+            # absent for SM products, so this fallback is the normal path
+            # here, not a legacy exception.
+            valid_partitions = np.where(np.isfinite(osw_hs) & (osw_hs > 0), osw_hs, np.nan)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                partition_mean = np.nanmean(valid_partitions, axis=-1)
+            needs_fallback = ~np.isfinite(osw_total_hs)
+            osw_total_hs = np.where(needs_fallback, partition_mean, osw_total_hs)
+
+            osw_land_flag = (
+                np.asarray(ds_raw["oswLandFlag"].values, dtype=float)
+                if "oswLandFlag" in ds_raw else None
+            )
+            osw_quality_flag = (
+                np.asarray(ds_raw["oswQualityFlag"].values, dtype=float)
+                if "oswQualityFlag" in ds_raw else None
+            )
+            if osw_land_flag is not None:
+                osw_attrs["oswLandFlag"] = dict(ds_raw["oswLandFlag"].attrs)
+            if osw_quality_flag is not None:
+                osw_attrs["oswQualityFlag"] = dict(ds_raw["oswQualityFlag"].attrs)
+
+            # oswLandFlag and oswQualityFlag mask a cell regardless of
+            # whether its value came from oswTotalHs directly or the
+            # oswHs-partition fallback. Independent checks -- a cell
+            # failing both increments both counters (no dedup). Only a
+            # cell that was otherwise usable counts as "rejected" -- one
+            # already NaN before masking is not attributed to either flag.
+            was_finite = np.isfinite(osw_total_hs)
+
+            land_reject_mask = np.zeros(osw_total_hs.shape, dtype=bool)
+            if osw_land_flag is not None:
+                land_reject_mask = (
+                    was_finite
+                    & np.isfinite(osw_land_flag)
+                    & (osw_land_flag == _OSW_LAND_FLAG_REJECT_VALUE)
+                )
+
+            # oswQualityFlag is unpopulated in Sentinel-1 OSW products
+            # today (always the fill value, WV and SM alike). NaN/fill is
+            # treated as "no opinion", not a rejection, so this is a
+            # documented no-op until ESA starts filling it.
+            quality_reject_mask = np.zeros(osw_total_hs.shape, dtype=bool)
+            if osw_quality_flag is not None:
+                quality_reject_mask = (
+                    was_finite
+                    & np.isfinite(osw_quality_flag)
+                    & (osw_quality_flag >= _OSW_QUALITY_FLAG_REJECT_THRESHOLD)
+                )
+
+            osw_total_hs = np.where(land_reject_mask | quality_reject_mask, np.nan, osw_total_hs)
+            osw_hs = np.where(
+                (land_reject_mask | quality_reject_mask)[..., np.newaxis],
+                np.nan,
+                osw_hs,
+            )
+
+            n_cells = osw_total_hs.size
+            osw_land_pixel_count = int(np.sum(land_reject_mask))
+            osw_land_pixel_fraction = osw_land_pixel_count / n_cells
+            osw_quality_masked_pixel_count = int(np.sum(quality_reject_mask))
+            osw_quality_masked_pixel_fraction = osw_quality_masked_pixel_count / n_cells
+
+            acq_time_ns = _parse_acquisition_time(ds_raw, osw_files[0].stem)
+            if acq_time_ns is None:
+                acq_time_ns = np.datetime64("NaT", "ns")
+
+            dims = ("y", "x")
+            data_vars = {
+                "oswTotalHs": (dims, osw_total_hs),
+                "oswHs": (dims + ("oswPartitions",), osw_hs),
+            }
+            if osw_land_flag is not None:
+                data_vars["oswLandFlag"] = (dims, osw_land_flag)
+            if osw_quality_flag is not None:
+                data_vars["oswQualityFlag"] = (dims, osw_quality_flag)
+            coords = {
+                "lon": (dims, osw_lons),
+                "lat": (dims, osw_lats),
+                "time": acq_time_ns,
+            }
+
+            ds = xr.Dataset(data_vars, coords=coords)
+            apply_cf_metadata(ds, "sar_osw", osw_attrs)
+            ds.attrs["data_type"] = "sar_l2_ocn"
+            ds.attrs["source"] = "Sentinel-1"
+            ds.attrs["safe_dir"] = safe_dir.name
+            ds.attrs["measurement_type"] = "osw"
+            ds.attrs["swath_mode"] = "IW/EW/SM"
+            ds.attrs["osw_land_pixel_count"] = osw_land_pixel_count
+            ds.attrs["osw_land_pixel_fraction"] = osw_land_pixel_fraction
+            ds.attrs["osw_quality_masked_pixel_count"] = osw_quality_masked_pixel_count
+            ds.attrs["osw_quality_masked_pixel_fraction"] = osw_quality_masked_pixel_fraction
+
+            if osw_land_pixel_count or osw_quality_masked_pixel_count:
+                logger.warning(
+                    "scene %s: OSW cells masked -- land=%d/%d (%.1f%%), "
+                    "quality=%d/%d (%.1f%%)",
+                    safe_dir.name,
+                    osw_land_pixel_count, n_cells, 100 * osw_land_pixel_fraction,
+                    osw_quality_masked_pixel_count, n_cells, 100 * osw_quality_masked_pixel_fraction,
+                )
+
+            logger.info(
+                "Extracted OSW grid from product %s (grid shape: %s)",
+                safe_dir.name, osw_total_hs.shape
+            )
+            return ds
+
+        except Exception as exc:
+            logger.debug("Could not extract OSW grid from %s: %s", osw_files[0], exc)
+            return None
+        finally:
+            ds_raw.close()
+
+    @staticmethod
     def _from_sar_l2_ocn_iw_safe(
         safe_dir: Union[str, Path],
         product_type: str = "wind",
@@ -3573,7 +3985,8 @@ class DataTreeConverter:
 
         Dispatches to the appropriate extraction function based on product_type:
         - "wind": Extracts OWI (Ocean Wind Index) 2D grid data
-        - "waves": Extracts OSW (Ocean Surface Waves) grid data (currently not implemented; tries OWI as fallback)
+        - "waves": Extracts OSW (Ocean Surface Waves) grid data, falling back to OWI or
+          RVL grid data for products without an OSW grid
         - "currents": Extracts RVL (Radial Velocity Linesight) 2D grid data
 
         All returned data maintains 2D grid structure (y, x) for collocation compatibility.
@@ -3616,9 +4029,12 @@ class DataTreeConverter:
                 return ds_rvl
 
         elif product_type.lower() == "waves":
-            # Try OSW extraction for wave products (future implementation)
-            # For now, try OWI as fallback
-            logger.debug("OSW extraction not yet implemented for %s; trying OWI fallback", safe_dir.name)
+            ds = DataTreeConverter._extract_osw_grid_data(measurement_dir, safe_dir)
+            if ds is not None:
+                logger.info("Extracted OSW grid from IW/EW/SM product %s", safe_dir.name)
+                return ds
+            # Legacy/degenerate product with no OSW grid at all.
+            logger.debug("No OSW grid in %s; trying OWI fallback", safe_dir.name)
             ds = DataTreeConverter._extract_owi_grid_data(measurement_dir, safe_dir)
             if ds is not None:
                 ds.attrs["swath_mode"] = "IW/EW/SM"

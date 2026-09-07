@@ -33,6 +33,7 @@ import logging
 import os
 import shutil
 import sys
+import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +42,7 @@ from typing import Iterable, Optional
 import pandas as pd
 
 from .base import build_output_dir, is_date_recent, normalize_datetime, split_antimeridian_bbox
+from .insitu_index_fallback import download_via_index
 
 __all__ = [
     "InSituDownloader",
@@ -56,6 +58,15 @@ logger = logging.getLogger(__name__)
 
 DATASET_ID = "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr"
 ALL_VARIABLES = ["WSPD", "WDIR", "VAVH", "VGHS", "VHM0", "HCDT", "HCSP", "EWCT", "NSCT"]
+
+# Fixed, run-independent location for the raw whole-archive platform files
+# the index fallback downloads (100s of MB each, one per matched platform,
+# covering that platform's entire record for the dataset part). Every run
+# reuses whatever is already here via download_index_files's skip_existing
+# behavior, instead of re-fetching into a fresh per-run folder -- matching
+# hf_radar_historical_downloader.py's _ARCHIVE_CACHE_DIR and
+# ismn_downloader.py's _SHARED_ARCHIVE_CACHE_DIR convention.
+_SHARED_INSITU_INDEX_CACHE_DIR = Path("data") / "_archive_cache" / "insitu_index"
 
 #: Recipe cfg.variable -> the ALL_VARIABLES subset actually comparable to
 #: that physical quantity. "waves" mirrors core/_variable_map.py's own
@@ -247,7 +258,7 @@ class InSituDownloader:
             Filter by platform type(s): mooring, buoy, ferrybox, drifter, tidal_gauge.
             None or empty list means keep all platform types.
         dataset_part : str, optional
-            Which dataset part to use: "monthly" (historical) or "latest" (recent).
+            Which dataset part to use: "history" (historical) or "latest" (recent).
             If None, auto-detects based on whether end_date is within 30 days.
 
         Returns
@@ -323,7 +334,7 @@ class InSituDownloader:
         """
         start_dt = normalize_datetime(start)
         end_dt = normalize_datetime(end)
-        resolved_part = dataset_part or ("latest" if is_date_recent(end_dt) else "monthly")
+        resolved_part = dataset_part or ("latest" if is_date_recent(end_dt) else "history")
         resolved_variables = list(variables) if variables is not None else ALL_VARIABLES
 
         cache_key = (
@@ -358,7 +369,16 @@ class InSituDownloader:
         _fetch_stations_dry shares via its own cache -- split out so the
         cache-hit path never re-imports copernicusmarine or repeats this
         method's own logging for a request another caller already
-        satisfied."""
+        satisfied.
+
+        Falls back to the same per-platform index download the real
+        download() path uses (_fetch_stations_via_index_fallback) whenever
+        read_dataframe() reports NoServiceAvailable for a non-"latest"
+        part -- confirmed live to hit the identical ARCO-service gap
+        subset() has, so a dry check for historical dates (e.g. an older
+        SAR scene's acquisition window) would otherwise always come back
+        "unknown" instead of reflecting real in-situ availability.
+        """
         copernicusmarine = self._get_copernicusmarine()
 
         frames = []
@@ -368,24 +388,76 @@ class InSituDownloader:
                 f"{min_lat:.2f}, {max_lat:.2f}]  window={start_dt} → {end_dt}  "
                 f"dataset={DATASET_ID} ({resolved_part})  variables={resolved_variables}"
             )
-            frames.append(copernicusmarine.read_dataframe(
-                dataset_id=DATASET_ID,
-                dataset_part=resolved_part,
-                variables=resolved_variables,
-                minimum_longitude=win_min_lon,
-                maximum_longitude=win_max_lon,
-                minimum_latitude=min_lat,
-                maximum_latitude=max_lat,
-                start_datetime=start_dt,
-                end_datetime=end_dt,
-                minimum_depth=self.min_depth,
-                maximum_depth=self.max_depth,
-                disable_progress_bar=True,
-            ))
+            try:
+                frames.append(copernicusmarine.read_dataframe(
+                    dataset_id=DATASET_ID,
+                    dataset_part=resolved_part,
+                    variables=resolved_variables,
+                    minimum_longitude=win_min_lon,
+                    maximum_longitude=win_max_lon,
+                    minimum_latitude=min_lat,
+                    maximum_latitude=max_lat,
+                    start_datetime=start_dt,
+                    end_datetime=end_dt,
+                    minimum_depth=self.min_depth,
+                    maximum_depth=self.max_depth,
+                    disable_progress_bar=True,
+                ))
+            except copernicusmarine.core_functions.exceptions.NoServiceAvailable:
+                if resolved_part == "latest":
+                    raise
+                print(
+                    f"  dataset_part='{resolved_part}' has no ARCO service available "
+                    "upstream right now; checking availability via the in-situ index …"
+                )
+                fallback_df = self._fetch_stations_via_index_fallback(
+                    win_min_lon, win_max_lon, min_lat, max_lat,
+                    start_dt, end_dt, resolved_part, resolved_variables,
+                )
+                if fallback_df is not None:
+                    frames.append(fallback_df)
         df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         if df.empty:
             return df
         return df.drop_duplicates().reset_index(drop=True)
+
+    def _fetch_stations_via_index_fallback(
+        self,
+        min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+        start_dt: str, end_dt: str, resolved_part: str, resolved_variables: "list[str]",
+    ) -> "Optional[pd.DataFrame]":
+        """Run download_via_index for one window and read its combined CSV
+        back into a DataFrame from a throwaway scratch file, removed
+        immediately after -- _fetch_stations_uncached's own contract is
+        "no lasting artifact", unlike the real download() path this reuses.
+        The matched platforms' whole-archive .nc files still land in the
+        real persistent shared cache (_SHARED_INSITU_INDEX_CACHE_DIR), so
+        a later dry check or real download covering an overlapping window
+        reuses them rather than re-fetching.
+
+        Deliberately queries every platform type (no platform_codes
+        filter), matching _fetch_stations_dry's own reason for not
+        filtering by source_types until after this shared fetch returns:
+        several source_types can share one identical underlying query
+        within a single recipe run.
+        """
+        scratch_dir = Path(tempfile.mkdtemp(prefix="insitu_dry_check_"))
+        try:
+            found = download_via_index(
+                dataset_id=DATASET_ID,
+                dataset_part=resolved_part,
+                min_lon=min_lon, max_lon=max_lon, min_lat=min_lat, max_lat=max_lat,
+                start_dt=start_dt, end_dt=end_dt,
+                min_depth=self.min_depth, max_depth=self.max_depth,
+                wanted_variables=set(resolved_variables),
+                dest_path=scratch_dir / "dry_check.csv",
+                work_dir=_SHARED_INSITU_INDEX_CACHE_DIR,
+            )
+            if found is None:
+                return None
+            return pd.read_csv(found)
+        finally:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
 
     def check_availability_dry(
         self,
@@ -497,7 +569,7 @@ class InSituDownloader:
         # Auto-detect dataset_part if not provided
         resolved_part = dataset_part
         if resolved_part is None:
-            resolved_part = "latest" if is_date_recent(end_dt) else "monthly"
+            resolved_part = "latest" if is_date_recent(end_dt) else "history"
 
         # Run the copernicusmarine subset call (downloads to CWD by default)
         print("Downloading in-situ data …")
@@ -506,7 +578,12 @@ class InSituDownloader:
         print(f"  Depth:  {self.min_depth} to {self.max_depth} m")
         print(f"  Dataset: {resolved_part}")
 
-        # Try initial dataset_part, with fallback if data not available
+        # Try initial dataset_part; ARCO subsetting is currently unavailable
+        # for any part other than "latest" on this dataset, so fall back to
+        # downloading and parsing the matched original files directly (see
+        # insitu_index_fallback.py) rather than treating that as a hard
+        # failure.
+        used_index_fallback = False
         try:
             self._download_with_part(
                 copernicusmarine,
@@ -514,12 +591,45 @@ class InSituDownloader:
                 min_lon, max_lon, min_lat, max_lat,
                 start_dt, end_dt,
             )
+        except copernicusmarine.core_functions.exceptions.NoServiceAvailable:
+            if resolved_part == "latest":
+                raise
+            print(
+                f"  dataset_part='{resolved_part}' has no ARCO service available "
+                "upstream right now; falling back to per-platform file download "
+                "via the in-situ index …"
+            )
+            found = download_via_index(
+                dataset_id=DATASET_ID,
+                dataset_part=resolved_part,
+                min_lon=min_lon, max_lon=max_lon, min_lat=min_lat, max_lat=max_lat,
+                start_dt=start_dt, end_dt=end_dt,
+                min_depth=self.min_depth, max_depth=self.max_depth,
+                wanted_variables=set(ALL_VARIABLES),
+                dest_path=dest_path,
+                work_dir=_SHARED_INSITU_INDEX_CACHE_DIR,
+                force_download=self.force_download,
+                # Unlike the ARCO/subset() path, this path downloads one
+                # whole-archive file per matched platform -- filtering by
+                # platform type before any file is fetched, rather than
+                # only on the finished CSV below, avoids downloading (e.g.)
+                # an irrelevant HF-radar network's file for a moorings-only
+                # recipe.
+                platform_codes=set(_resolve_platform_codes(source_types)) if source_types else None,
+            )
+            if found is None:
+                logger.debug(
+                    "No in-situ observations found via index fallback for "
+                    "[%s, %s].", start_dt, end_dt,
+                )
+                return None
+            used_index_fallback = True
         except Exception as e:
             error_msg = str(e)
             # Check if error is about data exceeding coordinates (date outside available range)
             if "exceed the dataset coordinates" in error_msg or "out of bounds" in error_msg.lower():
                 # Try the opposite dataset_part
-                alt_dataset_part = "monthly" if resolved_part == "latest" else "latest"
+                alt_dataset_part = "history" if resolved_part == "latest" else "latest"
                 print(f"  Retrying with dataset_part='{alt_dataset_part}' due to: {error_msg[:100]}…")
                 try:
                     self._download_with_part(
@@ -540,24 +650,10 @@ class InSituDownloader:
                 # Not a data availability error, re-raise original
                 raise
 
-        # Move the file (copernicusmarine writes it to CWD) to our output_dir
-        if Path(expected_filename).exists():
-            shutil.move(str(expected_filename), str(dest_path))
-            print(f"  Saved to {dest_path}")
-        elif dest_path.exists():
-            print(f"  Already at {dest_path}")
-        else:
-            # Try to find a recently-created CSV in CWD
-            candidates = sorted(Path(".").glob(f"{DATASET_ID}*.csv"), key=os.path.getmtime, reverse=True)
-            if candidates:
-                shutil.move(str(candidates[0]), str(dest_path))
-                print(f"  Saved to {dest_path}")
-            else:
-                logger.debug(
-                    "No in-situ observations in [%s, %s]; copernicusmarine "
-                    "wrote no output file.", start_dt, end_dt,
-                )
-                return None
+        if not used_index_fallback and not self._move_subset_output(
+            expected_filename, dest_path, start_dt, end_dt,
+        ):
+            return None
 
         # Apply platform-type filter
         if source_types:
@@ -570,6 +666,30 @@ class InSituDownloader:
                     print(f"  Filtered to {len(df)} rows ({', '.join(source_types)})")
 
         return dest_path
+
+    def _move_subset_output(
+        self, expected_filename: str, dest_path: Path, start_dt: str, end_dt: str,
+    ) -> bool:
+        """Move copernicusmarine.subset()'s CWD-written CSV into dest_path.
+        Returns False when subset() produced no file at all for this
+        window -- an empty result, not an error."""
+        if Path(expected_filename).exists():
+            shutil.move(str(expected_filename), str(dest_path))
+            print(f"  Saved to {dest_path}")
+            return True
+        if dest_path.exists():
+            print(f"  Already at {dest_path}")
+            return True
+        candidates = sorted(Path(".").glob(f"{DATASET_ID}*.csv"), key=os.path.getmtime, reverse=True)
+        if candidates:
+            shutil.move(str(candidates[0]), str(dest_path))
+            print(f"  Saved to {dest_path}")
+            return True
+        logger.debug(
+            "No in-situ observations in [%s, %s]; copernicusmarine wrote no output file.",
+            start_dt, end_dt,
+        )
+        return False
 
     def _download_with_part(
         self,

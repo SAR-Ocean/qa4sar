@@ -2097,10 +2097,12 @@ class TestSarEmptyStopsPipeline:
 
         mock_scat_cls.assert_not_called()
 
-    def test_sar_failure_does_not_trigger_the_stop(self, tmp_path):
-        """A SAR download that raises must keep today's behavior (continue
-        to validation downloads, ok=False) -- zero-found and failed are
-        different outcomes."""
+    def test_sar_failure_with_nothing_found_also_stops(self, tmp_path):
+        """A SAR download that raises before ever matching a product (e.g.
+        a THREDDS request timing out on its very first request, confirmed
+        live 2026-08-27) must still gate off validation downloads -- the
+        run is recorded as a failure (ok=False), but found_count == 0 is
+        just as authoritative on a failed entry as on a successful one."""
         recipe = self._recipe_with_validation_source()
         orchestrator = DataOrchestrator(recipe, dry_run=False)
         orchestrator.base_dir = tmp_path
@@ -2112,6 +2114,36 @@ class TestSarEmptyStopsPipeline:
         ) as mock_scat_cls:
             mock_sar = MagicMock()
             mock_sar.download.side_effect = RuntimeError("boom")
+            mock_sar.found_count = 0
+            mock_sar_cls.return_value = mock_sar
+
+            mock_scat = MagicMock()
+            mock_scat.download.return_value = []
+            mock_scat_cls.return_value = mock_scat
+
+            ok = orchestrator.download_all()
+
+        mock_scat_cls.assert_not_called()
+        assert ok is False
+        assert orchestrator.metadata["sar_data_found"] is False
+
+    def test_sar_partial_failure_with_some_found_still_proceeds(self, tmp_path):
+        """A SAR download that raises after already matching/downloading
+        some products (found_count > 0 despite the failure) must still
+        proceed to validation downloads -- there is real SAR data to
+        collocate against, even though the run as a whole is a failure."""
+        recipe = self._recipe_with_validation_source()
+        orchestrator = DataOrchestrator(recipe, dry_run=False)
+        orchestrator.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.sentinel1_l2_ocn_downloader.SARDownloader"
+        ) as mock_sar_cls, patch(
+            "sar_validation.downloaders.scatterometer_downloader.ScatterometerDownloader"
+        ) as mock_scat_cls:
+            mock_sar = MagicMock()
+            mock_sar.download.side_effect = RuntimeError("boom")
+            mock_sar.found_count = 3
             mock_sar_cls.return_value = mock_sar
 
             mock_scat = MagicMock()

@@ -1,0 +1,48 @@
+name: sm_osw_verification_test
+description: 'Small SM-mode waves recipe around the real product used to verify
+  OSW grid extraction (S1A_S3_OCN__2SDV_20190605T171913_...13DE.SAFE, south
+  Pacific near the dateline, 2019-06-05). Not for production validation --
+  just enough scope to manually confirm oswTotalHs/oswHs come out of
+  conversion instead of owiWindSpeed.'
+version: '1.0'
+variable: waves
+variable_specs:
+  components:
+  - significant_wave_height
+geographic_bounds:
+  min_lon: -179.5
+  max_lon: -176.5
+  min_lat: -32.0
+  max_lat: -28.0
+temporal_bounds:
+  start: '2019-06-04'
+  end: '2019-06-07'
+sar_data:
+  source: sentinel1_l2_ocn
+  swath_mode:
+  - SM
+  max_downloads: null
+validation_sources:
+- source_type: altimeter
+  download_kwargs:
+    frequencies:
+    - 1hz
+  collocation_kwargs: {}
+collocation:
+  point_vs_layer:
+    time_tolerance_minutes: 30
+    spatial_tolerance_km: 25
+    interpolation_method: nearest
+    aggregation_window_km: 5.0
+    validation_temporal_averaging_minutes: 30
+    distance_weighting: gaussian
+    gaussian_sigma_km: 2.0
+  sar_footprint_radius_km: 14.0
+  layer_vs_layer:
+    layer_type_specs:
+      altimeter_1hz:
+        time_tolerance_minutes: 180
+        aggregation_window_km: 7.0
+        distance_weighting: equal
+    method: cell-averaging
+output_dir: null

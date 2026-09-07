@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -10,6 +11,7 @@ import pytest
 
 from sar_validation.downloaders import insitu_downloader
 from sar_validation.downloaders.insitu_downloader import (
+    _SHARED_INSITU_INDEX_CACHE_DIR,
     ALL_VARIABLES,
     InSituDownloader,
     variables_for_recipe,
@@ -298,6 +300,134 @@ class TestStationRangesDry:
         assert ranges == {}
 
 
+class TestFetchStationsIndexFallback:
+    """_fetch_stations_uncached must fall back to the same per-platform
+    index download the real download() path uses whenever
+    read_dataframe() reports NoServiceAvailable for a non-"latest" part
+    -- confirmed live to hit the identical ARCO-service gap subset() has,
+    which otherwise leaves every historical-date dry-collocation check
+    (e.g. an older SAR scene's in-situ availability) permanently reporting
+    "unknown" regardless of the real download() path's own fix."""
+
+    def _fake_module_raising_no_service(self):
+        from copernicusmarine.core_functions.exceptions import NoServiceAvailable
+
+        fake_module = MagicMock()
+        fake_module.core_functions.exceptions.NoServiceAvailable = NoServiceAvailable
+
+        def fake_read_dataframe(**kwargs):
+            raise NoServiceAvailable("No service available for dataset with command subset")
+
+        fake_module.read_dataframe.side_effect = fake_read_dataframe
+        return fake_module, NoServiceAvailable
+
+    def test_falls_back_to_index_download_and_reads_the_result(self, monkeypatch, tmp_path):
+        fake_module, _ = self._fake_module_raising_no_service()
+        monkeypatch.setattr(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader._get_copernicusmarine",
+            lambda self: fake_module,
+        )
+
+        def fake_download_via_index(*, dest_path, **kwargs):
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            dest_path.write_text(
+                "variable,platform_id,platform_type,time,longitude,latitude,depth,value,"
+                "value_qc,institution\n"
+                "WSPD,A1,MO,2023-06-01T00:00:00,5.5,62.0,0.0,4.2,1,Org\n"
+            )
+            return dest_path
+
+        with patch(
+            "sar_validation.downloaders.insitu_downloader.download_via_index",
+            side_effect=fake_download_via_index,
+        ) as mock_fallback:
+            dl = InSituDownloader(output_dir=tmp_path)
+            ranges = dl.station_ranges_dry(
+                min_lon=5.0, max_lon=6.0, min_lat=61.0, max_lat=63.0,
+                start="2023-06-01T00:00:00", end="2023-06-02T00:00:00",
+                dataset_part="history",
+            )
+
+        mock_fallback.assert_called_once()
+        assert mock_fallback.call_args.kwargs["dataset_part"] == "history"
+        assert list(ranges.keys()) == ["A1"]
+
+    def test_no_matching_platforms_returns_empty_not_an_error(self, monkeypatch, tmp_path):
+        fake_module, _ = self._fake_module_raising_no_service()
+        monkeypatch.setattr(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader._get_copernicusmarine",
+            lambda self: fake_module,
+        )
+
+        with patch(
+            "sar_validation.downloaders.insitu_downloader.download_via_index",
+            return_value=None,
+        ):
+            dl = InSituDownloader(output_dir=tmp_path)
+            ranges = dl.station_ranges_dry(
+                min_lon=5.0, max_lon=6.0, min_lat=61.0, max_lat=63.0,
+                start="2023-06-01T00:00:00", end="2023-06-02T00:00:00",
+                dataset_part="history",
+            )
+
+        assert ranges == {}
+
+    def test_latest_part_reraises_instead_of_falling_back(self, monkeypatch, tmp_path):
+        """"latest" has always had a working ARCO service -- there is no
+        index file for it to fall back to, and a NoServiceAvailable there
+        is unexpected, so it must surface rather than be swallowed."""
+        fake_module, NoServiceAvailable = self._fake_module_raising_no_service()
+        monkeypatch.setattr(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader._get_copernicusmarine",
+            lambda self: fake_module,
+        )
+
+        with patch(
+            "sar_validation.downloaders.insitu_downloader.download_via_index",
+        ) as mock_fallback, pytest.raises(NoServiceAvailable):
+            dl = InSituDownloader(output_dir=tmp_path)
+            dl.station_ranges_dry(
+                min_lon=5.0, max_lon=6.0, min_lat=61.0, max_lat=63.0,
+                start="2026-08-01T00:00:00", end="2026-08-02T00:00:00",
+                dataset_part="latest",
+            )
+
+        mock_fallback.assert_not_called()
+
+    def test_scratch_directory_is_cleaned_up(self, monkeypatch, tmp_path):
+        """_fetch_stations_uncached's own contract is 'no lasting
+        artifact' -- the scratch CSV used to read the fallback's result
+        back into a DataFrame must not survive the call."""
+        fake_module, _ = self._fake_module_raising_no_service()
+        monkeypatch.setattr(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader._get_copernicusmarine",
+            lambda self: fake_module,
+        )
+        captured_scratch_dir = {}
+
+        def fake_download_via_index(*, dest_path, **kwargs):
+            captured_scratch_dir["path"] = dest_path.parent
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            dest_path.write_text(
+                "variable,platform_id,platform_type,time,longitude,latitude,depth,value,"
+                "value_qc,institution\n"
+            )
+            return dest_path
+
+        with patch(
+            "sar_validation.downloaders.insitu_downloader.download_via_index",
+            side_effect=fake_download_via_index,
+        ):
+            dl = InSituDownloader(output_dir=tmp_path)
+            dl.station_ranges_dry(
+                min_lon=5.0, max_lon=6.0, min_lat=61.0, max_lat=63.0,
+                start="2023-06-01T00:00:00", end="2023-06-02T00:00:00",
+                dataset_part="history",
+            )
+
+        assert not captured_scratch_dir["path"].exists()
+
+
 class TestFetchStationsCache:
     """_fetch_stations_dry's own shared cache: --dry-collocation's five
     real in-situ source types (mooring/buoy/ferrybox/drifter/tidal_gauge)
@@ -458,3 +588,139 @@ class TestVariablesForRecipe:
         for variable, codes in RECIPE_VARIABLE_TO_INSITU_VARIABLES.items():
             for code in codes:
                 assert code in ALL_VARIABLES, f"{variable!r} maps to {code!r}, not a real ALL_VARIABLES member"
+
+
+class TestIndexFallback:
+    """Copernicus Marine's ARCO/subset() service is currently unavailable
+    for this dataset's non-"latest" parts -- download() must fall back to
+    per-platform file download via the in-situ index (insitu_index_fallback
+    .download_via_index) instead of raising, but only for the parts where
+    that gap is actually known to exist."""
+
+    def test_no_service_available_on_historical_part_falls_back_to_index(self, tmp_path):
+        """When subset() reports NoServiceAvailable for the historical
+        part (the ARCO service Copernicus Marine currently does not
+        register for cmems_obs-ins_glo_phybgcwav_mynrt_na_irr's
+        "history"/"monthly" parts), download_via_index must be used
+        instead of raising."""
+        from copernicusmarine.core_functions.exceptions import NoServiceAvailable
+
+        dl = InSituDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+        fake_module.core_functions.exceptions.NoServiceAvailable = NoServiceAvailable
+
+        def fake_subset(**kwargs):
+            raise NoServiceAvailable("No service available for dataset with command subset")
+
+        fake_module.subset.side_effect = fake_subset
+
+        def fake_download_via_index(*, dest_path, **kwargs):
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            dest_path.write_text(
+                "variable,platform_id,platform_type,time,longitude,latitude,depth,value,institution\n"
+            )
+            return dest_path
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}), \
+             patch(
+                 "sar_validation.downloaders.insitu_downloader.download_via_index",
+                 side_effect=fake_download_via_index,
+             ) as mock_fallback:
+            out = dl.download(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2020-01-01", "2020-01-05",
+                dataset_part="history",
+            )
+
+        assert len(out) == 1
+        assert out[0].exists()
+        mock_fallback.assert_called_once()
+        assert mock_fallback.call_args.kwargs["dataset_part"] == "history"
+        assert mock_fallback.call_args.kwargs["work_dir"] == _SHARED_INSITU_INDEX_CACHE_DIR
+        assert mock_fallback.call_args.kwargs["platform_codes"] is None
+
+    def test_index_fallback_narrows_to_requested_platform_codes(self, tmp_path):
+        """A moorings-only recipe (source_types=["mooring"]) must resolve
+        to platform_codes={"MO"} so download_via_index can skip an
+        irrelevant platform's whole-archive file before downloading it,
+        rather than only filtering the finished CSV afterward."""
+        from copernicusmarine.core_functions.exceptions import NoServiceAvailable
+
+        dl = InSituDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+        fake_module.core_functions.exceptions.NoServiceAvailable = NoServiceAvailable
+        fake_module.subset.side_effect = NoServiceAvailable("No service available")
+
+        def fake_download_via_index(*, dest_path, **kwargs):
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            dest_path.write_text(
+                "variable,platform_id,platform_type,time,longitude,latitude,depth,value,institution\n"
+            )
+            return dest_path
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}), \
+             patch(
+                 "sar_validation.downloaders.insitu_downloader.download_via_index",
+                 side_effect=fake_download_via_index,
+             ) as mock_fallback:
+            dl.download(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2020-01-01", "2020-01-05",
+                source_types=["mooring"],
+                dataset_part="history",
+            )
+
+        assert mock_fallback.call_args.kwargs["platform_codes"] == {"MO"}
+
+    def test_no_service_available_on_latest_part_still_raises(self, tmp_path):
+        """"latest" has always had a working ARCO service -- a
+        NoServiceAvailable there is unexpected and should surface, not be
+        silently swallowed into an index-fallback attempt that has no
+        "latest" index file to fetch."""
+        from copernicusmarine.core_functions.exceptions import NoServiceAvailable
+
+        dl = InSituDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+        fake_module.core_functions.exceptions.NoServiceAvailable = NoServiceAvailable
+        fake_module.subset.side_effect = NoServiceAvailable("boom")
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}), \
+             pytest.raises(NoServiceAvailable):
+            dl.download(
+                _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
+                "2026-06-01", "2026-06-05",
+                dataset_part="latest",
+            )
+
+
+class TestMoveSubsetOutput:
+    """_move_subset_output moves copernicusmarine.subset()'s CWD-written
+    CSV into the run's own output_dir -- extracted out of _download_window
+    so its three "where did subset() actually put the file" branches, plus
+    the "it produced nothing" case, are each directly testable."""
+
+    def test_moves_the_expected_filename_from_cwd(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        expected_filename = "some_subset_output.csv"
+        Path(expected_filename).write_text("data")
+        dl = InSituDownloader(output_dir=tmp_path / "out")
+        dest_path = tmp_path / "out" / "renamed.csv"
+        dest_path.parent.mkdir(parents=True)
+
+        found = dl._move_subset_output(expected_filename, dest_path, "2020-01-01", "2020-01-02")
+
+        assert found is True
+        assert dest_path.read_text() == "data"
+        assert not Path(expected_filename).exists()
+
+    def test_returns_false_when_nothing_was_produced(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        dl = InSituDownloader(output_dir=tmp_path / "out")
+        dest_path = tmp_path / "out" / "renamed.csv"
+
+        found = dl._move_subset_output(
+            "nonexistent_expected.csv", dest_path, "2020-01-01", "2020-01-02",
+        )
+
+        assert found is False
+        assert not dest_path.exists()
