@@ -534,6 +534,17 @@ class Recipe:
                 "hycom validation source, or switch the recipe's variable to "
                 "'currents'."
             )
+        _GTS_BUOY_VALID_VARIABLES = {"wind", "waves", "currents"}
+        if data.get("variable") not in _GTS_BUOY_VALID_VARIABLES and any(
+            s.source_type in ("buoy_gts", "buoy_waterfall") for s in validation_sources
+        ):
+            raise ValueError(
+                "source_type 'buoy_gts'/'buoy_waterfall' is only valid for "
+                "'wind', 'waves', or 'currents' recipes -- GTS buoy "
+                "observations carry none of this toolbox's other supported "
+                "variables (e.g. soil moisture). Remove the GTS buoy "
+                "validation source, or switch the recipe's variable."
+            )
 
         config = RecipeConfig(
             name=data["name"],

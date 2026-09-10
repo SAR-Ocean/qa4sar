@@ -527,3 +527,36 @@ class TestExistingWavesRecipesHaveExplicitAltimeterFrequency:
             s for s in recipe.config.validation_sources if s.source_type == "altimeter"
         )
         assert alt_source.download_kwargs == {"frequencies": ["1hz"]}
+
+
+class TestBuoyGtsVariableCheck:
+    def test_buoy_gts_rejected_for_soil_moisture_recipe(self, tmp_path):
+        recipe_dict = {
+            "name": "test", "variable": "soil_moisture",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [{"source_type": "buoy_gts"}],
+        }
+        with pytest.raises(ValueError, match="only valid for 'wind', 'waves', or 'currents'"):
+            Recipe._from_dict(recipe_dict)
+
+    def test_buoy_waterfall_rejected_for_soil_moisture_recipe(self, tmp_path):
+        recipe_dict = {
+            "name": "test", "variable": "soil_moisture",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [{"source_type": "buoy_waterfall"}],
+        }
+        with pytest.raises(ValueError, match="only valid for 'wind', 'waves', or 'currents'"):
+            Recipe._from_dict(recipe_dict)
+
+    @pytest.mark.parametrize("variable", ["wind", "waves", "currents"])
+    def test_buoy_gts_accepted_for_wind_waves_and_currents_recipes(self, tmp_path, variable):
+        recipe_dict = {
+            "name": "test", "variable": variable,
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [{"source_type": "buoy_gts"}],
+        }
+        recipe = Recipe._from_dict(recipe_dict)
+        assert recipe.config.validation_sources[0].source_type == "buoy_gts"
