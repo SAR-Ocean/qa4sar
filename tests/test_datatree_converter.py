@@ -2505,6 +2505,59 @@ class TestBuildDataTreeIncludesGtsBuoy:
         assert tree is None
 
 
+class TestBuildDataTreeWaterfallDedup:
+    def test_copernicus_station_covered_by_gts_is_excluded(self, tmp_path, monkeypatch):
+        base = tmp_path / "run"
+        gts_dir = base / "gts_buoy"
+        gts_dir.mkdir(parents=True)
+        (gts_dir / "gts_buoy_20260830.bufr").write_bytes(b"mocked")
+
+        insitu_dir = base / "copernicus_insitu"
+        insitu_dir.mkdir()
+        pd.DataFrame([
+            {"platform_id": "6600021", "platform_type": "MO",
+             "time": "2026-08-30T08:00:00", "longitude": 13.87, "latitude": 54.88,
+             "variable": "WSPD", "value": 9.0},
+            {"platform_id": "1300002", "platform_type": "MO",
+             "time": "2026-08-30T08:00:00", "longitude": -20.0, "latitude": 10.0,
+             "variable": "WSPD", "value": 5.0},
+        ]).to_csv(insitu_dir / "insitu.csv", index=False)
+
+        gts_frame = pd.DataFrame([{
+            "marineObservingPlatformIdentifier": 6600021,
+            "stationOrSiteName": "Arkona Basin Buoy",
+            "latitude": 54.88, "longitude": 13.87,
+            "year": 2026, "month": 8, "day": 30, "hour": 8, "minute": 0,
+            "windSpeed": 9.0, "windDirection": 191.0,
+        }])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: gts_frame,
+        )
+
+        tree = DataTreeConverter.convert_downloaded_data(base, product_type="wind")
+
+        assert tree is not None
+        insitu_ds = tree["validation/insitu"].to_dataset()
+        assert list(insitu_ds["platform_id"].values) == ["1300002"]
+
+    def test_no_gts_dir_leaves_copernicus_unfiltered(self, tmp_path):
+        base = tmp_path / "run"
+        insitu_dir = base / "copernicus_insitu"
+        insitu_dir.mkdir(parents=True)
+        pd.DataFrame([
+            {"platform_id": "6600021", "platform_type": "MO",
+             "time": "2026-08-30T08:00:00", "longitude": 13.87, "latitude": 54.88,
+             "variable": "WSPD", "value": 9.0},
+        ]).to_csv(insitu_dir / "insitu.csv", index=False)
+
+        tree = DataTreeConverter.convert_downloaded_data(base, product_type="wind")
+
+        assert tree is not None
+        insitu_ds = tree["validation/insitu"].to_dataset()
+        assert list(insitu_ds["platform_id"].values) == ["6600021"]
+
+
 class TestBuildDatatreeHfRadarCopernicus:
     def test_hf_radar_folder_becomes_validation_node(self, tmp_path):
         base = tmp_path / "run"
