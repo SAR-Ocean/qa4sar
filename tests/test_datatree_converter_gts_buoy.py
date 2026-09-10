@@ -233,6 +233,51 @@ class TestFromGtsBuoyBufrCurrents:
         assert ds.sizes["point"] == 1
         assert list(ds["platform_id"].values) == ["1300002"]
 
+    def test_shallowest_row_missing_speed_is_dropped_not_backfilled_from_deeper_row(
+        self, tmp_path, monkeypatch,
+    ):
+        # The shallowest row (depth 0.0) carries no speed of its own, while
+        # a deeper row (depth 10.0) for the same platform/time does carry
+        # one. Selecting the shallowest depth must keep that row's own
+        # fields intact: since it is missing its own required speed, the
+        # whole observation is dropped, rather than the deeper row's speed
+        # being spliced onto the shallow row's depth and direction.
+        frame = _fake_bufr_frame([
+            _current_row(6600021, 54.88, 13.87, 2026, 8, 30, 8, 0, 0.0, np.nan, 90.0),
+            _current_row(6600021, 54.88, 13.87, 2026, 8, 30, 8, 0, 10.0, 0.3, 300.0),
+        ])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: frame,
+        )
+        bufr_path = tmp_path / "gts_buoy_20260830.bufr"
+        bufr_path.write_bytes(b"mocked")
+
+        ds = DataTreeConverter.from_gts_buoy_bufr(bufr_path, product_type="currents")
+
+        assert ds is None
+
+    def test_row_with_no_depth_reported_at_all_is_still_kept(self, tmp_path, monkeypatch):
+        # A single, non-replicated reading with no depth section at all
+        # (depthBelowSeaSurface is NaN for its whole platform/time group)
+        # must still resolve to that one available row rather than being
+        # dropped as an artifact of the depth-selection step.
+        frame = _fake_bufr_frame([
+            _current_row(1300002, 10.0, -20.0, 2026, 8, 30, 8, 0, np.nan, 0.4, 120.0),
+        ])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: frame,
+        )
+        bufr_path = tmp_path / "gts_buoy_20260830.bufr"
+        bufr_path.write_bytes(b"mocked")
+
+        ds = DataTreeConverter.from_gts_buoy_bufr(bufr_path, product_type="currents")
+
+        assert ds is not None
+        assert ds.sizes["point"] == 1
+        assert list(ds["platform_id"].values) == ["1300002"]
+
 
 class TestFromGtsBuoyBufrUnknownProductType:
     def test_unknown_product_type_raises(self, tmp_path):

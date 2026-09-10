@@ -1019,11 +1019,21 @@ class DataTreeConverter:
         if product_type == "currents":
             # Depth-profiled via delayed replication -- one row per
             # depth level per observation. Keep only the shallowest.
+            # Sorting the whole frame by depth and then taking the first
+            # row of each group with head(1) preserves each row intact:
+            # unlike DataFrameGroupBy.first(), which fills each column
+            # independently from the first non-null value seen anywhere
+            # in the group, head(1) never mixes fields sourced from
+            # different depth levels of the same platform/time
+            # observation. A group whose depth is missing for every one
+            # of its rows still resolves to its one available row, since
+            # na_position="last" only affects ordering relative to rows
+            # that do carry a depth, not membership.
             df = df.sort_values("depthBelowSeaSurface", na_position="last")
             group_cols = [
                 "marineObservingPlatformIdentifier", "year", "month", "day", "hour", "minute",
             ]
-            df = df.groupby(group_cols, as_index=False, sort=False).first()
+            df = df.groupby(group_cols, as_index=False, sort=False).head(1)
 
         if product_type == "wind":
             keep = df["windSpeed"].notna() | df["windDirection"].notna()
