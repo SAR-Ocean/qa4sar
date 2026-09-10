@@ -2473,6 +2473,38 @@ class TestBuildDatatreeHfrNoaa:
         assert any("hfr_noaa" in p for p in node_paths)
 
 
+class TestBuildDataTreeIncludesGtsBuoy:
+    def test_gts_buoy_bufr_files_are_converted_into_the_tree(self, tmp_path, monkeypatch):
+        base = tmp_path / "run"
+        gts_dir = base / "gts_buoy"
+        gts_dir.mkdir(parents=True)
+        (gts_dir / "gts_buoy_20260830.bufr").write_bytes(b"mocked")
+
+        frame = pd.DataFrame([{
+            "marineObservingPlatformIdentifier": 6600021,
+            "stationOrSiteName": "Arkona Basin Buoy",
+            "latitude": 54.88, "longitude": 13.87,
+            "year": 2026, "month": 8, "day": 30, "hour": 8, "minute": 0,
+            "windSpeed": 9.0, "windDirection": 191.0,
+        }])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: frame,
+        )
+
+        tree = DataTreeConverter.convert_downloaded_data(base, product_type="wind")
+
+        assert tree is not None
+        (node,) = tree["validation/buoy_gts"].children.values()
+        assert node.to_dataset().sizes["point"] == 1
+
+    def test_no_gts_buoy_dir_is_a_no_op(self, tmp_path):
+        base = tmp_path / "run"
+        base.mkdir()
+        tree = DataTreeConverter.convert_downloaded_data(base, product_type="wind")
+        assert tree is None
+
+
 class TestBuildDatatreeHfRadarCopernicus:
     def test_hf_radar_folder_becomes_validation_node(self, tmp_path):
         base = tmp_path / "run"

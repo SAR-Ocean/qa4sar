@@ -4240,6 +4240,7 @@ class DataTreeConverter:
         - ``S1_L2_OCN/*.SAFE``        → ``sar/<SAFE-name>`` nodes
         - ``S1_L3_SSM/*.tif``          → ``sar/<stem>`` nodes
         - ``copernicus_insitu/*.csv``  → ``validation/<stem>`` nodes
+        - ``gts_buoy/*.bufr``          → ``validation/buoy_gts/<stem>`` nodes
         - ``osi_saf_winds/*.nc``       → ``validation/osi_saf_winds/<stem>`` nodes
         - ``scatterometer/*.nc``       → ``validation/scatterometer/<stem>`` nodes
         - ``scatterometer_hy2b/*.nc``       → ``validation/scatterometer_hy2b/<stem>`` nodes
@@ -4364,6 +4365,21 @@ class DataTreeConverter:
                 if ds is not None:
                     datasets[f"validation/{csv_path.stem}"] = ds
                     logger.info("Converted in-situ CSV: %s", csv_path.name)
+
+        # GTS buoy observations (MARS obstype 181/182). product_type
+        # (this method's own parameter) selects which BUFR section
+        # from_gts_buoy_bufr decodes -- a run only ever validates one
+        # variable, so this never needs to fetch more than one.
+        gts_buoy_dir = base_dir / "gts_buoy"
+        if gts_buoy_dir.exists():
+            for bufr_path in sorted(gts_buoy_dir.glob("*.bufr")):
+                ds = _filtered(
+                    DataTreeConverter.from_gts_buoy_bufr(bufr_path, product_type=product_type),
+                    bufr_path.name,
+                )
+                if ds is not None:
+                    datasets[f"validation/buoy_gts/{bufr_path.stem}"] = ds
+                    logger.info("Converted GTS buoy BUFR: %s", bufr_path.name)
 
         # Delayed-mode in-situ current observations (Copernicus Marine
         # 013_044) — ADCP/Argo/drifter/glider, one dedicated folder per
