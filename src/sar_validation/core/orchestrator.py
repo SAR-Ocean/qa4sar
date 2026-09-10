@@ -1421,6 +1421,16 @@ class DataOrchestrator:
         return self._download_scatterometer_ftp(source, "oceansat3")
 
     def _download_gts_buoy(self, source) -> bool:
+        """Download GTS buoy reports for *source*, which may be a standalone
+        "buoy_gts" validation source or the GTS side of a "buoy_waterfall"
+        source (see download_all's buoy_waterfall loop). Both share the same
+        physical output_dir and always request "buoy_gts"'s own temporal
+        padding (_resolve_temporal_padding_minutes has no distinct entry for
+        "buoy_waterfall", so the two literals currently resolve to the same
+        window regardless), but metadata must be recorded under the calling
+        source's own source_type, not a hardcoded literal, so that
+        _already_succeeded("buoy_waterfall") can find a prior success
+        recorded by this same method on an earlier run."""
         from ..downloaders.gts_buoy_downloader import GTSBuoyDownloader
 
         cfg    = self.recipe.config
@@ -1429,7 +1439,7 @@ class DataOrchestrator:
         out_dir = self.base_dir / "gts_buoy"
 
         return self._run_download(
-            "buoy_gts", out_dir,
+            source.source_type, out_dir,
             lambda: GTSBuoyDownloader(output_dir=out_dir, dry_run=self.dry_run),
             windows,
             lambda start, end: dict(

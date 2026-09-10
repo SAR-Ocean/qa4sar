@@ -144,3 +144,54 @@ class TestBuoyWaterfallDispatch:
         assert ok is True
         mock_gts.assert_not_called()
         assert orch.metadata["downloads"]["buoy_waterfall"] == {"status": "success", "file_count": 3}
+
+    def test_buoy_waterfall_gts_metadata_recorded_under_own_source_type(self, tmp_path):
+        """A buoy_waterfall source's GTS download must record its success
+        under the "buoy_waterfall" metadata key, not under a different
+        validation source's key, since _already_succeeded looks up a
+        prior run's status by the calling source's own source_type."""
+        recipe = _make_recipe(tmp_path, ["buoy_waterfall"])
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        orch._previous_downloads = {"sar": {"status": "success", "found_count": 1}}
+
+        with (
+            patch.object(DataOrchestrator, "_download_insitu", return_value=True),
+            patch(
+                "sar_validation.downloaders.gts_buoy_downloader.GTSBuoyDownloader"
+            ) as mock_cls,
+        ):
+            mock_dl = MagicMock()
+            mock_dl.download.return_value = []
+            mock_cls.return_value = mock_dl
+
+            ok = orch.download_all()
+
+        assert ok is True
+        assert orch.metadata["downloads"]["buoy_waterfall"]["status"] == "dry_run"
+        assert "buoy_gts" not in orch.metadata["downloads"]
+
+    def test_buoy_waterfall_gts_real_success_gates_next_run(self, tmp_path):
+        """A buoy_waterfall GTS success recorded under the
+        "buoy_waterfall" metadata key, as a real download produces, must
+        cause a subsequent run's _already_succeeded gate to skip
+        re-dispatching GTSBuoyDownloader entirely."""
+        recipe = _make_recipe(tmp_path, ["buoy_waterfall"])
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        orch._previous_downloads = {
+            "sar": {"status": "success", "found_count": 1},
+            "buoy_waterfall": {"status": "success", "files": []},
+        }
+
+        with (
+            patch.object(DataOrchestrator, "_download_insitu", return_value=True),
+            patch(
+                "sar_validation.downloaders.gts_buoy_downloader.GTSBuoyDownloader"
+            ) as mock_cls,
+        ):
+            ok = orch.download_all()
+
+        assert ok is True
+        mock_cls.assert_not_called()
+        assert orch.metadata["downloads"]["buoy_waterfall"] == {"status": "success", "files": []}
