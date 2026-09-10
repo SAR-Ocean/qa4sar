@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
+
 from sar_validation.core.orchestrator import DataOrchestrator
 from sar_validation.core.recipe import (
     GeographicBounds,
@@ -71,6 +73,46 @@ class TestBuoyGtsDispatch:
 
 
 class TestBuoyWaterfallDispatch:
+    def test_buoy_waterfall_gts_honors_own_collocation_time_tolerance_override(
+        self, tmp_path,
+    ):
+        """A "buoy_waterfall" source's own
+        collocation_kwargs["time_tolerance_minutes"] override must widen
+        the GTS side's requested download window by that exact amount,
+        since the temporal padding is resolved from the calling source's
+        own source_type rather than a fixed "buoy_gts" literal that never
+        carries this source's override."""
+        config = RecipeConfig(
+            name="test-gts-buoy-override",
+            variable="wind",
+            geographic_bounds=GeographicBounds(min_lon=-10, max_lon=10, min_lat=40, max_lat=55),
+            temporal_bounds=TemporalBounds(start="2026-08-30T00:00:00", end="2026-08-30T12:00:00"),
+            validation_sources=[
+                ValidationDataSource(
+                    source_type="buoy_waterfall",
+                    collocation_kwargs={"time_tolerance_minutes": 999.0},
+                ),
+            ],
+        )
+        recipe = Recipe(config=config)
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.gts_buoy_downloader.GTSBuoyDownloader"
+        ) as mock_cls:
+            mock_dl = MagicMock()
+            mock_dl.download.return_value = []
+            mock_cls.return_value = mock_dl
+
+            source = recipe.config.validation_sources[0]
+            orch._download_gts_buoy(source)
+
+        _, kwargs = mock_dl.download.call_args
+        requested_start = pd.Timestamp(kwargs["start"])
+        nominal_start = pd.Timestamp("2026-08-30T00:00:00")
+        assert nominal_start - requested_start == pd.Timedelta(minutes=999.0)
+
     def test_buoy_waterfall_downloads_both_gts_and_copernicus_insitu(self, tmp_path):
         recipe = _make_recipe(tmp_path, ["buoy_waterfall"])
         orch = DataOrchestrator(recipe, dry_run=True)
@@ -172,17 +214,16 @@ class TestBuoyWaterfallDispatch:
         assert "buoy_gts" not in orch.metadata["downloads"]
 
     def test_buoy_waterfall_gts_real_success_gates_next_run(self, tmp_path):
-        """A buoy_waterfall GTS success recorded under the
-        "buoy_waterfall" metadata key, as a real download produces, must
-        cause a subsequent run's _already_succeeded gate to skip
-        re-dispatching GTSBuoyDownloader entirely."""
+        """A buoy_waterfall GTS success recorded by one DataOrchestrator's
+        actual (non-dry-run) download, under the "buoy_waterfall"
+        metadata key, must cause a second, independently constructed
+        DataOrchestrator that is seeded with that same recorded metadata
+        to skip re-dispatching GTSBuoyDownloader entirely on its own run."""
         recipe = _make_recipe(tmp_path, ["buoy_waterfall"])
-        orch = DataOrchestrator(recipe, dry_run=True)
-        orch.base_dir = tmp_path
-        orch._previous_downloads = {
-            "sar": {"status": "success", "found_count": 1},
-            "buoy_waterfall": {"status": "success", "files": []},
-        }
+
+        first = DataOrchestrator(recipe, dry_run=False)
+        first.base_dir = tmp_path
+        first._previous_downloads = {"sar": {"status": "success", "found_count": 1}}
 
         with (
             patch.object(DataOrchestrator, "_download_insitu", return_value=True),
@@ -190,8 +231,30 @@ class TestBuoyWaterfallDispatch:
                 "sar_validation.downloaders.gts_buoy_downloader.GTSBuoyDownloader"
             ) as mock_cls,
         ):
-            ok = orch.download_all()
+            mock_dl = MagicMock()
+            mock_dl.download.return_value = []
+            mock_cls.return_value = mock_dl
+
+            assert first.download_all() is True
+
+        recorded = first.metadata["downloads"]["buoy_waterfall"]
+        assert recorded["status"] == "success"
+
+        second = DataOrchestrator(recipe, dry_run=True)
+        second.base_dir = tmp_path
+        second._previous_downloads = {
+            "sar": {"status": "success", "found_count": 1},
+            "buoy_waterfall": recorded,
+        }
+
+        with (
+            patch.object(DataOrchestrator, "_download_insitu", return_value=True),
+            patch(
+                "sar_validation.downloaders.gts_buoy_downloader.GTSBuoyDownloader"
+            ) as mock_cls2,
+        ):
+            ok = second.download_all()
 
         assert ok is True
-        mock_cls.assert_not_called()
-        assert orch.metadata["downloads"]["buoy_waterfall"] == {"status": "success", "files": []}
+        mock_cls2.assert_not_called()
+        assert second.metadata["downloads"]["buoy_waterfall"] == recorded

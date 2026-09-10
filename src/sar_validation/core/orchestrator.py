@@ -1424,18 +1424,18 @@ class DataOrchestrator:
         """Download GTS buoy reports for *source*, which may be a standalone
         "buoy_gts" validation source or the GTS side of a "buoy_waterfall"
         source (see download_all's buoy_waterfall loop). Both share the same
-        physical output_dir and always request "buoy_gts"'s own temporal
-        padding (_resolve_temporal_padding_minutes has no distinct entry for
-        "buoy_waterfall", so the two literals currently resolve to the same
-        window regardless), but metadata must be recorded under the calling
-        source's own source_type, not a hardcoded literal, so that
+        physical output_dir. Temporal padding and download metadata are both
+        keyed by the calling source's own source_type, so a source-specific
+        override (e.g. collocation_kwargs["time_tolerance_minutes"] on a
+        "buoy_waterfall" validation source) is honored regardless of which
+        validation-source entry triggered this call, and
         _already_succeeded("buoy_waterfall") can find a prior success
         recorded by this same method on an earlier run."""
         from ..downloaders.gts_buoy_downloader import GTSBuoyDownloader
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        windows = self._padded_temporal_bounds("buoy_gts")
+        windows = self._padded_temporal_bounds(source.source_type)
         out_dir = self.base_dir / "gts_buoy"
 
         return self._run_download(
