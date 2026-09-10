@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
+import pdbufr
 import xarray as xr
 
 from ._cf_metadata import apply_cf_metadata
@@ -941,6 +942,141 @@ class DataTreeConverter:
         ds.attrs["data_type"]     = "insitu_observations"
         ds.attrs["platform_type"] = source_type
         ds.attrs["source"]        = "Copernicus Marine"
+        return ds
+
+    #: BUFR columns to decode per product_type, beyond the shared id
+    #: columns (platform/name/position/time). "currents" additionally
+    #: needs depthBelowSeaSurface to pick the shallowest reported level.
+    _GTS_BUOY_VALUE_COLUMNS = {
+        "wind": ("windSpeed", "windDirection"),
+        "waves": ("significantWaveHeight",),
+        "currents": ("depthBelowSeaSurface", "speedOfCurrent", "directionOfCurrent"),
+    }
+
+    @staticmethod
+    def from_gts_buoy_bufr(
+        bufr_path: Union[str, Path],
+        product_type: str = "wind",
+    ) -> Optional[xr.Dataset]:
+        """
+        Decode a GTS buoy BUFR file (MARS obstype 181/182) into a
+        standardised point-geometry Dataset.
+
+        *product_type* selects which of GTS's optional sections is
+        decoded: ``"wind"`` (``WSPD``/``WDIR``, from the always-present
+        wind block), ``"waves"`` (``VAVH``, time-domain significant wave
+        height), or ``"currents"`` (``EWCT``/``NSCT``, derived from
+        current speed and direction at the shallowest reported depth --
+        deeper levels from GTS's depth-profiled current section are
+        discarded, matching Copernicus Marine in-situ's own single-level
+        current convention). A row missing its product_type's own
+        variable(s) — including the WMO fill value decoded as NaN — is
+        dropped.
+
+        Parameters
+        ----------
+        bufr_path : str or Path
+            Path to a GTS buoy BUFR file, as downloaded by
+            :class:`~sar_validation.downloaders.gts_buoy_downloader.GTSBuoyDownloader`.
+        product_type : {"wind", "waves", "currents"}
+            Which variable group to decode.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="gts_buoy"``, or None on failure or
+            if no row carries the requested observation.
+        """
+        from ._cf_metadata import apply_cf_metadata
+
+        if product_type not in DataTreeConverter._GTS_BUOY_VALUE_COLUMNS:
+            raise ValueError(
+                f"product_type must be one of "
+                f"{sorted(DataTreeConverter._GTS_BUOY_VALUE_COLUMNS)}, got {product_type!r}."
+            )
+
+        bufr_path = Path(bufr_path)
+        if not bufr_path.exists():
+            logger.warning("BUFR file not found: %s", bufr_path)
+            return None
+
+        id_columns = (
+            "marineObservingPlatformIdentifier", "stationOrSiteName",
+            "latitude", "longitude", "year", "month", "day", "hour", "minute",
+        )
+        value_columns = DataTreeConverter._GTS_BUOY_VALUE_COLUMNS[product_type]
+
+        try:
+            df = pdbufr.read_bufr(bufr_path, columns=id_columns + value_columns)
+        except Exception as exc:
+            logger.warning("Could not decode GTS buoy BUFR %s: %s", bufr_path.name, exc)
+            return None
+
+        if df.empty:
+            logger.info("from_gts_buoy_bufr: no rows in %s.", bufr_path.name)
+            return None
+
+        if product_type == "currents":
+            # Depth-profiled via delayed replication -- one row per
+            # depth level per observation. Keep only the shallowest.
+            df = df.sort_values("depthBelowSeaSurface", na_position="last")
+            group_cols = [
+                "marineObservingPlatformIdentifier", "year", "month", "day", "hour", "minute",
+            ]
+            df = df.groupby(group_cols, as_index=False, sort=False).first()
+
+        if product_type == "wind":
+            keep = df["windSpeed"].notna() | df["windDirection"].notna()
+        elif product_type == "waves":
+            keep = df["significantWaveHeight"].notna()
+        else:
+            keep = df["speedOfCurrent"].notna() & df["directionOfCurrent"].notna()
+        df = df[keep]
+        if df.empty:
+            logger.info(
+                "from_gts_buoy_bufr: no %s observations in %s.", product_type, bufr_path.name,
+            )
+            return None
+
+        time = pd.to_datetime(df[["year", "month", "day", "hour", "minute"]]).values
+
+        data_vars: dict = {}
+        if product_type == "wind":
+            data_vars["WSPD"] = ("point", df["windSpeed"].to_numpy(dtype=float))
+            data_vars["WDIR"] = ("point", df["windDirection"].to_numpy(dtype=float))
+        elif product_type == "waves":
+            data_vars["VAVH"] = ("point", df["significantWaveHeight"].to_numpy(dtype=float))
+        else:
+            speed = df["speedOfCurrent"].to_numpy(dtype=float)
+            direction_rad = np.radians(df["directionOfCurrent"].to_numpy(dtype=float))
+            data_vars["EWCT"] = ("point", speed * np.sin(direction_rad))
+            data_vars["NSCT"] = ("point", speed * np.cos(direction_rad))
+
+        data_vars["platform_id"] = (
+            "point", df["marineObservingPlatformIdentifier"].astype(str).to_numpy(),
+        )
+        data_vars["platform_name"] = ("point", df["stationOrSiteName"].astype(str).to_numpy())
+
+        ds = xr.Dataset(
+            data_vars,
+            coords={
+                "lon": ("point", df["longitude"].to_numpy(dtype=float)),
+                "lat": ("point", df["latitude"].to_numpy(dtype=float)),
+                "time": ("point", time),
+            },
+        )
+        apply_cf_metadata(ds, "gts_buoy")
+
+        ds.attrs["data_type"] = "gts_buoy"
+        ds.attrs["platform_type"] = "buoy"
+        ds.attrs["source"] = "GTS (MARS obstype 181/182)"
+        ds.attrs["filename"] = bufr_path.name
+
+        logger.info(
+            "from_gts_buoy_bufr: %s (%s) → %d point(s) from %d platform(s)",
+            bufr_path.name, product_type, ds.sizes["point"],
+            len(set(df["marineObservingPlatformIdentifier"])),
+        )
         return ds
 
     @staticmethod
