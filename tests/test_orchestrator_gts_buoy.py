@@ -14,6 +14,11 @@ from sar_validation.core.recipe import (
 )
 
 
+class _FakePrediction:
+    def __init__(self, verdict: str) -> None:
+        self.verdict = verdict
+
+
 def _make_recipe(tmp_path, source_types):
     config = RecipeConfig(
         name="test-gts-buoy",
@@ -99,3 +104,43 @@ class TestBuoyWaterfallDispatch:
 
         assert ok is True
         mock_gts.assert_called_once()
+
+    def test_buoy_waterfall_gts_side_skipped_when_no_collocation_predicted(self, tmp_path, monkeypatch):
+        """The buoy_waterfall GTS download must honor the same
+        collocation-prediction skip gate as every other dispatch path in
+        download_all(), instead of dispatching unconditionally."""
+        recipe = _make_recipe(tmp_path, ["buoy_waterfall"])
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        orch._previous_downloads = {"sar": {"status": "success", "found_count": 1}}
+        monkeypatch.setattr(
+            orch, "_collocation_predictions",
+            lambda: {"buoy_waterfall": _FakePrediction(verdict="none-predicted")},
+        )
+
+        with patch.object(DataOrchestrator, "_download_gts_buoy", return_value=True) as mock_gts:
+            ok = orch.download_all()
+
+        assert ok is True
+        mock_gts.assert_not_called()
+        assert orch.metadata["downloads"]["buoy_waterfall"]["status"] == "skipped"
+        assert "collocation" in orch.metadata["downloads"]["buoy_waterfall"]["reason"]
+
+    def test_buoy_waterfall_gts_side_skipped_when_already_succeeded(self, tmp_path):
+        """A buoy_waterfall GTS download that already succeeded in a
+        previous run must not be re-dispatched, matching the
+        _already_succeeded gate used by every other dispatch path."""
+        recipe = _make_recipe(tmp_path, ["buoy_waterfall"])
+        orch = DataOrchestrator(recipe, dry_run=True)
+        orch.base_dir = tmp_path
+        orch._previous_downloads = {
+            "sar": {"status": "success", "found_count": 1},
+            "buoy_waterfall": {"status": "success", "file_count": 3},
+        }
+
+        with patch.object(DataOrchestrator, "_download_gts_buoy", return_value=True) as mock_gts:
+            ok = orch.download_all()
+
+        assert ok is True
+        mock_gts.assert_not_called()
+        assert orch.metadata["downloads"]["buoy_waterfall"] == {"status": "success", "file_count": 3}

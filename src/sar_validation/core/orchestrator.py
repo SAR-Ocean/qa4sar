@@ -730,6 +730,19 @@ class DataOrchestrator:
         for source in self.recipe.config.validation_sources:
             if source.source_type != "buoy_waterfall":
                 continue
+            if self._already_succeeded(source.source_type):
+                self.metadata["downloads"][source.source_type] = self._previous_downloads[source.source_type]
+                logger.info(
+                    "Skipping %s: already succeeded in a previous run.",
+                    source.source_type,
+                )
+                continue
+            if self._should_skip_for_collocation(source.source_type):
+                self.metadata["downloads"][source.source_type] = {
+                    "status": "skipped", "reason": "no predicted collocation with SAR data",
+                }
+                logger.info("Skipping %s: no predicted collocation.", source.source_type)
+                continue
             if not self._download_gts_buoy(source):
                 ok = False
 
