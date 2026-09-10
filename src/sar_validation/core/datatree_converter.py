@@ -741,6 +741,7 @@ class DataTreeConverter:
     def from_insitu_csv(
         csv_path: Union[str, Path],
         source_type: str = "mooring",
+        exclude_platform_ids: Optional[set] = None,
     ) -> Optional[xr.Dataset]:
         """
         Convert a Copernicus Marine in-situ CSV to a point-geometry Dataset.
@@ -755,6 +756,11 @@ class DataTreeConverter:
             Path to CSV file (output from the in-situ or HF radar downloader).
         source_type : str
             Platform category; stored as a Dataset attribute.
+        exclude_platform_ids : set of str, optional
+            Platform IDs to drop entirely before conversion, compared as
+            strings. Used by the ``"buoy_waterfall"`` wind source to keep
+            a Copernicus Marine station out of the DataTree once a GTS
+            BUFR file for the same window already covers it.
 
         Returns
         -------
@@ -780,6 +786,27 @@ class DataTreeConverter:
                 )
 
         df["time"] = pd.to_datetime(df["time"])
+
+        # Platform IDs are identifiers, not quantities -- a digit-only ID
+        # such as a WMO buoy number would otherwise round-trip through the
+        # CSV as an integer dtype, which would compare unequal to the
+        # string IDs decoded from GTS BUFR files.
+        if "platform_id" in df.columns:
+            df["platform_id"] = df["platform_id"].astype(str)
+
+        if exclude_platform_ids and "platform_id" in df.columns:
+            before = len(df)
+            df = df[~df["platform_id"].isin(exclude_platform_ids)]
+            dropped = before - len(df)
+            if dropped:
+                logger.info(
+                    "from_insitu_csv: excluded %d row(s) from %d platform ID(s) "
+                    "already covered by GTS.",
+                    dropped, len(exclude_platform_ids),
+                )
+            if df.empty:
+                logger.info("from_insitu_csv: no rows left after platform exclusion in %s.", csv_path.name)
+                return None
 
         # Provenance columns present in Copernicus Marine in-situ exports;
         # captured before the wide-format pivot drops them.
