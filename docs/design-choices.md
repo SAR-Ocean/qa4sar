@@ -290,6 +290,86 @@ that excluding only 4 let a meaningful share of untested cells through.
 > per-column QC filter, `from_hf_radar_grid`'s `QCflag` filter),
 > `core/_cf_metadata.py` (`INSITU_VARIABLE_ATTRS`'s `_QC` entries).
 
+### 3.8 GTS buoy wind/waves/currents, and the GTS/Copernicus Marine waterfall
+
+Three `source_type` values select GTS and/or Copernicus Marine buoy
+data, independent of each other -- a recipe can list any one of them
+(or, unusually, several at once, each dispatched independently) as a
+`validation_sources` entry. All three are valid for a `"wind"`,
+`"waves"`, or `"currents"` recipe (GTS buoys carry none of this
+toolbox's other supported variables, e.g. soil moisture):
+
+- **`buoy`/`mooring`** (unchanged): Copernicus Marine in-situ only, via
+  `InSituDownloader`/`from_insitu_csv`, as before this addition.
+- **`buoy_gts`**: WMO GTS buoy observations only, via `GTSBuoyDownloader`
+  (MARS `obstype=181/182`, moored + drifting buoys) and
+  `from_gts_buoy_bufr`. One MARS request per day already carries every
+  variable GTS reports; `from_gts_buoy_bufr`'s `product_type` argument
+  picks which of the BUFR's optional sections gets decoded for a given
+  recipe's variable: wind (`WSPD`/`WDIR`, from the always-present wind
+  block), significant wave height (`VAVH`, time-domain buoy measurement
+  -- not `VHM0`, since GTS buoys measure rather than model the sea
+  state), or near-surface currents (`EWCT`/`NSCT`, derived from current
+  speed/direction at the *shallowest* of the BUFR's depth-profiled
+  current readings -- deeper levels are discarded, matching Copernicus
+  Marine in-situ's own single-level current convention). Requires MARS
+  access -- a self-registered `api.ecmwf.int` account is not sufficient
+  (only accounts affiliated with an ECMWF Member/Co-operating-State
+  organization can reach MARS observation retrieval); a
+  self-registered-only account's request fails with `ecmwf.API error 1:
+  User has no access to services mars`.
+- **`buoy_waterfall`**: downloads both GTS and Copernicus Marine for the
+  full recipe bbox/window (no bbox-splitting or spatial coverage
+  reasoning -- both sources are always queried in full), then at
+  DataTree-build time drops any Copernicus Marine row whose
+  `platform_id` already appears among the WMO platform IDs GTS reported
+  *for that recipe's variable* in that window's `gts_buoy/*.bufr` files.
+  Matching is plain string equality on the shared 7-digit WMO
+  platform-code numbering both sources use (GTS's
+  `marineObservingPlatformIdentifier`, Copernicus Marine's
+  `platform_id`). Because a pipeline run only ever converts one
+  variable, this dedup can never drop a station's wave or current data
+  just because GTS happened to carry that station's wind instead.
+
+**Why per-station exclusion, not a spatial coverage mask:** GTS coverage
+gaps are per-station, not regional -- some coastal/regional moorings are
+Copernicus-Marine-only and never relayed onto GTS at all, while a
+station GTS does carry sits alongside them in the same bbox. Live
+comparison of one real station present in both feeds (Arkona Basin
+Buoy, WMO 6600021, 2026-08-30, wind) found the two sources agree to
+within instrument rounding wherever both report a value for the same
+hour (max 0.04 m/s, <1° difference) -- they are the same underlying
+observation relayed through two different paths, not independently
+sourced -- but GTS only carried wind for 5 of that day's 24 hours for
+that station, against Copernicus Marine's full 24/24. A spatial mask
+would have wrongly *kept* using the sparser GTS values for a station
+Copernicus Marine covers completely, purely because GTS carries some
+data for it. Per-station exclusion instead lets `buoy_waterfall` prefer
+GTS's usually-similar values where GTS actually reports, and only falls
+back to Copernicus Marine for stations GTS's own feed carries nothing
+for in this window at all.
+
+**Known gap, not fixed by this addition:** unlike Copernicus Marine's
+`WSPD_QC`/`WDIR_QC`/etc. (see the in-situ/HF-radar QC-flag-filtering
+design, `_VALID_QC_CODES` in `datatree_converter.py`), GTS BUFR's
+moored-buoy template (315008) carries no per-observation
+quality/confidence descriptor at all, for wind, waves, or currents --
+`from_gts_buoy_bufr` cannot attach a QC flag to anything it decodes,
+because the WMO template itself has none. A `buoy_gts`/`buoy_waterfall`
+point therefore has strictly less quality information available than an
+equivalent Copernicus Marine point.
+
+**Known judgment call, not independently confirmed:** GTS's wave height
+is mapped to `VAVH` rather than `VHM0` on the assumption that a
+buoy-measured significant wave height behaves like a time-domain
+statistic; some buoy networks instead compute it from spectral moments
+(closer to `VHM0`/Hm0 semantics). Revisit if a live comparison shows a
+systematic mismatch against `VHM0`-sourced references.
+
+> Code: `downloaders/gts_buoy_downloader.py`, `core/datatree_converter.py`
+> (`from_gts_buoy_bufr`, `from_insitu_csv`'s `exclude_platform_ids`),
+> `core/orchestrator.py` (`_download_gts_buoy`, `_INSITU_TYPES`).
+
 ---
 
 ## 4. datatree.nc content choices
