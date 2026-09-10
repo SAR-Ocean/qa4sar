@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["DataOrchestrator"]
 
 # In-situ platform types handled by the InSituDownloader
-_INSITU_TYPES = {"mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"}
+_INSITU_TYPES = {"mooring", "buoy", "buoy_waterfall", "drifter", "ferrybox", "tidal_gauge"}
 
 # Delayed-mode ("historical") source_types, dispatched before any NRT
 # source such that its results can inform whether the NRT counterpart is
@@ -722,6 +722,16 @@ class DataOrchestrator:
                 "Skipping NRT in-situ batch: every requested platform type "
                 "is covered by a historical source for this window."
             )
+
+        # buoy_waterfall additionally needs its own GTS download, on top
+        # of (not instead of) the Copernicus in-situ batch above --
+        # _INSITU_TYPES routes it through that batch for the Copernicus
+        # side, but the GTS side has no batch equivalent to join.
+        for source in self.recipe.config.validation_sources:
+            if source.source_type != "buoy_waterfall":
+                continue
+            if not self._download_gts_buoy(source):
+                ok = False
 
         # 4. Other sources one by one
         for source in self.recipe.config.validation_sources:

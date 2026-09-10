@@ -149,12 +149,14 @@ _SOURCE_COLORS = [
     "#00ff00",
     "#808000", "#42d4f4", "#800080",
     "#bcf60c",
+    "#aaffc3",
 ]
 
 _SOURCE_MARKERS = [
     "o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<", ">",
     "H", "d", "v",
     "H",
+    "o",
 ]
 
 # Fixed, append-only reference order for known validation source/platform
@@ -166,6 +168,7 @@ _CANONICAL_SOURCE_ORDER = [
     "cds_ssm",
     "era5_wind", "era5_waves", "era5_soil_moisture",
     "hycom",
+    "buoy_waterfall",
 ]
 
 

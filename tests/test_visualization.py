@@ -7302,8 +7302,12 @@ class TestHycomCanonicalSourceOrder:
     def test_hycom_present_and_appended_at_end(self):
         from sar_validation.core.visualization import _CANONICAL_SOURCE_ORDER
 
+        # "hycom" no longer occupies the last slot once "buoy_waterfall" is
+        # appended after it -- this only asserts hycom's own permanent slot
+        # (index 16, fixed by the append-only ordering rule) never moves,
+        # not that it is forever the newest entry.
         assert "hycom" in _CANONICAL_SOURCE_ORDER
-        assert _CANONICAL_SOURCE_ORDER[-1] == "hycom"
+        assert _CANONICAL_SOURCE_ORDER.index("hycom") == 16
 
     def test_canonical_source_order_still_in_sync_with_registered_sets(self):
         from sar_validation.core.visualization import _canonical_source_order

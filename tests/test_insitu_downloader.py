@@ -724,3 +724,9 @@ class TestMoveSubsetOutput:
 
         assert found is False
         assert not dest_path.exists()
+
+
+class TestBuoyWaterfallPlatformCode:
+    def test_buoy_waterfall_resolves_to_db(self):
+        from sar_validation.downloaders.insitu_downloader import _resolve_platform_codes
+        assert _resolve_platform_codes(["buoy_waterfall"]) == ["DB"]

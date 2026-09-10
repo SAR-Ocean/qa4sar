@@ -101,6 +101,7 @@ def variables_for_recipe(variable: str) -> "tuple[str, ...]":
 SOURCE_TYPE_TO_PLATFORM = {
     "mooring":     ["MO"],
     "buoy":        ["DB"],
+    "buoy_waterfall": ["DB"],
     "ferrybox":    ["FB"],
     "drifter":     ["DB", "AD"],
     "tidal_gauge": ["TG"],
