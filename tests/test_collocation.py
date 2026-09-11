@@ -2415,12 +2415,10 @@ class TestRunCollocationHycomModelSourceDispatch:
 class TestRunCollocationBuoyWaterfallOverride:
     """Regression test: a recipe's "buoy_waterfall" validation source
     carries its own collocation_kwargs keyed under "buoy_waterfall" in
-    source_type_overrides, but every GTS-side node datatree_converter.py
-    scans in is always grouped under the literal name "buoy_gts",
-    regardless of the recipe's own source_type. Before the fix, the
-    override lookup only ever checked the node's own literal "buoy_gts"
-    name, so a "buoy_waterfall" recipe's override was silently never
-    applied to its GTS-side node."""
+    source_type_overrides. A GTS-side node is always grouped under the
+    literal name "buoy_gts", regardless of the recipe's own source_type,
+    so a "buoy_waterfall" recipe's override must be resolved through
+    that name."""
 
     def _recipe_with_waterfall_override(self, time_tolerance_minutes: int):
         from sar_validation.core.recipe import (
