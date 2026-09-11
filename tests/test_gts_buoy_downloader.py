@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from sar_validation.downloaders.gts_buoy_downloader import GTSBuoyDownloader

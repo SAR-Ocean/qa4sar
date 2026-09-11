@@ -283,3 +283,48 @@ class TestFromGtsBuoyBufrUnknownProductType:
     def test_unknown_product_type_raises(self, tmp_path):
         with pytest.raises(ValueError, match="product_type"):
             DataTreeConverter.from_gts_buoy_bufr(tmp_path / "x.bufr", product_type="soil_moisture")
+
+
+class TestPdbufrOptionalDependency:
+    """
+    ``pdbufr`` is only guaranteed to be installed via the ``gts`` or
+    ``soil_moisture`` extras, so importing this module must succeed even
+    when it is absent; only calling ``from_gts_buoy_bufr`` itself should
+    require it.
+    """
+
+    def test_module_imports_without_pdbufr(self, monkeypatch):
+        import builtins
+        import importlib
+        import sys
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "pdbufr" or name.startswith("pdbufr."):
+                raise ImportError(f"No module named {name!r}")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.delitem(sys.modules, "pdbufr", raising=False)
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        module = importlib.reload(
+            importlib.import_module("sar_validation.core.datatree_converter")
+        )
+        try:
+            assert module.pdbufr is None
+        finally:
+            importlib.reload(module)
+
+    def test_from_gts_buoy_bufr_raises_clear_error_without_pdbufr(
+        self, tmp_path, monkeypatch,
+    ):
+        import sar_validation.core.datatree_converter as dtc_module
+
+        bufr_path = tmp_path / "gts_buoy_20260830.bufr"
+        bufr_path.write_bytes(b"not real bufr")
+
+        monkeypatch.setattr(dtc_module, "pdbufr", None)
+
+        with pytest.raises((ImportError, RuntimeError), match="gts"):
+            dtc_module.DataTreeConverter.from_gts_buoy_bufr(bufr_path)

@@ -26,8 +26,12 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
-import pdbufr
 import xarray as xr
+
+try:
+    import pdbufr
+except ImportError:  # optional dependency, provided by the "gts" extra
+    pdbufr = None
 
 from ._cf_metadata import apply_cf_metadata
 
@@ -1015,6 +1019,13 @@ class DataTreeConverter:
             if no row carries the requested observation.
         """
         from ._cf_metadata import apply_cf_metadata
+
+        if pdbufr is None:
+            raise ImportError(
+                "from_gts_buoy_bufr requires the optional 'pdbufr' dependency, "
+                "which is not installed. Install it with the 'gts' extra, e.g. "
+                "`pip install sar-l2-validation-toolbox[gts]`."
+            )
 
         if product_type not in DataTreeConverter._GTS_BUOY_VALUE_COLUMNS:
             raise ValueError(
