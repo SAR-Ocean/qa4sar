@@ -4279,6 +4279,10 @@ class DataTreeConverter:
         - ``S1_L3_SSM/*.tif``          → ``sar/<stem>`` nodes
         - ``copernicus_insitu/*.csv``  → ``validation/<stem>`` nodes
         - ``gts_buoy/*.bufr``          → ``validation/buoy_gts/<stem>`` nodes
+          (only scanned when *recipe* lists "buoy_gts" or "buoy_waterfall"
+          as a validation source, the same recipe-gating HYCOM below uses
+          to avoid picking up a leftover directory left by an earlier run
+          that shared this *base_dir*)
         - ``osi_saf_winds/*.nc``       → ``validation/osi_saf_winds/<stem>`` nodes
         - ``scatterometer/*.nc``       → ``validation/scatterometer/<stem>`` nodes
         - ``scatterometer_hy2b/*.nc``       → ``validation/scatterometer_hy2b/<stem>`` nodes
@@ -4403,9 +4407,23 @@ class DataTreeConverter:
         # save a BUFR decode, but from_gts_buoy_bufr's own decode is
         # already cheap enough (one file per day) that a second, narrower
         # decode path is not worth the duplication.
+        #
+        # Gated on the current recipe's own validation_sources, not merely
+        # on gts_buoy/ existing on disk: base_dir is keyed only by
+        # bbox/time window, so two separate recipe runs over the same
+        # window share the same base_dir. Without this gate, a later run
+        # that never requested "buoy_gts"/"buoy_waterfall" would still
+        # pick up a leftover gts_buoy/ directory from an earlier run over
+        # the identical window -- the same class of stale-cache
+        # cross-contamination the HYCOM block below guards against by
+        # checking recipe.config.variable == "currents" rather than just
+        # file existence.
         gts_buoy_platform_ids: set = set()
+        gts_buoy_requested = recipe is not None and any(
+            s.source_type in ("buoy_gts", "buoy_waterfall") for s in recipe.config.validation_sources
+        )
         gts_buoy_dir = base_dir / "gts_buoy"
-        if gts_buoy_dir.exists():
+        if gts_buoy_requested and gts_buoy_dir.exists():
             for bufr_path in sorted(gts_buoy_dir.glob("*.bufr")):
                 ds = _filtered(
                     DataTreeConverter.from_gts_buoy_bufr(bufr_path, product_type=product_type),
@@ -4418,17 +4436,26 @@ class DataTreeConverter:
 
         # In-situ CSV (Copernicus Marine). A station already covered by a
         # GTS BUFR file in this window (gts_buoy_platform_ids, populated
-        # above) is excluded here -- this is the "buoy_waterfall" dedup;
-        # it is unconditional whenever gts_buoy/ produced any platform
-        # IDs, since a recipe only ever populates that directory when it
-        # requested "buoy_gts" or "buoy_waterfall" in the first place.
+        # above) is excluded here -- this is the "buoy_waterfall" dedup.
+        # Gated on the current recipe specifically listing "buoy_waterfall"
+        # (not merely on gts_buoy_platform_ids being non-empty): a
+        # "buoy_gts"-alone recipe, combined with some other, non-overlapping
+        # Copernicus source such as "tidal_gauge", must never have its
+        # Copernicus data deduplicated against GTS platform IDs, since
+        # nothing about that recipe asked for the two sources to be
+        # combined.
+        buoy_waterfall_requested = recipe is not None and any(
+            s.source_type == "buoy_waterfall" for s in recipe.config.validation_sources
+        )
         insitu_dir = base_dir / "copernicus_insitu"
         if insitu_dir.exists():
             for csv_path in sorted(insitu_dir.glob("*.csv")):
                 ds = _filtered(
                     DataTreeConverter.from_insitu_csv(
                         csv_path, source_type="insitu",
-                        exclude_platform_ids=gts_buoy_platform_ids or None,
+                        exclude_platform_ids=(
+                            gts_buoy_platform_ids or None if buoy_waterfall_requested else None
+                        ),
                     ),
                     csv_path.name,
                 )
