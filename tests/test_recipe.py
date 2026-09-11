@@ -619,3 +619,42 @@ class TestBuoyGtsAndBuoyCmemsCombinationRejected:
         recipe = Recipe._from_dict(recipe_dict)
         source_types = {s.source_type for s in recipe.config.validation_sources}
         assert source_types == {"buoy_gts", "tidal_gauge"}
+
+    def test_buoy_gts_and_drifter_together_rejected(self, tmp_path):
+        """SOURCE_TYPE_TO_PLATFORM maps "drifter" to ["DB", "AD"] -- "DB"
+        is the exact same Copernicus Marine platform code "buoy_cmems"
+        maps to, so "buoy_gts" + "drifter" downloads and includes the
+        same overlapping drifting-buoy rows the buoy_gts + buoy_cmems
+        rule exists to keep out, undetected unless the check is derived
+        from SOURCE_TYPE_TO_PLATFORM itself rather than hardcoding
+        "buoy_cmems" as the only forbidden pairing."""
+        recipe_dict = {
+            "name": "test", "variable": "wind",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [
+                {"source_type": "buoy_gts"},
+                {"source_type": "drifter"},
+            ],
+        }
+        with pytest.raises(ValueError, match="buoy_waterfall"):
+            Recipe._from_dict(recipe_dict)
+
+    def test_buoy_waterfall_and_drifter_still_accepted(self, tmp_path):
+        """buoy_waterfall itself is excluded from the overlap check -- its
+        own per-station dedup at DataTree-build time already applies to
+        the whole Copernicus CSV regardless of which requested source
+        contributed each row, so combining it with drifter must remain
+        valid."""
+        recipe_dict = {
+            "name": "test", "variable": "wind",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [
+                {"source_type": "buoy_waterfall"},
+                {"source_type": "drifter"},
+            ],
+        }
+        recipe = Recipe._from_dict(recipe_dict)
+        source_types = {s.source_type for s in recipe.config.validation_sources}
+        assert source_types == {"buoy_waterfall", "drifter"}

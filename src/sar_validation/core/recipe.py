@@ -546,17 +546,38 @@ class Recipe:
                 "validation source, or switch the recipe's variable."
             )
         _validation_source_types = {s.source_type for s in validation_sources}
-        if "buoy_gts" in _validation_source_types and "buoy_cmems" in _validation_source_types:
-            raise ValueError(
-                "source_types 'buoy_gts' and 'buoy_cmems' may not both be "
-                "listed as separate validation_sources entries -- GTS mostly "
-                "relays the same physical WMO buoy stations Copernicus "
-                "Marine already reports, so combining them without "
-                "deduplication would double-count overlapping stations in "
-                "validation statistics. Use source_type 'buoy_waterfall' "
-                "instead, which combines both sources with per-station "
-                "deduplication."
-            )
+        if "buoy_gts" in _validation_source_types:
+            # GTS mostly relays the same physical WMO buoy stations
+            # Copernicus Marine's "DB" platform code already reports, so
+            # combining "buoy_gts" with ANY other requested source_type
+            # that also resolves to "DB" would double-count overlapping
+            # stations in validation statistics -- not just "buoy_cmems"
+            # itself (SOURCE_TYPE_TO_PLATFORM maps "drifter" to ["DB",
+            # "AD"], sharing "DB" with "buoy_cmems"). Derived from
+            # SOURCE_TYPE_TO_PLATFORM rather than hardcoding "buoy_cmems"
+            # as the only forbidden pairing, so a future source_type that
+            # also requests "DB" is caught automatically. "buoy_waterfall"
+            # is excluded from this check -- it is the deduplicated
+            # combination this rule exists to steer recipes towards, and
+            # its own dedup at DataTree-build time already applies to the
+            # whole Copernicus CSV regardless of which requested source
+            # contributed each row.
+            from ..downloaders.insitu_downloader import SOURCE_TYPE_TO_PLATFORM  # noqa: PLC0415
+
+            _gts_overlap_codes = set(SOURCE_TYPE_TO_PLATFORM.get("buoy_cmems", []))
+            for _other_type in sorted(_validation_source_types - {"buoy_gts", "buoy_waterfall"}):
+                _other_codes = set(SOURCE_TYPE_TO_PLATFORM.get(_other_type, []))
+                if _gts_overlap_codes & _other_codes:
+                    raise ValueError(
+                        f"source_types 'buoy_gts' and {_other_type!r} may not both be "
+                        "listed as separate validation_sources entries -- GTS mostly "
+                        "relays the same physical WMO buoy stations Copernicus "
+                        f"Marine's {_other_type!r} source_type already reports, so "
+                        "combining them without deduplication would double-count "
+                        "overlapping stations in validation statistics. Use "
+                        "source_type 'buoy_waterfall' instead, which combines both "
+                        "sources with per-station deduplication."
+                    )
 
         config = RecipeConfig(
             name=data["name"],
