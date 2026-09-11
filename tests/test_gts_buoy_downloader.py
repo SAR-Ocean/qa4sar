@@ -87,6 +87,27 @@ class TestGTSBuoyDownloaderExistingFile:
         assert paths == [existing]
         assert existing.read_bytes() == b"already here"
 
+    def test_force_download_re_fetches_an_existing_file(self, tmp_path, monkeypatch):
+        """A truncated or corrupted BUFR file left behind by an
+        interrupted process must be re-fetchable via force_download,
+        rather than requiring manual deletion."""
+        existing = tmp_path / "gts_buoy_20260830.bufr"
+        existing.write_bytes(b"truncated")
+
+        def fake_execute(self, request, target):
+            target.write_bytes(b"freshly downloaded")
+
+        monkeypatch.setattr(GTSBuoyDownloader, "_execute_mars_request", fake_execute)
+
+        dl = GTSBuoyDownloader(output_dir=tmp_path, force_download=True)
+        paths = dl.download(
+            min_lon=-10, max_lon=10, min_lat=40, max_lat=55,
+            start="2026-08-30T00:00:00", end="2026-08-30T12:00:00",
+        )
+
+        assert paths == [existing]
+        assert existing.read_bytes() == b"freshly downloaded"
+
 
 class TestGTSBuoyDownloaderDryRun:
     def test_dry_run_makes_no_request_and_returns_no_files(self, tmp_path, monkeypatch):

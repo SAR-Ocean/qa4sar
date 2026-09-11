@@ -71,6 +71,30 @@ class TestBuoyGtsDispatch:
         _, kwargs = mock_cls.call_args
         assert kwargs["output_dir"] == tmp_path / "gts_buoy"
 
+    def test_force_download_is_forwarded_to_gts_buoy_downloader(self, tmp_path):
+        """A truncated/corrupted BUFR file left by an interrupted process
+        can only be re-fetched via --force-download if the orchestrator's
+        own force_download flag actually reaches GTSBuoyDownloader's
+        constructor -- _already_succeeded already honors self.force_download
+        at the orchestrator level, but that alone does not bypass
+        GTSBuoyDownloader's own already-on-disk skip check."""
+        recipe = _make_recipe(tmp_path, ["buoy_gts"])
+        orch = DataOrchestrator(recipe, dry_run=True, force_download=True)
+        orch.base_dir = tmp_path
+
+        with patch(
+            "sar_validation.downloaders.gts_buoy_downloader.GTSBuoyDownloader"
+        ) as mock_cls:
+            mock_dl = MagicMock()
+            mock_dl.download.return_value = []
+            mock_cls.return_value = mock_dl
+
+            source = recipe.config.validation_sources[0]
+            orch._dispatch_source(source)
+
+        _, kwargs = mock_cls.call_args
+        assert kwargs["force_download"] is True
+
 
 class TestBuoyWaterfallDispatch:
     def test_buoy_waterfall_gts_honors_own_collocation_time_tolerance_override(

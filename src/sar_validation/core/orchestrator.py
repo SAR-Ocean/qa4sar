@@ -1440,7 +1440,9 @@ class DataOrchestrator:
 
         return self._run_download(
             source.source_type, out_dir,
-            lambda: GTSBuoyDownloader(output_dir=out_dir, dry_run=self.dry_run),
+            lambda: GTSBuoyDownloader(
+                output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
+            ),
             windows,
             lambda start, end: dict(
                 min_lon=bounds.min_lon, max_lon=bounds.max_lon,

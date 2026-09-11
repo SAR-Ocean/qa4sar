@@ -58,11 +58,19 @@ class GTSBuoyDownloader:
         Directory to save downloaded BUFR files.
     dry_run : bool
         If True, log what would be downloaded without calling MARS.
+    force_download : bool
+        If True, re-download a day's BUFR file even if it already exists
+        on disk, rather than skipping it. Lets a truncated or corrupted
+        file left behind by an interrupted process be re-fetched instead
+        of requiring manual deletion.
     """
 
-    def __init__(self, output_dir: Path, dry_run: bool = False) -> None:
+    def __init__(
+        self, output_dir: Path, dry_run: bool = False, force_download: bool = False,
+    ) -> None:
         self.output_dir = Path(output_dir)
         self.dry_run = dry_run
+        self.force_download = force_download
 
     def download(
         self,
@@ -103,7 +111,7 @@ class GTSBuoyDownloader:
         while day <= window_end.date():
             target = self._bufr_path_for_day(day)
 
-            if target.exists():
+            if not self.force_download and target.exists():
                 logger.info("  %s: already present (%s), skipping.", day.isoformat(), target.name)
                 downloaded.append(target)
                 day += timedelta(days=1)
