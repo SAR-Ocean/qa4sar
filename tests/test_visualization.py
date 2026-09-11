@@ -799,18 +799,15 @@ class TestSourceStyleMap:
         assert style_lower["altimeter"] == style_title["Altimeter"]
 
     def test_actual_runtime_emitted_buoy_family_labels_get_distinct_styles(self):
-        # Regression test: _CANONICAL_SOURCE_ORDER must track the labels
-        # actually emitted per point at runtime, not the recipe
-        # source_type values -- a Copernicus Marine drifting-buoy
-        # observation's own val_source label comes from
-        # insitu_downloader.PLATFORM_CODE_TO_SOURCE_TYPE["DB"] ("buoy"),
-        # never from the recipe source_type ("buoy_cmems"/"buoy_gts"/
-        # "buoy_waterfall") that requested it. Renaming the recipe
-        # source_type "buoy" to "buoy_cmems" in
-        # _CANONICAL_SOURCE_ORDER without also keeping "buoy" itself
-        # registered previously left "buoy" landing outside the canonical
-        # order entirely, colliding with "altimeter" on the same
-        # palette slot.
+        # _CANONICAL_SOURCE_ORDER must track the labels actually emitted
+        # per point at runtime, not the recipe source_type values -- a
+        # Copernicus Marine drifting-buoy observation's own val_source
+        # label comes from insitu_downloader.PLATFORM_CODE_TO_SOURCE_TYPE
+        # ["DB"] ("buoy"), never from the recipe source_type
+        # ("buoy_cmems"/"buoy_gts"/"buoy_waterfall") that requested it.
+        # _CANONICAL_SOURCE_ORDER must therefore contain "buoy" itself;
+        # an entry for the recipe source_type "buoy_cmems" alone does not
+        # cover it, and "buoy" would then collide with "altimeter"'s slot.
         from sar_validation.core.visualization import _source_style_map
         from sar_validation.downloaders.insitu_downloader import PLATFORM_CODE_TO_SOURCE_TYPE
 

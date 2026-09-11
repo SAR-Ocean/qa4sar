@@ -564,7 +564,7 @@ class Recipe:
             # contributed each row.
             from ..downloaders.insitu_downloader import SOURCE_TYPE_TO_PLATFORM  # noqa: PLC0415
 
-            _gts_overlap_codes = set(SOURCE_TYPE_TO_PLATFORM.get("buoy_cmems", []))
+            _gts_overlap_codes = set(SOURCE_TYPE_TO_PLATFORM["buoy_cmems"])
             for _other_type in sorted(_validation_source_types - {"buoy_gts", "buoy_waterfall"}):
                 _other_codes = set(SOURCE_TYPE_TO_PLATFORM.get(_other_type, []))
                 if _gts_overlap_codes & _other_codes:
