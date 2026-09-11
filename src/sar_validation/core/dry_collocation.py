@@ -2568,7 +2568,21 @@ def _predict_buoy_waterfall(
     include GTS data for whichever of these stations GTS also covers in
     this window, replacing the Copernicus value for that station, and
     that GTS-only coverage beyond what Copernicus reports cannot itself
-    be predicted without live MARS access."""
+    be predicted without live MARS access.
+
+    A "none-predicted" Copernicus-side result is downgraded to "unknown"
+    before being returned, rather than passed through as-is: this
+    source's own GTS side is still, always, unpredictable without live
+    MARS access (see the message above and _predict_buoy_gts), so
+    Copernicus alone finding no stations in the window must not be
+    treated as a confirmed absence of collocation for "buoy_waterfall"
+    as a whole. _should_skip_for_collocation only skips a source on a
+    confirmed "none-predicted" verdict, never on "unknown" -- downgrading
+    here keeps that skip from firing (and silently dropping the GTS
+    download alongside the Copernicus one) based on Copernicus-only
+    information. A genuine Copernicus match ("collocated") is left
+    unchanged, since Copernicus data is then confirmed to be included in
+    the real run regardless of GTS coverage."""
     reference = _predict_insitu(
         source, cfg, sar_footprints, stop_on_first_match=stop_on_first_match,
         query_source_type="buoy_cmems",
@@ -2579,7 +2593,8 @@ def _predict_buoy_waterfall(
         "this window, replacing the Copernicus value for that station; GTS-only coverage "
         "beyond what Copernicus reports cannot itself be predicted without live MARS access."
     )
-    return replace(reference, source_type=source.source_type, message=message)
+    verdict = "unknown" if reference.verdict == "none-predicted" else reference.verdict
+    return replace(reference, source_type=source.source_type, verdict=verdict, message=message)
 
 
 _PREDICATES["buoy_waterfall"] = _predict_buoy_waterfall
