@@ -3915,6 +3915,135 @@ class TestPredictInsitu:
         assert seen_variables != [None]
 
 
+class TestPredictBuoyGtsAndWaterfall:
+    """"buoy_gts" and "buoy_waterfall" are the two GTS-aware in-situ
+    source types (see gts_buoy_downloader.py and orchestrator.py's
+    waterfall dedup). Neither has a lightweight MARS/GTS station-index
+    endpoint to query dry, so both predicates instead run the same
+    Copernicus Marine query _predict_insitu already performs (query_
+    source_type="buoy_cmems") purely as reference data, surfaced via the
+    prediction's message field."""
+
+    def _cfg(self):
+        return SimpleNamespace(
+            variable="waves", collocation=SimpleNamespace(sar_footprint_radius_km=14.0),
+        )
+
+    def _footprint(self):
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        return SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+    def test_buoy_gts_registered(self):
+        from sar_validation.core import dry_collocation
+
+        assert dry_collocation._PREDICATES["buoy_gts"] is dry_collocation._predict_buoy_gts
+
+    def test_buoy_waterfall_registered(self):
+        from sar_validation.core import dry_collocation
+
+        assert dry_collocation._PREDICATES["buoy_waterfall"] is dry_collocation._predict_buoy_waterfall
+
+    def test_buoy_gts_verdict_is_always_unknown_with_caveat_message(self, monkeypatch):
+        """GTS coverage itself cannot be predicted without live MARS
+        access, so "buoy_gts" must always report "unknown", regardless of
+        what the Copernicus-side reference query finds -- even a real
+        Copernicus match must not upgrade the verdict."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        seen_source_types = []
+
+        def _fake_station_ranges_dry(
+            self, min_lon, max_lon, min_lat, max_lat, start, end,
+            source_types=None, dataset_part=None, variables=None,
+        ):
+            seen_source_types.append(source_types)
+            return {"S1": (45.0, 0.0, datetime(2026, 8, 1, 5, 0, 0), datetime(2026, 8, 1, 7, 0, 0))}
+
+        monkeypatch.setattr(InSituDownloader, "station_ranges_dry", _fake_station_ranges_dry)
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="buoy_gts"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+        )
+
+        assert seen_source_types == [["buoy_cmems"]]
+        assert result.verdict == "unknown"
+        assert result.source_type == "buoy_gts"
+        assert result.message is not None
+        assert "cannot be predicted without live MARS access" in result.message
+        assert "buoy_gts" in result.message
+        assert "buoy_waterfall" in result.message
+
+    def test_buoy_gts_caveat_message_present_even_with_no_copernicus_match(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        monkeypatch.setattr(InSituDownloader, "station_ranges_dry", lambda self, *a, **k: {})
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="buoy_gts"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+        )
+
+        assert result.verdict == "unknown"
+        assert result.message is not None
+        assert "cannot be predicted without live MARS access" in result.message
+
+    def test_buoy_waterfall_reflects_real_copernicus_match(self, monkeypatch):
+        """Unlike "buoy_gts", "buoy_waterfall" genuinely will include
+        Copernicus data wherever GTS does not cover a station, so its
+        verdict must be the real Copernicus-side match/no-match result,
+        not a fixed "unknown"."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        seen_source_types = []
+
+        def _fake_station_ranges_dry(
+            self, min_lon, max_lon, min_lat, max_lat, start, end,
+            source_types=None, dataset_part=None, variables=None,
+        ):
+            seen_source_types.append(source_types)
+            return {"S1": (45.0, 0.0, datetime(2026, 8, 1, 5, 0, 0), datetime(2026, 8, 1, 7, 0, 0))}
+
+        monkeypatch.setattr(InSituDownloader, "station_ranges_dry", _fake_station_ranges_dry)
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="buoy_waterfall"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+        )
+
+        assert seen_source_types == [["buoy_cmems"]]
+        assert result.verdict == "collocated"
+        assert result.source_type == "buoy_waterfall"
+        assert result.matched_stations == ["S1"]
+        assert result.message is not None
+        assert "Copernicus Marine coverage only" in result.message
+        assert "GTS" in result.message
+
+    def test_buoy_waterfall_reflects_real_copernicus_no_match(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        monkeypatch.setattr(InSituDownloader, "station_ranges_dry", lambda self, *a, **k: {})
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="buoy_waterfall"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+        )
+
+        assert result.verdict == "none-predicted"
+        assert result.source_type == "buoy_waterfall"
+        assert result.message is not None
+        assert "Copernicus Marine coverage only" in result.message
+
+
 class TestPredictInsituCurrentsHistorical:
     """_predict_insitu_currents_historical is registered under the four
     real orchestrator.py source_type keys (adcp_historical,
