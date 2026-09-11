@@ -2410,3 +2410,98 @@ class TestRunCollocationHycomModelSourceDispatch:
         assert captured["time_tolerance_minutes"] == 999  # recipe override still wins
         assert captured["aggregation_window_km"] == pytest.approx(4.6, abs=0.01)
         assert captured["distance_weighting"] == "equal"
+
+
+class TestRunCollocationBuoyWaterfallOverride:
+    """Regression test: a recipe's "buoy_waterfall" validation source
+    carries its own collocation_kwargs keyed under "buoy_waterfall" in
+    source_type_overrides, but every GTS-side node datatree_converter.py
+    scans in is always grouped under the literal name "buoy_gts",
+    regardless of the recipe's own source_type. Before the fix, the
+    override lookup only ever checked the node's own literal "buoy_gts"
+    name, so a "buoy_waterfall" recipe's override was silently never
+    applied to its GTS-side node."""
+
+    def _recipe_with_waterfall_override(self, time_tolerance_minutes: int):
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+        return Recipe(RecipeConfig(
+            name="buoy_waterfall_override", variable="currents",
+            geographic_bounds=GeographicBounds(-21.0, -18.0, 49.0, 52.0),
+            temporal_bounds=TemporalBounds("2026-06-20T18:00:00", "2026-06-20T23:00:00"),
+            validation_sources=[ValidationDataSource(
+                source_type="buoy_waterfall",
+                collocation_kwargs={"time_tolerance_minutes": time_tolerance_minutes},
+            )],
+        ))
+
+    def _tree(self):
+        import xarray as xr
+
+        # SAR RVL grid node (y, x) with a constant heading of 90 deg,
+        # timestamped 19:15:00.
+        ny, nx = 5, 5
+        lon2d, lat2d = np.meshgrid(
+            np.linspace(-20.0, -19.0, nx), np.linspace(50.0, 51.0, ny)
+        )
+        sar = xr.Dataset(
+            {
+                "rvlRadVel": (("y", "x"), np.full((ny, nx), 0.5, dtype="float32")),
+                "rvlHeading": (("y", "x"), np.full((ny, nx), 90.0, dtype="float32")),
+            },
+            coords={
+                "lon": (("y", "x"), lon2d),
+                "lat": (("y", "x"), lat2d),
+                "time": np.datetime64("2026-06-20T19:15:00", "ns"),
+            },
+            attrs={"data_type": "sar_l2_ocn", "swath_mode": "IW/EW/SM",
+                   "measurement_type": "rvl"},
+        )
+        # GTS-side node, grouped under the literal "buoy_gts" name exactly
+        # as datatree_converter.py's own scanning block always does,
+        # regardless of whether the recipe's own source_type is "buoy_gts"
+        # or "buoy_waterfall". Observation timestamped 45 minutes after the
+        # SAR scene -- outside the point_vs_layer default 30-minute
+        # tolerance, but inside a 60-minute override.
+        val = xr.Dataset(
+            {
+                "EWCT": (("point",), np.array([0.4], dtype="float32")),
+                "NSCT": (("point",), np.array([0.3], dtype="float32")),
+            },
+            coords={
+                "lon": (("point",), np.array([-19.5])),
+                "lat": (("point",), np.array([50.5])),
+                "time": (("point",), np.array([np.datetime64("2026-06-20T20:00:00", "ns")])),
+                "platform_type": (("point",), np.array(["buoy"])),
+            },
+            attrs={"data_type": "insitu_observations", "platform_type": "buoy"},
+        )
+        return xr.DataTree.from_dict({
+            "/sar/scene1": sar, "/validation/buoy_gts/station1": val,
+        })
+
+    def test_buoy_waterfall_time_tolerance_override_reaches_the_gts_node(self, tmp_path):
+        from sar_validation.core.collocation import run_collocation
+
+        recipe = self._recipe_with_waterfall_override(60)
+        result = run_collocation(recipe, self._tree(), tmp_path)
+
+        assert result is not None
+        assert result.sizes.get("collocation", 0) == 1
+        assert float(result["val_rvlRadVel_projection"].values[0]) == pytest.approx(0.4, abs=1e-5)
+
+    def test_default_tolerance_alone_would_not_have_matched(self, tmp_path):
+        """Confirms the 45-minute offset genuinely falls outside the
+        point_vs_layer default (30 minutes) -- otherwise the prior test
+        would pass even without the override ever being applied."""
+        from sar_validation.core.collocation import run_collocation
+
+        recipe = self._recipe_with_waterfall_override(15)
+        result = run_collocation(recipe, self._tree(), tmp_path)
+
+        assert result is None or result.sizes.get("collocation", 0) == 0

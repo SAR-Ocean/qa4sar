@@ -1507,6 +1507,34 @@ def _collocate_wv_points(
     return collocations
 
 
+def _resolve_source_type_override(
+    source_type_overrides: Dict[str, Dict[str, Any]], source_type: str,
+) -> Dict[str, Any]:
+    """Resolve *source_type*'s own collocation_kwargs override out of
+    *source_type_overrides* (keyed by each recipe validation source's own
+    source_type), additionally falling back to a "buoy_waterfall" entry
+    when *source_type* is exactly "buoy_gts".
+
+    datatree_converter.py's GTS buoy scanning block always groups GTS
+    nodes under the literal group name "buoy_gts", regardless of whether
+    the recipe's own validation source is configured as "buoy_gts" or
+    "buoy_waterfall" -- see its own from_gts_buoy_bufr scanning block.
+    A recipe source configured as "buoy_waterfall" therefore has its
+    collocation_kwargs keyed under "buoy_waterfall" in
+    source_type_overrides, which the GTS-side node's own literal
+    "buoy_gts" name would never find without this fallback, silently
+    dropping the override. A literal "buoy_gts"-alone recipe is
+    unaffected: its own override, if any, is already keyed under
+    "buoy_gts" itself and is found on the first lookup, before the
+    fallback is ever consulted.
+    """
+    if source_type in source_type_overrides:
+        return source_type_overrides[source_type]
+    if source_type == "buoy_gts":
+        return source_type_overrides.get("buoy_waterfall", {})
+    return {}
+
+
 def run_collocation(
     recipe,
     datatree: "xr.DataTree",
@@ -1642,7 +1670,7 @@ def run_collocation(
                 source_type = ds.attrs.get("platform_type", name.split("/")[-1])
                 source_metadata[name] = {
                     "source_type": source_type,
-                    "colloc_kwargs": source_type_overrides.get(source_type, {}),
+                    "colloc_kwargs": _resolve_source_type_override(source_type_overrides, source_type),
                 }
             # One level deeper (e.g. validation/osi_saf_winds/<file>)
             for subname, subnode in node.children.items():
@@ -1655,7 +1683,7 @@ def run_collocation(
                     source_type = name
                     source_metadata[path] = {
                         "source_type": source_type,
-                        "colloc_kwargs": source_type_overrides.get(source_type, {}),
+                        "colloc_kwargs": _resolve_source_type_override(source_type_overrides, source_type),
                     }
 
     # Gridded "model" sources (ERA5, HYCOM) -- kept as raw, native
