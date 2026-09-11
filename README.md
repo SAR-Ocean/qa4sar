@@ -428,6 +428,33 @@ Register and generate a token at: https://cds.climate.copernicus.eu
 Note: no `sar-validate --set-credential` command is needed; `cdsapi` reads
 `~/.cdsapirc` natively.
 
+### ECMWF MARS — for GTS moored/drifting buoy downloads
+
+`gts_buoy_downloader` downloads via the
+[`ecmwf-api-client`](https://github.com/ecmwf/ecmwf-api-client) library,
+which reads credentials automatically from `~/.ecmwfapirc`. Create that
+file after registering:
+
+```json
+{
+    "url"   : "https://api.ecmwf.int/v1",
+    "key"   : "<your-api-key>",
+    "email" : "<your-email-address>"
+}
+```
+
+Register and retrieve an API key at: https://api.ecmwf.int/v1/key/
+
+Note: no `sar-validate --set-credential` command is needed;
+`ecmwf-api-client` reads `~/.ecmwfapirc` natively.
+
+MARS observation retrieval (obstype 181/182, which this downloader uses)
+requires an account affiliated with an ECMWF Member or Co-operating State
+organization, typically granted by that organization's Computing
+Representative -- a self-registered-only `api.ecmwf.int` account is not
+sufficient and fails with `ecmwf.API error 1: User has no access to
+services mars`.
+
 ### ISMN — for soil moisture in-situ validation
 
 ISMN has no download API. Register at https://ismn.earth/en/dataviewer/,
