@@ -1066,12 +1066,15 @@ class DataTreeConverter:
             # observation. A group whose depth is missing for every one
             # of its rows still resolves to its one available row, since
             # na_position="last" only affects ordering relative to rows
-            # that do carry a depth, not membership.
-            df = df.sort_values("depthBelowSeaSurface", na_position="last")
+            # that do carry a depth, not membership. kind="stable" makes a
+            # tie between two rows reporting the identical depth resolve
+            # deterministically to the earlier-listed row, rather than an
+            # arbitrary one.
+            df = df.sort_values("depthBelowSeaSurface", na_position="last", kind="stable")
             group_cols = [
                 "marineObservingPlatformIdentifier", "year", "month", "day", "hour", "minute",
             ]
-            df = df.groupby(group_cols, as_index=False, sort=False).head(1)
+            df = df.groupby(group_cols, sort=False).head(1)
 
         if product_type == "wind":
             keep = df["windSpeed"].notna() | df["windDirection"].notna()

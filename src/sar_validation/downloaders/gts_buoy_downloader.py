@@ -1,8 +1,9 @@
 """
-Download moored and drifting buoy wind observations from the WMO Global
-Telecommunication System (GTS), via ECMWF's MARS archive.
+Download moored and drifting buoy wind, wave, and current observations
+from the WMO Global Telecommunication System (GTS), via ECMWF's MARS
+archive.
 
-Requires MARS access. A self-registered ``api.ecmwf.int`` account is NOT
+Requires MARS access. A self-registered ``api.ecmwf.int`` account is not
 sufficient for this -- MARS observation retrieval is only available to
 accounts affiliated with an ECMWF Member or Co-operating State
 organization (typically granted by that organization's Computing
@@ -48,7 +49,7 @@ _OBSTYPE = "181/182"
 
 class GTSBuoyDownloader:
     """
-    Download GTS buoy wind observations via MARS, one BUFR file per
+    Download GTS buoy wind, wave, and current observations via MARS, one BUFR file per
     calendar day covering the requested window.
 
     Parameters
@@ -164,7 +165,9 @@ class GTSBuoyDownloader:
 # ---------------------------------------------------------------------------
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Download GTS buoy wind observations via MARS.")
+    p = argparse.ArgumentParser(
+        description="Download GTS buoy wind, wave, and current observations via MARS."
+    )
     p.add_argument("--min-lon", type=float, required=True)
     p.add_argument("--max-lon", type=float, required=True)
     p.add_argument("--min-lat", type=float, required=True)

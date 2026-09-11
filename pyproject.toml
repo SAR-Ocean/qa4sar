@@ -36,11 +36,12 @@ gportal = ["paramiko"]
 # ERA5 user isn't pointed at soil_moisture's unrelated, much heavier
 # dependencies (pytesmo/ismn/earthaccess/ascat/pdbufr) just to get cdsapi.
 era5 = ["cdsapi"]
-# GTS/MARS buoy wind validation needs the ECMWF Web API client (for MARS
-# access) and pdbufr (to decode the returned BUFR). pdbufr is also pulled
-# in by the soil_moisture extra for a different downloader (H-SAF ASCAT
-# SSM) -- declared again here, standalone, so a wind-only GTS user isn't
-# pointed at soil_moisture's unrelated heavier dependencies just to get it.
+# GTS/MARS buoy wind/wave/current validation needs the ECMWF Web API
+# client (for MARS access) and pdbufr (to decode the returned BUFR).
+# pdbufr is also pulled in by the soil_moisture extra for a different
+# downloader (H-SAF ASCAT SSM) -- declared again here, standalone, so a
+# GTS-only user isn't pointed at soil_moisture's unrelated heavier
+# dependencies just to get it.
 gts = ["ecmwf-api-client", "pdbufr"]
 soil_moisture = ["pytesmo", "ismn", "earthaccess", "ascat", "pdbufr", "pyorbital", "sar-l2-validation-toolbox[era5]"]
 test = ["pytest", "pytest-cov"]
