@@ -798,6 +798,31 @@ class TestSourceStyleMap:
         style_title = _source_style_map(["Altimeter"])
         assert style_lower["altimeter"] == style_title["Altimeter"]
 
+    def test_actual_runtime_emitted_buoy_family_labels_get_distinct_styles(self):
+        # Regression test: _CANONICAL_SOURCE_ORDER must track the labels
+        # actually emitted per point at runtime, not the recipe
+        # source_type values -- a Copernicus Marine drifting-buoy
+        # observation's own val_source label comes from
+        # insitu_downloader.PLATFORM_CODE_TO_SOURCE_TYPE["DB"] ("buoy"),
+        # never from the recipe source_type ("buoy_cmems"/"buoy_gts"/
+        # "buoy_waterfall") that requested it. Renaming the recipe
+        # source_type "buoy" to "buoy_cmems" in
+        # _CANONICAL_SOURCE_ORDER without also keeping "buoy" itself
+        # registered previously left "buoy" landing outside the canonical
+        # order entirely, colliding with "altimeter" on the same
+        # palette slot.
+        from sar_validation.core.visualization import _source_style_map
+        from sar_validation.downloaders.insitu_downloader import PLATFORM_CODE_TO_SOURCE_TYPE
+
+        emitted_labels = sorted(set(PLATFORM_CODE_TO_SOURCE_TYPE.values()) | {"altimeter"})
+        style = _source_style_map(emitted_labels)
+        pairs = [style[name] for name in emitted_labels]
+        assert len(set(pairs)) == len(emitted_labels), (
+            f"Expected every runtime-emitted buoy-family label to get a distinct "
+            f"(color, marker) pair, got collisions: {dict(zip(emitted_labels, pairs))}"
+        )
+        assert style["buoy"] != style["altimeter"]
+
 
 class TestCanonicalSourceOrderStability:
     """_canonical_source_order() must assign each known source a permanent
@@ -812,7 +837,7 @@ class TestCanonicalSourceOrderStability:
     # LAYER_DATA_TYPES. Every one of these must keep this exact slot
     # forever; only newly-registered types may be appended after them.
     _PRE_EXISTING_ORDER = [
-        "altimeter", "buoy_cmems", "drifter", "ferrybox", "hf_radar", "hf_radar_grid",
+        "altimeter", "buoy", "drifter", "ferrybox", "hf_radar", "hf_radar_grid",
         "mooring", "radiometer", "radiometer_ssm", "scatterometer",
         "scatterometer_ssm", "tidal_gauge",
     ]
@@ -824,7 +849,7 @@ class TestCanonicalSourceOrderStability:
         assert canonical[: len(self._PRE_EXISTING_ORDER)] == self._PRE_EXISTING_ORDER
 
     def test_newly_registered_source_is_appended_not_inserted(self):
-        # cds_ssm sorts alphabetically between "buoy_cmems" and "drifter"; a
+        # cds_ssm sorts alphabetically between "buoy" and "drifter"; a
         # correct append-only order must NOT place it there.
         from sar_validation.core.visualization import _canonical_source_order
 
@@ -841,6 +866,19 @@ class TestCanonicalSourceOrderStability:
             ("#9467bd", "v"), ("#8c564b", "P"), ("#e377c2", "X"), ("#469990", "*"),
             ("#f032e6", "h"), ("#e6194b", "p"), ("#000080", "8"), ("#ffff00", "<"),
         ]
+
+    def test_buoy_cmems_reserved_slot_does_not_disturb_later_entries(self):
+        # "buoy_cmems" is a recipe source_type, never itself an emitted
+        # val_source label -- its reserved slot sits at the very end of
+        # the list so hycom's and buoy_waterfall's own permanent slots
+        # (see TestHycomCanonicalSourceOrder) are unaffected by its
+        # presence.
+        from sar_validation.core.visualization import _canonical_source_order
+
+        canonical = _canonical_source_order()
+        assert canonical.index("buoy_cmems") == len(canonical) - 1
+        assert canonical.index("hycom") == 16
+        assert canonical.index("buoy_waterfall") == 17
 
     def test_raises_when_order_list_drifts_out_of_sync_with_registered_sets(self, monkeypatch):
         # If a new source type is ever added to LAYER_DATA_TYPES/_INSITU_TYPES

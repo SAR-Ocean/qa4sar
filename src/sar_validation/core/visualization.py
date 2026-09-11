@@ -141,7 +141,11 @@ __all__ = [
 ]
 
 # Colour palette used for validation sources (cycles if more sources than
-# colours). 
+# colours). Kept at least as long as _CANONICAL_SOURCE_ORDER (see
+# TestHycomCanonicalSourceOrder.test_source_colors_and_markers_have_enough_entries)
+# so every canonical entry -- including reserved, never-emitted slots like
+# "buoy_cmems" -- gets its own distinct (color, marker) pair rather than
+# wrapping onto an earlier entry's.
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#469990",
@@ -150,6 +154,7 @@ _SOURCE_COLORS = [
     "#808000", "#42d4f4", "#800080",
     "#bcf60c",
     "#aaffc3",
+    "#a9a9a9",
 ]
 
 _SOURCE_MARKERS = [
@@ -157,19 +162,47 @@ _SOURCE_MARKERS = [
     "H", "d", "v",
     "H",
     "o",
+    "D",
 ]
 
 # Fixed, append-only reference order for known validation source/platform
-# types. Each name's *list position* is its permanent color/marker slot
+# types. Each name's *list position* is its permanent color/marker slot.
+#
+# This list tracks the runtime-emitted val_source labels a per-point
+# observation actually carries, not the recipe source_type values a
+# validation_sources entry is configured with. A Copernicus Marine
+# drifting-buoy observation's own label comes from
+# insitu_downloader.PLATFORM_CODE_TO_SOURCE_TYPE["DB"], which is the
+# provider-agnostic instrument-category label "buoy" -- distinct from the
+# recipe source_type "buoy_cmems"/"buoy_gts"/"buoy_waterfall" that
+# requested it. "buoy" therefore keeps its own permanent slot here, at the
+# same index it has always held.
 _CANONICAL_SOURCE_ORDER = [
-    "altimeter", "buoy_cmems", "drifter", "ferrybox", "hf_radar", "hf_radar_grid",
+    "altimeter", "buoy", "drifter", "ferrybox", "hf_radar", "hf_radar_grid",
     "mooring", "radiometer", "radiometer_ssm", "scatterometer",
     "scatterometer_ssm", "tidal_gauge",
     "cds_ssm",
     "era5_wind", "era5_waves", "era5_soil_moisture",
     "hycom",
     "buoy_waterfall",
+    # "buoy_cmems" is a recipe source_type, never itself an emitted
+    # val_source label (see the module comment above) -- it is only kept
+    # here, in a reserved slot at the end, to satisfy
+    # _canonical_source_order()'s own consistency guard, which requires
+    # every _INSITU_TYPES member to appear somewhere in this list.
+    "buoy_cmems",
 ]
+
+#: Names present in _CANONICAL_SOURCE_ORDER that are runtime-emitted
+#: val_source labels rather than recipe source_type values, so they are
+#: never members of LAYER_DATA_TYPES | _INSITU_TYPES. "buoy" is
+#: insitu_downloader.PLATFORM_CODE_TO_SOURCE_TYPE["DB"]'s label -- distinct
+#: from the recipe source_types "buoy_cmems"/"buoy_gts"/"buoy_waterfall"
+#: that request Copernicus Marine or GTS drifting-buoy data. Added to
+#: _canonical_source_order()'s "registered" side of its consistency check
+#: so a genuinely known, intentional case does not trip that guard, without
+#: weakening the guard's ability to catch a real, unregistered drift.
+_EMITTED_LABEL_ONLY = {"buoy"}
 
 
 # ---------------------------------------------------------------------------
@@ -188,12 +221,18 @@ def _canonical_source_order() -> List[str]:
 
     Raises ``AssertionError`` if a source type exists elsewhere in the
     codebase but is missing from this order, rather than silently
-    reshuffling every other source's color.
+    reshuffling every other source's color. _EMITTED_LABEL_ONLY entries
+    (runtime val_source labels rather than recipe source_type values) are
+    folded into the registered side of the comparison, since they are
+    never members of LAYER_DATA_TYPES/_INSITU_TYPES by design -- this does
+    not weaken the guard against a genuinely new, unregistered source
+    type, since only the known, explicitly listed exceptions in
+    _EMITTED_LABEL_ONLY are exempted.
     """
     from .collocation import LAYER_DATA_TYPES  # noqa: PLC0415
     from .orchestrator import _INSITU_TYPES  # noqa: PLC0415
 
-    registered = set(LAYER_DATA_TYPES) | set(_INSITU_TYPES)
+    registered = set(LAYER_DATA_TYPES) | set(_INSITU_TYPES) | _EMITTED_LABEL_ONLY
     known = set(_CANONICAL_SOURCE_ORDER)
     if registered != known:
         missing = sorted(registered - known)
