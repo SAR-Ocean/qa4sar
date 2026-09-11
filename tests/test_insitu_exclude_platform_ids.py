@@ -70,3 +70,30 @@ class TestExcludePlatformIds:
         )
 
         assert ds is None
+
+    def test_blank_platform_id_row_does_not_corrupt_other_rows_ids(self, tmp_path):
+        """A numeric-looking platform_id column containing even one blank
+        value makes pandas infer float64 for the whole column (to
+        accommodate NaN); a naive astype(str) on that column then yields
+        "6600021.0" rather than "6600021" for every clean row, a value
+        that can never match the plain-string platform ID decoded from
+        GTS BUFR -- silently disabling exclude_platform_ids matching.
+        Reading platform_id with an explicit string dtype keeps every
+        clean row's ID exact and preserves the blank row's own value as a
+        missing string rather than fabricating the literal text "nan"."""
+        rows = [
+            _row("6600021", "WSPD", 9.0),
+            _row("", "WSPD", 3.0, lon=14.0, lat=55.0),
+            _row("1300002", "WSPD", 5.0),
+        ]
+        path = _write_long_csv(tmp_path, rows)
+
+        ds = DataTreeConverter.from_insitu_csv(
+            path, source_type="buoy", exclude_platform_ids={"6600021"},
+        )
+
+        assert ds is not None
+        remaining_ids = sorted(str(v) for v in ds["platform_id"].values)
+        assert "6600021" not in remaining_ids
+        assert "6600021.0" not in remaining_ids
+        assert "1300002" in remaining_ids

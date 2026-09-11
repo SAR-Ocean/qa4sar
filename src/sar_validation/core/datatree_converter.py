@@ -776,7 +776,16 @@ class DataTreeConverter:
             logger.warning("CSV not found: %s", csv_path)
             return None
 
-        df = pd.read_csv(csv_path)
+        # platform_id is read as an explicit string dtype rather than left
+        # to pandas' own type inference: an all-numeric platform_id column
+        # containing even one missing/blank value is otherwise inferred as
+        # float64 (to accommodate NaN), so a later astype(str) call would
+        # yield "6600021.0" instead of "6600021" for every row -- a value
+        # that can never match the plain-string platform ID decoded from
+        # GTS BUFR, silently disabling the exclude_platform_ids matching
+        # the "buoy_waterfall" dedup depends on. Pandas ignores this dtype
+        # key harmlessly when platform_id is absent from a given CSV.
+        df = pd.read_csv(csv_path, dtype={"platform_id": "string"})
 
         # Normalise column names
         rename = {"longitude": "lon", "latitude": "lat"}
