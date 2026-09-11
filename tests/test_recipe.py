@@ -560,3 +560,62 @@ class TestBuoyGtsVariableCheck:
         }
         recipe = Recipe._from_dict(recipe_dict)
         assert recipe.config.validation_sources[0].source_type == "buoy_gts"
+
+    def test_buoy_waterfall_accepted_standalone(self, tmp_path):
+        recipe_dict = {
+            "name": "test", "variable": "wind",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [{"source_type": "buoy_waterfall"}],
+        }
+        recipe = Recipe._from_dict(recipe_dict)
+        assert recipe.config.validation_sources[0].source_type == "buoy_waterfall"
+
+    def test_buoy_cmems_accepted_standalone(self, tmp_path):
+        recipe_dict = {
+            "name": "test", "variable": "wind",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [{"source_type": "buoy_cmems"}],
+        }
+        recipe = Recipe._from_dict(recipe_dict)
+        assert recipe.config.validation_sources[0].source_type == "buoy_cmems"
+
+
+class TestBuoyGtsAndBuoyCmemsCombinationRejected:
+    """buoy_gts and buoy_cmems mostly relay the same physical WMO buoy
+    stations -- listing both as separate validation sources would
+    double-count overlapping stations in validation statistics.
+    buoy_waterfall exists precisely to combine both sources with
+    per-station deduplication and must be used instead."""
+
+    def test_buoy_gts_and_buoy_cmems_together_rejected(self, tmp_path):
+        recipe_dict = {
+            "name": "test", "variable": "wind",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [
+                {"source_type": "buoy_gts"},
+                {"source_type": "buoy_cmems"},
+            ],
+        }
+        with pytest.raises(ValueError, match="buoy_waterfall"):
+            Recipe._from_dict(recipe_dict)
+
+    def test_buoy_gts_with_unrelated_copernicus_source_still_accepted(self, tmp_path):
+        """buoy_gts combined with a non-overlapping Copernicus source (e.g.
+        tidal_gauge) is unaffected -- the rejection is specific to
+        buoy_gts + buoy_cmems together, not to buoy_gts alongside any
+        other Copernicus Marine source_type."""
+        recipe_dict = {
+            "name": "test", "variable": "wind",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [
+                {"source_type": "buoy_gts"},
+                {"source_type": "tidal_gauge"},
+            ],
+        }
+        recipe = Recipe._from_dict(recipe_dict)
+        source_types = {s.source_type for s in recipe.config.validation_sources}
+        assert source_types == {"buoy_gts", "tidal_gauge"}

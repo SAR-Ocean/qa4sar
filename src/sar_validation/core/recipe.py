@@ -545,6 +545,18 @@ class Recipe:
                 "variables (e.g. soil moisture). Remove the GTS buoy "
                 "validation source, or switch the recipe's variable."
             )
+        _validation_source_types = {s.source_type for s in validation_sources}
+        if "buoy_gts" in _validation_source_types and "buoy_cmems" in _validation_source_types:
+            raise ValueError(
+                "source_types 'buoy_gts' and 'buoy_cmems' may not both be "
+                "listed as separate validation_sources entries -- GTS mostly "
+                "relays the same physical WMO buoy stations Copernicus "
+                "Marine already reports, so combining them without "
+                "deduplication would double-count overlapping stations in "
+                "validation statistics. Use source_type 'buoy_waterfall' "
+                "instead, which combines both sources with per-station "
+                "deduplication."
+            )
 
         config = RecipeConfig(
             name=data["name"],
