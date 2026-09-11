@@ -2114,7 +2114,7 @@ class TestASCATSoilMoistureDownloaderZipExtraction:
 
 class TestInsituPlatformCodeMapping:
     def test_resolve_platform_codes_dedupes_shared_db(self):
-        codes = _resolve_platform_codes(["buoy", "drifter"])
+        codes = _resolve_platform_codes(["buoy_cmems", "drifter"])
         assert codes == ["DB", "AD"]
 
     def test_resolve_platform_codes_unknown_source_type_raises(self):
@@ -2928,7 +2928,7 @@ class TestOrchestratorDepthResolution:
             output_dir=str(tmp_path),
             validation_sources=[
                 ValidationDataSource(source_type="mooring"),
-                ValidationDataSource(source_type="buoy"),
+                ValidationDataSource(source_type="buoy_cmems"),
             ],
         ))
         orchestrator = DataOrchestrator(recipe, dry_run=True)
@@ -2957,7 +2957,7 @@ class TestOrchestratorDepthResolution:
             output_dir=str(tmp_path),
             validation_sources=[
                 ValidationDataSource(source_type="mooring", min_depth=-5.0, max_depth=5.0),
-                ValidationDataSource(source_type="buoy"),  # unspecified -> -20/20
+                ValidationDataSource(source_type="buoy_cmems"),  # unspecified -> -20/20
             ],
         ))
         orchestrator = DataOrchestrator(recipe, dry_run=True)

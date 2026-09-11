@@ -162,7 +162,7 @@ _SOURCE_MARKERS = [
 # Fixed, append-only reference order for known validation source/platform
 # types. Each name's *list position* is its permanent color/marker slot
 _CANONICAL_SOURCE_ORDER = [
-    "altimeter", "buoy", "drifter", "ferrybox", "hf_radar", "hf_radar_grid",
+    "altimeter", "buoy_cmems", "drifter", "ferrybox", "hf_radar", "hf_radar_grid",
     "mooring", "radiometer", "radiometer_ssm", "scatterometer",
     "scatterometer_ssm", "tidal_gauge",
     "cds_ssm",

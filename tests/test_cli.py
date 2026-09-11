@@ -908,7 +908,7 @@ class TestIsAlreadyDownloaded:
         assert _is_already_downloaded(tmp_path, recipe) is True
 
     def test_true_when_recorded_insitu_key_covers_individual_insitu_source_types(self, tmp_path):
-        """DataOrchestrator._download_insitu batches mooring/buoy/drifter/
+        """DataOrchestrator._download_insitu batches mooring/buoy_cmems/drifter/
         ferrybox/tidal_gauge under a single "insitu" downloads key, not one
         key per source_type -- a recipe requesting e.g. just "mooring" must
         still match against a recorded "insitu" key (no false re-download
@@ -922,7 +922,7 @@ class TestIsAlreadyDownloaded:
             "variable": "wind",
             "downloads": {
                 "sar": {"status": "success"},
-                "insitu": {"status": "success", "source_types": ["mooring", "buoy"]},
+                "insitu": {"status": "success", "source_types": ["mooring", "buoy_cmems"]},
             },
         }))
         recipe = Recipe(RecipeConfig(
@@ -930,7 +930,7 @@ class TestIsAlreadyDownloaded:
             variable="wind",
             validation_sources=[
                 ValidationDataSource(source_type="mooring"),
-                ValidationDataSource(source_type="buoy"),
+                ValidationDataSource(source_type="buoy_cmems"),
             ],
         ))
         assert _is_already_downloaded(tmp_path, recipe) is True
@@ -1007,7 +1007,7 @@ class TestBuildWindConfigEra5:
 
     def test_radarsat2_also_gets_era5(self):
         """validation_sources isn't conditioned on sar_source elsewhere in
-        this template (mooring/buoy/etc. are shared by every source) --
+        this template (mooring/buoy_cmems/etc. are shared by every source) --
         era5 follows the same pattern."""
         from sar_validation.cli import _build_wind_config
 

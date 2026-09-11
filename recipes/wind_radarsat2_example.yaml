@@ -30,7 +30,7 @@ validation_sources:
 - source_type: mooring
   download_kwargs: {}
   collocation_kwargs: {}
-- source_type: buoy
+- source_type: buoy_cmems
   download_kwargs: {}
   collocation_kwargs: {}
 - source_type: ferrybox

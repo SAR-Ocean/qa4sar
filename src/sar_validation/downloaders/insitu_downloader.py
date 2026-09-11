@@ -14,7 +14,7 @@ Library usage::
     paths = dl.download(
         min_lon=-20, max_lon=0, min_lat=35, max_lat=60,
         start="2026-01-01", end="2026-01-02",
-        source_types=["mooring", "buoy"],
+        source_types=["mooring", "buoy_cmems"],
     )
 
 CLI usage::
@@ -22,7 +22,7 @@ CLI usage::
     python -m sar_validation.downloaders.insitu_downloader \\
         --min-lon -20 --max-lon 0 --min-lat 35 --max-lat 60 \\
         --start 2026-01-01 --end 2026-01-02 \\
-        --source-types mooring,buoy,tidal_gauge
+        --source-types mooring,buoy_cmems,tidal_gauge
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ def variables_for_recipe(variable: str) -> "tuple[str, ...]":
 # drifter).
 SOURCE_TYPE_TO_PLATFORM = {
     "mooring":     ["MO"],
-    "buoy":        ["DB"],
+    "buoy_cmems":  ["DB"],
     "buoy_waterfall": ["DB"],
     "ferrybox":    ["FB"],
     "drifter":     ["DB", "AD"],
@@ -132,7 +132,7 @@ _fetch_stations_cache: "dict[tuple, pd.DataFrame]" = {}
 #: One lock per cache key (created lazily, guarded by
 #: _fetch_stations_locks_guard), not one lock for the whole cache: a
 #: predict_collocation run's own ThreadPoolExecutor checks --dry-collocation's
-#: five real in-situ source types (mooring/buoy/ferrybox/drifter/
+#: five real in-situ source types (mooring/buoy_cmems/ferrybox/drifter/
 #: tidal_gauge) concurrently, and every one of them shares the exact same
 #: bbox/window/dataset_part/variables for a single recipe run (cfg.variable
 #: is recipe-wide, not per-source) -- without this cache, that concurrency
@@ -256,7 +256,7 @@ class InSituDownloader:
         Parameters
         ----------
         source_types : list[str], optional
-            Filter by platform type(s): mooring, buoy, ferrybox, drifter, tidal_gauge.
+            Filter by platform type(s): mooring, buoy_cmems, ferrybox, drifter, tidal_gauge.
             None or empty list means keep all platform types.
         dataset_part : str, optional
             Which dataset part to use: "history" (historical) or "latest" (recent).
@@ -738,7 +738,7 @@ def _parse_args(argv=None):
     p.add_argument("--max-depth", type=float, default=20.0)
     p.add_argument(
         "--source-types",
-        help="Comma-separated: mooring,buoy,ferrybox,drifter,tidal_gauge",
+        help="Comma-separated: mooring,buoy_cmems,ferrybox,drifter,tidal_gauge",
     )
     p.add_argument("--output-dir", default=None)
     p.add_argument("--dry-run", action="store_true")

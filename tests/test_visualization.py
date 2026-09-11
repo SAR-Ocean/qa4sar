@@ -757,7 +757,7 @@ class TestSourceStyleMap:
 
     def test_distinct_known_sources_get_distinct_styles(self):
         from sar_validation.core.visualization import _source_style_map
-        style = _source_style_map(["altimeter", "radiometer", "mooring", "buoy"])
+        style = _source_style_map(["altimeter", "radiometer", "mooring", "buoy_cmems"])
         colors = [c for c, _ in style.values()]
         markers = [m for _, m in style.values()]
         assert len(set(colors)) == 4
@@ -812,7 +812,7 @@ class TestCanonicalSourceOrderStability:
     # LAYER_DATA_TYPES. Every one of these must keep this exact slot
     # forever; only newly-registered types may be appended after them.
     _PRE_EXISTING_ORDER = [
-        "altimeter", "buoy", "drifter", "ferrybox", "hf_radar", "hf_radar_grid",
+        "altimeter", "buoy_cmems", "drifter", "ferrybox", "hf_radar", "hf_radar_grid",
         "mooring", "radiometer", "radiometer_ssm", "scatterometer",
         "scatterometer_ssm", "tidal_gauge",
     ]
@@ -824,7 +824,7 @@ class TestCanonicalSourceOrderStability:
         assert canonical[: len(self._PRE_EXISTING_ORDER)] == self._PRE_EXISTING_ORDER
 
     def test_newly_registered_source_is_appended_not_inserted(self):
-        # cds_ssm sorts alphabetically between "buoy" and "drifter"; a
+        # cds_ssm sorts alphabetically between "buoy_cmems" and "drifter"; a
         # correct append-only order must NOT place it there.
         from sar_validation.core.visualization import _canonical_source_order
 

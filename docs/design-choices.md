@@ -294,13 +294,18 @@ that excluding only 4 let a meaningful share of untested cells through.
 
 Three `source_type` values select GTS and/or Copernicus Marine buoy
 data, independent of each other -- a recipe can list any one of them
-(or, unusually, several at once, each dispatched independently) as a
-`validation_sources` entry. All three are valid for a `"wind"`,
-`"waves"`, or `"currents"` recipe (GTS buoys carry none of this
-toolbox's other supported variables, e.g. soil moisture):
+as a `validation_sources` entry. `buoy_gts` and `buoy_cmems` may not be
+listed together as separate entries in the same recipe, because they
+mostly relay the same physical WMO stations and combining them without
+deduplication would double-count overlapping stations in validation
+statistics; `buoy_waterfall` exists precisely to combine both sources
+with per-station deduplication, and a recipe wanting both must use it
+instead. All three are valid for a `"wind"`, `"waves"`, or `"currents"`
+recipe (GTS buoys carry none of this toolbox's other supported
+variables, e.g. soil moisture):
 
-- **`buoy`/`mooring`** (unchanged): Copernicus Marine in-situ only, via
-  `InSituDownloader`/`from_insitu_csv`, as before this addition.
+- **`buoy_cmems`/`mooring`**: Copernicus Marine in-situ only, via
+  `InSituDownloader`/`from_insitu_csv`.
 - **`buoy_gts`**: WMO GTS buoy observations only, via `GTSBuoyDownloader`
   (MARS `obstype=181/182`, moored + drifting buoys) and
   `from_gts_buoy_bufr`. One MARS request per day already carries every
@@ -877,7 +882,7 @@ invariant does not apply here):
 They're correlated but not identical — confirmed live 2026-08-10 against
 `recipes/waves_era5_and_satellites2.yaml`: mooring platform `6200442`
 reported `VAVH=1.0` and `VHM0=1.1` for the same reading. Copernicus Marine
-in-situ platforms (mooring/tidal_gauge/drifter/buoy) are the only sources
+in-situ platforms (mooring/tidal_gauge/drifter/buoy_cmems) are the only sources
 that can report both in the same row — altimeter only ever produces
 `VAVH`, ERA5 only ever produces `VHM0` — since `insitu_downloader.py`
 requests the full `ALL_VARIABLES` set regardless of which codes a given

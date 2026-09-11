@@ -2374,7 +2374,7 @@ def _predict_insitu(
     source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
 ) -> SourcePrediction:
     """Predicate for the five real Copernicus Marine in-situ source
-    types (mooring, buoy, drifter, ferrybox, tidal_gauge) -- see
+    types (mooring, buoy_cmems, drifter, ferrybox, tidal_gauge) -- see
     orchestrator.py's _INSITU_TYPES. Unlike those five types' real
     (non-dry) download path, which batches every requested platform type
     into one InSituDownloader.download(source_types=[...]) call,
@@ -2490,7 +2490,7 @@ def _predict_insitu(
     )
 
 
-for _insitu_type in ("mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"):
+for _insitu_type in ("mooring", "buoy_cmems", "drifter", "ferrybox", "tidal_gauge"):
     _PREDICATES[_insitu_type] = _predict_insitu
 
 

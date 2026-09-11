@@ -86,7 +86,7 @@ class TestNoDataOutcome:
             out = dl.download(
                 _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
                 "2026-06-01", "2026-06-05",
-                source_types=["mooring", "buoy"],
+                source_types=["mooring", "buoy_cmems"],
             )
 
         assert out == []
@@ -157,8 +157,8 @@ class TestCheckAvailabilityDry:
 
     def test_check_availability_dry_filters_by_source_types(self, monkeypatch, tmp_path):
         """Data exists, but only from a mooring ("MO") platform -- a
-        caller asking for "buoy" ("DB") specifically must not see it as
-        available, even though the raw fetch was non-empty."""
+        caller asking for "buoy_cmems" ("DB") specifically must not see it
+        as available, even though the raw fetch was non-empty."""
         fake_copernicusmarine = _FakeCopernicusMarineModule(has_data=True, platform_type="MO")
         monkeypatch.setattr(
             "sar_validation.downloaders.insitu_downloader.InSituDownloader._get_copernicusmarine",
@@ -169,7 +169,7 @@ class TestCheckAvailabilityDry:
         result = dl.check_availability_dry(
             min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0,
             start="2026-08-01T00:00:00", end="2026-08-01T01:00:00",
-            source_types=["buoy"],
+            source_types=["buoy_cmems"],
         )
 
         assert result is False
@@ -282,8 +282,9 @@ class TestStationRangesDry:
         assert ranges["B2"][:2] == (20.0, -5.0)
 
     def test_filters_by_source_types(self, monkeypatch, tmp_path):
-        """Only "MO" (mooring) rows exist -- a caller asking for "buoy"
-        ("DB") specifically must not see that station at all."""
+        """Only "MO" (mooring) rows exist -- a caller asking for
+        "buoy_cmems" ("DB") specifically must not see that station at
+        all."""
         fake_copernicusmarine = _FakeCopernicusMarineModule(has_data=True, platform_type="MO")
         monkeypatch.setattr(
             "sar_validation.downloaders.insitu_downloader.InSituDownloader._get_copernicusmarine",
@@ -294,7 +295,7 @@ class TestStationRangesDry:
         ranges = dl.station_ranges_dry(
             min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0,
             start="2026-08-01T00:00:00", end="2026-08-01T01:00:00",
-            source_types=["buoy"],
+            source_types=["buoy_cmems"],
         )
 
         assert ranges == {}
@@ -476,7 +477,7 @@ class TestFetchStationsCache:
         dl.station_ranges_dry(
             min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0,
             start="2026-08-01T00:00:00", end="2026-08-01T01:00:00",
-            source_types=["buoy"],
+            source_types=["buoy_cmems"],
         )
 
         assert len(calls) == 1
@@ -544,7 +545,7 @@ class TestFetchStationsCache:
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_a = executor.submit(_call, "mooring")
             barrier.wait(timeout=5)
-            future_b = executor.submit(_call, "buoy")
+            future_b = executor.submit(_call, "buoy_cmems")
             result_a = future_a.result(timeout=5)
             result_b = future_b.result(timeout=5)
 

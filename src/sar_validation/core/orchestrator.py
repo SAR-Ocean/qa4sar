@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["DataOrchestrator"]
 
 # In-situ platform types handled by the InSituDownloader
-_INSITU_TYPES = {"mooring", "buoy", "buoy_waterfall", "drifter", "ferrybox", "tidal_gauge"}
+_INSITU_TYPES = {"mooring", "buoy_cmems", "buoy_waterfall", "drifter", "ferrybox", "tidal_gauge"}
 
 # Delayed-mode ("historical") source_types, dispatched before any NRT
 # source such that its results can inform whether the NRT counterpart is
