@@ -745,7 +745,7 @@ class DataTreeConverter:
     def from_insitu_csv(
         csv_path: Union[str, Path],
         source_type: str = "mooring",
-        exclude_platform_ids: Optional[set] = None,
+        exclude_platform_ids: Optional[set[str]] = None,
     ) -> Optional[xr.Dataset]:
         """
         Convert a Copernicus Marine in-situ CSV to a point-geometry Dataset.
@@ -4430,7 +4430,7 @@ class DataTreeConverter:
         # cross-contamination the HYCOM block below guards against by
         # checking recipe.config.variable == "currents" rather than just
         # file existence.
-        gts_buoy_platform_ids: set = set()
+        gts_buoy_platform_ids: set[str] = set()
         gts_buoy_requested = recipe is not None and any(
             s.source_type in ("buoy_gts", "buoy_waterfall") for s in recipe.config.validation_sources
         )
