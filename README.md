@@ -86,6 +86,7 @@ sar_validation/
     ├── earthdata_soil_moisture_downloader.py    # AMSR-E/2, SMAP, and NISAR SME2 soil moisture via NASA Earthdata
     ├── era5_downloader.py                       # ERA5 reanalysis (wind/waves/soil_moisture) via Copernicus CDS
     ├── gportal_downloader.py                    # AMSR2 soil moisture via JAXA G-Portal (SFTP)
+    ├── gts_buoy_downloader.py                   # Moored/drifting buoy wind/waves/currents via WMO GTS (ECMWF MARS obstype 181/182); requires a MARS Member/Co-operating-State account
     ├── hf_radar_downloader.py                   # Near-real-time HF-radar surface currents via Copernicus Marine
     ├── hf_radar_historical_downloader.py        # Delayed-mode/historical HF-radar currents via Copernicus Marine
     ├── hf_radar_us_downloader.py                # US HF-radar waterfall selector: NOAA ERDDAP → NOAA THREDDS → Copernicus Marine
@@ -211,6 +212,7 @@ The validation report is saved under `data/<timerange>_<bounds>/validation_repor
 | Sentinel-1 L2_OCN | wind / currents / waves | `sentinel1_l2_ocn_downloader` | Copernicus Dataspace (CDSE) | 2014-10-03 - present |
 | RADARSAT-2 | wind (speed only) | `radarsat2_wind_downloader` | NOAA NCEI THREDDS | 2014-05-02 - present |
 | Moorings / Buoys / Ferryboxes | wind / currents / waves | `insitu_downloader` | Copernicus Marine | varies by platform; max 2020-01-01 - present |
+| GTS Moored / Drifting Buoys (WMO GTS) | wind / waves / currents | `gts_buoy_downloader` | ECMWF MARS (obstype 181/182) | operational archive, no fixed historical start date; requires an ECMWF MARS account affiliated with a Member/Co-operating-State organization (a self-registered `api.ecmwf.int` account cannot access MARS observation retrieval) |
 | Delayed-mode in-situ currents (ADCP / Argo / drifter / glider) | ocean currents |   `insitu_currents_historical_downloader` | Copernicus Marine | varies by platform (6 - 24 months latency) |
 | HF Radar (near-real-time) | ocean currents | `hf_radar_downloader` | Copernicus Marine | varies by radar; max 2020-01-01 - present |
 | HF Radar (delayed-mode/historical) | ocean currents | `hf_radar_historical_downloader` | Copernicus Marine | varies by platform |
