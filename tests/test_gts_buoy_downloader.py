@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from sar_validation.downloaders.gts_buoy_downloader import GTSBuoyDownloader
@@ -142,3 +144,24 @@ class TestGTSBuoyDownloaderRequestFailure:
             )
 
         assert not (tmp_path / "gts_buoy_20260830.bufr").exists()
+
+
+class TestGTSBuoyDownloaderMarsRequestShape:
+    def test_target_is_not_a_key_in_the_submitted_request(self, tmp_path, monkeypatch):
+        """ECMWFService.execute(req, target) submits req to MARS as the
+        retrieval request and uses target only as the local download
+        destination -- a "target" key inside req itself would be
+        forwarded to MARS's own request-language parser, which requires
+        that value to be quoted, and an unquoted path fails immediately
+        at its first "/" character."""
+        mock_service = MagicMock()
+        monkeypatch.setattr("ecmwfapi.ECMWFService", MagicMock(return_value=mock_service))
+
+        dl = GTSBuoyDownloader(output_dir=tmp_path)
+        request = {"class": "od", "type": "ob"}
+        target = tmp_path / "gts_buoy_20260830.bufr"
+        dl._execute_mars_request(request, target)
+
+        submitted_request, submitted_target = mock_service.execute.call_args[0]
+        assert "target" not in submitted_request
+        assert submitted_target == str(target)

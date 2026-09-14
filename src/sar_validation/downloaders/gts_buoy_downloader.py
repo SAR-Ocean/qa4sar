@@ -161,11 +161,18 @@ class GTSBuoyDownloader:
 
         The only place ``ecmwfapi`` is imported or touched -- tests
         monkeypatch this method instead of mocking the network client.
+        ``target`` is passed only as ``ECMWFService.execute``'s own
+        second argument, which controls where the completed result is
+        downloaded to locally -- it must not also be a key inside
+        *request* itself, since that dictionary is submitted to MARS as
+        the retrieval request, and MARS's request-language parser
+        requires a ``target`` value to be quoted; an unquoted path
+        submitted this way fails immediately at its first "/" character.
         """
         from ecmwfapi import ECMWFService  # noqa: PLC0415 -- optional dependency, imported lazily
 
         server = ECMWFService("mars")
-        server.execute({**request, "target": str(target)}, str(target))
+        server.execute(request, str(target))
 
 
 # ---------------------------------------------------------------------------
