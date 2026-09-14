@@ -864,18 +864,20 @@ class TestCanonicalSourceOrderStability:
             ("#f032e6", "h"), ("#e6194b", "p"), ("#000080", "8"), ("#ffff00", "<"),
         ]
 
-    def test_buoy_cmems_reserved_slot_does_not_disturb_later_entries(self):
-        # "buoy_cmems" is a recipe source_type, never itself an emitted
-        # val_source label -- its reserved slot sits at the very end of
-        # the list so hycom's and buoy_waterfall's own permanent slots
-        # (see TestHycomCanonicalSourceOrder) are unaffected by its
+    def test_buoy_cmems_reserved_slots_do_not_disturb_earlier_entries(self):
+        # "buoy_cmems" and "buoy_cmems_family" are recipe source types,
+        # never themselves emitted val_source labels -- their reserved
+        # slots sit at the very end of the list so hycom's and
+        # buoy_waterfall's own permanent slots (see
+        # TestHycomCanonicalSourceOrder) are unaffected by their
         # presence.
         from sar_validation.core.visualization import _canonical_source_order
 
         canonical = _canonical_source_order()
-        assert canonical.index("buoy_cmems") == len(canonical) - 1
         assert canonical.index("hycom") == 16
         assert canonical.index("buoy_waterfall") == 17
+        assert canonical.index("buoy_cmems") == 18
+        assert canonical.index("buoy_cmems_family") == len(canonical) - 1
 
     def test_raises_when_order_list_drifts_out_of_sync_with_registered_sets(self, monkeypatch):
         # If a new source type is ever added to LAYER_DATA_TYPES/_INSITU_TYPES

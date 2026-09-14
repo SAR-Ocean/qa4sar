@@ -2502,7 +2502,9 @@ def _predict_insitu(
     )
 
 
-for _insitu_type in ("mooring", "buoy_cmems", "drifter", "ferrybox", "tidal_gauge"):
+for _insitu_type in (
+    "mooring", "buoy_cmems", "buoy_cmems_family", "drifter", "ferrybox", "tidal_gauge",
+):
     _PREDICATES[_insitu_type] = _predict_insitu
 
 

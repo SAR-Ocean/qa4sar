@@ -309,7 +309,17 @@ recipe wanting both must use it instead. All three are valid for a
 this toolbox's other supported variables, e.g. soil moisture):
 
 - **`buoy_cmems`/`mooring`**: Copernicus Marine in-situ only, via
-  `InSituDownloader`/`from_insitu_csv`.
+  `InSituDownloader`/`from_insitu_csv`. A convenience source_type,
+  `buoy_cmems_family`, combines `mooring`, `buoy_cmems`, and `drifter`
+  into a single `validation_sources` entry (`SOURCE_TYPE_TO_PLATFORM`
+  maps it to `["MO", "DB", "AD"]`) -- exactly the three Copernicus
+  categories that overlap with `buoy_gts`'s own combined obstype
+  181/182 scope, so a recipe can switch between the two feeds by
+  changing one source_type value (`buoy_cmems_family` to `buoy_gts`,
+  or back) instead of adding or removing three separate entries. Per-point
+  labeling is unaffected -- it still comes from the platform code each
+  row actually carries (`PLATFORM_CODE_TO_SOURCE_TYPE`), not from which
+  source_type requested the download.
 - **`buoy_gts`**: WMO GTS buoy observations only, via `GTSBuoyDownloader`
   (MARS `obstype=181/182`, moored + drifting buoys) and
   `from_gts_buoy_bufr`. One MARS request per day already carries every

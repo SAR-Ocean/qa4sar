@@ -731,3 +731,9 @@ class TestBuoyWaterfallPlatformCode:
     def test_buoy_waterfall_resolves_to_db(self):
         from sar_validation.downloaders.insitu_downloader import _resolve_platform_codes
         assert _resolve_platform_codes(["buoy_waterfall"]) == ["DB"]
+
+
+class TestBuoyCmemsFamilyPlatformCode:
+    def test_buoy_cmems_family_resolves_to_mooring_buoy_and_drifter_codes(self):
+        from sar_validation.downloaders.insitu_downloader import _resolve_platform_codes
+        assert _resolve_platform_codes(["buoy_cmems_family"]) == ["MO", "DB", "AD"]

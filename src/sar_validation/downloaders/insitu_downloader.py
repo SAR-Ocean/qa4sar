@@ -97,10 +97,16 @@ def variables_for_recipe(variable: str) -> "tuple[str, ...]":
 
 # Mapping from recipe source types to Copernicus platform codes.
 # "drifter" resolves to both "DB" (drifting buoy) and "AD" (autonomous
-# drifter).
+# drifter). "buoy_cmems_family" combines "mooring", "buoy_cmems", and
+# "drifter" in a single source_type -- exactly the three Copernicus
+# categories that overlap with "buoy_gts"'s own combined MARS obstype
+# 181/182 (moored + drifting buoys) request, so a recipe can switch
+# between the two feeds with a one-line source_type edit instead of
+# adding/removing three separate validation_sources entries.
 SOURCE_TYPE_TO_PLATFORM = {
     "mooring":     ["MO"],
     "buoy_cmems":  ["DB"],
+    "buoy_cmems_family": ["MO", "DB", "AD"],
     "buoy_waterfall": ["DB"],
     "ferrybox":    ["FB"],
     "drifter":     ["DB", "AD"],

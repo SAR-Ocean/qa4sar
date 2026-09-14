@@ -155,6 +155,7 @@ _SOURCE_COLORS = [
     "#bcf60c",
     "#aaffc3",
     "#a9a9a9",
+    "#911eb4",
 ]
 
 _SOURCE_MARKERS = [
@@ -163,6 +164,7 @@ _SOURCE_MARKERS = [
     "H",
     "o",
     "D",
+    "p",
 ]
 
 # Fixed, append-only reference order for known validation source/platform
@@ -185,12 +187,14 @@ _CANONICAL_SOURCE_ORDER = [
     "era5_wind", "era5_waves", "era5_soil_moisture",
     "hycom",
     "buoy_waterfall",
-    # "buoy_cmems" is a recipe source_type, never itself an emitted
-    # val_source label (see the module comment above) -- it is only kept
-    # here, in a reserved slot at the end, to satisfy
-    # _canonical_source_order()'s own consistency guard, which requires
-    # every _INSITU_TYPES member to appear somewhere in this list.
+    # "buoy_cmems" and "buoy_cmems_family" are recipe source types, never
+    # themselves emitted val_source labels (see the module comment
+    # above) -- they are only kept here, in reserved slots at the end, to
+    # satisfy _canonical_source_order()'s own consistency guard, which
+    # requires every _INSITU_TYPES member to appear somewhere in this
+    # list.
     "buoy_cmems",
+    "buoy_cmems_family",
 ]
 
 #: Names present in _CANONICAL_SOURCE_ORDER that are runtime-emitted

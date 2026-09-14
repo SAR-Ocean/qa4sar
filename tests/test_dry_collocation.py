@@ -3644,7 +3644,8 @@ class TestPredictInsitu:
         )
 
     @pytest.mark.parametrize(
-        "source_type", ["mooring", "buoy_cmems", "drifter", "ferrybox", "tidal_gauge"],
+        "source_type",
+        ["mooring", "buoy_cmems", "buoy_cmems_family", "drifter", "ferrybox", "tidal_gauge"],
     )
     def test_registered_under_each_real_insitu_source_type(self, source_type):
         from sar_validation.core import dry_collocation

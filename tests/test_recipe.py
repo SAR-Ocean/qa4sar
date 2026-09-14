@@ -643,6 +643,23 @@ class TestBuoyGtsOverlappingCombinationsRejected:
         with pytest.raises(ValueError, match="buoy_waterfall"):
             Recipe._from_dict(recipe_dict)
 
+    def test_buoy_gts_and_buoy_cmems_family_together_rejected(self, tmp_path):
+        """buoy_cmems_family combines mooring, buoy_cmems, and drifter's
+        own platform codes into one source_type -- the overlap check is
+        derived from SOURCE_TYPE_TO_PLATFORM, so this combination is
+        rejected automatically with no recipe.py change of its own."""
+        recipe_dict = {
+            "name": "test", "variable": "wind",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [
+                {"source_type": "buoy_gts"},
+                {"source_type": "buoy_cmems_family"},
+            ],
+        }
+        with pytest.raises(ValueError, match="buoy_waterfall"):
+            Recipe._from_dict(recipe_dict)
+
     def test_buoy_gts_and_mooring_together_rejected(self, tmp_path):
         """buoy_gts's obstype 181 half (moored buoys) mostly relays the
         same physical stations Copernicus Marine's "mooring" source_type
