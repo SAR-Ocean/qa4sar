@@ -547,24 +547,31 @@ class Recipe:
             )
         _validation_source_types = {s.source_type for s in validation_sources}
         if "buoy_gts" in _validation_source_types:
-            # GTS mostly relays the same physical WMO buoy stations
-            # Copernicus Marine's "DB" platform code already reports, so
-            # combining "buoy_gts" with ANY other requested source_type
-            # that also resolves to "DB" would double-count overlapping
-            # stations in validation statistics -- not just "buoy_cmems"
-            # itself (SOURCE_TYPE_TO_PLATFORM maps "drifter" to ["DB",
-            # "AD"], sharing "DB" with "buoy_cmems"). Derived from
-            # SOURCE_TYPE_TO_PLATFORM rather than hardcoding "buoy_cmems"
-            # as the only forbidden pairing, so a future source_type that
-            # also requests "DB" is caught automatically. "buoy_waterfall"
-            # is excluded from this check -- it is the deduplicated
-            # combination this rule exists to steer recipes towards, and
-            # its own dedup at DataTree-build time already applies to the
-            # whole Copernicus CSV regardless of which requested source
-            # contributed each row.
+            # "buoy_gts" retrieves MARS obstype 181 (moored buoys) and 182
+            # (drifting buoys) combined into a single request, so it
+            # overlaps with TWO separate Copernicus Marine source types,
+            # not one: obstype 181 mostly relays the same physical
+            # stations Copernicus Marine's "mooring" ("MO") source_type
+            # reports, and obstype 182 mostly relays the same stations as
+            # "buoy_cmems" ("DB") -- combining "buoy_gts" with ANY other
+            # requested source_type that also resolves to "MO" or "DB"
+            # would double-count overlapping stations in validation
+            # statistics (SOURCE_TYPE_TO_PLATFORM also maps "drifter" to
+            # ["DB", "AD"], sharing "DB" with "buoy_cmems"). Derived from
+            # SOURCE_TYPE_TO_PLATFORM rather than hardcoding "mooring"/
+            # "buoy_cmems" as the only forbidden pairings, so a future
+            # source_type that also requests "MO" or "DB" is caught
+            # automatically. "buoy_waterfall" is excluded from this check
+            # -- it is the deduplicated combination this rule exists to
+            # steer recipes towards, and its own dedup at DataTree-build
+            # time already applies to the whole Copernicus CSV regardless
+            # of which requested source contributed each row.
             from ..downloaders.insitu_downloader import SOURCE_TYPE_TO_PLATFORM  # noqa: PLC0415
 
-            _gts_overlap_codes = set(SOURCE_TYPE_TO_PLATFORM["buoy_cmems"])
+            _gts_overlap_codes = (
+                set(SOURCE_TYPE_TO_PLATFORM["mooring"])
+                | set(SOURCE_TYPE_TO_PLATFORM["buoy_cmems"])
+            )
             for _other_type in sorted(_validation_source_types - {"buoy_gts", "buoy_waterfall"}):
                 _other_codes = set(SOURCE_TYPE_TO_PLATFORM.get(_other_type, []))
                 if _gts_overlap_codes & _other_codes:

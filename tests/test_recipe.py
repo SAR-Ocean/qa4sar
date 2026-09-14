@@ -582,12 +582,15 @@ class TestBuoyGtsVariableCheck:
         assert recipe.config.validation_sources[0].source_type == "buoy_cmems"
 
 
-class TestBuoyGtsAndBuoyCmemsCombinationRejected:
-    """buoy_gts and buoy_cmems mostly relay the same physical WMO buoy
-    stations -- listing both as separate validation sources would
-    double-count overlapping stations in validation statistics.
-    buoy_waterfall exists precisely to combine both sources with
-    per-station deduplication and must be used instead."""
+class TestBuoyGtsOverlappingCombinationsRejected:
+    """buoy_gts retrieves MARS obstype 181 (moored buoys) and 182
+    (drifting buoys) combined, so it overlaps with both Copernicus
+    Marine's "mooring" ("MO") and "buoy_cmems" ("DB") source types --
+    listing either alongside buoy_gts as a separate validation source
+    would double-count overlapping physical stations in validation
+    statistics. buoy_waterfall exists precisely to combine GTS with
+    either Copernicus source with per-station deduplication and must be
+    used instead."""
 
     def test_buoy_gts_and_buoy_cmems_together_rejected(self, tmp_path):
         recipe_dict = {
@@ -639,6 +642,43 @@ class TestBuoyGtsAndBuoyCmemsCombinationRejected:
         }
         with pytest.raises(ValueError, match="buoy_waterfall"):
             Recipe._from_dict(recipe_dict)
+
+    def test_buoy_gts_and_mooring_together_rejected(self, tmp_path):
+        """buoy_gts's obstype 181 half (moored buoys) mostly relays the
+        same physical stations Copernicus Marine's "mooring" source_type
+        ("MO") already reports -- this overlap is independent of, and in
+        addition to, buoy_gts's overlap with "buoy_cmems"/"drifter" via
+        obstype 182 (drifting buoys, "DB")."""
+        recipe_dict = {
+            "name": "test", "variable": "wind",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [
+                {"source_type": "buoy_gts"},
+                {"source_type": "mooring"},
+            ],
+        }
+        with pytest.raises(ValueError, match="buoy_waterfall"):
+            Recipe._from_dict(recipe_dict)
+
+    def test_buoy_waterfall_and_mooring_still_accepted(self, tmp_path):
+        """buoy_waterfall itself is excluded from the overlap check -- its
+        own per-station dedup at DataTree-build time already applies to
+        the whole Copernicus CSV regardless of which requested source
+        contributed each row, so combining it with mooring must remain
+        valid."""
+        recipe_dict = {
+            "name": "test", "variable": "wind",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [
+                {"source_type": "buoy_waterfall"},
+                {"source_type": "mooring"},
+            ],
+        }
+        recipe = Recipe._from_dict(recipe_dict)
+        source_types = {s.source_type for s in recipe.config.validation_sources}
+        assert source_types == {"buoy_waterfall", "mooring"}
 
     def test_buoy_waterfall_and_drifter_still_accepted(self, tmp_path):
         """buoy_waterfall itself is excluded from the overlap check -- its

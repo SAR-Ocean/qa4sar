@@ -294,15 +294,19 @@ that excluding only 4 let a meaningful share of untested cells through.
 
 Three `source_type` values select GTS and/or Copernicus Marine buoy
 data, independent of each other -- a recipe can list any one of them
-as a `validation_sources` entry. `buoy_gts` and `buoy_cmems` may not be
-listed together as separate entries in the same recipe, because they
-mostly relay the same physical WMO stations and combining them without
-deduplication would double-count overlapping stations in validation
-statistics; `buoy_waterfall` exists precisely to combine both sources
-with per-station deduplication, and a recipe wanting both must use it
-instead. All three are valid for a `"wind"`, `"waves"`, or `"currents"`
-recipe (GTS buoys carry none of this toolbox's other supported
-variables, e.g. soil moisture):
+as a `validation_sources` entry. `buoy_gts` retrieves MARS obstype 181
+(moored buoys) and 182 (drifting buoys) combined into a single request,
+so it may not be listed alongside either `buoy_cmems` (Copernicus
+Marine's drifting-buoy source_type, overlapping via obstype 182) or
+`mooring` (Copernicus Marine's moored-platform source_type, overlapping
+via obstype 181) as a separate entry in the same recipe -- each pairing
+mostly relays the same physical WMO stations, and combining either
+without deduplication would double-count overlapping stations in
+validation statistics. `buoy_waterfall` exists precisely to combine GTS
+with either Copernicus source with per-station deduplication, and a
+recipe wanting both must use it instead. All three are valid for a
+`"wind"`, `"waves"`, or `"currents"` recipe (GTS buoys carry none of
+this toolbox's other supported variables, e.g. soil moisture):
 
 - **`buoy_cmems`/`mooring`**: Copernicus Marine in-situ only, via
   `InSituDownloader`/`from_insitu_csv`.
