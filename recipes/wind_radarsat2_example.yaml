@@ -27,16 +27,10 @@ sar_data:
   max_downloads: null
   download_kwargs: {}
 validation_sources:
-- source_type: mooring
-  download_kwargs: {}
-  collocation_kwargs: {}
-- source_type: buoy_cmems
+- source_type: buoy_cmems_family
   download_kwargs: {}
   collocation_kwargs: {}
 - source_type: ferrybox
-  download_kwargs: {}
-  collocation_kwargs: {}
-- source_type: drifter
   download_kwargs: {}
   collocation_kwargs: {}
 - source_type: tidal_gauge

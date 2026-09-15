@@ -22,13 +22,10 @@ sar_data:
   - SM
   max_downloads: null
 validation_sources:
-- source_type: mooring
+- source_type: buoy_cmems_family
   download_kwargs: {}
   collocation_kwargs: {}
 - source_type: tidal_gauge
-  download_kwargs: {}
-  collocation_kwargs: {}
-- source_type: drifter
   download_kwargs: {}
   collocation_kwargs: {}
 - source_type: altimeter
