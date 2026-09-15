@@ -76,6 +76,85 @@ class TestFromGtsBuoyBufrBasicConversion:
         assert pd.Timestamp(ds["time"].values[0]) == pd.Timestamp("2026-01-01T03:15:00")
 
 
+class TestFromGtsBuoyBufrMooringVsBuoyLabel:
+    """The WMO international buoy identifier number's own trailing three
+    digits (mod 1000, for both the five- and seven-digit forms) distinguish
+    moored (000-499) from drifting (500-999) buoys -- obstype 181/182
+    combines both populations into one request, so this is the only way to
+    recover the distinction per-point."""
+
+    def test_low_trailing_digits_label_as_mooring(self, tmp_path, monkeypatch):
+        frame = _fake_bufr_frame([
+            _row(6600021, 54.88, 13.87, 2026, 8, 30, 8, 0, 9.0, 191.0),  # 021 -> mooring
+            _row(1234000, 10.0, -20.0, 2026, 8, 30, 8, 0, 5.0, 90.0),  # 000 -> mooring
+            _row(1234499, 10.0, -20.0, 2026, 8, 30, 8, 0, 5.0, 90.0),  # 499 -> mooring
+        ])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: frame,
+        )
+        bufr_path = tmp_path / "gts_buoy_20260830.bufr"
+        bufr_path.write_bytes(b"mocked")
+
+        ds = DataTreeConverter.from_gts_buoy_bufr(bufr_path)
+
+        assert ds is not None
+        assert list(ds["platform_type"].values) == ["mooring", "mooring", "mooring"]
+
+    def test_high_trailing_digits_label_as_buoy(self, tmp_path, monkeypatch):
+        frame = _fake_bufr_frame([
+            _row(1234500, 10.0, -20.0, 2026, 8, 30, 8, 0, 5.0, 90.0),  # 500 -> buoy
+            _row(1234999, 10.0, -20.0, 2026, 8, 30, 8, 0, 5.0, 90.0),  # 999 -> buoy
+        ])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: frame,
+        )
+        bufr_path = tmp_path / "gts_buoy_20260830.bufr"
+        bufr_path.write_bytes(b"mocked")
+
+        ds = DataTreeConverter.from_gts_buoy_bufr(bufr_path)
+
+        assert ds is not None
+        assert list(ds["platform_type"].values) == ["buoy", "buoy"]
+
+    def test_seven_digit_identifier_uses_the_same_mod_1000_rule(self, tmp_path, monkeypatch):
+        frame = _fake_bufr_frame([
+            _row(42007500, 10.0, -20.0, 2026, 8, 30, 8, 0, 5.0, 90.0),  # 7500 % 1000 = 500 -> buoy
+        ])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: frame,
+        )
+        bufr_path = tmp_path / "gts_buoy_20260830.bufr"
+        bufr_path.write_bytes(b"mocked")
+
+        ds = DataTreeConverter.from_gts_buoy_bufr(bufr_path)
+
+        assert ds is not None
+        assert list(ds["platform_type"].values) == ["buoy"]
+
+    def test_dataset_level_attr_stays_the_coarse_fallback(self, tmp_path, monkeypatch):
+        """The per-point "platform_type" data variable carries the real
+        distinction; the dataset-level attrs entry is an unchanged, coarse
+        fallback."""
+        frame = _fake_bufr_frame([
+            _row(6600021, 54.88, 13.87, 2026, 8, 30, 8, 0, 9.0, 191.0),
+        ])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: frame,
+        )
+        bufr_path = tmp_path / "gts_buoy_20260830.bufr"
+        bufr_path.write_bytes(b"mocked")
+
+        ds = DataTreeConverter.from_gts_buoy_bufr(bufr_path)
+
+        assert ds is not None
+        assert ds.attrs["platform_type"] == "buoy"
+        assert list(ds["platform_type"].values) == ["mooring"]
+
+
 class TestFromGtsBuoyBufrMissingWind:
     def test_rows_with_both_wind_fields_nan_are_dropped(self, tmp_path, monkeypatch):
         frame = _fake_bufr_frame([

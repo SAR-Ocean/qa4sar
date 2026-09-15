@@ -1117,6 +1117,23 @@ class DataTreeConverter:
         )
         data_vars["platform_name"] = ("point", df["stationOrSiteName"].astype(str).to_numpy())
 
+        # The WMO international buoy identifier number's own numeric value
+        # distinguishes moored from drifting buoys: the last three digits
+        # (mod 1000, for both the five- and seven-digit forms) fall in
+        # 000-499 for moored buoys and 500-999 for drifting buoys (DBCP
+        # Technical Document No. 37, "Guide to Buoy Data Quality Control
+        # Tests to Perform in Real Time by a GTS Data Processing Centre",
+        # section 4.2). obstype 181/182 combines both populations into one
+        # request, so this is the only way to recover the distinction
+        # per-point without a separate BUFR descriptor for it.
+        platform_id_numeric = pd.to_numeric(
+            df["marineObservingPlatformIdentifier"], errors="coerce",
+        )
+        data_vars["platform_type"] = (
+            "point",
+            np.where(platform_id_numeric % 1000 < 500, "mooring", "buoy"),
+        )
+
         ds = xr.Dataset(
             data_vars,
             coords={
@@ -1125,9 +1142,16 @@ class DataTreeConverter:
                 "time": ("point", time),
             },
         )
-        apply_cf_metadata(ds, "gts_buoy")
+        apply_cf_metadata(ds, "gts_buoy", {
+            "platform_id":   {"long_name": "WMO international buoy identifier number"},
+            "platform_type": {"long_name": "platform category (mooring or buoy), derived "
+                                            "from the platform identifier's own numbering"},
+        })
 
         ds.attrs["data_type"] = "gts_buoy"
+        # Coarse, dataset-level fallback; the per-point "platform_type"
+        # data variable above carries the actual moored/drifting
+        # distinction and takes precedence wherever it is read.
         ds.attrs["platform_type"] = "buoy"
         ds.attrs["source"] = "GTS (MARS obstype 181/182)"
         ds.attrs["filename"] = bufr_path.name
