@@ -212,7 +212,7 @@ The validation report is saved under `data/<timerange>_<bounds>/validation_repor
 | Sentinel-1 L2_OCN | wind / currents / waves | `sentinel1_l2_ocn_downloader` | Copernicus Dataspace (CDSE) | 2014-10-03 - present |
 | RADARSAT-2 | wind (speed only) | `radarsat2_wind_downloader` | NOAA NCEI THREDDS | 2014-05-02 - present |
 | Moorings / Buoys / Ferryboxes | wind / currents / waves | `insitu_downloader` | Copernicus Marine | varies by platform; max 2020-01-01 - present |
-| GTS Moored / Drifting Buoys (WMO GTS) | wind / waves / currents | `gts_buoy_downloader` | ECMWF MARS (obstype 181/182) | operational archive, no fixed historical start date; requires an ECMWF MARS account affiliated with a Member/Co-operating-State organization (a self-registered `api.ecmwf.int` account cannot access MARS observation retrieval) |
+| GTS Moored / Drifting Buoys (WMO GTS) | wind / waves / currents | `gts_buoy_downloader` | ECMWF MARS (obstype 181/182) | operational archive; 28-11-2016 - present |
 | Delayed-mode in-situ currents (ADCP / Argo / drifter / glider) | ocean currents |   `insitu_currents_historical_downloader` | Copernicus Marine | varies by platform (6 - 24 months latency) |
 | HF Radar (near-real-time) | ocean currents | `hf_radar_downloader` | Copernicus Marine | varies by radar; max 2020-01-01 - present |
 | HF Radar (delayed-mode/historical) | ocean currents | `hf_radar_historical_downloader` | Copernicus Marine | varies by platform |
@@ -450,10 +450,7 @@ Note: no `sar-validate --set-credential` command is needed;
 
 MARS observation retrieval (obstype 181/182, which this downloader uses)
 requires an account affiliated with an ECMWF Member or Co-operating State
-organization, typically granted by that organization's Computing
-Representative -- a self-registered-only `api.ecmwf.int` account is not
-sufficient and fails with `ecmwf.API error 1: User has no access to
-services mars`.
+organization.
 
 ### ISMN — for soil moisture in-situ validation
 
