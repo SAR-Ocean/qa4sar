@@ -376,7 +376,43 @@ quality/confidence descriptor at all, for wind, waves, or currents --
 `from_gts_buoy_bufr` cannot attach a QC flag to anything it decodes,
 because the WMO template itself has none. A `buoy_gts`/`buoy_waterfall`
 point therefore has strictly less quality information available than an
-equivalent Copernicus Marine point.
+equivalent Copernicus Marine point. This reflects a different
+quality-assurance model, not an absent one: unlike Copernicus Marine
+(every observation kept, tagged with a 0-9 flag for the consumer to
+filter), GTS requires the data processing centre that owns a buoy to
+run automatic real-time quality control before an observation is ever
+transmitted, so a failing observation is simply never sent rather than
+sent and flagged (DBCP Technical Document No. 37, "Guide to Buoy Data
+Quality Control Tests to Perform in Real Time by a GTS Data Processing
+Centre"). A point that reaches this toolbox has therefore already
+passed gross-range, climatological, and location-sanity checks
+upstream -- but this toolbox has no way to attach a confidence gradient
+to it the way it can with Copernicus Marine's numeric flag, nor can it
+distinguish "this buoy reported nothing" from "this buoy reported
+something that was filtered out upstream."
+
+**Moored vs. drifting buoy labeling:** `from_gts_buoy_bufr` labels each
+point's `platform_type` as `"mooring"` or `"buoy"`, derived purely from
+the WMO international buoy identifier number's own trailing three
+digits (`platform_id % 1000`): `000`-`499` is moored, `500`-`999` is
+drifting (DBCP Technical Document No. 37, section 4.2 -- the same rule
+applies to the five- and seven-digit forms of the identifier, taking
+the mod-1000 reduction first for the seven-digit form). This recovers
+the distinction obstype 181/182's combined request otherwise loses,
+without needing a separate BUFR descriptor for it, and matches
+Copernicus Marine's own `"mooring"`/`"buoy"` vocabulary.
+
+**Statistics pool moored and drifting buoys into one group:**
+regardless of source (GTS or Copernicus Marine), `"mooring"` and
+`"buoy"` are combined into a single `"buoy_family"` group before
+computing aggregate statistics (`statistics._STATS_GROUP_ALIASES`,
+applied in `_group_by_columns`) -- moored and drifting buoys are
+physically different platforms, but their near-surface point
+observations are treated as one population for aggregate error metrics
+rather than reported as two separate rows. Point-level labeling (e.g.
+plot colors/markers, which read `val_source` directly from the
+collocation dataset) is unaffected, since only the statistics
+function's own local copy of the grouping column is remapped.
 
 **Known judgment call, not independently confirmed:** GTS's wave height
 is mapped to `VAVH` rather than `VHM0` on the assumption that a
@@ -387,7 +423,8 @@ systematic mismatch against `VHM0`-sourced references.
 
 > Code: `downloaders/gts_buoy_downloader.py`, `core/datatree_converter.py`
 > (`from_gts_buoy_bufr`, `from_insitu_csv`'s `exclude_platform_ids`),
-> `core/orchestrator.py` (`_download_gts_buoy`, `_INSITU_TYPES`).
+> `core/orchestrator.py` (`_download_gts_buoy`, `_INSITU_TYPES`),
+> `core/statistics.py` (`_STATS_GROUP_ALIASES`, `_group_by_columns`).
 
 ---
 

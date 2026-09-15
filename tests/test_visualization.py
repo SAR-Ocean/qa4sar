@@ -706,7 +706,7 @@ class TestPlotSummaryTable:
         ds = xr.Dataset({
             "sar_owiWindSpeed": ("collocation", sar),
             "val_WSPD":         ("collocation", val),
-            "val_source":       ("collocation", ["mooring"] * 10 + ["altimeter"] * 10),
+            "val_source":       ("collocation", ["drifter"] * 10 + ["altimeter"] * 10),
         })
         stats_ds = compute_statistics(ds, "owiWindSpeed", "WSPD", group_by=["val_source"])
 
@@ -717,7 +717,7 @@ class TestPlotSummaryTable:
         tables = [c for c in ax.get_children() if hasattr(c, "get_celld")]
         assert len(tables) == 1
         cell_texts = {cell.get_text().get_text() for cell in tables[0].get_celld().values()}
-        assert "mooring" in cell_texts
+        assert "drifter" in cell_texts
         assert "altimeter" in cell_texts
         assert "bias" in cell_texts or "Bias" in cell_texts
         import matplotlib.pyplot as plt
