@@ -2079,9 +2079,8 @@ def _altimeter_orbit_candidates_dry(
         if avail_end is not None and start_str > avail_end:
             continue
         candidates.append((sat_code, start_dt, end_dt))
-    from ..downloaders.reprocessed_altimeter_downloader import COVERAGE_END, MISSIONS
+    from ..downloaders.reprocessed_altimeter_downloader import MISSIONS
 
-    coverage_end_str = f"{COVERAGE_END}T23:59:59"
     for mission_code, spec in MISSIONS.items():
         if end_str < f"{spec['start']}T00:00:00":
             continue
