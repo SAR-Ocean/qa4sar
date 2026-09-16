@@ -508,9 +508,8 @@ def _build_currents_config(
         sar_data=SARDataSpec(source=sar_source, swath_mode=["WV","IW","EW","SM"], max_downloads=limit),
         validation_sources=[
             *hf_radar_sources,
-            ValidationDataSource(source_type="drifter"),
+            ValidationDataSource(source_type="buoy_cmems_family"),
             ValidationDataSource(source_type="ferrybox"),
-            ValidationDataSource(source_type="mooring"),
             # Delayed-mode (6mo+ old) current observations — Copernicus
             # Marine product 013_044, EWCT/NSCT only. Each individually
             # gated at download time by its own recency guard.
@@ -602,10 +601,8 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
         geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
         sar_data=SARDataSpec(source=sar_source, swath_mode=swath_mode, max_downloads=limit),
         validation_sources=[
-            ValidationDataSource(source_type="mooring"),
-            ValidationDataSource(source_type="buoy_cmems"),
+            ValidationDataSource(source_type="buoy_cmems_family"),
             ValidationDataSource(source_type="ferrybox"),
-            ValidationDataSource(source_type="drifter"),
             ValidationDataSource(source_type="tidal_gauge"),
             ValidationDataSource(source_type="scatterometer_ascat"),
             ValidationDataSource(source_type="altimeter"),
@@ -770,9 +767,8 @@ def _build_waves_config(
         geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
         sar_data=SARDataSpec(source=sar_source, swath_mode=["WV","SM"], max_downloads=limit),
         validation_sources=[
-            ValidationDataSource(source_type="mooring"),
+            ValidationDataSource(source_type="buoy_cmems_family"),
             ValidationDataSource(source_type="tidal_gauge"),
-            ValidationDataSource(source_type="drifter"),
             ValidationDataSource(
                 source_type="altimeter",
                 download_kwargs={"frequencies": altimeter_freqs},
