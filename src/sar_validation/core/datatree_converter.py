@@ -456,6 +456,28 @@ def _owi_quality_reject_mask(da: xr.DataArray) -> Optional[np.ndarray]:
     return np.isin(da.values, reject_values)
 
 
+def _decode_flag_variable(da: xr.DataArray) -> Optional[np.ndarray]:
+    """
+    Decode an integer CF flag variable into an array of its flag_meanings
+    strings, one per value in *da*.
+
+    Returns None -- signalling "cannot decode" -- when flag_values/
+    flag_meanings are missing from *da*'s own attributes or do not match
+    one-to-one, the same "unusable metadata never silently guesses"
+    precedent as _owi_quality_reject_mask.
+    """
+    meanings = da.attrs.get("flag_meanings")
+    values = da.attrs.get("flag_values")
+    if not meanings or values is None:
+        return None
+    names = str(meanings).split()
+    values = np.asarray(values)
+    if len(names) != len(values):
+        return None
+    lookup = dict(zip(values.tolist(), names))
+    return np.array([lookup.get(v, "unknown") for v in da.values], dtype=object)
+
+
 # Sentinel-1 OSW quality control, shared by the WV point path
 # (from_sar_l2_ocn_wv_safe) and the SM/IW/EW grid path
 # (_extract_osw_grid_data) so the two cannot silently drift apart.
