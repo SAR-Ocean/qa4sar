@@ -198,3 +198,17 @@ class TestAnnotateCollocationDsEra5DerivedWindAttrs:
         assert result_ds["val_WDIR"].attrs.get("units") == "degree"
         assert result_ds["val_WDIR"].attrs.get("standard_name") == "wind_from_direction"
         assert result_ds["val_WDIR"].attrs.get("long_name")
+
+
+class TestReprocessedAltimeterMetadata:
+    def test_product_reference_registered(self):
+        from sar_validation.core._cf_metadata import PRODUCT_REFERENCES
+        assert "altimeter_reprocessed" in PRODUCT_REFERENCES
+        assert PRODUCT_REFERENCES["altimeter_reprocessed"].startswith("https://")
+
+    def test_uncertainty_variable_has_units(self):
+        assert INSITU_VARIABLE_ATTRS["VAVH_UNCERTAINTY"]["units"] == "m"
+
+    def test_auxiliary_variables_have_units(self):
+        for name in ("swh", "swh_adjusted", "distance_to_coast", "bathymetry"):
+            assert INSITU_VARIABLE_ATTRS[name]["units"] == "m"

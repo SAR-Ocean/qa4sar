@@ -45,6 +45,10 @@ PRODUCT_REFERENCES: Dict[str, str] = {
         "https://data.marine.copernicus.eu/product/"
         "WAVE_GLO_PHY_SWH_L3_NRT_014_001/services"
     ),
+    "altimeter_reprocessed": (
+        "https://data.marine.copernicus.eu/product/"
+        "WAVE_GLO_PHY_SWH_L3_MY_014_005/services"
+    ),
     "radiometer": "https://www.remss.com/missions/amsr/",
     "radiometer_ssm": "https://nsidc.org/data/nsidc-0451; https://nsidc.org/data/spl2smp_e",
     "cds_ssm": "https://cds.climate.copernicus.eu/datasets/satellite-soil-moisture?tab=documentation",
@@ -92,6 +96,14 @@ INSITU_VARIABLE_ATTRS: Dict[str, Dict[str, str]] = {
              "long_name": "significant wave height (H1/3)", "units": "m"},
     "VGHS": {"standard_name": "sea_surface_wave_significant_height",
              "long_name": "significant wave height", "units": "m"},
+    "VAVH_UNCERTAINTY": {"long_name": "uncertainty of significant wave height (H1/3)", "units": "m"},
+    "swh": {"standard_name": "sea_surface_wave_significant_height",
+            "long_name": "significant wave height before bias correction and denoising", "units": "m"},
+    "swh_adjusted": {"standard_name": "sea_surface_wave_significant_height",
+                      "long_name": "bias-corrected significant wave height before denoising", "units": "m"},
+    "distance_to_coast": {"long_name": "distance to the nearest coastline", "units": "m"},
+    "bathymetry": {"standard_name": "sea_floor_depth_below_geoid",
+                   "long_name": "sea floor depth below mean sea level", "units": "m"},
     "EWCT": {"standard_name": "eastward_sea_water_velocity",
              "long_name": "eastward current component", "units": "m s-1"},
     "NSCT": {"standard_name": "northward_sea_water_velocity",
