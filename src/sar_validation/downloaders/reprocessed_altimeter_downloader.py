@@ -37,7 +37,7 @@ COVERAGE_END = "2023-12-31"
 #: variable flag_meanings, not the QUID's own mission-name spellings,
 #: which differ for three of these:
 #: "topex-poseidon" not "topex", and "sentinel-3_a"/"sentinel-3_b"/
-#: "sentinel-6_a" with an underscore before the trailing letter). Dates
+#: "sentinel-6_a" with an underscore before the trailing letter. Dates
 #: are from the WAVE_GLO_PHY_SWH_L3_MY_014_005 quality information
 #: document (Table 2) and product user manual (Table 3). "orbit_key" is
 #: the matching entry in orbit_coverage.SATELLITE_ORBIT_SPECS, used for
