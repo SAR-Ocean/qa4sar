@@ -1706,9 +1706,8 @@ class DataOrchestrator:
         # The reprocessed product carries significant wave height only --
         # a recipe requesting a different variable (e.g. wind) gets no
         # usable data from it, so the whole window goes to the
-        # near-real-time downloader unsplit, exactly as it did before this
-        # product existed (that downloader already finds nothing before
-        # its own missions' availability dates).
+        # near-real-time downloader unsplit (that downloader already finds
+        # nothing before its own missions' availability dates).
         if cfg.variable != "waves":
             return _download_nrt(windows)
 
