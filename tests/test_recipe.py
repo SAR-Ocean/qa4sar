@@ -470,6 +470,13 @@ class TestHycomDefaultLayerTypeSpec:
         assert spec["aggregation_window_km"] == pytest.approx(4.6, abs=0.2)
 
 
+class TestAltimeterReprocessedLayerTypeSpec:
+    def test_altimeter_reprocessed_layer_spec_matches_1hz(self):
+        from sar_validation.core.recipe import DEFAULT_LAYER_TYPE_SPECS
+
+        assert DEFAULT_LAYER_TYPE_SPECS["altimeter_reprocessed"] == DEFAULT_LAYER_TYPE_SPECS["altimeter_1hz"]
+
+
 class TestModelTimeToleranceMinimums:
     """time_tolerance_minutes for a model_vs_layer source (era5/hycom) is
     what a downloader now uses to size its bracket-fetch margin (see

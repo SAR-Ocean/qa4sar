@@ -186,6 +186,10 @@ DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
     },
     "altimeter_1hz":  {"time_tolerance_minutes": 180, "aggregation_window_km": 7.0,  "distance_weighting": "equal"},
     "altimeter_5hz":  {"time_tolerance_minutes": 180, "aggregation_window_km": 1.4,  "distance_weighting": "equal"},
+    # Reprocessed (multi-year) product: same ~7km along-track resolution
+    # as the near-real-time 1 Hz product, since it has no frequency
+    # distinction of its own.
+    "altimeter_reprocessed": {"time_tolerance_minutes": 180, "aggregation_window_km": 7.0, "distance_weighting": "equal"},
     "hf_radar_grid":  {
         "time_tolerance_minutes": 30, "aggregation_window_km": 6.0,
         "distance_weighting": "equal", "dedup_nearest_in_time": True,

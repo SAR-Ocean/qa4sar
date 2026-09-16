@@ -686,6 +686,28 @@ class TestLayerLayerCollocation:
         assert len(results) > 0
         assert all(r.sar_data.get("owiWindSpeed") == pytest.approx(9.0) for r in results)
 
+    def test_each_collocated_point_keeps_its_own_platform_id(self):
+        """Two points from different missions, close enough in space and
+        time to both collocate against the same SAR grid, must each keep
+        their own platform_id as val_id -- this is what lets a validation
+        report distinguish which mission each point came from once every
+        mission has been combined into one file."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        val = _make_val_dataframe(
+            lons=[0.0, 0.05], lats=[52.0, 52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0), datetime(2026, 1, 1, 12, 5, 0)],
+            VAVH=[2.1, 1.9],
+            platform_id=["jason-3", "cryosat-2"],
+        )
+
+        colloc = LayerLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "altimeter")
+
+        val_ids = {r.val_id for r in results}
+        assert val_ids == {"jason-3", "cryosat-2"}
+
 
 # ---------------------------------------------------------------------------
 # _detect_collocation_type
@@ -769,6 +791,15 @@ class TestResolveLayerTypeScatterometerVariants:
             ds, "validation/altimeter/Cryosat-2", DEFAULT_LAYER_TYPE_SPECS
         )
         assert layer_type == "altimeter_5hz"
+
+    def test_resolves_reprocessed_altimeter_to_its_own_layer_type(self):
+        import xarray as xr
+
+        from sar_validation.core.collocation import _resolve_layer_type
+
+        ds = xr.Dataset(attrs={"data_type": "altimeter", "frequency": "reprocessed"})
+
+        assert _resolve_layer_type(ds, "validation/altimeter_reprocessed/2023-12-31", {}) == "altimeter_reprocessed"
 
     def test_resolve_layer_type_refines_radiometer_ssm_by_sensor(self):
         import xarray as xr
