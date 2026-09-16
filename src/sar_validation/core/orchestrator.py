@@ -1660,39 +1660,77 @@ class DataOrchestrator:
         "waves": ["1hz"],
     }
 
+    #: Boundary between the reprocessed (multi-year) altimeter product,
+    #: which covers dates up to and including 2023-12-31, and the
+    #: near-real-time product, which covers 2024-01-01 onward.
+    _ALTIMETER_REPROCESSED_CUTOVER = "2024-01-01T00:00:00"
+
     def _download_altimeter(self, source) -> bool:
         from ..downloaders.altimeter_downloader import AltimeterDownloader
+        from ..downloaders.base import split_datetime_range_at_cutover
+        from ..downloaders.reprocessed_altimeter_downloader import ReprocessedAltimeterDownloader
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        # DEFAULT_LAYER_TYPE_SPECS keys altimeter by frequency
-        # ("altimeter_1hz"/"altimeter_5hz"), not the bare "altimeter"
-        # source_type; both are passed so the padding lookup finds their
-        # (equal, 180min) tolerance regardless of which frequency this
-        # recipe's variable requests.
-        windows = self._padded_temporal_bounds("altimeter_1hz", "altimeter_5hz")
-        out_dir = self.base_dir / "altimeter"
-        kwargs = {
-            "frequencies": self._ALTIMETER_FREQUENCIES_BY_VARIABLE.get(
-                cfg.variable, ["1hz"]
-            ),
-        }
-        kwargs.update(source.download_kwargs)   # recipe-level override wins
+        # DEFAULT_LAYER_TYPE_SPECS keys altimeter by product/frequency
+        # ("altimeter_1hz"/"altimeter_5hz"/"altimeter_reprocessed"), not
+        # the bare "altimeter" source_type; all three are passed so the
+        # padding lookup finds their (equal, 180min) tolerance regardless
+        # of which one this recipe's window actually resolves to.
+        windows = self._padded_temporal_bounds("altimeter_1hz", "altimeter_5hz", "altimeter_reprocessed")
 
-        return self._run_download(
-            "altimeter", out_dir,
-            lambda: AltimeterDownloader(
-                output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
-            ),
-            windows,
-            lambda start, end: dict(
-                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
-                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=start, end=end,
-                **kwargs,
-            ),
-            "Altimeter",
-        )
+        reprocessed_windows: "list[tuple[str, str]]" = []
+        nrt_windows: "list[tuple[str, str]]" = []
+        for start, end in windows:
+            before, after = split_datetime_range_at_cutover(start, end, self._ALTIMETER_REPROCESSED_CUTOVER)
+            if before is not None:
+                reprocessed_windows.append(before)
+            if after is not None:
+                nrt_windows.append(after)
+
+        ok = True
+
+        if reprocessed_windows:
+            reprocessed_out_dir = self.base_dir / "altimeter_reprocessed"
+            ok = self._run_download(
+                "altimeter_reprocessed", reprocessed_out_dir,
+                lambda: ReprocessedAltimeterDownloader(
+                    output_dir=reprocessed_out_dir, dry_run=self.dry_run, force_download=self.force_download,
+                ),
+                reprocessed_windows,
+                lambda start, end: dict(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=start, end=end,
+                ),
+                "Reprocessed altimeter",
+            ) and ok
+
+        if nrt_windows:
+            nrt_out_dir = self.base_dir / "altimeter"
+            kwargs = {
+                "frequencies": self._ALTIMETER_FREQUENCIES_BY_VARIABLE.get(
+                    cfg.variable, ["1hz"]
+                ),
+            }
+            kwargs.update(source.download_kwargs)   # recipe-level override wins
+
+            ok = self._run_download(
+                "altimeter", nrt_out_dir,
+                lambda: AltimeterDownloader(
+                    output_dir=nrt_out_dir, dry_run=self.dry_run, force_download=self.force_download,
+                ),
+                nrt_windows,
+                lambda start, end: dict(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=start, end=end,
+                    **kwargs,
+                ),
+                "Altimeter",
+            ) and ok
+
+        return ok
 
     def _download_radiometer(self, source) -> bool:
         from ..downloaders.radiometer_downloader import RadiometerDownloader

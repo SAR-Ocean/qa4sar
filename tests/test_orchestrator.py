@@ -2530,6 +2530,64 @@ class TestDownloadAscatSsmWaterfall:
         )
 
 
+class TestDownloadAltimeterCutover:
+    def _make_orchestrator(self, tmp_path, start, end):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            SARDataSpec,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+
+        config = RecipeConfig(
+            name="test", variable="waves",
+            geographic_bounds=GeographicBounds(min_lon=-10, max_lon=10, min_lat=40, max_lat=55),
+            temporal_bounds=TemporalBounds(start=start, end=end),
+            sar_data=SARDataSpec(source="sentinel1_l2_ocn"),
+            validation_sources=[ValidationDataSource(source_type="altimeter")],
+            output_dir=str(tmp_path),
+        )
+        recipe = Recipe(config=config)
+        return DataOrchestrator(recipe, dry_run=True)
+
+    def test_range_entirely_before_cutover_only_calls_reprocessed(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "sar_validation.downloaders.reprocessed_altimeter_downloader.ReprocessedAltimeterDownloader.download",
+            lambda self, **kw: calls.append(("reprocessed", kw)) or [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.altimeter_downloader.AltimeterDownloader.download",
+            lambda self, **kw: calls.append(("nrt", kw)) or [],
+        )
+        orch = self._make_orchestrator(tmp_path, "2023-06-01", "2023-06-02")
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_altimeter(source)
+
+        assert [c[0] for c in calls] == ["reprocessed"]
+
+    def test_range_entirely_after_cutover_only_calls_nrt(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "sar_validation.downloaders.reprocessed_altimeter_downloader.ReprocessedAltimeterDownloader.download",
+            lambda self, **kw: calls.append(("reprocessed", kw)) or [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.altimeter_downloader.AltimeterDownloader.download",
+            lambda self, **kw: calls.append(("nrt", kw)) or [],
+        )
+        orch = self._make_orchestrator(tmp_path, "2026-06-01", "2026-06-02")
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_altimeter(source)
+
+        assert [c[0] for c in calls] == ["nrt"]
+
+
 class TestCollocationSkipGating:
     """download_all() gates every non-SAR source dispatch on a predicted
     collocation verdict (default on), consulting _collocation_predictions()
