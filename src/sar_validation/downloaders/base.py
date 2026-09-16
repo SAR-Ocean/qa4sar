@@ -60,6 +60,7 @@ __all__ = [
     "authenticate_earthdata",
     "set_credential",
     "normalize_datetime",
+    "split_datetime_range_at_cutover",
     "is_date_recent",
     "build_output_dir",
     "split_antimeridian_bbox",
@@ -936,6 +937,31 @@ def normalize_datetime(dt_str: str) -> str:
         dt_str += "T00:00:00"
     
     return dt_str
+
+
+def split_datetime_range_at_cutover(
+    start: str, end: str, cutover: str,
+) -> "Tuple[Optional[Tuple[str, str]], Optional[Tuple[str, str]]]":
+    """
+    Split a (start, end) window into the portion before *cutover* and the
+    portion from *cutover* onward.
+
+    Returns (before, after); either element is None when the whole window
+    falls entirely on the other side. Used where a requested date range
+    can straddle a boundary between two data products that each cover
+    one side of it.
+    """
+    start_norm = normalize_datetime(start)
+    end_norm = normalize_datetime(end)
+    cutover_norm = normalize_datetime(cutover)
+
+    if end_norm < cutover_norm:
+        return (start, end), None
+    if start_norm >= cutover_norm:
+        return None, (start, end)
+
+    before_end = (datetime.fromisoformat(cutover_norm) - timedelta(seconds=1)).isoformat()
+    return (start, before_end), (cutover, end)
 
 
 def is_date_recent(dt_str: str, threshold_days: int = 30) -> bool:

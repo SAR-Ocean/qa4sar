@@ -195,6 +195,52 @@ class TestSplitAntimeridianBbox:
 
 
 # ---------------------------------------------------------------------------
+# Tests for split_datetime_range_at_cutover()
+# ---------------------------------------------------------------------------
+
+class TestSplitDatetimeRangeAtCutover:
+    def test_window_entirely_before_cutover(self):
+        from sar_validation.downloaders.base import split_datetime_range_at_cutover
+
+        before, after = split_datetime_range_at_cutover(
+            "2023-06-01T00:00:00", "2023-06-02T00:00:00", "2024-01-01T00:00:00",
+        )
+
+        assert before == ("2023-06-01T00:00:00", "2023-06-02T00:00:00")
+        assert after is None
+
+    def test_window_entirely_after_cutover(self):
+        from sar_validation.downloaders.base import split_datetime_range_at_cutover
+
+        before, after = split_datetime_range_at_cutover(
+            "2024-06-01T00:00:00", "2024-06-02T00:00:00", "2024-01-01T00:00:00",
+        )
+
+        assert before is None
+        assert after == ("2024-06-01T00:00:00", "2024-06-02T00:00:00")
+
+    def test_window_straddling_cutover_is_split(self):
+        from sar_validation.downloaders.base import split_datetime_range_at_cutover
+
+        before, after = split_datetime_range_at_cutover(
+            "2023-12-31T21:00:00", "2024-01-01T03:00:00", "2024-01-01T00:00:00",
+        )
+
+        assert before == ("2023-12-31T21:00:00", "2023-12-31T23:59:59")
+        assert after == ("2024-01-01T00:00:00", "2024-01-01T03:00:00")
+
+    def test_window_ending_exactly_at_cutover_is_entirely_before(self):
+        from sar_validation.downloaders.base import split_datetime_range_at_cutover
+
+        before, after = split_datetime_range_at_cutover(
+            "2023-12-31T00:00:00", "2023-12-31T23:59:59", "2024-01-01T00:00:00",
+        )
+
+        assert before == ("2023-12-31T00:00:00", "2023-12-31T23:59:59")
+        assert after is None
+
+
+# ---------------------------------------------------------------------------
 # Tests for prefer_ipv4_dns()
 # ---------------------------------------------------------------------------
 
