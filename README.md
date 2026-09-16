@@ -223,6 +223,7 @@ The validation report is saved under `data/<timerange>_<bounds>/validation_repor
 | HY-2B / HY-2C / Oceansat-3 | wind | `scatterometer_ftp_downloader` | OSI-SAF FTP | last 3 days |
 | Radiometer — AMSR2 (NetCDF); GMI, SSMIS F16/F17/F18, WindSat (binary bytemaps) | wind (+ direction from WindSat) | `radiometer_downloader` | RSS `data.remss.com` (public HTTPS) | AMSR2/GMI/SSMIS F16/F17/F18: 2012-07-02/2014-03-04/2003-10-26/2006-11-04/2009-10-18 - present |
 | Altimeter (10 missions, along-track) | wind (1 Hz only) / significant wave height | `altimeter_downloader` | Copernicus Marine | 1 Hz: varies by mission, 2023-11-21 to 2023-12-28 - present; 5 Hz (6 of the missions): varies by mission, 2026-03-07/09 - present |
+| Altimeter, reprocessed (12 missions, along-track) | significant wave height | `reprocessed_altimeter_downloader` | Copernicus Marine | 1991-08-03 - 2023-12-31 |
 | Sentinel-1 CLMS Surface Soil Moisture | soil moisture | `sentinel1_soil_moisture_downloader` | Copernicus Dataspace (CDSE) | 2014 - present (Europe only) |
 | ASCAT Soil Moisture (SOMO12) | soil moisture | `ascat_soil_moisture_downloader` | EUMETSAT EUMDAC | 2007 - 2025-07-15 |
 | ASCAT Soil Moisture NRT (H122/H29) | soil moisture | `hsaf_downloader` | H-SAF FTP | rolling last 60 days (⚠️ gap between 2025-07-15 and 60 days ago is not covered); H122 (6.25km) by default, H29 (12.5km) via `download_kwargs: {hsaf_product: h29}` |
@@ -258,6 +259,28 @@ in `altimeter_downloader.py`) and reflect the ARCO/zarr store this
 downloader queries via `copernicusmarine.subset()`; Copernicus Marine also
 holds a separate native-file archive with most missions' raw data back to
 2021, but that's a different service this downloader doesn't fetch from.
+
+Significant wave height recipes covering dates on or before 2023-12-31
+automatically use the reprocessed (multi-year) altimeter product instead
+(`WAVE_GLO_PHY_SWH_L3_MY_014_005`), which covers 12 missions (adding
+ERS-1/2, TOPEX/Poseidon, Jason-1/2, Envisat to the near-real-time
+product's set) back to 1991-08-03. This switch is automatic and needs no
+recipe change: a recipe's requested date range determines which product
+is fetched, and a range spanning the 2023-12-31/2024-01-01 boundary uses
+both. Unlike the near-real-time product, the reprocessed product is
+delivered as one combined NetCDF file per day covering every active
+mission together, rather than one NetCDF file per satellite, downloaded
+via `copernicusmarine.get()` against a different Copernicus Marine
+service (`original-files`) than the near-real-time downloader's
+`subset()` calls; the downloader checks each mission's predicted orbit
+before downloading a day's file, so a day with no mission crossing the
+requested area is never fetched. The
+reprocessed product's own bias-corrected, denoised significant wave
+height (`swh_denoised`) and its uncertainty (`swh_uncertainty`) are
+renamed to `VAVH`/`VAVH_UNCERTAINTY` to match the near-real-time
+product's codes; the product's own quality filtering happens before the
+data can be downloaded at all (see `docs/QC_flags_implementation.md`), so
+no separate quality flag needs to be read here.
 
 ### Collocation types
 

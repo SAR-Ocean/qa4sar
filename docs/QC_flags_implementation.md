@@ -33,7 +33,8 @@ sources, then soil moisture — matching validation priority in this toolbox.
 | NOAA HF-radar | No | — | N/A — NOAA filters upstream before publishing | N/A |
 | Copernicus Marine in-situ (buoy/mooring/drifter/ferrybox/tide-gauge, incl. ADCP/Argo/glider) | Yes | `value_qc` (CMEMS 0-9 scale) | Filtered to CMEMS's valid-code set (1, 2, 5, 7, 8); value and QC column nulled together otherwise | Done |
 | ISMN (soil moisture ground stations) | Yes, at source portal | ISMN's own "Good"/etc. scheme | Enforced only via unenforced manual portal instructions; no code-level filtering | Not implemented |
-| Altimeter (CMEMS L3 SWH) | No | — | N/A — filtered upstream (`VAVH` vs `VAVH_UNFILTERED` naming implies pre-filtering) | N/A |
+| Altimeter, near-real-time (CMEMS L3 SWH) | No | — | N/A — filtered upstream (`VAVH` vs `VAVH_UNFILTERED` naming implies pre-filtering) | N/A |
+| Altimeter, reprocessed (CMEMS L3 SWH, multi-year) | No | `swh_quality_level` (not a requestable variable) | N/A; dataset is filtered prior to construction (only value 3 = good data gets accepted into the dataset) | N/A |
 | ERA5 (reference model) | Land mask, not a QC flag | `land_sea_mask`/`lsm` | Applied at collocation time to exclude land points from wind comparisons | Done |
 | HYCOM (reference model) | No | — | N/A — fixed-grid reanalysis, no per-cell retrieval QC concept | N/A |
 | Scatterometer (MetOp ASCAT winds, HY-2, Oceansat-3) | Yes | `wvc_quality_flag` bitmask | Cells with any reject bit dropped entirely | Done |
@@ -217,12 +218,21 @@ carry no `value_qc` column — so even after the in-situ CSV filtering above
 ships, ISMN falls into its "no `value_qc` column → skipped" branch and
 receives no in-code QC filtering.
 
-**Altimeter (CMEMS L3 SWH)** (`from_altimeter`, `datatree_converter.py:830-940`)
+**Altimeter, near-real-time (CMEMS L3 SWH)** (`from_altimeter`, `datatree_converter.py:830-940`)
 Confirmed by inspecting a real cached file (`SARAL-Altika.nc`): no
 per-observation flag variable is delivered. The product ships both `VAVH`
 and `VAVH_UNFILTERED`, implying quality filtering already happens upstream
 before publication (the same pattern as NOAA HF-radar). Nothing to
 implement.
+
+**Altimeter, reprocessed (CMEMS L3 SWH, multi-year)** (`from_altimeter_reprocessed`, `datatree_converter.py`)
+Confirmed against product documentation and a real downloaded file:
+`swh_quality_level` is not a variable in this product at all (confirmed
+absent from a real NetCDF file's data variables), because the dataset
+itself is filtered before it can be downloaded — only points with
+quality level 3 (good data) are ever included in what
+`copernicusmarine.get()` returns. There is nothing to read or filter for
+this product.
 
 **ERA5** (`model_collocation.py:290-307` point mode, `:613-661`
 cell-averaging mode)
@@ -376,8 +386,7 @@ unconfirmed. No SAR-product gaps remain open.
    the base file format (not just its QC flag) is unconfirmed against a
    real download.
 
-**Not gaps** (confirmed no code action needed): NOAA HF-radar, Altimeter
-(CMEMS L3 SWH), HYCOM, SMOS (no discrete flag exists in the delivered NRT
+**Not gaps** (confirmed no code action needed): NOAA HF-radar, Altimeter (both products), HYCOM, SMOS (no discrete flag exists in the delivered NRT
 product), AMSR G-Portal L3SGSMC (sentinel-code filtering already
 functionally equivalent), NISAR SME2 (verified redundant with fill-value
 masking), RVL, RADARSAT-2, CLMS SSM, scatterometer, radiometer wind — all
