@@ -34,8 +34,8 @@ COVERAGE_END = "2023-12-31"
 
 #: Mission activity windows. Keys are this product's own mission names,
 #: exactly as they appear in a real downloaded file's "satellite"
-#: variable flag_meanings (confirmed live, not guessed from the QUID's
-#: own mission-name spellings, which differ for three of these:
+#: variable flag_meanings, not the QUID's own mission-name spellings,
+#: which differ for three of these:
 #: "topex-poseidon" not "topex", and "sentinel-3_a"/"sentinel-3_b"/
 #: "sentinel-6_a" with an underscore before the trailing letter). Dates
 #: are from the WAVE_GLO_PHY_SWH_L3_MY_014_005 quality information

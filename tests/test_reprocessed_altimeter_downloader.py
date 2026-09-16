@@ -34,15 +34,14 @@ class TestMissionsTable:
 
     def test_topex_poseidon_key_matches_the_files_own_satellite_flag_meaning(self):
         """The product's own "satellite" flag variable uses
-        "topex-poseidon" (confirmed against a real downloaded file), not
-        "topex" -- the MISSIONS table key must match exactly, since it
-        doubles as the platform_id value the converter decodes per
-        point."""
+        "topex-poseidon", not "topex" -- the MISSIONS table key must
+        match exactly, since it doubles as the platform_id value the
+        converter decodes per point."""
         assert "topex-poseidon" in MISSIONS
         assert MISSIONS["topex-poseidon"]["orbit_key"] == "topex"
 
     def test_sentinel_mission_keys_match_the_files_own_underscore_spelling(self):
-        """Confirmed against a real downloaded file's flag_meanings:
+        """The product's own flag_meanings use:
         "sentinel-3_a"/"sentinel-3_b"/"sentinel-6_a", not
         "sentinel-3a"/"sentinel-3b"/"sentinel-6a" (which remain valid as
         orbit_coverage.py's own key spelling, via orbit_key)."""
