@@ -1298,6 +1298,119 @@ class DataTreeConverter:
         return ds
 
     @staticmethod
+    def from_altimeter_reprocessed(
+        nc_path: Union[str, Path],
+    ) -> Optional[xr.Dataset]:
+        """
+        Open a Copernicus Marine reprocessed along-track altimeter NetCDF
+        (multi-year significant wave height product) and return a
+        standardised Dataset with a flat ``point`` dimension, matching the
+        layout produced by :meth:`from_altimeter`.
+
+        One file covers one day and every satellite mission active that
+        day, identified per point by the file's own ``satellite`` flag
+        variable. ``swh_denoised`` (bias-corrected and denoised) is
+        renamed to ``VAVH`` and ``swh_uncertainty`` to
+        ``VAVH_UNCERTAINTY``, matching the codes the near-real-time
+        altimeter product already uses, so both flow through the same
+        statistics and report code. The raw ``swh``, ``swh_adjusted``,
+        ``distance_to_coast``, ``bathymetry``, ``cycle`` and
+        ``relative_pass`` values are kept unchanged as auxiliary
+        variables.
+
+        ``platform_id`` (e.g. ``"jason-3"``) is decoded from the file's
+        own ``satellite`` flag variable and kept as a per-point
+        coordinate -- unlike the near-real-time product (one file per
+        satellite, so the satellite is already known from the file
+        itself), this product combines every mission into one daily
+        file, so this is the only way to tell which mission a given
+        point came from. Collocation already reads any ``platform_id``
+        coordinate generically (see ``collocation.py``'s
+        ``val_id=val_row.get("platform_id")``), so keeping it here is
+        what carries mission identity through to the collocation
+        dataset -- no further wiring is needed.
+
+        Parameters
+        ----------
+        nc_path : str or Path
+            Path to the reprocessed altimeter NetCDF file.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="altimeter"``, or None on failure.
+        """
+        nc_path = Path(nc_path)
+        if not nc_path.exists():
+            logger.warning("NetCDF not found: %s", nc_path)
+            return None
+
+        try:
+            raw = xr.open_dataset(nc_path)
+        except Exception as exc:
+            logger.warning("Could not open %s: %s", nc_path, exc)
+            return None
+
+        if "lon" not in raw or "lat" not in raw or "time" not in raw:
+            logger.warning(
+                "Could not find lon/lat/time in %s (available: %s)",
+                nc_path.name, list(raw.coords) + list(raw.data_vars),
+            )
+            raw.close()
+            return None
+
+        n_points = raw.sizes.get("time", 0)
+        if n_points == 0:
+            logger.warning("No points found in %s.", nc_path.name)
+            raw.close()
+            return None
+
+        platform_id = _decode_flag_variable(raw["satellite"]) if "satellite" in raw else None
+        if platform_id is None:
+            platform_id = np.full(n_points, "unknown", dtype=object)
+
+        _skip = {"lon", "lat", "time", "satellite"}
+        _rename = {"swh_denoised": "VAVH", "swh_uncertainty": "VAVH_UNCERTAINTY"}
+        data_vars: Dict[str, tuple] = {}
+        var_attrs: Dict[str, Dict] = {}
+        for vname, da in raw.data_vars.items():
+            if vname in _skip:
+                continue
+            if da.dtype.kind not in ("f", "i", "u"):
+                continue
+            flat = da.values.ravel()
+            if len(flat) != n_points:
+                continue
+            out_name = _rename.get(str(vname), str(vname))
+            data_vars[out_name] = ("point", flat.astype(float))
+            var_attrs[out_name] = dict(da.attrs)
+
+        if not data_vars:
+            logger.warning("No usable data variables found in %s.", nc_path.name)
+            raw.close()
+            return None
+
+        ds = xr.Dataset(
+            data_vars,
+            coords={
+                "lon":         ("point", raw["lon"].values.ravel()),
+                "lat":         ("point", raw["lat"].values.ravel()),
+                "time":        ("point", raw["time"].values.ravel()),
+                "platform_id": ("point", platform_id),
+            },
+        )
+        apply_cf_metadata(ds, "altimeter_reprocessed", var_attrs)
+
+        ds.attrs["data_type"]     = "altimeter"
+        ds.attrs["platform_type"] = "altimeter"
+        ds.attrs["frequency"]     = "reprocessed"
+        ds.attrs["source"]        = "Copernicus Marine altimeter L3 (reprocessed)"
+        ds.attrs["filename"]      = nc_path.name
+
+        raw.close()
+        return ds
+
+    @staticmethod
     def from_collocations(
         collocations: list,
     ) -> Optional[xr.Dataset]:
@@ -4733,6 +4846,17 @@ class DataTreeConverter:
                     key = "_".join(rel.parts)
                     datasets[f"validation/altimeter/{key}"] = ds
                     logger.info("Converted altimeter: %s", nc_path.relative_to(subdir))
+
+        # Reprocessed (multi-year) altimeter NetCDF products, one file per day.
+        subdir = base_dir / "altimeter_reprocessed"
+        if subdir.exists():
+            for nc_path in sorted(subdir.glob("*.nc")):
+                ds = _filtered(
+                    DataTreeConverter.from_altimeter_reprocessed(nc_path), nc_path.name,
+                )
+                if ds is not None:
+                    datasets[f"validation/altimeter_reprocessed/{nc_path.stem}"] = ds
+                    logger.info("Converted reprocessed altimeter: %s", nc_path.name)
 
         # Radiometer daily gridded products. Each file is a global 0.25° grid;
         # the converter flattens it to points and the domain filter crops to

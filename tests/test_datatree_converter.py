@@ -4545,3 +4545,19 @@ class TestConvertDownloadedDataHycom:
         tree = DataTreeConverter.convert_downloaded_data(tmp_path, recipe=recipe)
         assert tree is not None
         assert "hycom" not in getattr(tree.get("validation"), "children", {})
+
+    def test_convert_downloaded_data_routes_reprocessed_altimeter_nc(self, tmp_path):
+        from tests.test_datatree_converter_altimeter_reprocessed import _write_reprocessed_altimeter_nc
+
+        base_dir = tmp_path
+        subdir = base_dir / "altimeter_reprocessed"
+        subdir.mkdir()
+        _write_reprocessed_altimeter_nc(subdir / "ESACCI-SEASTATE-L3-SWH-MULTI_1D-20231230-fv01.nc")
+
+        tree = DataTreeConverter.convert_downloaded_data(base_dir)
+
+        assert tree is not None
+        node = tree["validation/altimeter_reprocessed/ESACCI-SEASTATE-L3-SWH-MULTI_1D-20231230-fv01"]
+        assert node is not None
+        ds = node.to_dataset()
+        assert ds.attrs["frequency"] == "reprocessed"
