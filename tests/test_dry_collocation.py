@@ -2640,7 +2640,7 @@ class TestPredictAltimeterTolerance:
 
         dry_collocation._predict_altimeter(source=object(), cfg=object(), sar_footprints=[footprint])
 
-        assert calls == [("altimeter_1hz", "altimeter_5hz")]
+        assert calls == [("altimeter_1hz", "altimeter_5hz", "altimeter_reprocessed")]
 
     def test_padded_window_reflects_180_minutes_end_to_end(self, monkeypatch):
         """Uses the REAL _resolve_temporal_padding_minutes (not mocked)
@@ -2740,6 +2740,13 @@ class TestAltimeterSatelliteResolver:
                 f"too wide for a nadir altimeter -- likely reusing a different instrument's orbit spec"
             )
 
+
+    def test_satellite_resolver_resolves_reprocessed_only_mission_codes(self):
+        from sar_validation.core.dry_collocation import _altimeter_satellite_resolver
+
+        assert _altimeter_satellite_resolver("ers-1") == "ers-1"
+        assert _altimeter_satellite_resolver("topex-poseidon") == "topex"
+        assert _altimeter_satellite_resolver("al") == "saral"  # existing NRT code, unaffected
 
 class TestAltimeterOrbitMarginKm:
     def test_predict_altimeter_passes_a_narrow_margin_not_the_wide_swath_default(self, monkeypatch):
@@ -2886,6 +2893,33 @@ class TestAltimeterOrbitCandidatesDry:
         assert "h2c" in names
 
 
+    def test_candidates_include_reprocessed_only_missions_for_a_1990s_window(self):
+        from sar_validation.core.dry_collocation import _altimeter_orbit_candidates_dry
+
+        candidates = _altimeter_orbit_candidates_dry(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="1993-01-01T00:00:00", end="1993-01-02T00:00:00",
+        )
+
+        codes = {c[0] for c in candidates}
+        assert "ers-1" in codes
+        assert "topex-poseidon" in codes
+        # No near-real-time mission was active in 1993.
+        assert "al" not in codes
+
+    def test_candidates_include_near_real_time_missions_for_a_2026_window(self):
+        from sar_validation.core.dry_collocation import _altimeter_orbit_candidates_dry
+
+        candidates = _altimeter_orbit_candidates_dry(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2026-06-01T00:00:00", end="2026-06-02T00:00:00",
+        )
+
+        codes = {c[0] for c in candidates}
+        assert "al" in codes
+        # No reprocessed-only mission was active in 2026.
+        assert "ers-1" not in codes
+
 class TestPredictAltimeterOrbitCorridor:
     """predict_source integration test for the altimeter source_type,
     mirroring TestPredictSmosSsm's pattern -- exercises the real
@@ -2955,6 +2989,11 @@ class TestPredictAltimeterOrbitCorridor:
 
         assert result.verdict == "none-predicted"
         assert result.bucket == "orbit-corridor"
+    def test_predict_altimeter_tolerance_source_types_include_reprocessed(self):
+        from sar_validation.core import dry_collocation
+
+        assert "altimeter_reprocessed" in dry_collocation._ALTIMETER_TOLERANCE_SOURCE_TYPES
+
 
 
 class TestPredictAmsrSsm:

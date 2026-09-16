@@ -1997,13 +1997,25 @@ _ALTIMETER_SATELLITE_MAP = {
 
 
 def _altimeter_satellite_resolver(candidate_name: str) -> str:
-    """satellite_resolver adapter for altimeter: candidate_name is one of
-    AltimeterDownloader's own satellite codes (e.g. "j3"), mapped to
-    orbit_coverage.py's SATELLITE_ORBIT_SPECS keys. An unrecognized code
-    still reaches orbit_overlap_windows, which itself fails open (whole
-    candidate window kept) on any key absent from SATELLITE_ORBIT_SPECS --
-    mirrors _hsaf_satellite_resolver's identical contract."""
-    return _ALTIMETER_SATELLITE_MAP.get(candidate_name, "unknown")
+    """
+    Resolve one candidate code to an orbit_coverage.py satellite key.
+
+    Accepts codes from either altimeter product: AltimeterDownloader's
+    near-real-time codes (e.g. "j3") via _ALTIMETER_SATELLITE_MAP, or
+    ReprocessedAltimeterDownloader's mission codes (e.g. "ers-1") via
+    that module's own MISSIONS table. An unrecognized code resolves to
+    "unknown", which orbit_overlap_windows treats as a fail-open match
+    (whole candidate window kept) rather than an error.
+    """
+    if candidate_name in _ALTIMETER_SATELLITE_MAP:
+        return _ALTIMETER_SATELLITE_MAP[candidate_name]
+
+    from ..downloaders.reprocessed_altimeter_downloader import MISSIONS
+
+    if candidate_name in MISSIONS:
+        return MISSIONS[candidate_name]["orbit_key"]
+
+    return "unknown"
 
 
 def _altimeter_orbit_candidates_dry(
@@ -2067,6 +2079,16 @@ def _altimeter_orbit_candidates_dry(
         if avail_end is not None and start_str > avail_end:
             continue
         candidates.append((sat_code, start_dt, end_dt))
+    from ..downloaders.reprocessed_altimeter_downloader import COVERAGE_END, MISSIONS
+
+    coverage_end_str = f"{COVERAGE_END}T23:59:59"
+    for mission_code, spec in MISSIONS.items():
+        if end_str < f"{spec['start']}T00:00:00":
+            continue
+        if start_str > f"{spec['end']}T23:59:59":
+            continue
+        candidates.append((mission_code, start_dt, end_dt))
+
     return candidates
 
 
@@ -2079,6 +2101,12 @@ def _altimeter_orbit_candidates_dry(
 #: wide-swath-sized buffer dominating a narrow instrument's effective
 #: search corridor.
 _ALTIMETER_ORBIT_MARGIN_KM = 12.0
+
+#: Every layer-type key altimeter data can be tagged with, used to look up
+#: the correct time-tolerance padding regardless of which product or
+#: frequency a given recipe's altimeter data actually resolves to.
+_ALTIMETER_TOLERANCE_SOURCE_TYPES = ("altimeter_1hz", "altimeter_5hz", "altimeter_reprocessed")
+
 
 
 def _predict_altimeter(
@@ -2108,7 +2136,7 @@ def _predict_altimeter(
         satellite_resolver=_altimeter_satellite_resolver,
         list_candidates_dry=_altimeter_orbit_candidates_dry,
         source_type="altimeter",
-        tolerance_source_types=("altimeter_1hz", "altimeter_5hz"),
+        tolerance_source_types=_ALTIMETER_TOLERANCE_SOURCE_TYPES,
         margin_km=_ALTIMETER_ORBIT_MARGIN_KM,
         stop_on_first_match=stop_on_first_match,
     )
