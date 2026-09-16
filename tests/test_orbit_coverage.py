@@ -58,6 +58,14 @@ class TestSatelliteOrbitSpecs:
         assert SATELLITE_ORBIT_SPECS["sentinel-1b"] == SatelliteOrbitSpec(norad_id=41456, swath_half_width_km=250.0)
         assert SATELLITE_ORBIT_SPECS["sentinel-1c"] == SatelliteOrbitSpec(norad_id=62261, swath_half_width_km=250.0)
 
+    def test_reprocessed_altimeter_missions_registered_with_real_norad_ids(self):
+        assert SATELLITE_ORBIT_SPECS["ers-1"] == SatelliteOrbitSpec(norad_id=21574, swath_half_width_km=8.0)
+        assert SATELLITE_ORBIT_SPECS["ers-2"] == SatelliteOrbitSpec(norad_id=23560, swath_half_width_km=8.0)
+        assert SATELLITE_ORBIT_SPECS["topex"] == SatelliteOrbitSpec(norad_id=22076, swath_half_width_km=8.0)
+        assert SATELLITE_ORBIT_SPECS["jason-1"] == SatelliteOrbitSpec(norad_id=26997, swath_half_width_km=8.0)
+        assert SATELLITE_ORBIT_SPECS["jason-2"] == SatelliteOrbitSpec(norad_id=33105, swath_half_width_km=8.0)
+        assert SATELLITE_ORBIT_SPECS["envisat"] == SatelliteOrbitSpec(norad_id=27386, swath_half_width_km=8.0)
+
 
 class TestBearingDeg:
     def test_due_north_is_zero(self):

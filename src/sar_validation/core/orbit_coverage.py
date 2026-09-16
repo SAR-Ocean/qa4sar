@@ -145,6 +145,16 @@ SATELLITE_ORBIT_SPECS: Dict[str, SatelliteOrbitSpec] = {
     # doesn't depend on which payload is being modeled).
     "hy2b-altimeter": SatelliteOrbitSpec(norad_id=43655, swath_half_width_km=8.0),
     "hy2c-altimeter": SatelliteOrbitSpec(norad_id=46469, swath_half_width_km=8.0),
+    # Reprocessed (multi-year) altimeter SWH product missions not shared
+    # with the near-real-time product (see reprocessed_altimeter_downloader.py's
+    # MISSIONS table). Same narrow nadir footprint as every other altimeter
+    # entry above.
+    "ers-1":   SatelliteOrbitSpec(norad_id=21574, swath_half_width_km=8.0),
+    "ers-2":   SatelliteOrbitSpec(norad_id=23560, swath_half_width_km=8.0),
+    "topex":   SatelliteOrbitSpec(norad_id=22076, swath_half_width_km=8.0),
+    "jason-1": SatelliteOrbitSpec(norad_id=26997, swath_half_width_km=8.0),
+    "jason-2": SatelliteOrbitSpec(norad_id=33105, swath_half_width_km=8.0),
+    "envisat": SatelliteOrbitSpec(norad_id=27386, swath_half_width_km=8.0),
 }
 
 
