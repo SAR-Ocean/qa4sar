@@ -5,7 +5,11 @@ from __future__ import annotations
 import numpy as np
 import xarray as xr
 
-from sar_validation.core._cf_metadata import INSITU_VARIABLE_ATTRS, annotate_collocation_ds
+from sar_validation.core._cf_metadata import (
+    INSITU_VARIABLE_ATTRS,
+    PRODUCT_REFERENCES,
+    annotate_collocation_ds,
+)
 from sar_validation.core.datatree_converter import DataTreeConverter
 
 
@@ -202,7 +206,6 @@ class TestAnnotateCollocationDsEra5DerivedWindAttrs:
 
 class TestReprocessedAltimeterMetadata:
     def test_product_reference_registered(self):
-        from sar_validation.core._cf_metadata import PRODUCT_REFERENCES
         assert "altimeter_reprocessed" in PRODUCT_REFERENCES
         assert PRODUCT_REFERENCES["altimeter_reprocessed"].startswith("https://")
 

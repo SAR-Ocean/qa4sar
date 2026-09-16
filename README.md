@@ -262,13 +262,13 @@ holds a separate native-file archive with most missions' raw data back to
 
 Significant wave height recipes covering dates on or before 2023-12-31
 automatically use the reprocessed (multi-year) altimeter product instead
-(`WAVE_GLO_PHY_SWH_L3_MY_014_005`), which covers 12 missions (adding
-ERS-1/2, TOPEX/Poseidon, Jason-1/2, Envisat to the near-real-time
-product's set) back to 1991-08-03. This switch is automatic and needs no
-recipe change: a recipe's requested date range determines which product
-is fetched, and a range spanning the 2023-12-31/2024-01-01 boundary uses
-both. Unlike the near-real-time product, the reprocessed product is
-delivered as one combined NetCDF file per day covering every active
+(`WAVE_GLO_PHY_SWH_L3_MY_014_005`), which covers 12 missions, including
+ERS-1/2, TOPEX/Poseidon, Jason-1/2 and Envisat, which the near-real-time
+product does not carry, back to 1991-08-03. This switch is automatic and
+needs no recipe change: a recipe's requested date range determines which
+product is fetched, and a range spanning the 2023-12-31/2024-01-01
+boundary uses both. Unlike the near-real-time product, the reprocessed
+product is delivered as one combined NetCDF file per day covering every active
 mission together, rather than one NetCDF file per satellite, downloaded
 via `copernicusmarine.get()` against a different Copernicus Marine
 service (`original-files`) than the near-real-time downloader's

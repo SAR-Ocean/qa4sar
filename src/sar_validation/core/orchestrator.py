@@ -1679,13 +1679,46 @@ class DataOrchestrator:
         # of which one this recipe's window actually resolves to.
         windows = self._padded_temporal_bounds("altimeter_1hz", "altimeter_5hz", "altimeter_reprocessed")
 
+        nrt_kwargs = {
+            "frequencies": self._ALTIMETER_FREQUENCIES_BY_VARIABLE.get(
+                cfg.variable, ["1hz"]
+            ),
+        }
+        nrt_kwargs.update(source.download_kwargs)   # recipe-level override wins
+
+        def _download_nrt(nrt_windows) -> bool:
+            nrt_out_dir = self.base_dir / "altimeter"
+            return self._run_download(
+                "altimeter", nrt_out_dir,
+                lambda: AltimeterDownloader(
+                    output_dir=nrt_out_dir, dry_run=self.dry_run, force_download=self.force_download,
+                ),
+                nrt_windows,
+                lambda start, end: dict(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=start, end=end,
+                    **nrt_kwargs,
+                ),
+                "Altimeter",
+            )
+
+        # The reprocessed product carries significant wave height only --
+        # a recipe requesting a different variable (e.g. wind) gets no
+        # usable data from it, so the whole window goes to the
+        # near-real-time downloader unsplit, exactly as it did before this
+        # product existed (that downloader already finds nothing before
+        # its own missions' availability dates).
+        if cfg.variable != "waves":
+            return _download_nrt(windows)
+
         reprocessed_windows: "list[tuple[str, str]]" = []
         nrt_windows: "list[tuple[str, str]]" = []
         for start, end in windows:
             before, after = split_datetime_range_at_cutover(start, end, self._ALTIMETER_REPROCESSED_CUTOVER)
-            if before is not None:
+            if before is not None and before[0] != before[1]:
                 reprocessed_windows.append(before)
-            if after is not None:
+            if after is not None and after[0] != after[1]:
                 nrt_windows.append(after)
 
         ok = True
@@ -1707,28 +1740,15 @@ class DataOrchestrator:
             ) and ok
 
         if nrt_windows:
-            nrt_out_dir = self.base_dir / "altimeter"
-            kwargs = {
-                "frequencies": self._ALTIMETER_FREQUENCIES_BY_VARIABLE.get(
-                    cfg.variable, ["1hz"]
-                ),
-            }
-            kwargs.update(source.download_kwargs)   # recipe-level override wins
-
-            ok = self._run_download(
-                "altimeter", nrt_out_dir,
-                lambda: AltimeterDownloader(
-                    output_dir=nrt_out_dir, dry_run=self.dry_run, force_download=self.force_download,
-                ),
-                nrt_windows,
-                lambda start, end: dict(
-                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
-                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                    start=start, end=end,
-                    **kwargs,
-                ),
-                "Altimeter",
-            ) and ok
+            ok = _download_nrt(nrt_windows) and ok
+        elif reprocessed_windows:
+            # The whole requested window fell before the cutover, so the
+            # near-real-time downloader never ran -- but the recipe's own
+            # source_type is "altimeter" regardless of which product
+            # actually served it, and the already-downloaded check in
+            # cli.py keys off source_type, so its outcome is aliased under
+            # "altimeter" too.
+            self.metadata["downloads"]["altimeter"] = self.metadata["downloads"]["altimeter_reprocessed"]
 
         return ok
 

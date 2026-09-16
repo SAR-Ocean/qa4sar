@@ -2107,7 +2107,6 @@ _ALTIMETER_ORBIT_MARGIN_KM = 12.0
 _ALTIMETER_TOLERANCE_SOURCE_TYPES = ("altimeter_1hz", "altimeter_5hz", "altimeter_reprocessed")
 
 
-
 def _predict_altimeter(
     source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
 ) -> SourcePrediction:

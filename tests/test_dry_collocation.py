@@ -2740,7 +2740,6 @@ class TestAltimeterSatelliteResolver:
                 f"too wide for a nadir altimeter -- likely reusing a different instrument's orbit spec"
             )
 
-
     def test_satellite_resolver_resolves_reprocessed_only_mission_codes(self):
         from sar_validation.core.dry_collocation import _altimeter_satellite_resolver
 
@@ -2920,6 +2919,7 @@ class TestAltimeterOrbitCandidatesDry:
         # No reprocessed-only mission was active in 2026.
         assert "ers-1" not in codes
 
+
 class TestPredictAltimeterOrbitCorridor:
     """predict_source integration test for the altimeter source_type,
     mirroring TestPredictSmosSsm's pattern -- exercises the real
@@ -2989,6 +2989,7 @@ class TestPredictAltimeterOrbitCorridor:
 
         assert result.verdict == "none-predicted"
         assert result.bucket == "orbit-corridor"
+
     def test_predict_altimeter_tolerance_source_types_include_reprocessed(self):
         from sar_validation.core import dry_collocation
 

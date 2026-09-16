@@ -464,7 +464,9 @@ def _decode_flag_variable(da: xr.DataArray) -> Optional[np.ndarray]:
     Returns None -- signalling "cannot decode" -- when flag_values/
     flag_meanings are missing from *da*'s own attributes or do not match
     one-to-one, the same "unusable metadata never silently guesses"
-    precedent as _owi_quality_reject_mask.
+    precedent as _owi_quality_reject_mask. A value present in *da* but
+    absent from *flag_values* becomes the string "unknown" for that entry
+    only, rather than causing the whole array to return None.
     """
     meanings = da.attrs.get("flag_meanings")
     values = da.attrs.get("flag_values")

@@ -2531,7 +2531,7 @@ class TestDownloadAscatSsmWaterfall:
 
 
 class TestDownloadAltimeterCutover:
-    def _make_orchestrator(self, tmp_path, start, end):
+    def _make_orchestrator(self, tmp_path, start, end, variable="waves", dry_run=True):
         from sar_validation.core.orchestrator import DataOrchestrator
         from sar_validation.core.recipe import (
             GeographicBounds,
@@ -2543,7 +2543,7 @@ class TestDownloadAltimeterCutover:
         )
 
         config = RecipeConfig(
-            name="test", variable="waves",
+            name="test", variable=variable,
             geographic_bounds=GeographicBounds(min_lon=-10, max_lon=10, min_lat=40, max_lat=55),
             temporal_bounds=TemporalBounds(start=start, end=end),
             sar_data=SARDataSpec(source="sentinel1_l2_ocn"),
@@ -2551,7 +2551,7 @@ class TestDownloadAltimeterCutover:
             output_dir=str(tmp_path),
         )
         recipe = Recipe(config=config)
-        return DataOrchestrator(recipe, dry_run=True)
+        return DataOrchestrator(recipe, dry_run=dry_run)
 
     def test_range_entirely_before_cutover_only_calls_reprocessed(self, tmp_path, monkeypatch):
         calls = []
@@ -2586,6 +2586,75 @@ class TestDownloadAltimeterCutover:
         orch._download_altimeter(source)
 
         assert [c[0] for c in calls] == ["nrt"]
+
+    def test_range_straddling_cutover_calls_both_with_split_windows(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "sar_validation.downloaders.reprocessed_altimeter_downloader.ReprocessedAltimeterDownloader.download",
+            lambda self, **kw: calls.append(("reprocessed", kw)) or [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.altimeter_downloader.AltimeterDownloader.download",
+            lambda self, **kw: calls.append(("nrt", kw)) or [],
+        )
+        start, end = "2023-12-31T22:00:00", "2024-01-01T02:00:00"
+        orch = self._make_orchestrator(tmp_path, start, end)
+        source = orch.recipe.config.validation_sources[0]
+        # Mirrors _padded_temporal_bounds's own symmetric +-180min padding
+        # for the altimeter layer types, so the split boundaries below can
+        # be asserted precisely rather than just checking both fired.
+        pad = pd.Timedelta(minutes=180)
+        padded_start = (pd.Timestamp(start) - pad).isoformat()
+        padded_end = (pd.Timestamp(end) + pad).isoformat()
+        cutover_minus_1s = "2023-12-31T23:59:59"
+        cutover = "2024-01-01T00:00:00"
+
+        orch._download_altimeter(source)
+
+        assert [c[0] for c in calls] == ["reprocessed", "nrt"]
+        reprocessed_kw = calls[0][1]
+        nrt_kw = calls[1][1]
+        assert reprocessed_kw["start"] == padded_start
+        assert reprocessed_kw["end"] == cutover_minus_1s
+        assert nrt_kw["start"] == cutover
+        assert nrt_kw["end"] == padded_end
+
+    def test_wind_variable_before_cutover_only_calls_nrt_unsplit(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "sar_validation.downloaders.reprocessed_altimeter_downloader.ReprocessedAltimeterDownloader.download",
+            lambda self, **kw: calls.append(("reprocessed", kw)) or [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.altimeter_downloader.AltimeterDownloader.download",
+            lambda self, **kw: calls.append(("nrt", kw)) or [],
+        )
+        start, end = "2023-06-01", "2023-06-02"
+        orch = self._make_orchestrator(tmp_path, start, end, variable="wind")
+        source = orch.recipe.config.validation_sources[0]
+        pad = pd.Timedelta(minutes=180)
+        padded_start = (pd.Timestamp(start) - pad).isoformat()
+        padded_end = (pd.Timestamp(end) + pad).isoformat()
+
+        orch._download_altimeter(source)
+
+        assert [c[0] for c in calls] == ["nrt"]
+        nrt_kw = calls[0][1]
+        assert nrt_kw["start"] == padded_start
+        assert nrt_kw["end"] == padded_end
+
+    def test_waves_before_cutover_aliases_altimeter_metadata_to_reprocessed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "sar_validation.downloaders.reprocessed_altimeter_downloader.ReprocessedAltimeterDownloader.download",
+            lambda self, **kw: [tmp_path / "reprocessed_file.nc"],
+        )
+        orch = self._make_orchestrator(tmp_path, "2023-06-01", "2023-06-02", dry_run=False)
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_altimeter(source)
+
+        assert "altimeter" in orch.metadata["downloads"]
+        assert orch.metadata["downloads"]["altimeter"] == orch.metadata["downloads"]["altimeter_reprocessed"]
 
 
 class TestCollocationSkipGating:

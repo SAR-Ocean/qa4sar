@@ -15,6 +15,9 @@ Provides:
 - set_credential         — Store a username/password pair in the OS keyring
   (used by ``sar-validate --set-credential``)
 - normalize_datetime     — ISO datetime normalisation helper
+- split_datetime_range_at_cutover — Split a date range into the portion
+  before and from a fixed cutover date, for products that switch data
+  source at a boundary
 - is_date_recent         — True if a date/datetime string falls within a
   recent threshold
 - build_output_dir       — Canonical output directory path
