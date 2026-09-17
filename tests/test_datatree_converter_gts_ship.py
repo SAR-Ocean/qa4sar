@@ -12,24 +12,11 @@ call signs, coordinates, and wind values are genuine.
 
 from __future__ import annotations
 
-import importlib
-
 import numpy as np
 import pandas as pd
 import pytest
 
 from sar_validation.core.datatree_converter import DataTreeConverter
-
-
-@pytest.fixture(autouse=True, scope="function")
-def _ensure_pdbufr_available():
-    """Ensure pdbufr is properly imported, even after tests that
-    intentionally disable it for testing error paths."""
-    import sar_validation.core.datatree_converter as dtc_module
-    # Reload the module to restore pdbufr in case a previous test disabled it
-    if dtc_module.pdbufr is None:
-        importlib.reload(dtc_module)
-    yield
 
 
 def _fake_bufr_frame(rows: list[dict]) -> pd.DataFrame:

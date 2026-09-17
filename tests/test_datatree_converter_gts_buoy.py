@@ -393,6 +393,7 @@ class TestPdbufrOptionalDependency:
         try:
             assert module.pdbufr is None
         finally:
+            monkeypatch.undo()
             importlib.reload(module)
 
     def test_from_gts_buoy_bufr_raises_clear_error_without_pdbufr(
