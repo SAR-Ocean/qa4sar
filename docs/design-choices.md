@@ -422,6 +422,23 @@ systematic mismatch against `VHM0`-sourced references.
 > `core/orchestrator.py` (`_download_gts_buoy`, `_INSITU_TYPES`),
 > `core/statistics.py` (`_STATS_GROUP_ALIASES`, `_group_by_columns`).
 
+The same GTS/Copernicus Marine pairing exists for ship wind observations,
+with one deliberate asymmetry: `ship_cmems_family` (Copernicus Marine's
+ferrybox network, renamed from `ferrybox` for this symmetry) and
+`ship_gts` (GTS obstype 180) cannot be listed together in one recipe, the
+same overlap guard `buoy_gts`/`buoy_cmems_family` enforces -- but no
+`ship_waterfall` combiner exists. GTS identifies ships by WMO call sign
+(`shipOrMobileLandStationIdentifier`), a different BUFR key and
+identifier format than buoys' numeric WMO platform identifier, and
+whether Copernicus Marine's ferrybox platform IDs correlate with those
+call signs -- i.e. whether the two feeds report the same physical
+vessels at all -- is unconfirmed. Both `ship_cmems_family` and GTS ship
+data emit the same runtime `"ferrybox"` val_source label
+(`PLATFORM_CODE_TO_SOURCE_TYPE["FB"]` is unchanged by the rename), the
+same way GTS buoy data already reuses the `"buoy"` label Copernicus
+Marine buoy/drifter data emits -- this keeps the report color palette
+stable regardless of which feed a point came from.
+
 ---
 
 ## 4. datatree.nc content choices

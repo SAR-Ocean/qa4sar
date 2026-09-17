@@ -282,6 +282,16 @@ product's codes; the product's own quality filtering happens before the
 data can be downloaded at all (see `docs/QC_flags_implementation.md`), so
 no separate quality flag needs to be read here.
 
+`ship_gts` retrieves ship synoptic wind observations from GTS (MARS
+obstype 180), the same MARS/BUFR path `buoy_gts` uses for buoys.
+`ship_cmems_family` is the Copernicus Marine equivalent (the renamed
+`ferrybox` source_type). A recipe may not list both `ship_gts` and
+`ship_cmems_family` -- unlike buoys, whether the two feeds report
+overlapping physical vessels is unconfirmed, so no combined,
+deduplicated source_type exists for ships yet. `ship_gts` is valid for
+`"wind"` recipes only; ship reports carry no other variable this
+toolbox supports.
+
 ### Collocation types
 
 | Type | Example |
