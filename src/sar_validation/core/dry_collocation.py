@@ -2577,6 +2577,49 @@ def _predict_buoy_gts(
 _PREDICATES["buoy_gts"] = _predict_buoy_gts
 
 
+def _predict_ship_gts(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
+    """Predicate for "ship_gts" -- the MARS/GTS ship synoptic wind
+    downloader. Unlike the five real Copernicus Marine in-situ source
+    types, MARS has no lightweight station-index endpoint: every MARS
+    request, however small, is a full BUFR retrieval, the same cost as a
+    real download, so GTS coverage itself genuinely cannot be predicted
+    without a live MARS call -- this predicate does not attempt one, and
+    always reports verdict "unknown" for that reason.
+
+    As a purely informational reference, it additionally runs
+    _predict_insitu's own Copernicus Marine query (query_source_type=
+    "ship_cmems_family", the "FB" platform code) over the same bbox/
+    window/variables, and surfaces the resulting station count/coverage
+    in the returned prediction's message field -- rendered as an extra
+    caveat line under the main verdict (see render_console_table). This
+    is reference data only: since the recipe requests "ship_gts" alone,
+    the real run includes only GTS data, never these referenced
+    Copernicus Marine ferrybox stations."""
+    reference = _predict_insitu(
+        source, cfg, sar_footprints, stop_on_first_match=stop_on_first_match,
+        query_source_type="ship_cmems_family",
+    )
+    message = (
+        f"Copernicus Marine ferrybox coverage (reference only): {reference.detail} "
+        "This reflects Copernicus Marine ferrybox coverage as a reference only -- GTS "
+        "coverage itself cannot be predicted without live MARS access. Because this recipe "
+        "requests \"ship_gts\" only, only GTS data (not the referenced Copernicus Marine "
+        "stations) will be included in the actual run; requesting \"ship_cmems_family\" "
+        "instead of \"ship_gts\" would use the Copernicus Marine ferrybox coverage shown "
+        "here instead, since the two source types cannot both appear in the same recipe."
+    )
+    return SourcePrediction(
+        source_type=source.source_type, bucket="ground-point", verdict="unknown",
+        detail="GTS coverage cannot be predicted without live MARS access.",
+        message=message,
+    )
+
+
+_PREDICATES["ship_gts"] = _predict_ship_gts
+
+
 def _predict_buoy_waterfall(
     source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
 ) -> SourcePrediction:

@@ -4099,6 +4099,85 @@ class TestPredictBuoyGtsAndWaterfall:
         assert "Copernicus Marine coverage only" in result.message
 
 
+class TestPredictShipGts:
+    """"ship_gts" is the GTS-aware ship synoptic wind source type (see
+    gts_ship_downloader.py). It has no lightweight MARS/GTS station-index
+    endpoint to query dry, so its predicate instead runs the same
+    Copernicus Marine query _predict_insitu already performs (query_
+    source_type="ship_cmems_family") purely as reference data, surfaced
+    via the prediction's message field. Unlike "buoy_gts", there is no
+    combined/deduplicated "ship_waterfall" source type, so the caveat
+    message points to using "ship_cmems_family" instead of "ship_gts"
+    rather than to a waterfall alternative."""
+
+    def _cfg(self):
+        return SimpleNamespace(
+            variable="wind", collocation=SimpleNamespace(sar_footprint_radius_km=14.0),
+        )
+
+    def _footprint(self):
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        return SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+    def test_ship_gts_registered(self):
+        from sar_validation.core import dry_collocation
+
+        assert dry_collocation._PREDICATES["ship_gts"] is dry_collocation._predict_ship_gts
+
+    def test_ship_gts_verdict_is_always_unknown_with_caveat_message(self, monkeypatch):
+        """GTS coverage itself cannot be predicted without live MARS
+        access, so "ship_gts" must always report "unknown", regardless of
+        what the Copernicus-side reference query finds -- even a real
+        Copernicus match must not upgrade the verdict."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        seen_source_types = []
+
+        def _fake_station_ranges_dry(
+            self, min_lon, max_lon, min_lat, max_lat, start, end,
+            source_types=None, dataset_part=None, variables=None,
+        ):
+            seen_source_types.append(source_types)
+            return {"S1": (45.0, 0.0, datetime(2026, 8, 1, 5, 0, 0), datetime(2026, 8, 1, 7, 0, 0))}
+
+        monkeypatch.setattr(InSituDownloader, "station_ranges_dry", _fake_station_ranges_dry)
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="ship_gts"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+        )
+
+        assert seen_source_types == [["ship_cmems_family"]]
+        assert result.verdict == "unknown"
+        assert result.source_type == "ship_gts"
+        assert result.message is not None
+        assert "cannot be predicted without live MARS access" in result.message
+        assert "ship_gts" in result.message
+        assert "ship_cmems_family" in result.message
+        assert "ship_waterfall" not in result.message
+
+    def test_ship_gts_caveat_message_present_even_with_no_copernicus_match(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        monkeypatch.setattr(InSituDownloader, "station_ranges_dry", lambda self, *a, **k: {})
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="ship_gts"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+        )
+
+        assert result.verdict == "unknown"
+        assert result.message is not None
+        assert "cannot be predicted without live MARS access" in result.message
+
+
 class TestBuoyWaterfallCopernicusOnlyVerdictNeverSkipsGts:
     """End-to-end regression coverage for the same bug
     TestPredictBuoyGtsAndWaterfall.test_buoy_waterfall_downgrades_no_copernicus_match_to_unknown
