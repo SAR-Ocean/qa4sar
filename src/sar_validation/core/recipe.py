@@ -449,6 +449,59 @@ def _build_sar_data_spec(sar: Dict[str, Any], variable: str) -> SARDataSpec:
     )
 
 
+def _check_gts_cmems_overlap(
+    validation_source_types: "set[str]",
+    gts_type: str,
+    station_description: str,
+    cmems_platform_types: "tuple[str, ...]",
+    excluded_types: "set[str]",
+    waterfall_hint: "Optional[str]",
+) -> None:
+    """
+    Raise ``ValueError`` if *gts_type* and any other requested source_type
+    in *validation_source_types* resolve to overlapping Copernicus Marine
+    platform codes.
+
+    *gts_type* retrieves the same physical stations several Copernicus
+    Marine source types can also report; combining them without
+    deduplication would double-count those stations in validation
+    statistics. *cmems_platform_types* are the Copernicus Marine
+    source_type names whose platform codes overlap with *gts_type*'s own
+    GTS coverage (looked up via ``SOURCE_TYPE_TO_PLATFORM`` rather than
+    hardcoded platform-code literals, so a future source_type that
+    resolves to the same platform code is caught automatically).
+    *excluded_types* are source_types this check never flags even if they
+    would otherwise match (*gts_type* itself, and any combined/deduplicated
+    variant of it). *waterfall_hint*, if given, names a combined
+    source_type to suggest instead; if ``None``, the error message simply
+    asks the two conflicting sources to be reconciled.
+    """
+    if gts_type not in validation_source_types:
+        return
+
+    from ..downloaders.insitu_downloader import SOURCE_TYPE_TO_PLATFORM  # noqa: PLC0415
+
+    overlap_codes: "set[str]" = set()
+    for cmems_type in cmems_platform_types:
+        overlap_codes |= set(SOURCE_TYPE_TO_PLATFORM[cmems_type])
+
+    for other_type in sorted(validation_source_types - excluded_types):
+        other_codes = set(SOURCE_TYPE_TO_PLATFORM.get(other_type, []))
+        if overlap_codes & other_codes:
+            hint = (
+                f" Use source_type {waterfall_hint!r} instead, which combines "
+                "both sources with per-station deduplication."
+            ) if waterfall_hint else " Remove one of the two conflicting validation sources."
+            raise ValueError(
+                f"source_types {gts_type!r} and {other_type!r} may not both be "
+                "listed as separate validation_sources entries -- GTS mostly "
+                f"relays the same physical {station_description} Copernicus "
+                f"Marine's {other_type!r} source_type already reports, so "
+                "combining them without deduplication would double-count "
+                "overlapping stations in validation statistics." + hint
+            )
+
+
 class Recipe:
     """Load, save, and manage a RecipeConfig."""
 
@@ -552,45 +605,22 @@ class Recipe:
                 "validation source, or switch the recipe's variable."
             )
         _validation_source_types = {s.source_type for s in validation_sources}
-        if "buoy_gts" in _validation_source_types:
-            # "buoy_gts" retrieves MARS obstype 181 (moored buoys) and 182
-            # (drifting buoys) combined into a single request, so it
-            # overlaps with TWO separate Copernicus Marine source types,
-            # not one: obstype 181 mostly relays the same physical
-            # stations Copernicus Marine's "mooring" ("MO") source_type
-            # reports, and obstype 182 mostly relays the same stations as
-            # "buoy_cmems" ("DB") -- combining "buoy_gts" with ANY other
-            # requested source_type that also resolves to "MO" or "DB"
-            # would double-count overlapping stations in validation
-            # statistics (SOURCE_TYPE_TO_PLATFORM also maps "drifter" to
-            # ["DB", "AD"], sharing "DB" with "buoy_cmems"). Derived from
-            # SOURCE_TYPE_TO_PLATFORM rather than hardcoding "mooring"/
-            # "buoy_cmems" as the only forbidden pairings, so a future
-            # source_type that also requests "MO" or "DB" is caught
-            # automatically. "buoy_waterfall" is excluded from this check
-            # -- it is the deduplicated combination this rule exists to
-            # steer recipes towards, and its own dedup at DataTree-build
-            # time already applies to the whole Copernicus CSV regardless
-            # of which requested source contributed each row.
-            from ..downloaders.insitu_downloader import SOURCE_TYPE_TO_PLATFORM  # noqa: PLC0415
-
-            _gts_overlap_codes = (
-                set(SOURCE_TYPE_TO_PLATFORM["mooring"])
-                | set(SOURCE_TYPE_TO_PLATFORM["buoy_cmems"])
+        _check_gts_cmems_overlap(
+            _validation_source_types, "buoy_gts", "WMO buoy stations",
+            ("mooring", "buoy_cmems"), {"buoy_gts", "buoy_waterfall"}, "buoy_waterfall",
+        )
+        _check_gts_cmems_overlap(
+            _validation_source_types, "ship_gts", "WMO ship stations",
+            ("ship_cmems_family",), {"ship_gts"}, None,
+        )
+        _GTS_SHIP_VALID_VARIABLES = {"wind"}
+        if data.get("variable") not in _GTS_SHIP_VALID_VARIABLES and "ship_gts" in _validation_source_types:
+            raise ValueError(
+                "source_type 'ship_gts' is only valid for 'wind' recipes -- GTS "
+                "ship observations carry no other variable this toolbox supports. "
+                "Remove the ship_gts validation source, or switch the recipe's "
+                "variable to 'wind'."
             )
-            for _other_type in sorted(_validation_source_types - {"buoy_gts", "buoy_waterfall"}):
-                _other_codes = set(SOURCE_TYPE_TO_PLATFORM.get(_other_type, []))
-                if _gts_overlap_codes & _other_codes:
-                    raise ValueError(
-                        f"source_types 'buoy_gts' and {_other_type!r} may not both be "
-                        "listed as separate validation_sources entries -- GTS mostly "
-                        "relays the same physical WMO buoy stations Copernicus "
-                        f"Marine's {_other_type!r} source_type already reports, so "
-                        "combining them without deduplication would double-count "
-                        "overlapping stations in validation statistics. Use "
-                        "source_type 'buoy_waterfall' instead, which combines both "
-                        "sources with per-station deduplication."
-                    )
 
         config = RecipeConfig(
             name=data["name"],

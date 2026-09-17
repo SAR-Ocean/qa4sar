@@ -722,3 +722,72 @@ class TestBuoyGtsOverlappingCombinationsRejected:
         recipe = Recipe._from_dict(recipe_dict)
         source_types = {s.source_type for s in recipe.config.validation_sources}
         assert source_types == {"buoy_waterfall", "drifter"}
+
+
+class TestShipGtsOverlapAndVariableCheck:
+    """ship_gts retrieves MARS obstype 180 (ship reports), which mostly
+    relays the same physical stations Copernicus Marine's
+    ship_cmems_family source_type ("FB") already reports. Unlike
+    buoy_gts, there is no combined/deduplicated "ship_waterfall"
+    source_type -- whether GTS ship reports and Copernicus Marine's
+    ferrybox network physically overlap is unconfirmed, so the two
+    source types simply cannot be listed together."""
+
+    def test_ship_gts_and_ship_cmems_family_together_raises(self, tmp_path):
+        recipe_dict = {
+            "name": "test", "variable": "wind",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [
+                {"source_type": "ship_gts"},
+                {"source_type": "ship_cmems_family"},
+            ],
+        }
+        with pytest.raises(ValueError, match="ship_gts.*ship_cmems_family"):
+            Recipe._from_dict(recipe_dict)
+
+    def test_ship_gts_alone_is_valid(self, tmp_path):
+        recipe_dict = {
+            "name": "test", "variable": "wind",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [{"source_type": "ship_gts"}],
+        }
+        recipe = Recipe._from_dict(recipe_dict)
+        assert recipe.config.validation_sources[0].source_type == "ship_gts"
+
+    def test_ship_cmems_family_alone_is_valid(self, tmp_path):
+        recipe_dict = {
+            "name": "test", "variable": "wind",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [{"source_type": "ship_cmems_family"}],
+        }
+        recipe = Recipe._from_dict(recipe_dict)
+        assert recipe.config.validation_sources[0].source_type == "ship_cmems_family"
+
+    def test_ship_gts_with_buoy_cmems_family_does_not_raise(self, tmp_path):
+        """ship_gts and buoy_cmems_family cover different platform codes
+        (FB-based vs. MO/DB/AD-based) and must not conflict."""
+        recipe_dict = {
+            "name": "test", "variable": "wind",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [
+                {"source_type": "ship_gts"},
+                {"source_type": "buoy_cmems_family"},
+            ],
+        }
+        recipe = Recipe._from_dict(recipe_dict)
+        source_types = {s.source_type for s in recipe.config.validation_sources}
+        assert source_types == {"ship_gts", "buoy_cmems_family"}
+
+    def test_ship_gts_requires_wind_variable(self, tmp_path):
+        recipe_dict = {
+            "name": "test", "variable": "waves",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [{"source_type": "ship_gts"}],
+        }
+        with pytest.raises(ValueError, match="ship_gts.*wind"):
+            Recipe._from_dict(recipe_dict)
