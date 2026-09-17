@@ -237,6 +237,16 @@ The validation report is saved under `data/<timerange>_<bounds>/validation_repor
 | ERA5 model | wind / waves / soil moisture | `era5_downloader` | Copernicus CDS | 1940 (ERA5) / 1950 (ERA5-Land) - present (~5 day latency) |
 | HYCOM model | currents | `hycom_downloader` | HYCOM | 2018-12-04 - present (~48 hour latency) |
 
+`ship_gts` retrieves ship synoptic wind observations from GTS (MARS
+obstype 180), the same MARS/BUFR path `buoy_gts` uses for buoys.
+`ship_cmems_family` is the Copernicus Marine equivalent (the renamed
+`ferrybox` source_type). A recipe may not list both `ship_gts` and
+`ship_cmems_family` -- unlike buoys, whether the two feeds report
+overlapping physical vessels is unconfirmed, so no combined,
+deduplicated source_type exists for ships yet. `ship_gts` is valid for
+`"wind"` recipes only; ship reports carry no other variable this
+toolbox supports.
+
 NISAR SME2 (`m3 m-3`, L-band, twice-daily per-overpass granules) is a second,
 beta/provisional SAR-side source for soil moisture, selectable per recipe via
 `sar-validate --create-recipe soil_moisture --sar-source nisar_sme2` (or
@@ -281,16 +291,6 @@ renamed to `VAVH`/`VAVH_UNCERTAINTY` to match the near-real-time
 product's codes; the product's own quality filtering happens before the
 data can be downloaded at all (see `docs/QC_flags_implementation.md`), so
 no separate quality flag needs to be read here.
-
-`ship_gts` retrieves ship synoptic wind observations from GTS (MARS
-obstype 180), the same MARS/BUFR path `buoy_gts` uses for buoys.
-`ship_cmems_family` is the Copernicus Marine equivalent (the renamed
-`ferrybox` source_type). A recipe may not list both `ship_gts` and
-`ship_cmems_family` -- unlike buoys, whether the two feeds report
-overlapping physical vessels is unconfirmed, so no combined,
-deduplicated source_type exists for ships yet. `ship_gts` is valid for
-`"wind"` recipes only; ship reports carry no other variable this
-toolbox supports.
 
 ### Collocation types
 
