@@ -1188,6 +1188,105 @@ class DataTreeConverter:
         return ds
 
     @staticmethod
+    def from_gts_ship_bufr(
+        bufr_path: Union[str, Path],
+    ) -> Optional[xr.Dataset]:
+        """
+        Decode a GTS ship BUFR file (MARS obstype 180) into a standardised
+        point-geometry Dataset.
+
+        Ship synoptic reports carry wind observations only -- unlike GTS
+        buoy reports, there is no wave or current section to decode, so
+        this always reads ``windSpeed``/``windDirection``. A row missing
+        both -- including the WMO fill value decoded as NaN -- is
+        dropped.
+
+        Parameters
+        ----------
+        bufr_path : str or Path
+            Path to a GTS ship BUFR file, as downloaded by
+            :class:`~sar_validation.downloaders.gts_ship_downloader.ShipDownloader`.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="gts_ship"``, or None on failure or
+            if no row carries a wind observation.
+        """
+        from ._cf_metadata import apply_cf_metadata
+
+        if pdbufr is None:
+            raise ImportError(
+                "from_gts_ship_bufr requires the optional 'pdbufr' dependency, "
+                "which is not installed. Install it with the 'gts' extra, e.g. "
+                "`pip install sar-l2-validation-toolbox[gts]`."
+            )
+
+        bufr_path = Path(bufr_path)
+        if not bufr_path.exists():
+            logger.warning("BUFR file not found: %s", bufr_path)
+            return None
+
+        id_columns = (
+            "shipOrMobileLandStationIdentifier",
+            "latitude", "longitude", "year", "month", "day", "hour", "minute",
+        )
+        value_columns = ("windSpeed", "windDirection")
+
+        try:
+            df = pdbufr.read_bufr(bufr_path, columns=id_columns + value_columns)
+        except Exception as exc:
+            logger.warning("Could not decode GTS ship BUFR %s: %s", bufr_path.name, exc)
+            return None
+
+        if df.empty:
+            logger.info("from_gts_ship_bufr: no rows in %s.", bufr_path.name)
+            return None
+
+        keep = df["windSpeed"].notna() | df["windDirection"].notna()
+        df = df[keep]
+        if df.empty:
+            logger.info("from_gts_ship_bufr: no wind observations in %s.", bufr_path.name)
+            return None
+
+        time = pd.to_datetime(df[["year", "month", "day", "hour", "minute"]]).values
+
+        data_vars: dict = {
+            "WSPD": ("point", df["windSpeed"].to_numpy(dtype=float)),
+            "WDIR": ("point", df["windDirection"].to_numpy(dtype=float)),
+            "platform_id": (
+                "point", df["shipOrMobileLandStationIdentifier"].astype(str).to_numpy(),
+            ),
+        }
+
+        ds = xr.Dataset(
+            data_vars,
+            coords={
+                "lon": ("point", df["longitude"].to_numpy(dtype=float)),
+                "lat": ("point", df["latitude"].to_numpy(dtype=float)),
+                "time": ("point", time),
+            },
+        )
+        apply_cf_metadata(ds, "gts_ship", {
+            "platform_id": {"long_name": "WMO ship or mobile station call sign"},
+        })
+
+        ds.attrs["data_type"] = "gts_ship"
+        # Reuses the same runtime label Copernicus Marine ferrybox data
+        # emits -- both are ship-based wind observations and are not
+        # distinguished by color/marker in a report.
+        ds.attrs["platform_type"] = "ferrybox"
+        ds.attrs["source"] = "GTS (MARS obstype 180)"
+        ds.attrs["filename"] = bufr_path.name
+
+        logger.info(
+            "from_gts_ship_bufr: %s → %d point(s) from %d platform(s)",
+            bufr_path.name, ds.sizes["point"],
+            len(set(df["shipOrMobileLandStationIdentifier"])),
+        )
+        return ds
+
+    @staticmethod
     def from_altimeter(
         nc_path: Union[str, Path],
     ) -> Optional[xr.Dataset]:
@@ -4456,6 +4555,9 @@ class DataTreeConverter:
           as a validation source, the same recipe-gating HYCOM below uses
           to avoid picking up a leftover directory left by an earlier run
           that shared this *base_dir*)
+        - ``gts_ship/*.bufr``          → ``validation/ship_gts/<stem>`` nodes
+          (only scanned when *recipe* lists "ship_gts" as a validation
+          source, the same recipe-gating the GTS buoy block above uses)
         - ``osi_saf_winds/*.nc``       → ``validation/osi_saf_winds/<stem>`` nodes
         - ``scatterometer/*.nc``       → ``validation/scatterometer/<stem>`` nodes
         - ``scatterometer_hy2b/*.nc``       → ``validation/scatterometer_hy2b/<stem>`` nodes
@@ -4606,6 +4708,24 @@ class DataTreeConverter:
                     datasets[f"validation/buoy_gts/{bufr_path.stem}"] = ds
                     gts_buoy_platform_ids.update(str(p) for p in ds["platform_id"].values)
                     logger.info("Converted GTS buoy BUFR: %s", bufr_path.name)
+
+        # GTS ship observations (MARS obstype 180). No dedup/exclusion
+        # step is needed here, unlike GTS buoy above -- there is no
+        # combined "ship_waterfall" source_type pairing this with
+        # Copernicus Marine's ship_cmems_family.
+        gts_ship_requested = recipe is not None and any(
+            s.source_type == "ship_gts" for s in recipe.config.validation_sources
+        )
+        gts_ship_dir = base_dir / "gts_ship"
+        if gts_ship_requested and gts_ship_dir.exists():
+            for bufr_path in sorted(gts_ship_dir.glob("*.bufr")):
+                ds = _filtered(
+                    DataTreeConverter.from_gts_ship_bufr(bufr_path),
+                    bufr_path.name,
+                )
+                if ds is not None:
+                    datasets[f"validation/ship_gts/{bufr_path.stem}"] = ds
+                    logger.info("Converted GTS ship BUFR: %s", bufr_path.name)
 
         # In-situ CSV (Copernicus Marine). A station already covered by a
         # GTS BUFR file in this window (gts_buoy_platform_ids, populated

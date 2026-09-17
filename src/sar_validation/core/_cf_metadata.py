@@ -67,6 +67,10 @@ PRODUCT_REFERENCES: Dict[str, str] = {
         "WMO Global Telecommunication System (GTS) buoy observations, "
         "obstype 181/182, distributed via ECMWF's MARS archive"
     ),
+    "gts_ship": (
+        "WMO Global Telecommunication System (GTS) ship observations, "
+        "obstype 180, distributed via ECMWF's MARS archive"
+    ),
 }
 
 #: CF attributes for the coordinate variables the converters emit. ``time``

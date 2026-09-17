@@ -2577,6 +2577,76 @@ class TestBuildDataTreeWaterfallDedup:
         assert list(insitu_ds["platform_id"].values) == ["6600021"]
 
 
+class TestBuildDataTreeIncludesGtsShip:
+    def test_gts_ship_bufr_files_are_converted_into_the_tree(self, tmp_path, monkeypatch):
+        base = tmp_path / "run"
+        gts_dir = base / "gts_ship"
+        gts_dir.mkdir(parents=True)
+        (gts_dir / "gts_ship_20260801.bufr").write_bytes(b"mocked")
+
+        frame = pd.DataFrame([{
+            "shipOrMobileLandStationIdentifier": "KBAG",
+            "latitude": 44.0, "longitude": -86.9,
+            "year": 2026, "month": 8, "day": 1, "hour": 0, "minute": 0,
+            "windSpeed": 11.3, "windDirection": 340.0,
+        }])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: frame,
+        )
+
+        tree = DataTreeConverter.convert_downloaded_data(
+            base, product_type="wind", recipe=_make_gts_recipe("ship_gts"),
+        )
+
+        assert tree is not None
+        (node,) = tree["validation/ship_gts"].children.values()
+        assert node.to_dataset().sizes["point"] == 1
+
+    def test_no_gts_ship_dir_is_a_no_op(self, tmp_path):
+        base = tmp_path / "run"
+        base.mkdir()
+        tree = DataTreeConverter.convert_downloaded_data(base, product_type="wind")
+        assert tree is None
+
+    def test_ship_gts_dir_ignored_when_not_requested(self, tmp_path, monkeypatch):
+        """A leftover gts_ship/ directory from an earlier run over the same
+        base_dir must not be picked up by a recipe that never asked for
+        "ship_gts", mirroring the equivalent GTS buoy stale-cache guard
+        (TestBuildDataTreeGtsBuoyRecipeGating above)."""
+        base = tmp_path / "run"
+        gts_dir = base / "gts_ship"
+        gts_dir.mkdir(parents=True)
+        (gts_dir / "gts_ship_20260801.bufr").write_bytes(b"mocked")
+
+        insitu_dir = base / "copernicus_insitu"
+        insitu_dir.mkdir()
+        pd.DataFrame([
+            {"platform_id": "1234567", "platform_type": "TG",
+             "time": "2026-08-01T00:00:00", "longitude": -86.9, "latitude": 44.0,
+             "variable": "WSPD", "value": 9.0},
+        ]).to_csv(insitu_dir / "insitu.csv", index=False)
+
+        frame = pd.DataFrame([{
+            "shipOrMobileLandStationIdentifier": "KBAG",
+            "latitude": 44.0, "longitude": -86.9,
+            "year": 2026, "month": 8, "day": 1, "hour": 0, "minute": 0,
+            "windSpeed": 11.3, "windDirection": 340.0,
+        }])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: frame,
+        )
+
+        tree = DataTreeConverter.convert_downloaded_data(
+            base, product_type="wind", recipe=_make_gts_recipe("tidal_gauge"),
+        )
+
+        assert tree is not None
+        node_paths = [node.path for node in tree.subtree]
+        assert not any("ship_gts" in p for p in node_paths)
+
+
 class TestBuildDataTreeGtsBuoyRecipeGating:
     """convert_downloaded_data's base_dir is keyed only by bbox/time window,
     so two separate recipe runs over the same window can share one
