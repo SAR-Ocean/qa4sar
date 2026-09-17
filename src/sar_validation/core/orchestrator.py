@@ -23,7 +23,6 @@ import pandas as pd
 
 from ..downloaders.base import build_output_dir
 from .recipe import GeographicBounds, Recipe
-from .sar_sources import SAR_SOURCES
 
 logger = logging.getLogger(__name__)
 
@@ -661,6 +660,7 @@ class DataOrchestrator:
         fallback = cfg.geographic_bounds
         try:
             from .dry_collocation import sar_footprints_from_downloaded
+            from .sar_sources import SAR_SOURCES
 
             sar_entry = self.metadata["downloads"].get("sar", {})
             sar_files = [Path(f) for f in sar_entry.get("files", [])]

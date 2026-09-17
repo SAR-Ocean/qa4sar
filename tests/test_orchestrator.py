@@ -82,7 +82,7 @@ class TestFootprintNarrowedBounds:
         ]
         orchestrator.recipe.config.collocation.sar_footprint_radius_km = 0.0
         monkeypatch.setattr(
-            "sar_validation.core.orchestrator.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
+            "sar_validation.core.sar_sources.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
         )
         monkeypatch.setattr(
             "sar_validation.core.dry_collocation.sar_footprints_from_downloaded",
@@ -99,7 +99,7 @@ class TestFootprintNarrowedBounds:
     def test_falls_back_to_recipe_bounds_on_empty_footprints(self, tmp_path, monkeypatch):
         orchestrator, fake_spec = self._orchestrator_with_footprints(tmp_path, None)
         monkeypatch.setattr(
-            "sar_validation.core.orchestrator.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
+            "sar_validation.core.sar_sources.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
         )
         monkeypatch.setattr(
             "sar_validation.core.dry_collocation.sar_footprints_from_downloaded",
@@ -117,7 +117,7 @@ class TestFootprintNarrowedBounds:
     def test_falls_back_to_recipe_bounds_on_exception(self, tmp_path, monkeypatch):
         orchestrator, fake_spec = self._orchestrator_with_footprints(tmp_path, None)
         monkeypatch.setattr(
-            "sar_validation.core.orchestrator.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
+            "sar_validation.core.sar_sources.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
         )
 
         def _raise(sar_files, spec, product_type):
@@ -135,7 +135,7 @@ class TestFootprintNarrowedBounds:
     def test_is_computed_once_and_cached(self, tmp_path, monkeypatch):
         orchestrator, fake_spec = self._orchestrator_with_footprints(tmp_path, None)
         monkeypatch.setattr(
-            "sar_validation.core.orchestrator.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
+            "sar_validation.core.sar_sources.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
         )
         calls = {"n": 0}
 
