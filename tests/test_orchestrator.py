@@ -52,6 +52,136 @@ class _FakePrediction:
         self.verdict = verdict
 
 
+class TestFootprintNarrowedBounds:
+    def _orchestrator_with_footprints(self, tmp_path, footprints):
+        orchestrator = _orchestrator_with_source(tmp_path, "tidal_gauge")
+        orchestrator.metadata["downloads"]["sar"] = {"files": ["scene1.SAFE"]}
+
+        class _FakeSpec:
+            key = "sentinel1_l2_ocn"
+
+        return orchestrator, _FakeSpec()
+
+    def test_narrows_to_the_union_of_real_sar_footprints(self, tmp_path, monkeypatch):
+        from datetime import datetime
+
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        orchestrator, fake_spec = self._orchestrator_with_footprints(tmp_path, None)
+        footprints = [
+            SarFootprint(
+                kind="polygon", bbox=(0.0, 2.0, 50.0, 52.0), polygon=None, points=None,
+                sensing_start=datetime(2026, 1, 1), sensing_end=datetime(2026, 1, 1, 0, 1),
+                source_file="a.SAFE",
+            ),
+            SarFootprint(
+                kind="polygon", bbox=(1.0, 3.0, 51.0, 53.0), polygon=None, points=None,
+                sensing_start=datetime(2026, 1, 1), sensing_end=datetime(2026, 1, 1, 0, 1),
+                source_file="b.SAFE",
+            ),
+        ]
+        orchestrator.recipe.config.collocation.sar_footprint_radius_km = 0.0
+        monkeypatch.setattr(
+            "sar_validation.core.orchestrator.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
+        )
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.sar_footprints_from_downloaded",
+            lambda sar_files, spec, product_type: footprints,
+        )
+
+        bounds = orchestrator._footprint_narrowed_bounds()
+
+        assert bounds.min_lon == pytest.approx(0.0)
+        assert bounds.max_lon == pytest.approx(3.0)
+        assert bounds.min_lat == pytest.approx(50.0)
+        assert bounds.max_lat == pytest.approx(53.0)
+
+    def test_falls_back_to_recipe_bounds_on_empty_footprints(self, tmp_path, monkeypatch):
+        orchestrator, fake_spec = self._orchestrator_with_footprints(tmp_path, None)
+        monkeypatch.setattr(
+            "sar_validation.core.orchestrator.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
+        )
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.sar_footprints_from_downloaded",
+            lambda sar_files, spec, product_type: [],
+        )
+
+        bounds = orchestrator._footprint_narrowed_bounds()
+
+        recipe_bounds = orchestrator.recipe.config.geographic_bounds
+        assert bounds.min_lon == recipe_bounds.min_lon
+        assert bounds.max_lon == recipe_bounds.max_lon
+        assert bounds.min_lat == recipe_bounds.min_lat
+        assert bounds.max_lat == recipe_bounds.max_lat
+
+    def test_falls_back_to_recipe_bounds_on_exception(self, tmp_path, monkeypatch):
+        orchestrator, fake_spec = self._orchestrator_with_footprints(tmp_path, None)
+        monkeypatch.setattr(
+            "sar_validation.core.orchestrator.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
+        )
+
+        def _raise(sar_files, spec, product_type):
+            raise RuntimeError("conversion failed")
+
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.sar_footprints_from_downloaded", _raise,
+        )
+
+        bounds = orchestrator._footprint_narrowed_bounds()
+
+        recipe_bounds = orchestrator.recipe.config.geographic_bounds
+        assert bounds.min_lon == recipe_bounds.min_lon
+
+    def test_is_computed_once_and_cached(self, tmp_path, monkeypatch):
+        orchestrator, fake_spec = self._orchestrator_with_footprints(tmp_path, None)
+        monkeypatch.setattr(
+            "sar_validation.core.orchestrator.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
+        )
+        calls = {"n": 0}
+
+        def _fake(sar_files, spec, product_type):
+            calls["n"] += 1
+            return []
+
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.sar_footprints_from_downloaded", _fake,
+        )
+
+        orchestrator._footprint_narrowed_bounds()
+        orchestrator._footprint_narrowed_bounds()
+
+        assert calls["n"] == 1
+
+
+class TestDownloadInsituUsesFootprintNarrowedBounds:
+    def test_insitu_download_uses_narrowed_bounds_not_recipe_bounds(self, tmp_path, monkeypatch):
+        orchestrator = _orchestrator_with_source(tmp_path, "tidal_gauge")
+        from sar_validation.core.recipe import GeographicBounds
+
+        narrowed = GeographicBounds(min_lon=1.0, max_lon=2.0, min_lat=51.0, max_lat=52.0)
+        monkeypatch.setattr(orchestrator, "_footprint_narrowed_bounds", lambda: narrowed)
+        seen_bounds = {}
+
+        class _FakeDownloader:
+            def __init__(self, **kwargs):
+                pass
+
+            def download(self, **kwargs):
+                seen_bounds.update(kwargs)
+                return []
+
+        monkeypatch.setattr(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader", _FakeDownloader,
+        )
+
+        orchestrator._download_insitu(["tidal_gauge"], min_depth=0.0, max_depth=0.0)
+
+        assert seen_bounds["min_lon"] == 1.0
+        assert seen_bounds["max_lon"] == 2.0
+        assert seen_bounds["min_lat"] == 51.0
+        assert seen_bounds["max_lat"] == 52.0
+
+
 def test_download_all_in_bbox_defaults_to_false(tmp_path):
     """Default (no flag) means collocation-based skip-gating IS active --
     download_all_in_bbox=False is the new default, inverted from a plain

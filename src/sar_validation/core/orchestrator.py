@@ -22,7 +22,8 @@ import numpy as np
 import pandas as pd
 
 from ..downloaders.base import build_output_dir
-from .recipe import Recipe
+from .recipe import GeographicBounds, Recipe
+from .sar_sources import SAR_SOURCES
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +263,16 @@ class DataOrchestrator:
         # on first use, keyed by validation source_type -- None until then,
         # matching _sar_scene_times's own established laziness pattern.
         self._collocation_predictions_cache: Optional[Dict[str, Any]] = None
+
+        # Populated lazily by _footprint_narrowed_bounds() on first use --
+        # None until then, matching _collocation_predictions_cache's own
+        # established laziness pattern. Computed independently of
+        # _collocation_predictions_cache (a second, cheap
+        # sar_footprints_from_downloaded call) rather than sharing that
+        # cache's footprints, since _collocation_predictions() discards
+        # its own footprints after building predictions and does not
+        # expose them.
+        self._footprint_narrowed_bounds_cache: Optional[GeographicBounds] = None
 
     # ------------------------------------------------------------------
     # Setup
@@ -631,6 +642,50 @@ class DataOrchestrator:
         prediction = self._collocation_predictions().get(source_type)
         return prediction is not None and prediction.verdict == "none-predicted"
 
+    def _footprint_narrowed_bounds(self) -> GeographicBounds:
+        """
+        The union bbox of this run's real, already-downloaded SAR
+        footprints, padded by cfg.collocation.sar_footprint_radius_km, or
+        the recipe's full geographic_bounds if footprint computation is
+        unavailable, empty, or fails.
+
+        Computed once (cached) from the real downloaded+converted SAR
+        files, independent of which validation source_type calls it --
+        extending narrowing to another downloader later needs only a call
+        to this same method, no new footprint logic.
+        """
+        cfg = self.recipe.config
+        if self._footprint_narrowed_bounds_cache is not None:
+            return self._footprint_narrowed_bounds_cache
+
+        fallback = cfg.geographic_bounds
+        try:
+            from .dry_collocation import sar_footprints_from_downloaded
+
+            sar_entry = self.metadata["downloads"].get("sar", {})
+            sar_files = [Path(f) for f in sar_entry.get("files", [])]
+            sar_source_spec = SAR_SOURCES[cfg.sar_data.source]
+            footprints = sar_footprints_from_downloaded(sar_files, sar_source_spec, cfg.variable)
+            if not footprints:
+                self._footprint_narrowed_bounds_cache = fallback
+                return fallback
+
+            radius_deg = cfg.collocation.sar_footprint_radius_km / 111.0
+            min_lon = min(fp.bbox[0] for fp in footprints) - radius_deg
+            max_lon = max(fp.bbox[1] for fp in footprints) + radius_deg
+            min_lat = min(fp.bbox[2] for fp in footprints) - radius_deg
+            max_lat = max(fp.bbox[3] for fp in footprints) + radius_deg
+            self._footprint_narrowed_bounds_cache = GeographicBounds(
+                min_lon=min_lon, max_lon=max_lon, min_lat=min_lat, max_lat=max_lat,
+            )
+        except Exception:
+            logger.debug(
+                "_footprint_narrowed_bounds: footprint derivation failed, "
+                "falling back to the recipe's full geographic_bounds", exc_info=True,
+            )
+            self._footprint_narrowed_bounds_cache = fallback
+        return self._footprint_narrowed_bounds_cache
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -827,8 +882,7 @@ class DataOrchestrator:
     ) -> bool:
         from ..downloaders.insitu_downloader import InSituDownloader
 
-        cfg    = self.recipe.config
-        bounds = cfg.geographic_bounds
+        bounds = self._footprint_narrowed_bounds()
         windows = self._padded_temporal_bounds(*source_types)
 
         out_dir = self.base_dir / "copernicus_insitu"
