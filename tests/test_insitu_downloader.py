@@ -431,7 +431,7 @@ class TestFetchStationsIndexFallback:
 
 class TestFetchStationsCache:
     """_fetch_stations_dry's own shared cache: --dry-collocation's five
-    real in-situ source types (mooring/buoy/ferrybox/drifter/tidal_gauge)
+    real in-situ source types (mooring/buoy/ship_cmems_family/drifter/tidal_gauge)
     all run concurrently via predict_collocation's own ThreadPoolExecutor,
     every one of them requesting the exact same bbox/window/dataset_part/
     variables for a single recipe run (cfg.variable is recipe-wide, not

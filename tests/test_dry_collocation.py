@@ -3730,7 +3730,9 @@ class TestPredictInsitu:
         )
 
         assert seen_source_types == [[source_type]]
-        assert all(st != ["mooring", "buoy_cmems", "drifter", "ship_cmems_family", "tidal_gauge"] for st in seen_source_types)
+        excluded_source_types = ["mooring", "buoy_cmems", "drifter",
+                                  "ship_cmems_family", "tidal_gauge"]
+        assert all(st != excluded_source_types for st in seen_source_types)
         assert result.verdict == "collocated"
         assert result.source_type == source_type
         assert result.bucket == "ground-point"

@@ -909,7 +909,7 @@ class TestIsAlreadyDownloaded:
 
     def test_true_when_recorded_insitu_key_covers_individual_insitu_source_types(self, tmp_path):
         """DataOrchestrator._download_insitu batches mooring/buoy_cmems/drifter/
-        ferrybox/tidal_gauge under a single "insitu" downloads key, not one
+        ship_cmems_family/tidal_gauge under a single "insitu" downloads key, not one
         key per source_type -- a recipe requesting e.g. just "mooring" must
         still match against a recorded "insitu" key (no false re-download
         for the common in-situ case)."""

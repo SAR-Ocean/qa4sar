@@ -71,7 +71,7 @@ class ValidationDataSource:
     Platform / product type.
 
     Accepted values:
-      in-situ (real-time)   : mooring, buoy, ferrybox, drifter,
+      in-situ (real-time)   : mooring, buoy, ship_cmems_family, drifter,
                                tidal_gauge
       in-situ (historical)  : adcp_historical, argo_historical,
                                drifter_historical, glider_historical
