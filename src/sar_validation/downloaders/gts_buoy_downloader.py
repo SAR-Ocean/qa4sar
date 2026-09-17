@@ -3,13 +3,8 @@ Download moored and drifting buoy wind, wave, and current observations
 from the WMO Global Telecommunication System (GTS), via ECMWF's MARS
 archive.
 
-Requires MARS access. A self-registered ``api.ecmwf.int`` account is not
-sufficient for this -- MARS observation retrieval is only available to
-accounts affiliated with an ECMWF Member or Co-operating State
-organization (typically granted by that organization's Computing
-Representative). A self-registered-only account fails with
-``ecmwf.API error 1: User has no access to services mars``. Credentials
-are read from ``~/.ecmwfapirc`` (the standard MARS/Web API key file).
+Requires MARS access, with credentials read from ``~/.ecmwfapirc`` (the
+standard MARS/Web API key file).
 
 Library usage::
 

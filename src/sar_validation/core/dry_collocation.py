@@ -2541,11 +2541,10 @@ def _predict_buoy_gts(
     downloader (see gts_buoy_downloader.py). Unlike the five real
     Copernicus Marine in-situ source types, MARS has no lightweight
     station-index endpoint: every MARS request, however small, is a full
-    BUFR retrieval subject to the same Member/Co-operating-State account
-    access barrier as a real download, so GTS coverage itself genuinely
-    cannot be predicted without a live MARS call -- this predicate does
-    not attempt one, and always reports verdict "unknown" for that
-    reason.
+    BUFR retrieval, the same cost as a real download, so GTS coverage
+    itself genuinely cannot be predicted without a live MARS call -- this
+    predicate does not attempt one, and always reports verdict "unknown"
+    for that reason.
 
     As a purely informational reference, it additionally runs
     _predict_insitu's own Copernicus Marine query (query_source_type=

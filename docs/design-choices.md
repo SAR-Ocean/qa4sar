@@ -332,11 +332,7 @@ this toolbox's other supported variables, e.g. soil moisture):
   speed/direction at the *shallowest* of the BUFR's depth-profiled
   current readings -- deeper levels are discarded, matching Copernicus
   Marine in-situ's own single-level current convention). Requires MARS
-  access -- a self-registered `api.ecmwf.int` account is not sufficient
-  (only accounts affiliated with an ECMWF Member/Co-operating-State
-  organization can reach MARS observation retrieval); a
-  self-registered-only account's request fails with `ecmwf.API error 1:
-  User has no access to services mars`.
+  access, with credentials read from `~/.ecmwfapirc`.
 - **`buoy_waterfall`**: downloads both GTS and Copernicus Marine for the
   full recipe bbox/window (no bbox-splitting or spatial coverage
   reasoning -- both sources are always queried in full), then at

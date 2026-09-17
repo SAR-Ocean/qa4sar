@@ -86,7 +86,7 @@ sar_validation/
     ├── earthdata_soil_moisture_downloader.py    # AMSR-E/2, SMAP, and NISAR SME2 soil moisture via NASA Earthdata
     ├── era5_downloader.py                       # ERA5 reanalysis (wind/waves/soil_moisture) via Copernicus CDS
     ├── gportal_downloader.py                    # AMSR2 soil moisture via JAXA G-Portal (SFTP)
-    ├── gts_buoy_downloader.py                   # Moored/drifting buoy wind/waves/currents via WMO GTS (ECMWF MARS obstype 181/182); requires a MARS Member/Co-operating-State account
+    ├── gts_buoy_downloader.py                   # Moored/drifting buoy wind/waves/currents via WMO GTS (ECMWF MARS obstype 181/182)
     ├── hf_radar_downloader.py                   # Near-real-time HF-radar surface currents via Copernicus Marine
     ├── hf_radar_historical_downloader.py        # Delayed-mode/historical HF-radar currents via Copernicus Marine
     ├── hf_radar_us_downloader.py                # US HF-radar waterfall selector: NOAA ERDDAP → NOAA THREDDS → Copernicus Marine
@@ -470,10 +470,6 @@ Register and retrieve an API key at: https://api.ecmwf.int/v1/key/
 
 Note: no `sar-validate --set-credential` command is needed;
 `ecmwf-api-client` reads `~/.ecmwfapirc` natively.
-
-MARS observation retrieval (obstype 181/182, which this downloader uses)
-requires an account affiliated with an ECMWF Member or Co-operating State
-organization.
 
 ### ISMN — for soil moisture in-situ validation
 
