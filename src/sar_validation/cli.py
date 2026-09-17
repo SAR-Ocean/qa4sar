@@ -508,7 +508,7 @@ def _build_currents_config(
         sar_data=SARDataSpec(source=sar_source, swath_mode=["WV","IW","EW","SM"], max_downloads=limit),
         validation_sources=[
             *hf_radar_sources,
-            ValidationDataSource(source_type="buoy_cmems_family"),
+            ValidationDataSource(source_type="buoy_gts"),
             ValidationDataSource(source_type="ship_cmems_family"),
             # Delayed-mode (6mo+ old) current observations — Copernicus
             # Marine product 013_044, EWCT/NSCT only. Each individually
@@ -601,8 +601,8 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
         geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
         sar_data=SARDataSpec(source=sar_source, swath_mode=swath_mode, max_downloads=limit),
         validation_sources=[
-            ValidationDataSource(source_type="buoy_cmems_family"),
-            ValidationDataSource(source_type="ship_cmems_family"),
+            ValidationDataSource(source_type="buoy_gts"),
+            ValidationDataSource(source_type="ship_gts"),
             ValidationDataSource(source_type="tidal_gauge"),
             ValidationDataSource(source_type="scatterometer_ascat"),
             ValidationDataSource(source_type="altimeter"),
@@ -767,7 +767,7 @@ def _build_waves_config(
         geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
         sar_data=SARDataSpec(source=sar_source, swath_mode=["WV","SM"], max_downloads=limit),
         validation_sources=[
-            ValidationDataSource(source_type="buoy_cmems_family"),
+            ValidationDataSource(source_type="buoy_gts"),
             ValidationDataSource(source_type="tidal_gauge"),
             ValidationDataSource(
                 source_type="altimeter",
@@ -944,6 +944,15 @@ def _create_recipe(
     }
     resolved_sar_source = sar_source if sar_source is not None else defaults.get(name, "sentinel1_l2_ocn")
 
+    # Free GTS source types stand in for the Copernicus Marine
+    # (`_cmems_family`) in-situ sources as the recipe template default;
+    # each generated recipe line carries a comment pointing to its
+    # Copernicus Marine counterpart for users who have credentials for it.
+    _GTS_DEFAULT_COMMENTS = {
+        "buoy_gts": "buoy_cmems_family",
+        "ship_gts": "ship_cmems_family",
+    }
+
     # All four templates are built eagerly (see the `if name not in templates` 
     # check below), but an explicit --sar-source only applies to the *requested* 
     # category: e.g. `--create-recipe soil_moisture --sar-source sentinel1_clms_ssm` 
@@ -995,7 +1004,18 @@ def _create_recipe(
     recipe = Recipe(cfg)
     slug = recipe_name.lower().replace(" ", "_") if recipe_name else f"{name}_validation"
     out_path = Path("recipes") / f"{slug}.yaml"
-    recipe.to_yaml(out_path)
+
+    import yaml
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    yaml_text = yaml.dump(recipe.config.to_dict(), default_flow_style=False, sort_keys=False)
+    for gts_type, cmems_type in _GTS_DEFAULT_COMMENTS.items():
+        yaml_text = yaml_text.replace(
+            f"- source_type: {gts_type}\n",
+            f"- source_type: {gts_type}  "
+            f"# if wanting Copernicus Marine in situ data instead, use {cmems_type}\n",
+        )
+    out_path.write_text(yaml_text)
     print(f"Recipe created: {out_path}")
     print("Edit the file to adjust data sources and collocation settings.")
 

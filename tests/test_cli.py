@@ -1016,6 +1016,69 @@ class TestBuildWindConfigEra5:
         assert "era5" in source_types
 
 
+class TestBuildWindConfigGtsDefaults:
+    def test_defaults_to_buoy_gts_and_ship_gts(self):
+        from sar_validation.cli import _build_wind_config
+
+        cfg = _build_wind_config()
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "buoy_gts" in source_types
+        assert "ship_gts" in source_types
+        assert "buoy_cmems_family" not in source_types
+        assert "ship_cmems_family" not in source_types
+
+
+class TestBuildWavesConfigGtsDefaults:
+    def test_defaults_to_buoy_gts(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config()
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "buoy_gts" in source_types
+        assert "buoy_cmems_family" not in source_types
+
+
+class TestBuildCurrentsConfigGtsDefaults:
+    def test_defaults_to_buoy_gts(self):
+        from sar_validation.cli import _build_currents_config
+
+        cfg = _build_currents_config()
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "buoy_gts" in source_types
+        assert "buoy_cmems_family" not in source_types
+
+
+class TestCreateRecipeGtsComment:
+    def test_wind_recipe_has_trailing_comments_on_both_gts_lines(self, tmp_path, monkeypatch):
+        from sar_validation.cli import _create_recipe
+
+        monkeypatch.chdir(tmp_path)
+        _create_recipe("wind")
+
+        written = next(tmp_path.glob("recipes/*.yaml")).read_text()
+        assert (
+            "- source_type: buoy_gts  "
+            "# if wanting Copernicus Marine in situ data instead, use buoy_cmems_family"
+        ) in written
+        assert (
+            "- source_type: ship_gts  "
+            "# if wanting Copernicus Marine in situ data instead, use ship_cmems_family"
+        ) in written
+
+    def test_waves_recipe_has_trailing_comment_on_buoy_gts_line_only(self, tmp_path, monkeypatch):
+        from sar_validation.cli import _create_recipe
+
+        monkeypatch.chdir(tmp_path)
+        _create_recipe("waves")
+
+        written = next(tmp_path.glob("recipes/*.yaml")).read_text()
+        assert (
+            "- source_type: buoy_gts  "
+            "# if wanting Copernicus Marine in situ data instead, use buoy_cmems_family"
+        ) in written
+        assert "ship_gts" not in written
+
+
 class TestBuildWavesConfigEra5:
     def test_includes_era5_alongside_observational_sources(self):
         from sar_validation.cli import _build_waves_config
