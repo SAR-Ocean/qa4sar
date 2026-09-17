@@ -951,6 +951,7 @@ class DataOrchestrator:
             "scatterometer_hy2c": self._download_scatterometer_hy2c,
             "scatterometer_oceansat3": self._download_scatterometer_oceansat3,
             "buoy_gts":      self._download_gts_buoy,
+            "ship_gts":      self._download_gts_ship,
             "hf_radar":      self._download_hf_radar,
             "hf_radar_noaa": self._download_noaa_hfradar,
             "hf_radar_historical": self._download_hf_radar_historical,
@@ -1453,6 +1454,30 @@ class DataOrchestrator:
                 start=start,            end=end,
             ),
             "GTS buoy",
+            result_to_metadata=lambda result, dl: {"files": [str(p) for p in (result or [])]},
+        )
+
+    def _download_gts_ship(self, source) -> bool:
+        """Download GTS ship reports for *source* ("ship_gts")."""
+        from ..downloaders.gts_ship_downloader import ShipDownloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        windows = self._padded_temporal_bounds(source.source_type)
+        out_dir = self.base_dir / "gts_ship"
+
+        return self._run_download(
+            source.source_type, out_dir,
+            lambda: ShipDownloader(
+                output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
+            ),
+            windows,
+            lambda start, end: dict(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=start,            end=end,
+            ),
+            "GTS ship",
             result_to_metadata=lambda result, dl: {"files": [str(p) for p in (result or [])]},
         )
 
