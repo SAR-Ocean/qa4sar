@@ -2416,8 +2416,10 @@ def _predict_insitu(
     Copernicus Marine query (passing query_source_type="buoy_cmems", the
     "DB" platform code) for two recipe source types that are not
     themselves real Copernicus Marine platform codes and would otherwise
-    fail station_ranges_dry's own source-type resolution. Defaults to
-    source.source_type, matching every other caller.
+    fail station_ranges_dry's own source-type resolution; _predict_ship_gts
+    reuses the same mechanism with query_source_type="ship_cmems_family"
+    (the "FB" platform code). Defaults to source.source_type, matching
+    every other caller.
 
     Uses InSituDownloader.station_ranges_dry (real per-station
     coordinates) rather than check_availability_dry's boolean, so
