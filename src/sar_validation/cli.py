@@ -509,7 +509,7 @@ def _build_currents_config(
         validation_sources=[
             *hf_radar_sources,
             ValidationDataSource(source_type="buoy_cmems_family"),
-            ValidationDataSource(source_type="ferrybox"),
+            ValidationDataSource(source_type="ship_cmems_family"),
             # Delayed-mode (6mo+ old) current observations — Copernicus
             # Marine product 013_044, EWCT/NSCT only. Each individually
             # gated at download time by its own recency guard.
@@ -602,7 +602,7 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
         sar_data=SARDataSpec(source=sar_source, swath_mode=swath_mode, max_downloads=limit),
         validation_sources=[
             ValidationDataSource(source_type="buoy_cmems_family"),
-            ValidationDataSource(source_type="ferrybox"),
+            ValidationDataSource(source_type="ship_cmems_family"),
             ValidationDataSource(source_type="tidal_gauge"),
             ValidationDataSource(source_type="scatterometer_ascat"),
             ValidationDataSource(source_type="altimeter"),

@@ -31,7 +31,7 @@ validation_sources:
 - source_type: buoy_cmems_family
   download_kwargs: {}
   collocation_kwargs: {}
-- source_type: ferrybox
+- source_type: ship_cmems_family
   download_kwargs: {}
   collocation_kwargs: {}
 - source_type: adcp_historical

@@ -31,7 +31,7 @@ __all__ = ["DataOrchestrator"]
 # In-situ platform types handled by the InSituDownloader
 _INSITU_TYPES = {
     "mooring", "buoy_cmems", "buoy_cmems_family", "buoy_waterfall",
-    "drifter", "ferrybox", "tidal_gauge",
+    "drifter", "ship_cmems_family", "tidal_gauge",
 }
 
 # Delayed-mode ("historical") source_types, dispatched before any NRT

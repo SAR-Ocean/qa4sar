@@ -156,6 +156,7 @@ _SOURCE_COLORS = [
     "#aaffc3",
     "#a9a9a9",
     "#911eb4",
+    "#17becf",
 ]
 
 _SOURCE_MARKERS = [
@@ -165,6 +166,7 @@ _SOURCE_MARKERS = [
     "o",
     "D",
     "p",
+    "x",
 ]
 
 # Fixed, append-only reference order for known validation source/platform
@@ -187,14 +189,15 @@ _CANONICAL_SOURCE_ORDER = [
     "era5_wind", "era5_waves", "era5_soil_moisture",
     "hycom",
     "buoy_waterfall",
-    # "buoy_cmems" and "buoy_cmems_family" are recipe source types, never
-    # themselves emitted val_source labels (see the module comment
-    # above) -- they are only kept here, in reserved slots at the end, to
-    # satisfy _canonical_source_order()'s own consistency guard, which
-    # requires every _INSITU_TYPES member to appear somewhere in this
-    # list.
+    # "buoy_cmems", "buoy_cmems_family", and "ship_cmems_family" are recipe
+    # source types, never themselves emitted val_source labels (see the
+    # module comment above) -- they are only kept here, in reserved slots
+    # at the end, to satisfy _canonical_source_order()'s own consistency
+    # guard, which requires every _INSITU_TYPES member to appear somewhere
+    # in this list.
     "buoy_cmems",
     "buoy_cmems_family",
+    "ship_cmems_family",
 ]
 
 #: Names present in _CANONICAL_SOURCE_ORDER that are runtime-emitted
@@ -202,11 +205,14 @@ _CANONICAL_SOURCE_ORDER = [
 #: never members of LAYER_DATA_TYPES | _INSITU_TYPES. "buoy" is
 #: insitu_downloader.PLATFORM_CODE_TO_SOURCE_TYPE["DB"]'s label -- distinct
 #: from the recipe source_types "buoy_cmems"/"buoy_gts"/"buoy_waterfall"
-#: that request Copernicus Marine or GTS drifting-buoy data. Added to
-#: _canonical_source_order()'s "registered" side of its consistency check
-#: so a genuinely known, intentional case does not trip that guard, without
-#: weakening the guard's ability to catch a real, unregistered drift.
-_EMITTED_LABEL_ONLY = {"buoy"}
+#: that request Copernicus Marine or GTS drifting-buoy data. "ferrybox" is
+#: insitu_downloader.PLATFORM_CODE_TO_SOURCE_TYPE["FB"]'s label -- distinct
+#: from the recipe source_type "ship_cmems_family" that requests Copernicus
+#: Marine ferrybox data. Added to _canonical_source_order()'s "registered"
+#: side of its consistency check so a genuinely known, intentional case does
+#: not trip that guard, without weakening the guard's ability to catch a
+#: real, unregistered drift.
+_EMITTED_LABEL_ONLY = {"buoy", "ferrybox"}
 
 
 # ---------------------------------------------------------------------------

@@ -108,7 +108,7 @@ SOURCE_TYPE_TO_PLATFORM = {
     "buoy_cmems":  ["DB"],
     "buoy_cmems_family": ["MO", "DB", "AD"],
     "buoy_waterfall": ["DB"],
-    "ferrybox":    ["FB"],
+    "ship_cmems_family": ["FB"],
     "drifter":     ["DB", "AD"],
     "tidal_gauge": ["TG"],
 }
@@ -262,7 +262,7 @@ class InSituDownloader:
         Parameters
         ----------
         source_types : list[str], optional
-            Filter by platform type(s): mooring, buoy_cmems, ferrybox, drifter, tidal_gauge.
+            Filter by platform type(s): mooring, buoy_cmems, ship_cmems_family, drifter, tidal_gauge.
             None or empty list means keep all platform types.
         dataset_part : str, optional
             Which dataset part to use: "history" (historical) or "latest" (recent).
@@ -744,7 +744,7 @@ def _parse_args(argv=None):
     p.add_argument("--max-depth", type=float, default=20.0)
     p.add_argument(
         "--source-types",
-        help="Comma-separated: mooring,buoy_cmems,ferrybox,drifter,tidal_gauge",
+        help="Comma-separated: mooring,buoy_cmems,ship_cmems_family,drifter,tidal_gauge",
     )
     p.add_argument("--output-dir", default=None)
     p.add_argument("--dry-run", action="store_true")

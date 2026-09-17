@@ -3685,7 +3685,7 @@ class TestPredictInsitu:
 
     @pytest.mark.parametrize(
         "source_type",
-        ["mooring", "buoy_cmems", "buoy_cmems_family", "drifter", "ferrybox", "tidal_gauge"],
+        ["mooring", "buoy_cmems", "buoy_cmems_family", "drifter", "ship_cmems_family", "tidal_gauge"],
     )
     def test_registered_under_each_real_insitu_source_type(self, source_type):
         from sar_validation.core import dry_collocation
@@ -3700,7 +3700,7 @@ class TestPredictInsitu:
         assert "insitu" not in dry_collocation._PREDICATES
 
     @pytest.mark.parametrize(
-        "source_type", ["mooring", "buoy_cmems", "drifter", "ferrybox", "tidal_gauge"],
+        "source_type", ["mooring", "buoy_cmems", "drifter", "ship_cmems_family", "tidal_gauge"],
     )
     def test_station_ranges_dry_filtered_to_single_source_type_not_full_batch(
         self, monkeypatch, source_type,
@@ -3730,7 +3730,7 @@ class TestPredictInsitu:
         )
 
         assert seen_source_types == [[source_type]]
-        assert all(st != ["mooring", "buoy_cmems", "drifter", "ferrybox", "tidal_gauge"] for st in seen_source_types)
+        assert all(st != ["mooring", "buoy_cmems", "drifter", "ship_cmems_family", "tidal_gauge"] for st in seen_source_types)
         assert result.verdict == "collocated"
         assert result.source_type == source_type
         assert result.bucket == "ground-point"
@@ -3782,7 +3782,7 @@ class TestPredictInsitu:
         monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
 
         result = dry_collocation.predict_source(
-            SimpleNamespace(source_type="ferrybox"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+            SimpleNamespace(source_type="ship_cmems_family"), cfg=self._cfg(), sar_footprints=[self._footprint()],
         )
 
         assert result.verdict == "collocated"
