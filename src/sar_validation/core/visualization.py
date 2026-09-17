@@ -166,7 +166,7 @@ _SOURCE_MARKERS = [
     "o",
     "D",
     "p",
-    "x",
+    "*",
 ]
 
 # Fixed, append-only reference order for known validation source/platform

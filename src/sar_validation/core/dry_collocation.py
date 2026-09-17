@@ -2401,7 +2401,7 @@ def _predict_insitu(
     query_source_type: Optional[str] = None,
 ) -> SourcePrediction:
     """Predicate for the five real Copernicus Marine in-situ source
-    types (mooring, buoy_cmems, drifter, ferrybox, tidal_gauge) -- see
+    types (mooring, buoy_cmems, drifter, ship_cmems_family, tidal_gauge) -- see
     orchestrator.py's _INSITU_TYPES. Unlike those five types' real
     (non-dry) download path, which batches every requested platform type
     into one InSituDownloader.download(source_types=[...]) call,

@@ -3644,7 +3644,7 @@ class TestToNaiveUtc:
 
 class TestPredictInsitu:
     """_predict_insitu is registered under all five real
-    orchestrator._INSITU_TYPES keys (mooring, buoy, drifter, ferrybox,
+    orchestrator._INSITU_TYPES keys (mooring, buoy, drifter, ship_cmems_family,
     tidal_gauge) -- there is no source_type="insitu" anywhere in this
     codebase. predict_source is called once per individual validation
     source, so the predicate must filter its own station_ranges_dry

@@ -138,7 +138,7 @@ _fetch_stations_cache: "dict[tuple, pd.DataFrame]" = {}
 #: One lock per cache key (created lazily, guarded by
 #: _fetch_stations_locks_guard), not one lock for the whole cache: a
 #: predict_collocation run's own ThreadPoolExecutor checks --dry-collocation's
-#: five real in-situ source types (mooring/buoy_cmems/ferrybox/drifter/
+#: five real in-situ source types (mooring/buoy_cmems/ship_cmems_family/drifter/
 #: tidal_gauge) concurrently, and every one of them shares the exact same
 #: bbox/window/dataset_part/variables for a single recipe run (cfg.variable
 #: is recipe-wide, not per-source) -- without this cache, that concurrency
