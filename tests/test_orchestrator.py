@@ -350,6 +350,89 @@ class TestGtsBackgroundDispatch:
         assert orchestrator.metadata["downloads"]["ship_gts"]["status"] == "skipped"
         assert "collocation" in orchestrator.metadata["downloads"]["ship_gts"]["reason"]
 
+    def test_buoy_gts_is_not_backgrounded_when_buoy_waterfall_is_also_requested(
+        self, tmp_path, monkeypatch,
+    ):
+        """buoy_gts and buoy_waterfall's own GTS download both write into
+        the same gts_buoy/ per-day files, so when a recipe requests both,
+        buoy_gts must fall through to the main-thread "other sources" loop
+        instead of being backgrounded -- otherwise it could race
+        buoy_waterfall's GTS call for the same on-disk files."""
+        import threading
+
+        calls = []
+
+        def fake_download_gts_buoy(self, source):
+            calls.append((source.source_type, threading.current_thread() is threading.main_thread()))
+            self.metadata["downloads"][source.source_type] = {"status": "success", "files": []}
+            return True
+
+        cfg = RecipeConfig(
+            name="test", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[
+                ValidationDataSource(source_type="buoy_gts"),
+                ValidationDataSource(source_type="buoy_waterfall"),
+            ],
+        )
+        orchestrator = DataOrchestrator(Recipe(cfg), dry_run=False)
+        orchestrator.base_dir = tmp_path
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(DataOrchestrator, "_download_gts_buoy", fake_download_gts_buoy)
+        monkeypatch.setattr(DataOrchestrator, "_download_insitu", lambda self, *a, **k: True)
+
+        orchestrator.download_all()
+
+        # buoy_waterfall's GTS call (step 3) must run, on the main thread,
+        # before buoy_gts's (step 4) -- both on the main thread means they
+        # cannot overlap.
+        assert [source_type for source_type, _ in calls] == ["buoy_waterfall", "buoy_gts"]
+        assert all(on_main_thread for _, on_main_thread in calls)
+
+    def test_ship_gts_is_still_backgrounded_when_buoy_waterfall_is_present(
+        self, tmp_path, monkeypatch,
+    ):
+        """ship_gts has no waterfall counterpart sharing its target files,
+        so its background dispatch must be unaffected by buoy_waterfall
+        (or buoy_gts) being present in the same recipe."""
+        order = []
+
+        def fake_download_gts_ship(self, source):
+            order.append("ship_gts-start")
+            self.metadata["downloads"]["ship_gts"] = {"status": "success", "files": []}
+            return True
+
+        def fake_download_gts_buoy(self, source):
+            self.metadata["downloads"][source.source_type] = {"status": "success", "files": []}
+            return True
+
+        cfg = RecipeConfig(
+            name="test", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[
+                ValidationDataSource(source_type="buoy_gts"),
+                ValidationDataSource(source_type="buoy_waterfall"),
+                ValidationDataSource(source_type="ship_gts"),
+            ],
+        )
+        orchestrator = DataOrchestrator(Recipe(cfg), dry_run=False)
+        orchestrator.base_dir = tmp_path
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(DataOrchestrator, "_download_gts_ship", fake_download_gts_ship)
+        monkeypatch.setattr(DataOrchestrator, "_download_gts_buoy", fake_download_gts_buoy)
+        monkeypatch.setattr(DataOrchestrator, "_download_insitu", lambda self, *a, **k: True)
+
+        gts_threads, gts_dispatched_types = orchestrator._dispatch_gts_sources_in_background()
+
+        assert "ship_gts" in gts_dispatched_types
+        assert "buoy_gts" not in gts_dispatched_types
+        assert any(source_type == "ship_gts" for _, source_type in gts_threads)
+        for thread, _ in gts_threads:
+            thread.join(timeout=2.0)
+        assert "ship_gts-start" in order
+
 
 def test_download_all_in_bbox_defaults_to_false(tmp_path):
     """Default (no flag) means collocation-based skip-gating IS active --

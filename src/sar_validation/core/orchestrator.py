@@ -17,7 +17,7 @@ import shutil
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -56,12 +56,15 @@ _HISTORICAL_FIRST_PAIRS = {
     "drifter": "drifter_historical",
 }
 
-# buoy_gts/ship_gts are dispatched separately from every other source_type
-# (see DataOrchestrator._dispatch_gts_sources_in_background), so both the
-# historical-first loop and step 4's "other sources" loop in download_all()
-# must skip them -- this set is the single place that exclusion is
-# expressed, rather than repeating "buoy_gts"/"ship_gts" string literals at
-# each loop.
+# buoy_gts/ship_gts are ordinarily dispatched separately from every other
+# source_type (see DataOrchestrator._dispatch_gts_sources_in_background),
+# ahead of step 4's "other sources" loop in download_all() -- this set is
+# the single place that source_type pairing is expressed, rather than
+# repeating the "buoy_gts"/"ship_gts" string literals elsewhere. A recipe
+# combining "buoy_gts" with "buoy_waterfall" is the one exception: step 4
+# checks against the dispatched-types set _dispatch_gts_sources_in_background
+# actually returns, not this static set, since that case leaves "buoy_gts"
+# for step 4 to handle instead.
 _GTS_BACKGROUND_TYPES = frozenset({"buoy_gts", "ship_gts"})
 
 # Delayed-mode in-situ current instruments that share a single combined
@@ -695,7 +698,9 @@ class DataOrchestrator:
             self._footprint_narrowed_bounds_cache = fallback
         return self._footprint_narrowed_bounds_cache
 
-    def _dispatch_gts_sources_in_background(self) -> List[Tuple[threading.Thread, str]]:
+    def _dispatch_gts_sources_in_background(
+        self,
+    ) -> Tuple[List[Tuple[threading.Thread, str]], Set[str]]:
         """
         Start a background daemon thread for every "buoy_gts"/"ship_gts"
         validation source in this recipe, applying the same
@@ -708,12 +713,31 @@ class DataOrchestrator:
         gts_buoy_downloader.py/gts_ship_downloader.py's per-day timeout),
         so no additional timeout is applied here -- the caller joins each
         returned thread without one, in _join_gts_threads.
+
+        A recipe may also list "buoy_waterfall", whose own GTS download
+        (in download_all()'s step 3) writes to the same gts_buoy/ per-day
+        files as "buoy_gts" -- backgrounding "buoy_gts" in that case would
+        race step 3's main-thread call against the same target files. When
+        "buoy_waterfall" is present, "buoy_gts" is left completely
+        untouched here so it falls through to step 4's "other sources"
+        loop instead, which already runs after step 3 on the main thread.
+
+        Returns the started (thread, source_type) pairs to join later,
+        together with the set of source_types this method actually
+        handled -- step 4 uses that set to tell an untouched "buoy_gts"
+        apart from one already handled here.
         """
         threads: List[Tuple[threading.Thread, str]] = []
+        handled_types: Set[str] = set()
         handlers = {"buoy_gts": self._download_gts_buoy, "ship_gts": self._download_gts_ship}
+        present_types = {s.source_type for s in self.recipe.config.validation_sources}
+        buoy_waterfall_present = "buoy_waterfall" in present_types
         for source in self.recipe.config.validation_sources:
             if source.source_type not in _GTS_BACKGROUND_TYPES:
                 continue
+            if source.source_type == "buoy_gts" and buoy_waterfall_present:
+                continue
+            handled_types.add(source.source_type)
             if self._already_succeeded(source.source_type):
                 self.metadata["downloads"][source.source_type] = self._previous_downloads[source.source_type]
                 logger.info(
@@ -731,7 +755,7 @@ class DataOrchestrator:
             thread = threading.Thread(target=handler, args=(source,), daemon=True)
             thread.start()
             threads.append((thread, source.source_type))
-        return threads
+        return threads, handled_types
 
     def _join_gts_threads(self, threads: List[Tuple[threading.Thread, str]], ok: bool) -> bool:
         """Wait for every background GTS thread _dispatch_gts_sources_in_background
@@ -785,7 +809,7 @@ class DataOrchestrator:
 
         self._compute_sar_scene_times()
 
-        gts_threads = self._dispatch_gts_sources_in_background()
+        gts_threads, gts_dispatched_types = self._dispatch_gts_sources_in_background()
 
         # 2. Delayed-mode ("*_historical") sources first. hf_radar and the
         # NRT in-situ batch (below) consult file_count from these results
@@ -873,7 +897,7 @@ class DataOrchestrator:
                 continue   # handled above
             if source.source_type in _HISTORICAL_FIRST_TYPES:
                 continue   # already dispatched in step 2
-            if source.source_type in _GTS_BACKGROUND_TYPES:
+            if source.source_type in gts_dispatched_types:
                 continue   # already dispatched in the background, right after SAR
             paired_historical = _HISTORICAL_FIRST_PAIRS.get(source.source_type)
             if paired_historical and historical_had_data.get(paired_historical):
