@@ -408,9 +408,27 @@ class TestFetchStationsIndexFallback:
             lambda self: fake_module,
         )
 
+        # Create a minimal index file with a row whose bbox does not match
+        # the test's query region (200.0-201.0, -80.0 to -79.0), so the dry
+        # path exercises the real rows_matching_query logic and finds zero
+        # matches, but without requiring a network call to fetch the index.
+        minimal_index_content = (
+            "# Title : in-situ files catalog\n"
+            "# Description : catalog of available in-situ files compliant with Marine Data Store\n"
+            "# Date of update : 2023-06-01T00:00:00Z\n"
+            "# product_id,file_name,geospatial_lat_min,geospatial_lat_max,geospatial_lon_min,geospatial_lon_max,time_coverage_start,time_coverage_end,institution,date_update,data_mode,parameters\n"  # noqa: E501
+            "COP-TEST-01,history/MO/TEST_TS_MO_1.nc,10.0,15.0,0.0,5.0,2023-01-01T00:00:00Z,2023-12-31T23:59:00Z,Test Org,2023-06-01T00:00:00Z,R,VHM0 VAVH\n"  # noqa: E501
+        )
+        index_file = tmp_path / "index_history.txt"
+        index_file.write_text(minimal_index_content)
+
         with patch(
-            "sar_validation.downloaders.insitu_index_fallback.download_index_files",
-        ) as mock_download_files:
+            "sar_validation.downloaders.insitu_index_fallback.fetch_index_file",
+            return_value=index_file,
+        ) as mock_fetch_index, \
+             patch(
+                 "sar_validation.downloaders.insitu_index_fallback.download_index_files",
+            ) as mock_download_files:
             dl = InSituDownloader(output_dir=tmp_path)
             dl.station_ranges_dry(
                 min_lon=200.0, max_lon=201.0, min_lat=-80.0, max_lat=-79.0,
@@ -418,6 +436,7 @@ class TestFetchStationsIndexFallback:
                 dataset_part="history",
             )
 
+        mock_fetch_index.assert_called_once()
         mock_download_files.assert_not_called()
 
 
