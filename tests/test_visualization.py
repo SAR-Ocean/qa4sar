@@ -119,7 +119,10 @@ def geo_datatree_and_collocation():
         "sar_owiWindSpeed":            ("collocation", np.array([6.1, 6.9, 8.2, 9.3])),
         "val_WSPD":                    ("collocation", np.array([6.0, 7.0, 8.0, 9.5])),
         "val_source":                  ("collocation", ["mooring", "mooring", "altimeter", "altimeter"]),
+        "collocation_type":            ("collocation", ["point_vs_layer"] * n),
         "sar_scene_name":              ("collocation", ["sceneA"] * n),
+        "sar_lon":                     ("collocation", np.array([-9.8, -9.6, -9.0, -8.8])),
+        "sar_lat":                     ("collocation", np.array([50.2, 50.4, 51.0, 51.2])),
         "val_lon":                     ("collocation", np.array([-9.8, -9.6, -9.0, -8.8])),
         "val_lat":                     ("collocation", np.array([50.2, 50.4, 51.0, 51.2])),
         "val_id":                      ("collocation", ["mo0", "mo1", "al0", "al1"]),
@@ -1849,9 +1852,8 @@ class TestPlotGeographicTicks:
         from sar_validation.core.visualization import plot_geographic
 
         datatree, collocation_ds = geo_datatree_and_collocation
-        # This fixture has no "collocation_type" field, so split_by=None
-        # (matching TestPlotGeographic's existing convention) makes
-        # plot_geographic return a single Figure rather than a dict.
+        # split_by=None (matching TestPlotGeographic's existing convention)
+        # makes plot_geographic return a single Figure rather than a dict.
         fig = plot_geographic(
             datatree, collocation_ds, "owiWindSpeed", "WSPD", split_by=None,
         )
@@ -2925,6 +2927,61 @@ class TestPlotGeographicTwoColumnByType:
             split_by="collocation_type",
         )
         assert set(result.keys()) == {"point_vs_layer"}
+
+
+class TestPlotGeographicTwoColumnMissingCollocationType:
+    """A standalone ``collocation_results.nc`` file re-run directly
+    through ``plot_geographic`` can predate the ``collocation_type``
+    column (e.g. an older or hand-built file). ``two_column_by_type``
+    must fall back to a single combined figure and log a warning
+    explaining why, instead of silently producing no figure at all."""
+
+    def test_on_figure_receives_one_fallback_figure_and_warns(
+        self, geo_datatree_and_collocation, caplog,
+    ):
+        import logging
+
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        collocation_ds = collocation_ds.drop_vars("collocation_type")
+
+        received = []
+
+        def on_figure(group, fig):
+            received.append((group, fig))
+
+        with caplog.at_level(logging.WARNING, logger="sar_validation.core.visualization"):
+            result = plot_geographic(
+                datatree, collocation_ds, "owiWindSpeed", "WSPD",
+                two_column_by_type=True, on_figure=on_figure,
+            )
+
+        assert len(received) == 1, "expected exactly one fallback Figure via on_figure"
+        assert result == {}
+        assert "collocation_type" in caplog.text, (
+            "expected a warning explaining the fallback to a single combined figure"
+        )
+        plt.close("all")
+
+    def test_without_on_figure_returns_nonempty_dict(self, geo_datatree_and_collocation):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        collocation_ds = collocation_ds.drop_vars("collocation_type")
+
+        result = plot_geographic(
+            datatree, collocation_ds, "owiWindSpeed", "WSPD",
+            two_column_by_type=True,
+        )
+
+        assert result, "expected a non-empty dict when on_figure is not given"
+        assert all(fig is not None for fig in result.values())
+        plt.close("all")
 
 
 class TestPlotGeographicOnFigureCallback:
@@ -5180,6 +5237,125 @@ class TestValidationReportGeographicColorbarsAndDifferencePlot:
         ), "no validation source has >= 10 points, so no difference page should appear"
 
 
+class TestValidationReportSoilMoistureDifferenceUsesRescaledSar:
+    """Regression test: the main CDF-matched section's difference page
+    for soil_moisture recipes must plot SAR-minus-validation differences
+    computed from the same rescaled SAR series the scatter/residuals
+    pages already use, not raw SAR values still expressed in the SAR
+    retrieval's own percent-based domain."""
+
+    @staticmethod
+    def _fixture(n=20):
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        y, x = 4, 5
+        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.linspace(10.0, 90.0, y * x).reshape(y, x), {"units": "%"})},
+            coords={
+                "lon": (("y", "x"), lon2d),
+                "lat": (("y", "x"), lat2d),
+                "time": pd.Timestamp("2026-07-10T19:00:00"),
+            },
+        )
+
+        lons = np.linspace(-9.9, -8.1, n)
+        lats = np.linspace(50.1, 51.9, n)
+        ismn_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", np.linspace(0.05, 0.45, n))},
+            coords={
+                "lon": ("point", lons), "lat": ("point", lats),
+                "time": ("point", pd.date_range("2026-07-10T19:05", periods=n, freq="1min")),
+            },
+            attrs={"platform_type": "ismn"},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds, "validation/ismn": ismn_ds})
+
+        # SAR's raw retrieval ("%", roughly 10-90) and ISMN's volumetric
+        # domain (roughly 0.05-0.45) share the same rank order but differ
+        # by two orders of magnitude -- a domain-mismatch bug produces an
+        # obviously wrong, uniformly-positive raw difference at every
+        # point, unlike the small, near-zero difference the rescaled
+        # series gives.
+        sar_vals = np.linspace(10.0, 90.0, n)
+        val_vals = np.linspace(0.05, 0.45, n)
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":        xr.DataArray(sar_vals, dims="collocation", attrs={"units": "%"}),
+            "val_SOIL_MOISTURE": xr.DataArray(val_vals, dims="collocation", attrs={"units": "m3 m-3"}),
+            "val_source":        ("collocation", ["ismn"] * n),
+            "collocation_type":  ("collocation", ["point_vs_layer"] * n),
+            "sar_scene_name":    ("collocation", ["sceneA"] * n),
+            "sar_lon":           ("collocation", lons),
+            "sar_lat":           ("collocation", lats),
+            "val_lon":           ("collocation", lons),
+            "val_lat":           ("collocation", lats),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-10T19:05", periods=n, freq="1min")),
+        )
+        return datatree, collocation_ds
+
+    @staticmethod
+    def _difference_figure(figs):
+        for fig in figs:
+            if any("difference (n=" in ax.get_title() for ax in fig.axes):
+                return fig
+        return None
+
+    @staticmethod
+    def _difference_scatter(fig):
+        from matplotlib.collections import PathCollection
+
+        for ax in fig.axes:
+            for coll in ax.collections:
+                if isinstance(coll, PathCollection) and coll.get_array() is not None:
+                    return coll
+        return None
+
+    def test_difference_values_come_from_rescaled_sar_not_raw(self):
+        import warnings
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.statistics import add_rescaled_sar_column
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = self._fixture()
+        recipe = Recipe(config=RecipeConfig(name="test_sm_diff", variable="soil_moisture"))
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            result = validation_report(collocation_ds, datatree, recipe, out_dir=None)
+            expected_ds = add_rescaled_sar_column(collocation_ds, "sarSSM", "SOIL_MOISTURE")
+
+        figs = result["sarSSM_vs_SOIL_MOISTURE"]
+        diff_fig = self._difference_figure(figs)
+        assert diff_fig is not None, "expected a difference page for the ismn source"
+
+        sc = self._difference_scatter(diff_fig)
+        assert sc is not None, "expected a colored scatter collection on the difference page"
+
+        actual_lat = np.asarray(sc.get_offsets())[:, 1]
+        actual_diff = np.asarray(sc.get_array())
+        order = np.argsort(actual_lat)
+        actual_diff = actual_diff[order]
+
+        expected_diff = (
+            expected_ds["sar_sarSSM"].values - expected_ds["val_SOIL_MOISTURE"].values
+        )
+        expected_order = np.argsort(collocation_ds["sar_lat"].values)
+        expected_diff = expected_diff[expected_order]
+
+        np.testing.assert_allclose(actual_diff, expected_diff, atol=1e-6)
+
+        # The raw (pre-rescale) difference is uniformly positive and about
+        # two orders of magnitude larger -- the exact symptom of feeding
+        # the difference plot the wrong (pre-rescale) dataset.
+        raw_diff = collocation_ds["sar_sarSSM"].values - collocation_ds["val_SOIL_MOISTURE"].values
+        assert not np.allclose(actual_diff, raw_diff[expected_order], atol=1.0), (
+            "difference plot appears to be using raw, non-rescaled SAR values"
+        )
+
+
 class TestDropNonDirectionalSources:
     def _ds(self):
         return xr.Dataset({
@@ -5442,7 +5618,9 @@ class TestValidationReportPointSizeAdaptive:
         ("variable", "n", "source", "expected_point_size"),
         [
             pytest.param("currents", 4, "hf_radar", 15, id="currents-hf_radar-always-15"),
-            pytest.param("wind", 4, None, 15, id="wind-sparse-4pts-scene-15"),
+            pytest.param(
+                "wind", 4, None, {"point_vs_layer": 15}, id="wind-sparse-4pts-scene-15",
+            ),
             pytest.param("soil_moisture", 4, "ismn", 15, id="soil_moisture-sparse-ismn-15"),
             pytest.param("soil_moisture", 400, "ascat_ssm", 5, id="soil_moisture-dense-ascat_ssm-5"),
         ],
@@ -7047,12 +7225,13 @@ class TestValidationReportNativeUnitsGeographicWiring:
             native_units_stats_ds_map={key: native_stats},
         )
 
-        # captured[0] is the CDF-matched section's call, captured[1] the
-        # native-units section's -- both request per-scene figures.
-        assert len(captured) >= 2
-        nu_call = captured[1]
-        assert nu_call.get("two_column_by_type") is True
-        assert callable(nu_call.get("on_figure"))
+        nu_calls = [
+            kwargs for kwargs in captured
+            if kwargs.get("skip_domain_harmonization") is True
+        ]
+        assert nu_calls, "expected at least one plot_geographic call for the native-units section"
+        assert nu_calls[0].get("two_column_by_type") is True
+        assert callable(nu_calls[0].get("on_figure"))
 
     def test_native_units_difference_page_appears_for_qualifying_source(self, tmp_path):
         from sar_validation.core.visualization import validation_report
