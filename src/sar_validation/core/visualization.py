@@ -4007,7 +4007,22 @@ def validation_report(
             # above - spatial context before the point-cloud
             # comparison, for the same reason in both sections.
             try:
-                fig_nu_geo_result = plot_geographic(
+                _nu_geo_index = [0]
+
+                def _write_nu_geo_figure(group, fig_nu_geo, index):
+                    fig_nu_geo = _mark_native_units(
+                        fig_nu_geo, description=_NATIVE_UNITS_DESCRIPTION if index == 0 else None,
+                    )
+                    figs.append(fig_nu_geo)
+                    title = f"{sar_var} vs {val_var} — native units — geographic [{group}]"
+                    if base_dir is not None:
+                        _write_page(title, _finalize_figure_for_report(fig_nu_geo, None))
+
+                def _on_nu_geo_figure(scene_name, fig_nu_geo):
+                    _write_nu_geo_figure(scene_name, fig_nu_geo, _nu_geo_index[0])
+                    _nu_geo_index[0] += 1
+
+                plot_geographic(
                     datatree, nu_pair_ds, sar_var, val_var, scenes=matched_scenes,
                     point_size=geo_point_size,
                     geographic_bounds=(
@@ -4026,31 +4041,23 @@ def validation_report(
                     # units mismatch and wrongly fall back to two separate
                     # colorbars.
                     skip_domain_harmonization=True,
+                    two_column_by_type=True,
+                    on_figure=_on_nu_geo_figure,
                 )
-                if isinstance(fig_nu_geo_result, dict):
-                    # One page per group (per SAR scene, or per
-                    # collocation_type) -- the section-opening description
-                    # belongs on the first page only, not every one.
-                    for i, (group, fig_nu_geo) in enumerate(fig_nu_geo_result.items()):
-                        if fig_nu_geo is not None:
-                            fig_nu_geo = _mark_native_units(
-                                fig_nu_geo,
-                                description=_NATIVE_UNITS_DESCRIPTION if i == 0 else None,
-                            )
-                            figs.append(fig_nu_geo)
-                            title = f"{sar_var} vs {val_var} — native units — geographic [{group}]"
-                            if base_dir is not None:
-                                _write_page(title, _finalize_figure_for_report(fig_nu_geo, None))
-                elif fig_nu_geo_result is not None:
-                    fig_nu_geo_result = _mark_native_units(
-                        fig_nu_geo_result, description=_NATIVE_UNITS_DESCRIPTION,
-                    )
-                    figs.append(fig_nu_geo_result)
-                    title = f"{sar_var} vs {val_var} — native units — geographic"
-                    if base_dir is not None:
-                        _write_page(title, _finalize_figure_for_report(fig_nu_geo_result, None))
             except Exception as exc:
                 logger.warning("plot_geographic failed for native-units %s: %s", sar_var, exc)
+
+            try:
+                def _on_nu_diff_figure(val_source, fig_nu_diff):
+                    fig_nu_diff = _mark_native_units(fig_nu_diff)
+                    figs.append(fig_nu_diff)
+                    title = f"{sar_var} vs {val_var} — native units — difference [{val_source}]"
+                    if base_dir is not None:
+                        _write_page(title, _finalize_figure_for_report(fig_nu_diff, None))
+
+                plot_geographic_difference(nu_pair_ds, sar_var, val_var, on_figure=_on_nu_diff_figure)
+            except Exception as exc:
+                logger.warning("plot_geographic_difference failed for native-units %s: %s", sar_var, exc)
 
             fig_nu_scatter = plot_scatter(nu_pair_ds, sar_var, val_var)
             if fig_nu_scatter is not None:

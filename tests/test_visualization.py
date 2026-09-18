@@ -6980,6 +6980,102 @@ class TestValidationReportNativeUnitsSection:
         assert "sarSSM_vs_SOIL_MOISTURE" in figs
 
 
+class TestValidationReportNativeUnitsGeographicWiring:
+    """The native-units section must pass two_column_by_type/on_figure
+    through to plot_geographic (matching the main CDF-matched section)
+    and must also add a difference page per qualifying source."""
+
+    @staticmethod
+    def _recipe():
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
+
+        cfg = RecipeConfig(
+            name="test_native_units_geo", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        )
+        return Recipe(config=cfg)
+
+    @staticmethod
+    def _fixture(n=12):
+        import pandas as pd
+
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.linspace(10.0, 60.0, y * x).reshape(y, x), {"units": "%"})},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-01-01T12:00:00")},
+        )
+        datatree = xr.DataTree.from_dict({"sar/sceneA": sar_ds})
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":       ("collocation", np.linspace(20.0, 30.0, n), {"units": "%"}),
+            "val_SOIL_MOISTURE": ("collocation", np.linspace(20.0, 30.0, n), {"units": "%"}),
+            "val_source":       ("collocation", ["ascat_ssm"] * n),
+            "collocation_type": ("collocation", ["layer_vs_layer"] * n),
+            "sar_scene_name":   ("collocation", ["sceneA"] * n),
+            "val_lon":          ("collocation", np.linspace(-9.8, -8.2, n)),
+            "val_lat":          ("collocation", np.linspace(50.2, 51.8, n)),
+            "sar_lon":          ("collocation", np.linspace(-9.8, -8.2, n)),
+            "sar_lat":          ("collocation", np.linspace(50.2, 51.8, n)),
+            "val_id":           ("collocation", [f"a{i}" for i in range(n)]),
+        })
+        return datatree, collocation_ds
+
+    def _native_stats(self, collocation_ds):
+        from sar_validation.core.statistics import compute_statistics
+
+        return compute_statistics(collocation_ds, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
+
+    def test_native_units_geographic_call_passes_two_column_and_on_figure(self, tmp_path, monkeypatch):
+        import sar_validation.core.visualization as viz
+
+        datatree, collocation_ds = self._fixture()
+        native_stats = self._native_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        captured = []
+        original = viz.plot_geographic
+
+        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
+            captured.append(kwargs)
+            return original(datatree_, coll_, sar_var, val_var, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_geographic", spy)
+        viz.validation_report(
+            collocation_ds, datatree, self._recipe(), out_dir=tmp_path,
+            native_units_stats_ds_map={key: native_stats},
+        )
+
+        # captured[0] is the CDF-matched section's call, captured[1] the
+        # native-units section's -- both request per-scene figures.
+        assert len(captured) >= 2
+        nu_call = captured[1]
+        assert nu_call.get("two_column_by_type") is True
+        assert callable(nu_call.get("on_figure"))
+
+    def test_native_units_difference_page_appears_for_qualifying_source(self, tmp_path):
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = self._fixture(n=12)
+        native_stats = self._native_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        figs = validation_report(
+            collocation_ds, datatree, self._recipe(), out_dir=tmp_path,
+            native_units_stats_ds_map={key: native_stats},
+        )
+
+        found = False
+        for fig in figs[key]:
+            banner_texts = [t.get_text() for t in fig.texts]
+            if not any("native units" in t for t in banner_texts):
+                continue
+            if any("difference (n=" in ax.get_title() for ax in fig.axes):
+                found = True
+        assert found, "expected a native-units-banner figure with a difference title"
+
+
 class TestValidationReportMainSectionExcludesCdsSsm:
     """cds_ssm is deliberately excluded from run_statistics()'s CDF-matched
     pass and gets its own separate '— C3S CDS SSM —' section instead (see
