@@ -1401,7 +1401,6 @@ class TestExecuteRecipeStopsWhenNoSarData:
         assert "No SAR data found" in out
 
     def test_dry_download_flag_is_registered_and_dry_run_is_not(self, capsys):
-        import pytest
         with pytest.raises(SystemExit) as exc_info:
             cli.main(["--help"])
 
