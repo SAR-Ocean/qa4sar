@@ -2232,3 +2232,76 @@ bbox is always a superset of the true polygon.
 > (`orbit_overlap_windows`, `_point_in_polygon`), `core/orchestrator.py`
 > (`_collocation_predictions`, `_should_skip_for_collocation`), `cli.py`
 > (`--dry-collocation`, `--download-all-in-bbox`).
+
+---
+
+## 13. In-situ download narrowing and MARS GTS concurrency/timeout
+
+A recipe's `geographic_bounds` is often much larger than the region SAR
+data was actually found in for a given run's window -- Copernicus
+Marine's in-situ TAC fallback path (`insitu_index_fallback.py`,
+used when ARCO subsetting is unavailable for a historical date)
+downloads each matched platform's entire reporting history as one file,
+so querying the full recipe bbox rather than the real SAR footprints can
+mean downloading far more platform files than the run's actual SAR
+coverage needs. `orchestrator.py`'s `_footprint_narrowed_bounds()`
+narrows the real in-situ download's query bbox to the union of the
+run's actually-downloaded SAR footprints (padded by
+`cfg.collocation.sar_footprint_radius_km`), reusing the same
+`sar_footprints_from_downloaded` helper `_collocation_predictions()`
+already calls for its own, separate boolean skip-gating. This narrowing
+is deliberately scoped to `_download_insitu` only, not every downloader
+-- extending it elsewhere is a one-line change per method (the helper is
+source-type-agnostic), left for a future need rather than done
+speculatively here.
+
+`--dry-collocation`'s own in-situ check already queried the correct,
+footprint-narrowed region (`_predict_insitu` computes that same union
+bbox from the SAR footprints it is handed before ever reaching the
+index fallback), but it answered its existence/range question by
+calling the same `download_via_index()` the real download path uses --
+downloading full platform files just to check whether a platform has
+any real observations in the window. `insitu_index_fallback.py`'s
+`dry_platform_ranges()` answers the identical question using only the
+free index file plus the lazy remote-open mechanism
+`row_overlaps_window()` already had (reading a platform's `TIME`/
+longitude/latitude coordinates via a direct HTTPS open, never
+downloading the file), so a dry check now never downloads a platform
+file.
+
+`buoy_gts`/`ship_gts` (MARS/GTS) downloads have no client-side timeout
+of their own -- `ecmwfapi.ECMWFService.execute()` blocks until MARS
+completes, with no way to cancel an in-flight request. Each individual
+per-day MARS request (both GTS downloaders already loop one request per
+calendar day) is now bounded by a fixed 6-minute timeout
+(`run_with_timeout()` in `downloaders/base.py`, a generic helper: run a
+callable on a background daemon thread, wait up to a timeout, and
+report whether it finished). A timeout abandons the remaining days in
+that `download()` call rather than continuing to try each one --
+MARS being backed up for one day's request usually means the same for
+the next. The abandoned thread, being a daemon thread, cannot block the
+process from exiting; if it eventually completes after the timeout, its
+result is discarded, and the day it was trying to fetch is simply
+retried (or not, if it succeeded and left a real file) on a later run.
+
+`download_all()` dispatches `buoy_gts`/`ship_gts` onto background
+daemon threads immediately after SAR download completes and SAR scene
+times are computed (rather than at their previous point in the
+sequential "other sources" loop), so a slow or backed-up MARS queue no
+longer serializes in front of every other validation source's download.
+Both sources still pass through the same `_already_succeeded`/
+`_should_skip_for_collocation` gates the sequential loop would have
+applied -- moving the dispatch point earlier changes only when a
+download starts, never whether it is skipped. `download_all()` joins
+each background thread (with no additional timeout at the join site --
+the per-request 6-minute timeout above already bounds each thread's
+worst-case lifetime) before returning, folding its recorded outcome
+into the run's overall success/failure the same way a synchronous
+source's outcome already is.
+
+> Code: `core/orchestrator.py` (`_footprint_narrowed_bounds`,
+> `_dispatch_gts_sources_in_background`, `_join_gts_threads`),
+> `downloaders/insitu_index_fallback.py` (`dry_platform_ranges`,
+> `_lazy_row_coordinates`), `downloaders/base.py` (`run_with_timeout`),
+> `downloaders/gts_buoy_downloader.py`/`gts_ship_downloader.py`
+> (`_MARS_REQUEST_TIMEOUT_SECONDS`).
