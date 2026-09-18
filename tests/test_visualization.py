@@ -4999,6 +4999,186 @@ class TestValidationReportGeoFigureStreaming:
         )
         assert plt.get_fignums() == [], "figures must be closed once the report is written"
 
+    def test_many_scene_wind_report_never_exceeds_a_few_open_figures(
+        self, tmp_path, monkeypatch,
+    ):
+        """A many-scene wind report must stream scenes through on_figure
+        just like soil moisture, so it never holds every scene's figure
+        open simultaneously."""
+        import matplotlib
+        import matplotlib.pyplot as plt
+        import pandas as pd
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
+
+        n_scenes = 25
+        sar_nodes = {}
+        for i in range(n_scenes):
+            y, x = 3, 3
+            lon2d, lat2d = np.meshgrid(
+                np.linspace(-10.0 + i, -9.0 + i, x), np.linspace(50.0, 51.0, y),
+            )
+            sar_nodes[f"sar/scene{i}"] = xr.Dataset(
+                {"owiWindSpeed": (("y", "x"), np.linspace(5.0, 12.0, y * x).reshape(y, x))},
+                coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                        "time": pd.Timestamp("2026-07-10T12:00:00")},
+            )
+        mooring_ds = xr.Dataset(
+            {"WSPD": ("point", np.linspace(6.0, 9.0, n_scenes))},
+            coords={"lon": ("point", np.linspace(-9.8, -9.0, n_scenes)),
+                    "lat": ("point", np.linspace(50.2, 50.8, n_scenes)),
+                    "time": ("point", pd.date_range("2026-07-10T12:00", periods=n_scenes, freq="5min"))},
+            attrs={"platform_type": "mooring"},
+        )
+        datatree = DataTreeConverter.to_datatree({**sar_nodes, "validation/mooring": mooring_ds})
+        collocation_ds = xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", np.linspace(6.0, 9.0, n_scenes)),
+            "val_WSPD":         ("collocation", np.linspace(6.0, 9.0, n_scenes)),
+            "val_source":       ("collocation", ["mooring"] * n_scenes),
+            "collocation_type": ("collocation", ["point_vs_layer"] * n_scenes),
+            "sar_scene_name":   ("collocation", [f"scene{i}" for i in range(n_scenes)]),
+            "val_lon":          ("collocation", np.linspace(-9.8, -9.0, n_scenes)),
+            "val_lat":          ("collocation", np.linspace(50.2, 50.8, n_scenes)),
+        })
+
+        peak_open = [0]
+        original_figure = matplotlib.pyplot.figure
+
+        def tracking_figure(*a, **kw):
+            fig = original_figure(*a, **kw)
+            peak_open[0] = max(peak_open[0], len(plt.get_fignums()))
+            return fig
+
+        monkeypatch.setattr(matplotlib.pyplot, "figure", tracking_figure)
+
+        recipe = Recipe(config=RecipeConfig(name="wind_test", variable="wind"))
+        plt.close("all")
+        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        assert peak_open[0] < 20, (
+            f"more than 20 figures were simultaneously open at some point "
+            f"(peak {peak_open[0]}) for a non-soil-moisture recipe"
+        )
+        assert plt.get_fignums() == []
+
+
+class TestValidationReportGeographicColorbarsAndDifferencePlot:
+    """Every recipe type gets one geographic Figure per SAR scene, each
+    with its own colorbar, plus a difference page per qualifying
+    validation source right after the geographic page(s)."""
+
+    @staticmethod
+    def _multi_scene_wind_fixture(n_scenes, n_per_scene=1):
+        import pandas as pd
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        sar_nodes = {}
+        for i in range(n_scenes):
+            y, x = 3, 3
+            lon2d, lat2d = np.meshgrid(
+                np.linspace(-10.0 + i, -9.0 + i, x), np.linspace(50.0, 51.0, y),
+            )
+            sar_nodes[f"sar/scene{i}"] = xr.Dataset(
+                {"owiWindSpeed": (("y", "x"), np.linspace(5.0, 12.0, y * x).reshape(y, x))},
+                coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                        "time": pd.Timestamp("2026-07-10T12:00:00")},
+            )
+        n = n_scenes * n_per_scene
+        mooring_ds = xr.Dataset(
+            {"WSPD": ("point", np.linspace(6.0, 9.0, n))},
+            coords={"lon": ("point", np.linspace(-9.8, -9.0, n)),
+                    "lat": ("point", np.linspace(50.2, 50.8, n)),
+                    "time": ("point", pd.date_range("2026-07-10T12:00", periods=n, freq="5min"))},
+            attrs={"platform_type": "mooring"},
+        )
+        datatree = DataTreeConverter.to_datatree({**sar_nodes, "validation/mooring": mooring_ds})
+        scene_names = [f"scene{i}" for i in range(n_scenes) for _ in range(n_per_scene)]
+        collocation_ds = xr.Dataset({
+            "sar_owiWindSpeed":  ("collocation", np.linspace(6.0, 9.0, n)),
+            "val_WSPD":          ("collocation", np.linspace(6.0, 9.0, n)),
+            "val_source":        ("collocation", ["mooring"] * n),
+            "collocation_type":  ("collocation", ["point_vs_layer"] * n),
+            "sar_scene_name":    ("collocation", scene_names),
+            "val_lon":           ("collocation", np.linspace(-9.8, -9.0, n)),
+            "val_lat":           ("collocation", np.linspace(50.2, 50.8, n)),
+            "sar_lon":           ("collocation", np.linspace(-9.8, -9.0, n)),
+            "sar_lat":           ("collocation", np.linspace(50.2, 50.8, n)),
+        })
+        return datatree, collocation_ds
+
+    def test_wind_report_geographic_gets_one_colorbar_per_scene(self, tmp_path):
+        """A multi-scene wind report's geographic Figures are one Figure
+        per scene, each carrying its own colorbar axes."""
+        from cartopy.mpl.geoaxes import GeoAxes
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
+
+        n_scenes = 3
+        datatree, collocation_ds = self._multi_scene_wind_fixture(n_scenes)
+        recipe = Recipe(config=RecipeConfig(name="wind_test", variable="wind"))
+        result = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        key = "owiWindSpeed_vs_WSPD"
+        geo_figs = [
+            fig for fig in result[key]
+            if getattr(fig, "_suptitle", None) is not None
+            and any(isinstance(ax, GeoAxes) for ax in fig.axes)
+        ]
+        assert len(geo_figs) == n_scenes, "expected one geographic Figure per scene"
+        for fig in geo_figs:
+            non_data_axes = [ax for ax in fig.axes if not isinstance(ax, GeoAxes)]
+            assert len(non_data_axes) >= 1, "expected each scene's own colorbar axes"
+
+    def test_difference_page_follows_geographic_and_precedes_scatter(self, tmp_path):
+        from cartopy.mpl.geoaxes import GeoAxes
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = self._multi_scene_wind_fixture(1, n_per_scene=12)
+        recipe = Recipe(config=RecipeConfig(name="wind_test", variable="wind"))
+        result = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        figs = result["owiWindSpeed_vs_WSPD"]
+        geo_indices = [
+            i for i, fig in enumerate(figs)
+            if getattr(fig, "_suptitle", None) is not None
+            and any(isinstance(ax, GeoAxes) for ax in fig.axes)
+        ]
+        diff_indices = [
+            i for i, fig in enumerate(figs)
+            if any("difference (n=" in ax.get_title() for ax in fig.axes)
+        ]
+        other_indices = [
+            i for i in range(len(figs)) if i not in geo_indices and i not in diff_indices
+        ]
+        assert geo_indices, "expected at least one geographic figure"
+        assert diff_indices, "expected at least one difference figure"
+        assert max(geo_indices) < min(diff_indices), (
+            "expected the difference page(s) to come after every geographic page"
+        )
+        if other_indices:
+            assert min(diff_indices) < min(other_indices), (
+                "expected the difference page(s) to come before scatter/residuals"
+            )
+
+    def test_difference_page_skipped_below_threshold(self, tmp_path):
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = self._multi_scene_wind_fixture(1, n_per_scene=5)
+        recipe = Recipe(config=RecipeConfig(name="wind_test", variable="wind"))
+        result = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        figs = result["owiWindSpeed_vs_WSPD"]
+        assert not any(
+            "difference (n=" in ax.get_title() for fig in figs for ax in fig.axes
+        ), "no validation source has >= 10 points, so no difference page should appear"
+
 
 class TestDropNonDirectionalSources:
     def _ds(self):
