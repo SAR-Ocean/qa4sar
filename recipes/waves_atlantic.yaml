@@ -1,7 +1,6 @@
 name: waves_atlantic
 description: 'Validate Sentinel-1 significant wave height
-
-  against moorings, tidal gauges, drifters, and altimeter.'
+  against moorings, tidal gauges, altimeter, and era5 reanalysis.'
 version: '1.0'
 variable: waves
 variable_specs:
@@ -22,7 +21,7 @@ sar_data:
   - SM
   max_downloads: null
 validation_sources:
-- source_type: buoy_cmems_family
+- source_type: buoy_gts
   download_kwargs: {}
   collocation_kwargs: {}
 - source_type: tidal_gauge
