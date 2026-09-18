@@ -422,13 +422,15 @@ class TestFetchStationsIndexFallback:
         index_file = tmp_path / "index_history.txt"
         index_file.write_text(minimal_index_content)
 
-        with patch(
-            "sar_validation.downloaders.insitu_index_fallback.fetch_index_file",
-            return_value=index_file,
-        ) as mock_fetch_index, \
-             patch(
-                 "sar_validation.downloaders.insitu_index_fallback.download_index_files",
-            ) as mock_download_files:
+        with (
+            patch(
+                "sar_validation.downloaders.insitu_index_fallback.fetch_index_file",
+                return_value=index_file,
+            ) as mock_fetch_index,
+            patch(
+                "sar_validation.downloaders.insitu_index_fallback.download_index_files",
+            ) as mock_download_files,
+        ):
             dl = InSituDownloader(output_dir=tmp_path)
             dl.station_ranges_dry(
                 min_lon=200.0, max_lon=201.0, min_lat=-80.0, max_lat=-79.0,
