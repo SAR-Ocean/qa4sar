@@ -2279,8 +2279,9 @@ that `download()` call rather than continuing to try each one --
 MARS being backed up for one day's request usually means the same for
 the next. The abandoned thread, being a daemon thread, cannot block the
 process from exiting; if it eventually completes after the timeout, its
-result is discarded, and the day it was trying to fetch is simply
-retried (or not, if it succeeded and left a real file) on a later run.
+result is discarded. Any partially-written file is removed immediately
+on timeout, so a later run always retries that day cleanly rather than
+risking a silently-truncated file being mistaken for a complete one.
 
 `download_all()` dispatches `buoy_gts`/`ship_gts` onto background
 daemon threads immediately after SAR download completes and SAR scene

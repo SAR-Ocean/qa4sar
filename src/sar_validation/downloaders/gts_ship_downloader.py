@@ -132,6 +132,7 @@ class ShipDownloader:
                 target.unlink(missing_ok=True)
                 raise
             if not completed:
+                target.unlink(missing_ok=True)
                 logger.warning(
                     "GTS ship obs for %s timed out after %d minute(s) waiting on "
                     "MARS; abandoning the remaining day(s) in this window for "
