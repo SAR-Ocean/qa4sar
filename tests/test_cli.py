@@ -1400,7 +1400,17 @@ class TestExecuteRecipeStopsWhenNoSarData:
         out = capsys.readouterr().out
         assert "No SAR data found" in out
 
-    def test_dry_run_stops_before_dry_run_complete_message(self, tmp_path, capsys):
+    def test_dry_download_flag_is_registered_and_dry_run_is_not(self, capsys):
+        import pytest
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(["--help"])
+
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert "--dry-download" in captured.out
+        assert "--dry-run" not in captured.out
+
+    def test_dry_download_stops_before_dry_download_complete_message(self, tmp_path, capsys):
         from unittest.mock import patch
 
         from sar_validation.core.recipe import Recipe, RecipeConfig
@@ -1422,7 +1432,7 @@ class TestExecuteRecipeStopsWhenNoSarData:
 
         out = capsys.readouterr().out
         assert "No SAR data found" in out
-        assert "Dry run complete" not in out
+        assert "Dry download complete" not in out
 
     def test_real_run_proceeds_when_sar_data_found_true(self, tmp_path, capsys):
         """Sanity check the gate doesn't fire on a normal successful run."""

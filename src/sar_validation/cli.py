@@ -16,7 +16,7 @@ Usage
   sar-validate --set-credential eumdac
 
   # Dry-run (see what would be downloaded)
-  sar-validate --recipe recipes/wind_validation.yaml --dry-run
+  sar-validate --recipe recipes/wind_validation.yaml --dry-download
 
   # Execute a recipe (download all data)
   sar-validate --recipe recipes/wind_validation.yaml
@@ -116,7 +116,7 @@ Examples:
   sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65 \\
       --start 2026-03-01 --end 2026-03-31 --recipe-name north_sea_march_2026
   # Dry run: no data downloaded, just show what would be downloaded
-  sar-validate --recipe recipes/wind_validation.yaml --dry-run
+  sar-validate --recipe recipes/wind_validation.yaml --dry-download
   # Download the data (skipped when download_metadata.json already exists in the data folder)
   sar-validate --recipe recipes/wind_validation.yaml
   # Ignore download_metadata.json and redownload the data
@@ -228,7 +228,8 @@ Examples:
              "of this flag.",
     )
     parser.add_argument(
-        "--dry-run",
+        "--dry-download",
+        dest="dry_run",
         action="store_true",
         help="Show what will be downloaded without actually downloading",
     )
@@ -1114,8 +1115,8 @@ def _execute_recipe(
         if not orchestrator.metadata.get("sar_data_found", True):
             if dry_run:
                 print(
-                    "\nNo SAR data found for this window — stopping dry run "
-                    "before validation sources."
+                    "\nNo SAR data found for this window — stopping dry "
+                    "download before validation sources."
                 )
             else:
                 print(
@@ -1125,7 +1126,7 @@ def _execute_recipe(
             return
 
         if dry_run:
-            print("\nDry run complete — no data was downloaded.")
+            print("\nDry download complete — no data was downloaded.")
             print("No data directories or files were created.")
             return
         elif not success:

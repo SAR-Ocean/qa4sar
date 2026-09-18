@@ -26,7 +26,7 @@ Step 0 — Create recipe (.yaml)
 Step 1 — Download data
           │  download selected SAR data source + all validation sources
           │  for the recipe region and time window
-          |  --dry-run available to check product availibility
+          |  --dry-download available to check product availibility
           |  default: only downloads validation-source data predicted to collocate with
           |  the SAR data; --download-all-in-bbox downloads everything in the bbox/window.
           ▼
@@ -134,7 +134,7 @@ Edit the file to adjust the geographic region, time window, and validation sourc
 ### 3a. Dry-run (check what will be downloaded)
 
 ```bash
-sar-validate --recipe recipes/wind_validation.yaml --dry-run
+sar-validate --recipe recipes/wind_validation.yaml --dry-download
 ```
 
 ### 3b. Dry-collocation (check whether there would be any collocation prior to downloading)
