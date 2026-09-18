@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import socket
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -70,6 +71,7 @@ __all__ = [
     "months_touched",
     "copernicus_marine_download_kwargs",
     "prefer_ipv4_dns",
+    "run_with_timeout",
 ]
 
 # ---------------------------------------------------------------------------
@@ -1112,3 +1114,33 @@ def copernicus_marine_download_kwargs(force_download: bool) -> dict:
     the real API, so no downloader has to reason about the mapping itself.
     """
     return {"skip_existing": not force_download, "overwrite": force_download}
+
+
+def run_with_timeout(func: "Callable[[], None]", timeout_seconds: float) -> bool:
+    """
+    Run *func* (a zero-argument callable) on a background daemon thread,
+    waiting up to *timeout_seconds* for it to finish.
+
+    Returns True if *func* completed in time (any exception it raised
+    propagates normally on this calling thread); False if the timeout
+    elapsed first. There is no way to interrupt an in-flight call, so a
+    *func* that has not finished by the timeout keeps running in the
+    background -- being a daemon thread, it cannot block the interpreter
+    from exiting, and its eventual result (or exception) is discarded.
+    """
+    caught: "list[BaseException]" = []
+
+    def _wrapper() -> None:
+        try:
+            func()
+        except BaseException as exc:  # noqa: BLE001 -- re-raised on the calling thread below
+            caught.append(exc)
+
+    thread = threading.Thread(target=_wrapper, daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        return False
+    if caught:
+        raise caught[0]
+    return True

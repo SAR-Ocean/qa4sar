@@ -120,3 +120,30 @@ class TestShipDownloaderDryRun:
 
         assert paths == []
         assert not tmp_path.exists() or list(tmp_path.iterdir()) == []
+
+
+class TestShipDownloaderTimeout:
+    def test_a_hung_request_times_out_and_abandons_remaining_days(self, tmp_path, monkeypatch):
+        import threading
+
+        release = threading.Event()
+        calls = []
+
+        def fake_execute(self, request, target):
+            calls.append(request["date"])
+            release.wait()  # never released within the test -- simulates a hung MARS job
+
+        monkeypatch.setattr(ShipDownloader, "_execute_mars_request", fake_execute)
+        monkeypatch.setattr(
+            "sar_validation.downloaders.gts_ship_downloader._MARS_REQUEST_TIMEOUT_SECONDS", 0.05,
+        )
+
+        dl = ShipDownloader(output_dir=tmp_path)
+        paths = dl.download(
+            min_lon=-10, max_lon=10, min_lat=40, max_lat=55,
+            start="2026-08-30T00:00:00", end="2026-09-01T00:00:00",
+        )
+
+        assert calls == ["20260830"]
+        assert paths == []
+        release.set()  # let the background thread finish so it does not leak into other tests

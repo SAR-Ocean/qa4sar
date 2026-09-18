@@ -18,6 +18,7 @@ from sar_validation.downloaders.base import (
     is_date_recent,
     normalize_datetime,
     prefer_ipv4_dns,
+    run_with_timeout,
     set_credential,
     split_antimeridian_bbox,
 )
@@ -4990,3 +4991,42 @@ class TestHFRadarUSDownloaderCheckAvailabilityDry:
             result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
 
         assert result is False
+
+
+class TestRunWithTimeout:
+    def test_returns_true_when_func_completes_in_time(self):
+        calls = []
+        assert run_with_timeout(lambda: calls.append(1), timeout_seconds=1.0) is True
+        assert calls == [1]
+
+    def test_returns_false_when_func_does_not_complete_in_time(self):
+        import threading
+
+        release = threading.Event()
+
+        def _blocks_until_released():
+            release.wait()
+
+        assert run_with_timeout(_blocks_until_released, timeout_seconds=0.05) is False
+        release.set()  # let the background thread finish so it does not leak into other tests
+
+    def test_re_raises_the_func_exception_on_the_calling_thread(self):
+        def _raises():
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            run_with_timeout(_raises, timeout_seconds=1.0)
+
+    def test_the_background_thread_is_a_daemon_thread(self):
+        import threading
+
+        seen_daemon = {}
+
+        def _record_and_block():
+            seen_daemon["value"] = threading.current_thread().daemon
+            # Return immediately -- this test only needs to observe the
+            # thread's daemon flag, not exercise a real timeout.
+
+        run_with_timeout(_record_and_block, timeout_seconds=1.0)
+
+        assert seen_daemon["value"] is True

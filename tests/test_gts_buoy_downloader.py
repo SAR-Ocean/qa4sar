@@ -165,3 +165,55 @@ class TestGTSBuoyDownloaderMarsRequestShape:
         submitted_request, submitted_target = mock_service.execute.call_args[0]
         assert "target" not in submitted_request
         assert submitted_target == str(target)
+
+
+class TestGTSBuoyDownloaderTimeout:
+    def test_a_hung_request_times_out_and_abandons_remaining_days(self, tmp_path, monkeypatch):
+        import threading
+
+        release = threading.Event()
+        calls = []
+
+        def fake_execute(self, request, target):
+            calls.append(request["date"])
+            release.wait()  # never released within the test -- simulates a hung MARS job
+
+        monkeypatch.setattr(GTSBuoyDownloader, "_execute_mars_request", fake_execute)
+        monkeypatch.setattr(
+            "sar_validation.downloaders.gts_buoy_downloader._MARS_REQUEST_TIMEOUT_SECONDS", 0.05,
+        )
+
+        dl = GTSBuoyDownloader(output_dir=tmp_path)
+        paths = dl.download(
+            min_lon=-10, max_lon=10, min_lat=40, max_lat=55,
+            start="2026-08-30T00:00:00", end="2026-09-01T00:00:00",
+        )
+
+        assert calls == ["20260830"]  # only the first (hung) day was attempted
+        assert paths == []
+        release.set()  # let the background thread finish so it does not leak into other tests
+
+    def test_a_completed_earlier_day_is_kept_when_a_later_day_times_out(self, tmp_path, monkeypatch):
+        import threading
+
+        release = threading.Event()
+
+        def fake_execute(self, request, target):
+            if request["date"] == "20260830":
+                target.write_bytes(b"")
+                return
+            release.wait()  # the second day hangs
+
+        monkeypatch.setattr(GTSBuoyDownloader, "_execute_mars_request", fake_execute)
+        monkeypatch.setattr(
+            "sar_validation.downloaders.gts_buoy_downloader._MARS_REQUEST_TIMEOUT_SECONDS", 0.05,
+        )
+
+        dl = GTSBuoyDownloader(output_dir=tmp_path)
+        paths = dl.download(
+            min_lon=-10, max_lon=10, min_lat=40, max_lat=55,
+            start="2026-08-30T00:00:00", end="2026-08-31T00:00:00",
+        )
+
+        assert paths == [tmp_path / "gts_buoy_20260830.bufr"]
+        release.set()  # let the background thread finish so it does not leak into other tests

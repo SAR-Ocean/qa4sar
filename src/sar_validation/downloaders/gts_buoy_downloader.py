@@ -28,7 +28,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from .base import build_output_dir, normalize_datetime
+from .base import build_output_dir, normalize_datetime, run_with_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,12 @@ __all__ = ["GTSBuoyDownloader", "main"]
 #: request: an ident-filtered pull returned zero matches for a station
 #: known to be present in the unfiltered result for the same day).
 _OBSTYPE = "181/182"
+
+#: How long to wait for a single day's MARS request before giving up on
+#: it. MARS provides no way to cancel an in-flight request, so this only
+#: bounds how long this process waits -- the abandoned request keeps
+#: running on ECMWF's side regardless.
+_MARS_REQUEST_TIMEOUT_SECONDS = 360
 
 
 class GTSBuoyDownloader:
@@ -124,10 +130,21 @@ class GTSBuoyDownloader:
             request = self._build_request(day)
             print(f"  Downloading GTS buoy obs for {day.isoformat()} …")
             try:
-                self._execute_mars_request(request, target)
+                completed = run_with_timeout(
+                    lambda: self._execute_mars_request(request, target),
+                    _MARS_REQUEST_TIMEOUT_SECONDS,
+                )
             except Exception:
                 target.unlink(missing_ok=True)
                 raise
+            if not completed:
+                logger.warning(
+                    "GTS buoy obs for %s timed out after %d minute(s) waiting on "
+                    "MARS; abandoning the remaining day(s) in this window for "
+                    "this run.",
+                    day.isoformat(), _MARS_REQUEST_TIMEOUT_SECONDS // 60,
+                )
+                break
             downloaded.append(target)
             day += timedelta(days=1)
 
