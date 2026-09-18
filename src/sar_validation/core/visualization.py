@@ -4108,38 +4108,46 @@ def validation_report(
             )
 
             try:
-                fig_cds_geo_result = plot_geographic(
+                _cds_geo_index = [0]
+
+                def _write_cds_geo_figure(group, fig_cds_geo, index):
+                    fig_cds_geo = _mark_cds_section(
+                        fig_cds_geo, cds_product_type,
+                        description=cds_description if index == 0 else None,
+                    )
+                    figs.append(fig_cds_geo)
+                    title = f"{sar_var} vs {val_var} — C3S CDS SSM — geographic [{group}]"
+                    if base_dir is not None:
+                        _write_page(title, _finalize_figure_for_report(fig_cds_geo, None))
+
+                def _on_cds_geo_figure(scene_name, fig_cds_geo):
+                    _write_cds_geo_figure(scene_name, fig_cds_geo, _cds_geo_index[0])
+                    _cds_geo_index[0] += 1
+
+                plot_geographic(
                     datatree, cds_pair_ds, sar_var, val_var, scenes=matched_scenes,
                     point_size=geo_point_size,
                     geographic_bounds=(
                         recipe.config.geographic_bounds if geo_clamp_bounds else None
                     ),
                     skip_domain_harmonization=True,
+                    two_column_by_type=True,
+                    on_figure=_on_cds_geo_figure,
                 )
-                if isinstance(fig_cds_geo_result, dict):
-                    # One page per group (per SAR scene, or per
-                    # collocation_type) -- the section-opening description
-                    # belongs on the first page only, not every one.
-                    for i, (group, fig_cds_geo) in enumerate(fig_cds_geo_result.items()):
-                        if fig_cds_geo is not None:
-                            fig_cds_geo = _mark_cds_section(
-                                fig_cds_geo, cds_product_type,
-                                description=cds_description if i == 0 else None,
-                            )
-                            figs.append(fig_cds_geo)
-                            title = f"{sar_var} vs {val_var} — C3S CDS SSM — geographic [{group}]"
-                            if base_dir is not None:
-                                _write_page(title, _finalize_figure_for_report(fig_cds_geo, None))
-                elif fig_cds_geo_result is not None:
-                    fig_cds_geo_result = _mark_cds_section(
-                        fig_cds_geo_result, cds_product_type, description=cds_description,
-                    )
-                    figs.append(fig_cds_geo_result)
-                    title = f"{sar_var} vs {val_var} — C3S CDS SSM — geographic"
-                    if base_dir is not None:
-                        _write_page(title, _finalize_figure_for_report(fig_cds_geo_result, None))
             except Exception as exc:
                 logger.warning("plot_geographic failed for C3S CDS SSM %s: %s", sar_var, exc)
+
+            try:
+                def _on_cds_diff_figure(val_source, fig_cds_diff):
+                    fig_cds_diff = _mark_cds_section(fig_cds_diff, cds_product_type)
+                    figs.append(fig_cds_diff)
+                    title = f"{sar_var} vs {val_var} — C3S CDS SSM — difference [{val_source}]"
+                    if base_dir is not None:
+                        _write_page(title, _finalize_figure_for_report(fig_cds_diff, None))
+
+                plot_geographic_difference(cds_pair_ds, sar_var, val_var, on_figure=_on_cds_diff_figure)
+            except Exception as exc:
+                logger.warning("plot_geographic_difference failed for C3S CDS SSM %s: %s", sar_var, exc)
 
             fig_cds_scatter = plot_scatter(cds_pair_ds, sar_var, val_var)
             if fig_cds_scatter is not None:

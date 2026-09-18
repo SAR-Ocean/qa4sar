@@ -7285,6 +7285,14 @@ class TestValidationReportCdsSection:
                         "cds_ssm", "cds_ssm", "cds_ssm", "ascat_ssm", "ascat_ssm", "ismn", "ismn",
                     ]),
                 ),
+                "collocation_type": (
+                    "collocation",
+                    np.array([
+                        "layer_vs_layer", "layer_vs_layer", "layer_vs_layer",
+                        "layer_vs_layer", "layer_vs_layer",
+                        "point_vs_layer", "point_vs_layer",
+                    ]),
+                ),
                 "sar_scene_name": ("collocation", np.array(["sceneA"] * 7)),
                 "val_lon": ("collocation", np.array([2.0, 3.0, 4.0, 2.5, 3.5, 2.2, 3.2])),
                 "val_lat": ("collocation", np.array([47.0, 48.0, 49.0, 47.5, 48.5, 47.2, 48.2])),
@@ -7391,6 +7399,107 @@ class TestValidationReportCdsSection:
             f"expected a sentence naming ASCAT (the active product's sensor) "
             f"somewhere in the CDS section; got: {all_texts}"
         )
+
+
+class TestValidationReportCdsSsmGeographicWiring:
+    """The C3S CDS SSM section must pass two_column_by_type/on_figure
+    through to plot_geographic (matching the main CDF-matched section)
+    and must also add a difference page per qualifying source."""
+
+    @staticmethod
+    def _recipe():
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
+
+        # _cds_ssm_product_type(recipe) looks for a "cds_ssm"
+        # ValidationDataSource entry and falls back to "active" when none
+        # is configured -- no ValidationDataSource is needed here since
+        # both tests below only exercise the default "active" banner.
+        cfg = RecipeConfig(
+            name="test_cds_geo", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 10.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        )
+        return Recipe(config=cfg)
+
+    @staticmethod
+    def _fixture(n=12):
+        import pandas as pd
+
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(0.0, 4.0, x), np.linspace(45.0, 49.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.linspace(15.0, 25.0, y * x).reshape(y, x), {"units": "%"})},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-01-01T12:00:00")},
+        )
+        datatree = xr.DataTree.from_dict({"sar/sceneA": sar_ds})
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":       ("collocation", np.linspace(20.0, 26.0, n), {"units": "%"}),
+            "val_SOIL_MOISTURE": ("collocation", np.linspace(0.20, 0.26, n)),
+            "val_source":       ("collocation", ["cds_ssm"] * n),
+            "collocation_type": ("collocation", ["layer_vs_layer"] * n),
+            "sar_scene_name":   ("collocation", ["sceneA"] * n),
+            "val_lon":          ("collocation", np.linspace(2.0, 3.5, n)),
+            "val_lat":          ("collocation", np.linspace(47.0, 48.5, n)),
+            "sar_lon":          ("collocation", np.linspace(2.0, 3.5, n)),
+            "sar_lat":          ("collocation", np.linspace(47.0, 48.5, n)),
+            "val_id":           ("collocation", [f"c{i}" for i in range(n)]),
+        })
+        return datatree, collocation_ds
+
+    def _cds_stats(self, collocation_ds):
+        from sar_validation.core.statistics import compute_statistics
+
+        return compute_statistics(collocation_ds, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
+
+    def test_cds_geographic_call_passes_two_column_and_on_figure(self, tmp_path, monkeypatch):
+        import sar_validation.core.visualization as viz
+
+        datatree, collocation_ds = self._fixture()
+        cds_stats = self._cds_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        captured = []
+        original = viz.plot_geographic
+
+        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
+            captured.append(kwargs)
+            return original(datatree_, coll_, sar_var, val_var, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_geographic", spy)
+        viz.validation_report(
+            collocation_ds, datatree, self._recipe(), out_dir=tmp_path,
+            cds_ssm_stats_ds_map={key: cds_stats},
+        )
+
+        cds_calls = [
+            kwargs for kwargs in captured
+            if kwargs.get("skip_domain_harmonization") is True
+        ]
+        assert cds_calls, "expected at least one plot_geographic call for the CDS section"
+        assert cds_calls[0].get("two_column_by_type") is True
+        assert callable(cds_calls[0].get("on_figure"))
+
+    def test_cds_difference_page_appears_for_qualifying_source(self, tmp_path):
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = self._fixture(n=12)
+        cds_stats = self._cds_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        figs = validation_report(
+            collocation_ds, datatree, self._recipe(), out_dir=tmp_path,
+            cds_ssm_stats_ds_map={key: cds_stats},
+        )
+
+        found = False
+        for fig in figs[key]:
+            banner_texts = [t.get_text() for t in fig.texts]
+            if not any("ESA Climate Change Initiative" in t for t in banner_texts):
+                continue
+            if any("difference (n=" in ax.get_title() for ax in fig.axes):
+                found = True
+        assert found, "expected a CDS-banner figure with a difference title"
 
 
 class TestValidationReportNativeUnitsGeographic:
