@@ -2233,8 +2233,6 @@ bbox is always a superset of the true polygon.
 > (`_collocation_predictions`, `_should_skip_for_collocation`), `cli.py`
 > (`--dry-collocation`, `--download-all-in-bbox`).
 
----
-
 ## 13. In-situ download narrowing and MARS GTS concurrency/timeout
 
 A recipe's `geographic_bounds` is often much larger than the region SAR
