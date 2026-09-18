@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -54,6 +55,14 @@ _HISTORICAL_FIRST_PAIRS = {
     "hf_radar": "hf_radar_historical",
     "drifter": "drifter_historical",
 }
+
+# buoy_gts/ship_gts are dispatched separately from every other source_type
+# (see DataOrchestrator._dispatch_gts_sources_in_background), so both the
+# historical-first loop and step 4's "other sources" loop in download_all()
+# must skip them -- this set is the single place that exclusion is
+# expressed, rather than repeating "buoy_gts"/"ship_gts" string literals at
+# each loop.
+_GTS_BACKGROUND_TYPES = frozenset({"buoy_gts", "ship_gts"})
 
 # Delayed-mode in-situ current instruments that share a single combined
 # "no data" message (see _report_combined_currents_status) instead of each
@@ -686,6 +695,58 @@ class DataOrchestrator:
             self._footprint_narrowed_bounds_cache = fallback
         return self._footprint_narrowed_bounds_cache
 
+    def _dispatch_gts_sources_in_background(self) -> List[Tuple[threading.Thread, str]]:
+        """
+        Start a background daemon thread for every "buoy_gts"/"ship_gts"
+        validation source in this recipe, applying the same
+        _already_succeeded/_should_skip_for_collocation gates step 4's
+        "other sources" loop would otherwise apply -- moving their
+        dispatch earlier must not change whether a given source is
+        skipped, only when it starts.
+
+        Each MARS request already bounds its own worst-case duration (see
+        gts_buoy_downloader.py/gts_ship_downloader.py's per-day timeout),
+        so no additional timeout is applied here -- the caller joins each
+        returned thread without one, in _join_gts_threads.
+        """
+        threads: List[Tuple[threading.Thread, str]] = []
+        handlers = {"buoy_gts": self._download_gts_buoy, "ship_gts": self._download_gts_ship}
+        for source in self.recipe.config.validation_sources:
+            if source.source_type not in _GTS_BACKGROUND_TYPES:
+                continue
+            if self._already_succeeded(source.source_type):
+                self.metadata["downloads"][source.source_type] = self._previous_downloads[source.source_type]
+                logger.info(
+                    "Skipping %s: already succeeded in a previous run.",
+                    source.source_type,
+                )
+                continue
+            if self._should_skip_for_collocation(source.source_type):
+                self.metadata["downloads"][source.source_type] = {
+                    "status": "skipped", "reason": "no predicted collocation with SAR data",
+                }
+                logger.info("Skipping %s: no predicted collocation.", source.source_type)
+                continue
+            handler = handlers[source.source_type]
+            thread = threading.Thread(target=handler, args=(source,), daemon=True)
+            thread.start()
+            threads.append((thread, source.source_type))
+        return threads
+
+    def _join_gts_threads(self, threads: List[Tuple[threading.Thread, str]], ok: bool) -> bool:
+        """Wait for every background GTS thread _dispatch_gts_sources_in_background
+        started, folding each one's recorded success/failure into *ok*.
+        A thread's own downloader already records its outcome into
+        self.metadata["downloads"] the same way a synchronous source
+        would (see _run_download), so this only needs to read that
+        outcome back, not compute a new one."""
+        for thread, source_type in threads:
+            thread.join()
+            entry = self.metadata["downloads"].get(source_type, {})
+            if entry.get("status") == "failed":
+                ok = False
+        return ok
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -723,6 +784,8 @@ class DataOrchestrator:
             return ok
 
         self._compute_sar_scene_times()
+
+        gts_threads = self._dispatch_gts_sources_in_background()
 
         # 2. Delayed-mode ("*_historical") sources first. hf_radar and the
         # NRT in-situ batch (below) consult file_count from these results
@@ -810,6 +873,8 @@ class DataOrchestrator:
                 continue   # handled above
             if source.source_type in _HISTORICAL_FIRST_TYPES:
                 continue   # already dispatched in step 2
+            if source.source_type in _GTS_BACKGROUND_TYPES:
+                continue   # already dispatched in the background, right after SAR
             paired_historical = _HISTORICAL_FIRST_PAIRS.get(source.source_type)
             if paired_historical and historical_had_data.get(paired_historical):
                 self.metadata["downloads"][source.source_type] = {
@@ -839,6 +904,8 @@ class DataOrchestrator:
 
         self._report_combined_hf_radar_us_status()
         self._report_combined_hf_radar_status()
+
+        ok = self._join_gts_threads(gts_threads, ok)
 
         if not self.dry_run:
             self._save_metadata()

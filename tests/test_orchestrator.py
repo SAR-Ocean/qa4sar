@@ -182,6 +182,175 @@ class TestDownloadInsituUsesFootprintNarrowedBounds:
         assert seen_bounds["max_lat"] == 52.0
 
 
+class TestGtsBackgroundDispatch:
+    def _recipe_with_gts_and_altimeter(self, tmp_path):
+        cfg = RecipeConfig(
+            name="test", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[
+                ValidationDataSource(source_type="buoy_gts"),
+                ValidationDataSource(source_type="ship_gts"),
+                ValidationDataSource(source_type="altimeter"),
+            ],
+        )
+        orchestrator = DataOrchestrator(Recipe(cfg), dry_run=False)
+        orchestrator.base_dir = tmp_path
+        return orchestrator
+
+    def test_both_gts_sources_are_dispatched_before_the_other_sources_loop_completes(
+        self, tmp_path, monkeypatch,
+    ):
+        order = []
+
+        def fake_download_gts_buoy(self, source):
+            order.append("buoy_gts-start")
+            self.metadata["downloads"]["buoy_gts"] = {"status": "success", "files": []}
+            order.append("buoy_gts-end")
+            return True
+
+        def fake_download_gts_ship(self, source):
+            order.append("ship_gts-start")
+            self.metadata["downloads"]["ship_gts"] = {"status": "success", "files": []}
+            order.append("ship_gts-end")
+            return True
+
+        def fake_dispatch_source(self, source):
+            order.append(f"{source.source_type}-dispatched")
+            self.metadata["downloads"][source.source_type] = {"status": "success", "files": []}
+            return True
+
+        orchestrator = self._recipe_with_gts_and_altimeter(tmp_path)
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(DataOrchestrator, "_download_gts_buoy", fake_download_gts_buoy)
+        monkeypatch.setattr(DataOrchestrator, "_download_gts_ship", fake_download_gts_ship)
+        monkeypatch.setattr(DataOrchestrator, "_dispatch_source", fake_dispatch_source)
+
+        orchestrator.download_all()
+
+        assert "buoy_gts-start" in order
+        assert "ship_gts-start" in order
+        assert order.index("buoy_gts-start") < order.index("altimeter-dispatched")
+        assert order.index("ship_gts-start") < order.index("altimeter-dispatched")
+
+    def test_step_4_loop_does_not_redundantly_dispatch_buoy_gts_or_ship_gts(self, tmp_path, monkeypatch):
+        dispatched_source_types = []
+
+        def fake_dispatch_source(self, source):
+            dispatched_source_types.append(source.source_type)
+            self.metadata["downloads"][source.source_type] = {"status": "success", "files": []}
+            return True
+
+        orchestrator = self._recipe_with_gts_and_altimeter(tmp_path)
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(
+            DataOrchestrator, "_download_gts_buoy",
+            lambda self, source: self.metadata["downloads"].__setitem__(
+                "buoy_gts", {"status": "success", "files": []},
+            ) or True,
+        )
+        monkeypatch.setattr(
+            DataOrchestrator, "_download_gts_ship",
+            lambda self, source: self.metadata["downloads"].__setitem__(
+                "ship_gts", {"status": "success", "files": []},
+            ) or True,
+        )
+        monkeypatch.setattr(DataOrchestrator, "_dispatch_source", fake_dispatch_source)
+
+        orchestrator.download_all()
+
+        assert "buoy_gts" not in dispatched_source_types
+        assert "ship_gts" not in dispatched_source_types
+        assert dispatched_source_types == ["altimeter"]
+
+    def test_a_gts_thread_being_late_does_not_block_download_all_from_returning(self, tmp_path, monkeypatch):
+        import threading
+
+        release = threading.Event()
+
+        def fake_download_gts_buoy(self, source):
+            release.wait(timeout=2.0)  # released just after download_all() returns, below
+            self.metadata["downloads"]["buoy_gts"] = {"status": "success", "files": []}
+            return True
+
+        cfg = RecipeConfig(
+            name="test", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[ValidationDataSource(source_type="buoy_gts")],
+        )
+        orchestrator = DataOrchestrator(Recipe(cfg), dry_run=False)
+        orchestrator.base_dir = tmp_path
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(DataOrchestrator, "_download_gts_buoy", fake_download_gts_buoy)
+
+        thread = threading.Thread(target=orchestrator.download_all)
+        thread.start()
+        thread.join(timeout=1.0)
+        release.set()
+        thread.join(timeout=2.0)
+
+        # download_all() legitimately waits for the GTS thread (this is
+        # not a timeout scenario -- the GTS call itself is still
+        # in-flight), so it is fine for it to still be running at the
+        # 1-second mark; this test's real assertion is that it does
+        # finish soon after being released, not that it returns
+        # instantly.
+        assert not thread.is_alive()
+
+    def test_already_succeeded_prevents_a_gts_background_dispatch(self, tmp_path, monkeypatch):
+        orchestrator = self._recipe_with_gts_and_altimeter(tmp_path)
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(
+            orchestrator, "_already_succeeded",
+            lambda source_type: source_type == "buoy_gts",
+        )
+        orchestrator._previous_downloads["buoy_gts"] = {"status": "success", "files": ["x.bufr"]}
+        monkeypatch.setattr(
+            DataOrchestrator, "_download_gts_buoy",
+            lambda self, source: (_ for _ in ()).throw(
+                AssertionError("must not re-dispatch an already-succeeded source"),
+            ),
+        )
+        monkeypatch.setattr(
+            DataOrchestrator, "_download_gts_ship",
+            lambda self, source: self.metadata["downloads"].__setitem__(
+                "ship_gts", {"status": "success", "files": []},
+            ) or True,
+        )
+        monkeypatch.setattr(DataOrchestrator, "_dispatch_source", lambda self, source: True)
+
+        orchestrator.download_all()
+
+        assert orchestrator.metadata["downloads"]["buoy_gts"] == {"status": "success", "files": ["x.bufr"]}
+
+    def test_should_skip_for_collocation_prevents_a_gts_background_dispatch(self, tmp_path, monkeypatch):
+        orchestrator = self._recipe_with_gts_and_altimeter(tmp_path)
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(
+            orchestrator, "_should_skip_for_collocation",
+            lambda source_type: source_type == "ship_gts",
+        )
+        monkeypatch.setattr(
+            DataOrchestrator, "_download_gts_buoy",
+            lambda self, source: self.metadata["downloads"].__setitem__(
+                "buoy_gts", {"status": "success", "files": []},
+            ) or True,
+        )
+        monkeypatch.setattr(
+            DataOrchestrator, "_download_gts_ship",
+            lambda self, source: (_ for _ in ()).throw(
+                AssertionError("must not dispatch a none-predicted GTS source"),
+            ),
+        )
+        monkeypatch.setattr(DataOrchestrator, "_dispatch_source", lambda self, source: True)
+
+        orchestrator.download_all()
+
+        assert orchestrator.metadata["downloads"]["ship_gts"]["status"] == "skipped"
+        assert "collocation" in orchestrator.metadata["downloads"]["ship_gts"]["reason"]
+
+
 def test_download_all_in_bbox_defaults_to_false(tmp_path):
     """Default (no flag) means collocation-based skip-gating IS active --
     download_all_in_bbox=False is the new default, inverted from a plain
