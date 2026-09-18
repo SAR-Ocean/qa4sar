@@ -166,6 +166,28 @@ def _row_matches_bbox(
     return False
 
 
+def _matching_observations_mask(
+    times: "np.ndarray", lons: "np.ndarray", lats: "np.ndarray",
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    start: pd.Timestamp, end: pd.Timestamp,
+) -> "np.ndarray":
+    """Boolean mask of (time, lon, lat) observations falling inside the
+    requested window. NaN coordinates/timestamps never match. Antimeridian
+    wrap (min_lon > max_lon) uses the same split_antimeridian_bbox
+    convention as the rest of this module."""
+    times = pd.to_datetime(times)
+    valid = ~(pd.isna(times) | np.isnan(lons) | np.isnan(lats))
+
+    time_ok = (times >= start) & (times <= end) & valid
+
+    lon_ok = np.zeros_like(lons, dtype=bool)
+    for win_min_lon, win_max_lon in split_antimeridian_bbox(min_lon, max_lon):
+        lon_ok |= (lons >= win_min_lon) & (lons <= win_max_lon)
+    lat_ok = (lats >= min_lat) & (lats <= max_lat)
+
+    return time_ok & lon_ok & lat_ok
+
+
 def _observations_overlap_window(
     times: "np.ndarray", lons: "np.ndarray", lats: "np.ndarray",
     min_lon: float, max_lon: float, min_lat: float, max_lat: float,
@@ -175,19 +197,9 @@ def _observations_overlap_window(
     requested window. NaN coordinates/timestamps never match. Antimeridian
     wrap (min_lon > max_lon) uses the same split_antimeridian_bbox
     convention as the rest of this module."""
-    times = pd.to_datetime(times)
-    valid = ~(pd.isna(times) | np.isnan(lons) | np.isnan(lats))
-    if not valid.any():
-        return False
-
-    time_ok = (times >= start) & (times <= end) & valid
-
-    lon_ok = np.zeros_like(lons, dtype=bool)
-    for win_min_lon, win_max_lon in split_antimeridian_bbox(min_lon, max_lon):
-        lon_ok |= (lons >= win_min_lon) & (lons <= win_max_lon)
-    lat_ok = (lats >= min_lat) & (lats <= max_lat)
-
-    return bool(np.any(time_ok & lon_ok & lat_ok))
+    return bool(np.any(_matching_observations_mask(
+        times, lons, lats, min_lon, max_lon, min_lat, max_lat, start, end,
+    )))
 
 
 #: A row whose own reported bbox spans less than this in both dimensions is
@@ -266,6 +278,24 @@ def row_overlaps_window(
     if _row_is_effectively_stationary(row):
         return True
 
+    coords = _lazy_row_coordinates(row, dataset_id, dataset_part, work_dir)
+    if coords is None:
+        return True
+    times, lons, lats = coords
+    return _observations_overlap_window(
+        times, lons, lats, min_lon, max_lon, min_lat, max_lat, start, end,
+    )
+
+
+def _lazy_row_coordinates(
+    row: IndexRow, dataset_id: str, dataset_part: str, work_dir: Path,
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray] | None":
+    """Return (TIME, longitude, latitude) arrays for *row*'s platform
+    file, read lazily from the local cache if present or a direct remote
+    HTTPS open otherwise -- never downloading the file just to read these
+    three coordinate variables. None on any failure (missing coordinates,
+    network error, unreadable file); callers decide their own fail-open
+    or fail-closed handling of that case."""
     local_path = work_dir / Path(row.file_name).name
     try:
         if local_path.exists():
@@ -273,20 +303,17 @@ def row_overlaps_window(
         else:
             url = _get_remote_url(dataset_id, dataset_part, row.file_name, work_dir)
             if url is None:
-                return True
+                return None
             source = url
 
         with xr.open_dataset(source, engine="h5netcdf") as ds:
             lon_name = _first_present(ds, _LON_NAMES)
             lat_name = _first_present(ds, _LAT_NAMES)
             if lon_name is None or lat_name is None or "TIME" not in ds.variables:
-                return True
-            return _observations_overlap_window(
-                ds["TIME"].values, ds[lon_name].values, ds[lat_name].values,
-                min_lon, max_lon, min_lat, max_lat, start, end,
-            )
+                return None
+            return ds["TIME"].values, ds[lon_name].values, ds[lat_name].values
     except Exception:
-        return True
+        return None
 
 
 def rows_matching_query(
@@ -536,3 +563,94 @@ def download_via_index(
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(dest_path, index=False)
     return dest_path
+
+
+def dry_platform_ranges(
+    dataset_id: str,
+    dataset_part: str,
+    min_lon: float, max_lon: float, min_lat: float, max_lat: float,
+    start_dt: str, end_dt: str,
+    wanted_variables: "set[str]",
+    work_dir: Path,
+    platform_codes: "set[str] | None" = None,
+) -> "pd.DataFrame":
+    """
+    Answer download_via_index's own existence/range question -- which
+    platforms report real observations in this bbox/time/variable window,
+    and their earliest/latest observation time -- without downloading any
+    platform's full file.
+
+    Returns a DataFrame in the same long-format schema parse_platform_file
+    produces (so callers do not need to know which path answered), with
+    exactly two rows per matched platform: its earliest and latest
+    in-window observation. A caller's own
+    groupby("platform_id")["time"].min()/.max() then recovers the real
+    observed range exactly as it would from a full per-observation
+    dataframe. variable/value/value_qc/depth/institution carry no real
+    per-observation data along this path and are always empty/NaN/zero --
+    only platform_id, platform_type, time, longitude, and latitude are
+    meaningful here.
+
+    Mirrors download_via_index's own row-matching logic (the free,
+    index-only bbox/time/variable filter via rows_matching_query) but
+    stops there: rather than downloading each matched platform's full
+    file, this reuses row_overlaps_window's own lazy remote-open
+    mechanism (_lazy_row_coordinates) to read just the TIME/longitude/
+    latitude coordinates needed to confirm a real observation exists in
+    the window and derive its range. A stationary platform (see
+    _row_is_effectively_stationary) is reported using the index row's own
+    reported bbox/time_start/time_end directly, clamped to the query
+    window, with no file open at all -- matching row_overlaps_window's
+    own short-circuit. A platform whose lazy open fails for any reason is
+    omitted from the result rather than assumed present -- unlike
+    row_overlaps_window's fail-open "cannot check, so do not filter out"
+    contract for a boolean pre-check, a platform this function cannot
+    actually confirm real observations for must not be reported as one.
+    """
+    start = pd.Timestamp(normalize_datetime(start_dt))
+    end = pd.Timestamp(normalize_datetime(end_dt))
+
+    index_path = fetch_index_file(dataset_id, dataset_part, work_dir)
+    rows = rows_matching_query(
+        index_path, min_lon, max_lon, min_lat, max_lat, start.to_pydatetime(),
+        end.to_pydatetime(), wanted_variables,
+    )
+    if platform_codes:
+        rows = [row for row in rows if Path(row.file_name).parent.name in platform_codes]
+
+    columns = [
+        "variable", "platform_id", "platform_type", "time",
+        "longitude", "latitude", "depth", "value", "value_qc", "institution",
+    ]
+    records: "list[dict]" = []
+    for row in rows:
+        platform_id = Path(row.file_name).stem
+        platform_type_code = Path(row.file_name).parent.name
+
+        if _row_is_effectively_stationary(row):
+            lat = (row.lat_min + row.lat_max) / 2
+            lon = (row.lon_min + row.lon_max) / 2
+            earliest = max(pd.Timestamp(row.time_start), start)
+            latest = min(pd.Timestamp(row.time_end), end)
+        else:
+            coords = _lazy_row_coordinates(row, dataset_id, dataset_part, work_dir)
+            if coords is None:
+                continue
+            times, lons, lats = coords
+            mask = _matching_observations_mask(
+                times, lons, lats, min_lon, max_lon, min_lat, max_lat, start, end,
+            )
+            if not mask.any():
+                continue
+            matched_times = pd.to_datetime(times[mask])
+            lat, lon = float(lats[mask][0]), float(lons[mask][0])
+            earliest, latest = matched_times.min(), matched_times.max()
+
+        for observation_time in (earliest, latest):
+            records.append({
+                "variable": "", "platform_id": platform_id, "platform_type": platform_type_code,
+                "time": observation_time, "longitude": lon, "latitude": lat,
+                "depth": 0.0, "value": np.nan, "value_qc": np.nan, "institution": "",
+            })
+
+    return pd.DataFrame.from_records(records, columns=columns)

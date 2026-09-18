@@ -33,7 +33,6 @@ import logging
 import os
 import shutil
 import sys
-import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -42,7 +41,7 @@ from typing import Iterable, Optional
 import pandas as pd
 
 from .base import build_output_dir, is_date_recent, normalize_datetime, split_antimeridian_bbox
-from .insitu_index_fallback import download_via_index
+from .insitu_index_fallback import download_via_index, dry_platform_ranges
 
 __all__ = [
     "InSituDownloader",
@@ -433,38 +432,24 @@ class InSituDownloader:
         min_lon: float, max_lon: float, min_lat: float, max_lat: float,
         start_dt: str, end_dt: str, resolved_part: str, resolved_variables: "list[str]",
     ) -> "Optional[pd.DataFrame]":
-        """Run download_via_index for one window and read its combined CSV
-        back into a DataFrame from a throwaway scratch file, removed
-        immediately after -- _fetch_stations_uncached's own contract is
-        "no lasting artifact", unlike the real download() path this reuses.
-        The matched platforms' whole-archive .nc files still land in the
-        real persistent shared cache (_SHARED_INSITU_INDEX_CACHE_DIR), so
-        a later dry check or real download covering an overlapping window
-        reuses them rather than re-fetching.
-
-        Deliberately queries every platform type (no platform_codes
-        filter), matching _fetch_stations_dry's own reason for not
-        filtering by source_types until after this shared fetch returns:
-        several source_types can share one identical underlying query
-        within a single recipe run.
-        """
-        scratch_dir = Path(tempfile.mkdtemp(prefix="insitu_dry_check_"))
-        try:
-            found = download_via_index(
-                dataset_id=DATASET_ID,
-                dataset_part=resolved_part,
-                min_lon=min_lon, max_lon=max_lon, min_lat=min_lat, max_lat=max_lat,
-                start_dt=start_dt, end_dt=end_dt,
-                min_depth=self.min_depth, max_depth=self.max_depth,
-                wanted_variables=set(resolved_variables),
-                dest_path=scratch_dir / "dry_check.csv",
-                work_dir=_SHARED_INSITU_INDEX_CACHE_DIR,
-            )
-            if found is None:
-                return None
-            return pd.read_csv(found)
-        finally:
-            shutil.rmtree(scratch_dir, ignore_errors=True)
+        """Answer this dry check via the in-situ index, the same fallback
+        the real download() path uses -- but without downloading any
+        platform's full file (see dry_platform_ranges), unlike the real
+        path's own download_via_index. Deliberately queries every
+        platform type (no platform_codes filter), matching
+        _fetch_stations_dry's own reason for not filtering by
+        source_types until after this shared fetch returns: several
+        source_types can share one identical underlying query within a
+        single recipe run."""
+        df = dry_platform_ranges(
+            dataset_id=DATASET_ID,
+            dataset_part=resolved_part,
+            min_lon=min_lon, max_lon=max_lon, min_lat=min_lat, max_lat=max_lat,
+            start_dt=start_dt, end_dt=end_dt,
+            wanted_variables=set(resolved_variables),
+            work_dir=_SHARED_INSITU_INDEX_CACHE_DIR,
+        )
+        return df if not df.empty else None
 
     def check_availability_dry(
         self,
