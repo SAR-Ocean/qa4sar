@@ -1601,6 +1601,18 @@ def plot_geographic(
 
     # ── Build figures ────────────────────────────────────────────────────────
     if two_column_by_type and split_by == "collocation_type":
+        if "collocation_type" not in point_collocation_ds:
+            logger.warning(
+                "plot_geographic: point_collocation_ds has no collocation_type "
+                "column, so per-scene/per-type figures cannot be built. "
+                "Falling back to a single combined figure."
+            )
+            fallback_fig = _build_figure(point_collocation_ds, None)
+            if on_figure is not None:
+                on_figure("all scenes", fallback_fig)
+                return {}
+            return {"all scenes": fallback_fig}
+
         scene_figures: Dict[str, object] = {}
         for scene_name in scene_names:
             fig = _build_scene_pair_figure(scene_name)
@@ -3749,6 +3761,41 @@ def validation_report(
         writer.savefig(fig, dpi=150, bbox_inches="tight")
         plt.close(fig)
 
+    def _make_geo_page_writer(figs, mark_fig, title_for_group, description):
+        """
+        Build the ``on_figure`` callback ``plot_geographic``'s
+        ``two_column_by_type`` mode invokes once per scene: append the
+        figure (after applying *mark_fig*, a section-specific banner
+        function) to *figs*, and write it as a report page. *description*
+        is only forwarded to *mark_fig* for the section's first page.
+        """
+        index = [0]
+
+        def _on_figure(group, fig):
+            marked = mark_fig(fig, description if index[0] == 0 else None)
+            figs.append(marked)
+            if base_dir is not None:
+                _write_page(title_for_group(group), _finalize_figure_for_report(marked, None))
+            index[0] += 1
+
+        return _on_figure
+
+    def _make_diff_page_writer(figs, mark_fig, title_for_source):
+        """
+        Build the ``on_figure`` callback ``plot_geographic_difference``
+        invokes once per validation source: append the figure (after
+        applying *mark_fig*, a section-specific banner function) to
+        *figs*, and write it as a report page.
+        """
+
+        def _on_figure(val_source, fig):
+            marked = mark_fig(fig)
+            figs.append(marked)
+            if base_dir is not None:
+                _write_page(title_for_source(val_source), _finalize_figure_for_report(marked, None))
+
+        return _on_figure
+
     # Collocation diagnostics plot — generated once per recipe, written
     # first (right after the cover page) so a reader sees the spatial/
     # matching overview before the per-pair detail sections below.
@@ -3797,7 +3844,7 @@ def validation_report(
 
     for sar_var, val_var in pairs:
         key = f"{sar_var}_vs_{val_var}"
-        figs = []
+        figs: List["Figure"] = []
 
         # Direction-only sources for circular variables (WDIR): drop
         # non-directional instruments (altimeter/radiometer, all-NaN
@@ -3896,21 +3943,14 @@ def validation_report(
                     geo_point_size = 5 if (n_points / n_scenes) > 300 else 15
             else:
                 geo_point_size = 40
-            _geo_scene_index = [0]
 
-            def _write_geo_figure(group, fig_geo, index):
-                if cdf_matched_suffix:
-                    fig_geo = _mark_cdf_matched(
-                        fig_geo, description=_CDF_MATCHED_DESCRIPTION if index == 0 else None,
-                    )
-                figs.append(fig_geo)
-                title = f"{sar_var} vs {val_var} — geographic [{group}]{cdf_matched_suffix}"
-                if base_dir is not None:
-                    _write_page(title, _finalize_figure_for_report(fig_geo, None))
-
-            def _on_geo_figure(scene_name, fig_geo):
-                _write_geo_figure(scene_name, fig_geo, _geo_scene_index[0])
-                _geo_scene_index[0] += 1
+            _on_geo_figure = _make_geo_page_writer(
+                figs,
+                (lambda fig, desc: _mark_cdf_matched(fig, description=desc))
+                if cdf_matched_suffix else (lambda fig, desc: fig),
+                lambda group: f"{sar_var} vs {val_var} — geographic [{group}]{cdf_matched_suffix}",
+                _CDF_MATCHED_DESCRIPTION,
+            )
 
             plot_geographic(
                 datatree, cdf_geo_pair_ds, sar_var, val_var, scenes=matched_scenes,
@@ -3927,17 +3967,19 @@ def validation_report(
         # Difference — one map per validation source of (SAR minus
         # validation) at each collocated point's own SAR-side location,
         # right after the geographic section since both are spatial views
-        # of the same pair.
+        # of the same pair. Uses cdf_pair_ds (the domain the scatter/
+        # residuals plots above already use) rather than cdf_geo_pair_ds,
+        # since for soil_moisture those two live in different physical
+        # domains — plotting the difference from the wrong one would
+        # subtract two incomparable series.
         try:
-            def _on_diff_figure(val_source, fig_diff):
-                if cdf_matched_suffix:
-                    fig_diff = _mark_cdf_matched(fig_diff)
-                figs.append(fig_diff)
-                title = f"{sar_var} vs {val_var} — difference [{val_source}]{cdf_matched_suffix}"
-                if base_dir is not None:
-                    _write_page(title, _finalize_figure_for_report(fig_diff, None))
+            _on_diff_figure = _make_diff_page_writer(
+                figs,
+                _mark_cdf_matched if cdf_matched_suffix else (lambda fig: fig),
+                lambda val_source: f"{sar_var} vs {val_var} — difference [{val_source}]{cdf_matched_suffix}",
+            )
 
-            plot_geographic_difference(cdf_geo_pair_ds, sar_var, val_var, on_figure=_on_diff_figure)
+            plot_geographic_difference(cdf_pair_ds, sar_var, val_var, on_figure=_on_diff_figure)
         except Exception as exc:
             logger.warning("plot_geographic_difference failed for %s: %s", sar_var, exc, exc_info=True)
 
@@ -4007,20 +4049,12 @@ def validation_report(
             # above - spatial context before the point-cloud
             # comparison, for the same reason in both sections.
             try:
-                _nu_geo_index = [0]
-
-                def _write_nu_geo_figure(group, fig_nu_geo, index):
-                    fig_nu_geo = _mark_native_units(
-                        fig_nu_geo, description=_NATIVE_UNITS_DESCRIPTION if index == 0 else None,
-                    )
-                    figs.append(fig_nu_geo)
-                    title = f"{sar_var} vs {val_var} — native units — geographic [{group}]"
-                    if base_dir is not None:
-                        _write_page(title, _finalize_figure_for_report(fig_nu_geo, None))
-
-                def _on_nu_geo_figure(scene_name, fig_nu_geo):
-                    _write_nu_geo_figure(scene_name, fig_nu_geo, _nu_geo_index[0])
-                    _nu_geo_index[0] += 1
+                _on_nu_geo_figure = _make_geo_page_writer(
+                    figs,
+                    lambda fig, desc: _mark_native_units(fig, description=desc),
+                    lambda group: f"{sar_var} vs {val_var} — native units — geographic [{group}]",
+                    _NATIVE_UNITS_DESCRIPTION,
+                )
 
                 plot_geographic(
                     datatree, nu_pair_ds, sar_var, val_var, scenes=matched_scenes,
@@ -4048,12 +4082,10 @@ def validation_report(
                 logger.warning("plot_geographic failed for native-units %s: %s", sar_var, exc)
 
             try:
-                def _on_nu_diff_figure(val_source, fig_nu_diff):
-                    fig_nu_diff = _mark_native_units(fig_nu_diff)
-                    figs.append(fig_nu_diff)
-                    title = f"{sar_var} vs {val_var} — native units — difference [{val_source}]"
-                    if base_dir is not None:
-                        _write_page(title, _finalize_figure_for_report(fig_nu_diff, None))
+                _on_nu_diff_figure = _make_diff_page_writer(
+                    figs, _mark_native_units,
+                    lambda val_source: f"{sar_var} vs {val_var} — native units — difference [{val_source}]",
+                )
 
                 plot_geographic_difference(nu_pair_ds, sar_var, val_var, on_figure=_on_nu_diff_figure)
             except Exception as exc:
@@ -4108,21 +4140,12 @@ def validation_report(
             )
 
             try:
-                _cds_geo_index = [0]
-
-                def _write_cds_geo_figure(group, fig_cds_geo, index):
-                    fig_cds_geo = _mark_cds_section(
-                        fig_cds_geo, cds_product_type,
-                        description=cds_description if index == 0 else None,
-                    )
-                    figs.append(fig_cds_geo)
-                    title = f"{sar_var} vs {val_var} — C3S CDS SSM — geographic [{group}]"
-                    if base_dir is not None:
-                        _write_page(title, _finalize_figure_for_report(fig_cds_geo, None))
-
-                def _on_cds_geo_figure(scene_name, fig_cds_geo):
-                    _write_cds_geo_figure(scene_name, fig_cds_geo, _cds_geo_index[0])
-                    _cds_geo_index[0] += 1
+                _on_cds_geo_figure = _make_geo_page_writer(
+                    figs,
+                    lambda fig, desc: _mark_cds_section(fig, cds_product_type, description=desc),
+                    lambda group: f"{sar_var} vs {val_var} — C3S CDS SSM — geographic [{group}]",
+                    cds_description,
+                )
 
                 plot_geographic(
                     datatree, cds_pair_ds, sar_var, val_var, scenes=matched_scenes,
@@ -4138,12 +4161,11 @@ def validation_report(
                 logger.warning("plot_geographic failed for C3S CDS SSM %s: %s", sar_var, exc)
 
             try:
-                def _on_cds_diff_figure(val_source, fig_cds_diff):
-                    fig_cds_diff = _mark_cds_section(fig_cds_diff, cds_product_type)
-                    figs.append(fig_cds_diff)
-                    title = f"{sar_var} vs {val_var} — C3S CDS SSM — difference [{val_source}]"
-                    if base_dir is not None:
-                        _write_page(title, _finalize_figure_for_report(fig_cds_diff, None))
+                _on_cds_diff_figure = _make_diff_page_writer(
+                    figs,
+                    lambda fig: _mark_cds_section(fig, cds_product_type),
+                    lambda val_source: f"{sar_var} vs {val_var} — C3S CDS SSM — difference [{val_source}]",
+                )
 
                 plot_geographic_difference(cds_pair_ds, sar_var, val_var, on_figure=_on_cds_diff_figure)
             except Exception as exc:
