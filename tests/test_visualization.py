@@ -2262,6 +2262,62 @@ class TestPlotGeographicPanelAspect:
         plt.close("all")
 
 
+class TestPadLonLatExtent:
+    """_pad_lonlat_extent computes a padded bounding box around a set of
+    point coordinates, for zooming a map to where the data actually is
+    instead of showing a full scene's native extent."""
+
+    def test_pads_around_points_with_default_margin(self):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import _pad_lonlat_extent
+
+        lon = np.array([-9.0, -8.0, -7.0])
+        lat = np.array([50.0, 51.0, 52.0])
+        lon_min, lon_max, lat_min, lat_max = _pad_lonlat_extent(lon, lat, crosses_dateline=False)
+
+        xmargin = plt.rcParams["axes.xmargin"]
+        ymargin = plt.rcParams["axes.ymargin"]
+        assert lon_min < -9.0 - xmargin * 2.0 * 0.99
+        assert lon_max > -7.0 + xmargin * 2.0 * 0.99
+        assert lat_min < 50.0 - ymargin * 2.0 * 0.99
+        assert lat_max > 52.0 + ymargin * 2.0 * 0.99
+
+    def test_degenerate_single_point_gets_nonzero_span(self):
+        from sar_validation.core.visualization import _pad_lonlat_extent
+
+        lon = np.array([-9.0, -9.0, -9.0])
+        lat = np.array([50.0, 50.0, 50.0])
+        lon_min, lon_max, lat_min, lat_max = _pad_lonlat_extent(lon, lat, crosses_dateline=False)
+
+        assert lon_max > lon_min
+        assert lat_max > lat_min
+
+    def test_dateline_crossing_shifts_into_180_frame(self):
+        """Points at 179E and -179W (a real antimeridian-crossing source)
+        must produce one contiguous span in the central_longitude=180
+        frame, not a box spanning nearly the whole globe."""
+        from sar_validation.core.visualization import _pad_lonlat_extent
+
+        lon = np.array([179.0, -179.0])
+        lat = np.array([50.0, 51.0])
+        lon_min, lon_max, lat_min, lat_max = _pad_lonlat_extent(lon, lat, crosses_dateline=True)
+
+        assert lon_max - lon_min < 10.0
+
+    def test_clamps_to_valid_lon_lat_range(self):
+        from sar_validation.core.visualization import _pad_lonlat_extent
+
+        lon = np.array([-179.5, 179.5])
+        lat = np.array([-89.5, 89.5])
+        lon_min, lon_max, lat_min, lat_max = _pad_lonlat_extent(lon, lat, crosses_dateline=False)
+
+        assert lon_min >= -180.0
+        assert lon_max <= 180.0
+        assert lat_min >= -90.0
+        assert lat_max <= 90.0
+
+
 class TestPlotGeographicPointSubsampling:
     def test_dense_scene_is_subsampled_for_plotting(self):
         """A scene with far more collocated points than max_points_per_panel

@@ -406,6 +406,38 @@ def _pad_extent_to_min_aspect(ax, min_aspect: float = 1.0, bounds=None) -> None:
         ax.set_ylim(y0, y1)
 
 
+def _pad_lonlat_extent(
+    lon: np.ndarray, lat: np.ndarray, crosses_dateline: bool,
+) -> Tuple[float, float, float, float]:
+    """
+    Return a (lon_min, lon_max, lat_min, lat_max) box padded by
+    matplotlib's default 5% autoscale margin around a set of point
+    coordinates, clamped to valid lon/lat ranges.
+
+    For points spanning the antimeridian, longitudes are shifted into the
+    central_longitude=180 frame before padding, so the returned box is one
+    contiguous span rather than one that wraps across both edges of a
+    plain [-180, 180] plot.
+    """
+    import matplotlib.pyplot as plt
+
+    xmargin = plt.rcParams["axes.xmargin"]
+    ymargin = plt.rcParams["axes.ymargin"]
+
+    def _pad(lo: float, hi: float, margin: float) -> Tuple[float, float]:
+        lo, hi = _pad_degenerate_range(lo, hi)
+        pad = margin * (hi - lo)
+        return lo - pad, hi + pad
+
+    lat_min, lat_max = _pad(float(lat.min()), float(lat.max()), ymargin)
+    lat_min, lat_max = max(lat_min, -90.0), min(lat_max, 90.0)
+
+    lon_for_extent = ((lon % 360.0) - 180.0) if crosses_dateline else lon
+    lon_min, lon_max = _pad(float(lon_for_extent.min()), float(lon_for_extent.max()), xmargin)
+    lon_min, lon_max = max(lon_min, -180.0), min(lon_max, 180.0)
+    return lon_min, lon_max, lat_min, lat_max
+
+
 def _fill_nan_nearest(a: np.ndarray) -> np.ndarray:
     """
     Fill NaN cells in a 2D array with the value of their nearest finite cell.
