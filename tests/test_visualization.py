@@ -3045,6 +3045,169 @@ class TestPlotGeographicOnFigureCallback:
         plt.close("all")
 
 
+class TestPlotGeographicDifference:
+    """plot_geographic_difference maps SAR-minus-validation differences at
+    each collocation row's own sar_lat/sar_lon, one Figure per validation
+    source, using every column already present in collocation_results.nc
+    -- no DataTree lookup involved."""
+
+    @staticmethod
+    def _coll_ds(n_per_source=12, sources=("mooring",), circular=False):
+        rng = np.random.default_rng(0)
+        n = n_per_source * len(sources)
+        val_source = []
+        for s in sources:
+            val_source += [s] * n_per_source
+        sar_col = "sar_owiWindDirection" if circular else "sar_owiWindSpeed"
+        val_col = "val_WDIR" if circular else "val_WSPD"
+        base = rng.uniform(0.0, 360.0, n) if circular else rng.uniform(5.0, 10.0, n)
+        offset = rng.uniform(-2.0, 2.0, n)
+        return xr.Dataset({
+            sar_col: ("collocation", (base + offset) % 360.0 if circular else base + offset),
+            val_col: ("collocation", base),
+            "val_source": ("collocation", val_source),
+            "sar_lon": ("collocation", np.linspace(-9.8, -8.2, n)),
+            "sar_lat": ("collocation", np.linspace(50.2, 51.8, n)),
+        })
+
+    def test_missing_columns_returns_empty_dict(self):
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = xr.Dataset({"sar_owiWindSpeed": ("collocation", [1.0, 2.0])})
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        assert result == {}
+
+    def test_below_threshold_source_skipped(self):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(n_per_source=9)
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD", min_points=10)
+        assert result == {}
+        plt.close("all")
+
+    def test_at_threshold_source_included(self):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(n_per_source=10)
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD", min_points=10)
+        assert set(result.keys()) == {"mooring"}
+        plt.close("all")
+
+    def test_points_are_not_deduplicated(self):
+        """Unlike plot_geographic's validation-point overlay, every
+        collocation row must produce its own marker at its own
+        sar_lat/sar_lon -- proving the individual collocation method's
+        many-SAR-pixels-per-observation rows are not collapsed."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(n_per_source=15)
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD", min_points=10)
+        fig = result["mooring"]
+        scatter = next(
+            c for ax in fig.axes for c in ax.collections
+            if isinstance(c, mcollections.PathCollection) and len(c.get_offsets()) > 1
+        )
+        assert len(scatter.get_offsets()) == 15
+        plt.close("all")
+
+    def test_circular_variable_uses_wrapped_diff(self):
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(n_per_source=10, circular=True)
+        ds["sar_owiWindDirection"] = ("collocation", np.full(10, 5.0))
+        ds["val_WDIR"] = ("collocation", np.full(10, 355.0))
+        result = plot_geographic_difference(ds, "owiWindDirection", "WDIR", min_points=10)
+        fig = result["mooring"]
+        scatter = next(
+            c for ax in fig.axes for c in ax.collections
+            if isinstance(c, mcollections.PathCollection) and len(c.get_offsets()) > 1
+        )
+        # 5 - 355 wrapped to (-180, 180] is +10, not -350.
+        assert np.allclose(scatter.get_array(), 10.0)
+        plt.close("all")
+
+    def test_color_scale_symmetric_around_zero(self):
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(n_per_source=10)
+        ds["sar_owiWindSpeed"] = ("collocation", ds["val_WSPD"].values + 3.0)
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD", min_points=10)
+        scatter = next(
+            c for ax in result["mooring"].axes for c in ax.collections
+            if isinstance(c, mcollections.PathCollection) and len(c.get_offsets()) > 1
+        )
+        assert scatter.norm.vmin == -scatter.norm.vmax
+        plt.close("all")
+
+    def test_degenerate_all_zero_diff_does_not_crash(self):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(n_per_source=10)
+        ds["sar_owiWindSpeed"] = ds["val_WSPD"]
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD", min_points=10)
+        assert "mooring" in result
+        plt.close("all")
+
+    def test_on_figure_streams_and_dict_stays_empty(self):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(n_per_source=10)
+        handed_off = []
+
+        def on_figure(val_source, fig):
+            handed_off.append(val_source)
+            plt.close(fig)
+
+        result = plot_geographic_difference(
+            ds, "owiWindSpeed", "WSPD", min_points=10, on_figure=on_figure,
+        )
+        assert handed_off == ["mooring"]
+        assert result == {}
+
+    def test_two_sources_each_get_their_own_figure(self):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(n_per_source=10, sources=("mooring", "altimeter"))
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD", min_points=10)
+        assert set(result.keys()) == {"mooring", "altimeter"}
+        assert result["mooring"] is not result["altimeter"]
+        plt.close("all")
+
+    def test_dateline_crossing_source_does_not_crash(self):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(n_per_source=10)
+        n = ds.sizes["collocation"]
+        crossing_lon = np.concatenate([
+            np.linspace(178.0, 180.0, n // 2), np.linspace(-180.0, -178.0, n - n // 2),
+        ])
+        ds["sar_lon"] = ("collocation", crossing_lon)
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD", min_points=10)
+        assert "mooring" in result
+        plt.close("all")
+
+
 class TestExtractValidationDataForPlotSkipsGriddedNodes:
     """_extract_validation_data_for_plot's process_node assumes every
     validation node's lon/lat coords represent a flattened per-observation

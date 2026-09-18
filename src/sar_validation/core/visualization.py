@@ -134,6 +134,7 @@ if TYPE_CHECKING:
 __all__ = [
     "plot_scatter",
     "plot_geographic",
+    "plot_geographic_difference",
     "plot_statistics",
     "plot_residuals",
     "plot_collocation_diagnostics",
@@ -1623,6 +1624,152 @@ def plot_geographic(
         if group_ds.sizes.get("collocation", 0) == 0:
             continue
         figures[gv] = _build_figure(group_ds, gv)
+    return figures
+
+
+def plot_geographic_difference(
+    collocation_ds,
+    sar_var: str,
+    val_var: str,
+    *,
+    cmap: str = "RdBu",
+    min_points: int = 10,
+    on_figure: Optional[Callable[[str, "Figure"], None]] = None,
+) -> Dict[str, "Figure"]:
+    """
+    Map SAR-minus-validation differences at each collocated point's own
+    SAR-side location, one Figure per validation source.
+
+    Every collocation row is plotted at its own sar_lat/sar_lon rather
+    than being deduplicated to one dot per validation observation (unlike
+    plot_geographic's point overlay): for the cell-averaging collocation
+    method this is close to one point per observation, while the
+    individual method's many SAR pixels per observation spread out
+    naturally into many more, finer-grained points. A validation source
+    needs at least min_points finite SAR-minus-validation differences to
+    get a Figure; sources below that threshold are skipped entirely.
+
+    Parameters
+    ----------
+    collocation_ds : xr.Dataset
+        Step-3 collocations (``collocation_results.nc``). Needs
+        ``sar_<sar_var>``, ``val_<val_var>``, ``sar_lat``, ``sar_lon``, and
+        ``val_source`` — every one of these already exists in the saved
+        file, so no DataTree is needed.
+    sar_var : str
+        SAR variable name (e.g. ``"owiWindSpeed"``).
+    val_var : str
+        Validation variable name (e.g. ``"WSPD"``).
+    cmap : str
+        Diverging colormap for the difference values, centered at zero.
+    min_points : int
+        Minimum number of finite SAR-minus-validation differences a
+        validation source needs before it gets its own Figure.
+    on_figure : callable(val_source, Figure), optional
+        If given, each qualifying source's Figure is handed to this
+        callback immediately instead of being accumulated in the
+        returned dict, so the caller owns its lifecycle (write + close)
+        instead of every source's Figure staying open at once.
+
+    Returns
+    -------
+    dict[str, matplotlib.figure.Figure]
+        Validation source name to Figure, for every source that met
+        min_points. Empty if none did, or if collocation_ds is missing
+        the columns this function needs.
+    """
+    sar_col = f"sar_{sar_var}"
+    val_col = f"val_{val_var}"
+    required = (sar_col, val_col, "sar_lat", "sar_lon", "val_source")
+    if any(c not in collocation_ds for c in required):
+        return {}
+
+    import matplotlib.colors as mcolors  # noqa: PLC0415
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    try:
+        import cartopy.crs as ccrs  # noqa: PLC0415
+        HAS_CARTOPY = True
+    except ImportError:
+        HAS_CARTOPY = False
+        warnings.warn(
+            "cartopy is not installed — falling back to plain matplotlib axes.",
+            UserWarning, stacklevel=2,
+        )
+
+    from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg  # noqa: PLC0415
+
+    df = collocation_ds[[sar_col, val_col, "sar_lat", "sar_lon", "val_source"]].to_dataframe()
+    df = df.dropna(subset=[sar_col, val_col, "sar_lat", "sar_lon"])
+    if val_var in CIRCULAR_VAL_VARS:
+        df["diff"] = circular_diff_deg(df[sar_col].values, df[val_col].values)
+    else:
+        df["diff"] = df[sar_col] - df[val_col]
+    df = df[np.isfinite(df["diff"].to_numpy())]
+
+    figures: Dict[str, "Figure"] = {}
+    for source, sub in df.groupby("val_source"):
+        if len(sub) < min_points:
+            continue
+
+        diff = sub["diff"].to_numpy()
+        vmax = float(np.nanpercentile(np.abs(diff), 98))
+        if vmax == 0.0:
+            vmax = 1e-6
+        norm = mcolors.Normalize(vmin=-vmax, vmax=vmax)
+
+        lon = sub["sar_lon"].to_numpy()
+        lat = sub["sar_lat"].to_numpy()
+        crosses_dateline = bool(lon.max() - lon.min() > 180.0)
+
+        fig = plt.figure(figsize=(9, 7))
+        if HAS_CARTOPY:
+            projection = ccrs.PlateCarree(central_longitude=180.0 if crosses_dateline else 0.0)
+            ax = fig.add_subplot(1, 1, 1, projection=projection)
+            land, coastline = _land_coastline_features()
+            ax.add_feature(land, facecolor="lightgray", zorder=0, rasterized=True)
+            ax.add_feature(coastline, linewidth=0.5, zorder=0, rasterized=True)
+            gl = ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
+            transform = ccrs.PlateCarree()
+        else:
+            ax = fig.add_subplot(1, 1, 1)
+            transform = None
+
+        point_size = 5 if len(sub) > 300 else 15
+        kw = {"transform": transform} if transform is not None else {}
+        sc = ax.scatter(
+            lon, lat, c=diff, cmap=cmap, norm=norm, s=point_size,
+            edgecolors="black", linewidths=0.3, zorder=3, rasterized=True, **kw,
+        )
+
+        lon_min, lon_max, lat_min, lat_max = _pad_lonlat_extent(lon, lat, crosses_dateline)
+        if HAS_CARTOPY:
+            ax.set_extent(
+                [lon_min, lon_max, lat_min, lat_max],
+                crs=(ax.projection if crosses_dateline else transform),
+            )
+        else:
+            ax.set_xlim(lon_min, lon_max)
+            ax.set_ylim(lat_min, lat_max)
+        _pad_extent_to_min_aspect(ax)
+        if HAS_CARTOPY:
+            _set_lonlat_ticks(ax, gl)
+
+        val_units = _val_units_for_source(collocation_ds, str(source))
+        if val_units is None:
+            val_units = collocation_ds[val_col].attrs.get("units")
+        cbar_label = f"SAR {sar_var} − {source} {val_var}"
+        if val_units:
+            cbar_label += f" ({val_units})"
+        cbar = fig.colorbar(sc, ax=ax, shrink=0.8)
+        cbar.set_label(cbar_label)
+        ax.set_title(f"SAR {sar_var} − {source} difference (n={len(sub)})", fontsize=10)
+
+        if on_figure is not None:
+            on_figure(str(source), fig)
+        else:
+            figures[str(source)] = fig
+
     return figures
 
 

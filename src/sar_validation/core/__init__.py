@@ -49,6 +49,7 @@ from .statistics import (
 from .visualization import (
     plot_collocation_diagnostics,
     plot_geographic,
+    plot_geographic_difference,
     plot_residuals,
     plot_scatter,
     plot_statistics,
@@ -97,6 +98,7 @@ __all__ = [
     "MIN_N_FOR_CORRELATION",
     "plot_scatter",
     "plot_geographic",
+    "plot_geographic_difference",
     "plot_statistics",
     "plot_residuals",
     "plot_collocation_diagnostics",
