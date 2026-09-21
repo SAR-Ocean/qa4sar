@@ -1640,7 +1640,6 @@ def plot_geographic(
 
 
 def plot_geographic_difference(
-    datatree,
     collocation_ds,
     sar_var: str,
     val_var: str,
@@ -1649,42 +1648,35 @@ def plot_geographic_difference(
     on_figure: Optional[Callable[[str, "Figure"], None]] = None,
 ) -> Dict[str, "Figure"]:
     """
-    Map SAR-minus-validation differences as filled grid cells, one Figure
-    per qualifying validation source.
+    Map SAR-minus-validation differences as a smooth triangulated surface,
+    one Figure per qualifying validation source.
 
     Only validation sources whose collocation_type is layer_vs_layer or
     model_vs_layer are considered — dense satellite/model coverage, where
-    a filled map communicates the spatial pattern of the difference far
-    better than a handful of scattered in-situ dots. A source with even a
-    single qualifying row still gets a Figure; there is no minimum count.
+    a continuous surface communicates the spatial pattern of the
+    difference far better than a handful of scattered in-situ dots. There
+    is no minimum point count for a qualifying source.
 
-    For each qualifying source, every SAR scene present in its rows
-    contributes its own reconstructed difference grid, built by snapping
-    each row's own sar_lat/sar_lon back to the nearest cell of that
-    scene's native (lon, lat) grid (read from datatree, the same
-    coordinates plot_geographic itself renders the SAR field with) and
-    filling that cell with the difference — every other cell stays
-    unfilled. Every scene's grid is drawn onto the same shared axes with
-    the same color scale, so multiple scenes combine into one map. A
-    scene whose own geolocation is one-dimensional (point-mode
-    acquisitions) has no grid to snap into and falls back to a scatter
-    plot on the same shared color scale instead.
+    The surface is a Delaunay triangulation of the source's own collocated
+    points (each row's own sar_lat/sar_lon and its SAR-minus-validation
+    difference), smoothly shaded between vertices. A source with fewer
+    than three points, or whose points are collinear (a degenerate
+    triangulation), falls back to a plain colored scatter instead, so no
+    qualifying source is ever silently skipped.
 
-    Some acquisition modes (for example Sentinel-1 wave mode, WV)
-    relabel an otherwise dense satellite source such as a scatterometer
-    or altimeter as point_vs_layer for that mode, so that source's rows
-    from wave mode do not qualify for this plot even though the same
-    source's rows from other modes may.
+    Some acquisition modes (for example Sentinel-1 wave mode, WV) relabel
+    an otherwise dense satellite source such as a scatterometer or
+    altimeter as point_vs_layer for that mode, so that source's rows from
+    wave mode do not qualify for this plot even though the same source's
+    rows from other modes may.
 
     Parameters
     ----------
-    datatree : xr.DataTree
-        Step-2 DataTree (``datatree.nc``), providing each SAR scene's
-        native ``lon``/``lat`` grid.
     collocation_ds : xr.Dataset
         Step-3 collocations (``collocation_results.nc``). Needs
         ``sar_<sar_var>``, ``val_<val_var>``, ``sar_lat``, ``sar_lon``,
-        ``val_source``, ``collocation_type``, and ``sar_scene_name``.
+        ``val_source``, and ``collocation_type`` — every one of these
+        already exists in the saved file.
     sar_var : str
         SAR variable name (e.g. ``"owiWindSpeed"``).
     val_var : str
@@ -1701,24 +1693,15 @@ def plot_geographic_difference(
     -------
     dict[str, matplotlib.figure.Figure]
         Validation source name to Figure, for every source with at least
-        one qualifying row. Empty if none did, if collocation_ds is
-        missing the columns this function needs, or if datatree has no
-        ``/sar`` group.
+        one qualifying row. Empty if none did, or if collocation_ds is
+        missing the columns this function needs.
     """
     sar_col = f"sar_{sar_var}"
     val_col = f"val_{val_var}"
-    required = (
-        sar_col, val_col, "sar_lat", "sar_lon", "val_source",
-        "collocation_type", "sar_scene_name",
-    )
+    required = (sar_col, val_col, "sar_lat", "sar_lon", "val_source", "collocation_type")
     if any(c not in collocation_ds for c in required):
         return {}
 
-    sar_node = datatree.get("sar")
-    if sar_node is None:
-        return {}
-
-    import matplotlib.cm as mcm  # noqa: PLC0415
     import matplotlib.colors as mcolors  # noqa: PLC0415
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
@@ -1733,7 +1716,6 @@ def plot_geographic_difference(
         )
 
     from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg  # noqa: PLC0415
-    from .collocation import PointLayerCollocation, _lonlat_to_unit_xyz  # noqa: PLC0415
 
     df = collocation_ds[list(required)].to_dataframe()
     df = df.dropna(subset=[sar_col, val_col, "sar_lat", "sar_lon"])
@@ -1749,17 +1731,16 @@ def plot_geographic_difference(
         if sub.empty:
             continue
 
-        diff_all = sub["diff"].to_numpy()
-        vmax = float(np.nanpercentile(np.abs(diff_all), 98))
+        diff = sub["diff"].to_numpy()
+        lon = sub["sar_lon"].to_numpy()
+        lat = sub["sar_lat"].to_numpy()
+
+        vmax = float(np.nanpercentile(np.abs(diff), 98))
         if vmax == 0.0:
             vmax = 1e-6
         norm = mcolors.Normalize(vmin=-vmax, vmax=vmax)
-        sm = mcm.ScalarMappable(cmap=cmap, norm=norm)
-        sm.set_array([])
 
-        lon_all = sub["sar_lon"].to_numpy()
-        lat_all = sub["sar_lat"].to_numpy()
-        crosses_dateline = bool(lon_all.max() - lon_all.min() > 180.0)
+        crosses_dateline = bool(lon.max() - lon.min() > 180.0)
 
         fig = plt.figure(figsize=(9, 7))
         if HAS_CARTOPY:
@@ -1775,74 +1756,22 @@ def plot_geographic_difference(
             transform = None
         kw = {"transform": transform} if transform is not None else {}
 
-        for scene_name, scene_rows in sub.groupby("sar_scene_name"):
-            scene_node = sar_node.get(scene_name)
-            if scene_node is None:
-                logger.debug(
-                    "plot_geographic_difference: scene %r absent from datatree, skipping",
-                    scene_name,
+        mappable = None
+        if len(lon) >= 3:
+            try:
+                mappable = ax.tripcolor(
+                    lon, lat, diff, shading="gouraud", cmap=cmap, norm=norm,
+                    zorder=3, rasterized=True, **kw,
                 )
-                continue
-            scene_ds = scene_node.to_dataset()
-            if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
-                logger.debug(
-                    "plot_geographic_difference: scene %r has no lon/lat coordinates, skipping",
-                    scene_name,
-                )
-                continue
-            scene_lon = scene_ds["lon"].values
-            scene_lat = scene_ds["lat"].values
+            except (RuntimeError, ValueError):
+                mappable = None
+        if mappable is None:
+            mappable = ax.scatter(
+                lon, lat, c=diff, cmap=cmap, norm=norm, s=40,
+                edgecolors="black", linewidths=0.3, zorder=3, rasterized=True, **kw,
+            )
 
-            row_lon = scene_rows["sar_lon"].to_numpy()
-            row_lat = scene_rows["sar_lat"].to_numpy()
-            row_diff = scene_rows["diff"].to_numpy()
-
-            if scene_lon.ndim == 2:
-                tree, flat_idx, n_x = PointLayerCollocation._build_grid_tree(scene_lon, scene_lat)
-                if flat_idx.size == 0:
-                    logger.debug(
-                        "plot_geographic_difference: scene %r has no finite lon/lat "
-                        "cells, skipping",
-                        scene_name,
-                    )
-                    continue
-                _, nearest = tree.query(_lonlat_to_unit_xyz(row_lon, row_lat))
-                cells = flat_idx[nearest]
-                y_idx, x_idx = np.divmod(cells, n_x)
-
-                sum_grid = np.zeros(scene_lon.shape)
-                count_grid = np.zeros(scene_lon.shape, dtype=int)
-                np.add.at(sum_grid, (y_idx, x_idx), row_diff)
-                np.add.at(count_grid, (y_idx, x_idx), 1)
-                diff_grid = np.full(scene_lon.shape, np.nan)
-                filled = count_grid > 0
-                diff_grid[filled] = sum_grid[filled] / count_grid[filled]
-
-                # pcolormesh rejects non-finite x/y, so repair NaN
-                # geolocation cells (common at swath edges) for the mesh
-                # coordinates only. The KD-tree above already excludes
-                # non-finite cells, so no row can have snapped into one;
-                # masking diff_grid at those cells too keeps its NaN
-                # pattern honest independent of that.
-                invalid_xy = ~(np.isfinite(scene_lon) & np.isfinite(scene_lat))
-                if invalid_xy.any():
-                    diff_grid[invalid_xy] = np.nan
-                    mesh_lon = _fill_nan_nearest(scene_lon)
-                    mesh_lat = _fill_nan_nearest(scene_lat)
-                else:
-                    mesh_lon, mesh_lat = scene_lon, scene_lat
-
-                ax.pcolormesh(
-                    mesh_lon, mesh_lat, np.ma.masked_invalid(diff_grid),
-                    cmap=cmap, norm=norm, shading="auto", zorder=3, rasterized=True, **kw,
-                )
-            else:
-                ax.scatter(
-                    row_lon, row_lat, c=row_diff, cmap=cmap, norm=norm, s=15,
-                    edgecolors="black", linewidths=0.3, zorder=3, rasterized=True, **kw,
-                )
-
-        lon_min, lon_max, lat_min, lat_max = _pad_lonlat_extent(lon_all, lat_all, crosses_dateline)
+        lon_min, lon_max, lat_min, lat_max = _pad_lonlat_extent(lon, lat, crosses_dateline)
         if HAS_CARTOPY:
             ax.set_extent(
                 [lon_min, lon_max, lat_min, lat_max],
@@ -1861,7 +1790,7 @@ def plot_geographic_difference(
         cbar_label = f"SAR {sar_var} − {source} {val_var}"
         if val_units:
             cbar_label += f" ({val_units})"
-        cbar = fig.colorbar(sm, ax=ax, shrink=0.8)
+        cbar = fig.colorbar(mappable, ax=ax, shrink=0.8)
         cbar.set_label(cbar_label)
         ax.set_title(f"SAR {sar_var} − {source} difference (n={len(sub)})", fontsize=10)
 
@@ -1871,6 +1800,7 @@ def plot_geographic_difference(
             figures[str(source)] = fig
 
     return figures
+
 
 
 # ---------------------------------------------------------------------------
