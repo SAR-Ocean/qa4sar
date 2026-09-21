@@ -3996,7 +3996,7 @@ def validation_report(
                 lambda val_source: f"{sar_var} vs {val_var} — difference [{val_source}]{cdf_matched_suffix}",
             )
 
-            plot_geographic_difference(datatree, cdf_pair_ds, sar_var, val_var, on_figure=_on_diff_figure)
+            plot_geographic_difference(cdf_pair_ds, sar_var, val_var, on_figure=_on_diff_figure)
         except Exception as exc:
             logger.warning("plot_geographic_difference failed for %s: %s", sar_var, exc, exc_info=True)
 
@@ -4104,7 +4104,7 @@ def validation_report(
                     lambda val_source: f"{sar_var} vs {val_var} — native units — difference [{val_source}]",
                 )
 
-                plot_geographic_difference(datatree, nu_pair_ds, sar_var, val_var, on_figure=_on_nu_diff_figure)
+                plot_geographic_difference(nu_pair_ds, sar_var, val_var, on_figure=_on_nu_diff_figure)
             except Exception as exc:
                 logger.warning("plot_geographic_difference failed for native-units %s: %s", sar_var, exc)
 
@@ -4184,7 +4184,7 @@ def validation_report(
                     lambda val_source: f"{sar_var} vs {val_var} — C3S CDS SSM — difference [{val_source}]",
                 )
 
-                plot_geographic_difference(datatree, cds_pair_ds, sar_var, val_var, on_figure=_on_cds_diff_figure)
+                plot_geographic_difference(cds_pair_ds, sar_var, val_var, on_figure=_on_cds_diff_figure)
             except Exception as exc:
                 logger.warning("plot_geographic_difference failed for C3S CDS SSM %s: %s", sar_var, exc)
 

@@ -5420,7 +5420,7 @@ class TestValidationReportSoilMoistureDifferenceUsesRescaledSar:
         collocation_ds = collocation_ds.assign_coords(
             val_time=("collocation", pd.date_range("2026-07-10T19:05", periods=n + n_ismn, freq="1min")),
         )
-        return datatree, collocation_ds, y, x
+        return datatree, collocation_ds
 
     @staticmethod
     def _difference_mesh(figs):
@@ -5431,7 +5431,7 @@ class TestValidationReportSoilMoistureDifferenceUsesRescaledSar:
                 continue
             for ax in fig.axes:
                 for coll in ax.collections:
-                    if isinstance(coll, mcollections.QuadMesh):
+                    if isinstance(coll, mcollections.TriMesh):
                         return coll
         return None
 
@@ -5442,7 +5442,7 @@ class TestValidationReportSoilMoistureDifferenceUsesRescaledSar:
         from sar_validation.core.statistics import add_rescaled_sar_column
         from sar_validation.core.visualization import validation_report
 
-        datatree, collocation_ds, y, x = self._fixture()
+        datatree, collocation_ds = self._fixture()
         recipe = Recipe(config=RecipeConfig(name="test_sm_diff", variable="soil_moisture"))
 
         with warnings.catch_warnings():
@@ -5456,19 +5456,21 @@ class TestValidationReportSoilMoistureDifferenceUsesRescaledSar:
 
         # The difference page only ever covers ascat_ssm (the sole
         # layer_vs_layer source); ismn's rows are point_vs_layer and never
-        # reach it, so they are excluded here to line up with the mesh.
+        # reach it, so they are excluded here to match the mesh. tripcolor's
+        # gouraud-shaded array holds one value per input vertex in input
+        # order, so no reshape is needed to compare against it.
         ascat_mask = (expected_ds["val_source"].values == "ascat_ssm")
-        actual = np.ma.filled(mesh.get_array(), np.nan).reshape(y, x)
+        actual = np.ma.filled(mesh.get_array(), np.nan)
         expected = (
             expected_ds["sar_sarSSM"].values[ascat_mask]
             - expected_ds["val_SOIL_MOISTURE"].values[ascat_mask]
-        ).reshape(y, x)
+        )
         np.testing.assert_allclose(actual, expected, atol=1e-6)
 
         raw_diff = (
             collocation_ds["sar_sarSSM"].values[ascat_mask]
             - collocation_ds["val_SOIL_MOISTURE"].values[ascat_mask]
-        ).reshape(y, x)
+        )
         assert not np.allclose(actual, raw_diff, atol=1.0), (
             "difference plot appears to be using raw, non-rescaled SAR values"
         )
