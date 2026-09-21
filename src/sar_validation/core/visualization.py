@@ -1670,6 +1670,12 @@ def plot_geographic_difference(
     acquisitions) has no grid to snap into and falls back to a scatter
     plot on the same shared color scale instead.
 
+    Some acquisition modes (for example Sentinel-1 wave mode, WV)
+    relabel an otherwise dense satellite source such as a scatterometer
+    or altimeter as point_vs_layer for that mode, so that source's rows
+    from wave mode do not qualify for this plot even though the same
+    source's rows from other modes may.
+
     Parameters
     ----------
     datatree : xr.DataTree
@@ -1772,9 +1778,17 @@ def plot_geographic_difference(
         for scene_name, scene_rows in sub.groupby("sar_scene_name"):
             scene_node = sar_node.get(scene_name)
             if scene_node is None:
+                logger.debug(
+                    "plot_geographic_difference: scene %r absent from datatree, skipping",
+                    scene_name,
+                )
                 continue
             scene_ds = scene_node.to_dataset()
             if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
+                logger.debug(
+                    "plot_geographic_difference: scene %r has no lon/lat coordinates, skipping",
+                    scene_name,
+                )
                 continue
             scene_lon = scene_ds["lon"].values
             scene_lat = scene_ds["lat"].values
@@ -1785,6 +1799,13 @@ def plot_geographic_difference(
 
             if scene_lon.ndim == 2:
                 tree, flat_idx, n_x = PointLayerCollocation._build_grid_tree(scene_lon, scene_lat)
+                if flat_idx.size == 0:
+                    logger.debug(
+                        "plot_geographic_difference: scene %r has no finite lon/lat "
+                        "cells, skipping",
+                        scene_name,
+                    )
+                    continue
                 _, nearest = tree.query(_lonlat_to_unit_xyz(row_lon, row_lat))
                 cells = flat_idx[nearest]
                 y_idx, x_idx = np.divmod(cells, n_x)
@@ -1797,8 +1818,22 @@ def plot_geographic_difference(
                 filled = count_grid > 0
                 diff_grid[filled] = sum_grid[filled] / count_grid[filled]
 
+                # pcolormesh rejects non-finite x/y, so repair NaN
+                # geolocation cells (common at swath edges) for the mesh
+                # coordinates only. The KD-tree above already excludes
+                # non-finite cells, so no row can have snapped into one;
+                # masking diff_grid at those cells too keeps its NaN
+                # pattern honest independent of that.
+                invalid_xy = ~(np.isfinite(scene_lon) & np.isfinite(scene_lat))
+                if invalid_xy.any():
+                    diff_grid[invalid_xy] = np.nan
+                    mesh_lon = _fill_nan_nearest(scene_lon)
+                    mesh_lat = _fill_nan_nearest(scene_lat)
+                else:
+                    mesh_lon, mesh_lat = scene_lon, scene_lat
+
                 ax.pcolormesh(
-                    scene_lon, scene_lat, np.ma.masked_invalid(diff_grid),
+                    mesh_lon, mesh_lat, np.ma.masked_invalid(diff_grid),
                     cmap=cmap, norm=norm, shading="auto", zorder=3, rasterized=True, **kw,
                 )
             else:

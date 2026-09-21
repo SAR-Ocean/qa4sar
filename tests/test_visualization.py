@@ -3262,6 +3262,116 @@ class TestPlotGeographicDifference:
         assert np.isclose(arr[0, 0], 3.0)
         plt.close("all")
 
+    def test_gridded_scene_with_nan_geolocation_does_not_raise(self):
+        """Regression test: S1 OCN scenes commonly carry NaN lon/lat at
+        swath-edge cells; pcolormesh rejects non-finite x/y outright, so
+        the reconstructed difference grid must repair the coordinate
+        mesh rather than crash."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        datatree, lon2d, lat2d = self._sar_datatree(y=3, x=3)
+        scene_ds = datatree["sar/sceneA"].to_dataset()
+        lon2d_nan = lon2d.copy()
+        lat2d_nan = lat2d.copy()
+        lon2d_nan[0, -1] = np.nan
+        lat2d_nan[0, -1] = np.nan
+        scene_ds = scene_ds.assign_coords(
+            lon=(("y", "x"), lon2d_nan), lat=(("y", "x"), lat2d_nan),
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": scene_ds})
+
+        ds = self._coll_ds(
+            sar_lon=[float(lon2d[1, 1])], sar_lat=[float(lat2d[1, 1])],
+            sar_vals=[9.0], val_vals=[6.0],
+        )
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
+        fig = result["ascat_ssm"]
+        mesh = next(
+            c for ax in fig.axes for c in ax.collections
+            if isinstance(c, mcollections.QuadMesh)
+        )
+        arr = np.ma.filled(mesh.get_array(), np.nan).reshape(3, 3)
+        assert np.isclose(arr[1, 1], 3.0)
+        plt.close("all")
+
+    def test_all_nan_geolocation_scene_is_skipped(self):
+        """A scene whose entire lon/lat grid is non-finite has no cells
+        a collocation row could ever snap into and must be skipped
+        rather than raising."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        datatree, lon2d, lat2d = self._sar_datatree(y=3, x=3)
+        scene_ds = datatree["sar/sceneA"].to_dataset()
+        scene_ds = scene_ds.assign_coords(
+            lon=(("y", "x"), np.full_like(lon2d, np.nan)),
+            lat=(("y", "x"), np.full_like(lat2d, np.nan)),
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": scene_ds})
+
+        ds = self._coll_ds(
+            sar_lon=[float(lon2d[1, 1])], sar_lat=[float(lat2d[1, 1])],
+            sar_vals=[9.0], val_vals=[6.0],
+        )
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
+        assert "ascat_ssm" in result
+        fig = result["ascat_ssm"]
+        main_ax = fig.axes[0]
+        assert not any(
+            isinstance(c, mcollections.QuadMesh) for c in main_ax.collections
+        )
+        plt.close("all")
+
+    def test_mixed_2d_and_1d_scenes_share_the_same_color_scale(self):
+        """One val_source's rows can come from two different SAR scenes
+        -- a gridded one and a point-mode one -- and both must render
+        onto the same Figure/Axes with the same color scale."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        datatree_grid, lon2d, lat2d = self._sar_datatree(scene_name="sceneGrid", y=3, x=3)
+        grid_ds = datatree_grid["sar/sceneGrid"].to_dataset()
+
+        n = 4
+        wv_ds = xr.Dataset(
+            {"owiWindSpeed": ("point", np.full(n, 7.0))},
+            coords={"lon": ("point", np.linspace(-9.5, -8.5, n)),
+                    "lat": ("point", np.linspace(50.5, 51.5, n)),
+                    "time": pd.Timestamp("2026-07-10T12:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({
+            "sar/sceneGrid": grid_ds,
+            "sar/sceneWV": wv_ds,
+        })
+
+        ds_grid = self._coll_ds(
+            sar_lon=[float(lon2d[1, 1])], sar_lat=[float(lat2d[1, 1])],
+            sar_vals=[9.0], val_vals=[6.0], scene_name="sceneGrid",
+        )
+        ds_wv = self._coll_ds(
+            sar_lon=np.linspace(-9.5, -8.5, n), sar_lat=np.linspace(50.5, 51.5, n),
+            sar_vals=np.full(n, 12.0), val_vals=np.full(n, 6.0), scene_name="sceneWV",
+        )
+        ds = xr.concat([ds_grid, ds_wv], dim="collocation")
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
+        fig = result["ascat_ssm"]
+        collections_all = [c for ax in fig.axes for c in ax.collections]
+        mesh = next(c for c in collections_all if isinstance(c, mcollections.QuadMesh))
+        scatter = next(c for c in collections_all if isinstance(c, mcollections.PathCollection))
+        assert mesh.norm.vmin == scatter.norm.vmin
+        assert mesh.norm.vmax == scatter.norm.vmax
+        plt.close("all")
+
     def test_1d_scene_falls_back_to_scatter_sharing_the_mesh_color_scale(self):
         import matplotlib.collections as mcollections
         import matplotlib.pyplot as plt
