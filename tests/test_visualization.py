@@ -3415,6 +3415,7 @@ class TestPlotGeographicDifference:
         assert "ascat_ssm" in result
         plt.close("all")
 
+
 class TestExtractValidationDataForPlotSkipsGriddedNodes:
     """_extract_validation_data_for_plot's process_node assumes every
     validation node's lon/lat coords represent a flattened per-observation

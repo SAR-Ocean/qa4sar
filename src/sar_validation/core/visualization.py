@@ -1637,6 +1637,8 @@ def plot_geographic(
             continue
         figures[gv] = _build_figure(group_ds, gv)
     return figures
+
+
 def plot_geographic_difference(
     datatree,
     collocation_ds,
