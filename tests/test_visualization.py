@@ -3290,8 +3290,9 @@ class TestPlotGeographicDifference:
         )
         result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
         fig = result["ascat_ssm"]
+        main_ax = fig.axes[0]
         mesh = next(
-            c for ax in fig.axes for c in ax.collections
+            c for c in main_ax.collections
             if isinstance(c, mcollections.QuadMesh)
         )
         arr = np.ma.filled(mesh.get_array(), np.nan).reshape(3, 3)
@@ -3365,9 +3366,9 @@ class TestPlotGeographicDifference:
         ds = xr.concat([ds_grid, ds_wv], dim="collocation")
         result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
         fig = result["ascat_ssm"]
-        collections_all = [c for ax in fig.axes for c in ax.collections]
-        mesh = next(c for c in collections_all if isinstance(c, mcollections.QuadMesh))
-        scatter = next(c for c in collections_all if isinstance(c, mcollections.PathCollection))
+        main_collections = fig.axes[0].collections
+        mesh = next(c for c in main_collections if isinstance(c, mcollections.QuadMesh))
+        scatter = next(c for c in main_collections if isinstance(c, mcollections.PathCollection))
         assert mesh.norm.vmin == scatter.norm.vmin
         assert mesh.norm.vmax == scatter.norm.vmax
         plt.close("all")
