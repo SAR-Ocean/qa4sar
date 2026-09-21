@@ -3103,75 +3103,193 @@ class TestPlotGeographicOnFigureCallback:
 
 
 class TestPlotGeographicDifference:
-    """plot_geographic_difference maps SAR-minus-validation differences at
-    each collocation row's own sar_lat/sar_lon, one Figure per validation
-    source, using every column already present in collocation_results.nc
-    -- no DataTree lookup involved."""
+    """plot_geographic_difference maps SAR-minus-validation differences,
+    one Figure per qualifying validation source, by reconstructing each
+    SAR scene's own geolocation grid from the DataTree and filling it
+    with the differences that land in each cell."""
 
     @staticmethod
-    def _coll_ds(n_per_source=12, sources=("mooring",), circular=False):
-        rng = np.random.default_rng(0)
-        n = n_per_source * len(sources)
-        val_source = []
-        for s in sources:
-            val_source += [s] * n_per_source
-        sar_col = "sar_owiWindDirection" if circular else "sar_owiWindSpeed"
-        val_col = "val_WDIR" if circular else "val_WSPD"
-        base = rng.uniform(0.0, 360.0, n) if circular else rng.uniform(5.0, 10.0, n)
-        offset = rng.uniform(-2.0, 2.0, n)
+    def _sar_datatree(scene_name="sceneA", y=3, x=3,
+                       lon_range=(-10.0, -8.0), lat_range=(50.0, 52.0)):
+        import pandas as pd
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        lon2d, lat2d = np.meshgrid(np.linspace(*lon_range, x), np.linspace(*lat_range, y))
+        sar_ds = xr.Dataset(
+            {"owiWindSpeed": (("y", "x"), np.full((y, x), 7.0))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T12:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({f"sar/{scene_name}": sar_ds})
+        return datatree, lon2d, lat2d
+
+    @staticmethod
+    def _coll_ds(sar_lon, sar_lat, sar_vals, val_vals, val_source="ascat_ssm",
+                 collocation_type="layer_vs_layer", scene_name="sceneA",
+                 sar_col="sar_owiWindSpeed", val_col="val_WSPD"):
+        n = len(sar_lon)
         return xr.Dataset({
-            sar_col: ("collocation", (base + offset) % 360.0 if circular else base + offset),
-            val_col: ("collocation", base),
-            "val_source": ("collocation", val_source),
-            "sar_lon": ("collocation", np.linspace(-9.8, -8.2, n)),
-            "sar_lat": ("collocation", np.linspace(50.2, 51.8, n)),
+            sar_col: ("collocation", np.asarray(sar_vals, dtype=float)),
+            val_col: ("collocation", np.asarray(val_vals, dtype=float)),
+            "val_source": ("collocation", [val_source] * n),
+            "collocation_type": ("collocation", [collocation_type] * n),
+            "sar_scene_name": ("collocation", [scene_name] * n),
+            "sar_lon": ("collocation", np.asarray(sar_lon, dtype=float)),
+            "sar_lat": ("collocation", np.asarray(sar_lat, dtype=float)),
         })
 
     def test_missing_columns_returns_empty_dict(self):
         from sar_validation.core.visualization import plot_geographic_difference
 
+        datatree, _, _ = self._sar_datatree()
         ds = xr.Dataset({"sar_owiWindSpeed": ("collocation", [1.0, 2.0])})
-        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
         assert result == {}
 
-    def test_below_threshold_source_skipped(self):
+    def test_point_vs_layer_source_never_qualifies_regardless_of_point_count(self):
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        datatree, _, _ = self._sar_datatree()
+        n = 50
+        ds = self._coll_ds(
+            sar_lon=np.linspace(-9.8, -8.2, n), sar_lat=np.linspace(50.2, 51.8, n),
+            sar_vals=np.linspace(5.0, 10.0, n), val_vals=np.linspace(5.0, 10.0, n) - 3.0,
+            val_source="mooring", collocation_type="point_vs_layer",
+        )
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
+        assert result == {}
+
+    def test_layer_vs_layer_source_with_a_single_point_still_qualifies(self):
         import matplotlib.pyplot as plt
 
         from sar_validation.core.visualization import plot_geographic_difference
 
-        ds = self._coll_ds(n_per_source=9)
-        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD", min_points=10)
-        assert result == {}
+        datatree, lon2d, lat2d = self._sar_datatree()
+        ds = self._coll_ds(
+            sar_lon=[float(lon2d[1, 1])], sar_lat=[float(lat2d[1, 1])],
+            sar_vals=[8.0], val_vals=[6.0],
+        )
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
+        assert set(result.keys()) == {"ascat_ssm"}
         plt.close("all")
 
-    def test_at_threshold_source_included(self):
+    def test_model_vs_layer_source_also_qualifies(self):
         import matplotlib.pyplot as plt
 
         from sar_validation.core.visualization import plot_geographic_difference
 
-        ds = self._coll_ds(n_per_source=10)
-        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD", min_points=10)
-        assert set(result.keys()) == {"mooring"}
+        datatree, lon2d, lat2d = self._sar_datatree()
+        ds = self._coll_ds(
+            sar_lon=[float(lon2d[0, 0])], sar_lat=[float(lat2d[0, 0])],
+            sar_vals=[8.0], val_vals=[6.0], val_source="era5", collocation_type="model_vs_layer",
+        )
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
+        assert set(result.keys()) == {"era5"}
         plt.close("all")
 
-    def test_points_are_not_deduplicated(self):
-        """Unlike plot_geographic's validation-point overlay, every
-        collocation row must produce its own marker at its own
-        sar_lat/sar_lon -- proving the individual collocation method's
-        many-SAR-pixels-per-observation rows are not collapsed."""
+    def test_mixed_source_only_reflects_qualifying_rows(self):
+        """A single val_source mixing point_vs_layer and layer_vs_layer
+        rows must still get a Figure (from its layer_vs_layer rows), and
+        its title's point count must not include the non-qualifying
+        rows."""
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        datatree, lon2d, lat2d = self._sar_datatree()
+        ds_qual = self._coll_ds(
+            sar_lon=[float(lon2d[0, 0]), float(lon2d[0, 1]), float(lon2d[0, 2])],
+            sar_lat=[float(lat2d[0, 0]), float(lat2d[0, 1]), float(lat2d[0, 2])],
+            sar_vals=[8.0, 8.5, 9.0], val_vals=[6.0, 6.0, 6.0],
+            val_source="mixed_source", collocation_type="layer_vs_layer",
+        )
+        ds_nonqual = self._coll_ds(
+            sar_lon=[float(lon2d[2, 2])], sar_lat=[float(lat2d[2, 2])],
+            sar_vals=[100.0], val_vals=[1.0],
+            val_source="mixed_source", collocation_type="point_vs_layer",
+        )
+        ds = xr.concat([ds_qual, ds_nonqual], dim="collocation")
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
+        assert set(result.keys()) == {"mixed_source"}
+        fig = result["mixed_source"]
+        assert any("n=3" in ax.get_title() for ax in fig.axes)
+        plt.close("all")
+
+    def test_pcolormesh_fills_matched_cell_and_masks_the_rest(self):
         import matplotlib.collections as mcollections
         import matplotlib.pyplot as plt
 
         from sar_validation.core.visualization import plot_geographic_difference
 
-        ds = self._coll_ds(n_per_source=15)
-        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD", min_points=10)
-        fig = result["mooring"]
+        datatree, lon2d, lat2d = self._sar_datatree(y=3, x=3)
+        ds = self._coll_ds(
+            sar_lon=[float(lon2d[1, 1])], sar_lat=[float(lat2d[1, 1])],
+            sar_vals=[9.0], val_vals=[6.0],
+        )
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
+        fig = result["ascat_ssm"]
+        mesh = next(
+            c for ax in fig.axes for c in ax.collections
+            if isinstance(c, mcollections.QuadMesh)
+        )
+        arr = np.ma.filled(mesh.get_array(), np.nan).reshape(3, 3)
+        assert np.isclose(arr[1, 1], 3.0)
+        assert np.isnan(arr).sum() == 8
+        plt.close("all")
+
+    def test_two_observations_snapping_to_the_same_cell_are_averaged(self):
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        datatree, lon2d, lat2d = self._sar_datatree(y=3, x=3)
+        cell_lon, cell_lat = float(lon2d[0, 0]), float(lat2d[0, 0])
+        tiny = 1e-6
+        ds = self._coll_ds(
+            sar_lon=[cell_lon, cell_lon + tiny], sar_lat=[cell_lat, cell_lat + tiny],
+            sar_vals=[8.0, 10.0], val_vals=[6.0, 6.0],
+        )
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
+        fig = result["ascat_ssm"]
+        mesh = next(
+            c for ax in fig.axes for c in ax.collections
+            if isinstance(c, mcollections.QuadMesh)
+        )
+        arr = np.ma.filled(mesh.get_array(), np.nan).reshape(3, 3)
+        # diffs are 8-6=2 and 10-6=4; both snap to cell (0, 0) and average to 3.0.
+        assert np.isclose(arr[0, 0], 3.0)
+        plt.close("all")
+
+    def test_1d_scene_falls_back_to_scatter_sharing_the_mesh_color_scale(self):
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+        import pandas as pd
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        n = 4
+        wv_ds = xr.Dataset(
+            {"owiWindSpeed": ("point", np.full(n, 7.0))},
+            coords={"lon": ("point", np.linspace(-9.5, -8.5, n)),
+                    "lat": ("point", np.linspace(50.5, 51.5, n)),
+                    "time": pd.Timestamp("2026-07-10T12:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneWV": wv_ds})
+        ds = self._coll_ds(
+            sar_lon=np.linspace(-9.5, -8.5, n), sar_lat=np.linspace(50.5, 51.5, n),
+            sar_vals=np.full(n, 9.0), val_vals=np.full(n, 6.0), scene_name="sceneWV",
+        )
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
+        fig = result["ascat_ssm"]
         scatter = next(
             c for ax in fig.axes for c in ax.collections
-            if isinstance(c, mcollections.PathCollection) and len(c.get_offsets()) > 1
+            if isinstance(c, mcollections.PathCollection)
         )
-        assert len(scatter.get_offsets()) == 15
+        assert len(scatter.get_offsets()) == n
+        assert np.allclose(scatter.get_array(), 3.0)
         plt.close("all")
 
     def test_circular_variable_uses_wrapped_diff(self):
@@ -3180,17 +3298,21 @@ class TestPlotGeographicDifference:
 
         from sar_validation.core.visualization import plot_geographic_difference
 
-        ds = self._coll_ds(n_per_source=10, circular=True)
-        ds["sar_owiWindDirection"] = ("collocation", np.full(10, 5.0))
-        ds["val_WDIR"] = ("collocation", np.full(10, 355.0))
-        result = plot_geographic_difference(ds, "owiWindDirection", "WDIR", min_points=10)
-        fig = result["mooring"]
-        scatter = next(
-            c for ax in fig.axes for c in ax.collections
-            if isinstance(c, mcollections.PathCollection) and len(c.get_offsets()) > 1
+        datatree, lon2d, lat2d = self._sar_datatree()
+        ds = self._coll_ds(
+            sar_lon=[float(lon2d[1, 1])], sar_lat=[float(lat2d[1, 1])],
+            sar_vals=[5.0], val_vals=[355.0],
+            sar_col="sar_owiWindDirection", val_col="val_WDIR",
         )
+        result = plot_geographic_difference(datatree, ds, "owiWindDirection", "WDIR")
+        fig = result["ascat_ssm"]
+        mesh = next(
+            c for ax in fig.axes for c in ax.collections
+            if isinstance(c, mcollections.QuadMesh)
+        )
+        arr = np.ma.filled(mesh.get_array(), np.nan).reshape(3, 3)
         # 5 - 355 wrapped to (-180, 180] is +10, not -350.
-        assert np.allclose(scatter.get_array(), 10.0)
+        assert np.isclose(arr[1, 1], 10.0)
         plt.close("all")
 
     def test_color_scale_symmetric_around_zero(self):
@@ -3199,14 +3321,17 @@ class TestPlotGeographicDifference:
 
         from sar_validation.core.visualization import plot_geographic_difference
 
-        ds = self._coll_ds(n_per_source=10)
-        ds["sar_owiWindSpeed"] = ("collocation", ds["val_WSPD"].values + 3.0)
-        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD", min_points=10)
-        scatter = next(
-            c for ax in result["mooring"].axes for c in ax.collections
-            if isinstance(c, mcollections.PathCollection) and len(c.get_offsets()) > 1
+        datatree, lon2d, lat2d = self._sar_datatree()
+        ds = self._coll_ds(
+            sar_lon=[float(lon2d[0, 0])], sar_lat=[float(lat2d[0, 0])],
+            sar_vals=[9.0], val_vals=[6.0],
         )
-        assert scatter.norm.vmin == -scatter.norm.vmax
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
+        mesh = next(
+            c for ax in result["ascat_ssm"].axes for c in ax.collections
+            if isinstance(c, mcollections.QuadMesh)
+        )
+        assert mesh.norm.vmin == -mesh.norm.vmax
         plt.close("all")
 
     def test_degenerate_all_zero_diff_does_not_crash(self):
@@ -3214,10 +3339,13 @@ class TestPlotGeographicDifference:
 
         from sar_validation.core.visualization import plot_geographic_difference
 
-        ds = self._coll_ds(n_per_source=10)
-        ds["sar_owiWindSpeed"] = ds["val_WSPD"]
-        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD", min_points=10)
-        assert "mooring" in result
+        datatree, lon2d, lat2d = self._sar_datatree()
+        ds = self._coll_ds(
+            sar_lon=[float(lon2d[0, 0])], sar_lat=[float(lat2d[0, 0])],
+            sar_vals=[6.0], val_vals=[6.0],
+        )
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
+        assert "ascat_ssm" in result
         plt.close("all")
 
     def test_on_figure_streams_and_dict_stays_empty(self):
@@ -3225,7 +3353,11 @@ class TestPlotGeographicDifference:
 
         from sar_validation.core.visualization import plot_geographic_difference
 
-        ds = self._coll_ds(n_per_source=10)
+        datatree, lon2d, lat2d = self._sar_datatree()
+        ds = self._coll_ds(
+            sar_lon=[float(lon2d[0, 0])], sar_lat=[float(lat2d[0, 0])],
+            sar_vals=[9.0], val_vals=[6.0],
+        )
         handed_off = []
 
         def on_figure(val_source, fig):
@@ -3233,9 +3365,9 @@ class TestPlotGeographicDifference:
             plt.close(fig)
 
         result = plot_geographic_difference(
-            ds, "owiWindSpeed", "WSPD", min_points=10, on_figure=on_figure,
+            datatree, ds, "owiWindSpeed", "WSPD", on_figure=on_figure,
         )
-        assert handed_off == ["mooring"]
+        assert handed_off == ["ascat_ssm"]
         assert result == {}
 
     def test_two_sources_each_get_their_own_figure(self):
@@ -3243,27 +3375,45 @@ class TestPlotGeographicDifference:
 
         from sar_validation.core.visualization import plot_geographic_difference
 
-        ds = self._coll_ds(n_per_source=10, sources=("mooring", "altimeter"))
-        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD", min_points=10)
-        assert set(result.keys()) == {"mooring", "altimeter"}
-        assert result["mooring"] is not result["altimeter"]
+        datatree, lon2d, lat2d = self._sar_datatree()
+        ds1 = self._coll_ds(
+            sar_lon=[float(lon2d[0, 0])], sar_lat=[float(lat2d[0, 0])],
+            sar_vals=[8.0], val_vals=[6.0], val_source="ascat_ssm",
+        )
+        ds2 = self._coll_ds(
+            sar_lon=[float(lon2d[2, 2])], sar_lat=[float(lat2d[2, 2])],
+            sar_vals=[9.0], val_vals=[6.0], val_source="era5", collocation_type="model_vs_layer",
+        )
+        ds = xr.concat([ds1, ds2], dim="collocation")
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
+        assert set(result.keys()) == {"ascat_ssm", "era5"}
+        assert result["ascat_ssm"] is not result["era5"]
         plt.close("all")
 
     def test_dateline_crossing_source_does_not_crash(self):
         import matplotlib.pyplot as plt
+        import pandas as pd
 
+        from sar_validation.core.datatree_converter import DataTreeConverter
         from sar_validation.core.visualization import plot_geographic_difference
 
-        ds = self._coll_ds(n_per_source=10)
-        n = ds.sizes["collocation"]
-        crossing_lon = np.concatenate([
-            np.linspace(178.0, 180.0, n // 2), np.linspace(-180.0, -178.0, n - n // 2),
-        ])
-        ds["sar_lon"] = ("collocation", crossing_lon)
-        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD", min_points=10)
-        assert "mooring" in result
+        lon_vals = np.array([178.0, 179.0, -179.0])
+        lat_vals = np.linspace(50.0, 51.0, 3)
+        lon2d, lat2d = np.meshgrid(lon_vals, lat_vals)
+        sar_ds = xr.Dataset(
+            {"owiWindSpeed": (("y", "x"), np.full((3, 3), 7.0))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T12:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+        ds = self._coll_ds(
+            sar_lon=[float(lon2d[1, 0]), float(lon2d[1, 2])],
+            sar_lat=[float(lat2d[1, 0]), float(lat2d[1, 2])],
+            sar_vals=[8.0, 9.0], val_vals=[6.0, 6.0],
+        )
+        result = plot_geographic_difference(datatree, ds, "owiWindSpeed", "WSPD")
+        assert "ascat_ssm" in result
         plt.close("all")
-
 
 class TestExtractValidationDataForPlotSkipsGriddedNodes:
     """_extract_validation_data_for_plot's process_node assumes every
