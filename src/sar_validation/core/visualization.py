@@ -1704,6 +1704,7 @@ def plot_geographic_difference(
 
     import matplotlib.colors as mcolors  # noqa: PLC0415
     import matplotlib.pyplot as plt  # noqa: PLC0415
+    import matplotlib.tri as mtri  # noqa: PLC0415
 
     try:
         import cartopy.crs as ccrs  # noqa: PLC0415
@@ -1747,8 +1748,14 @@ def plot_geographic_difference(
             projection = ccrs.PlateCarree(central_longitude=180.0 if crosses_dateline else 0.0)
             ax = fig.add_subplot(1, 1, 1, projection=projection)
             land, coastline = _land_coastline_features()
-            ax.add_feature(land, facecolor="lightgray", zorder=0, rasterized=True)
-            ax.add_feature(coastline, linewidth=0.5, zorder=0, rasterized=True)
+            # Drawn above the mesh (zorder=3 below) rather than this
+            # module's usual zorder=0 for land: a single triangulation
+            # covering every one of a source's collocated points can
+            # produce a triangle spanning real land between two separate
+            # SAR passes, and land must stay visibly opaque over any such
+            # triangle rather than being painted over.
+            ax.add_feature(land, facecolor="lightgray", zorder=4, rasterized=True)
+            ax.add_feature(coastline, linewidth=0.5, zorder=4, rasterized=True)
             gl = ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
             transform = ccrs.PlateCarree()
         else:
@@ -1771,12 +1778,28 @@ def plot_geographic_difference(
         mappable = None
         if len(lon) >= 3:
             try:
+                triangulation = mtri.Triangulation(lon_tri, lat)
+            except (RuntimeError, ValueError):
+                triangulation = None
+            if triangulation is not None:
+                points = np.column_stack([lon_tri, lat])
+                corners = triangulation.triangles
+                edge_ab = np.linalg.norm(points[corners[:, 0]] - points[corners[:, 1]], axis=1)
+                edge_bc = np.linalg.norm(points[corners[:, 1]] - points[corners[:, 2]], axis=1)
+                edge_ca = np.linalg.norm(points[corners[:, 2]] - points[corners[:, 0]], axis=1)
+                max_edge = np.maximum(np.maximum(edge_ab, edge_bc), edge_ca)
+                # A single triangulation of every one of a source's
+                # collocated points connects widely separated SAR passes
+                # with long, thin triangles that fabricate a smooth
+                # gradient across a gap with no real data behind it.
+                # Hiding triangles whose longest edge is far above the
+                # typical (median) edge length removes those spurious
+                # bridges while keeping each genuinely covered area intact.
+                triangulation.set_mask(max_edge > 5.0 * np.median(max_edge))
                 mappable = ax.tripcolor(
-                    lon_tri, lat, diff, shading="gouraud", cmap=cmap, norm=norm,
+                    triangulation, diff, shading="gouraud", cmap=cmap, norm=norm,
                     zorder=3, rasterized=True,
                 )
-            except (RuntimeError, ValueError):
-                mappable = None
         if mappable is None:
             mappable = ax.scatter(
                 lon, lat, c=diff, cmap=cmap, norm=norm, s=40,

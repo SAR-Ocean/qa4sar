@@ -3347,6 +3347,55 @@ class TestPlotGeographicDifference:
         )
         plt.close("all")
 
+    def test_spurious_long_range_triangles_are_masked(self):
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[0.0, 0.1, 0.05, 0.15, 0.02, 10.0, 10.1, 10.05, 10.15, 10.02],
+            sar_lat=[50.0, 50.1, 50.05, 50.02, 50.12, 50.0, 50.1, 50.05, 50.02, 50.12],
+            sar_vals=[8.0, 8.5, 9.0, 7.5, 8.2, 6.5, 7.0, 6.8, 7.2, 6.9],
+            val_vals=[6.0] * 10,
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        fig = result["ascat_ssm"]
+        mesh = next(
+            c for c in fig.axes[0].collections
+            if isinstance(c, mcollections.TriMesh)
+        )
+        mask = mesh._triangulation.mask
+        assert mask is not None and mask.any(), (
+            "expected at least one long bridging triangle between the two "
+            "far-apart point clusters to be masked out"
+        )
+        assert not mask.all(), (
+            "expected the two clusters' own local triangles to remain visible"
+        )
+        plt.close("all")
+
+    def test_land_features_draw_above_the_mesh(self):
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+        from cartopy.mpl.feature_artist import FeatureArtist
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        ax = result["ascat_ssm"].axes[0]
+        mesh = next(c for c in ax.collections if isinstance(c, mcollections.TriMesh))
+        land_features = [c for c in ax.collections if isinstance(c, FeatureArtist)]
+        assert land_features, "expected land/coastline feature artists on the axes"
+        assert all(f.zorder > mesh.zorder for f in land_features), (
+            "expected land/coastline to draw above the mesh so it cannot be painted over"
+        )
+        plt.close("all")
+
 
 class TestExtractValidationDataForPlotSkipsGriddedNodes:
     """_extract_validation_data_for_plot's process_node assumes every
