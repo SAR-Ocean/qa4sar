@@ -5278,7 +5278,7 @@ class TestValidationReportGeographicColorbarsAndDifferencePlot:
     validation source right after the geographic page(s)."""
 
     @staticmethod
-    def _multi_scene_wind_fixture(n_scenes, n_per_scene=1):
+    def _multi_scene_wind_fixture(n_scenes, n_per_scene=1, include_layer_vs_layer_source=False):
         import pandas as pd
 
         from sar_validation.core.datatree_converter import DataTreeConverter
@@ -5302,18 +5302,45 @@ class TestValidationReportGeographicColorbarsAndDifferencePlot:
                     "time": ("point", pd.date_range("2026-07-10T12:00", periods=n, freq="5min"))},
             attrs={"platform_type": "mooring"},
         )
-        datatree = DataTreeConverter.to_datatree({**sar_nodes, "validation/mooring": mooring_ds})
+        validation_nodes = {"validation/mooring": mooring_ds}
         scene_names = [f"scene{i}" for i in range(n_scenes) for _ in range(n_per_scene)]
+
+        sar_col_vals = list(np.linspace(6.0, 9.0, n))
+        val_col_vals = list(np.linspace(6.0, 9.0, n))
+        sources = ["mooring"] * n
+        ctypes = ["point_vs_layer"] * n
+        scene_col = list(scene_names)
+        lon_col = list(np.linspace(-9.8, -9.0, n))
+        lat_col = list(np.linspace(50.2, 50.8, n))
+
+        if include_layer_vs_layer_source:
+            scatterometer_ds = xr.Dataset(
+                {"WSPD": ("point", np.array([7.0, 8.0]))},
+                coords={"lon": ("point", np.array([-9.6, -9.3])),
+                        "lat": ("point", np.array([50.3, 50.6])),
+                        "time": ("point", pd.to_datetime(["2026-07-10T12:00", "2026-07-10T12:05"]))},
+                attrs={"platform_type": "scatterometer"},
+            )
+            validation_nodes["validation/scatterometer"] = scatterometer_ds
+            sar_col_vals += [10.0, 11.0]
+            val_col_vals += [7.0, 8.0]
+            sources += ["scatterometer", "scatterometer"]
+            ctypes += ["layer_vs_layer", "layer_vs_layer"]
+            scene_col += ["scene0", "scene0"]
+            lon_col += [-9.6, -9.3]
+            lat_col += [50.3, 50.6]
+
+        datatree = DataTreeConverter.to_datatree({**sar_nodes, **validation_nodes})
         collocation_ds = xr.Dataset({
-            "sar_owiWindSpeed":  ("collocation", np.linspace(6.0, 9.0, n)),
-            "val_WSPD":          ("collocation", np.linspace(6.0, 9.0, n)),
-            "val_source":        ("collocation", ["mooring"] * n),
-            "collocation_type":  ("collocation", ["point_vs_layer"] * n),
-            "sar_scene_name":    ("collocation", scene_names),
-            "val_lon":           ("collocation", np.linspace(-9.8, -9.0, n)),
-            "val_lat":           ("collocation", np.linspace(50.2, 50.8, n)),
-            "sar_lon":           ("collocation", np.linspace(-9.8, -9.0, n)),
-            "sar_lat":           ("collocation", np.linspace(50.2, 50.8, n)),
+            "sar_owiWindSpeed":  ("collocation", np.asarray(sar_col_vals)),
+            "val_WSPD":          ("collocation", np.asarray(val_col_vals)),
+            "val_source":        ("collocation", sources),
+            "collocation_type":  ("collocation", ctypes),
+            "sar_scene_name":    ("collocation", scene_col),
+            "val_lon":           ("collocation", np.asarray(lon_col)),
+            "val_lat":           ("collocation", np.asarray(lat_col)),
+            "sar_lon":           ("collocation", np.asarray(lon_col)),
+            "sar_lat":           ("collocation", np.asarray(lat_col)),
         })
         return datatree, collocation_ds
 
@@ -5347,7 +5374,9 @@ class TestValidationReportGeographicColorbarsAndDifferencePlot:
         from sar_validation.core.recipe import Recipe, RecipeConfig
         from sar_validation.core.visualization import validation_report
 
-        datatree, collocation_ds = self._multi_scene_wind_fixture(1, n_per_scene=12)
+        datatree, collocation_ds = self._multi_scene_wind_fixture(
+            1, n_per_scene=12, include_layer_vs_layer_source=True,
+        )
         recipe = Recipe(config=RecipeConfig(name="wind_test", variable="wind"))
         result = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
 
@@ -5374,93 +5403,114 @@ class TestValidationReportGeographicColorbarsAndDifferencePlot:
                 "expected the difference page(s) to come before scatter/residuals"
             )
 
-    def test_difference_page_skipped_below_threshold(self, tmp_path):
+    def test_point_vs_layer_source_never_produces_a_difference_page(self, tmp_path):
         from sar_validation.core.recipe import Recipe, RecipeConfig
         from sar_validation.core.visualization import validation_report
 
-        datatree, collocation_ds = self._multi_scene_wind_fixture(1, n_per_scene=5)
+        datatree, collocation_ds = self._multi_scene_wind_fixture(1, n_per_scene=15)
         recipe = Recipe(config=RecipeConfig(name="wind_test", variable="wind"))
         result = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
 
         figs = result["owiWindSpeed_vs_WSPD"]
         assert not any(
             "difference (n=" in ax.get_title() for fig in figs for ax in fig.axes
-        ), "no validation source has >= 10 points, so no difference page should appear"
+        ), "mooring is point_vs_layer, so no difference page should appear regardless of point count"
 
 
 class TestValidationReportSoilMoistureDifferenceUsesRescaledSar:
-    """Regression test: the main CDF-matched section's difference page
-    for soil_moisture recipes must plot SAR-minus-validation differences
-    computed from the same rescaled SAR series the scatter/residuals
-    pages already use, not raw SAR values still expressed in the SAR
-    retrieval's own percent-based domain."""
+    """The main CDF-matched section's difference page for soil_moisture
+    recipes plots SAR-minus-validation differences computed from the same
+    rescaled SAR series the scatter/residuals pages already use, not raw
+    SAR values still expressed in the SAR retrieval's own percent-based
+    domain."""
 
     @staticmethod
-    def _fixture(n=20):
+    def _fixture():
         from sar_validation.core.datatree_converter import DataTreeConverter
 
         y, x = 4, 5
+        n = y * x
         lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
         sar_ds = xr.Dataset(
-            {"sarSSM": (("y", "x"), np.linspace(10.0, 90.0, y * x).reshape(y, x), {"units": "%"})},
+            {"sarSSM": (("y", "x"), np.linspace(10.0, 90.0, n).reshape(y, x), {"units": "%"})},
             coords={
                 "lon": (("y", "x"), lon2d),
                 "lat": (("y", "x"), lat2d),
                 "time": pd.Timestamp("2026-07-10T19:00:00"),
             },
         )
-
-        lons = np.linspace(-9.9, -8.1, n)
-        lats = np.linspace(50.1, 51.9, n)
-        ismn_ds = xr.Dataset(
+        ascat_lons = lon2d.ravel()
+        ascat_lats = lat2d.ravel()
+        ascat_ds = xr.Dataset(
             {"SOIL_MOISTURE": ("point", np.linspace(0.05, 0.45, n))},
             coords={
-                "lon": ("point", lons), "lat": ("point", lats),
+                "lon": ("point", ascat_lons), "lat": ("point", ascat_lats),
                 "time": ("point", pd.date_range("2026-07-10T19:05", periods=n, freq="1min")),
+            },
+            attrs={"platform_type": "ascat_ssm"},
+        )
+
+        # A small in-situ reference source is required alongside ascat_ssm:
+        # converting a percent-domain source into the validation domain
+        # needs a volumetric reference to fit the CDF-matching transform
+        # against, and with none present ascat_ssm would be dropped from
+        # the CDF-matched section entirely rather than rescaled.
+        ismn_lons = np.array([-9.9, -9.7, -9.5, -9.3])
+        ismn_lats = np.array([50.1, 50.3, 50.5, 50.7])
+        ismn_vals = np.array([0.10, 0.15, 0.20, 0.25])
+        ismn_sar_vals = np.array([12.0, 18.0, 22.0, 28.0])
+        n_ismn = len(ismn_vals)
+        ismn_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", ismn_vals)},
+            coords={
+                "lon": ("point", ismn_lons), "lat": ("point", ismn_lats),
+                "time": ("point", pd.date_range("2026-07-10T19:10", periods=n_ismn, freq="1min")),
             },
             attrs={"platform_type": "ismn"},
         )
-        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds, "validation/ismn": ismn_ds})
 
-        # SAR's raw retrieval ("%", roughly 10-90) and ISMN's volumetric
-        # domain (roughly 0.05-0.45) share the same rank order but differ
-        # by two orders of magnitude -- a domain-mismatch bug produces an
-        # obviously wrong, uniformly-positive raw difference at every
-        # point, unlike the small, near-zero difference the rescaled
-        # series gives.
+        datatree = DataTreeConverter.to_datatree(
+            {"sar/sceneA": sar_ds, "validation/ascat_ssm": ascat_ds, "validation/ismn": ismn_ds},
+        )
+
+        # SAR's raw retrieval ("%", roughly 10-90) and the validation
+        # source's volumetric domain (roughly 0.05-0.45) share the same
+        # rank order but differ by two orders of magnitude, so an
+        # unrescaled difference is uniformly positive and about two
+        # orders of magnitude larger than a correctly rescaled one.
         sar_vals = np.linspace(10.0, 90.0, n)
         val_vals = np.linspace(0.05, 0.45, n)
         collocation_ds = xr.Dataset({
-            "sar_sarSSM":        xr.DataArray(sar_vals, dims="collocation", attrs={"units": "%"}),
-            "val_SOIL_MOISTURE": xr.DataArray(val_vals, dims="collocation", attrs={"units": "m3 m-3"}),
-            "val_source":        ("collocation", ["ismn"] * n),
-            "collocation_type":  ("collocation", ["point_vs_layer"] * n),
-            "sar_scene_name":    ("collocation", ["sceneA"] * n),
-            "sar_lon":           ("collocation", lons),
-            "sar_lat":           ("collocation", lats),
-            "val_lon":           ("collocation", lons),
-            "val_lat":           ("collocation", lats),
+            "sar_sarSSM": xr.DataArray(
+                np.concatenate([sar_vals, ismn_sar_vals]), dims="collocation", attrs={"units": "%"},
+            ),
+            "val_SOIL_MOISTURE": xr.DataArray(
+                np.concatenate([val_vals, ismn_vals]), dims="collocation", attrs={"units": "m3 m-3"},
+            ),
+            "val_source":        ("collocation", ["ascat_ssm"] * n + ["ismn"] * n_ismn),
+            "collocation_type":  ("collocation", ["layer_vs_layer"] * n + ["point_vs_layer"] * n_ismn),
+            "sar_scene_name":    ("collocation", ["sceneA"] * (n + n_ismn)),
+            "sar_lon":           ("collocation", np.concatenate([ascat_lons, ismn_lons])),
+            "sar_lat":           ("collocation", np.concatenate([ascat_lats, ismn_lats])),
+            "val_lon":           ("collocation", np.concatenate([ascat_lons, ismn_lons])),
+            "val_lat":           ("collocation", np.concatenate([ascat_lats, ismn_lats])),
         })
         collocation_ds = collocation_ds.assign_coords(
-            val_time=("collocation", pd.date_range("2026-07-10T19:05", periods=n, freq="1min")),
+            val_time=("collocation", pd.date_range("2026-07-10T19:05", periods=n + n_ismn, freq="1min")),
         )
-        return datatree, collocation_ds
+        return datatree, collocation_ds, y, x
 
     @staticmethod
-    def _difference_figure(figs):
+    def _difference_mesh(figs):
+        import matplotlib.collections as mcollections
+
         for fig in figs:
-            if any("difference (n=" in ax.get_title() for ax in fig.axes):
-                return fig
-        return None
-
-    @staticmethod
-    def _difference_scatter(fig):
-        from matplotlib.collections import PathCollection
-
-        for ax in fig.axes:
-            for coll in ax.collections:
-                if isinstance(coll, PathCollection) and coll.get_array() is not None:
-                    return coll
+            if not any("difference (n=" in ax.get_title() for ax in fig.axes):
+                continue
+            for ax in fig.axes:
+                for coll in ax.collections:
+                    if isinstance(coll, mcollections.QuadMesh):
+                        return coll
         return None
 
     def test_difference_values_come_from_rescaled_sar_not_raw(self):
@@ -5470,7 +5520,7 @@ class TestValidationReportSoilMoistureDifferenceUsesRescaledSar:
         from sar_validation.core.statistics import add_rescaled_sar_column
         from sar_validation.core.visualization import validation_report
 
-        datatree, collocation_ds = self._fixture()
+        datatree, collocation_ds, y, x = self._fixture()
         recipe = Recipe(config=RecipeConfig(name="test_sm_diff", variable="soil_moisture"))
 
         with warnings.catch_warnings():
@@ -5479,30 +5529,25 @@ class TestValidationReportSoilMoistureDifferenceUsesRescaledSar:
             expected_ds = add_rescaled_sar_column(collocation_ds, "sarSSM", "SOIL_MOISTURE")
 
         figs = result["sarSSM_vs_SOIL_MOISTURE"]
-        diff_fig = self._difference_figure(figs)
-        assert diff_fig is not None, "expected a difference page for the ismn source"
+        mesh = self._difference_mesh(figs)
+        assert mesh is not None, "expected a difference page with a mesh for the ascat_ssm source"
 
-        sc = self._difference_scatter(diff_fig)
-        assert sc is not None, "expected a colored scatter collection on the difference page"
+        # The difference page only ever covers ascat_ssm (the sole
+        # layer_vs_layer source); ismn's rows are point_vs_layer and never
+        # reach it, so they are excluded here to line up with the mesh.
+        ascat_mask = (expected_ds["val_source"].values == "ascat_ssm")
+        actual = np.ma.filled(mesh.get_array(), np.nan).reshape(y, x)
+        expected = (
+            expected_ds["sar_sarSSM"].values[ascat_mask]
+            - expected_ds["val_SOIL_MOISTURE"].values[ascat_mask]
+        ).reshape(y, x)
+        np.testing.assert_allclose(actual, expected, atol=1e-6)
 
-        actual_lat = np.asarray(sc.get_offsets())[:, 1]
-        actual_diff = np.asarray(sc.get_array())
-        order = np.argsort(actual_lat)
-        actual_diff = actual_diff[order]
-
-        expected_diff = (
-            expected_ds["sar_sarSSM"].values - expected_ds["val_SOIL_MOISTURE"].values
-        )
-        expected_order = np.argsort(collocation_ds["sar_lat"].values)
-        expected_diff = expected_diff[expected_order]
-
-        np.testing.assert_allclose(actual_diff, expected_diff, atol=1e-6)
-
-        # The raw (pre-rescale) difference is uniformly positive and about
-        # two orders of magnitude larger -- the exact symptom of feeding
-        # the difference plot the wrong (pre-rescale) dataset.
-        raw_diff = collocation_ds["sar_sarSSM"].values - collocation_ds["val_SOIL_MOISTURE"].values
-        assert not np.allclose(actual_diff, raw_diff[expected_order], atol=1.0), (
+        raw_diff = (
+            collocation_ds["sar_sarSSM"].values[ascat_mask]
+            - collocation_ds["val_SOIL_MOISTURE"].values[ascat_mask]
+        ).reshape(y, x)
+        assert not np.allclose(actual, raw_diff, atol=1.0), (
             "difference plot appears to be using raw, non-rescaled SAR values"
         )
 
