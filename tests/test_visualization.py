@@ -3323,7 +3323,8 @@ class TestPlotGeographicDifference:
         assert result["ascat_ssm"] is not result["era5"]
         plt.close("all")
 
-    def test_dateline_crossing_source_does_not_crash(self):
+    def test_dateline_crossing_source_renders_a_local_mesh_not_a_global_smear(self):
+        import matplotlib.collections as mcollections
         import matplotlib.pyplot as plt
 
         from sar_validation.core.visualization import plot_geographic_difference
@@ -3333,9 +3334,18 @@ class TestPlotGeographicDifference:
             sar_vals=[8.0, 9.0, 8.5], val_vals=[6.0, 6.0, 6.0],
         )
         result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
-        assert "ascat_ssm" in result
+        fig = result["ascat_ssm"]
+        mesh = next(
+            c for c in fig.axes[0].collections
+            if isinstance(c, mcollections.TriMesh)
+        )
+        x = mesh._triangulation.x
+        assert x.max() - x.min() < 10.0, (
+            "expected the mesh's own coordinates to span only a few "
+            "degrees on a continuous branch, not the roughly 358 degrees "
+            "a raw triangulation of 178/179/-179 would span"
+        )
         plt.close("all")
-
 
 
 class TestExtractValidationDataForPlotSkipsGriddedNodes:

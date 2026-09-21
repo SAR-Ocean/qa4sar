@@ -1756,12 +1756,24 @@ def plot_geographic_difference(
             transform = None
         kw = {"transform": transform} if transform is not None else {}
 
+        # cartopy reprojects pcolormesh and scatter through their transform
+        # argument, but does not do the same for tripcolor, so a source
+        # whose points straddle the antimeridian would otherwise be
+        # triangulated in raw longitude space, drawing each connecting
+        # triangle the long way around the globe instead of the short way.
+        # Shifting onto the same continuous longitude branch
+        # _pad_lonlat_extent already uses for this axes' own
+        # central_longitude=180 frame, and letting tripcolor treat that
+        # shifted value as a literal axes-space coordinate (no transform
+        # argument), places every point correctly without it.
+        lon_tri = ((lon % 360.0) - 180.0) if crosses_dateline else lon
+
         mappable = None
         if len(lon) >= 3:
             try:
                 mappable = ax.tripcolor(
-                    lon, lat, diff, shading="gouraud", cmap=cmap, norm=norm,
-                    zorder=3, rasterized=True, **kw,
+                    lon_tri, lat, diff, shading="gouraud", cmap=cmap, norm=norm,
+                    zorder=3, rasterized=True,
                 )
             except (RuntimeError, ValueError):
                 mappable = None
