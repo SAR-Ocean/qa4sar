@@ -3375,7 +3375,11 @@ class TestPlotGeographicDifference:
         )
         plt.close("all")
 
-    def test_land_features_draw_above_the_mesh(self):
+    def test_land_based_collocations_remain_visible(self):
+        """A source's mesh must not be hidden by land: collocations for a
+        land-based quantity (for example soil moisture) sit on land by
+        definition, so land cannot draw above the data or every such
+        difference page would render as a blank land-colored rectangle."""
         import matplotlib.collections as mcollections
         import matplotlib.pyplot as plt
         from cartopy.mpl.feature_artist import FeatureArtist
@@ -3391,8 +3395,8 @@ class TestPlotGeographicDifference:
         mesh = next(c for c in ax.collections if isinstance(c, mcollections.TriMesh))
         land_features = [c for c in ax.collections if isinstance(c, FeatureArtist)]
         assert land_features, "expected land/coastline feature artists on the axes"
-        assert all(f.zorder > mesh.zorder for f in land_features), (
-            "expected land/coastline to draw above the mesh so it cannot be painted over"
+        assert all(mesh.zorder >= f.zorder for f in land_features), (
+            "expected the mesh to draw at or above land so land-based collocations stay visible"
         )
         plt.close("all")
 

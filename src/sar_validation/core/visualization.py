@@ -1748,14 +1748,8 @@ def plot_geographic_difference(
             projection = ccrs.PlateCarree(central_longitude=180.0 if crosses_dateline else 0.0)
             ax = fig.add_subplot(1, 1, 1, projection=projection)
             land, coastline = _land_coastline_features()
-            # Drawn above the mesh (zorder=3 below) rather than this
-            # module's usual zorder=0 for land: a single triangulation
-            # covering every one of a source's collocated points can
-            # produce a triangle spanning real land between two separate
-            # SAR passes, and land must stay visibly opaque over any such
-            # triangle rather than being painted over.
-            ax.add_feature(land, facecolor="lightgray", zorder=4, rasterized=True)
-            ax.add_feature(coastline, linewidth=0.5, zorder=4, rasterized=True)
+            ax.add_feature(land, facecolor="lightgray", zorder=0, rasterized=True)
+            ax.add_feature(coastline, linewidth=0.5, zorder=0, rasterized=True)
             gl = ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
             transform = ccrs.PlateCarree()
         else:
@@ -1795,6 +1789,15 @@ def plot_geographic_difference(
                 # Hiding triangles whose longest edge is far above the
                 # typical (median) edge length removes those spurious
                 # bridges while keeping each genuinely covered area intact.
+                # This works well when a source's points form a handful
+                # of locally dense clusters separated by real gaps, the
+                # common case for collocated SAR passes. It is not exact:
+                # if bridging triangles between distant clusters outnumber
+                # a source's own genuinely local triangles, the median
+                # itself reflects bridge length and nothing gets masked;
+                # if a single cluster's own point spacing varies widely,
+                # a few genuinely local triangles can be masked along
+                # with real bridges.
                 triangulation.set_mask(max_edge > 5.0 * np.median(max_edge))
                 mappable = ax.tripcolor(
                     triangulation, diff, shading="gouraud", cmap=cmap, norm=norm,
