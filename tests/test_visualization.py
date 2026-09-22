@@ -3387,7 +3387,7 @@ class TestPlotGeographicDifference:
         from sar_validation.core.visualization import plot_geographic_difference
 
         ds = self._coll_ds(
-            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_lon=[-4.0, -3.7, -3.4], sar_lat=[40.2, 40.5, 40.3],
             sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
         )
         result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
@@ -3395,8 +3395,8 @@ class TestPlotGeographicDifference:
         mesh = next(c for c in ax.collections if isinstance(c, mcollections.TriMesh))
         land_features = [c for c in ax.collections if isinstance(c, FeatureArtist)]
         assert land_features, "expected land/coastline feature artists on the axes"
-        assert all(mesh.zorder >= f.zorder for f in land_features), (
-            "expected the mesh to draw at or above land so land-based collocations stay visible"
+        assert all(mesh.zorder > f.zorder for f in land_features), (
+            "expected the mesh to draw above land so land-based collocations stay visible"
         )
         plt.close("all")
 

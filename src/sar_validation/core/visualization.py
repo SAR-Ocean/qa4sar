@@ -1659,10 +1659,14 @@ def plot_geographic_difference(
 
     The surface is a Delaunay triangulation of the source's own collocated
     points (each row's own sar_lat/sar_lon and its SAR-minus-validation
-    difference), smoothly shaded between vertices. A source with fewer
-    than three points, or whose points are collinear (a degenerate
-    triangulation), falls back to a plain colored scatter instead, so no
-    qualifying source is ever silently skipped.
+    difference), smoothly shaded between vertices. Implausibly long
+    triangles, which would otherwise fabricate a gradient across a gap
+    with no real data behind it, are hidden rather than drawn — a region
+    of a source that is much sparser than that source's densest cluster
+    can therefore render as empty background rather than as a coarse
+    surface. A source with fewer than three points, or whose points are
+    collinear (a degenerate triangulation), falls back to a plain colored
+    scatter instead, so no qualifying source is ever silently skipped.
 
     Some acquisition modes (for example Sentinel-1 wave mode, WV) relabel
     an otherwise dense satellite source such as a scatterometer or
@@ -1795,9 +1799,10 @@ def plot_geographic_difference(
                 # if bridging triangles between distant clusters outnumber
                 # a source's own genuinely local triangles, the median
                 # itself reflects bridge length and nothing gets masked;
-                # if a single cluster's own point spacing varies widely,
-                # a few genuinely local triangles can be masked along
-                # with real bridges.
+                # the median is taken across all of a source's triangles,
+                # so a cluster that is much sparser than the source's
+                # densest cluster can have every one of its own triangles
+                # masked, rendering that region as empty background.
                 triangulation.set_mask(max_edge > 5.0 * np.median(max_edge))
                 mappable = ax.tripcolor(
                     triangulation, diff, shading="gouraud", cmap=cmap, norm=norm,
