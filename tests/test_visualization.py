@@ -3111,12 +3111,16 @@ class TestPlotGeographicDifference:
     def _coll_ds(sar_lon, sar_lat, sar_vals, val_vals, val_source="ascat_ssm",
                  collocation_type="layer_vs_layer",
                  sar_col="sar_owiWindSpeed", val_col="val_WSPD",
-                 aggregation_window_km=12.5):
+                 aggregation_window_km=12.5, sar_pixel_spacing_km=None):
         n = len(sar_lon)
         if aggregation_window_km is None:
             agg = np.full(n, np.nan)
         else:
             agg = np.broadcast_to(np.asarray(aggregation_window_km, dtype=float), (n,)).copy()
+        if sar_pixel_spacing_km is None:
+            px = np.full(n, np.nan)
+        else:
+            px = np.broadcast_to(np.asarray(sar_pixel_spacing_km, dtype=float), (n,)).copy()
         return xr.Dataset({
             sar_col: ("collocation", np.asarray(sar_vals, dtype=float)),
             val_col: ("collocation", np.asarray(val_vals, dtype=float)),
@@ -3125,6 +3129,7 @@ class TestPlotGeographicDifference:
             "sar_lon": ("collocation", np.asarray(sar_lon, dtype=float)),
             "sar_lat": ("collocation", np.asarray(sar_lat, dtype=float)),
             "aggregation_window_km": ("collocation", agg),
+            "sar_pixel_spacing_km": ("collocation", px),
         })
 
     def test_missing_columns_returns_empty_dict(self):
@@ -3251,6 +3256,75 @@ class TestPlotGeographicDifference:
         result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
         ax = result["ascat_ssm"].axes[0]
         assert not any(isinstance(c, mcollections.QuadMesh) for c in ax.collections)
+        assert any(isinstance(c, mcollections.PathCollection) for c in ax.collections)
+        plt.close("all")
+
+    def test_individual_method_source_grids_by_sar_pixel_spacing(self):
+        """A source with no aggregation_window_km but a recorded SAR
+        pixel spacing (an individual-method collocation) grids instead
+        of falling back to scatter."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+            aggregation_window_km=None, sar_pixel_spacing_km=1.0,
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        ax = result["ascat_ssm"].axes[0]
+        assert any(isinstance(c, mcollections.QuadMesh) for c in ax.collections)
+        plt.close("all")
+
+    def test_cell_averaged_source_prefers_aggregation_window_over_pixel_spacing(self):
+        """A source with both a recorded aggregation window and a
+        recorded pixel spacing (should not occur in practice, since a
+        recipe's collocation method is one run-wide setting, but the
+        priority order must still resolve sensibly) grids by the
+        aggregation window, unchanged from before this plan."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        rng = np.random.default_rng(0)
+        n = 60
+        lon = rng.uniform(-1.0, 1.0, n)
+        lat = rng.uniform(50.0, 52.0, n)
+        sar_vals = rng.uniform(5.0, 10.0, n)
+        val_vals = sar_vals - 2.0
+
+        ds = self._coll_ds(
+            lon, lat, sar_vals, val_vals,
+            aggregation_window_km=12.5, sar_pixel_spacing_km=1.0,
+        )
+        fig = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")["ascat_ssm"]
+        mesh = next(c for c in fig.axes[0].collections if isinstance(c, mcollections.QuadMesh))
+        coords = mesh.get_coordinates()
+        dlat_deg = float(np.diff(coords[:, 0, 1]).mean())
+        dlat_km = dlat_deg * 111.32
+        assert dlat_km == pytest.approx(25.0, rel=1e-3)
+        plt.close("all")
+
+    def test_no_pixel_spacing_column_still_falls_back_to_scatter(self):
+        """An older collocation_results.nc saved before this column
+        existed, with no usable aggregation window either, must still
+        render via scatter rather than raising."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+            aggregation_window_km=None,
+        )
+        ds = ds.drop_vars("sar_pixel_spacing_km")
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        ax = result["ascat_ssm"].axes[0]
         assert any(isinstance(c, mcollections.PathCollection) for c in ax.collections)
         plt.close("all")
 

@@ -1658,12 +1658,17 @@ def plot_geographic_difference(
     point count for a qualifying source.
 
     Each source's own collocated points are averaged into square grid
-    cells sized after that source's own SAR aggregation footprint (twice
-    its aggregation_window_km, the footprint's diameter), so a cell does
-    not imply meaningfully more spatial resolution than the underlying
-    collocation already has. The kilometer-to-degree conversion uses the
-    source's mean latitude, so actual cell width in kilometers varies
-    somewhat across a source spanning a wide latitude range. A cell with
+    cells. A source with a recorded SAR aggregation footprint
+    (aggregation_window_km, from a cell-averaging collocation) grids at
+    twice that value, the footprint's diameter, so a cell does not imply
+    meaningfully more spatial resolution than the underlying collocation
+    already has. A source with no aggregation footprint but a recorded
+    SAR native pixel spacing (an individual-method collocation, matching
+    each SAR pixel directly with no spatial averaging) grids at that
+    pixel spacing instead, since each of its points already represents
+    exactly one real SAR pixel. The kilometer-to-degree conversion uses
+    the source's mean latitude, so actual cell width in kilometers
+    varies somewhat across a source spanning a wide latitude range. A cell with
     no collocated points inside it is left blank rather than
     interpolated, so this plot never draws a value between two real
     observations that were never actually measured together. A source
@@ -1733,10 +1738,17 @@ def plot_geographic_difference(
     from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg  # noqa: PLC0415
 
     has_agg_col = "aggregation_window_km" in collocation_ds
-    columns = list(required) + (["aggregation_window_km"] if has_agg_col else [])
+    has_px_col = "sar_pixel_spacing_km" in collocation_ds
+    columns = (
+        list(required)
+        + (["aggregation_window_km"] if has_agg_col else [])
+        + (["sar_pixel_spacing_km"] if has_px_col else [])
+    )
     df = collocation_ds[columns].to_dataframe()
     if not has_agg_col:
         df["aggregation_window_km"] = np.nan
+    if not has_px_col:
+        df["sar_pixel_spacing_km"] = np.nan
     df = df.dropna(subset=[sar_col, val_col, "sar_lat", "sar_lon"])
     if val_var in CIRCULAR_VAL_VARS:
         df["diff"] = circular_diff_deg(df[sar_col].values, df[val_col].values)
@@ -1754,6 +1766,7 @@ def plot_geographic_difference(
         lon = sub["sar_lon"].to_numpy()
         lat = sub["sar_lat"].to_numpy()
         agg_km = sub["aggregation_window_km"].to_numpy()
+        px_km = sub["sar_pixel_spacing_km"].to_numpy()
 
         vmax = float(np.nanpercentile(np.abs(diff), 98))
         if vmax == 0.0:
@@ -1777,7 +1790,13 @@ def plot_geographic_difference(
         kw = {"transform": transform} if transform is not None else {}
 
         valid_windows = agg_km[np.isfinite(agg_km)]
-        cell_km = 2.0 * float(np.median(valid_windows)) if valid_windows.size > 0 else 0.0
+        valid_pixel_spacings = px_km[np.isfinite(px_km)]
+        if valid_windows.size > 0:
+            cell_km = 2.0 * float(np.median(valid_windows))
+        elif valid_pixel_spacings.size > 0:
+            cell_km = float(np.median(valid_pixel_spacings))
+        else:
+            cell_km = 0.0
         mappable = None
         if cell_km > 0:
             mean_lat = float(np.mean(lat))
