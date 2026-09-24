@@ -4651,3 +4651,95 @@ class TestConvertDownloadedDataHycom:
         assert node is not None
         ds = node.to_dataset()
         assert ds.attrs["frequency"] == "reprocessed"
+
+    def test_convert_downloaded_data_dedupes_overlapping_altimeter_windows(self, tmp_path):
+        """Two altimeter downloads of the same dataset for overlapping time
+        windows -- as a rerun with a differently-padded window would
+        produce, without clearing prior downloads -- must merge into one
+        validation node with the shared observation counted once, not
+        collocated twice."""
+        base_dir = tmp_path
+        subdir = base_dir / "altimeter"
+        subdir.mkdir()
+
+        def _write(filename: str, times, lats, lons, vavh):
+            ds = xr.Dataset(
+                {
+                    "VAVH": ("time", np.asarray(vavh, dtype=float),
+                             {"standard_name": "sea_surface_wave_significant_height", "units": "m"}),
+                },
+                coords={
+                    "time": pd.to_datetime(times),
+                    "latitude": ("time", np.asarray(lats, dtype=float)),
+                    "longitude": ("time", np.asarray(lons, dtype=float)),
+                },
+                attrs={"platform": "Jason-3"},
+            )
+            ds.to_netcdf(subdir / filename)
+
+        # File A: 2026-07-01 -> 2026-07-02, points at t1, t2.
+        _write(
+            "cmems_obs-wave_glo_phy-swh_nrt_j3-l3_PT1S_2026-07-01_2026-07-02.nc",
+            ["2026-07-01T10:00:00", "2026-07-01T12:00:00"],
+            [40.0, 41.0], [350.0, 351.0], [1.5, 1.6],
+        )
+        # File B: 2026-07-01 -> 2026-07-03 (overlaps file A), points at t1
+        # (exact duplicate of file A's first point) and t3 (new).
+        _write(
+            "cmems_obs-wave_glo_phy-swh_nrt_j3-l3_PT1S_2026-07-01_2026-07-03.nc",
+            ["2026-07-01T10:00:00", "2026-07-02T10:00:00"],
+            [40.0, 42.0], [350.0, 352.0], [1.5, 1.8],
+        )
+
+        tree = DataTreeConverter.convert_downloaded_data(base_dir)
+
+        assert tree is not None
+        matching_keys = [k for k in tree.groups if k.startswith("/validation/altimeter/")]
+        assert len(matching_keys) == 1, f"expected one merged node, got {matching_keys}"
+        ds = tree[matching_keys[0]].to_dataset()
+        assert ds.sizes["point"] == 3
+        assert sorted(pd.to_datetime(ds["time"].values)) == sorted(pd.to_datetime([
+            "2026-07-01T10:00:00", "2026-07-01T12:00:00", "2026-07-02T10:00:00",
+        ]))
+
+
+class TestDedupeAltimeterPoints:
+    def test_removes_exact_duplicate_time_lat_lon_rows(self):
+        from sar_validation.core.datatree_converter import _dedupe_altimeter_points
+
+        ds_a = xr.Dataset(
+            {"VAVH": ("point", [1.5, 1.6])},
+            coords={
+                "time": ("point", pd.to_datetime(["2026-07-01T10:00:00", "2026-07-01T12:00:00"])),
+                "lat": ("point", [40.0, 41.0]),
+                "lon": ("point", [350.0, 351.0]),
+            },
+            attrs={"platform": "Jason-3"},
+        )
+        ds_b = xr.Dataset(
+            {"VAVH": ("point", [1.5, 1.8])},
+            coords={
+                "time": ("point", pd.to_datetime(["2026-07-01T10:00:00", "2026-07-02T10:00:00"])),
+                "lat": ("point", [40.0, 42.0]),
+                "lon": ("point", [350.0, 352.0]),
+            },
+            attrs={"platform": "Jason-3"},
+        )
+
+        result = _dedupe_altimeter_points([ds_a, ds_b])
+
+        assert result.sizes["point"] == 3
+        assert result.attrs["platform"] == "Jason-3"
+
+    def test_window_suffix_regex_strips_trailing_date_range(self):
+        from sar_validation.core.datatree_converter import _ALTIMETER_WINDOW_SUFFIX_RE
+
+        assert _ALTIMETER_WINDOW_SUFFIX_RE.sub(
+            "", "cmems_obs-wave_glo_phy-swh_nrt_al-l3_PT1S_2026-07-01_2026-07-03",
+        ) == "cmems_obs-wave_glo_phy-swh_nrt_al-l3_PT1S"
+        assert _ALTIMETER_WINDOW_SUFFIX_RE.sub(
+            "", "cmems_obs-wave_glo_phy-swh_nrt_al-l3_PT1S_2026-07-01_2026-07-03_w0",
+        ) == "cmems_obs-wave_glo_phy-swh_nrt_al-l3_PT1S"
+        assert _ALTIMETER_WINDOW_SUFFIX_RE.sub(
+            "", "cmems_obs-wave_glo_phy-swh_nrt_al-l3-1km_PT0.2S-i_2026-07-01_2026-07-03",
+        ) == "cmems_obs-wave_glo_phy-swh_nrt_al-l3-1km_PT0.2S-i"

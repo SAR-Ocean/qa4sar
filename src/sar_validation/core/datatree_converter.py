@@ -118,6 +118,31 @@ _ERA5_VARS: dict[str, dict] = {
 #: ERA5Downloader.download() when a recipe bbox crosses the antimeridian.
 _ERA5_WINDOW_SUFFIX_RE = re.compile(r"^(?P<stem>.+)_w(?P<idx>\d+)$")
 
+#: Matches the trailing "<YYYY-MM-DD>_<YYYY-MM-DD>" (optionally followed
+#: by "_w<N>" for an antimeridian-split request) that AltimeterDownloader
+#: appends to both flat output files and per-platform output directories,
+#: identifying which requested time window produced a given download --
+#: stripped when grouping files so two downloads of the same dataset for
+#: two different (possibly overlapping) windows are recognized as the
+#: same real product rather than two distinct ones.
+_ALTIMETER_WINDOW_SUFFIX_RE = re.compile(r"_\d{4}-\d{2}-\d{2}_\d{4}-\d{2}-\d{2}(?:_w\d+)?$")
+
+
+def _dedupe_altimeter_points(datasets_list: List[xr.Dataset]) -> xr.Dataset:
+    """
+    Concatenate several altimeter Datasets sharing the same real product
+    along their "point" dimension, keeping only one row per distinct
+    (time, lat, lon) triple -- the real-world consequence of the same
+    along-track observation being present in more than one overlapping,
+    separately downloaded time window.
+    """
+    combined = xr.concat(datasets_list, dim="point")
+    coord_df = combined[["time", "lat", "lon"]].to_dataframe()
+    keep = ~coord_df.duplicated(subset=["time", "lat", "lon"], keep="first")
+    deduped = combined.isel(point=np.where(keep.values)[0])
+    deduped.attrs = dict(datasets_list[0].attrs)
+    return deduped
+
 
 def _normalize_era5_grib_coords(ds: xr.Dataset) -> xr.Dataset:
     """
@@ -4967,15 +4992,44 @@ class DataTreeConverter:
         # different frequency subdirectories can contain identically-named
         # platform files (e.g. "Cryosat-2.nc" under both a 1 Hz and 5 Hz
         # dataset folder), which would otherwise collide in `datasets`.
+        #
+        # AltimeterDownloader names each requested window's own output
+        # after that window's own start/end dates, so re-running the same
+        # recipe with a differently-padded window never overwrites a
+        # prior run's file -- it just adds another, overlapping-window
+        # file for the same real dataset/platform. Grouping by the key
+        # with that trailing date range stripped, and deduplicating
+        # identical (time, lat, lon) rows across every file in a group,
+        # keeps this from collocating the same real observation twice
+        # just because it happens to be present in two overlapping
+        # downloads.
         subdir = base_dir / "altimeter"
         if subdir.exists():
+            altimeter_groups: Dict[str, List[Path]] = {}
             for nc_path in sorted(subdir.rglob("*.nc")):
-                ds = _filtered(DataTreeConverter.from_altimeter(nc_path), nc_path.name)
-                if ds is not None:
-                    rel = nc_path.relative_to(subdir).with_suffix("")
-                    key = "_".join(rel.parts)
-                    datasets[f"validation/altimeter/{key}"] = ds
-                    logger.info("Converted altimeter: %s", nc_path.relative_to(subdir))
+                rel = nc_path.relative_to(subdir).with_suffix("")
+                parts = list(rel.parts)
+                parts[0] = _ALTIMETER_WINDOW_SUFFIX_RE.sub("", parts[0])
+                key = "_".join(parts)
+                altimeter_groups.setdefault(key, []).append(nc_path)
+
+            for key, nc_paths in sorted(altimeter_groups.items()):
+                per_file_datasets = []
+                for nc_path in nc_paths:
+                    ds = _filtered(DataTreeConverter.from_altimeter(nc_path), nc_path.name)
+                    if ds is not None:
+                        per_file_datasets.append(ds)
+                if not per_file_datasets:
+                    continue
+                merged = (
+                    per_file_datasets[0] if len(per_file_datasets) == 1
+                    else _dedupe_altimeter_points(per_file_datasets)
+                )
+                datasets[f"validation/altimeter/{key}"] = merged
+                logger.info(
+                    "Converted altimeter: %s (%d file(s), %d point(s) after dedup)",
+                    key, len(nc_paths), merged.sizes.get("point", 0),
+                )
 
         # Reprocessed (multi-year) altimeter NetCDF products, one file per day.
         subdir = base_dir / "altimeter_reprocessed"
