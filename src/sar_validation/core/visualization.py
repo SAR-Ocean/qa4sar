@@ -1660,26 +1660,27 @@ def plot_geographic_difference(
     Each source's own collocated points are averaged into square grid
     cells. A source with a recorded SAR aggregation footprint
     (aggregation_window_km, from a cell-averaging collocation) grids at
-    twice that value, the footprint's diameter, so a cell does not imply
-    meaningfully more spatial resolution than the underlying collocation
-    already has. A source with no aggregation footprint but a recorded
-    SAR native pixel spacing (an individual-method collocation, matching
-    each SAR pixel directly with no spatial averaging) grids at that
-    pixel spacing instead, since each of its points already represents
-    exactly one real SAR pixel. The kilometer-to-degree conversion uses
-    the source's mean latitude, so actual cell width in kilometers
-    varies somewhat across a source spanning a wide latitude range. A cell with
-    no collocated points inside it is left blank rather than
-    interpolated, so this plot never draws a value between two real
-    observations that were never actually measured together. A source
-    with no recorded aggregation_window_km at all (an older
-    collocation_results.nc saved before this column existed), or whose
-    recorded values are all non-positive, falls back to a plain colored
-    scatter instead, so no qualifying source is ever silently skipped. A
-    source with only some rows lacking a recorded value (for example a
-    mix of cell-averaged and direct-interpolation matches) still grids
-    every row, using the cell size derived from the rows that do have
-    one.
+    twice that value, the footprint's diameter, so a cell does not
+    imply meaningfully more spatial resolution than the underlying
+    collocation already has. A source with no aggregation footprint but
+    a recorded SAR native pixel spacing (sar_pixel_spacing_km, from an
+    individual-method collocation, matching each SAR pixel directly
+    with no spatial averaging) grids at that pixel spacing instead,
+    since each of its points already represents exactly one real SAR
+    pixel. The kilometer-to-degree conversion uses the source's mean
+    latitude, so actual cell width in kilometers varies somewhat across
+    a source spanning a wide latitude range. A cell with no collocated
+    points inside it is left blank rather than interpolated, so this
+    plot never draws a value between two real observations that were
+    never actually measured together. A source with no recorded
+    aggregation_window_km and no recorded sar_pixel_spacing_km at all
+    (an older collocation_results.nc saved before these columns
+    existed), or whose recorded values are all non-positive, falls back
+    to a plain colored scatter instead, so no qualifying source is ever
+    silently skipped. A source with only some rows lacking a recorded
+    value (for example a mix of cell-averaged and direct-interpolation
+    matches) still grids every row, using the cell size derived from
+    the rows that do have one.
 
     Some acquisition modes (for example Sentinel-1 wave mode, WV) relabel
     an otherwise dense satellite source such as a scatterometer or
@@ -1693,10 +1694,12 @@ def plot_geographic_difference(
         Step-3 collocations (``collocation_results.nc``). Needs
         ``sar_<sar_var>``, ``val_<val_var>``, ``sar_lat``, ``sar_lon``,
         ``val_source``, and ``collocation_type`` — every one of these
-        already exists in the saved file. ``aggregation_window_km`` is
-        read when present and used for the grid cell size; its absence
-        does not stop a source from qualifying, only from being
-        gridded — see above.
+        already exists in the saved file. ``aggregation_window_km`` and
+        ``sar_pixel_spacing_km`` are each read when present and used
+        for the grid cell size (the former takes priority when both are
+        present); the absence of either does not stop a source from
+        qualifying, only from being gridded by that particular
+        source — see above.
     sar_var : str
         SAR variable name (e.g. ``"owiWindSpeed"``).
     val_var : str
