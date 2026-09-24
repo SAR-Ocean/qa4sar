@@ -64,6 +64,30 @@ class TestToDatetimeArray:
         assert arr[0] == dt
 
 
+class TestSarGridPixelSpacingKm:
+    def test_returns_the_expected_spacing_for_a_known_grid(self):
+        from sar_validation.core.collocation import _sar_grid_pixel_spacing_km
+
+        lons = np.linspace(-1.0, 1.0, 5)
+        lats = np.linspace(51.0, 53.0, 4)
+        grid_lon, grid_lat = np.meshgrid(lons, lats)
+
+        result = _sar_grid_pixel_spacing_km(grid_lon, grid_lat)
+        assert result == pytest.approx(54.241, rel=1e-3)
+
+    def test_returns_none_for_a_single_row_grid(self):
+        from sar_validation.core.collocation import _sar_grid_pixel_spacing_km
+
+        grid_lon, grid_lat = np.meshgrid(np.linspace(-1.0, 1.0, 5), [52.0])
+        assert _sar_grid_pixel_spacing_km(grid_lon, grid_lat) is None
+
+    def test_returns_none_for_a_single_column_grid(self):
+        from sar_validation.core.collocation import _sar_grid_pixel_spacing_km
+
+        grid_lon, grid_lat = np.meshgrid([0.0], np.linspace(51.0, 53.0, 4))
+        assert _sar_grid_pixel_spacing_km(grid_lon, grid_lat) is None
+
+
 def test_normalize_weights_sums_to_one():
     weights = _normalize_weights(np.array([1.0, 2.0, 3.0]))
     assert weights.sum() == pytest.approx(1.0)

@@ -16,7 +16,7 @@ import pandas as pd
 import xarray as xr
 from scipy.interpolate import RegularGridInterpolator
 
-from .collocation import CollocatedPoint, PointLayerCollocation
+from .collocation import CollocatedPoint, PointLayerCollocation, _sar_grid_pixel_spacing_km
 
 logger = logging.getLogger(__name__)
 
@@ -478,19 +478,10 @@ class ModelLayerCollocation:
         lons_flat = sar_lon.ravel()
         lats_flat = sar_lat.ravel()
 
-        # This SAR scene's own native pixel grid spacing, derived once
-        # from the median distance between adjacent grid cells, recorded
-        # on every row below in place of an aggregation window, since
+        # This SAR scene's own native pixel grid spacing, recorded on
+        # every row below in place of an aggregation window, since
         # direct interpolation involves no spatial averaging.
-        sar_pixel_spacing_km: Optional[float] = None
-        if ny > 1 and nx > 1:
-            lat_spacing_deg = float(np.nanmedian(np.abs(np.diff(sar_lat, axis=0))))
-            lon_spacing_deg = float(np.nanmedian(np.abs(np.diff(sar_lon, axis=1))))
-            mean_lat = float(np.nanmean(sar_lat))
-            lat_spacing_km = lat_spacing_deg * 111.32
-            lon_spacing_km = lon_spacing_deg * 111.32 * max(np.cos(np.radians(mean_lat)), 1e-6)
-            if lat_spacing_km > 0 and lon_spacing_km > 0:
-                sar_pixel_spacing_km = (lat_spacing_km + lon_spacing_km) / 2.0
+        sar_pixel_spacing_km = _sar_grid_pixel_spacing_km(sar_lon, sar_lat)
 
         obs_time = pd.Timestamp(np.atleast_1d(sar_time)[0]).to_pydatetime()
         times_flat = np.full(lons_flat.shape, np.datetime64(obs_time), dtype="datetime64[ns]")
