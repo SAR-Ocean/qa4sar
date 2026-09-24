@@ -456,6 +456,7 @@ class ModelLayerCollocation:
                 collocation_type=self.collocation_type,
                 sar_y_idx=0, sar_x_idx=i,
                 sar_scene_name=sar_scene_name,
+                aggregation_window_km=None,
             ))
         return results
 
@@ -512,6 +513,7 @@ class ModelLayerCollocation:
                 collocation_type=self.collocation_type,
                 sar_y_idx=y_idx, sar_x_idx=x_idx,
                 sar_scene_name=sar_scene_name,
+                aggregation_window_km=None,
             ))
         return results
 
@@ -660,5 +662,6 @@ class ModelLayerCollocation:
                     collocation_type=self.collocation_type,
                     sar_y_idx=cy, sar_x_idx=cx,
                     sar_scene_name=sar_scene_name,
+                    aggregation_window_km=self.aggregation_window_km,
                 ))
         return results

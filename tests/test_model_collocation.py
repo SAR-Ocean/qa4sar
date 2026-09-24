@@ -454,6 +454,26 @@ class TestModelLayerCollocationIndividualGrid:
             assert r.val_source == "era5"
             assert r.collocation_type == "model_vs_layer"
 
+    def test_records_no_aggregation_window(self):
+        """The individual method interpolates the model directly at each
+        SAR pixel with no spatial averaging, so it has no aggregation
+        window to record."""
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_ds()
+        sar_lon = np.array([[-9.5, -9.0], [-9.5, -9.0]])
+        sar_lat = np.array([[41.0, 41.0], [40.5, 40.5]])
+        sar_time = np.array([np.datetime64("2026-07-12T01:00:00")])
+        sar_data = {"owiWindSpeed": np.array([[[5.0, 6.0], [7.0, 8.0]]])}
+
+        colloc = ModelLayerCollocation(method="individual", temporal_method="nearest")
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        assert len(results) > 0
+        assert all(r.aggregation_window_km is None for r in results)
+
     def test_nan_sar_pixel_produces_no_match(self):
         from sar_validation.core.model_collocation import ModelLayerCollocation
 
@@ -518,6 +538,30 @@ class TestModelLayerCollocationIndividualPoints:
         assert all(r.val_data["u10"] == pytest.approx(10.0) for r in results)
         assert all(r.collocation_type == "model_vs_layer" for r in results)
 
+    def test_records_no_aggregation_window(self):
+        """WV-mode always interpolates the model directly at each sparse
+        vignette point, so it has no aggregation window to record --
+        even when the collocation is otherwise configured for
+        cell-averaging."""
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_ds()
+        sar_point_vars = {"oswHs": np.array([2.0, 3.0])}
+        sar_lons = np.array([-9.5, -9.0])
+        sar_lats = np.array([41.0, 40.5])
+        sar_times = np.array([
+            np.datetime64("2026-07-12T01:00:00"),
+            np.datetime64("2026-07-12T01:00:00"),
+        ])
+
+        colloc = ModelLayerCollocation(method="cell-averaging", temporal_method="nearest")
+        results = colloc.collocate_points(
+            sar_point_vars=sar_point_vars, sar_lons=sar_lons, sar_lats=sar_lats,
+            sar_times=sar_times, model_ds=era5_ds, val_source="era5", sar_scene_name="wv1",
+        )
+        assert len(results) > 0
+        assert all(r.aggregation_window_km is None for r in results)
+
     def test_wind_dataset_produces_wspd_wdir_not_u10_v10(self):
         """C1 regression: WV-mode (collocate_points) also shares
         _model_values_at_points -- must produce WSPD/WDIR, not u10/v10."""
@@ -565,6 +609,27 @@ class TestModelLayerCollocationCellAveraging:
             assert r.sar_data["owiWindSpeed"] == pytest.approx(7.5)
             assert r.collocation_type == "model_vs_layer"
             assert r.temporal_distance_minutes == 0.0
+
+    def test_records_aggregation_window_km(self):
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_ds(n_lat=2, n_lon=2)
+        lat_pix = np.linspace(39.8, 42.2, 10)
+        lon_pix = np.linspace(-10.2, -7.8, 10)
+        sar_lon, sar_lat = np.meshgrid(lon_pix, lat_pix)
+        sar_time = np.array([np.datetime64("2026-07-12T01:00:00")])
+        sar_data = {"owiWindSpeed": np.full((1, 10, 10), 7.5)}
+
+        colloc = ModelLayerCollocation(
+            method="cell-averaging", temporal_method="nearest",
+            aggregation_window_km=60.0, distance_weighting="equal",
+        )
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        assert len(results) > 0
+        assert all(r.aggregation_window_km == 60.0 for r in results)
 
     def test_cell_with_no_nearby_sar_produces_no_match(self):
         from sar_validation.core.model_collocation import ModelLayerCollocation
