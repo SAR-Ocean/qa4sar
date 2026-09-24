@@ -2514,10 +2514,24 @@ class TestRunCollocationHycomModelSourceDispatch:
         recipe = self._currents_recipe_with_hycom_override("individual")
         result = run_collocation(recipe, self._tree(), tmp_path)
         assert result is not None
-        assert len(result["val_rvlRadVel_projection"]) > 5
+        assert len(result["val_rvlRadVel_projection"]) == 25
         # heading 90 -> projection == EWCT == 0.4 (hand-checkable, same as
         # the existing mooring test above)
         assert float(result["val_rvlRadVel_projection"].values[0]) == pytest.approx(0.4, abs=1e-5)
+
+    def test_hycom_per_source_override_wins_over_a_conflicting_cli_flag(self, tmp_path):
+        """A recipe's own per-source collocation_kwargs override must
+        win even when the CLI's requested collocation method disagrees
+        with it -- the per-source setting is the more specific, more
+        deliberate choice."""
+        from sar_validation.core.collocation import run_collocation
+
+        recipe = self._currents_recipe_with_hycom_override("individual")
+        result = run_collocation(
+            recipe, self._tree(), tmp_path, layer_vs_layer_collocation_method="cell-averaging",
+        )
+        assert result is not None
+        assert len(result["val_rvlRadVel_projection"]) == 25
 
     def test_partial_layer_type_spec_override_keeps_other_defaults(self, tmp_path, monkeypatch):
         """Regression test: a recipe overriding only ONE field of a
