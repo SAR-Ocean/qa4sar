@@ -1792,7 +1792,7 @@ def plot_geographic_difference(
             transform = None
         kw = {"transform": transform} if transform is not None else {}
 
-        valid_windows = agg_km[np.isfinite(agg_km)]
+        valid_windows = agg_km[np.isfinite(agg_km) & (agg_km > 0)]
         valid_pixel_spacings = px_km[np.isfinite(px_km)]
         if valid_windows.size > 0:
             cell_km = 2.0 * float(np.median(valid_windows))

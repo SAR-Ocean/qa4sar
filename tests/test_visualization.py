@@ -3349,6 +3349,26 @@ class TestPlotGeographicDifference:
         assert any(isinstance(c, mcollections.PathCollection) for c in ax.collections)
         plt.close("all")
 
+    def test_non_positive_aggregation_window_does_not_shadow_a_valid_pixel_spacing(self):
+        """A non-positive aggregation_window_km must not block a
+        perfectly usable sar_pixel_spacing_km from being used -- the
+        fallback chain should still grid rather than falling all the
+        way through to scatter."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+            aggregation_window_km=0.0, sar_pixel_spacing_km=1.0,
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        ax = result["ascat_ssm"].axes[0]
+        assert any(isinstance(c, mcollections.QuadMesh) for c in ax.collections)
+        plt.close("all")
+
     def test_no_aggregation_window_column_falls_back_to_scatter(self):
         """An older collocation_results.nc saved before this column
         existed must still render every qualifying source, via the same
