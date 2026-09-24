@@ -863,10 +863,12 @@ class DataOrchestrator:
             if not self._download_insitu(source_types, min_depth, max_depth):
                 ok = False
         elif insitu_sources:
-            logger.info(
-                "Skipping NRT in-situ batch: every requested platform type "
-                "is covered by a historical source for this window."
+            reason = (
+                "every requested platform type is either covered by a historical "
+                "source or has no predicted collocation with SAR data"
             )
+            logger.info("Skipping NRT in-situ batch: %s.", reason)
+            self.metadata["downloads"]["insitu"] = {"status": "skipped", "reason": reason}
 
         # buoy_waterfall additionally needs its own GTS download, on top
         # of (not instead of) the Copernicus in-situ batch above --

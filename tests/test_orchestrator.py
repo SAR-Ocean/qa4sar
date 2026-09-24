@@ -3169,6 +3169,27 @@ class TestCollocationSkipGating:
 
         assert "mooring" not in orchestrator.metadata["downloads"]
 
+    def test_fully_excluded_insitu_batch_records_a_skipped_metadata_entry(self, tmp_path, monkeypatch):
+        """When every in-situ source in a recipe is excluded from the
+        batch, the run must still record an "insitu" entry in
+        download_metadata.json -- otherwise a later run can never see
+        this requirement as satisfied and re-downloads everything from
+        scratch every time, even though nothing was actually missing."""
+        orchestrator = _orchestrator_with_source(tmp_path, "mooring")
+
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: {"mooring": _FakePrediction(verdict="none-predicted")},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(orchestrator, "_download_insitu", lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("must not batch-download a none-predicted in-situ source")
+        ))
+
+        orchestrator.download_all()
+
+        assert orchestrator.metadata["downloads"]["insitu"]["status"] == "skipped"
+
     def test_unknown_verdict_does_not_skip_insitu_batch(self, tmp_path, monkeypatch):
         orchestrator = _orchestrator_with_source(tmp_path, "mooring")
         monkeypatch.setattr(
