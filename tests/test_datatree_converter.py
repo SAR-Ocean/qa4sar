@@ -838,6 +838,16 @@ class TestFromCollocations:
         assert "sar_wind_direction" in ds
         assert np.isnan(ds["sar_wind_direction"].values[1])
 
+    def test_aggregation_window_km_column(self):
+        c1 = _make_collocations(1)[0]
+        c1.aggregation_window_km = 12.5
+        c2 = _make_collocations(1)[0]
+        c2.aggregation_window_km = None
+        ds = DataTreeConverter.from_collocations([c1, c2])
+        assert "aggregation_window_km" in ds
+        assert ds["aggregation_window_km"].values[0] == 12.5
+        assert np.isnan(ds["aggregation_window_km"].values[1])
+
 
 # ---------------------------------------------------------------------------
 # to_datatree

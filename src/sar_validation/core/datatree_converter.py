@@ -1554,6 +1554,10 @@ class DataTreeConverter:
             ("spatial_distance_km",        lambda c: c.spatial_distance_km),
             ("temporal_distance_minutes",  lambda c: c.temporal_distance_minutes),
             ("val_source",                 lambda c: c.val_source),
+            (
+                "aggregation_window_km",
+                lambda c: c.aggregation_window_km if c.aggregation_window_km is not None else np.nan,
+            ),
         ):
             data[key] = ("collocation", [getter(c) for c in collocations])
 
