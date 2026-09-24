@@ -1659,16 +1659,22 @@ def plot_geographic_difference(
 
     Each source's own collocated points are averaged into square grid
     cells sized after that source's own SAR aggregation footprint (twice
-    its aggregation_window_km, the footprint's diameter), so a cell
-    never implies more spatial resolution than the underlying
-    collocation already has. A cell with no collocated points inside it
-    is left blank rather than interpolated, so this plot never draws a
-    value between two real observations that were never actually
-    measured together. A source with no recorded aggregation_window_km
-    (an older collocation_results.nc saved before this column existed,
-    or rows matched by direct nearest-point lookup with no spatial
-    averaging) falls back to a plain colored scatter instead, so no
-    qualifying source is ever silently skipped.
+    its aggregation_window_km, the footprint's diameter), so a cell does
+    not imply meaningfully more spatial resolution than the underlying
+    collocation already has. The kilometer-to-degree conversion uses the
+    source's mean latitude, so actual cell width in kilometers varies
+    somewhat across a source spanning a wide latitude range. A cell with
+    no collocated points inside it is left blank rather than
+    interpolated, so this plot never draws a value between two real
+    observations that were never actually measured together. A source
+    with no recorded aggregation_window_km at all (an older
+    collocation_results.nc saved before this column existed), or whose
+    recorded values are all non-positive, falls back to a plain colored
+    scatter instead, so no qualifying source is ever silently skipped. A
+    source with only some rows lacking a recorded value (for example a
+    mix of cell-averaged and direct-interpolation matches) still grids
+    every row, using the cell size derived from the rows that do have
+    one.
 
     Some acquisition modes (for example Sentinel-1 wave mode, WV) relabel
     an otherwise dense satellite source such as a scatterometer or

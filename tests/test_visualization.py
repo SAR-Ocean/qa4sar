@@ -3204,7 +3204,12 @@ class TestPlotGeographicDifference:
         sar_vals = rng.uniform(5.0, 10.0, n)
         val_vals = sar_vals - 2.0
 
-        ds_fine = self._coll_ds(lon, lat, sar_vals, val_vals, aggregation_window_km=12.5)
+        # One outlier row keeps the median at 12.5 while the max jumps to
+        # 50.0, so a formula using max instead of median would produce a
+        # visibly different (and wrong) cell size than this test expects.
+        agg_fine = np.full(n, 12.5)
+        agg_fine[0] = 50.0
+        ds_fine = self._coll_ds(lon, lat, sar_vals, val_vals, aggregation_window_km=agg_fine)
         ds_coarse = self._coll_ds(lon, lat, sar_vals, val_vals, aggregation_window_km=90.0)
 
         fig_fine = plot_geographic_difference(ds_fine, "owiWindSpeed", "WSPD")["ascat_ssm"]
@@ -3213,7 +3218,23 @@ class TestPlotGeographicDifference:
         mesh_fine = next(c for c in fig_fine.axes[0].collections if isinstance(c, mcollections.QuadMesh))
         mesh_coarse = next(c for c in fig_coarse.axes[0].collections if isinstance(c, mcollections.QuadMesh))
 
-        assert mesh_coarse.get_array().size < mesh_fine.get_array().size
+        mean_lat = float(np.mean(lat))
+        km_per_deg_lat = 111.32
+        km_per_deg_lon = 111.32 * np.cos(np.radians(mean_lat))
+
+        def cell_size_km(mesh):
+            coords = mesh.get_coordinates()
+            dlat_deg = float(np.diff(coords[:, 0, 1]).mean())
+            dlon_deg = float(np.diff(coords[0, :, 0]).mean())
+            return dlat_deg * km_per_deg_lat, dlon_deg * km_per_deg_lon
+
+        fine_dlat_km, fine_dlon_km = cell_size_km(mesh_fine)
+        coarse_dlat_km, coarse_dlon_km = cell_size_km(mesh_coarse)
+
+        assert fine_dlat_km == pytest.approx(25.0, rel=1e-3)
+        assert fine_dlon_km == pytest.approx(25.0, rel=1e-3)
+        assert coarse_dlat_km == pytest.approx(180.0, rel=1e-3)
+        assert coarse_dlon_km == pytest.approx(180.0, rel=1e-3)
         plt.close("all")
 
     def test_missing_aggregation_window_falls_back_to_scatter(self):
