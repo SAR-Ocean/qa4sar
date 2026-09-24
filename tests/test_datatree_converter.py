@@ -848,6 +848,16 @@ class TestFromCollocations:
         assert ds["aggregation_window_km"].values[0] == 12.5
         assert np.isnan(ds["aggregation_window_km"].values[1])
 
+    def test_sar_pixel_spacing_km_column(self):
+        c1 = _make_collocations(1)[0]
+        c1.sar_pixel_spacing_km = 1.0
+        c2 = _make_collocations(1)[0]
+        c2.sar_pixel_spacing_km = None
+        ds = DataTreeConverter.from_collocations([c1, c2])
+        assert "sar_pixel_spacing_km" in ds
+        assert ds["sar_pixel_spacing_km"].values[0] == 1.0
+        assert np.isnan(ds["sar_pixel_spacing_km"].values[1])
+
 
 # ---------------------------------------------------------------------------
 # to_datatree

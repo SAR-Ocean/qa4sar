@@ -1558,6 +1558,10 @@ class DataTreeConverter:
                 "aggregation_window_km",
                 lambda c: c.aggregation_window_km if c.aggregation_window_km is not None else np.nan,
             ),
+            (
+                "sar_pixel_spacing_km",
+                lambda c: c.sar_pixel_spacing_km if c.sar_pixel_spacing_km is not None else np.nan,
+            ),
         ):
             data[key] = ("collocation", [getter(c) for c in collocations])
 
