@@ -1784,10 +1784,11 @@ def plot_geographic_difference(
             # a dateline-crossing source (the same shift _pad_lonlat_extent
             # already uses), otherwise a plain np.arange over the raw
             # lon range would span nearly 360 degrees of mostly-empty
-            # bins. The edges are shifted back to the standard range
-            # before being handed to pcolormesh, which — unlike
-            # tripcolor — cartopy already reprojects correctly through
-            # its own transform argument.
+            # bins. For a crossing source, those shifted edges are handed
+            # to pcolormesh directly, treated as already being native
+            # coordinates in this axes' own central_longitude=180 frame,
+            # rather than raw geographic longitude that still needs
+            # reprojecting through the base PlateCarree transform.
             lon_for_binning = ((lon % 360.0) - 180.0) if crosses_dateline else lon
             lon_edges_binning = np.arange(
                 lon_for_binning.min() - cell_deg_lon, lon_for_binning.max() + 2 * cell_deg_lon, cell_deg_lon,
@@ -1802,12 +1803,16 @@ def plot_geographic_difference(
             np.add.at(count_grid, (row_idx, col_idx), 1)
             mean_grid = np.where(count_grid > 0, sum_grid / np.maximum(count_grid, 1), np.nan)
 
-            lon_edges = (
-                ((lon_edges_binning + 180.0) % 360.0) - 180.0
-            ) if crosses_dateline else lon_edges_binning
+            # The still-shifted lon_edges_binning values are already
+            # native coordinates for this axes' own central_longitude=180
+            # frame when crossing the dateline, so pcolormesh is told not
+            # to reproject them through the base (unshifted) PlateCarree
+            # transform -- doing so would place the mesh roughly 180
+            # degrees away from where the axes is actually zoomed.
+            mesh_kw = {"transform": (ax.projection if crosses_dateline else transform)} if HAS_CARTOPY else {}
             mappable = ax.pcolormesh(
-                lon_edges, lat_edges, mean_grid, cmap=cmap, norm=norm,
-                zorder=3, rasterized=True, **kw,
+                lon_edges_binning, lat_edges, mean_grid, cmap=cmap, norm=norm,
+                zorder=3, rasterized=True, **mesh_kw,
             )
         if mappable is None:
             mappable = ax.scatter(

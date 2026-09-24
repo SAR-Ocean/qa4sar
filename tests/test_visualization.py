@@ -3351,6 +3351,54 @@ class TestPlotGeographicDifference:
         assert lon_span < 10.0, f"expected a narrow local grid, got a {lon_span} degree span"
         plt.close("all")
 
+    def test_dateline_crossing_mesh_is_drawn_at_the_correct_geographic_location(self):
+        """A regression guard for a bug where a dateline-crossing mesh's
+        bin edges, after being shifted onto a continuous longitude
+        branch for compact bin-edge computation, were reprojected
+        through the wrong transform and ended up drawn roughly 180
+        degrees away from the data's true location -- rendering a
+        completely blank page despite the underlying grid holding real
+        occupied cells. Checking only the mesh's own internal coordinate
+        span (as a neighboring test does) cannot catch this, since a
+        mesh can have a small span while still being placed in entirely
+        the wrong location; this test instead renders to actual pixels
+        and checks color at the true geographic location of each
+        cluster."""
+        import cartopy.crs as ccrs
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        rng = np.random.default_rng(3)
+        n1, n2 = 30, 30
+        lon_a = rng.uniform(178.0, 179.0, n1)
+        lat_a = rng.uniform(40.0, 41.0, n1)
+        lon_b = rng.uniform(-179.0, -178.0, n2)
+        lat_b = rng.uniform(40.0, 41.0, n2)
+        lon = np.concatenate([lon_a, lon_b])
+        lat = np.concatenate([lat_a, lat_b])
+        sar_vals = np.full(n1 + n2, 8.0)
+        val_vals = np.full(n1 + n2, 2.0)
+
+        ds = self._coll_ds(lon, lat, sar_vals, val_vals, aggregation_window_km=12.5)
+        fig = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")["ascat_ssm"]
+        ax = fig.axes[0]
+
+        fig.canvas.draw()
+        buf = np.asarray(fig.canvas.get_renderer().buffer_rgba())
+
+        def is_background_at(true_lon, true_lat):
+            proj_xy = ax.projection.transform_point(true_lon, true_lat, ccrs.PlateCarree())
+            disp_xy = ax.transData.transform(proj_xy)
+            px, py = int(round(disp_xy[0])), buf.shape[0] - int(round(disp_xy[1]))
+            window = buf[max(0, py - 3):py + 4, max(0, px - 3):px + 4, :3]
+            return bool(np.all(window > 250))
+
+        assert not is_background_at(178.5, 40.5), "expected colored data at cluster A's true location"
+        assert not is_background_at(-178.5, 40.5), "expected colored data at cluster B's true location"
+        assert is_background_at(0.0, 40.5), "expected background far from either cluster"
+        plt.close("all")
+
     def test_land_based_collocations_remain_visible(self):
         """A source's grid must not be hidden by land: collocations for a
         land-based quantity (for example soil moisture) sit on land by
