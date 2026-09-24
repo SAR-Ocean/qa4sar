@@ -1964,7 +1964,10 @@ def run_collocation(
                 model_kwargs = dict(layer_vs_layer_specs.get(layer_type, {}))
                 model_kwargs.update(per_source_kwargs)
                 model_colloc = ModelLayerCollocation(
-                    method=model_kwargs.get("method", "cell-averaging"),
+                    # collocate_points (below) always interpolates
+                    # directly regardless of this value, but it is set
+                    # consistently with the grid-mode dispatch anyway.
+                    method=layer_vs_layer_collocation_method,
                     temporal_method=model_kwargs.get("temporal_method", "hyperbolic"),
                 )
                 source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
@@ -2063,7 +2066,12 @@ def run_collocation(
                 model_kwargs = dict(layer_vs_layer_specs.get(layer_type, {}))
                 model_kwargs.update(per_source_kwargs)
                 model_colloc = ModelLayerCollocation(
-                    method=model_kwargs.get("method", "cell-averaging"),
+                    # Mirrors the layer_vs_layer bucket's own precedent
+                    # just above: an explicitly requested collocation
+                    # method always wins over any recipe-level default,
+                    # for model sources exactly as for layer_vs_layer
+                    # ones.
+                    method=layer_vs_layer_collocation_method,
                     temporal_method=model_kwargs.get("temporal_method", "hyperbolic"),
                     time_tolerance_minutes=model_kwargs.get("time_tolerance_minutes", 60),
                     aggregation_window_km=model_kwargs.get("aggregation_window_km", 12.5),

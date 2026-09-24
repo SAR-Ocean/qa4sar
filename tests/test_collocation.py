@@ -2395,6 +2395,28 @@ class TestRunCollocationEra5Wiring:
         era5_mask = result_ds["val_source"].values == "era5_wind"
         assert int(era5_mask.sum()) > 0
 
+    def test_layer_vs_layer_collocation_method_flag_also_applies_to_era5(self, tmp_path):
+        """The CLI's collocation-method flag must not silently stop at
+        layer_vs_layer sources -- a run requesting the individual
+        method must also switch ERA5's own grid-mode collocation to
+        individual, not silently keep whatever the recipe's own
+        layer-type default says regardless of what was actually
+        requested."""
+        from sar_validation.core.collocation import run_collocation
+
+        tree, recipe = self._build_datatree_and_recipe(tmp_path)
+        result_ds = run_collocation(
+            recipe, tree, tmp_path, layer_vs_layer_collocation_method="individual",
+        )
+
+        assert result_ds is not None
+        era5_mask = result_ds["val_source"].values == "era5_wind"
+        assert int(era5_mask.sum()) > 0
+        agg = result_ds["aggregation_window_km"].values[era5_mask]
+        px = result_ds["sar_pixel_spacing_km"].values[era5_mask]
+        assert np.all(np.isnan(agg))
+        assert np.all(np.isfinite(px)) and np.all(px > 0)
+
 
 class TestModelSourceType:
     def test_era5_prefixed_data_types_map_to_era5(self):
