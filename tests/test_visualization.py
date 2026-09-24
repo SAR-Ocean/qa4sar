@@ -3283,7 +3283,7 @@ class TestPlotGeographicDifference:
         recorded pixel spacing (should not occur in practice, since a
         recipe's collocation method is one run-wide setting, but the
         priority order must still resolve sensibly) grids by the
-        aggregation window, unchanged from before this plan."""
+        aggregation window, matching the cell-averaged behavior."""
         import matplotlib.collections as mcollections
         import matplotlib.pyplot as plt
 
