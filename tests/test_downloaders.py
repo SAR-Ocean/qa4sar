@@ -4217,7 +4217,7 @@ class TestOrchestratorHistoricalFirstDedup:
 
         assert ok is True
         mock_insitu_cls.assert_not_called()
-        assert "insitu" not in orchestrator.metadata["downloads"]
+        assert orchestrator.metadata["downloads"]["insitu"]["status"] == "skipped"
 
     def test_insitu_batch_depth_window_ignores_excluded_drifter(self, tmp_path):
         from sar_validation.core.orchestrator import DataOrchestrator
