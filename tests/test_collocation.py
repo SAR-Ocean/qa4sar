@@ -177,6 +177,22 @@ class TestPointLayerCollocation:
         assert isinstance(r.sar_time, datetime)
         assert isinstance(r.val_time, datetime)
 
+    def test_collocated_point_records_aggregation_window_km(self):
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            WSPD=[7.0], WDIR=[200.0],
+        )
+
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "mooring")
+
+        assert len(results) > 0
+        assert results[0].aggregation_window_km == 100.0
+
     def test_forward_fill_never_borrows_from_a_different_platform(self):
         """A validation point whose own platform never reports a given
         variable at all (e.g. a tidal gauge, which only measures water
@@ -487,6 +503,47 @@ class TestLayerLayerCollocation:
         assert len(results) > 0
         assert all(r.collocation_type == "layer_vs_layer" for r in results)
         assert all(r.val_source == "scatterometer" for r in results)
+
+    def test_cell_averaging_records_aggregation_window_km(self):
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        scat_lons = np.linspace(-1.5, 1.5, 8)
+        scat_lats = np.linspace(50.5, 53.5, 6)
+        mg_lon, mg_lat = np.meshgrid(scat_lons, scat_lats)
+        val = _make_val_dataframe(
+            lons=mg_lon.ravel().tolist(),
+            lats=mg_lat.ravel().tolist(),
+            times=[datetime(2026, 1, 1, 12, 0, 0)] * mg_lon.size,
+            wind_speed=[8.5] * mg_lon.size,
+            wind_dir=[230.0] * mg_lon.size,
+        )
+        colloc = LayerLayerCollocation(spatial_tolerance_km=100, time_tolerance_minutes=60,
+                                        aggregation_window_km=80)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
+
+        assert len(results) > 0
+        assert all(r.aggregation_window_km == 80.0 for r in results)
+
+    def test_individual_method_records_no_aggregation_window(self):
+        """The individual method matches each SAR pixel to its single
+        closest validation point with no spatial averaging, so it has no
+        aggregation window to record."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        scat_lons = np.linspace(-1.5, 1.5, 8)
+        scat_lats = np.linspace(50.5, 53.5, 6)
+        mg_lon, mg_lat = np.meshgrid(scat_lons, scat_lats)
+        val = _make_val_dataframe(
+            lons=mg_lon.ravel().tolist(),
+            lats=mg_lat.ravel().tolist(),
+            times=[datetime(2026, 1, 1, 12, 0, 0)] * mg_lon.size,
+            wind_speed=[8.5] * mg_lon.size,
+            wind_dir=[230.0] * mg_lon.size,
+        )
+        colloc = LayerLayerCollocation(spatial_tolerance_km=100, time_tolerance_minutes=60,
+                                        aggregation_window_km=80, method="individual")
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
+
+        assert len(results) > 0
+        assert all(r.aggregation_window_km is None for r in results)
 
     def test_no_match_outside_time_tolerance(self):
         grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()

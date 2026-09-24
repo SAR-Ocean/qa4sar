@@ -95,6 +95,11 @@ class CollocatedPoint:
     sar_x_idx: int = 0
     sar_scene_name: str = ""
 
+    # Circular radius (km) used to average the SAR side of this row, or
+    # None when the row was matched by direct nearest-point lookup with
+    # no spatial averaging.
+    aggregation_window_km: Optional[float] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "sar_lon":                   self.sar_lon,
@@ -113,6 +118,7 @@ class CollocatedPoint:
             "sar_y_idx":                 self.sar_y_idx,
             "sar_x_idx":                 self.sar_x_idx,
             "sar_scene_name":            self.sar_scene_name,
+            "aggregation_window_km":     self.aggregation_window_km,
         }
 
 
@@ -786,6 +792,7 @@ class PointLayerCollocation:
                     sar_y_idx=y_idx,
                     sar_x_idx=x_idx,
                     sar_scene_name=sar_scene_name,
+                    aggregation_window_km=self.aggregation_window_km,
                 )
 
                 if not self.dedup_nearest_in_time:
@@ -1497,6 +1504,7 @@ def _collocate_wv_points(
                 sar_y_idx=0,
                 sar_x_idx=i,
                 sar_scene_name=sar_scene_name,
+                aggregation_window_km=None,
             )
         )
 
@@ -2459,6 +2467,7 @@ class LayerLayerCollocation(PointLayerCollocation):
                         sar_y_idx=y_idx,
                         sar_x_idx=x_idx,
                         sar_scene_name=sar_scene_name,
+                        aggregation_window_km=None,
                     )
                 )
 
