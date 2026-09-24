@@ -3233,6 +3233,27 @@ class TestPlotGeographicDifference:
         assert any(isinstance(c, mcollections.PathCollection) for c in ax.collections)
         plt.close("all")
 
+    def test_zero_aggregation_window_falls_back_to_scatter_instead_of_crashing(self):
+        """A zero-valued (not NaN) aggregation_window_km would otherwise
+        collapse the grid cell size to zero, which cannot be gridded --
+        this must fall back to scatter like any other source with no
+        usable aggregation window, not raise."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+            aggregation_window_km=0.0,
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        ax = result["ascat_ssm"].axes[0]
+        assert not any(isinstance(c, mcollections.QuadMesh) for c in ax.collections)
+        assert any(isinstance(c, mcollections.PathCollection) for c in ax.collections)
+        plt.close("all")
+
     def test_no_aggregation_window_column_falls_back_to_scatter(self):
         """An older collocation_results.nc saved before this column
         existed must still render every qualifying source, via the same
@@ -3396,7 +3417,7 @@ class TestPlotGeographicDifference:
 
         assert not is_background_at(178.5, 40.5), "expected colored data at cluster A's true location"
         assert not is_background_at(-178.5, 40.5), "expected colored data at cluster B's true location"
-        assert is_background_at(0.0, 40.5), "expected background far from either cluster"
+        assert is_background_at(178.5, 42.0), "expected background above cluster A, still on-canvas"
         plt.close("all")
 
     def test_land_based_collocations_remain_visible(self):

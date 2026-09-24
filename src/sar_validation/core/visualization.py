@@ -1771,9 +1771,9 @@ def plot_geographic_difference(
         kw = {"transform": transform} if transform is not None else {}
 
         valid_windows = agg_km[np.isfinite(agg_km)]
+        cell_km = 2.0 * float(np.median(valid_windows)) if valid_windows.size > 0 else 0.0
         mappable = None
-        if valid_windows.size > 0:
-            cell_km = 2.0 * float(np.median(valid_windows))
+        if cell_km > 0:
             mean_lat = float(np.mean(lat))
             km_per_deg_lat = 111.32
             km_per_deg_lon = max(111.32 * np.cos(np.radians(mean_lat)), 1e-6)
