@@ -1648,25 +1648,27 @@ def plot_geographic_difference(
     on_figure: Optional[Callable[[str, "Figure"], None]] = None,
 ) -> Dict[str, "Figure"]:
     """
-    Map SAR-minus-validation differences as a smooth triangulated surface,
-    one Figure per qualifying validation source.
+    Map SAR-minus-validation differences as a grid of local averages, one
+    Figure per qualifying validation source.
 
     Only validation sources whose collocation_type is layer_vs_layer or
-    model_vs_layer are considered — dense satellite/model coverage, where
-    a continuous surface communicates the spatial pattern of the
-    difference far better than a handful of scattered in-situ dots. There
-    is no minimum point count for a qualifying source.
+    model_vs_layer are considered — dense satellite/model coverage,
+    where a spatial grid communicates the pattern of the difference far
+    better than a handful of scattered in-situ dots. There is no minimum
+    point count for a qualifying source.
 
-    The surface is a Delaunay triangulation of the source's own collocated
-    points (each row's own sar_lat/sar_lon and its SAR-minus-validation
-    difference), smoothly shaded between vertices. Implausibly long
-    triangles, which would otherwise fabricate a gradient across a gap
-    with no real data behind it, are hidden rather than drawn — a region
-    of a source that is much sparser than that source's densest cluster
-    can therefore render as empty background rather than as a coarse
-    surface. A source with fewer than three points, or whose points are
-    collinear (a degenerate triangulation), falls back to a plain colored
-    scatter instead, so no qualifying source is ever silently skipped.
+    Each source's own collocated points are averaged into square grid
+    cells sized after that source's own SAR aggregation footprint (twice
+    its aggregation_window_km, the footprint's diameter), so a cell
+    never implies more spatial resolution than the underlying
+    collocation already has. A cell with no collocated points inside it
+    is left blank rather than interpolated, so this plot never draws a
+    value between two real observations that were never actually
+    measured together. A source with no recorded aggregation_window_km
+    (an older collocation_results.nc saved before this column existed,
+    or rows matched by direct nearest-point lookup with no spatial
+    averaging) falls back to a plain colored scatter instead, so no
+    qualifying source is ever silently skipped.
 
     Some acquisition modes (for example Sentinel-1 wave mode, WV) relabel
     an otherwise dense satellite source such as a scatterometer or
@@ -1680,7 +1682,10 @@ def plot_geographic_difference(
         Step-3 collocations (``collocation_results.nc``). Needs
         ``sar_<sar_var>``, ``val_<val_var>``, ``sar_lat``, ``sar_lon``,
         ``val_source``, and ``collocation_type`` — every one of these
-        already exists in the saved file.
+        already exists in the saved file. ``aggregation_window_km`` is
+        read when present and used for the grid cell size; its absence
+        does not stop a source from qualifying, only from being
+        gridded — see above.
     sar_var : str
         SAR variable name (e.g. ``"owiWindSpeed"``).
     val_var : str
@@ -1708,7 +1713,6 @@ def plot_geographic_difference(
 
     import matplotlib.colors as mcolors  # noqa: PLC0415
     import matplotlib.pyplot as plt  # noqa: PLC0415
-    import matplotlib.tri as mtri  # noqa: PLC0415
 
     try:
         import cartopy.crs as ccrs  # noqa: PLC0415
@@ -1722,7 +1726,11 @@ def plot_geographic_difference(
 
     from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg  # noqa: PLC0415
 
-    df = collocation_ds[list(required)].to_dataframe()
+    has_agg_col = "aggregation_window_km" in collocation_ds
+    columns = list(required) + (["aggregation_window_km"] if has_agg_col else [])
+    df = collocation_ds[columns].to_dataframe()
+    if not has_agg_col:
+        df["aggregation_window_km"] = np.nan
     df = df.dropna(subset=[sar_col, val_col, "sar_lat", "sar_lon"])
     if val_var in CIRCULAR_VAL_VARS:
         df["diff"] = circular_diff_deg(df[sar_col].values, df[val_col].values)
@@ -1739,6 +1747,7 @@ def plot_geographic_difference(
         diff = sub["diff"].to_numpy()
         lon = sub["sar_lon"].to_numpy()
         lat = sub["sar_lat"].to_numpy()
+        agg_km = sub["aggregation_window_km"].to_numpy()
 
         vmax = float(np.nanpercentile(np.abs(diff), 98))
         if vmax == 0.0:
@@ -1761,53 +1770,45 @@ def plot_geographic_difference(
             transform = None
         kw = {"transform": transform} if transform is not None else {}
 
-        # cartopy reprojects pcolormesh and scatter through their transform
-        # argument, but does not do the same for tripcolor, so a source
-        # whose points straddle the antimeridian would otherwise be
-        # triangulated in raw longitude space, drawing each connecting
-        # triangle the long way around the globe instead of the short way.
-        # Shifting onto the same continuous longitude branch
-        # _pad_lonlat_extent already uses for this axes' own
-        # central_longitude=180 frame, and letting tripcolor treat that
-        # shifted value as a literal axes-space coordinate (no transform
-        # argument), places every point correctly without it.
-        lon_tri = ((lon % 360.0) - 180.0) if crosses_dateline else lon
-
+        valid_windows = agg_km[np.isfinite(agg_km)]
         mappable = None
-        if len(lon) >= 3:
-            try:
-                triangulation = mtri.Triangulation(lon_tri, lat)
-            except (RuntimeError, ValueError):
-                triangulation = None
-            if triangulation is not None:
-                points = np.column_stack([lon_tri, lat])
-                corners = triangulation.triangles
-                edge_ab = np.linalg.norm(points[corners[:, 0]] - points[corners[:, 1]], axis=1)
-                edge_bc = np.linalg.norm(points[corners[:, 1]] - points[corners[:, 2]], axis=1)
-                edge_ca = np.linalg.norm(points[corners[:, 2]] - points[corners[:, 0]], axis=1)
-                max_edge = np.maximum(np.maximum(edge_ab, edge_bc), edge_ca)
-                # A single triangulation of every one of a source's
-                # collocated points connects widely separated SAR passes
-                # with long, thin triangles that fabricate a smooth
-                # gradient across a gap with no real data behind it.
-                # Hiding triangles whose longest edge is far above the
-                # typical (median) edge length removes those spurious
-                # bridges while keeping each genuinely covered area intact.
-                # This works well when a source's points form a handful
-                # of locally dense clusters separated by real gaps, the
-                # common case for collocated SAR passes. It is not exact:
-                # if bridging triangles between distant clusters outnumber
-                # a source's own genuinely local triangles, the median
-                # itself reflects bridge length and nothing gets masked;
-                # the median is taken across all of a source's triangles,
-                # so a cluster that is much sparser than the source's
-                # densest cluster can have every one of its own triangles
-                # masked, rendering that region as empty background.
-                triangulation.set_mask(max_edge > 5.0 * np.median(max_edge))
-                mappable = ax.tripcolor(
-                    triangulation, diff, shading="gouraud", cmap=cmap, norm=norm,
-                    zorder=3, rasterized=True,
-                )
+        if valid_windows.size > 0:
+            cell_km = 2.0 * float(np.median(valid_windows))
+            mean_lat = float(np.mean(lat))
+            km_per_deg_lat = 111.32
+            km_per_deg_lon = max(111.32 * np.cos(np.radians(mean_lat)), 1e-6)
+            cell_deg_lat = cell_km / km_per_deg_lat
+            cell_deg_lon = cell_km / km_per_deg_lon
+
+            # Bin edges are computed on a continuous longitude branch for
+            # a dateline-crossing source (the same shift _pad_lonlat_extent
+            # already uses), otherwise a plain np.arange over the raw
+            # lon range would span nearly 360 degrees of mostly-empty
+            # bins. The edges are shifted back to the standard range
+            # before being handed to pcolormesh, which — unlike
+            # tripcolor — cartopy already reprojects correctly through
+            # its own transform argument.
+            lon_for_binning = ((lon % 360.0) - 180.0) if crosses_dateline else lon
+            lon_edges_binning = np.arange(
+                lon_for_binning.min() - cell_deg_lon, lon_for_binning.max() + 2 * cell_deg_lon, cell_deg_lon,
+            )
+            lat_edges = np.arange(lat.min() - cell_deg_lat, lat.max() + 2 * cell_deg_lat, cell_deg_lat)
+
+            sum_grid = np.zeros((len(lat_edges) - 1, len(lon_edges_binning) - 1))
+            count_grid = np.zeros_like(sum_grid)
+            col_idx = np.clip(np.digitize(lon_for_binning, lon_edges_binning) - 1, 0, len(lon_edges_binning) - 2)
+            row_idx = np.clip(np.digitize(lat, lat_edges) - 1, 0, len(lat_edges) - 2)
+            np.add.at(sum_grid, (row_idx, col_idx), diff)
+            np.add.at(count_grid, (row_idx, col_idx), 1)
+            mean_grid = np.where(count_grid > 0, sum_grid / np.maximum(count_grid, 1), np.nan)
+
+            lon_edges = (
+                ((lon_edges_binning + 180.0) % 360.0) - 180.0
+            ) if crosses_dateline else lon_edges_binning
+            mappable = ax.pcolormesh(
+                lon_edges, lat_edges, mean_grid, cmap=cmap, norm=norm,
+                zorder=3, rasterized=True, **kw,
+            )
         if mappable is None:
             mappable = ax.scatter(
                 lon, lat, c=diff, cmap=cmap, norm=norm, s=40,

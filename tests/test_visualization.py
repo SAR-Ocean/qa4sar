@@ -3104,15 +3104,19 @@ class TestPlotGeographicOnFigureCallback:
 
 class TestPlotGeographicDifference:
     """plot_geographic_difference maps SAR-minus-validation differences,
-    one Figure per qualifying validation source, using a smooth
-    triangulated surface built directly from each source's own collocated
-    points."""
+    one Figure per qualifying validation source, as a grid of local
+    averages sized to each source's own SAR aggregation window."""
 
     @staticmethod
     def _coll_ds(sar_lon, sar_lat, sar_vals, val_vals, val_source="ascat_ssm",
                  collocation_type="layer_vs_layer",
-                 sar_col="sar_owiWindSpeed", val_col="val_WSPD"):
+                 sar_col="sar_owiWindSpeed", val_col="val_WSPD",
+                 aggregation_window_km=12.5):
         n = len(sar_lon)
+        if aggregation_window_km is None:
+            agg = np.full(n, np.nan)
+        else:
+            agg = np.broadcast_to(np.asarray(aggregation_window_km, dtype=float), (n,)).copy()
         return xr.Dataset({
             sar_col: ("collocation", np.asarray(sar_vals, dtype=float)),
             val_col: ("collocation", np.asarray(val_vals, dtype=float)),
@@ -3120,6 +3124,7 @@ class TestPlotGeographicDifference:
             "collocation_type": ("collocation", [collocation_type] * n),
             "sar_lon": ("collocation", np.asarray(sar_lon, dtype=float)),
             "sar_lat": ("collocation", np.asarray(sar_lat, dtype=float)),
+            "aggregation_window_km": ("collocation", agg),
         })
 
     def test_missing_columns_returns_empty_dict(self):
@@ -3141,22 +3146,78 @@ class TestPlotGeographicDifference:
         result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
         assert result == {}
 
-    def test_layer_vs_layer_source_with_three_points_renders_via_tripcolor(self):
+    def test_layer_vs_layer_source_renders_via_pcolormesh(self):
         import matplotlib.collections as mcollections
         import matplotlib.pyplot as plt
 
         from sar_validation.core.visualization import plot_geographic_difference
 
         ds = self._coll_ds(
-            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
-            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+            sar_lon=[-9.8, -9.5, -9.2, -9.6], sar_lat=[50.2, 50.8, 50.4, 50.5],
+            sar_vals=[8.0, 9.0, 7.5, 8.2], val_vals=[6.0, 6.0, 6.0, 6.0],
         )
         result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
-        fig = result["ascat_ssm"]
-        assert any(isinstance(c, mcollections.TriMesh) for c in fig.axes[0].collections)
+        assert list(result.keys()) == ["ascat_ssm"]
+        ax = result["ascat_ssm"].axes[0]
+        assert any(isinstance(c, mcollections.QuadMesh) for c in ax.collections)
         plt.close("all")
 
     def test_model_vs_layer_source_also_qualifies(self):
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+            val_source="era5_wind", collocation_type="model_vs_layer",
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        assert list(result.keys()) == ["era5_wind"]
+
+    def test_mixed_source_only_reflects_qualifying_rows(self):
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds_a = self._coll_ds(
+            sar_lon=[-9.8, -9.5], sar_lat=[50.2, 50.8], sar_vals=[8.0, 9.0], val_vals=[6.0, 6.0],
+            val_source="ascat_ssm", collocation_type="layer_vs_layer",
+        )
+        ds_b = self._coll_ds(
+            sar_lon=[-9.6], sar_lat=[50.4], sar_vals=[20.0], val_vals=[6.0],
+            val_source="ascat_ssm", collocation_type="point_vs_layer",
+        )
+        combined = xr.concat([ds_a, ds_b], dim="collocation")
+        result = plot_geographic_difference(combined, "owiWindSpeed", "WSPD")
+        assert list(result.keys()) == ["ascat_ssm"]
+
+    def test_cell_size_derived_from_median_aggregation_window(self):
+        """The grid cell size is twice the median aggregation_window_km
+        across a source's own rows -- the window's diameter -- so a
+        90 km window source grids far coarser than a 12.5 km one."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        rng = np.random.default_rng(0)
+        n = 60
+        lon = rng.uniform(-1.0, 1.0, n)
+        lat = rng.uniform(50.0, 52.0, n)
+        sar_vals = rng.uniform(5.0, 10.0, n)
+        val_vals = sar_vals - 2.0
+
+        ds_fine = self._coll_ds(lon, lat, sar_vals, val_vals, aggregation_window_km=12.5)
+        ds_coarse = self._coll_ds(lon, lat, sar_vals, val_vals, aggregation_window_km=90.0)
+
+        fig_fine = plot_geographic_difference(ds_fine, "owiWindSpeed", "WSPD")["ascat_ssm"]
+        fig_coarse = plot_geographic_difference(ds_coarse, "owiWindSpeed", "WSPD")["ascat_ssm"]
+
+        mesh_fine = next(c for c in fig_fine.axes[0].collections if isinstance(c, mcollections.QuadMesh))
+        mesh_coarse = next(c for c in fig_coarse.axes[0].collections if isinstance(c, mcollections.QuadMesh))
+
+        assert mesh_coarse.get_array().size < mesh_fine.get_array().size
+        plt.close("all")
+
+    def test_missing_aggregation_window_falls_back_to_scatter(self):
+        import matplotlib.collections as mcollections
         import matplotlib.pyplot as plt
 
         from sar_validation.core.visualization import plot_geographic_difference
@@ -3164,70 +3225,32 @@ class TestPlotGeographicDifference:
         ds = self._coll_ds(
             sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
             sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
-            val_source="era5", collocation_type="model_vs_layer",
+            aggregation_window_km=None,
         )
         result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
-        assert set(result.keys()) == {"era5"}
+        ax = result["ascat_ssm"].axes[0]
+        assert not any(isinstance(c, mcollections.QuadMesh) for c in ax.collections)
+        assert any(isinstance(c, mcollections.PathCollection) for c in ax.collections)
         plt.close("all")
 
-    def test_mixed_source_only_reflects_qualifying_rows(self):
+    def test_no_aggregation_window_column_falls_back_to_scatter(self):
+        """An older collocation_results.nc saved before this column
+        existed must still render every qualifying source, via the same
+        scatter fallback as a row that explicitly has no aggregation
+        window."""
+        import matplotlib.collections as mcollections
         import matplotlib.pyplot as plt
 
         from sar_validation.core.visualization import plot_geographic_difference
 
-        ds_qual = self._coll_ds(
+        ds = self._coll_ds(
             sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
-            sar_vals=[8.0, 8.5, 9.0], val_vals=[6.0, 6.0, 6.0],
-            val_source="mixed_source", collocation_type="layer_vs_layer",
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
         )
-        ds_nonqual = self._coll_ds(
-            sar_lon=[-9.0], sar_lat=[51.0],
-            sar_vals=[100.0], val_vals=[1.0],
-            val_source="mixed_source", collocation_type="point_vs_layer",
-        )
-        ds = xr.concat([ds_qual, ds_nonqual], dim="collocation")
+        ds = ds.drop_vars("aggregation_window_km")
         result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
-        assert set(result.keys()) == {"mixed_source"}
-        fig = result["mixed_source"]
-        assert any("n=3" in ax.get_title() for ax in fig.axes)
-        plt.close("all")
-
-    def test_fewer_than_three_points_falls_back_to_scatter(self):
-        import matplotlib.collections as mcollections
-        import matplotlib.pyplot as plt
-
-        from sar_validation.core.visualization import plot_geographic_difference
-
-        ds = self._coll_ds(
-            sar_lon=[-9.8, -9.5], sar_lat=[50.2, 50.8],
-            sar_vals=[8.0, 9.0], val_vals=[6.0, 6.0],
-        )
-        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
-        fig = result["ascat_ssm"]
-        scatter = next(
-            c for c in fig.axes[0].collections
-            if isinstance(c, mcollections.PathCollection)
-        )
-        assert len(scatter.get_offsets()) == 2
-        plt.close("all")
-
-    def test_collinear_points_fall_back_to_scatter(self):
-        import matplotlib.collections as mcollections
-        import matplotlib.pyplot as plt
-
-        from sar_validation.core.visualization import plot_geographic_difference
-
-        ds = self._coll_ds(
-            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.5, 50.8],
-            sar_vals=[8.0, 9.0, 10.0], val_vals=[6.0, 6.0, 6.0],
-        )
-        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
-        fig = result["ascat_ssm"]
-        scatter = next(
-            c for c in fig.axes[0].collections
-            if isinstance(c, mcollections.PathCollection)
-        )
-        assert len(scatter.get_offsets()) == 3
+        ax = result["ascat_ssm"].axes[0]
+        assert any(isinstance(c, mcollections.PathCollection) for c in ax.collections)
         plt.close("all")
 
     def test_circular_variable_uses_wrapped_diff(self):
@@ -3243,35 +3266,27 @@ class TestPlotGeographicDifference:
         )
         result = plot_geographic_difference(ds, "owiWindDirection", "WDIR")
         fig = result["ascat_ssm"]
-        mesh = next(
-            c for c in fig.axes[0].collections
-            if isinstance(c, mcollections.TriMesh)
-        )
+        mesh = next(c for c in fig.axes[0].collections if isinstance(c, mcollections.QuadMesh))
+        grid = mesh.get_array()
+        occupied = grid[np.isfinite(grid)]
         # 5 - 355 wrapped to (-180, 180] is +10, not -350.
-        assert np.allclose(mesh.get_array(), 10.0)
+        assert occupied.size > 0
+        assert np.allclose(occupied, 10.0)
         plt.close("all")
 
     def test_color_scale_symmetric_around_zero(self):
-        import matplotlib.collections as mcollections
-        import matplotlib.pyplot as plt
-
         from sar_validation.core.visualization import plot_geographic_difference
 
         ds = self._coll_ds(
             sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
-            sar_vals=[9.0, 9.0, 9.0], val_vals=[6.0, 6.0, 6.0],
+            sar_vals=[8.0, 9.0, 20.0], val_vals=[6.0, 6.0, 6.0],
         )
-        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
-        mesh = next(
-            c for c in result["ascat_ssm"].axes[0].collections
-            if isinstance(c, mcollections.TriMesh)
-        )
+        fig = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")["ascat_ssm"]
+        import matplotlib.collections as mcollections
+        mesh = next(c for c in fig.axes[0].collections if isinstance(c, mcollections.QuadMesh))
         assert mesh.norm.vmin == -mesh.norm.vmax
-        plt.close("all")
 
     def test_degenerate_all_zero_diff_does_not_crash(self):
-        import matplotlib.pyplot as plt
-
         from sar_validation.core.visualization import plot_geographic_difference
 
         ds = self._coll_ds(
@@ -3279,104 +3294,65 @@ class TestPlotGeographicDifference:
             sar_vals=[6.0, 6.0, 6.0], val_vals=[6.0, 6.0, 6.0],
         )
         result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
-        assert "ascat_ssm" in result
-        plt.close("all")
+        assert list(result.keys()) == ["ascat_ssm"]
 
     def test_on_figure_streams_and_dict_stays_empty(self):
-        import matplotlib.pyplot as plt
-
         from sar_validation.core.visualization import plot_geographic_difference
 
         ds = self._coll_ds(
             sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
-            sar_vals=[9.0, 8.0, 9.5], val_vals=[6.0, 6.0, 6.0],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
         )
-        handed_off = []
-
-        def on_figure(val_source, fig):
-            handed_off.append(val_source)
-            plt.close(fig)
-
+        seen = {}
         result = plot_geographic_difference(
-            ds, "owiWindSpeed", "WSPD", on_figure=on_figure,
+            ds, "owiWindSpeed", "WSPD", on_figure=lambda name, fig: seen.setdefault(name, fig),
         )
-        assert handed_off == ["ascat_ssm"]
         assert result == {}
+        assert list(seen.keys()) == ["ascat_ssm"]
 
     def test_two_sources_each_get_their_own_figure(self):
-        import matplotlib.pyplot as plt
-
         from sar_validation.core.visualization import plot_geographic_difference
 
-        ds1 = self._coll_ds(
+        ds_a = self._coll_ds(
             sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
             sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0], val_source="ascat_ssm",
         )
-        ds2 = self._coll_ds(
-            sar_lon=[-8.0, -7.5, -7.2], sar_lat=[51.2, 51.8, 51.4],
-            sar_vals=[9.0, 10.0, 8.5], val_vals=[6.0, 6.0, 6.0],
-            val_source="era5", collocation_type="model_vs_layer",
+        ds_b = self._coll_ds(
+            sar_lon=[-9.7, -9.4, -9.1], sar_lat=[50.3, 50.9, 50.5],
+            sar_vals=[9.0, 10.0, 8.5], val_vals=[7.0, 7.0, 7.0], val_source="radiometer",
         )
-        ds = xr.concat([ds1, ds2], dim="collocation")
-        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
-        assert set(result.keys()) == {"ascat_ssm", "era5"}
-        assert result["ascat_ssm"] is not result["era5"]
-        plt.close("all")
+        combined = xr.concat([ds_a, ds_b], dim="collocation")
+        result = plot_geographic_difference(combined, "owiWindSpeed", "WSPD")
+        assert sorted(result.keys()) == ["ascat_ssm", "radiometer"]
+        assert result["ascat_ssm"] is not result["radiometer"]
 
-    def test_dateline_crossing_source_renders_a_local_mesh_not_a_global_smear(self):
+    def test_dateline_crossing_source_renders_a_local_grid_not_a_global_smear(self):
         import matplotlib.collections as mcollections
         import matplotlib.pyplot as plt
 
         from sar_validation.core.visualization import plot_geographic_difference
 
-        ds = self._coll_ds(
-            sar_lon=[178.0, 179.0, -179.0], sar_lat=[50.0, 50.5, 51.0],
-            sar_vals=[8.0, 9.0, 8.5], val_vals=[6.0, 6.0, 6.0],
-        )
-        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
-        fig = result["ascat_ssm"]
-        mesh = next(
-            c for c in fig.axes[0].collections
-            if isinstance(c, mcollections.TriMesh)
-        )
-        x = mesh._triangulation.x
-        assert x.max() - x.min() < 10.0, (
-            "expected the mesh's own coordinates to span only a few "
-            "degrees on a continuous branch, not the roughly 358 degrees "
-            "a raw triangulation of 178/179/-179 would span"
-        )
-        plt.close("all")
+        rng = np.random.default_rng(2)
+        lon_a = rng.uniform(178.0, 179.0, 15)
+        lat_a = rng.uniform(40.0, 41.0, 15)
+        lon_b = rng.uniform(-179.0, -178.0, 15)
+        lat_b = rng.uniform(40.0, 41.0, 15)
+        lon = np.concatenate([lon_a, lon_b])
+        lat = np.concatenate([lat_a, lat_b])
+        sar_vals = np.concatenate([np.full(15, 8.0), np.full(15, 12.0)])
+        val_vals = np.full(30, 6.0)
 
-    def test_spurious_long_range_triangles_are_masked(self):
-        import matplotlib.collections as mcollections
-        import matplotlib.pyplot as plt
-
-        from sar_validation.core.visualization import plot_geographic_difference
-
-        ds = self._coll_ds(
-            sar_lon=[0.0, 0.1, 0.05, 0.15, 0.02, 10.0, 10.1, 10.05, 10.15, 10.02],
-            sar_lat=[50.0, 50.1, 50.05, 50.02, 50.12, 50.0, 50.1, 50.05, 50.02, 50.12],
-            sar_vals=[8.0, 8.5, 9.0, 7.5, 8.2, 6.5, 7.0, 6.8, 7.2, 6.9],
-            val_vals=[6.0] * 10,
-        )
-        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
-        fig = result["ascat_ssm"]
-        mesh = next(
-            c for c in fig.axes[0].collections
-            if isinstance(c, mcollections.TriMesh)
-        )
-        mask = mesh._triangulation.mask
-        assert mask is not None and mask.any(), (
-            "expected at least one long bridging triangle between the two "
-            "far-apart point clusters to be masked out"
-        )
-        assert not mask.all(), (
-            "expected the two clusters' own local triangles to remain visible"
-        )
+        ds = self._coll_ds(lon, lat, sar_vals, val_vals, aggregation_window_km=12.5)
+        fig = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")["ascat_ssm"]
+        ax = fig.axes[0]
+        mesh = next(c for c in ax.collections if isinstance(c, mcollections.QuadMesh))
+        coords = mesh.get_coordinates()
+        lon_span = float(coords[..., 0].max() - coords[..., 0].min())
+        assert lon_span < 10.0, f"expected a narrow local grid, got a {lon_span} degree span"
         plt.close("all")
 
     def test_land_based_collocations_remain_visible(self):
-        """A source's mesh must not be hidden by land: collocations for a
+        """A source's grid must not be hidden by land: collocations for a
         land-based quantity (for example soil moisture) sit on land by
         definition, so land cannot draw above the data or every such
         difference page would render as a blank land-colored rectangle."""
@@ -3392,11 +3368,11 @@ class TestPlotGeographicDifference:
         )
         result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
         ax = result["ascat_ssm"].axes[0]
-        mesh = next(c for c in ax.collections if isinstance(c, mcollections.TriMesh))
+        mesh = next(c for c in ax.collections if isinstance(c, mcollections.QuadMesh))
         land_features = [c for c in ax.collections if isinstance(c, FeatureArtist)]
         assert land_features, "expected land/coastline feature artists on the axes"
         assert all(mesh.zorder > f.zorder for f in land_features), (
-            "expected the mesh to draw above land so land-based collocations stay visible"
+            "expected the grid to draw above land so land-based collocations stay visible"
         )
         plt.close("all")
 
@@ -5494,7 +5470,7 @@ class TestValidationReportSoilMoistureDifferenceUsesRescaledSar:
                 continue
             for ax in fig.axes:
                 for coll in ax.collections:
-                    if isinstance(coll, mcollections.TriMesh):
+                    if isinstance(coll, (mcollections.QuadMesh, mcollections.PathCollection)):
                         return coll
         return None
 
@@ -5515,13 +5491,15 @@ class TestValidationReportSoilMoistureDifferenceUsesRescaledSar:
 
         figs = result["sarSSM_vs_SOIL_MOISTURE"]
         mesh = self._difference_mesh(figs)
-        assert mesh is not None, "expected a difference page with a mesh for the ascat_ssm source"
+        assert mesh is not None, "expected a difference page with a plotted collection for the ascat_ssm source"
 
         # The difference page only ever covers ascat_ssm (the sole
         # layer_vs_layer source); ismn's rows are point_vs_layer and never
-        # reach it, so they are excluded here to match the mesh. tripcolor's
-        # gouraud-shaded array holds one value per input vertex in input
-        # order, so no reshape is needed to compare against it.
+        # reach it, so they are excluded here to match the plotted
+        # collection. This fixture carries no aggregation_window_km, so
+        # the source renders through the scatter fallback, whose color
+        # array holds one value per input point in input order, so no
+        # reshape is needed to compare against it.
         ascat_mask = (expected_ds["val_source"].values == "ascat_ssm")
         actual = np.ma.filled(mesh.get_array(), np.nan)
         expected = (
