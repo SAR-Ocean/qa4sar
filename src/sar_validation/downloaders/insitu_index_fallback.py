@@ -56,29 +56,49 @@ class IndexRow:
 _INDEX_MAX_AGE = timedelta(days=1)
 
 
+def _index_max_age_for_window(window_end: "datetime | None") -> timedelta:
+    """
+    How long a cached index file is trusted, scaled by how far in the
+    past the query window itself is. A window from well in the past
+    queries a fixed historical archive that gains no new platforms day
+    to day, so a much longer cache lifetime is safe there; a recent or
+    ongoing window still needs the tight default so a newly added
+    platform is not silently missed.
+    """
+    if window_end is None:
+        return _INDEX_MAX_AGE
+    age = datetime.now() - window_end
+    if age > timedelta(days=60):
+        return timedelta(days=30)
+    if age > timedelta(days=14):
+        return timedelta(days=7)
+    return _INDEX_MAX_AGE
+
+
 def fetch_index_file(
     dataset_id: str, dataset_part: str, work_dir: Path, force_download: bool = False,
+    window_end: "datetime | None" = None,
 ) -> Path:
-    """Download (or reuse, while younger than _INDEX_MAX_AGE) one
-    dataset/part's in-situ TAC index file and return its local path.
+    """Download (or reuse, while younger than _index_max_age_for_window)
+    one dataset/part's in-situ TAC index file and return its local path.
 
     copernicusmarine.get(index_parts=True) always fetches all of a
     dataset's index files together (confirmed live: its own filter/regex
     parameters have no effect in this mode) -- a real bandwidth cost
-    (several hundred MB combined) but one this function limits to roughly
-    once per day per dataset, not once per run, via the staleness check
-    above. no_directories=True keeps the files directly under work_dir
-    (confirmed live to still work under index_parts=True) rather than
-    copernicusmarine's default nested product-id/version subdirectories,
-    which the staleness check below relies on to find the cached copy at
-    all.
+    (several hundred MB combined) but one this function limits via the
+    staleness check above, at a rate matched to how far in the past
+    *window_end* (the query's own time window) is. no_directories=True
+    keeps the files directly under work_dir (confirmed live to still
+    work under index_parts=True) rather than copernicusmarine's default
+    nested product-id/version subdirectories, which the staleness check
+    below relies on to find the cached copy at all.
     """
     import copernicusmarine
 
     cached_path = work_dir / f"index_{dataset_part}.txt"
     if not force_download and cached_path.exists():
         age = datetime.now() - datetime.fromtimestamp(cached_path.stat().st_mtime)
-        if age < _INDEX_MAX_AGE:
+        if age < _index_max_age_for_window(window_end):
             return cached_path
 
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -505,7 +525,7 @@ def download_via_index(
     start = pd.Timestamp(normalize_datetime(start_dt))
     end = pd.Timestamp(normalize_datetime(end_dt))
 
-    index_path = fetch_index_file(dataset_id, dataset_part, work_dir, force_download)
+    index_path = fetch_index_file(dataset_id, dataset_part, work_dir, force_download, window_end=end.to_pydatetime())
     rows = rows_matching_query(
         index_path, min_lon, max_lon, min_lat, max_lat, start.to_pydatetime(),
         end.to_pydatetime(), wanted_variables,
@@ -610,7 +630,7 @@ def dry_platform_ranges(
     start = pd.Timestamp(normalize_datetime(start_dt))
     end = pd.Timestamp(normalize_datetime(end_dt))
 
-    index_path = fetch_index_file(dataset_id, dataset_part, work_dir)
+    index_path = fetch_index_file(dataset_id, dataset_part, work_dir, window_end=end.to_pydatetime())
     rows = rows_matching_query(
         index_path, min_lon, max_lon, min_lat, max_lat, start.to_pydatetime(),
         end.to_pydatetime(), wanted_variables,

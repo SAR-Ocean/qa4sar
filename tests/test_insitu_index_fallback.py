@@ -102,6 +102,63 @@ def test_fetch_index_file_force_download_refetches_even_a_fresh_copy(tmp_path):
     fake_module.get.assert_called_once()
 
 
+def test_index_max_age_scales_with_how_historic_the_query_window_is():
+    from datetime import timedelta
+
+    from sar_validation.downloaders.insitu_index_fallback import _index_max_age_for_window
+
+    now = datetime.now()
+    assert _index_max_age_for_window(now) == timedelta(days=1)
+    assert _index_max_age_for_window(now - timedelta(days=10)) == timedelta(days=1)
+    assert _index_max_age_for_window(now - timedelta(days=15)) == timedelta(days=7)
+    assert _index_max_age_for_window(now - timedelta(days=61)) == timedelta(days=30)
+    assert _index_max_age_for_window(None) == timedelta(days=1)
+
+
+def test_fetch_index_file_reuses_a_five_day_old_cache_for_a_historic_window(tmp_path):
+    """A cache older than the 1-day default would normally be
+    considered stale, but a query window from three weeks ago only
+    needs a 7-day-fresh index, since a historical archive that far in
+    the past gains no new platforms day to day."""
+    from datetime import timedelta
+
+    cached_path = tmp_path / "index_history.txt"
+    cached_path.write_text(_FIXTURE_INDEX)
+    stale_time = time.time() - timedelta(days=5).total_seconds()
+    os.utime(cached_path, (stale_time, stale_time))
+
+    fake_module = MagicMock()
+    window_end = datetime.now() - timedelta(days=20)
+
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        result = fetch_index_file("dataset", "history", tmp_path, window_end=window_end)
+
+    assert result == cached_path
+    fake_module.get.assert_not_called()
+
+
+def test_fetch_index_file_still_refetches_beyond_the_scaled_max_age(tmp_path):
+    """A cache old enough to exceed even the widened threshold for a
+    historic window must still refetch."""
+    from datetime import timedelta
+
+    cached_path = tmp_path / "index_history.txt"
+    cached_path.write_text(_FIXTURE_INDEX)
+    stale_time = time.time() - timedelta(days=10).total_seconds()
+    os.utime(cached_path, (stale_time, stale_time))
+
+    fake_module = MagicMock()
+    fake_module.get.return_value = MagicMock(
+        files=[MagicMock(filename="index_history.txt", file_path=cached_path)],
+    )
+    window_end = datetime.now() - timedelta(days=1)
+
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        fetch_index_file("dataset", "history", tmp_path, window_end=window_end)
+
+    fake_module.get.assert_called_once()
+
+
 def test_iter_index_rows_parses_data_lines_skipping_comment_header(tmp_path):
     index_path = tmp_path / "index_history.txt"
     index_path.write_text(_FIXTURE_INDEX)
