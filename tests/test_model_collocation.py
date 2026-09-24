@@ -474,6 +474,32 @@ class TestModelLayerCollocationIndividualGrid:
         assert len(results) > 0
         assert all(r.aggregation_window_km is None for r in results)
 
+    def test_records_sar_pixel_spacing_km(self):
+        """The individual method interpolates the model directly at
+        each SAR pixel with no spatial averaging, so instead of an
+        aggregation window it records the SAR grid's own native pixel
+        spacing."""
+        from sar_validation.core.model_collocation import ModelLayerCollocation
+
+        era5_ds = _make_era5_ds()
+        sar_lon = np.array([[-9.5, -9.0], [-9.5, -9.0]])
+        sar_lat = np.array([[41.0, 41.0], [40.5, 40.5]])
+        sar_time = np.array([np.datetime64("2026-07-12T01:00:00")])
+        sar_data = {"owiWindSpeed": np.array([[[5.0, 6.0], [7.0, 8.0]]])}
+
+        colloc = ModelLayerCollocation(method="individual", temporal_method="nearest")
+        results = colloc.collocate(
+            sar_data=sar_data, sar_lon=sar_lon, sar_lat=sar_lat, sar_time=sar_time,
+            model_ds=era5_ds, val_source="era5", sar_scene_name="scene1",
+        )
+        assert len(results) > 0
+        assert all(r.aggregation_window_km is None for r in results)
+        # This 2x2 grid steps 0.5 deg in both lon and lat, converted to
+        # km at its own mean latitude (40.75 deg): 55.66 km (lat) and
+        # 42.166 km (lon), averaging to 48.913 km.
+        for r in results:
+            assert r.sar_pixel_spacing_km == pytest.approx(48.913, rel=1e-3)
+
     def test_nan_sar_pixel_produces_no_match(self):
         from sar_validation.core.model_collocation import ModelLayerCollocation
 

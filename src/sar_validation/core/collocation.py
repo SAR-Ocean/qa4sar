@@ -100,6 +100,13 @@ class CollocatedPoint:
     # no spatial averaging.
     aggregation_window_km: Optional[float] = None
 
+    # The SAR product's own native pixel grid spacing (km), recorded
+    # only on rows matched by direct nearest-pixel lookup with no
+    # spatial averaging -- None wherever aggregation_window_km already
+    # describes the row's real spatial footprint, and None for
+    # collocation methods with no continuous SAR grid to measure.
+    sar_pixel_spacing_km: Optional[float] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "sar_lon":                   self.sar_lon,
@@ -119,6 +126,7 @@ class CollocatedPoint:
             "sar_x_idx":                 self.sar_x_idx,
             "sar_scene_name":            self.sar_scene_name,
             "aggregation_window_km":     self.aggregation_window_km,
+            "sar_pixel_spacing_km":      self.sar_pixel_spacing_km,
         }
 
 
@@ -2223,6 +2231,22 @@ class LayerLayerCollocation(PointLayerCollocation):
         sar_times = _to_datetime_array(sar_time)
         collocations: List[CollocatedPoint] = []
 
+        # This SAR scene's own native pixel grid spacing, derived once
+        # from the median distance between adjacent grid cells (the same
+        # degrees-to-km conversion this codebase already uses for
+        # HF-radar's own native-resolution derivation), recorded on every
+        # row below in place of an aggregation window, since none of
+        # these matches involve spatial averaging.
+        sar_pixel_spacing_km: Optional[float] = None
+        if sar_lat.shape[0] > 1 and sar_lon.shape[1] > 1:
+            lat_spacing_deg = float(np.nanmedian(np.abs(np.diff(sar_lat, axis=0))))
+            lon_spacing_deg = float(np.nanmedian(np.abs(np.diff(sar_lon, axis=1))))
+            mean_lat = float(np.nanmean(sar_lat))
+            lat_spacing_km = lat_spacing_deg * 111.32
+            lon_spacing_km = lon_spacing_deg * 111.32 * max(np.cos(np.radians(mean_lat)), 1e-6)
+            if lat_spacing_km > 0 and lon_spacing_km > 0:
+                sar_pixel_spacing_km = (lat_spacing_km + lon_spacing_km) / 2.0
+
         # Pre-filter scatterometer data: spatial and temporal bounds.
         # nanmin/nanmax: SAR grids commonly carry NaN lon/lat at masked or
         # edge cells, and plain min/max would propagate that NaN into every
@@ -2468,6 +2492,7 @@ class LayerLayerCollocation(PointLayerCollocation):
                         sar_x_idx=x_idx,
                         sar_scene_name=sar_scene_name,
                         aggregation_window_km=None,
+                        sar_pixel_spacing_km=sar_pixel_spacing_km,
                     )
                 )
 

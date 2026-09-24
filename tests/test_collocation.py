@@ -545,6 +545,35 @@ class TestLayerLayerCollocation:
         assert len(results) > 0
         assert all(r.aggregation_window_km is None for r in results)
 
+    def test_individual_method_records_sar_pixel_spacing_km(self):
+        """The individual method matches each SAR pixel to its single
+        closest validation point with no spatial averaging, so instead
+        of an aggregation window it records the SAR grid's own native
+        pixel spacing."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        scat_lons = np.linspace(-1.5, 1.5, 8)
+        scat_lats = np.linspace(50.5, 53.5, 6)
+        mg_lon, mg_lat = np.meshgrid(scat_lons, scat_lats)
+        val = _make_val_dataframe(
+            lons=mg_lon.ravel().tolist(),
+            lats=mg_lat.ravel().tolist(),
+            times=[datetime(2026, 1, 1, 12, 0, 0)] * mg_lon.size,
+            wind_speed=[8.5] * mg_lon.size,
+            wind_dir=[230.0] * mg_lon.size,
+        )
+        colloc = LayerLayerCollocation(spatial_tolerance_km=100, time_tolerance_minutes=60,
+                                        aggregation_window_km=80, method="individual")
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
+
+        assert len(results) > 0
+        assert all(r.aggregation_window_km is None for r in results)
+        # _make_sar_grid()'s default 5x4 grid spans lon [-1.0, 1.0] (0.5 deg
+        # steps) and lat [51.0, 53.0] (0.6667 deg steps) -- converted to km
+        # at this grid's own mean latitude (52.0 deg), lat spacing is
+        # 74.213 km and lon spacing is 34.268 km, averaging to 54.241 km.
+        for r in results:
+            assert r.sar_pixel_spacing_km == pytest.approx(54.241, rel=1e-3)
+
     def test_no_match_outside_time_tolerance(self):
         grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
         val = _make_val_dataframe(
