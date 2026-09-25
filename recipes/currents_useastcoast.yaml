@@ -28,13 +28,10 @@ validation_sources:
 - source_type: hf_radar_us
   download_kwargs: {}
   collocation_kwargs: {}
-- source_type: drifter
+- source_type: buoy_cmems_family
   download_kwargs: {}
   collocation_kwargs: {}
-- source_type: ferrybox
-  download_kwargs: {}
-  collocation_kwargs: {}
-- source_type: mooring
+- source_type: ship_cmems_family
   download_kwargs: {}
   collocation_kwargs: {}
 - source_type: adcp_historical

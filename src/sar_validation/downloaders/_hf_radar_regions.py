@@ -5,8 +5,11 @@ Bounding boxes and the "has_latest" flag are read from
 ``copernicusmarine.describe(dataset_id="cmems_obs-ins_glo_phybgcwav_mynrt_na_irr")``:
 each ``<latest|monthly>-radar-total--<Region>`` dataset_part's declared
 variable bbox is the region's real grid extent. ``monthly-radar-total``
-covers all 25 regions; ``latest-radar-total`` exists only for the 18
-with a near-real-time feed.
+covers all 25 regions; ``latest-radar-total`` exists only for 19 of them.
+Catalogues drift over time, so re-check against a live
+``copernicusmarine.describe()`` call periodically rather than trusting
+this table indefinitely; ``handy_notebooks/
+extract_hf_radar_station_metadata.ipynb`` automates that check.
 """
 
 from __future__ import annotations
@@ -16,8 +19,7 @@ from typing import Dict, Tuple, TypedDict
 __all__ = ["HFR_REGIONS", "resolve_hfr_region"]
 
 _NO_LATEST = {
-    "ARPAS", "COSYNA", "Finnmark", "US-Alaska",
-    "US-EastGulfCoast", "US-Hawaii", "WHub",
+    "ARPAS", "COSYNA", "Finnmark", "US-Alaska", "US-Hawaii", "WHub",
 }
 
 _BBOXES: Dict[str, Tuple[float, float, float, float]] = {

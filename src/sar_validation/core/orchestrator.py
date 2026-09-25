@@ -14,22 +14,26 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
 
 from ..downloaders.base import build_output_dir
-from .recipe import Recipe
+from .recipe import GeographicBounds, Recipe
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["DataOrchestrator"]
 
 # In-situ platform types handled by the InSituDownloader
-_INSITU_TYPES = {"mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"}
+_INSITU_TYPES = {
+    "mooring", "buoy_cmems", "buoy_cmems_family", "buoy_waterfall",
+    "drifter", "ship_cmems_family", "tidal_gauge",
+}
 
 # Delayed-mode ("historical") source_types, dispatched before any NRT
 # source such that its results can inform whether the NRT counterpart is
@@ -51,6 +55,17 @@ _HISTORICAL_FIRST_PAIRS = {
     "hf_radar": "hf_radar_historical",
     "drifter": "drifter_historical",
 }
+
+# buoy_gts/ship_gts are ordinarily dispatched separately from every other
+# source_type (see DataOrchestrator._dispatch_gts_sources_in_background),
+# ahead of step 4's "other sources" loop in download_all() -- this set is
+# the single place that source_type pairing is expressed, rather than
+# repeating the "buoy_gts"/"ship_gts" string literals elsewhere. A recipe
+# combining "buoy_gts" with "buoy_waterfall" is the one exception: step 4
+# checks against the dispatched-types set _dispatch_gts_sources_in_background
+# actually returns, not this static set, since that case leaves "buoy_gts"
+# for step 4 to handle instead.
+_GTS_BACKGROUND_TYPES = frozenset({"buoy_gts", "ship_gts"})
 
 # Delayed-mode in-situ current instruments that share a single combined
 # "no data" message (see _report_combined_currents_status) instead of each
@@ -259,6 +274,16 @@ class DataOrchestrator:
         # on first use, keyed by validation source_type -- None until then,
         # matching _sar_scene_times's own established laziness pattern.
         self._collocation_predictions_cache: Optional[Dict[str, Any]] = None
+
+        # Populated lazily by _footprint_narrowed_bounds() on first use --
+        # None until then, matching _collocation_predictions_cache's own
+        # established laziness pattern. Computed independently of
+        # _collocation_predictions_cache (a second, cheap
+        # sar_footprints_from_downloaded call) rather than sharing that
+        # cache's footprints, since _collocation_predictions() discards
+        # its own footprints after building predictions and does not
+        # expose them.
+        self._footprint_narrowed_bounds_cache: Optional[GeographicBounds] = None
 
     # ------------------------------------------------------------------
     # Setup
@@ -628,6 +653,124 @@ class DataOrchestrator:
         prediction = self._collocation_predictions().get(source_type)
         return prediction is not None and prediction.verdict == "none-predicted"
 
+    def _footprint_narrowed_bounds(self) -> GeographicBounds:
+        """
+        The union bbox of this run's real, already-downloaded SAR
+        footprints, padded by cfg.collocation.sar_footprint_radius_km, or
+        the recipe's full geographic_bounds if footprint computation is
+        unavailable, empty, or fails.
+
+        Computed once (cached) from the real downloaded+converted SAR
+        files, independent of which validation source_type calls it --
+        extending narrowing to another downloader later needs only a call
+        to this same method, no new footprint logic.
+        """
+        cfg = self.recipe.config
+        if self._footprint_narrowed_bounds_cache is not None:
+            return self._footprint_narrowed_bounds_cache
+
+        fallback = cfg.geographic_bounds
+        try:
+            from .dry_collocation import sar_footprints_from_downloaded
+            from .sar_sources import SAR_SOURCES
+
+            sar_entry = self.metadata["downloads"].get("sar", {})
+            sar_files = [Path(f) for f in sar_entry.get("files", [])]
+            sar_source_spec = SAR_SOURCES[cfg.sar_data.source]
+            footprints = sar_footprints_from_downloaded(sar_files, sar_source_spec, cfg.variable)
+            if not footprints:
+                self._footprint_narrowed_bounds_cache = fallback
+                return fallback
+
+            radius_deg = cfg.collocation.sar_footprint_radius_km / 111.0
+            min_lon = min(fp.bbox[0] for fp in footprints) - radius_deg
+            max_lon = max(fp.bbox[1] for fp in footprints) + radius_deg
+            min_lat = min(fp.bbox[2] for fp in footprints) - radius_deg
+            max_lat = max(fp.bbox[3] for fp in footprints) + radius_deg
+            self._footprint_narrowed_bounds_cache = GeographicBounds(
+                min_lon=min_lon, max_lon=max_lon, min_lat=min_lat, max_lat=max_lat,
+            )
+        except Exception:
+            logger.debug(
+                "_footprint_narrowed_bounds: footprint derivation failed, "
+                "falling back to the recipe's full geographic_bounds", exc_info=True,
+            )
+            self._footprint_narrowed_bounds_cache = fallback
+        return self._footprint_narrowed_bounds_cache
+
+    def _dispatch_gts_sources_in_background(
+        self,
+    ) -> Tuple[List[Tuple[threading.Thread, str]], Set[str]]:
+        """
+        Start a background daemon thread for every "buoy_gts"/"ship_gts"
+        validation source in this recipe, applying the same
+        _already_succeeded/_should_skip_for_collocation gates step 4's
+        "other sources" loop would otherwise apply -- moving their
+        dispatch earlier must not change whether a given source is
+        skipped, only when it starts.
+
+        Each MARS request already bounds its own worst-case duration (see
+        gts_buoy_downloader.py/gts_ship_downloader.py's per-day timeout),
+        so no additional timeout is applied here -- the caller joins each
+        returned thread without one, in _join_gts_threads.
+
+        A recipe may also list "buoy_waterfall", whose own GTS download
+        (in download_all()'s step 3) writes to the same gts_buoy/ per-day
+        files as "buoy_gts" -- backgrounding "buoy_gts" in that case would
+        race step 3's main-thread call against the same target files. When
+        "buoy_waterfall" is present, "buoy_gts" is left completely
+        untouched here so it falls through to step 4's "other sources"
+        loop instead, which already runs after step 3 on the main thread.
+
+        Returns the started (thread, source_type) pairs to join later,
+        together with the set of source_types this method actually
+        handled -- step 4 uses that set to tell an untouched "buoy_gts"
+        apart from one already handled here.
+        """
+        threads: List[Tuple[threading.Thread, str]] = []
+        handled_types: Set[str] = set()
+        handlers = {"buoy_gts": self._download_gts_buoy, "ship_gts": self._download_gts_ship}
+        present_types = {s.source_type for s in self.recipe.config.validation_sources}
+        buoy_waterfall_present = "buoy_waterfall" in present_types
+        for source in self.recipe.config.validation_sources:
+            if source.source_type not in _GTS_BACKGROUND_TYPES:
+                continue
+            if source.source_type == "buoy_gts" and buoy_waterfall_present:
+                continue
+            handled_types.add(source.source_type)
+            if self._already_succeeded(source.source_type):
+                self.metadata["downloads"][source.source_type] = self._previous_downloads[source.source_type]
+                logger.info(
+                    "Skipping %s: already succeeded in a previous run.",
+                    source.source_type,
+                )
+                continue
+            if self._should_skip_for_collocation(source.source_type):
+                self.metadata["downloads"][source.source_type] = {
+                    "status": "skipped", "reason": "no predicted collocation with SAR data",
+                }
+                logger.info("Skipping %s: no predicted collocation.", source.source_type)
+                continue
+            handler = handlers[source.source_type]
+            thread = threading.Thread(target=handler, args=(source,), daemon=True)
+            thread.start()
+            threads.append((thread, source.source_type))
+        return threads, handled_types
+
+    def _join_gts_threads(self, threads: List[Tuple[threading.Thread, str]], ok: bool) -> bool:
+        """Wait for every background GTS thread _dispatch_gts_sources_in_background
+        started, folding each one's recorded success/failure into *ok*.
+        A thread's own downloader already records its outcome into
+        self.metadata["downloads"] the same way a synchronous source
+        would (see _run_download), so this only needs to read that
+        outcome back, not compute a new one."""
+        for thread, source_type in threads:
+            thread.join()
+            entry = self.metadata["downloads"].get(source_type, {})
+            if entry.get("status") == "failed":
+                ok = False
+        return ok
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -665,6 +808,8 @@ class DataOrchestrator:
             return ok
 
         self._compute_sar_scene_times()
+
+        gts_threads, gts_dispatched_types = self._dispatch_gts_sources_in_background()
 
         # 2. Delayed-mode ("*_historical") sources first. hf_radar and the
         # NRT in-situ batch (below) consult file_count from these results
@@ -718,10 +863,35 @@ class DataOrchestrator:
             if not self._download_insitu(source_types, min_depth, max_depth):
                 ok = False
         elif insitu_sources:
-            logger.info(
-                "Skipping NRT in-situ batch: every requested platform type "
-                "is covered by a historical source for this window."
+            reason = (
+                "every requested platform type is either covered by a historical "
+                "source or has no predicted collocation with SAR data"
             )
+            logger.info("Skipping NRT in-situ batch: %s.", reason)
+            self.metadata["downloads"]["insitu"] = {"status": "skipped", "reason": reason}
+
+        # buoy_waterfall additionally needs its own GTS download, on top
+        # of (not instead of) the Copernicus in-situ batch above --
+        # _INSITU_TYPES routes it through that batch for the Copernicus
+        # side, but the GTS side has no batch equivalent to join.
+        for source in self.recipe.config.validation_sources:
+            if source.source_type != "buoy_waterfall":
+                continue
+            if self._already_succeeded(source.source_type):
+                self.metadata["downloads"][source.source_type] = self._previous_downloads[source.source_type]
+                logger.info(
+                    "Skipping %s: already succeeded in a previous run.",
+                    source.source_type,
+                )
+                continue
+            if self._should_skip_for_collocation(source.source_type):
+                self.metadata["downloads"][source.source_type] = {
+                    "status": "skipped", "reason": "no predicted collocation with SAR data",
+                }
+                logger.info("Skipping %s: no predicted collocation.", source.source_type)
+                continue
+            if not self._download_gts_buoy(source):
+                ok = False
 
         # 4. Other sources one by one
         for source in self.recipe.config.validation_sources:
@@ -729,6 +899,8 @@ class DataOrchestrator:
                 continue   # handled above
             if source.source_type in _HISTORICAL_FIRST_TYPES:
                 continue   # already dispatched in step 2
+            if source.source_type in gts_dispatched_types:
+                continue   # already dispatched in the background, right after SAR
             paired_historical = _HISTORICAL_FIRST_PAIRS.get(source.source_type)
             if paired_historical and historical_had_data.get(paired_historical):
                 self.metadata["downloads"][source.source_type] = {
@@ -758,6 +930,8 @@ class DataOrchestrator:
 
         self._report_combined_hf_radar_us_status()
         self._report_combined_hf_radar_status()
+
+        ok = self._join_gts_threads(gts_threads, ok)
 
         if not self.dry_run:
             self._save_metadata()
@@ -801,8 +975,7 @@ class DataOrchestrator:
     ) -> bool:
         from ..downloaders.insitu_downloader import InSituDownloader
 
-        cfg    = self.recipe.config
-        bounds = cfg.geographic_bounds
+        bounds = self._footprint_narrowed_bounds()
         windows = self._padded_temporal_bounds(*source_types)
 
         out_dir = self.base_dir / "copernicus_insitu"
@@ -924,6 +1097,8 @@ class DataOrchestrator:
             "scatterometer_hy2b": self._download_scatterometer_hy2b,
             "scatterometer_hy2c": self._download_scatterometer_hy2c,
             "scatterometer_oceansat3": self._download_scatterometer_oceansat3,
+            "buoy_gts":      self._download_gts_buoy,
+            "ship_gts":      self._download_gts_ship,
             "hf_radar":      self._download_hf_radar,
             "hf_radar_noaa": self._download_noaa_hfradar,
             "hf_radar_historical": self._download_hf_radar_historical,
@@ -1396,6 +1571,63 @@ class DataOrchestrator:
     def _download_scatterometer_oceansat3(self, source) -> bool:
         return self._download_scatterometer_ftp(source, "oceansat3")
 
+    def _download_gts_buoy(self, source) -> bool:
+        """Download GTS buoy reports for *source*, which may be a standalone
+        "buoy_gts" validation source or the GTS side of a "buoy_waterfall"
+        source (see download_all's buoy_waterfall loop). Both share the same
+        physical output_dir. Temporal padding and download metadata are both
+        keyed by the calling source's own source_type, so a source-specific
+        override (e.g. collocation_kwargs["time_tolerance_minutes"] on a
+        "buoy_waterfall" validation source) is honored regardless of which
+        validation-source entry triggered this call, and
+        _already_succeeded("buoy_waterfall") can find a prior success
+        recorded by this same method on an earlier run."""
+        from ..downloaders.gts_buoy_downloader import GTSBuoyDownloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        windows = self._padded_temporal_bounds(source.source_type)
+        out_dir = self.base_dir / "gts_buoy"
+
+        return self._run_download(
+            source.source_type, out_dir,
+            lambda: GTSBuoyDownloader(
+                output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
+            ),
+            windows,
+            lambda start, end: dict(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=start,            end=end,
+            ),
+            "GTS buoy",
+            result_to_metadata=lambda result, dl: {"files": [str(p) for p in (result or [])]},
+        )
+
+    def _download_gts_ship(self, source) -> bool:
+        """Download GTS ship reports for *source* ("ship_gts")."""
+        from ..downloaders.gts_ship_downloader import ShipDownloader
+
+        cfg    = self.recipe.config
+        bounds = cfg.geographic_bounds
+        windows = self._padded_temporal_bounds(source.source_type)
+        out_dir = self.base_dir / "gts_ship"
+
+        return self._run_download(
+            source.source_type, out_dir,
+            lambda: ShipDownloader(
+                output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
+            ),
+            windows,
+            lambda start, end: dict(
+                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                start=start,            end=end,
+            ),
+            "GTS ship",
+            result_to_metadata=lambda result, dl: {"files": [str(p) for p in (result or [])]},
+        )
+
     def _download_hf_radar(self, source) -> bool:
         from ..downloaders.hf_radar_downloader import HFRadarDownloader
 
@@ -1600,39 +1832,96 @@ class DataOrchestrator:
         "waves": ["1hz"],
     }
 
+    #: Boundary between the reprocessed (multi-year) altimeter product,
+    #: which covers dates up to and including 2023-12-31, and the
+    #: near-real-time product, which covers 2024-01-01 onward.
+    _ALTIMETER_REPROCESSED_CUTOVER = "2024-01-01T00:00:00"
+
     def _download_altimeter(self, source) -> bool:
         from ..downloaders.altimeter_downloader import AltimeterDownloader
+        from ..downloaders.base import split_datetime_range_at_cutover
+        from ..downloaders.reprocessed_altimeter_downloader import ReprocessedAltimeterDownloader
 
         cfg    = self.recipe.config
         bounds = cfg.geographic_bounds
-        # DEFAULT_LAYER_TYPE_SPECS keys altimeter by frequency
-        # ("altimeter_1hz"/"altimeter_5hz"), not the bare "altimeter"
-        # source_type; both are passed so the padding lookup finds their
-        # (equal, 180min) tolerance regardless of which frequency this
-        # recipe's variable requests.
-        windows = self._padded_temporal_bounds("altimeter_1hz", "altimeter_5hz")
-        out_dir = self.base_dir / "altimeter"
-        kwargs = {
+        # DEFAULT_LAYER_TYPE_SPECS keys altimeter by product/frequency
+        # ("altimeter_1hz"/"altimeter_5hz"/"altimeter_reprocessed"), not
+        # the bare "altimeter" source_type; all three are passed so the
+        # padding lookup finds their (equal, 180min) tolerance regardless
+        # of which one this recipe's window actually resolves to.
+        windows = self._padded_temporal_bounds("altimeter_1hz", "altimeter_5hz", "altimeter_reprocessed")
+
+        nrt_kwargs = {
             "frequencies": self._ALTIMETER_FREQUENCIES_BY_VARIABLE.get(
                 cfg.variable, ["1hz"]
             ),
         }
-        kwargs.update(source.download_kwargs)   # recipe-level override wins
+        nrt_kwargs.update(source.download_kwargs)   # recipe-level override wins
 
-        return self._run_download(
-            "altimeter", out_dir,
-            lambda: AltimeterDownloader(
-                output_dir=out_dir, dry_run=self.dry_run, force_download=self.force_download,
-            ),
-            windows,
-            lambda start, end: dict(
-                min_lon=bounds.min_lon, max_lon=bounds.max_lon,
-                min_lat=bounds.min_lat, max_lat=bounds.max_lat,
-                start=start, end=end,
-                **kwargs,
-            ),
-            "Altimeter",
-        )
+        def _download_nrt(nrt_windows) -> bool:
+            nrt_out_dir = self.base_dir / "altimeter"
+            return self._run_download(
+                "altimeter", nrt_out_dir,
+                lambda: AltimeterDownloader(
+                    output_dir=nrt_out_dir, dry_run=self.dry_run, force_download=self.force_download,
+                ),
+                nrt_windows,
+                lambda start, end: dict(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=start, end=end,
+                    **nrt_kwargs,
+                ),
+                "Altimeter",
+            )
+
+        # The reprocessed product carries significant wave height only --
+        # a recipe requesting a different variable (e.g. wind) gets no
+        # usable data from it, so the whole window goes to the
+        # near-real-time downloader unsplit (that downloader already finds
+        # nothing before its own missions' availability dates).
+        if cfg.variable != "waves":
+            return _download_nrt(windows)
+
+        reprocessed_windows: "list[tuple[str, str]]" = []
+        nrt_windows: "list[tuple[str, str]]" = []
+        for start, end in windows:
+            before, after = split_datetime_range_at_cutover(start, end, self._ALTIMETER_REPROCESSED_CUTOVER)
+            if before is not None and before[0] != before[1]:
+                reprocessed_windows.append(before)
+            if after is not None and after[0] != after[1]:
+                nrt_windows.append(after)
+
+        ok = True
+
+        if reprocessed_windows:
+            reprocessed_out_dir = self.base_dir / "altimeter_reprocessed"
+            ok = self._run_download(
+                "altimeter_reprocessed", reprocessed_out_dir,
+                lambda: ReprocessedAltimeterDownloader(
+                    output_dir=reprocessed_out_dir, dry_run=self.dry_run, force_download=self.force_download,
+                ),
+                reprocessed_windows,
+                lambda start, end: dict(
+                    min_lon=bounds.min_lon, max_lon=bounds.max_lon,
+                    min_lat=bounds.min_lat, max_lat=bounds.max_lat,
+                    start=start, end=end,
+                ),
+                "Reprocessed altimeter",
+            ) and ok
+
+        if nrt_windows:
+            ok = _download_nrt(nrt_windows) and ok
+        elif reprocessed_windows:
+            # The whole requested window fell before the cutover, so the
+            # near-real-time downloader never ran -- but the recipe's own
+            # source_type is "altimeter" regardless of which product
+            # actually served it, and the already-downloaded check in
+            # cli.py keys off source_type, so its outcome is aliased under
+            # "altimeter" too.
+            self.metadata["downloads"]["altimeter"] = self.metadata["downloads"]["altimeter_reprocessed"]
+
+        return ok
 
     def _download_radiometer(self, source) -> bool:
         from ..downloaders.radiometer_downloader import RadiometerDownloader

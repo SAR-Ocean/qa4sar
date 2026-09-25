@@ -119,7 +119,10 @@ def geo_datatree_and_collocation():
         "sar_owiWindSpeed":            ("collocation", np.array([6.1, 6.9, 8.2, 9.3])),
         "val_WSPD":                    ("collocation", np.array([6.0, 7.0, 8.0, 9.5])),
         "val_source":                  ("collocation", ["mooring", "mooring", "altimeter", "altimeter"]),
+        "collocation_type":            ("collocation", ["point_vs_layer"] * n),
         "sar_scene_name":              ("collocation", ["sceneA"] * n),
+        "sar_lon":                     ("collocation", np.array([-9.8, -9.6, -9.0, -8.8])),
+        "sar_lat":                     ("collocation", np.array([50.2, 50.4, 51.0, 51.2])),
         "val_lon":                     ("collocation", np.array([-9.8, -9.6, -9.0, -8.8])),
         "val_lat":                     ("collocation", np.array([50.2, 50.4, 51.0, 51.2])),
         "val_id":                      ("collocation", ["mo0", "mo1", "al0", "al1"]),
@@ -706,7 +709,7 @@ class TestPlotSummaryTable:
         ds = xr.Dataset({
             "sar_owiWindSpeed": ("collocation", sar),
             "val_WSPD":         ("collocation", val),
-            "val_source":       ("collocation", ["mooring"] * 10 + ["altimeter"] * 10),
+            "val_source":       ("collocation", ["drifter"] * 10 + ["altimeter"] * 10),
         })
         stats_ds = compute_statistics(ds, "owiWindSpeed", "WSPD", group_by=["val_source"])
 
@@ -717,7 +720,7 @@ class TestPlotSummaryTable:
         tables = [c for c in ax.get_children() if hasattr(c, "get_celld")]
         assert len(tables) == 1
         cell_texts = {cell.get_text().get_text() for cell in tables[0].get_celld().values()}
-        assert "mooring" in cell_texts
+        assert "drifter" in cell_texts
         assert "altimeter" in cell_texts
         assert "bias" in cell_texts or "Bias" in cell_texts
         import matplotlib.pyplot as plt
@@ -757,7 +760,7 @@ class TestSourceStyleMap:
 
     def test_distinct_known_sources_get_distinct_styles(self):
         from sar_validation.core.visualization import _source_style_map
-        style = _source_style_map(["altimeter", "radiometer", "mooring", "buoy"])
+        style = _source_style_map(["altimeter", "radiometer", "mooring", "buoy_cmems"])
         colors = [c for c, _ in style.values()]
         markers = [m for _, m in style.values()]
         assert len(set(colors)) == 4
@@ -797,6 +800,28 @@ class TestSourceStyleMap:
         style_lower = _source_style_map(["altimeter"])
         style_title = _source_style_map(["Altimeter"])
         assert style_lower["altimeter"] == style_title["Altimeter"]
+
+    def test_actual_runtime_emitted_buoy_family_labels_get_distinct_styles(self):
+        # _CANONICAL_SOURCE_ORDER must track the labels actually emitted
+        # per point at runtime, not the recipe source_type values -- a
+        # Copernicus Marine drifting-buoy observation's own val_source
+        # label comes from insitu_downloader.PLATFORM_CODE_TO_SOURCE_TYPE
+        # ["DB"] ("buoy"), never from the recipe source_type
+        # ("buoy_cmems"/"buoy_gts"/"buoy_waterfall") that requested it.
+        # _CANONICAL_SOURCE_ORDER must therefore contain "buoy" itself;
+        # an entry for the recipe source_type "buoy_cmems" alone does not
+        # cover it, and "buoy" would then collide with "altimeter"'s slot.
+        from sar_validation.core.visualization import _source_style_map
+        from sar_validation.downloaders.insitu_downloader import PLATFORM_CODE_TO_SOURCE_TYPE
+
+        emitted_labels = sorted(set(PLATFORM_CODE_TO_SOURCE_TYPE.values()) | {"altimeter"})
+        style = _source_style_map(emitted_labels)
+        pairs = [style[name] for name in emitted_labels]
+        assert len(set(pairs)) == len(emitted_labels), (
+            f"Expected every runtime-emitted buoy-family label to get a distinct "
+            f"(color, marker) pair, got collisions: {dict(zip(emitted_labels, pairs))}"
+        )
+        assert style["buoy"] != style["altimeter"]
 
 
 class TestCanonicalSourceOrderStability:
@@ -841,6 +866,21 @@ class TestCanonicalSourceOrderStability:
             ("#9467bd", "v"), ("#8c564b", "P"), ("#e377c2", "X"), ("#469990", "*"),
             ("#f032e6", "h"), ("#e6194b", "p"), ("#000080", "8"), ("#ffff00", "<"),
         ]
+
+    def test_buoy_cmems_reserved_slots_do_not_disturb_earlier_entries(self):
+        # "buoy_cmems", "buoy_cmems_family", and "ship_cmems_family" are
+        # recipe source types, never themselves emitted val_source labels --
+        # their reserved slots sit at the very end of the list so hycom's and
+        # buoy_waterfall's own permanent slots (see
+        # TestHycomCanonicalSourceOrder) are unaffected by their presence.
+        from sar_validation.core.visualization import _canonical_source_order
+
+        canonical = _canonical_source_order()
+        assert canonical.index("hycom") == 16
+        assert canonical.index("buoy_waterfall") == 17
+        assert canonical.index("buoy_cmems") == 18
+        assert canonical.index("buoy_cmems_family") == 19
+        assert canonical.index("ship_cmems_family") == len(canonical) - 1
 
     def test_raises_when_order_list_drifts_out_of_sync_with_registered_sets(self, monkeypatch):
         # If a new source type is ever added to LAYER_DATA_TYPES/_INSITU_TYPES
@@ -1018,6 +1058,55 @@ class TestPlotGeographic:
         assert 90 in recorded_sizes, (
             f"SAR scatter should use point_size + 50 = 90, got {recorded_sizes!r}"
         )
+
+    def test_point_vs_layer_keeps_black_edge_dense_types_omit_it(self, monkeypatch):
+        """A sparse in-situ overlay (e.g. ISMN, point_vs_layer) needs a black
+        marker edge to distinguish individual dots, but the same edge on a
+        dense satellite or model overlay (thousands of points) merges into a
+        solid black mass that hides the SAR field underneath it."""
+        import matplotlib.axes
+        import matplotlib.pyplot as plt
+        import pandas as pd
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.full((y, x), 30.0))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T19:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+
+        rng = np.random.default_rng(0)
+        n_layer, n_point = 6, 3
+        n = n_layer + n_point
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":       ("collocation", rng.uniform(20, 40, n)),
+            "val_SOIL_MOISTURE": ("collocation", rng.uniform(0.1, 0.4, n)),
+            "val_source":       ("collocation", ["ascat_ssm"] * n_layer + ["ismn"] * n_point),
+            "collocation_type": ("collocation", ["layer_vs_layer"] * n_layer + ["point_vs_layer"] * n_point),
+            "sar_scene_name":   ("collocation", ["sceneA"] * n),
+            "val_lon":          ("collocation", rng.uniform(-9.8, -8.2, n)),
+            "val_lat":          ("collocation", rng.uniform(50.2, 51.8, n)),
+        })
+
+        recorded = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded.append((kwargs.get("edgecolors"), kwargs.get("linewidths")))
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        figs = plot_geographic(datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE")
+        plt.close("all")
+
+        assert set(figs.keys()) == {"layer_vs_layer", "point_vs_layer"}
+        assert ("black", 0.9) in recorded, f"point_vs_layer should keep a black edge, got {recorded!r}"
+        assert ("none", 0.0) in recorded, f"layer_vs_layer should drop its edge, got {recorded!r}"
 
     def test_gridded_scene_with_nan_geolocation_does_not_raise(
         self, geo_datatree_and_collocation,
@@ -1812,9 +1901,8 @@ class TestPlotGeographicTicks:
         from sar_validation.core.visualization import plot_geographic
 
         datatree, collocation_ds = geo_datatree_and_collocation
-        # This fixture has no "collocation_type" field, so split_by=None
-        # (matching TestPlotGeographic's existing convention) makes
-        # plot_geographic return a single Figure rather than a dict.
+        # split_by=None (matching TestPlotGeographic's existing convention)
+        # makes plot_geographic return a single Figure rather than a dict.
         fig = plot_geographic(
             datatree, collocation_ds, "owiWindSpeed", "WSPD", split_by=None,
         )
@@ -2223,6 +2311,62 @@ class TestPlotGeographicPanelAspect:
         assert y1 == pytest.approx(expected_y1, abs=1e-6)
 
         plt.close("all")
+
+
+class TestPadLonLatExtent:
+    """_pad_lonlat_extent computes a padded bounding box around a set of
+    point coordinates, for zooming a map to where the data actually is
+    instead of showing a full scene's native extent."""
+
+    def test_pads_around_points_with_default_margin(self):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import _pad_lonlat_extent
+
+        lon = np.array([-9.0, -8.0, -7.0])
+        lat = np.array([50.0, 51.0, 52.0])
+        lon_min, lon_max, lat_min, lat_max = _pad_lonlat_extent(lon, lat, crosses_dateline=False)
+
+        xmargin = plt.rcParams["axes.xmargin"]
+        ymargin = plt.rcParams["axes.ymargin"]
+        assert lon_min < -9.0 - xmargin * 2.0 * 0.99
+        assert lon_max > -7.0 + xmargin * 2.0 * 0.99
+        assert lat_min < 50.0 - ymargin * 2.0 * 0.99
+        assert lat_max > 52.0 + ymargin * 2.0 * 0.99
+
+    def test_degenerate_single_point_gets_nonzero_span(self):
+        from sar_validation.core.visualization import _pad_lonlat_extent
+
+        lon = np.array([-9.0, -9.0, -9.0])
+        lat = np.array([50.0, 50.0, 50.0])
+        lon_min, lon_max, lat_min, lat_max = _pad_lonlat_extent(lon, lat, crosses_dateline=False)
+
+        assert lon_max > lon_min
+        assert lat_max > lat_min
+
+    def test_dateline_crossing_shifts_into_180_frame(self):
+        """Points at 179E and -179W (a real antimeridian-crossing source)
+        must produce one contiguous span in the central_longitude=180
+        frame, not a box spanning nearly the whole globe."""
+        from sar_validation.core.visualization import _pad_lonlat_extent
+
+        lon = np.array([179.0, -179.0])
+        lat = np.array([50.0, 51.0])
+        lon_min, lon_max, lat_min, lat_max = _pad_lonlat_extent(lon, lat, crosses_dateline=True)
+
+        assert lon_max - lon_min < 10.0
+
+    def test_clamps_to_valid_lon_lat_range(self):
+        from sar_validation.core.visualization import _pad_lonlat_extent
+
+        lon = np.array([-179.5, 179.5])
+        lat = np.array([-89.5, 89.5])
+        lon_min, lon_max, lat_min, lat_max = _pad_lonlat_extent(lon, lat, crosses_dateline=False)
+
+        assert lon_min >= -180.0
+        assert lon_max <= 180.0
+        assert lat_min >= -90.0
+        assert lat_max <= 90.0
 
 
 class TestPlotGeographicPointSubsampling:
@@ -2834,6 +2978,61 @@ class TestPlotGeographicTwoColumnByType:
         assert set(result.keys()) == {"point_vs_layer"}
 
 
+class TestPlotGeographicTwoColumnMissingCollocationType:
+    """A standalone ``collocation_results.nc`` file re-run directly
+    through ``plot_geographic`` can predate the ``collocation_type``
+    column (e.g. an older or hand-built file). ``two_column_by_type``
+    must fall back to a single combined figure and log a warning
+    explaining why, instead of silently producing no figure at all."""
+
+    def test_on_figure_receives_one_fallback_figure_and_warns(
+        self, geo_datatree_and_collocation, caplog,
+    ):
+        import logging
+
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        collocation_ds = collocation_ds.drop_vars("collocation_type")
+
+        received = []
+
+        def on_figure(group, fig):
+            received.append((group, fig))
+
+        with caplog.at_level(logging.WARNING, logger="sar_validation.core.visualization"):
+            result = plot_geographic(
+                datatree, collocation_ds, "owiWindSpeed", "WSPD",
+                two_column_by_type=True, on_figure=on_figure,
+            )
+
+        assert len(received) == 1, "expected exactly one fallback Figure via on_figure"
+        assert result == {}
+        assert "collocation_type" in caplog.text, (
+            "expected a warning explaining the fallback to a single combined figure"
+        )
+        plt.close("all")
+
+    def test_without_on_figure_returns_nonempty_dict(self, geo_datatree_and_collocation):
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic
+
+        datatree, collocation_ds = geo_datatree_and_collocation
+        collocation_ds = collocation_ds.drop_vars("collocation_type")
+
+        result = plot_geographic(
+            datatree, collocation_ds, "owiWindSpeed", "WSPD",
+            two_column_by_type=True,
+        )
+
+        assert result, "expected a non-empty dict when on_figure is not given"
+        assert all(fig is not None for fig in result.values())
+        plt.close("all")
+
+
 class TestPlotGeographicOnFigureCallback:
     """The NISAR too-many-open-figures bug: two_column_by_type built every
     scene's Figure before returning any of them, so a many-scene recipe
@@ -2949,6 +3148,465 @@ class TestPlotGeographicOnFigureCallback:
         )
 
         assert sorted(result.keys()) == ["scene0", "scene1", "scene2"]
+        plt.close("all")
+
+
+class TestPlotGeographicDifference:
+    """plot_geographic_difference maps SAR-minus-validation differences,
+    one Figure per qualifying validation source, as a grid of local
+    averages sized to each source's own SAR aggregation window."""
+
+    @staticmethod
+    def _coll_ds(sar_lon, sar_lat, sar_vals, val_vals, val_source="ascat_ssm",
+                 collocation_type="layer_vs_layer",
+                 sar_col="sar_owiWindSpeed", val_col="val_WSPD",
+                 aggregation_window_km=12.5, sar_pixel_spacing_km=None):
+        n = len(sar_lon)
+        if aggregation_window_km is None:
+            agg = np.full(n, np.nan)
+        else:
+            agg = np.broadcast_to(np.asarray(aggregation_window_km, dtype=float), (n,)).copy()
+        if sar_pixel_spacing_km is None:
+            px = np.full(n, np.nan)
+        else:
+            px = np.broadcast_to(np.asarray(sar_pixel_spacing_km, dtype=float), (n,)).copy()
+        return xr.Dataset({
+            sar_col: ("collocation", np.asarray(sar_vals, dtype=float)),
+            val_col: ("collocation", np.asarray(val_vals, dtype=float)),
+            "val_source": ("collocation", [val_source] * n),
+            "collocation_type": ("collocation", [collocation_type] * n),
+            "sar_lon": ("collocation", np.asarray(sar_lon, dtype=float)),
+            "sar_lat": ("collocation", np.asarray(sar_lat, dtype=float)),
+            "aggregation_window_km": ("collocation", agg),
+            "sar_pixel_spacing_km": ("collocation", px),
+        })
+
+    def test_missing_columns_returns_empty_dict(self):
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = xr.Dataset({"sar_owiWindSpeed": ("collocation", [1.0, 2.0])})
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        assert result == {}
+
+    def test_point_vs_layer_source_never_qualifies_regardless_of_point_count(self):
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        n = 50
+        ds = self._coll_ds(
+            sar_lon=np.linspace(-9.8, -8.2, n), sar_lat=np.linspace(50.2, 51.8, n),
+            sar_vals=np.linspace(5.0, 10.0, n), val_vals=np.linspace(5.0, 10.0, n) - 3.0,
+            val_source="mooring", collocation_type="point_vs_layer",
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        assert result == {}
+
+    def test_layer_vs_layer_source_renders_via_pcolormesh(self):
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2, -9.6], sar_lat=[50.2, 50.8, 50.4, 50.5],
+            sar_vals=[8.0, 9.0, 7.5, 8.2], val_vals=[6.0, 6.0, 6.0, 6.0],
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        assert list(result.keys()) == ["ascat_ssm"]
+        ax = result["ascat_ssm"].axes[0]
+        assert any(isinstance(c, mcollections.QuadMesh) for c in ax.collections)
+        plt.close("all")
+
+    def test_model_vs_layer_source_also_qualifies(self):
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+            val_source="era5_wind", collocation_type="model_vs_layer",
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        assert list(result.keys()) == ["era5_wind"]
+
+    def test_mixed_source_only_reflects_qualifying_rows(self):
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds_a = self._coll_ds(
+            sar_lon=[-9.8, -9.5], sar_lat=[50.2, 50.8], sar_vals=[8.0, 9.0], val_vals=[6.0, 6.0],
+            val_source="ascat_ssm", collocation_type="layer_vs_layer",
+        )
+        ds_b = self._coll_ds(
+            sar_lon=[-9.6], sar_lat=[50.4], sar_vals=[20.0], val_vals=[6.0],
+            val_source="ascat_ssm", collocation_type="point_vs_layer",
+        )
+        combined = xr.concat([ds_a, ds_b], dim="collocation")
+        result = plot_geographic_difference(combined, "owiWindSpeed", "WSPD")
+        assert list(result.keys()) == ["ascat_ssm"]
+
+    def test_cell_size_derived_from_median_aggregation_window(self):
+        """The grid cell size is twice the median aggregation_window_km
+        across a source's own rows -- the window's diameter -- so a
+        90 km window source grids far coarser than a 12.5 km one."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        rng = np.random.default_rng(0)
+        n = 60
+        lon = rng.uniform(-1.0, 1.0, n)
+        lat = rng.uniform(50.0, 52.0, n)
+        sar_vals = rng.uniform(5.0, 10.0, n)
+        val_vals = sar_vals - 2.0
+
+        # One outlier row keeps the median at 12.5 while the max jumps to
+        # 50.0, so a formula using max instead of median would produce a
+        # visibly different (and wrong) cell size than this test expects.
+        agg_fine = np.full(n, 12.5)
+        agg_fine[0] = 50.0
+        ds_fine = self._coll_ds(lon, lat, sar_vals, val_vals, aggregation_window_km=agg_fine)
+        ds_coarse = self._coll_ds(lon, lat, sar_vals, val_vals, aggregation_window_km=90.0)
+
+        fig_fine = plot_geographic_difference(ds_fine, "owiWindSpeed", "WSPD")["ascat_ssm"]
+        fig_coarse = plot_geographic_difference(ds_coarse, "owiWindSpeed", "WSPD")["ascat_ssm"]
+
+        mesh_fine = next(c for c in fig_fine.axes[0].collections if isinstance(c, mcollections.QuadMesh))
+        mesh_coarse = next(c for c in fig_coarse.axes[0].collections if isinstance(c, mcollections.QuadMesh))
+
+        mean_lat = float(np.mean(lat))
+        km_per_deg_lat = 111.32
+        km_per_deg_lon = 111.32 * np.cos(np.radians(mean_lat))
+
+        def cell_size_km(mesh):
+            coords = mesh.get_coordinates()
+            dlat_deg = float(np.diff(coords[:, 0, 1]).mean())
+            dlon_deg = float(np.diff(coords[0, :, 0]).mean())
+            return dlat_deg * km_per_deg_lat, dlon_deg * km_per_deg_lon
+
+        fine_dlat_km, fine_dlon_km = cell_size_km(mesh_fine)
+        coarse_dlat_km, coarse_dlon_km = cell_size_km(mesh_coarse)
+
+        assert fine_dlat_km == pytest.approx(25.0, rel=1e-3)
+        assert fine_dlon_km == pytest.approx(25.0, rel=1e-3)
+        assert coarse_dlat_km == pytest.approx(180.0, rel=1e-3)
+        assert coarse_dlon_km == pytest.approx(180.0, rel=1e-3)
+        plt.close("all")
+
+    def test_missing_aggregation_window_falls_back_to_scatter(self):
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+            aggregation_window_km=None,
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        ax = result["ascat_ssm"].axes[0]
+        assert not any(isinstance(c, mcollections.QuadMesh) for c in ax.collections)
+        assert any(isinstance(c, mcollections.PathCollection) for c in ax.collections)
+        plt.close("all")
+
+    def test_individual_method_source_grids_by_sar_pixel_spacing(self):
+        """A source with no aggregation_window_km but a recorded SAR
+        pixel spacing (an individual-method collocation) grids instead
+        of falling back to scatter."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+            aggregation_window_km=None, sar_pixel_spacing_km=1.0,
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        ax = result["ascat_ssm"].axes[0]
+        assert any(isinstance(c, mcollections.QuadMesh) for c in ax.collections)
+        plt.close("all")
+
+    def test_cell_averaged_source_prefers_aggregation_window_over_pixel_spacing(self):
+        """A source with both a recorded aggregation window and a
+        recorded pixel spacing (should not occur in practice, since a
+        recipe's collocation method is one run-wide setting, but the
+        priority order must still resolve sensibly) grids by the
+        aggregation window, matching the cell-averaged behavior."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        rng = np.random.default_rng(0)
+        n = 60
+        lon = rng.uniform(-1.0, 1.0, n)
+        lat = rng.uniform(50.0, 52.0, n)
+        sar_vals = rng.uniform(5.0, 10.0, n)
+        val_vals = sar_vals - 2.0
+
+        ds = self._coll_ds(
+            lon, lat, sar_vals, val_vals,
+            aggregation_window_km=12.5, sar_pixel_spacing_km=1.0,
+        )
+        fig = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")["ascat_ssm"]
+        mesh = next(c for c in fig.axes[0].collections if isinstance(c, mcollections.QuadMesh))
+        coords = mesh.get_coordinates()
+        dlat_deg = float(np.diff(coords[:, 0, 1]).mean())
+        dlat_km = dlat_deg * 111.32
+        assert dlat_km == pytest.approx(25.0, rel=1e-3)
+        plt.close("all")
+
+    def test_no_pixel_spacing_column_still_falls_back_to_scatter(self):
+        """An older collocation_results.nc saved before this column
+        existed, with no usable aggregation window either, must still
+        render via scatter rather than raising."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+            aggregation_window_km=None,
+        )
+        ds = ds.drop_vars("sar_pixel_spacing_km")
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        ax = result["ascat_ssm"].axes[0]
+        assert any(isinstance(c, mcollections.PathCollection) for c in ax.collections)
+        plt.close("all")
+
+    def test_zero_aggregation_window_falls_back_to_scatter_instead_of_crashing(self):
+        """A zero-valued (not NaN) aggregation_window_km would otherwise
+        collapse the grid cell size to zero, which cannot be gridded --
+        this must fall back to scatter like any other source with no
+        usable aggregation window, not raise."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+            aggregation_window_km=0.0,
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        ax = result["ascat_ssm"].axes[0]
+        assert not any(isinstance(c, mcollections.QuadMesh) for c in ax.collections)
+        assert any(isinstance(c, mcollections.PathCollection) for c in ax.collections)
+        plt.close("all")
+
+    def test_non_positive_aggregation_window_does_not_shadow_a_valid_pixel_spacing(self):
+        """A non-positive aggregation_window_km must not block a
+        perfectly usable sar_pixel_spacing_km from being used -- the
+        fallback chain should still grid rather than falling all the
+        way through to scatter."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+            aggregation_window_km=0.0, sar_pixel_spacing_km=1.0,
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        ax = result["ascat_ssm"].axes[0]
+        assert any(isinstance(c, mcollections.QuadMesh) for c in ax.collections)
+        plt.close("all")
+
+    def test_no_aggregation_window_column_falls_back_to_scatter(self):
+        """An older collocation_results.nc saved before this column
+        existed must still render every qualifying source, via the same
+        scatter fallback as a row that explicitly has no aggregation
+        window."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+        )
+        ds = ds.drop_vars("aggregation_window_km")
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        ax = result["ascat_ssm"].axes[0]
+        assert any(isinstance(c, mcollections.PathCollection) for c in ax.collections)
+        plt.close("all")
+
+    def test_circular_variable_uses_wrapped_diff(self):
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[5.0, 5.0, 5.0], val_vals=[355.0, 355.0, 355.0],
+            sar_col="sar_owiWindDirection", val_col="val_WDIR",
+        )
+        result = plot_geographic_difference(ds, "owiWindDirection", "WDIR")
+        fig = result["ascat_ssm"]
+        mesh = next(c for c in fig.axes[0].collections if isinstance(c, mcollections.QuadMesh))
+        grid = mesh.get_array()
+        occupied = grid[np.isfinite(grid)]
+        # 5 - 355 wrapped to (-180, 180] is +10, not -350.
+        assert occupied.size > 0
+        assert np.allclose(occupied, 10.0)
+        plt.close("all")
+
+    def test_color_scale_symmetric_around_zero(self):
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 20.0], val_vals=[6.0, 6.0, 6.0],
+        )
+        fig = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")["ascat_ssm"]
+        import matplotlib.collections as mcollections
+        mesh = next(c for c in fig.axes[0].collections if isinstance(c, mcollections.QuadMesh))
+        assert mesh.norm.vmin == -mesh.norm.vmax
+
+    def test_degenerate_all_zero_diff_does_not_crash(self):
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[6.0, 6.0, 6.0], val_vals=[6.0, 6.0, 6.0],
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        assert list(result.keys()) == ["ascat_ssm"]
+
+    def test_on_figure_streams_and_dict_stays_empty(self):
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+        )
+        seen = {}
+        result = plot_geographic_difference(
+            ds, "owiWindSpeed", "WSPD", on_figure=lambda name, fig: seen.setdefault(name, fig),
+        )
+        assert result == {}
+        assert list(seen.keys()) == ["ascat_ssm"]
+
+    def test_two_sources_each_get_their_own_figure(self):
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds_a = self._coll_ds(
+            sar_lon=[-9.8, -9.5, -9.2], sar_lat=[50.2, 50.8, 50.4],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0], val_source="ascat_ssm",
+        )
+        ds_b = self._coll_ds(
+            sar_lon=[-9.7, -9.4, -9.1], sar_lat=[50.3, 50.9, 50.5],
+            sar_vals=[9.0, 10.0, 8.5], val_vals=[7.0, 7.0, 7.0], val_source="radiometer",
+        )
+        combined = xr.concat([ds_a, ds_b], dim="collocation")
+        result = plot_geographic_difference(combined, "owiWindSpeed", "WSPD")
+        assert sorted(result.keys()) == ["ascat_ssm", "radiometer"]
+        assert result["ascat_ssm"] is not result["radiometer"]
+
+    def test_dateline_crossing_source_renders_a_local_grid_not_a_global_smear(self):
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        rng = np.random.default_rng(2)
+        lon_a = rng.uniform(178.0, 179.0, 15)
+        lat_a = rng.uniform(40.0, 41.0, 15)
+        lon_b = rng.uniform(-179.0, -178.0, 15)
+        lat_b = rng.uniform(40.0, 41.0, 15)
+        lon = np.concatenate([lon_a, lon_b])
+        lat = np.concatenate([lat_a, lat_b])
+        sar_vals = np.concatenate([np.full(15, 8.0), np.full(15, 12.0)])
+        val_vals = np.full(30, 6.0)
+
+        ds = self._coll_ds(lon, lat, sar_vals, val_vals, aggregation_window_km=12.5)
+        fig = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")["ascat_ssm"]
+        ax = fig.axes[0]
+        mesh = next(c for c in ax.collections if isinstance(c, mcollections.QuadMesh))
+        coords = mesh.get_coordinates()
+        lon_span = float(coords[..., 0].max() - coords[..., 0].min())
+        assert lon_span < 10.0, f"expected a narrow local grid, got a {lon_span} degree span"
+        plt.close("all")
+
+    def test_dateline_crossing_mesh_is_drawn_at_the_correct_geographic_location(self):
+        """A regression guard for a bug where a dateline-crossing mesh's
+        bin edges, after being shifted onto a continuous longitude
+        branch for compact bin-edge computation, were reprojected
+        through the wrong transform and ended up drawn roughly 180
+        degrees away from the data's true location -- rendering a
+        completely blank page despite the underlying grid holding real
+        occupied cells. Checking only the mesh's own internal coordinate
+        span (as a neighboring test does) cannot catch this, since a
+        mesh can have a small span while still being placed in entirely
+        the wrong location; this test instead renders to actual pixels
+        and checks color at the true geographic location of each
+        cluster."""
+        import cartopy.crs as ccrs
+        import matplotlib.pyplot as plt
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        rng = np.random.default_rng(3)
+        n1, n2 = 30, 30
+        lon_a = rng.uniform(178.0, 179.0, n1)
+        lat_a = rng.uniform(40.0, 41.0, n1)
+        lon_b = rng.uniform(-179.0, -178.0, n2)
+        lat_b = rng.uniform(40.0, 41.0, n2)
+        lon = np.concatenate([lon_a, lon_b])
+        lat = np.concatenate([lat_a, lat_b])
+        sar_vals = np.full(n1 + n2, 8.0)
+        val_vals = np.full(n1 + n2, 2.0)
+
+        ds = self._coll_ds(lon, lat, sar_vals, val_vals, aggregation_window_km=12.5)
+        fig = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")["ascat_ssm"]
+        ax = fig.axes[0]
+
+        fig.canvas.draw()
+        buf = np.asarray(fig.canvas.get_renderer().buffer_rgba())
+
+        def is_background_at(true_lon, true_lat):
+            proj_xy = ax.projection.transform_point(true_lon, true_lat, ccrs.PlateCarree())
+            disp_xy = ax.transData.transform(proj_xy)
+            px, py = int(round(disp_xy[0])), buf.shape[0] - int(round(disp_xy[1]))
+            window = buf[max(0, py - 3):py + 4, max(0, px - 3):px + 4, :3]
+            return bool(np.all(window > 250))
+
+        assert not is_background_at(178.5, 40.5), "expected colored data at cluster A's true location"
+        assert not is_background_at(-178.5, 40.5), "expected colored data at cluster B's true location"
+        assert is_background_at(178.5, 42.0), "expected background above cluster A, still on-canvas"
+        plt.close("all")
+
+    def test_land_based_collocations_remain_visible(self):
+        """A source's grid must not be hidden by land: collocations for a
+        land-based quantity (for example soil moisture) sit on land by
+        definition, so land cannot draw above the data or every such
+        difference page would render as a blank land-colored rectangle."""
+        import matplotlib.collections as mcollections
+        import matplotlib.pyplot as plt
+        from cartopy.mpl.feature_artist import FeatureArtist
+
+        from sar_validation.core.visualization import plot_geographic_difference
+
+        ds = self._coll_ds(
+            sar_lon=[-4.0, -3.7, -3.4], sar_lat=[40.2, 40.5, 40.3],
+            sar_vals=[8.0, 9.0, 7.5], val_vals=[6.0, 6.0, 6.0],
+        )
+        result = plot_geographic_difference(ds, "owiWindSpeed", "WSPD")
+        ax = result["ascat_ssm"].axes[0]
+        mesh = next(c for c in ax.collections if isinstance(c, mcollections.QuadMesh))
+        land_features = [c for c in ax.collections if isinstance(c, FeatureArtist)]
+        assert land_features, "expected land/coastline feature artists on the axes"
+        assert all(mesh.zorder > f.zorder for f in land_features), (
+            "expected the grid to draw above land so land-based collocations stay visible"
+        )
         plt.close("all")
 
 
@@ -4743,6 +5401,354 @@ class TestValidationReportGeoFigureStreaming:
         )
         assert plt.get_fignums() == [], "figures must be closed once the report is written"
 
+    def test_many_scene_wind_report_never_exceeds_a_few_open_figures(
+        self, tmp_path, monkeypatch,
+    ):
+        """A many-scene wind report must stream scenes through on_figure
+        just like soil moisture, so it never holds every scene's figure
+        open simultaneously."""
+        import matplotlib
+        import matplotlib.pyplot as plt
+        import pandas as pd
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
+
+        n_scenes = 25
+        sar_nodes = {}
+        for i in range(n_scenes):
+            y, x = 3, 3
+            lon2d, lat2d = np.meshgrid(
+                np.linspace(-10.0 + i, -9.0 + i, x), np.linspace(50.0, 51.0, y),
+            )
+            sar_nodes[f"sar/scene{i}"] = xr.Dataset(
+                {"owiWindSpeed": (("y", "x"), np.linspace(5.0, 12.0, y * x).reshape(y, x))},
+                coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                        "time": pd.Timestamp("2026-07-10T12:00:00")},
+            )
+        mooring_ds = xr.Dataset(
+            {"WSPD": ("point", np.linspace(6.0, 9.0, n_scenes))},
+            coords={"lon": ("point", np.linspace(-9.8, -9.0, n_scenes)),
+                    "lat": ("point", np.linspace(50.2, 50.8, n_scenes)),
+                    "time": ("point", pd.date_range("2026-07-10T12:00", periods=n_scenes, freq="5min"))},
+            attrs={"platform_type": "mooring"},
+        )
+        datatree = DataTreeConverter.to_datatree({**sar_nodes, "validation/mooring": mooring_ds})
+        collocation_ds = xr.Dataset({
+            "sar_owiWindSpeed": ("collocation", np.linspace(6.0, 9.0, n_scenes)),
+            "val_WSPD":         ("collocation", np.linspace(6.0, 9.0, n_scenes)),
+            "val_source":       ("collocation", ["mooring"] * n_scenes),
+            "collocation_type": ("collocation", ["point_vs_layer"] * n_scenes),
+            "sar_scene_name":   ("collocation", [f"scene{i}" for i in range(n_scenes)]),
+            "val_lon":          ("collocation", np.linspace(-9.8, -9.0, n_scenes)),
+            "val_lat":          ("collocation", np.linspace(50.2, 50.8, n_scenes)),
+        })
+
+        peak_open = [0]
+        original_figure = matplotlib.pyplot.figure
+
+        def tracking_figure(*a, **kw):
+            fig = original_figure(*a, **kw)
+            peak_open[0] = max(peak_open[0], len(plt.get_fignums()))
+            return fig
+
+        monkeypatch.setattr(matplotlib.pyplot, "figure", tracking_figure)
+
+        recipe = Recipe(config=RecipeConfig(name="wind_test", variable="wind"))
+        plt.close("all")
+        validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        assert peak_open[0] < 20, (
+            f"more than 20 figures were simultaneously open at some point "
+            f"(peak {peak_open[0]}) for a non-soil-moisture recipe"
+        )
+        assert plt.get_fignums() == []
+
+
+class TestValidationReportGeographicColorbarsAndDifferencePlot:
+    """Every recipe type gets one geographic Figure per SAR scene, each
+    with its own colorbar, plus a difference page per qualifying
+    validation source right after the geographic page(s)."""
+
+    @staticmethod
+    def _multi_scene_wind_fixture(n_scenes, n_per_scene=1, include_layer_vs_layer_source=False):
+        import pandas as pd
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        sar_nodes = {}
+        for i in range(n_scenes):
+            y, x = 3, 3
+            lon2d, lat2d = np.meshgrid(
+                np.linspace(-10.0 + i, -9.0 + i, x), np.linspace(50.0, 51.0, y),
+            )
+            sar_nodes[f"sar/scene{i}"] = xr.Dataset(
+                {"owiWindSpeed": (("y", "x"), np.linspace(5.0, 12.0, y * x).reshape(y, x))},
+                coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                        "time": pd.Timestamp("2026-07-10T12:00:00")},
+            )
+        n = n_scenes * n_per_scene
+        mooring_ds = xr.Dataset(
+            {"WSPD": ("point", np.linspace(6.0, 9.0, n))},
+            coords={"lon": ("point", np.linspace(-9.8, -9.0, n)),
+                    "lat": ("point", np.linspace(50.2, 50.8, n)),
+                    "time": ("point", pd.date_range("2026-07-10T12:00", periods=n, freq="5min"))},
+            attrs={"platform_type": "mooring"},
+        )
+        validation_nodes = {"validation/mooring": mooring_ds}
+        scene_names = [f"scene{i}" for i in range(n_scenes) for _ in range(n_per_scene)]
+
+        sar_col_vals = list(np.linspace(6.0, 9.0, n))
+        val_col_vals = list(np.linspace(6.0, 9.0, n))
+        sources = ["mooring"] * n
+        ctypes = ["point_vs_layer"] * n
+        scene_col = list(scene_names)
+        lon_col = list(np.linspace(-9.8, -9.0, n))
+        lat_col = list(np.linspace(50.2, 50.8, n))
+
+        if include_layer_vs_layer_source:
+            scatterometer_ds = xr.Dataset(
+                {"WSPD": ("point", np.array([7.0, 8.0]))},
+                coords={"lon": ("point", np.array([-9.6, -9.3])),
+                        "lat": ("point", np.array([50.3, 50.6])),
+                        "time": ("point", pd.to_datetime(["2026-07-10T12:00", "2026-07-10T12:05"]))},
+                attrs={"platform_type": "scatterometer"},
+            )
+            validation_nodes["validation/scatterometer"] = scatterometer_ds
+            sar_col_vals += [10.0, 11.0]
+            val_col_vals += [7.0, 8.0]
+            sources += ["scatterometer", "scatterometer"]
+            ctypes += ["layer_vs_layer", "layer_vs_layer"]
+            scene_col += ["scene0", "scene0"]
+            lon_col += [-9.6, -9.3]
+            lat_col += [50.3, 50.6]
+
+        datatree = DataTreeConverter.to_datatree({**sar_nodes, **validation_nodes})
+        collocation_ds = xr.Dataset({
+            "sar_owiWindSpeed":  ("collocation", np.asarray(sar_col_vals)),
+            "val_WSPD":          ("collocation", np.asarray(val_col_vals)),
+            "val_source":        ("collocation", sources),
+            "collocation_type":  ("collocation", ctypes),
+            "sar_scene_name":    ("collocation", scene_col),
+            "val_lon":           ("collocation", np.asarray(lon_col)),
+            "val_lat":           ("collocation", np.asarray(lat_col)),
+            "sar_lon":           ("collocation", np.asarray(lon_col)),
+            "sar_lat":           ("collocation", np.asarray(lat_col)),
+        })
+        return datatree, collocation_ds
+
+    def test_wind_report_geographic_gets_one_colorbar_per_scene(self, tmp_path):
+        """A multi-scene wind report's geographic Figures are one Figure
+        per scene, each carrying its own colorbar axes."""
+        from cartopy.mpl.geoaxes import GeoAxes
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
+
+        n_scenes = 3
+        datatree, collocation_ds = self._multi_scene_wind_fixture(n_scenes)
+        recipe = Recipe(config=RecipeConfig(name="wind_test", variable="wind"))
+        result = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        key = "owiWindSpeed_vs_WSPD"
+        geo_figs = [
+            fig for fig in result[key]
+            if getattr(fig, "_suptitle", None) is not None
+            and any(isinstance(ax, GeoAxes) for ax in fig.axes)
+        ]
+        assert len(geo_figs) == n_scenes, "expected one geographic Figure per scene"
+        for fig in geo_figs:
+            non_data_axes = [ax for ax in fig.axes if not isinstance(ax, GeoAxes)]
+            assert len(non_data_axes) >= 1, "expected each scene's own colorbar axes"
+
+    def test_difference_page_follows_geographic_and_precedes_scatter(self, tmp_path):
+        from cartopy.mpl.geoaxes import GeoAxes
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = self._multi_scene_wind_fixture(
+            1, n_per_scene=12, include_layer_vs_layer_source=True,
+        )
+        recipe = Recipe(config=RecipeConfig(name="wind_test", variable="wind"))
+        result = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        figs = result["owiWindSpeed_vs_WSPD"]
+        geo_indices = [
+            i for i, fig in enumerate(figs)
+            if getattr(fig, "_suptitle", None) is not None
+            and any(isinstance(ax, GeoAxes) for ax in fig.axes)
+        ]
+        diff_indices = [
+            i for i, fig in enumerate(figs)
+            if any("difference (n=" in ax.get_title() for ax in fig.axes)
+        ]
+        other_indices = [
+            i for i in range(len(figs)) if i not in geo_indices and i not in diff_indices
+        ]
+        assert geo_indices, "expected at least one geographic figure"
+        assert diff_indices, "expected at least one difference figure"
+        assert max(geo_indices) < min(diff_indices), (
+            "expected the difference page(s) to come after every geographic page"
+        )
+        if other_indices:
+            assert min(diff_indices) < min(other_indices), (
+                "expected the difference page(s) to come before scatter/residuals"
+            )
+
+    def test_point_vs_layer_source_never_produces_a_difference_page(self, tmp_path):
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = self._multi_scene_wind_fixture(1, n_per_scene=15)
+        recipe = Recipe(config=RecipeConfig(name="wind_test", variable="wind"))
+        result = validation_report(collocation_ds, datatree, recipe, out_dir=tmp_path)
+
+        figs = result["owiWindSpeed_vs_WSPD"]
+        assert not any(
+            "difference (n=" in ax.get_title() for fig in figs for ax in fig.axes
+        ), "mooring is point_vs_layer, so no difference page should appear regardless of point count"
+
+
+class TestValidationReportSoilMoistureDifferenceUsesRescaledSar:
+    """The main CDF-matched section's difference page for soil_moisture
+    recipes plots SAR-minus-validation differences computed from the same
+    rescaled SAR series the scatter/residuals pages already use, not raw
+    SAR values still expressed in the SAR retrieval's own percent-based
+    domain."""
+
+    @staticmethod
+    def _fixture():
+        from sar_validation.core.datatree_converter import DataTreeConverter
+
+        y, x = 4, 5
+        n = y * x
+        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.linspace(10.0, 90.0, n).reshape(y, x), {"units": "%"})},
+            coords={
+                "lon": (("y", "x"), lon2d),
+                "lat": (("y", "x"), lat2d),
+                "time": pd.Timestamp("2026-07-10T19:00:00"),
+            },
+        )
+        ascat_lons = lon2d.ravel()
+        ascat_lats = lat2d.ravel()
+        ascat_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", np.linspace(0.05, 0.45, n))},
+            coords={
+                "lon": ("point", ascat_lons), "lat": ("point", ascat_lats),
+                "time": ("point", pd.date_range("2026-07-10T19:05", periods=n, freq="1min")),
+            },
+            attrs={"platform_type": "ascat_ssm"},
+        )
+
+        # A small in-situ reference source is required alongside ascat_ssm:
+        # converting a percent-domain source into the validation domain
+        # needs a volumetric reference to fit the CDF-matching transform
+        # against, and with none present ascat_ssm would be dropped from
+        # the CDF-matched section entirely rather than rescaled.
+        ismn_lons = np.array([-9.9, -9.7, -9.5, -9.3])
+        ismn_lats = np.array([50.1, 50.3, 50.5, 50.7])
+        ismn_vals = np.array([0.10, 0.15, 0.20, 0.25])
+        ismn_sar_vals = np.array([12.0, 18.0, 22.0, 28.0])
+        n_ismn = len(ismn_vals)
+        ismn_ds = xr.Dataset(
+            {"SOIL_MOISTURE": ("point", ismn_vals)},
+            coords={
+                "lon": ("point", ismn_lons), "lat": ("point", ismn_lats),
+                "time": ("point", pd.date_range("2026-07-10T19:10", periods=n_ismn, freq="1min")),
+            },
+            attrs={"platform_type": "ismn"},
+        )
+
+        datatree = DataTreeConverter.to_datatree(
+            {"sar/sceneA": sar_ds, "validation/ascat_ssm": ascat_ds, "validation/ismn": ismn_ds},
+        )
+
+        # SAR's raw retrieval ("%", roughly 10-90) and the validation
+        # source's volumetric domain (roughly 0.05-0.45) share the same
+        # rank order but differ by two orders of magnitude, so an
+        # unrescaled difference is uniformly positive and about two
+        # orders of magnitude larger than a correctly rescaled one.
+        sar_vals = np.linspace(10.0, 90.0, n)
+        val_vals = np.linspace(0.05, 0.45, n)
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM": xr.DataArray(
+                np.concatenate([sar_vals, ismn_sar_vals]), dims="collocation", attrs={"units": "%"},
+            ),
+            "val_SOIL_MOISTURE": xr.DataArray(
+                np.concatenate([val_vals, ismn_vals]), dims="collocation", attrs={"units": "m3 m-3"},
+            ),
+            "val_source":        ("collocation", ["ascat_ssm"] * n + ["ismn"] * n_ismn),
+            "collocation_type":  ("collocation", ["layer_vs_layer"] * n + ["point_vs_layer"] * n_ismn),
+            "sar_scene_name":    ("collocation", ["sceneA"] * (n + n_ismn)),
+            "sar_lon":           ("collocation", np.concatenate([ascat_lons, ismn_lons])),
+            "sar_lat":           ("collocation", np.concatenate([ascat_lats, ismn_lats])),
+            "val_lon":           ("collocation", np.concatenate([ascat_lons, ismn_lons])),
+            "val_lat":           ("collocation", np.concatenate([ascat_lats, ismn_lats])),
+        })
+        collocation_ds = collocation_ds.assign_coords(
+            val_time=("collocation", pd.date_range("2026-07-10T19:05", periods=n + n_ismn, freq="1min")),
+        )
+        return datatree, collocation_ds
+
+    @staticmethod
+    def _difference_mesh(figs):
+        import matplotlib.collections as mcollections
+
+        for fig in figs:
+            if not any("difference (n=" in ax.get_title() for ax in fig.axes):
+                continue
+            for ax in fig.axes:
+                for coll in ax.collections:
+                    if isinstance(coll, (mcollections.QuadMesh, mcollections.PathCollection)):
+                        return coll
+        return None
+
+    def test_difference_values_come_from_rescaled_sar_not_raw(self):
+        import warnings
+
+        from sar_validation.core.recipe import Recipe, RecipeConfig
+        from sar_validation.core.statistics import add_rescaled_sar_column
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = self._fixture()
+        recipe = Recipe(config=RecipeConfig(name="test_sm_diff", variable="soil_moisture"))
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            result = validation_report(collocation_ds, datatree, recipe, out_dir=None)
+            expected_ds = add_rescaled_sar_column(collocation_ds, "sarSSM", "SOIL_MOISTURE")
+
+        figs = result["sarSSM_vs_SOIL_MOISTURE"]
+        mesh = self._difference_mesh(figs)
+        assert mesh is not None, "expected a difference page with a plotted collection for the ascat_ssm source"
+
+        # The difference page only ever covers ascat_ssm (the sole
+        # layer_vs_layer source); ismn's rows are point_vs_layer and never
+        # reach it, so they are excluded here to match the plotted
+        # collection. This fixture carries no aggregation_window_km, so
+        # the source renders through the scatter fallback, whose color
+        # array holds one value per input point in input order, so no
+        # reshape is needed to compare against it.
+        ascat_mask = (expected_ds["val_source"].values == "ascat_ssm")
+        actual = np.ma.filled(mesh.get_array(), np.nan)
+        expected = (
+            expected_ds["sar_sarSSM"].values[ascat_mask]
+            - expected_ds["val_SOIL_MOISTURE"].values[ascat_mask]
+        )
+        np.testing.assert_allclose(actual, expected, atol=1e-6)
+
+        raw_diff = (
+            collocation_ds["sar_sarSSM"].values[ascat_mask]
+            - collocation_ds["val_SOIL_MOISTURE"].values[ascat_mask]
+        )
+        assert not np.allclose(actual, raw_diff, atol=1.0), (
+            "difference plot appears to be using raw, non-rescaled SAR values"
+        )
+
 
 class TestDropNonDirectionalSources:
     def _ds(self):
@@ -5006,7 +6012,9 @@ class TestValidationReportPointSizeAdaptive:
         ("variable", "n", "source", "expected_point_size"),
         [
             pytest.param("currents", 4, "hf_radar", 15, id="currents-hf_radar-always-15"),
-            pytest.param("wind", 4, None, 15, id="wind-sparse-4pts-scene-15"),
+            pytest.param(
+                "wind", 4, None, {"point_vs_layer": 15}, id="wind-sparse-4pts-scene-15",
+            ),
             pytest.param("soil_moisture", 4, "ismn", 15, id="soil_moisture-sparse-ismn-15"),
             pytest.param("soil_moisture", 400, "ascat_ssm", 5, id="soil_moisture-dense-ascat_ssm-5"),
         ],
@@ -6544,6 +7552,103 @@ class TestValidationReportNativeUnitsSection:
         assert "sarSSM_vs_SOIL_MOISTURE" in figs
 
 
+class TestValidationReportNativeUnitsGeographicWiring:
+    """The native-units section must pass two_column_by_type/on_figure
+    through to plot_geographic (matching the main CDF-matched section)
+    and must also add a difference page per qualifying source."""
+
+    @staticmethod
+    def _recipe():
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
+
+        cfg = RecipeConfig(
+            name="test_native_units_geo", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        )
+        return Recipe(config=cfg)
+
+    @staticmethod
+    def _fixture(n=12):
+        import pandas as pd
+
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(-10.0, -8.0, x), np.linspace(50.0, 52.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.linspace(10.0, 60.0, y * x).reshape(y, x), {"units": "%"})},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-01-01T12:00:00")},
+        )
+        datatree = xr.DataTree.from_dict({"sar/sceneA": sar_ds})
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":       ("collocation", np.linspace(20.0, 30.0, n), {"units": "%"}),
+            "val_SOIL_MOISTURE": ("collocation", np.linspace(20.0, 30.0, n), {"units": "%"}),
+            "val_source":       ("collocation", ["ascat_ssm"] * n),
+            "collocation_type": ("collocation", ["layer_vs_layer"] * n),
+            "sar_scene_name":   ("collocation", ["sceneA"] * n),
+            "val_lon":          ("collocation", np.linspace(-9.8, -8.2, n)),
+            "val_lat":          ("collocation", np.linspace(50.2, 51.8, n)),
+            "sar_lon":          ("collocation", np.linspace(-9.8, -8.2, n)),
+            "sar_lat":          ("collocation", np.linspace(50.2, 51.8, n)),
+            "val_id":           ("collocation", [f"a{i}" for i in range(n)]),
+        })
+        return datatree, collocation_ds
+
+    def _native_stats(self, collocation_ds):
+        from sar_validation.core.statistics import compute_statistics
+
+        return compute_statistics(collocation_ds, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
+
+    def test_native_units_geographic_call_passes_two_column_and_on_figure(self, tmp_path, monkeypatch):
+        import sar_validation.core.visualization as viz
+
+        datatree, collocation_ds = self._fixture()
+        native_stats = self._native_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        captured = []
+        original = viz.plot_geographic
+
+        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
+            captured.append(kwargs)
+            return original(datatree_, coll_, sar_var, val_var, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_geographic", spy)
+        viz.validation_report(
+            collocation_ds, datatree, self._recipe(), out_dir=tmp_path,
+            native_units_stats_ds_map={key: native_stats},
+        )
+
+        nu_calls = [
+            kwargs for kwargs in captured
+            if kwargs.get("skip_domain_harmonization") is True
+        ]
+        assert nu_calls, "expected at least one plot_geographic call for the native-units section"
+        assert nu_calls[0].get("two_column_by_type") is True
+        assert callable(nu_calls[0].get("on_figure"))
+
+    def test_native_units_difference_page_appears_for_qualifying_source(self, tmp_path):
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = self._fixture(n=12)
+        native_stats = self._native_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        figs = validation_report(
+            collocation_ds, datatree, self._recipe(), out_dir=tmp_path,
+            native_units_stats_ds_map={key: native_stats},
+        )
+
+        found = False
+        for fig in figs[key]:
+            banner_texts = [t.get_text() for t in fig.texts]
+            if not any("native units" in t for t in banner_texts):
+                continue
+            if any("difference (n=" in ax.get_title() for ax in fig.axes):
+                found = True
+        assert found, "expected a native-units-banner figure with a difference title"
+
+
 class TestValidationReportMainSectionExcludesCdsSsm:
     """cds_ssm is deliberately excluded from run_statistics()'s CDF-matched
     pass and gets its own separate '— C3S CDS SSM —' section instead (see
@@ -6753,6 +7858,14 @@ class TestValidationReportCdsSection:
                         "cds_ssm", "cds_ssm", "cds_ssm", "ascat_ssm", "ascat_ssm", "ismn", "ismn",
                     ]),
                 ),
+                "collocation_type": (
+                    "collocation",
+                    np.array([
+                        "layer_vs_layer", "layer_vs_layer", "layer_vs_layer",
+                        "layer_vs_layer", "layer_vs_layer",
+                        "point_vs_layer", "point_vs_layer",
+                    ]),
+                ),
                 "sar_scene_name": ("collocation", np.array(["sceneA"] * 7)),
                 "val_lon": ("collocation", np.array([2.0, 3.0, 4.0, 2.5, 3.5, 2.2, 3.2])),
                 "val_lat": ("collocation", np.array([47.0, 48.0, 49.0, 47.5, 48.5, 47.2, 48.2])),
@@ -6859,6 +7972,107 @@ class TestValidationReportCdsSection:
             f"expected a sentence naming ASCAT (the active product's sensor) "
             f"somewhere in the CDS section; got: {all_texts}"
         )
+
+
+class TestValidationReportCdsSsmGeographicWiring:
+    """The C3S CDS SSM section must pass two_column_by_type/on_figure
+    through to plot_geographic (matching the main CDF-matched section)
+    and must also add a difference page per qualifying source."""
+
+    @staticmethod
+    def _recipe():
+        from sar_validation.core.recipe import GeographicBounds, Recipe, RecipeConfig, TemporalBounds
+
+        # _cds_ssm_product_type(recipe) looks for a "cds_ssm"
+        # ValidationDataSource entry and falls back to "active" when none
+        # is configured -- no ValidationDataSource is needed here since
+        # both tests below only exercise the default "active" banner.
+        cfg = RecipeConfig(
+            name="test_cds_geo", variable="soil_moisture",
+            geographic_bounds=GeographicBounds(-10.0, 10.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+        )
+        return Recipe(config=cfg)
+
+    @staticmethod
+    def _fixture(n=12):
+        import pandas as pd
+
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(0.0, 4.0, x), np.linspace(45.0, 49.0, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.linspace(15.0, 25.0, y * x).reshape(y, x), {"units": "%"})},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-01-01T12:00:00")},
+        )
+        datatree = xr.DataTree.from_dict({"sar/sceneA": sar_ds})
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":       ("collocation", np.linspace(20.0, 26.0, n), {"units": "%"}),
+            "val_SOIL_MOISTURE": ("collocation", np.linspace(0.20, 0.26, n)),
+            "val_source":       ("collocation", ["cds_ssm"] * n),
+            "collocation_type": ("collocation", ["layer_vs_layer"] * n),
+            "sar_scene_name":   ("collocation", ["sceneA"] * n),
+            "val_lon":          ("collocation", np.linspace(2.0, 3.5, n)),
+            "val_lat":          ("collocation", np.linspace(47.0, 48.5, n)),
+            "sar_lon":          ("collocation", np.linspace(2.0, 3.5, n)),
+            "sar_lat":          ("collocation", np.linspace(47.0, 48.5, n)),
+            "val_id":           ("collocation", [f"c{i}" for i in range(n)]),
+        })
+        return datatree, collocation_ds
+
+    def _cds_stats(self, collocation_ds):
+        from sar_validation.core.statistics import compute_statistics
+
+        return compute_statistics(collocation_ds, "sarSSM", "SOIL_MOISTURE", group_by=["val_source"])
+
+    def test_cds_geographic_call_passes_two_column_and_on_figure(self, tmp_path, monkeypatch):
+        import sar_validation.core.visualization as viz
+
+        datatree, collocation_ds = self._fixture()
+        cds_stats = self._cds_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        captured = []
+        original = viz.plot_geographic
+
+        def spy(datatree_, coll_, sar_var, val_var, **kwargs):
+            captured.append(kwargs)
+            return original(datatree_, coll_, sar_var, val_var, **kwargs)
+
+        monkeypatch.setattr(viz, "plot_geographic", spy)
+        viz.validation_report(
+            collocation_ds, datatree, self._recipe(), out_dir=tmp_path,
+            cds_ssm_stats_ds_map={key: cds_stats},
+        )
+
+        cds_calls = [
+            kwargs for kwargs in captured
+            if kwargs.get("skip_domain_harmonization") is True
+        ]
+        assert cds_calls, "expected at least one plot_geographic call for the CDS section"
+        assert cds_calls[0].get("two_column_by_type") is True
+        assert callable(cds_calls[0].get("on_figure"))
+
+    def test_cds_difference_page_appears_for_qualifying_source(self, tmp_path):
+        from sar_validation.core.visualization import validation_report
+
+        datatree, collocation_ds = self._fixture(n=12)
+        cds_stats = self._cds_stats(collocation_ds)
+        key = "sarSSM_vs_SOIL_MOISTURE"
+
+        figs = validation_report(
+            collocation_ds, datatree, self._recipe(), out_dir=tmp_path,
+            cds_ssm_stats_ds_map={key: cds_stats},
+        )
+
+        found = False
+        for fig in figs[key]:
+            banner_texts = [t.get_text() for t in fig.texts]
+            if not any("ESA Climate Change Initiative" in t for t in banner_texts):
+                continue
+            if any("difference (n=" in ax.get_title() for ax in fig.axes):
+                found = True
+        assert found, "expected a CDS-banner figure with a difference title"
 
 
 class TestValidationReportNativeUnitsGeographic:
@@ -7302,8 +8516,11 @@ class TestHycomCanonicalSourceOrder:
     def test_hycom_present_and_appended_at_end(self):
         from sar_validation.core.visualization import _CANONICAL_SOURCE_ORDER
 
+        # hycom's own permanent slot is index 16, fixed by the append-only
+        # ordering rule -- entries appended after it (e.g. "buoy_waterfall")
+        # do not move it, and it is not required to be the last entry.
         assert "hycom" in _CANONICAL_SOURCE_ORDER
-        assert _CANONICAL_SOURCE_ORDER[-1] == "hycom"
+        assert _CANONICAL_SOURCE_ORDER.index("hycom") == 16
 
     def test_canonical_source_order_still_in_sync_with_registered_sets(self):
         from sar_validation.core.visualization import _canonical_source_order

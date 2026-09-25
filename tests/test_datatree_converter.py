@@ -838,6 +838,26 @@ class TestFromCollocations:
         assert "sar_wind_direction" in ds
         assert np.isnan(ds["sar_wind_direction"].values[1])
 
+    def test_aggregation_window_km_column(self):
+        c1 = _make_collocations(1)[0]
+        c1.aggregation_window_km = 12.5
+        c2 = _make_collocations(1)[0]
+        c2.aggregation_window_km = None
+        ds = DataTreeConverter.from_collocations([c1, c2])
+        assert "aggregation_window_km" in ds
+        assert ds["aggregation_window_km"].values[0] == 12.5
+        assert np.isnan(ds["aggregation_window_km"].values[1])
+
+    def test_sar_pixel_spacing_km_column(self):
+        c1 = _make_collocations(1)[0]
+        c1.sar_pixel_spacing_km = 1.0
+        c2 = _make_collocations(1)[0]
+        c2.sar_pixel_spacing_km = None
+        ds = DataTreeConverter.from_collocations([c1, c2])
+        assert "sar_pixel_spacing_km" in ds
+        assert ds["sar_pixel_spacing_km"].values[0] == 1.0
+        assert np.isnan(ds["sar_pixel_spacing_km"].values[1])
+
 
 # ---------------------------------------------------------------------------
 # to_datatree
@@ -989,6 +1009,21 @@ def _make_recipe() -> Recipe:
         variable="wind",
         geographic_bounds=GeographicBounds(-10.0, 0.0, 50.0, 60.0),
         temporal_bounds=TemporalBounds("2026-07-05", "2026-07-06"),
+    ))
+
+
+def _make_gts_recipe(*source_types: str) -> Recipe:
+    """A recipe wide enough (bbox and window) to keep every point used by
+    the GTS buoy / buoy_waterfall dedup tests below, with the given
+    validation_sources -- convert_downloaded_data's gts_buoy/*.bufr scan
+    and its buoy_waterfall dedup are both gated on the current recipe's
+    own validation_sources, not merely on what exists on disk."""
+    return Recipe(RecipeConfig(
+        name="gts-test",
+        variable="wind",
+        geographic_bounds=GeographicBounds(-180.0, 180.0, -90.0, 90.0),
+        temporal_bounds=TemporalBounds("2026-08-01", "2026-09-01"),
+        validation_sources=[ValidationDataSource(source_type=st) for st in source_types],
     ))
 
 
@@ -2471,6 +2506,248 @@ class TestBuildDatatreeHfrNoaa:
         assert tree is not None
         node_paths = [node.path for node in tree.subtree]
         assert any("hfr_noaa" in p for p in node_paths)
+
+
+class TestBuildDataTreeIncludesGtsBuoy:
+    def test_gts_buoy_bufr_files_are_converted_into_the_tree(self, tmp_path, monkeypatch):
+        base = tmp_path / "run"
+        gts_dir = base / "gts_buoy"
+        gts_dir.mkdir(parents=True)
+        (gts_dir / "gts_buoy_20260830.bufr").write_bytes(b"mocked")
+
+        frame = pd.DataFrame([{
+            "marineObservingPlatformIdentifier": 6600021,
+            "stationOrSiteName": "Arkona Basin Buoy",
+            "latitude": 54.88, "longitude": 13.87,
+            "year": 2026, "month": 8, "day": 30, "hour": 8, "minute": 0,
+            "windSpeed": 9.0, "windDirection": 191.0,
+        }])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: frame,
+        )
+
+        tree = DataTreeConverter.convert_downloaded_data(
+            base, product_type="wind", recipe=_make_gts_recipe("buoy_gts"),
+        )
+
+        assert tree is not None
+        (node,) = tree["validation/buoy_gts"].children.values()
+        assert node.to_dataset().sizes["point"] == 1
+
+    def test_no_gts_buoy_dir_is_a_no_op(self, tmp_path):
+        base = tmp_path / "run"
+        base.mkdir()
+        tree = DataTreeConverter.convert_downloaded_data(base, product_type="wind")
+        assert tree is None
+
+
+class TestBuildDataTreeWaterfallDedup:
+    def test_copernicus_station_covered_by_gts_is_excluded(self, tmp_path, monkeypatch):
+        base = tmp_path / "run"
+        gts_dir = base / "gts_buoy"
+        gts_dir.mkdir(parents=True)
+        (gts_dir / "gts_buoy_20260830.bufr").write_bytes(b"mocked")
+
+        insitu_dir = base / "copernicus_insitu"
+        insitu_dir.mkdir()
+        pd.DataFrame([
+            {"platform_id": "6600021", "platform_type": "MO",
+             "time": "2026-08-30T08:00:00", "longitude": 13.87, "latitude": 54.88,
+             "variable": "WSPD", "value": 9.0},
+            {"platform_id": "1300002", "platform_type": "MO",
+             "time": "2026-08-30T08:00:00", "longitude": -20.0, "latitude": 10.0,
+             "variable": "WSPD", "value": 5.0},
+        ]).to_csv(insitu_dir / "insitu.csv", index=False)
+
+        gts_frame = pd.DataFrame([{
+            "marineObservingPlatformIdentifier": 6600021,
+            "stationOrSiteName": "Arkona Basin Buoy",
+            "latitude": 54.88, "longitude": 13.87,
+            "year": 2026, "month": 8, "day": 30, "hour": 8, "minute": 0,
+            "windSpeed": 9.0, "windDirection": 191.0,
+        }])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: gts_frame,
+        )
+
+        tree = DataTreeConverter.convert_downloaded_data(
+            base, product_type="wind", recipe=_make_gts_recipe("buoy_waterfall"),
+        )
+
+        assert tree is not None
+        insitu_ds = tree["validation/insitu"].to_dataset()
+        assert list(insitu_ds["platform_id"].values) == ["1300002"]
+
+    def test_no_gts_dir_leaves_copernicus_unfiltered(self, tmp_path):
+        base = tmp_path / "run"
+        insitu_dir = base / "copernicus_insitu"
+        insitu_dir.mkdir(parents=True)
+        pd.DataFrame([
+            {"platform_id": "6600021", "platform_type": "MO",
+             "time": "2026-08-30T08:00:00", "longitude": 13.87, "latitude": 54.88,
+             "variable": "WSPD", "value": 9.0},
+        ]).to_csv(insitu_dir / "insitu.csv", index=False)
+
+        tree = DataTreeConverter.convert_downloaded_data(base, product_type="wind")
+
+        assert tree is not None
+        insitu_ds = tree["validation/insitu"].to_dataset()
+        assert list(insitu_ds["platform_id"].values) == ["6600021"]
+
+
+class TestBuildDataTreeIncludesGtsShip:
+    def test_gts_ship_bufr_files_are_converted_into_the_tree(self, tmp_path, monkeypatch):
+        base = tmp_path / "run"
+        gts_dir = base / "gts_ship"
+        gts_dir.mkdir(parents=True)
+        (gts_dir / "gts_ship_20260801.bufr").write_bytes(b"mocked")
+
+        frame = pd.DataFrame([{
+            "shipOrMobileLandStationIdentifier": "KBAG",
+            "latitude": 44.0, "longitude": -86.9,
+            "year": 2026, "month": 8, "day": 1, "hour": 0, "minute": 0,
+            "windSpeed": 11.3, "windDirection": 340.0,
+        }])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: frame,
+        )
+
+        tree = DataTreeConverter.convert_downloaded_data(
+            base, product_type="wind", recipe=_make_gts_recipe("ship_gts"),
+        )
+
+        assert tree is not None
+        (node,) = tree["validation/ship_gts"].children.values()
+        assert node.to_dataset().sizes["point"] == 1
+
+    def test_no_gts_ship_dir_is_a_no_op(self, tmp_path):
+        base = tmp_path / "run"
+        base.mkdir()
+        tree = DataTreeConverter.convert_downloaded_data(base, product_type="wind")
+        assert tree is None
+
+    def test_ship_gts_dir_ignored_when_not_requested(self, tmp_path, monkeypatch):
+        """A leftover gts_ship/ directory from an earlier run over the same
+        base_dir must not be picked up by a recipe that never asked for
+        "ship_gts", mirroring the equivalent GTS buoy stale-cache guard
+        (TestBuildDataTreeGtsBuoyRecipeGating above)."""
+        base = tmp_path / "run"
+        gts_dir = base / "gts_ship"
+        gts_dir.mkdir(parents=True)
+        (gts_dir / "gts_ship_20260801.bufr").write_bytes(b"mocked")
+
+        insitu_dir = base / "copernicus_insitu"
+        insitu_dir.mkdir()
+        pd.DataFrame([
+            {"platform_id": "1234567", "platform_type": "TG",
+             "time": "2026-08-01T00:00:00", "longitude": -86.9, "latitude": 44.0,
+             "variable": "WSPD", "value": 9.0},
+        ]).to_csv(insitu_dir / "insitu.csv", index=False)
+
+        frame = pd.DataFrame([{
+            "shipOrMobileLandStationIdentifier": "KBAG",
+            "latitude": 44.0, "longitude": -86.9,
+            "year": 2026, "month": 8, "day": 1, "hour": 0, "minute": 0,
+            "windSpeed": 11.3, "windDirection": 340.0,
+        }])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: frame,
+        )
+
+        tree = DataTreeConverter.convert_downloaded_data(
+            base, product_type="wind", recipe=_make_gts_recipe("tidal_gauge"),
+        )
+
+        assert tree is not None
+        node_paths = [node.path for node in tree.subtree]
+        assert not any("ship_gts" in p for p in node_paths)
+
+
+class TestBuildDataTreeGtsBuoyRecipeGating:
+    """convert_downloaded_data's base_dir is keyed only by bbox/time window,
+    so two separate recipe runs over the same window can share one
+    base_dir -- a leftover gts_buoy/ directory from an earlier run must
+    not leak into a later run over the identical window that never
+    requested "buoy_gts"/"buoy_waterfall" itself, and the Copernicus
+    dedup must fire only for a recipe that specifically requested
+    "buoy_waterfall", not merely because gts_buoy/ happens to exist."""
+
+    def test_buoy_cmems_only_recipe_ignores_leftover_gts_buoy_dir(self, tmp_path, monkeypatch):
+        base = tmp_path / "run"
+        gts_dir = base / "gts_buoy"
+        gts_dir.mkdir(parents=True)
+        (gts_dir / "gts_buoy_20260830.bufr").write_bytes(b"mocked")
+
+        insitu_dir = base / "copernicus_insitu"
+        insitu_dir.mkdir()
+        pd.DataFrame([
+            {"platform_id": "6600021", "platform_type": "MO",
+             "time": "2026-08-30T08:00:00", "longitude": 13.87, "latitude": 54.88,
+             "variable": "WSPD", "value": 9.0},
+        ]).to_csv(insitu_dir / "insitu.csv", index=False)
+
+        gts_frame = pd.DataFrame([{
+            "marineObservingPlatformIdentifier": 6600021,
+            "stationOrSiteName": "Arkona Basin Buoy",
+            "latitude": 54.88, "longitude": 13.87,
+            "year": 2026, "month": 8, "day": 30, "hour": 8, "minute": 0,
+            "windSpeed": 9.0, "windDirection": 191.0,
+        }])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: gts_frame,
+        )
+
+        tree = DataTreeConverter.convert_downloaded_data(
+            base, product_type="wind", recipe=_make_gts_recipe("buoy_cmems"),
+        )
+
+        assert tree is not None
+        node_paths = [node.path for node in tree.subtree]
+        assert not any("buoy_gts" in p for p in node_paths)
+        insitu_ds = tree["validation/insitu"].to_dataset()
+        assert list(insitu_ds["platform_id"].values) == ["6600021"]
+
+    def test_buoy_gts_with_tidal_gauge_does_not_dedup_copernicus(self, tmp_path, monkeypatch):
+        base = tmp_path / "run"
+        gts_dir = base / "gts_buoy"
+        gts_dir.mkdir(parents=True)
+        (gts_dir / "gts_buoy_20260830.bufr").write_bytes(b"mocked")
+
+        insitu_dir = base / "copernicus_insitu"
+        insitu_dir.mkdir()
+        pd.DataFrame([
+            {"platform_id": "6600021", "platform_type": "TG",
+             "time": "2026-08-30T08:00:00", "longitude": 13.87, "latitude": 54.88,
+             "variable": "WSPD", "value": 9.0},
+        ]).to_csv(insitu_dir / "insitu.csv", index=False)
+
+        gts_frame = pd.DataFrame([{
+            "marineObservingPlatformIdentifier": 6600021,
+            "stationOrSiteName": "Arkona Basin Buoy",
+            "latitude": 54.88, "longitude": 13.87,
+            "year": 2026, "month": 8, "day": 30, "hour": 8, "minute": 0,
+            "windSpeed": 9.0, "windDirection": 191.0,
+        }])
+        monkeypatch.setattr(
+            "sar_validation.core.datatree_converter.pdbufr.read_bufr",
+            lambda path, columns, filters=None: gts_frame,
+        )
+
+        tree = DataTreeConverter.convert_downloaded_data(
+            base, product_type="wind",
+            recipe=_make_gts_recipe("buoy_gts", "tidal_gauge"),
+        )
+
+        assert tree is not None
+        (gts_node,) = tree["validation/buoy_gts"].children.values()
+        assert gts_node.to_dataset().sizes["point"] == 1
+        insitu_ds = tree["validation/insitu"].to_dataset()
+        assert list(insitu_ds["platform_id"].values) == ["6600021"]
 
 
 class TestBuildDatatreeHfRadarCopernicus:
@@ -4358,3 +4635,111 @@ class TestConvertDownloadedDataHycom:
         tree = DataTreeConverter.convert_downloaded_data(tmp_path, recipe=recipe)
         assert tree is not None
         assert "hycom" not in getattr(tree.get("validation"), "children", {})
+
+    def test_convert_downloaded_data_routes_reprocessed_altimeter_nc(self, tmp_path):
+        from tests.test_datatree_converter_altimeter_reprocessed import _write_reprocessed_altimeter_nc
+
+        base_dir = tmp_path
+        subdir = base_dir / "altimeter_reprocessed"
+        subdir.mkdir()
+        _write_reprocessed_altimeter_nc(subdir / "ESACCI-SEASTATE-L3-SWH-MULTI_1D-20231230-fv01.nc")
+
+        tree = DataTreeConverter.convert_downloaded_data(base_dir)
+
+        assert tree is not None
+        node = tree["validation/altimeter_reprocessed/ESACCI-SEASTATE-L3-SWH-MULTI_1D-20231230-fv01"]
+        assert node is not None
+        ds = node.to_dataset()
+        assert ds.attrs["frequency"] == "reprocessed"
+
+    def test_convert_downloaded_data_dedupes_overlapping_altimeter_windows(self, tmp_path):
+        """Two altimeter downloads of the same dataset for overlapping time
+        windows -- as a rerun with a differently-padded window would
+        produce, without clearing prior downloads -- must merge into one
+        validation node with the shared observation counted once, not
+        collocated twice."""
+        base_dir = tmp_path
+        subdir = base_dir / "altimeter"
+        subdir.mkdir()
+
+        def _write(filename: str, times, lats, lons, vavh):
+            ds = xr.Dataset(
+                {
+                    "VAVH": ("time", np.asarray(vavh, dtype=float),
+                             {"standard_name": "sea_surface_wave_significant_height", "units": "m"}),
+                },
+                coords={
+                    "time": pd.to_datetime(times),
+                    "latitude": ("time", np.asarray(lats, dtype=float)),
+                    "longitude": ("time", np.asarray(lons, dtype=float)),
+                },
+                attrs={"platform": "Jason-3"},
+            )
+            ds.to_netcdf(subdir / filename)
+
+        # File A: 2026-07-01 -> 2026-07-02, points at t1, t2.
+        _write(
+            "cmems_obs-wave_glo_phy-swh_nrt_j3-l3_PT1S_2026-07-01_2026-07-02.nc",
+            ["2026-07-01T10:00:00", "2026-07-01T12:00:00"],
+            [40.0, 41.0], [350.0, 351.0], [1.5, 1.6],
+        )
+        # File B: 2026-07-01 -> 2026-07-03 (overlaps file A), points at t1
+        # (exact duplicate of file A's first point) and t3 (new).
+        _write(
+            "cmems_obs-wave_glo_phy-swh_nrt_j3-l3_PT1S_2026-07-01_2026-07-03.nc",
+            ["2026-07-01T10:00:00", "2026-07-02T10:00:00"],
+            [40.0, 42.0], [350.0, 352.0], [1.5, 1.8],
+        )
+
+        tree = DataTreeConverter.convert_downloaded_data(base_dir)
+
+        assert tree is not None
+        matching_keys = [k for k in tree.groups if k.startswith("/validation/altimeter/")]
+        assert len(matching_keys) == 1, f"expected one merged node, got {matching_keys}"
+        ds = tree[matching_keys[0]].to_dataset()
+        assert ds.sizes["point"] == 3
+        assert sorted(pd.to_datetime(ds["time"].values)) == sorted(pd.to_datetime([
+            "2026-07-01T10:00:00", "2026-07-01T12:00:00", "2026-07-02T10:00:00",
+        ]))
+
+
+class TestDedupeAltimeterPoints:
+    def test_removes_exact_duplicate_time_lat_lon_rows(self):
+        from sar_validation.core.datatree_converter import _dedupe_altimeter_points
+
+        ds_a = xr.Dataset(
+            {"VAVH": ("point", [1.5, 1.6])},
+            coords={
+                "time": ("point", pd.to_datetime(["2026-07-01T10:00:00", "2026-07-01T12:00:00"])),
+                "lat": ("point", [40.0, 41.0]),
+                "lon": ("point", [350.0, 351.0]),
+            },
+            attrs={"platform": "Jason-3"},
+        )
+        ds_b = xr.Dataset(
+            {"VAVH": ("point", [1.5, 1.8])},
+            coords={
+                "time": ("point", pd.to_datetime(["2026-07-01T10:00:00", "2026-07-02T10:00:00"])),
+                "lat": ("point", [40.0, 42.0]),
+                "lon": ("point", [350.0, 352.0]),
+            },
+            attrs={"platform": "Jason-3"},
+        )
+
+        result = _dedupe_altimeter_points([ds_a, ds_b])
+
+        assert result.sizes["point"] == 3
+        assert result.attrs["platform"] == "Jason-3"
+
+    def test_window_suffix_regex_strips_trailing_date_range(self):
+        from sar_validation.core.datatree_converter import _ALTIMETER_WINDOW_SUFFIX_RE
+
+        assert _ALTIMETER_WINDOW_SUFFIX_RE.sub(
+            "", "cmems_obs-wave_glo_phy-swh_nrt_al-l3_PT1S_2026-07-01_2026-07-03",
+        ) == "cmems_obs-wave_glo_phy-swh_nrt_al-l3_PT1S"
+        assert _ALTIMETER_WINDOW_SUFFIX_RE.sub(
+            "", "cmems_obs-wave_glo_phy-swh_nrt_al-l3_PT1S_2026-07-01_2026-07-03_w0",
+        ) == "cmems_obs-wave_glo_phy-swh_nrt_al-l3_PT1S"
+        assert _ALTIMETER_WINDOW_SUFFIX_RE.sub(
+            "", "cmems_obs-wave_glo_phy-swh_nrt_al-l3-1km_PT0.2S-i_2026-07-01_2026-07-03",
+        ) == "cmems_obs-wave_glo_phy-swh_nrt_al-l3-1km_PT0.2S-i"

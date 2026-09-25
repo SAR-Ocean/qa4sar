@@ -16,7 +16,7 @@ Usage
   sar-validate --set-credential eumdac
 
   # Dry-run (see what would be downloaded)
-  sar-validate --recipe recipes/wind_validation.yaml --dry-run
+  sar-validate --recipe recipes/wind_validation.yaml --dry-download
 
   # Execute a recipe (download all data)
   sar-validate --recipe recipes/wind_validation.yaml
@@ -116,7 +116,7 @@ Examples:
   sar-validate --create-recipe wind --min-lon -10 --max-lon 5 --min-lat 50 --max-lat 65 \\
       --start 2026-03-01 --end 2026-03-31 --recipe-name north_sea_march_2026
   # Dry run: no data downloaded, just show what would be downloaded
-  sar-validate --recipe recipes/wind_validation.yaml --dry-run
+  sar-validate --recipe recipes/wind_validation.yaml --dry-download
   # Download the data (skipped when download_metadata.json already exists in the data folder)
   sar-validate --recipe recipes/wind_validation.yaml
   # Ignore download_metadata.json and redownload the data
@@ -228,7 +228,8 @@ Examples:
              "of this flag.",
     )
     parser.add_argument(
-        "--dry-run",
+        "--dry-download",
+        dest="dry_run",
         action="store_true",
         help="Show what will be downloaded without actually downloading",
     )
@@ -508,9 +509,8 @@ def _build_currents_config(
         sar_data=SARDataSpec(source=sar_source, swath_mode=["WV","IW","EW","SM"], max_downloads=limit),
         validation_sources=[
             *hf_radar_sources,
-            ValidationDataSource(source_type="drifter"),
-            ValidationDataSource(source_type="ferrybox"),
-            ValidationDataSource(source_type="mooring"),
+            ValidationDataSource(source_type="buoy_gts"),
+            ValidationDataSource(source_type="ship_cmems_family"),
             # Delayed-mode (6mo+ old) current observations — Copernicus
             # Marine product 013_044, EWCT/NSCT only. Each individually
             # gated at download time by its own recency guard.
@@ -602,11 +602,12 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
         geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
         sar_data=SARDataSpec(source=sar_source, swath_mode=swath_mode, max_downloads=limit),
         validation_sources=[
-            ValidationDataSource(source_type="mooring"),
-            ValidationDataSource(source_type="buoy"),
-            ValidationDataSource(source_type="ferrybox"),
-            ValidationDataSource(source_type="drifter"),
-            ValidationDataSource(source_type="tidal_gauge"),
+            ValidationDataSource(source_type="buoy_gts"),
+            ValidationDataSource(source_type="ship_gts"),
+            # tidal_gauge (Copernicus Marine) is deliberately not included
+            # active by default -- its wind sensors are not QC-filtered to
+            # the same standard as buoy_gts/ship_gts. _create_recipe adds it
+            # to the generated file as a commented-out line instead.
             ValidationDataSource(source_type="scatterometer_ascat"),
             ValidationDataSource(source_type="altimeter"),
             ValidationDataSource(source_type="radiometer"),
@@ -770,9 +771,8 @@ def _build_waves_config(
         geographic_bounds=GeographicBounds(-20.0, 0.0, 35.0, 60.0),
         sar_data=SARDataSpec(source=sar_source, swath_mode=["WV","SM"], max_downloads=limit),
         validation_sources=[
-            ValidationDataSource(source_type="mooring"),
+            ValidationDataSource(source_type="buoy_gts"),
             ValidationDataSource(source_type="tidal_gauge"),
-            ValidationDataSource(source_type="drifter"),
             ValidationDataSource(
                 source_type="altimeter",
                 download_kwargs={"frequencies": altimeter_freqs},
@@ -948,6 +948,15 @@ def _create_recipe(
     }
     resolved_sar_source = sar_source if sar_source is not None else defaults.get(name, "sentinel1_l2_ocn")
 
+    # Free GTS source types stand in for the Copernicus Marine
+    # (`_cmems_family`) in-situ sources as the recipe template default;
+    # each generated recipe line carries a comment pointing to its
+    # Copernicus Marine counterpart for users who have credentials for it.
+    _GTS_DEFAULT_COMMENTS = {
+        "buoy_gts": "buoy_cmems_family",
+        "ship_gts": "ship_cmems_family",
+    }
+
     # All four templates are built eagerly (see the `if name not in templates` 
     # check below), but an explicit --sar-source only applies to the *requested* 
     # category: e.g. `--create-recipe soil_moisture --sar-source sentinel1_clms_ssm` 
@@ -999,7 +1008,32 @@ def _create_recipe(
     recipe = Recipe(cfg)
     slug = recipe_name.lower().replace(" ", "_") if recipe_name else f"{name}_validation"
     out_path = Path("recipes") / f"{slug}.yaml"
-    recipe.to_yaml(out_path)
+
+    import yaml
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    yaml_text = yaml.dump(recipe.config.to_dict(), default_flow_style=False, sort_keys=False)
+    for gts_type, cmems_type in _GTS_DEFAULT_COMMENTS.items():
+        yaml_text = yaml_text.replace(
+            f"- source_type: {gts_type}\n",
+            f"- source_type: {gts_type}  "
+            f"# if wanting Copernicus Marine in situ data instead, use {cmems_type}\n",
+        )
+    if name == "wind":
+        # tidal_gauge (Copernicus Marine) is offered as a commented-out
+        # line rather than omitted entirely, so a user who wants it can
+        # uncomment it instead of having to know the exact block to add.
+        yaml_text = yaml_text.replace(
+            "- source_type: scatterometer_ascat\n",
+            "# - source_type: tidal_gauge  # Copernicus Marine source; excluded "
+            "from the wind standard (buoy_gts/ship_gts) since its wind sensors "
+            "are not QC-filtered to the same standard -- uncomment to include "
+            "anyway\n"
+            "#   download_kwargs: {}\n"
+            "#   collocation_kwargs: {}\n"
+            "- source_type: scatterometer_ascat\n",
+        )
+    out_path.write_text(yaml_text)
     print(f"Recipe created: {out_path}")
     print("Edit the file to adjust data sources and collocation settings.")
 
@@ -1098,8 +1132,8 @@ def _execute_recipe(
         if not orchestrator.metadata.get("sar_data_found", True):
             if dry_run:
                 print(
-                    "\nNo SAR data found for this window — stopping dry run "
-                    "before validation sources."
+                    "\nNo SAR data found for this window — stopping dry "
+                    "download before validation sources."
                 )
             else:
                 print(
@@ -1109,7 +1143,7 @@ def _execute_recipe(
             return
 
         if dry_run:
-            print("\nDry run complete — no data was downloaded.")
+            print("\nDry download complete — no data was downloaded.")
             print("No data directories or files were created.")
             return
         elif not success:

@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import h5netcdf  # noqa: F401
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -24,6 +25,15 @@ from sar_validation.downloaders.insitu_index_fallback import (
     parse_platform_file,
     rows_matching_query,
 )
+
+# Several tests below open a real file through xarray's "h5netcdf" engine
+# while sys.modules is patched (to keep copernicusmarine out of the loop).
+# unittest.mock.patch.dict("sys.modules", ...) restores sys.modules to a
+# full snapshot on exit, which would otherwise discard h5netcdf/h5py the
+# first time either is imported inside such a patched block -- and h5py's
+# own C-extension initialization cannot run a second time in one process.
+# The unused import above keeps it resident in sys.modules across every
+# patch/restore cycle in this file.
 
 _FIXTURE_INDEX = (  # noqa: E501
     "# Title : in-situ files catalog\n"
@@ -88,6 +98,63 @@ def test_fetch_index_file_force_download_refetches_even_a_fresh_copy(tmp_path):
 
     with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
         fetch_index_file("dataset", "history", tmp_path, force_download=True)
+
+    fake_module.get.assert_called_once()
+
+
+def test_index_max_age_scales_with_how_historic_the_query_window_is():
+    from datetime import timedelta
+
+    from sar_validation.downloaders.insitu_index_fallback import _index_max_age_for_window
+
+    now = datetime.now()
+    assert _index_max_age_for_window(now) == timedelta(days=1)
+    assert _index_max_age_for_window(now - timedelta(days=10)) == timedelta(days=1)
+    assert _index_max_age_for_window(now - timedelta(days=15)) == timedelta(days=7)
+    assert _index_max_age_for_window(now - timedelta(days=61)) == timedelta(days=30)
+    assert _index_max_age_for_window(None) == timedelta(days=1)
+
+
+def test_fetch_index_file_reuses_a_five_day_old_cache_for_a_historic_window(tmp_path):
+    """A cache older than the 1-day default would normally be
+    considered stale, but a query window from three weeks ago only
+    needs a 7-day-fresh index, since a historical archive that far in
+    the past gains no new platforms day to day."""
+    from datetime import timedelta
+
+    cached_path = tmp_path / "index_history.txt"
+    cached_path.write_text(_FIXTURE_INDEX)
+    stale_time = time.time() - timedelta(days=5).total_seconds()
+    os.utime(cached_path, (stale_time, stale_time))
+
+    fake_module = MagicMock()
+    window_end = datetime.now() - timedelta(days=20)
+
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        result = fetch_index_file("dataset", "history", tmp_path, window_end=window_end)
+
+    assert result == cached_path
+    fake_module.get.assert_not_called()
+
+
+def test_fetch_index_file_still_refetches_beyond_the_scaled_max_age(tmp_path):
+    """A cache old enough to exceed even the widened threshold for a
+    historic window must still refetch."""
+    from datetime import timedelta
+
+    cached_path = tmp_path / "index_history.txt"
+    cached_path.write_text(_FIXTURE_INDEX)
+    stale_time = time.time() - timedelta(days=10).total_seconds()
+    os.utime(cached_path, (stale_time, stale_time))
+
+    fake_module = MagicMock()
+    fake_module.get.return_value = MagicMock(
+        files=[MagicMock(filename="index_history.txt", file_path=cached_path)],
+    )
+    window_end = datetime.now() - timedelta(days=1)
+
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        fetch_index_file("dataset", "history", tmp_path, window_end=window_end)
 
     fake_module.get.assert_called_once()
 
@@ -294,6 +361,74 @@ def _write_mooring_fixture(path):
         attrs={"platform_code": "A-Sulafjorden"},
     )
     ds.to_netcdf(path)
+
+
+def test_lazy_row_coordinates_reads_local_cached_file(tmp_path):
+    from sar_validation.downloaders.insitu_index_fallback import _lazy_row_coordinates
+
+    row = IndexRow(
+        file_name="history/MO/AR_TS_MO_A-Sulafjorden.nc",
+        lat_min=62.4, lat_max=62.5, lon_min=6.0, lon_max=6.1,
+        time_start=datetime(2023, 1, 1), time_end=datetime(2023, 12, 31),
+        institution="x", parameters={"HCDT"},
+    )
+    nc_path = tmp_path / "AR_TS_MO_A-Sulafjorden.nc"
+    _write_mooring_fixture(nc_path)
+
+    fake_module = MagicMock()  # must not be called -- local file exists
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        result = _lazy_row_coordinates(
+            row, "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr", "history", tmp_path,
+        )
+
+    assert result is not None
+    times, lons, lats = result
+    assert len(times) == 3
+    fake_module.get.assert_not_called()
+
+
+def test_lazy_row_coordinates_returns_none_on_missing_coordinates(tmp_path):
+    from sar_validation.downloaders.insitu_index_fallback import _lazy_row_coordinates
+
+    row = IndexRow(
+        file_name="history/MO/no_coords.nc",
+        lat_min=1.0, lat_max=2.0, lon_min=1.0, lon_max=2.0,
+        time_start=datetime(2023, 1, 1), time_end=datetime(2023, 12, 31),
+        institution="x", parameters={"HCDT"},
+    )
+    nc_path = tmp_path / "no_coords.nc"
+    xr.Dataset(
+        data_vars={"HCDT": ("TIME", [1.0, 2.0])},
+        coords={"TIME": pd.date_range("2023-01-01", periods=2)},
+    ).to_netcdf(nc_path)
+
+    result = _lazy_row_coordinates(
+        row, "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr", "history", tmp_path,
+    )
+
+    assert result is None
+
+
+def test_matching_observations_mask_matches_the_prior_boolean_logic():
+    from sar_validation.downloaders.insitu_index_fallback import (
+        _matching_observations_mask,
+        _observations_overlap_window,
+    )
+
+    times = np.array(pd.date_range("2023-01-01", periods=3, freq="h").values)
+    lons = np.array([6.04, 6.05, 6.06])
+    lats = np.array([62.42, 62.43, 62.44])
+
+    mask = _matching_observations_mask(
+        times, lons, lats, 6.0, 6.06, 62.4, 62.44,
+        pd.Timestamp("2023-01-01T00:00:00"), pd.Timestamp("2023-01-01T01:00:00"),
+    )
+
+    assert list(mask) == [True, True, False]
+    assert _observations_overlap_window(
+        times, lons, lats, 6.0, 6.06, 62.4, 62.44,
+        pd.Timestamp("2023-01-01T00:00:00"), pd.Timestamp("2023-01-01T01:00:00"),
+    ) is True
 
 
 def _write_argo_fixture(path):
@@ -880,3 +1015,96 @@ def test_download_via_index_logs_a_warning_on_duplicate_file_stems(tmp_path, cap
         )
 
     assert "Duplicate platform file stem" in caplog.text
+
+
+def test_dry_platform_ranges_returns_earliest_and_latest_for_a_moving_platform(tmp_path):
+    from sar_validation.downloaders.insitu_index_fallback import dry_platform_ranges
+
+    # Unlike _FIXTURE_INDEX's own tight (GPS-jitter-sized) bbox for this
+    # platform, this row's reported bbox is wide enough to be treated as a
+    # genuinely moving platform, so the lazy per-observation open below is
+    # actually exercised rather than short-circuited by the index row's own
+    # reported time range.
+    index_path = tmp_path / "index_history.txt"
+    index_path.write_text(
+        "# Title : in-situ files catalog\n"
+        "# product_id,file_name,geospatial_lat_min,geospatial_lat_max,geospatial_lon_min,geospatial_lon_max,time_coverage_start,time_coverage_end,institution,date_update,data_mode,parameters\n"  # noqa: E501
+        "COP-AR-01,history/MO/AR_TS_MO_A-Sulafjorden.nc,62.3,62.6,6.0,6.3,2022-03-01T00:00:00Z,2024-04-02T07:59:00Z,x,2025-05-07T14:08:19Z,R,HCDT\n"  # noqa: E501
+    )
+    nc_path = tmp_path / "AR_TS_MO_A-Sulafjorden.nc"
+    _write_mooring_fixture(nc_path)
+
+    fake_module = MagicMock()  # must not be called -- local file exists
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        df = dry_platform_ranges(
+            "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr", "history",
+            min_lon=6.0, max_lon=6.1, min_lat=62.4, max_lat=62.5,
+            start_dt="2023-01-01T00:00:00", end_dt="2023-01-01T03:00:00",
+            wanted_variables={"HCDT"}, work_dir=tmp_path,
+        )
+
+    fake_module.get.assert_not_called()
+    assert set(df["platform_id"]) == {"AR_TS_MO_A-Sulafjorden"}
+    platform_rows = df[df["platform_id"] == "AR_TS_MO_A-Sulafjorden"]
+    assert pd.Timestamp(platform_rows["time"].min()) == pd.Timestamp("2023-01-01T00:00:00")
+    assert pd.Timestamp(platform_rows["time"].max()) == pd.Timestamp("2023-01-01T02:00:00")
+    assert list(df.columns) == [
+        "variable", "platform_id", "platform_type", "time",
+        "longitude", "latitude", "depth", "value", "value_qc", "institution",
+    ]
+
+
+def test_dry_platform_ranges_uses_index_bbox_for_a_stationary_platform(tmp_path):
+    from sar_validation.downloaders.insitu_index_fallback import dry_platform_ranges
+
+    index_path = tmp_path / "index_history.txt"
+    index_path.write_text(_FIXTURE_INDEX)
+
+    fake_module = MagicMock()  # must not be called -- stationary row, no file open at all
+    with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+        df = dry_platform_ranges(
+            "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr", "history",
+            min_lon=6.0, max_lon=6.1, min_lat=62.4, max_lat=62.5,
+            start_dt="2022-01-01T00:00:00", end_dt="2025-01-01T00:00:00",
+            wanted_variables={"HCDT"}, work_dir=tmp_path,
+        )
+
+    fake_module.get.assert_not_called()
+    assert set(df["platform_id"]) == {"AR_TS_MO_A-Sulafjorden"}
+
+
+def test_dry_platform_ranges_omits_a_platform_whose_lazy_open_fails(tmp_path, monkeypatch):
+    from sar_validation.downloaders.insitu_index_fallback import dry_platform_ranges
+
+    index_path = tmp_path / "index_history.txt"
+    index_path.write_text(_FIXTURE_INDEX)
+
+    monkeypatch.setattr(
+        "sar_validation.downloaders.insitu_index_fallback._lazy_row_coordinates",
+        lambda row, dataset_id, dataset_part, work_dir: None,
+    )
+
+    df = dry_platform_ranges(
+        "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr", "history",
+        min_lon=-179.99, max_lon=179.99, min_lat=-89.0, max_lat=89.0,
+        start_dt="2023-05-01T00:00:00", end_dt="2023-06-01T00:00:00",
+        wanted_variables={"EWCT"}, work_dir=tmp_path,
+    )
+
+    assert df.empty
+
+
+def test_dry_platform_ranges_no_matching_rows_returns_empty_dataframe(tmp_path):
+    from sar_validation.downloaders.insitu_index_fallback import dry_platform_ranges
+
+    index_path = tmp_path / "index_history.txt"
+    index_path.write_text(_FIXTURE_INDEX)
+
+    df = dry_platform_ranges(
+        "cmems_obs-ins_glo_phybgcwav_mynrt_na_irr", "history",
+        min_lon=100.0, max_lon=101.0, min_lat=10.0, max_lat=11.0,
+        start_dt="2023-01-01T00:00:00", end_dt="2023-01-02T00:00:00",
+        wanted_variables={"HCDT"}, work_dir=tmp_path,
+    )
+
+    assert df.empty

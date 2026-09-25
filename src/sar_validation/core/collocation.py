@@ -95,6 +95,18 @@ class CollocatedPoint:
     sar_x_idx: int = 0
     sar_scene_name: str = ""
 
+    # Circular radius (km) used to average the SAR side of this row, or
+    # None when the row was matched by direct nearest-point lookup with
+    # no spatial averaging.
+    aggregation_window_km: Optional[float] = None
+
+    # The SAR product's own native pixel grid spacing (km), recorded
+    # only on rows matched by direct nearest-pixel lookup with no
+    # spatial averaging -- None wherever aggregation_window_km already
+    # describes the row's real spatial footprint, and None for
+    # collocation methods with no continuous SAR grid to measure.
+    sar_pixel_spacing_km: Optional[float] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "sar_lon":                   self.sar_lon,
@@ -113,6 +125,8 @@ class CollocatedPoint:
             "sar_y_idx":                 self.sar_y_idx,
             "sar_x_idx":                 self.sar_x_idx,
             "sar_scene_name":            self.sar_scene_name,
+            "aggregation_window_km":     self.aggregation_window_km,
+            "sar_pixel_spacing_km":      self.sar_pixel_spacing_km,
         }
 
 
@@ -357,6 +371,30 @@ def _model_source_type(data_type: str) -> Optional[str]:
     if data_type == "hycom":
         return "hycom"
     return None
+
+
+def _sar_grid_pixel_spacing_km(sar_lon: np.ndarray, sar_lat: np.ndarray) -> Optional[float]:
+    """
+    The median distance (km) between adjacent cells of a native SAR
+    grid, structurally the same degrees-to-km conversion this codebase
+    already uses for HF-radar's own native-resolution derivation
+    (111.32 km per degree of latitude, with a cos(latitude) correction
+    for longitude), applied here to a 2-D grid's own row/column spacing
+    instead of a 1-D coordinate vector. Returns None for a grid with
+    fewer than two rows or columns, or whose derived spacing collapses
+    to zero or less in either direction.
+    """
+    ny, nx = sar_lon.shape
+    if ny <= 1 or nx <= 1:
+        return None
+    lat_spacing_deg = float(np.nanmedian(np.abs(np.diff(sar_lat, axis=0))))
+    lon_spacing_deg = float(np.nanmedian(np.abs(np.diff(sar_lon, axis=1))))
+    mean_lat = float(np.nanmean(sar_lat))
+    lat_spacing_km = lat_spacing_deg * 111.32
+    lon_spacing_km = lon_spacing_deg * 111.32 * max(np.cos(np.radians(mean_lat)), 1e-6)
+    if lat_spacing_km <= 0 or lon_spacing_km <= 0:
+        return None
+    return (lat_spacing_km + lon_spacing_km) / 2.0
 
 
 def _detect_collocation_type(val_ds: "xr.Dataset", source_path: str) -> str:
@@ -786,6 +824,7 @@ class PointLayerCollocation:
                     sar_y_idx=y_idx,
                     sar_x_idx=x_idx,
                     sar_scene_name=sar_scene_name,
+                    aggregation_window_km=self.aggregation_window_km,
                 )
 
                 if not self.dedup_nearest_in_time:
@@ -1497,6 +1536,7 @@ def _collocate_wv_points(
                 sar_y_idx=0,
                 sar_x_idx=i,
                 sar_scene_name=sar_scene_name,
+                aggregation_window_km=None,
             )
         )
 
@@ -1505,6 +1545,34 @@ def _collocate_wv_points(
         collocation_type, len(collocations), len(sar_lons), val_source,
     )
     return collocations
+
+
+def _resolve_source_type_override(
+    source_type_overrides: Dict[str, Dict[str, Any]], source_type: str,
+) -> Dict[str, Any]:
+    """Resolve *source_type*'s own collocation_kwargs override out of
+    *source_type_overrides* (keyed by each recipe validation source's own
+    source_type), additionally falling back to a "buoy_waterfall" entry
+    when *source_type* is exactly "buoy_gts".
+
+    datatree_converter.py's GTS buoy scanning block always groups GTS
+    nodes under the literal group name "buoy_gts", regardless of whether
+    the recipe's own validation source is configured as "buoy_gts" or
+    "buoy_waterfall" -- see its own from_gts_buoy_bufr scanning block.
+    A recipe source configured as "buoy_waterfall" therefore has its
+    collocation_kwargs keyed under "buoy_waterfall" in
+    source_type_overrides, which the GTS-side node's own literal
+    "buoy_gts" name would never find without this fallback, silently
+    dropping the override. A literal "buoy_gts"-alone recipe is
+    unaffected: its own override, if any, is already keyed under
+    "buoy_gts" itself and is found on the first lookup, before the
+    fallback is ever consulted.
+    """
+    if source_type in source_type_overrides:
+        return source_type_overrides[source_type]
+    if source_type == "buoy_gts":
+        return source_type_overrides.get("buoy_waterfall", {})
+    return {}
 
 
 def run_collocation(
@@ -1642,7 +1710,7 @@ def run_collocation(
                 source_type = ds.attrs.get("platform_type", name.split("/")[-1])
                 source_metadata[name] = {
                     "source_type": source_type,
-                    "colloc_kwargs": source_type_overrides.get(source_type, {}),
+                    "colloc_kwargs": _resolve_source_type_override(source_type_overrides, source_type),
                 }
             # One level deeper (e.g. validation/osi_saf_winds/<file>)
             for subname, subnode in node.children.items():
@@ -1655,7 +1723,7 @@ def run_collocation(
                     source_type = name
                     source_metadata[path] = {
                         "source_type": source_type,
-                        "colloc_kwargs": source_type_overrides.get(source_type, {}),
+                        "colloc_kwargs": _resolve_source_type_override(source_type_overrides, source_type),
                     }
 
     # Gridded "model" sources (ERA5, HYCOM) -- kept as raw, native
@@ -1896,7 +1964,10 @@ def run_collocation(
                 model_kwargs = dict(layer_vs_layer_specs.get(layer_type, {}))
                 model_kwargs.update(per_source_kwargs)
                 model_colloc = ModelLayerCollocation(
-                    method=model_kwargs.get("method", "cell-averaging"),
+                    # collocate_points (below) always interpolates
+                    # directly regardless of this value, but it is set
+                    # consistently with the grid-mode dispatch anyway.
+                    method=per_source_kwargs.get("method", layer_vs_layer_collocation_method),
                     temporal_method=model_kwargs.get("temporal_method", "hyperbolic"),
                 )
                 source_label = val_ds.attrs.get("platform_type", val_name.split("/")[-1])
@@ -1995,7 +2066,12 @@ def run_collocation(
                 model_kwargs = dict(layer_vs_layer_specs.get(layer_type, {}))
                 model_kwargs.update(per_source_kwargs)
                 model_colloc = ModelLayerCollocation(
-                    method=model_kwargs.get("method", "cell-averaging"),
+                    # A recipe's own per-source override wins outright
+                    # (matching every other per_source_kwargs field
+                    # below); otherwise the requested collocation
+                    # method applies here exactly as it already does
+                    # for layer_vs_layer sources.
+                    method=per_source_kwargs.get("method", layer_vs_layer_collocation_method),
                     temporal_method=model_kwargs.get("temporal_method", "hyperbolic"),
                     time_tolerance_minutes=model_kwargs.get("time_tolerance_minutes", 60),
                     aggregation_window_km=model_kwargs.get("aggregation_window_km", 12.5),
@@ -2186,6 +2262,11 @@ class LayerLayerCollocation(PointLayerCollocation):
 
         sar_times = _to_datetime_array(sar_time)
         collocations: List[CollocatedPoint] = []
+
+        # This SAR scene's own native pixel grid spacing, recorded on
+        # every row below in place of an aggregation window, since none
+        # of these matches involve spatial averaging.
+        sar_pixel_spacing_km = _sar_grid_pixel_spacing_km(sar_lon, sar_lat)
 
         # Pre-filter scatterometer data: spatial and temporal bounds.
         # nanmin/nanmax: SAR grids commonly carry NaN lon/lat at masked or
@@ -2431,6 +2512,8 @@ class LayerLayerCollocation(PointLayerCollocation):
                         sar_y_idx=y_idx,
                         sar_x_idx=x_idx,
                         sar_scene_name=sar_scene_name,
+                        aggregation_window_km=None,
+                        sar_pixel_spacing_km=sar_pixel_spacing_km,
                     )
                 )
 

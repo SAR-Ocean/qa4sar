@@ -18,6 +18,7 @@ from sar_validation.downloaders.base import (
     is_date_recent,
     normalize_datetime,
     prefer_ipv4_dns,
+    run_with_timeout,
     set_credential,
     split_antimeridian_bbox,
 )
@@ -192,6 +193,52 @@ class TestSplitAntimeridianBbox:
         windows = split_antimeridian_bbox(170.0, -170.0)
         for lo, hi in windows:
             assert lo <= hi
+
+
+# ---------------------------------------------------------------------------
+# Tests for split_datetime_range_at_cutover()
+# ---------------------------------------------------------------------------
+
+class TestSplitDatetimeRangeAtCutover:
+    def test_window_entirely_before_cutover(self):
+        from sar_validation.downloaders.base import split_datetime_range_at_cutover
+
+        before, after = split_datetime_range_at_cutover(
+            "2023-06-01T00:00:00", "2023-06-02T00:00:00", "2024-01-01T00:00:00",
+        )
+
+        assert before == ("2023-06-01T00:00:00", "2023-06-02T00:00:00")
+        assert after is None
+
+    def test_window_entirely_after_cutover(self):
+        from sar_validation.downloaders.base import split_datetime_range_at_cutover
+
+        before, after = split_datetime_range_at_cutover(
+            "2024-06-01T00:00:00", "2024-06-02T00:00:00", "2024-01-01T00:00:00",
+        )
+
+        assert before is None
+        assert after == ("2024-06-01T00:00:00", "2024-06-02T00:00:00")
+
+    def test_window_straddling_cutover_is_split(self):
+        from sar_validation.downloaders.base import split_datetime_range_at_cutover
+
+        before, after = split_datetime_range_at_cutover(
+            "2023-12-31T21:00:00", "2024-01-01T03:00:00", "2024-01-01T00:00:00",
+        )
+
+        assert before == ("2023-12-31T21:00:00", "2023-12-31T23:59:59")
+        assert after == ("2024-01-01T00:00:00", "2024-01-01T03:00:00")
+
+    def test_window_ending_exactly_at_cutover_is_entirely_before(self):
+        from sar_validation.downloaders.base import split_datetime_range_at_cutover
+
+        before, after = split_datetime_range_at_cutover(
+            "2023-12-31T00:00:00", "2023-12-31T23:59:59", "2024-01-01T00:00:00",
+        )
+
+        assert before == ("2023-12-31T00:00:00", "2023-12-31T23:59:59")
+        assert after is None
 
 
 # ---------------------------------------------------------------------------
@@ -2114,7 +2161,7 @@ class TestASCATSoilMoistureDownloaderZipExtraction:
 
 class TestInsituPlatformCodeMapping:
     def test_resolve_platform_codes_dedupes_shared_db(self):
-        codes = _resolve_platform_codes(["buoy", "drifter"])
+        codes = _resolve_platform_codes(["buoy_cmems", "drifter"])
         assert codes == ["DB", "AD"]
 
     def test_resolve_platform_codes_unknown_source_type_raises(self):
@@ -2471,6 +2518,33 @@ class TestNOAAHFRadarDownload:
         assert "[(30.0)" not in called_url
         assert "[(-126.0):(-115.8056)]" in called_url
 
+    def test_download_raises_value_error_on_transient_404(self, tmp_path):
+        """ERDDAP's rolling real-time catalogue can drop a dataset without
+        warning even though select_erddap_dataset() says it should exist --
+        this must surface as the same ValueError type the antimeridian
+        waterfall in hf_radar_us_downloader.py already falls through on,
+        not an unhandled HTTPError."""
+        import urllib.error
+
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            m.side_effect = urllib.error.HTTPError("url", 404, "Not Found", {}, None)
+            with pytest.raises(ValueError, match="404"):
+                dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+    def test_download_reraises_non_404_http_errors_unchanged(self, tmp_path):
+        import urllib.error
+
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            m.side_effect = urllib.error.HTTPError("url", 500, "Server Error", {}, None)
+            with pytest.raises(urllib.error.HTTPError):
+                dl.download(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
 
 _DAS_RANGE_START = (datetime.now(timezone.utc) - timedelta(days=30)).replace(microsecond=0)
 _DAS_RANGE_END = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0)
@@ -2581,6 +2655,34 @@ class TestNOAAHFRadarCheckAvailabilityDry:
 
         assert result is False
         m.assert_not_called()
+
+    def test_false_when_das_request_transiently_404s(self, tmp_path):
+        """Same transient-404 case _download_window() handles -- ERDDAP's
+        rolling catalogue can drop this exact dataset without warning even
+        though select_erddap_dataset() says it should exist; this is a
+        structural "ERDDAP doesn't apply here" outcome, not a check
+        failure, so it must return False rather than raise."""
+        import urllib.error
+
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            m.side_effect = urllib.error.HTTPError("url", 404, "Not Found", {}, None)
+            result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
+
+        assert result is False
+
+    def test_reraises_non_404_http_errors_unchanged(self, tmp_path):
+        import urllib.error
+
+        dl = NOAAHFRadarDownloader(output_dir=tmp_path, dry_run=False, resolution_km=6)
+        with patch(
+            "sar_validation.downloaders.noaa_hfradar_downloader.urllib.request.urlopen"
+        ) as m:
+            m.side_effect = urllib.error.HTTPError("url", 500, "Server Error", {}, None)
+            with pytest.raises(urllib.error.HTTPError):
+                dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
 
 
 class TestNOAAHFRadarDownload500m:
@@ -2928,7 +3030,7 @@ class TestOrchestratorDepthResolution:
             output_dir=str(tmp_path),
             validation_sources=[
                 ValidationDataSource(source_type="mooring"),
-                ValidationDataSource(source_type="buoy"),
+                ValidationDataSource(source_type="buoy_cmems"),
             ],
         ))
         orchestrator = DataOrchestrator(recipe, dry_run=True)
@@ -2957,7 +3059,7 @@ class TestOrchestratorDepthResolution:
             output_dir=str(tmp_path),
             validation_sources=[
                 ValidationDataSource(source_type="mooring", min_depth=-5.0, max_depth=5.0),
-                ValidationDataSource(source_type="buoy"),  # unspecified -> -20/20
+                ValidationDataSource(source_type="buoy_cmems"),  # unspecified -> -20/20
             ],
         ))
         orchestrator = DataOrchestrator(recipe, dry_run=True)
@@ -3081,12 +3183,35 @@ class TestHFRadarDownloaderGrid:
             Path(kwargs["output_directory"], kwargs["output_filename"]).write_bytes(b"")
 
         fake_module.subset.side_effect = fake_subset
-        # US-WestCoast has a `latest` feed (unlike US-EastGulfCoast).
         with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
             dl.download(-125.0, -119.0, 33.0, 38.0, recent_start, recent_end)
 
         _, kwargs = fake_module.subset.call_args
         assert kwargs["dataset_part"] == "latest-radar-total--US-WestCoast"
+
+    def test_recent_date_uses_latest_part_for_us_east_gulf_coast(self, tmp_path):
+        """US-EastGulfCoast has a near-real-time ("latest-radar-total")
+        feed -- see _hf_radar_regions.py."""
+        from datetime import datetime, timedelta, timezone
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        recent_end = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+        recent_start = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%d")
+        dl = HFRadarDownloader(output_dir=tmp_path, dry_run=False)
+        fake_module = MagicMock()
+
+        def fake_subset(**kwargs):
+            Path(kwargs["output_directory"], kwargs["output_filename"]).write_bytes(b"")
+
+        fake_module.subset.side_effect = fake_subset
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            dl.download(-90.0, -60.0, 30.0, 40.0, recent_start, recent_end)
+
+        _, kwargs = fake_module.subset.call_args
+        assert kwargs["dataset_part"] == "latest-radar-total--US-EastGulfCoast"
 
     def test_retries_with_monthly_part_when_latest_out_of_bounds(self, tmp_path):
         from datetime import datetime, timedelta, timezone
@@ -3206,6 +3331,25 @@ class TestHFRadarDownloaderCheckAvailabilityDry:
 
         _, kwargs = fake_module.open_dataset.call_args
         assert kwargs["dataset_part"] == "latest-radar-total--US-WestCoast"
+
+    def test_recent_date_uses_latest_part_for_us_east_gulf_coast(self, tmp_path):
+        """US-EastGulfCoast has a near-real-time ("latest-radar-total")
+        feed -- see _hf_radar_regions.py."""
+        from datetime import datetime, timedelta, timezone
+
+        from sar_validation.downloaders.hf_radar_downloader import HFRadarDownloader
+
+        recent_end = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+        recent_start = (datetime.now(timezone.utc) - timedelta(days=4)).strftime("%Y-%m-%d")
+        dl = HFRadarDownloader(output_dir=tmp_path)
+        fake_module = MagicMock()
+        fake_module.open_dataset.return_value = _FakeGridDataset(1)
+
+        with patch.dict("sys.modules", {"copernicusmarine": fake_module}):
+            dl.check_availability_dry(-90.0, -60.0, 30.0, 40.0, recent_start, recent_end)
+
+        _, kwargs = fake_module.open_dataset.call_args
+        assert kwargs["dataset_part"] == "latest-radar-total--US-EastGulfCoast"
 
 
 class TestHFRadarDownloaderGridAntimeridian:
@@ -4170,7 +4314,7 @@ class TestOrchestratorHistoricalFirstDedup:
 
         assert ok is True
         mock_insitu_cls.assert_not_called()
-        assert "insitu" not in orchestrator.metadata["downloads"]
+        assert orchestrator.metadata["downloads"]["insitu"]["status"] == "skipped"
 
     def test_insitu_batch_depth_window_ignores_excluded_drifter(self, tmp_path):
         from sar_validation.core.orchestrator import DataOrchestrator
@@ -4944,3 +5088,42 @@ class TestHFRadarUSDownloaderCheckAvailabilityDry:
             result = dl.check_availability_dry(-125, -119, 33, 38, _RECENT_START, _RECENT_END)
 
         assert result is False
+
+
+class TestRunWithTimeout:
+    def test_returns_true_when_func_completes_in_time(self):
+        calls = []
+        assert run_with_timeout(lambda: calls.append(1), timeout_seconds=1.0) is True
+        assert calls == [1]
+
+    def test_returns_false_when_func_does_not_complete_in_time(self):
+        import threading
+
+        release = threading.Event()
+
+        def _blocks_until_released():
+            release.wait()
+
+        assert run_with_timeout(_blocks_until_released, timeout_seconds=0.05) is False
+        release.set()  # let the background thread finish so it does not leak into other tests
+
+    def test_re_raises_the_func_exception_on_the_calling_thread(self):
+        def _raises():
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            run_with_timeout(_raises, timeout_seconds=1.0)
+
+    def test_the_background_thread_is_a_daemon_thread(self):
+        import threading
+
+        seen_daemon = {}
+
+        def _record_and_block():
+            seen_daemon["value"] = threading.current_thread().daemon
+            # Return immediately -- this test only needs to observe the
+            # thread's daemon flag, not exercise a real timeout.
+
+        run_with_timeout(_record_and_block, timeout_seconds=1.0)
+
+        assert seen_daemon["value"] is True

@@ -28,6 +28,11 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+try:
+    import pdbufr
+except ImportError:  # optional dependency, provided by the "gts" extra
+    pdbufr = None
+
 from ._cf_metadata import apply_cf_metadata
 
 logger = logging.getLogger(__name__)
@@ -112,6 +117,31 @@ _ERA5_VARS: dict[str, dict] = {
 #: "era5_wind_20260712_w0" -> stem="era5_wind_20260712", idx=0. Produced by
 #: ERA5Downloader.download() when a recipe bbox crosses the antimeridian.
 _ERA5_WINDOW_SUFFIX_RE = re.compile(r"^(?P<stem>.+)_w(?P<idx>\d+)$")
+
+#: Matches the trailing "<YYYY-MM-DD>_<YYYY-MM-DD>" (optionally followed
+#: by "_w<N>" for an antimeridian-split request) that AltimeterDownloader
+#: appends to both flat output files and per-platform output directories,
+#: identifying which requested time window produced a given download --
+#: stripped when grouping files so two downloads of the same dataset for
+#: two different (possibly overlapping) windows are recognized as the
+#: same real product rather than two distinct ones.
+_ALTIMETER_WINDOW_SUFFIX_RE = re.compile(r"_\d{4}-\d{2}-\d{2}_\d{4}-\d{2}-\d{2}(?:_w\d+)?$")
+
+
+def _dedupe_altimeter_points(datasets_list: List[xr.Dataset]) -> xr.Dataset:
+    """
+    Concatenate several altimeter Datasets sharing the same real product
+    along their "point" dimension, keeping only one row per distinct
+    (time, lat, lon) triple -- the real-world consequence of the same
+    along-track observation being present in more than one overlapping,
+    separately downloaded time window.
+    """
+    combined = xr.concat(datasets_list, dim="point")
+    coord_df = combined[["time", "lat", "lon"]].to_dataframe()
+    keep = ~coord_df.duplicated(subset=["time", "lat", "lon"], keep="first")
+    deduped = combined.isel(point=np.where(keep.values)[0])
+    deduped.attrs = dict(datasets_list[0].attrs)
+    return deduped
 
 
 def _normalize_era5_grib_coords(ds: xr.Dataset) -> xr.Dataset:
@@ -451,6 +481,30 @@ def _owi_quality_reject_mask(da: xr.DataArray) -> Optional[np.ndarray]:
     return np.isin(da.values, reject_values)
 
 
+def _decode_flag_variable(da: xr.DataArray) -> Optional[np.ndarray]:
+    """
+    Decode an integer CF flag variable into an array of its flag_meanings
+    strings, one per value in *da*.
+
+    Returns None -- signalling "cannot decode" -- when flag_values/
+    flag_meanings are missing from *da*'s own attributes or do not match
+    one-to-one, the same "unusable metadata never silently guesses"
+    precedent as _owi_quality_reject_mask. A value present in *da* but
+    absent from *flag_values* becomes the string "unknown" for that entry
+    only, rather than causing the whole array to return None.
+    """
+    meanings = da.attrs.get("flag_meanings")
+    values = da.attrs.get("flag_values")
+    if not meanings or values is None:
+        return None
+    names = str(meanings).split()
+    values = np.asarray(values)
+    if len(names) != len(values):
+        return None
+    lookup = dict(zip(values.tolist(), names))
+    return np.array([lookup.get(v, "unknown") for v in da.values], dtype=object)
+
+
 # Sentinel-1 OSW quality control, shared by the WV point path
 # (from_sar_l2_ocn_wv_safe) and the SM/IW/EW grid path
 # (_extract_osw_grid_data) so the two cannot silently drift apart.
@@ -740,6 +794,7 @@ class DataTreeConverter:
     def from_insitu_csv(
         csv_path: Union[str, Path],
         source_type: str = "mooring",
+        exclude_platform_ids: Optional[set[str]] = None,
     ) -> Optional[xr.Dataset]:
         """
         Convert a Copernicus Marine in-situ CSV to a point-geometry Dataset.
@@ -754,6 +809,11 @@ class DataTreeConverter:
             Path to CSV file (output from the in-situ or HF radar downloader).
         source_type : str
             Platform category; stored as a Dataset attribute.
+        exclude_platform_ids : set of str, optional
+            Platform IDs to drop entirely before conversion, compared as
+            strings. Used by the ``"buoy_waterfall"`` wind source to keep
+            a Copernicus Marine station out of the DataTree once a GTS
+            BUFR file for the same window already covers it.
 
         Returns
         -------
@@ -765,7 +825,16 @@ class DataTreeConverter:
             logger.warning("CSV not found: %s", csv_path)
             return None
 
-        df = pd.read_csv(csv_path)
+        # platform_id is read as an explicit string dtype rather than left
+        # to pandas' own type inference: an all-numeric platform_id column
+        # containing even one missing/blank value is otherwise inferred as
+        # float64 (to accommodate NaN), so a later astype(str) call would
+        # yield "6600021.0" instead of "6600021" for every row -- a value
+        # that can never match the plain-string platform ID decoded from
+        # GTS BUFR, silently disabling the exclude_platform_ids matching
+        # the "buoy_waterfall" dedup depends on. Pandas ignores this dtype
+        # key harmlessly when platform_id is absent from a given CSV.
+        df = pd.read_csv(csv_path, dtype={"platform_id": "string"})
 
         # Normalise column names
         rename = {"longitude": "lon", "latitude": "lat"}
@@ -779,6 +848,27 @@ class DataTreeConverter:
                 )
 
         df["time"] = pd.to_datetime(df["time"])
+
+        # Platform IDs are identifiers, not quantities -- a digit-only ID
+        # such as a WMO buoy number would otherwise round-trip through the
+        # CSV as an integer dtype, which would compare unequal to the
+        # string IDs decoded from GTS BUFR files.
+        if "platform_id" in df.columns:
+            df["platform_id"] = df["platform_id"].astype(str)
+
+        if exclude_platform_ids and "platform_id" in df.columns:
+            before = len(df)
+            df = df[~df["platform_id"].isin(exclude_platform_ids)]
+            dropped = before - len(df)
+            if dropped:
+                logger.info(
+                    "from_insitu_csv: excluded %d row(s) from %d platform ID(s) "
+                    "already covered by GTS.",
+                    dropped, len(exclude_platform_ids),
+                )
+            if df.empty:
+                logger.info("from_insitu_csv: no rows left after platform exclusion in %s.", csv_path.name)
+                return None
 
         # Provenance columns present in Copernicus Marine in-situ exports;
         # captured before the wide-format pivot drops them.
@@ -943,6 +1033,284 @@ class DataTreeConverter:
         ds.attrs["source"]        = "Copernicus Marine"
         return ds
 
+    #: BUFR columns to decode per product_type, beyond the shared id
+    #: columns (platform/name/position/time). "currents" additionally
+    #: needs depthBelowSeaSurface to pick the shallowest reported level.
+    _GTS_BUOY_VALUE_COLUMNS = {
+        "wind": ("windSpeed", "windDirection"),
+        "waves": ("significantWaveHeight",),
+        "currents": ("depthBelowSeaSurface", "speedOfCurrent", "directionOfCurrent"),
+    }
+
+    @staticmethod
+    def from_gts_buoy_bufr(
+        bufr_path: Union[str, Path],
+        product_type: str = "wind",
+    ) -> Optional[xr.Dataset]:
+        """
+        Decode a GTS buoy BUFR file (MARS obstype 181/182) into a
+        standardised point-geometry Dataset.
+
+        *product_type* selects which of GTS's optional sections is
+        decoded: ``"wind"`` (``WSPD``/``WDIR``, from the always-present
+        wind block), ``"waves"`` (``VAVH``, time-domain significant wave
+        height), or ``"currents"`` (``EWCT``/``NSCT``, derived from
+        current speed and direction at the shallowest reported depth --
+        deeper levels from GTS's depth-profiled current section are
+        discarded, matching Copernicus Marine in-situ's own single-level
+        current convention). A row missing its product_type's own
+        variable(s) — including the WMO fill value decoded as NaN — is
+        dropped.
+
+        Parameters
+        ----------
+        bufr_path : str or Path
+            Path to a GTS buoy BUFR file, as downloaded by
+            :class:`~sar_validation.downloaders.gts_buoy_downloader.GTSBuoyDownloader`.
+        product_type : {"wind", "waves", "currents"}
+            Which variable group to decode.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="gts_buoy"``, or None on failure or
+            if no row carries the requested observation.
+        """
+        from ._cf_metadata import apply_cf_metadata
+
+        if pdbufr is None:
+            raise ImportError(
+                "from_gts_buoy_bufr requires the optional 'pdbufr' dependency, "
+                "which is not installed. Install it with the 'gts' extra, e.g. "
+                "`pip install sar-l2-validation-toolbox[gts]`."
+            )
+
+        if product_type not in DataTreeConverter._GTS_BUOY_VALUE_COLUMNS:
+            raise ValueError(
+                f"product_type must be one of "
+                f"{sorted(DataTreeConverter._GTS_BUOY_VALUE_COLUMNS)}, got {product_type!r}."
+            )
+
+        bufr_path = Path(bufr_path)
+        if not bufr_path.exists():
+            logger.warning("BUFR file not found: %s", bufr_path)
+            return None
+
+        id_columns = (
+            "marineObservingPlatformIdentifier", "stationOrSiteName",
+            "latitude", "longitude", "year", "month", "day", "hour", "minute",
+        )
+        value_columns = DataTreeConverter._GTS_BUOY_VALUE_COLUMNS[product_type]
+
+        try:
+            df = pdbufr.read_bufr(bufr_path, columns=id_columns + value_columns)
+        except Exception as exc:
+            logger.warning("Could not decode GTS buoy BUFR %s: %s", bufr_path.name, exc)
+            return None
+
+        if df.empty:
+            logger.info("from_gts_buoy_bufr: no rows in %s.", bufr_path.name)
+            return None
+
+        if product_type == "currents":
+            # Depth-profiled via delayed replication -- one row per
+            # depth level per observation. Keep only the shallowest.
+            # Sorting the whole frame by depth and then taking the first
+            # row of each group with head(1) preserves each row intact:
+            # unlike DataFrameGroupBy.first(), which fills each column
+            # independently from the first non-null value seen anywhere
+            # in the group, head(1) never mixes fields sourced from
+            # different depth levels of the same platform/time
+            # observation. A group whose depth is missing for every one
+            # of its rows still resolves to its one available row, since
+            # na_position="last" only affects ordering relative to rows
+            # that do carry a depth, not membership. kind="stable" makes a
+            # tie between two rows reporting the identical depth resolve
+            # deterministically to the earlier-listed row, rather than an
+            # arbitrary one.
+            df = df.sort_values("depthBelowSeaSurface", na_position="last", kind="stable")
+            group_cols = [
+                "marineObservingPlatformIdentifier", "year", "month", "day", "hour", "minute",
+            ]
+            df = df.groupby(group_cols, sort=False).head(1)
+
+        if product_type == "wind":
+            keep = df["windSpeed"].notna() | df["windDirection"].notna()
+        elif product_type == "waves":
+            keep = df["significantWaveHeight"].notna()
+        else:
+            keep = df["speedOfCurrent"].notna() & df["directionOfCurrent"].notna()
+        df = df[keep]
+        if df.empty:
+            logger.info(
+                "from_gts_buoy_bufr: no %s observations in %s.", product_type, bufr_path.name,
+            )
+            return None
+
+        time = pd.to_datetime(df[["year", "month", "day", "hour", "minute"]]).values
+
+        data_vars: dict = {}
+        if product_type == "wind":
+            data_vars["WSPD"] = ("point", df["windSpeed"].to_numpy(dtype=float))
+            data_vars["WDIR"] = ("point", df["windDirection"].to_numpy(dtype=float))
+        elif product_type == "waves":
+            data_vars["VAVH"] = ("point", df["significantWaveHeight"].to_numpy(dtype=float))
+        else:
+            speed = df["speedOfCurrent"].to_numpy(dtype=float)
+            direction_rad = np.radians(df["directionOfCurrent"].to_numpy(dtype=float))
+            data_vars["EWCT"] = ("point", speed * np.sin(direction_rad))
+            data_vars["NSCT"] = ("point", speed * np.cos(direction_rad))
+
+        data_vars["platform_id"] = (
+            "point", df["marineObservingPlatformIdentifier"].astype(str).to_numpy(),
+        )
+        data_vars["platform_name"] = ("point", df["stationOrSiteName"].astype(str).to_numpy())
+
+        # The WMO international buoy identifier number's own numeric value
+        # distinguishes moored from drifting buoys: the last three digits
+        # (mod 1000, for both the five- and seven-digit forms) fall in
+        # 000-499 for moored buoys and 500-999 for drifting buoys (DBCP
+        # Technical Document No. 37, "Guide to Buoy Data Quality Control
+        # Tests to Perform in Real Time by a GTS Data Processing Centre",
+        # section 4.2). obstype 181/182 combines both populations into one
+        # request, so this is the only way to recover the distinction
+        # per-point without a separate BUFR descriptor for it.
+        platform_id_numeric = pd.to_numeric(
+            df["marineObservingPlatformIdentifier"], errors="coerce",
+        )
+        data_vars["platform_type"] = (
+            "point",
+            np.where(platform_id_numeric % 1000 < 500, "mooring", "buoy"),
+        )
+
+        ds = xr.Dataset(
+            data_vars,
+            coords={
+                "lon": ("point", df["longitude"].to_numpy(dtype=float)),
+                "lat": ("point", df["latitude"].to_numpy(dtype=float)),
+                "time": ("point", time),
+            },
+        )
+        apply_cf_metadata(ds, "gts_buoy", {
+            "platform_id":   {"long_name": "WMO international buoy identifier number"},
+            "platform_type": {"long_name": "platform category (mooring or buoy), derived "
+                                            "from the platform identifier's own numbering"},
+        })
+
+        ds.attrs["data_type"] = "gts_buoy"
+        # Coarse, dataset-level fallback; the per-point "platform_type"
+        # data variable above carries the actual moored/drifting
+        # distinction and takes precedence wherever it is read.
+        ds.attrs["platform_type"] = "buoy"
+        ds.attrs["source"] = "GTS (MARS obstype 181/182)"
+        ds.attrs["filename"] = bufr_path.name
+
+        logger.info(
+            "from_gts_buoy_bufr: %s (%s) → %d point(s) from %d platform(s)",
+            bufr_path.name, product_type, ds.sizes["point"],
+            len(set(df["marineObservingPlatformIdentifier"])),
+        )
+        return ds
+
+    @staticmethod
+    def from_gts_ship_bufr(
+        bufr_path: Union[str, Path],
+    ) -> Optional[xr.Dataset]:
+        """
+        Decode a GTS ship BUFR file (MARS obstype 180) into a standardised
+        point-geometry Dataset.
+
+        Ship synoptic reports carry wind observations only -- unlike GTS
+        buoy reports, there is no wave or current section to decode, so
+        this always reads ``windSpeed``/``windDirection``. A row missing
+        both -- including the WMO fill value decoded as NaN -- is
+        dropped.
+
+        Parameters
+        ----------
+        bufr_path : str or Path
+            Path to a GTS ship BUFR file, as downloaded by
+            :class:`~sar_validation.downloaders.gts_ship_downloader.ShipDownloader`.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="gts_ship"``, or None on failure or
+            if no row carries a wind observation.
+        """
+        from ._cf_metadata import apply_cf_metadata
+
+        if pdbufr is None:
+            raise ImportError(
+                "from_gts_ship_bufr requires the optional 'pdbufr' dependency, "
+                "which is not installed. Install it with the 'gts' extra, e.g. "
+                "`pip install sar-l2-validation-toolbox[gts]`."
+            )
+
+        bufr_path = Path(bufr_path)
+        if not bufr_path.exists():
+            logger.warning("BUFR file not found: %s", bufr_path)
+            return None
+
+        id_columns = (
+            "shipOrMobileLandStationIdentifier",
+            "latitude", "longitude", "year", "month", "day", "hour", "minute",
+        )
+        value_columns = ("windSpeed", "windDirection")
+
+        try:
+            df = pdbufr.read_bufr(bufr_path, columns=id_columns + value_columns)
+        except Exception as exc:
+            logger.warning("Could not decode GTS ship BUFR %s: %s", bufr_path.name, exc)
+            return None
+
+        if df.empty:
+            logger.info("from_gts_ship_bufr: no rows in %s.", bufr_path.name)
+            return None
+
+        keep = df["windSpeed"].notna() | df["windDirection"].notna()
+        df = df[keep]
+        if df.empty:
+            logger.info("from_gts_ship_bufr: no wind observations in %s.", bufr_path.name)
+            return None
+
+        time = pd.to_datetime(df[["year", "month", "day", "hour", "minute"]]).values
+
+        data_vars: dict = {
+            "WSPD": ("point", df["windSpeed"].to_numpy(dtype=float)),
+            "WDIR": ("point", df["windDirection"].to_numpy(dtype=float)),
+            "platform_id": (
+                "point", df["shipOrMobileLandStationIdentifier"].astype(str).to_numpy(),
+            ),
+        }
+
+        ds = xr.Dataset(
+            data_vars,
+            coords={
+                "lon": ("point", df["longitude"].to_numpy(dtype=float)),
+                "lat": ("point", df["latitude"].to_numpy(dtype=float)),
+                "time": ("point", time),
+            },
+        )
+        apply_cf_metadata(ds, "gts_ship", {
+            "platform_id": {"long_name": "WMO ship or mobile station call sign"},
+        })
+
+        ds.attrs["data_type"] = "gts_ship"
+        # Reuses the same runtime label Copernicus Marine ferrybox data
+        # emits -- both are ship-based wind observations and are not
+        # distinguished by color/marker in a report.
+        ds.attrs["platform_type"] = "ferrybox"
+        ds.attrs["source"] = "GTS (MARS obstype 180)"
+        ds.attrs["filename"] = bufr_path.name
+
+        logger.info(
+            "from_gts_ship_bufr: %s → %d point(s) from %d platform(s)",
+            bufr_path.name, ds.sizes["point"],
+            len(set(df["shipOrMobileLandStationIdentifier"])),
+        )
+        return ds
+
     @staticmethod
     def from_altimeter(
         nc_path: Union[str, Path],
@@ -1056,6 +1424,119 @@ class DataTreeConverter:
         return ds
 
     @staticmethod
+    def from_altimeter_reprocessed(
+        nc_path: Union[str, Path],
+    ) -> Optional[xr.Dataset]:
+        """
+        Open a Copernicus Marine reprocessed along-track altimeter NetCDF
+        (multi-year significant wave height product) and return a
+        standardised Dataset with a flat ``point`` dimension, matching the
+        layout produced by :meth:`from_altimeter`.
+
+        One file covers one day and every satellite mission active that
+        day, identified per point by the file's own ``satellite`` flag
+        variable. ``swh_denoised`` (bias-corrected and denoised) is
+        renamed to ``VAVH`` and ``swh_uncertainty`` to
+        ``VAVH_UNCERTAINTY``, matching the codes the near-real-time
+        altimeter product already uses, so both flow through the same
+        statistics and report code. The raw ``swh``, ``swh_adjusted``,
+        ``distance_to_coast``, ``bathymetry``, ``cycle`` and
+        ``relative_pass`` values are kept unchanged as auxiliary
+        variables.
+
+        ``platform_id`` (e.g. ``"jason-3"``) is decoded from the file's
+        own ``satellite`` flag variable and kept as a per-point
+        coordinate -- unlike the near-real-time product (one file per
+        satellite, so the satellite is already known from the file
+        itself), this product combines every mission into one daily
+        file, so this is the only way to tell which mission a given
+        point came from. Collocation already reads any ``platform_id``
+        coordinate generically (see ``collocation.py``'s
+        ``val_id=val_row.get("platform_id")``), so keeping it here is
+        what carries mission identity through to the collocation
+        dataset -- no further wiring is needed.
+
+        Parameters
+        ----------
+        nc_path : str or Path
+            Path to the reprocessed altimeter NetCDF file.
+
+        Returns
+        -------
+        xr.Dataset or None
+            Dataset with ``data_type="altimeter"``, or None on failure.
+        """
+        nc_path = Path(nc_path)
+        if not nc_path.exists():
+            logger.warning("NetCDF not found: %s", nc_path)
+            return None
+
+        try:
+            raw = xr.open_dataset(nc_path)
+        except Exception as exc:
+            logger.warning("Could not open %s: %s", nc_path, exc)
+            return None
+
+        if "lon" not in raw or "lat" not in raw or "time" not in raw:
+            logger.warning(
+                "Could not find lon/lat/time in %s (available: %s)",
+                nc_path.name, list(raw.coords) + list(raw.data_vars),
+            )
+            raw.close()
+            return None
+
+        n_points = raw.sizes.get("time", 0)
+        if n_points == 0:
+            logger.warning("No points found in %s.", nc_path.name)
+            raw.close()
+            return None
+
+        platform_id = _decode_flag_variable(raw["satellite"]) if "satellite" in raw else None
+        if platform_id is None:
+            platform_id = np.full(n_points, "unknown", dtype=object)
+
+        _skip = {"lon", "lat", "time", "satellite"}
+        _rename = {"swh_denoised": "VAVH", "swh_uncertainty": "VAVH_UNCERTAINTY"}
+        data_vars: Dict[str, tuple] = {}
+        var_attrs: Dict[str, Dict] = {}
+        for vname, da in raw.data_vars.items():
+            if vname in _skip:
+                continue
+            if da.dtype.kind not in ("f", "i", "u"):
+                continue
+            flat = da.values.ravel()
+            if len(flat) != n_points:
+                continue
+            out_name = _rename.get(str(vname), str(vname))
+            data_vars[out_name] = ("point", flat.astype(float))
+            var_attrs[out_name] = dict(da.attrs)
+
+        if not data_vars:
+            logger.warning("No usable data variables found in %s.", nc_path.name)
+            raw.close()
+            return None
+
+        ds = xr.Dataset(
+            data_vars,
+            coords={
+                "lon":         ("point", raw["lon"].values.ravel()),
+                "lat":         ("point", raw["lat"].values.ravel()),
+                "time":        ("point", raw["time"].values.ravel()),
+                "platform_id": ("point", platform_id),
+            },
+        )
+        apply_cf_metadata(ds, "altimeter_reprocessed", var_attrs)
+
+        ds.attrs["data_type"]     = "altimeter"
+        ds.attrs["platform_type"] = "altimeter"
+        ds.attrs["frequency"]     = "reprocessed"
+        ds.attrs["source"]        = "Copernicus Marine altimeter L3 (reprocessed)"
+        ds.attrs["filename"]      = nc_path.name
+
+        raw.close()
+        return ds
+
+    @staticmethod
     def from_collocations(
         collocations: list,
     ) -> Optional[xr.Dataset]:
@@ -1098,6 +1579,14 @@ class DataTreeConverter:
             ("spatial_distance_km",        lambda c: c.spatial_distance_km),
             ("temporal_distance_minutes",  lambda c: c.temporal_distance_minutes),
             ("val_source",                 lambda c: c.val_source),
+            (
+                "aggregation_window_km",
+                lambda c: c.aggregation_window_km if c.aggregation_window_km is not None else np.nan,
+            ),
+            (
+                "sar_pixel_spacing_km",
+                lambda c: c.sar_pixel_spacing_km if c.sar_pixel_spacing_km is not None else np.nan,
+            ),
         ):
             data[key] = ("collocation", [getter(c) for c in collocations])
 
@@ -4094,6 +4583,14 @@ class DataTreeConverter:
         - ``S1_L2_OCN/*.SAFE``        → ``sar/<SAFE-name>`` nodes
         - ``S1_L3_SSM/*.tif``          → ``sar/<stem>`` nodes
         - ``copernicus_insitu/*.csv``  → ``validation/<stem>`` nodes
+        - ``gts_buoy/*.bufr``          → ``validation/buoy_gts/<stem>`` nodes
+          (only scanned when *recipe* lists "buoy_gts" or "buoy_waterfall"
+          as a validation source, the same recipe-gating HYCOM below uses
+          to avoid picking up a leftover directory left by an earlier run
+          that shared this *base_dir*)
+        - ``gts_ship/*.bufr``          → ``validation/ship_gts/<stem>`` nodes
+          (only scanned when *recipe* lists "ship_gts" as a validation
+          source, the same recipe-gating the GTS buoy block above uses)
         - ``osi_saf_winds/*.nc``       → ``validation/osi_saf_winds/<stem>`` nodes
         - ``scatterometer/*.nc``       → ``validation/scatterometer/<stem>`` nodes
         - ``scatterometer_hy2b/*.nc``       → ``validation/scatterometer_hy2b/<stem>`` nodes
@@ -4207,12 +4704,85 @@ class DataTreeConverter:
                         datasets[f"sar/{tif_path.stem}"] = ds
                         logger.info("Converted SSM GeoTIFF: %s", tif_path.name)
 
-        # In-situ CSV (Copernicus Marine)
+        # GTS buoy observations (MARS obstype 181/182) -- decoded first
+        # so its platform IDs are available to exclude from the
+        # Copernicus Marine in-situ block below when "buoy_waterfall" is
+        # in play. product_type (this method's own parameter) selects
+        # which BUFR section is decoded; gts_buoy_platform_ids therefore
+        # only ever reflects platforms GTS reported this run's variable
+        # for, so it cannot cross-contaminate a different variable's
+        # Copernicus data. Peeking IDs alone (not full conversion) would
+        # save a BUFR decode, but from_gts_buoy_bufr's own decode is
+        # already cheap enough (one file per day) that a second, narrower
+        # decode path is not worth the duplication.
+        #
+        # Gated on the current recipe's own validation_sources, not merely
+        # on gts_buoy/ existing on disk: base_dir is keyed only by
+        # bbox/time window, so two separate recipe runs over the same
+        # window share the same base_dir. Without this gate, a later run
+        # that never requested "buoy_gts"/"buoy_waterfall" would still
+        # pick up a leftover gts_buoy/ directory from an earlier run over
+        # the identical window -- the same class of stale-cache
+        # cross-contamination the HYCOM block below guards against by
+        # checking recipe.config.variable == "currents" rather than just
+        # file existence.
+        gts_buoy_platform_ids: set[str] = set()
+        gts_buoy_requested = recipe is not None and any(
+            s.source_type in ("buoy_gts", "buoy_waterfall") for s in recipe.config.validation_sources
+        )
+        gts_buoy_dir = base_dir / "gts_buoy"
+        if gts_buoy_requested and gts_buoy_dir.exists():
+            for bufr_path in sorted(gts_buoy_dir.glob("*.bufr")):
+                ds = _filtered(
+                    DataTreeConverter.from_gts_buoy_bufr(bufr_path, product_type=product_type),
+                    bufr_path.name,
+                )
+                if ds is not None:
+                    datasets[f"validation/buoy_gts/{bufr_path.stem}"] = ds
+                    gts_buoy_platform_ids.update(str(p) for p in ds["platform_id"].values)
+                    logger.info("Converted GTS buoy BUFR: %s", bufr_path.name)
+
+        # GTS ship observations (MARS obstype 180). No dedup/exclusion
+        # step is needed here, unlike GTS buoy above -- there is no
+        # combined "ship_waterfall" source_type pairing this with
+        # Copernicus Marine's ship_cmems_family.
+        gts_ship_requested = recipe is not None and any(
+            s.source_type == "ship_gts" for s in recipe.config.validation_sources
+        )
+        gts_ship_dir = base_dir / "gts_ship"
+        if gts_ship_requested and gts_ship_dir.exists():
+            for bufr_path in sorted(gts_ship_dir.glob("*.bufr")):
+                ds = _filtered(
+                    DataTreeConverter.from_gts_ship_bufr(bufr_path),
+                    bufr_path.name,
+                )
+                if ds is not None:
+                    datasets[f"validation/ship_gts/{bufr_path.stem}"] = ds
+                    logger.info("Converted GTS ship BUFR: %s", bufr_path.name)
+
+        # In-situ CSV (Copernicus Marine). A station already covered by a
+        # GTS BUFR file in this window (gts_buoy_platform_ids, populated
+        # above) is excluded here -- this is the "buoy_waterfall" dedup.
+        # Gated on the current recipe specifically listing "buoy_waterfall"
+        # (not merely on gts_buoy_platform_ids being non-empty): a
+        # "buoy_gts"-alone recipe, combined with some other, non-overlapping
+        # Copernicus source such as "tidal_gauge", must never have its
+        # Copernicus data deduplicated against GTS platform IDs, since
+        # nothing about that recipe asked for the two sources to be
+        # combined.
+        buoy_waterfall_requested = recipe is not None and any(
+            s.source_type == "buoy_waterfall" for s in recipe.config.validation_sources
+        )
         insitu_dir = base_dir / "copernicus_insitu"
         if insitu_dir.exists():
             for csv_path in sorted(insitu_dir.glob("*.csv")):
                 ds = _filtered(
-                    DataTreeConverter.from_insitu_csv(csv_path, source_type="insitu"),
+                    DataTreeConverter.from_insitu_csv(
+                        csv_path, source_type="insitu",
+                        exclude_platform_ids=(
+                            gts_buoy_platform_ids or None if buoy_waterfall_requested else None
+                        ),
+                    ),
                     csv_path.name,
                 )
                 if ds is not None:
@@ -4422,15 +4992,55 @@ class DataTreeConverter:
         # different frequency subdirectories can contain identically-named
         # platform files (e.g. "Cryosat-2.nc" under both a 1 Hz and 5 Hz
         # dataset folder), which would otherwise collide in `datasets`.
+        #
+        # AltimeterDownloader names each requested window's own output
+        # after that window's own start/end dates, so re-running the same
+        # recipe with a differently-padded window never overwrites a
+        # prior run's file -- it just adds another, overlapping-window
+        # file for the same real dataset/platform. Grouping by the key
+        # with that trailing date range stripped, and deduplicating
+        # identical (time, lat, lon) rows across every file in a group,
+        # keeps this from collocating the same real observation twice
+        # just because it happens to be present in two overlapping
+        # downloads.
         subdir = base_dir / "altimeter"
         if subdir.exists():
+            altimeter_groups: Dict[str, List[Path]] = {}
             for nc_path in sorted(subdir.rglob("*.nc")):
-                ds = _filtered(DataTreeConverter.from_altimeter(nc_path), nc_path.name)
+                rel = nc_path.relative_to(subdir).with_suffix("")
+                parts = list(rel.parts)
+                parts[0] = _ALTIMETER_WINDOW_SUFFIX_RE.sub("", parts[0])
+                key = "_".join(parts)
+                altimeter_groups.setdefault(key, []).append(nc_path)
+
+            for key, nc_paths in sorted(altimeter_groups.items()):
+                per_file_datasets = []
+                for nc_path in nc_paths:
+                    ds = _filtered(DataTreeConverter.from_altimeter(nc_path), nc_path.name)
+                    if ds is not None:
+                        per_file_datasets.append(ds)
+                if not per_file_datasets:
+                    continue
+                merged = (
+                    per_file_datasets[0] if len(per_file_datasets) == 1
+                    else _dedupe_altimeter_points(per_file_datasets)
+                )
+                datasets[f"validation/altimeter/{key}"] = merged
+                logger.info(
+                    "Converted altimeter: %s (%d file(s), %d point(s) after dedup)",
+                    key, len(nc_paths), merged.sizes.get("point", 0),
+                )
+
+        # Reprocessed (multi-year) altimeter NetCDF products, one file per day.
+        subdir = base_dir / "altimeter_reprocessed"
+        if subdir.exists():
+            for nc_path in sorted(subdir.glob("*.nc")):
+                ds = _filtered(
+                    DataTreeConverter.from_altimeter_reprocessed(nc_path), nc_path.name,
+                )
                 if ds is not None:
-                    rel = nc_path.relative_to(subdir).with_suffix("")
-                    key = "_".join(rel.parts)
-                    datasets[f"validation/altimeter/{key}"] = ds
-                    logger.info("Converted altimeter: %s", nc_path.relative_to(subdir))
+                    datasets[f"validation/altimeter_reprocessed/{nc_path.stem}"] = ds
+                    logger.info("Converted reprocessed altimeter: %s", nc_path.name)
 
         # Radiometer daily gridded products. Each file is a global 0.25° grid;
         # the converter flattens it to points and the domain filter crops to

@@ -908,8 +908,8 @@ class TestIsAlreadyDownloaded:
         assert _is_already_downloaded(tmp_path, recipe) is True
 
     def test_true_when_recorded_insitu_key_covers_individual_insitu_source_types(self, tmp_path):
-        """DataOrchestrator._download_insitu batches mooring/buoy/drifter/
-        ferrybox/tidal_gauge under a single "insitu" downloads key, not one
+        """DataOrchestrator._download_insitu batches mooring/buoy_cmems/drifter/
+        ship_cmems_family/tidal_gauge under a single "insitu" downloads key, not one
         key per source_type -- a recipe requesting e.g. just "mooring" must
         still match against a recorded "insitu" key (no false re-download
         for the common in-situ case)."""
@@ -922,7 +922,7 @@ class TestIsAlreadyDownloaded:
             "variable": "wind",
             "downloads": {
                 "sar": {"status": "success"},
-                "insitu": {"status": "success", "source_types": ["mooring", "buoy"]},
+                "insitu": {"status": "success", "source_types": ["mooring", "buoy_cmems"]},
             },
         }))
         recipe = Recipe(RecipeConfig(
@@ -930,7 +930,7 @@ class TestIsAlreadyDownloaded:
             variable="wind",
             validation_sources=[
                 ValidationDataSource(source_type="mooring"),
-                ValidationDataSource(source_type="buoy"),
+                ValidationDataSource(source_type="buoy_cmems"),
             ],
         ))
         assert _is_already_downloaded(tmp_path, recipe) is True
@@ -1007,13 +1007,112 @@ class TestBuildWindConfigEra5:
 
     def test_radarsat2_also_gets_era5(self):
         """validation_sources isn't conditioned on sar_source elsewhere in
-        this template (mooring/buoy/etc. are shared by every source) --
+        this template (mooring/buoy_cmems/etc. are shared by every source) --
         era5 follows the same pattern."""
         from sar_validation.cli import _build_wind_config
 
         cfg = _build_wind_config(sar_source="radarsat2")
         source_types = [s.source_type for s in cfg.validation_sources]
         assert "era5" in source_types
+
+
+class TestBuildWindConfigGtsDefaults:
+    def test_defaults_to_buoy_gts_and_ship_gts(self):
+        from sar_validation.cli import _build_wind_config
+
+        cfg = _build_wind_config()
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "buoy_gts" in source_types
+        assert "ship_gts" in source_types
+        assert "buoy_cmems_family" not in source_types
+        assert "ship_cmems_family" not in source_types
+
+    def test_tidal_gauge_not_active_by_default(self):
+        """tidal_gauge's wind sensors are not QC-filtered to the same
+        standard as buoy_gts/ship_gts -- _create_recipe adds it to the
+        generated file as a commented-out line instead of an active
+        source (see TestCreateRecipeTidalGaugeComment)."""
+        from sar_validation.cli import _build_wind_config
+
+        cfg = _build_wind_config()
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "tidal_gauge" not in source_types
+
+
+class TestBuildWavesConfigGtsDefaults:
+    def test_defaults_to_buoy_gts(self):
+        from sar_validation.cli import _build_waves_config
+
+        cfg = _build_waves_config()
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "buoy_gts" in source_types
+        assert "buoy_cmems_family" not in source_types
+
+
+class TestBuildCurrentsConfigGtsDefaults:
+    def test_defaults_to_buoy_gts(self):
+        from sar_validation.cli import _build_currents_config
+
+        cfg = _build_currents_config()
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "buoy_gts" in source_types
+        assert "buoy_cmems_family" not in source_types
+
+
+class TestCreateRecipeGtsComment:
+    def test_wind_recipe_has_trailing_comments_on_both_gts_lines(self, tmp_path, monkeypatch):
+        from sar_validation.cli import _create_recipe
+
+        monkeypatch.chdir(tmp_path)
+        _create_recipe("wind")
+
+        written = next(tmp_path.glob("recipes/*.yaml")).read_text()
+        assert (
+            "- source_type: buoy_gts  "
+            "# if wanting Copernicus Marine in situ data instead, use buoy_cmems_family"
+        ) in written
+        assert (
+            "- source_type: ship_gts  "
+            "# if wanting Copernicus Marine in situ data instead, use ship_cmems_family"
+        ) in written
+
+    def test_waves_recipe_has_trailing_comment_on_buoy_gts_line_only(self, tmp_path, monkeypatch):
+        from sar_validation.cli import _create_recipe
+
+        monkeypatch.chdir(tmp_path)
+        _create_recipe("waves")
+
+        written = next(tmp_path.glob("recipes/*.yaml")).read_text()
+        assert (
+            "- source_type: buoy_gts  "
+            "# if wanting Copernicus Marine in situ data instead, use buoy_cmems_family"
+        ) in written
+        assert "ship_gts" not in written
+
+
+class TestCreateRecipeTidalGaugeComment:
+    def test_wind_recipe_gets_tidal_gauge_as_commented_out_block(self, tmp_path, monkeypatch):
+        from sar_validation.cli import _create_recipe
+
+        monkeypatch.chdir(tmp_path)
+        _create_recipe("wind")
+
+        written = next(tmp_path.glob("recipes/*.yaml")).read_text()
+        assert "# - source_type: tidal_gauge" in written
+        assert "\n- source_type: tidal_gauge" not in written
+
+    def test_waves_recipe_keeps_tidal_gauge_active(self, tmp_path, monkeypatch):
+        """The wind-only QC concern behind commenting out tidal_gauge does
+        not apply to waves recipes -- tidal_gauge stays an active
+        validation source there."""
+        from sar_validation.cli import _create_recipe
+
+        monkeypatch.chdir(tmp_path)
+        _create_recipe("waves")
+
+        written = next(tmp_path.glob("recipes/*.yaml")).read_text()
+        assert "\n- source_type: tidal_gauge" in written
+        assert "# - source_type: tidal_gauge" not in written
 
 
 class TestBuildWavesConfigEra5:
@@ -1337,7 +1436,16 @@ class TestExecuteRecipeStopsWhenNoSarData:
         out = capsys.readouterr().out
         assert "No SAR data found" in out
 
-    def test_dry_run_stops_before_dry_run_complete_message(self, tmp_path, capsys):
+    def test_dry_download_flag_is_registered_and_dry_run_is_not(self, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(["--help"])
+
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert "--dry-download" in captured.out
+        assert "--dry-run" not in captured.out
+
+    def test_dry_download_stops_before_dry_download_complete_message(self, tmp_path, capsys):
         from unittest.mock import patch
 
         from sar_validation.core.recipe import Recipe, RecipeConfig
@@ -1359,7 +1467,7 @@ class TestExecuteRecipeStopsWhenNoSarData:
 
         out = capsys.readouterr().out
         assert "No SAR data found" in out
-        assert "Dry run complete" not in out
+        assert "Dry download complete" not in out
 
     def test_real_run_proceeds_when_sar_data_found_true(self, tmp_path, capsys):
         """Sanity check the gate doesn't fire on a normal successful run."""

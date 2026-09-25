@@ -15,6 +15,9 @@ Provides:
 - set_credential         — Store a username/password pair in the OS keyring
   (used by ``sar-validate --set-credential``)
 - normalize_datetime     — ISO datetime normalisation helper
+- split_datetime_range_at_cutover — Split a date range into the portion
+  before and from a fixed cutover date, for products that switch data
+  source at a boundary
 - is_date_recent         — True if a date/datetime string falls within a
   recent threshold
 - build_output_dir       — Canonical output directory path
@@ -37,6 +40,7 @@ import logging
 import os
 import re
 import socket
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -60,12 +64,14 @@ __all__ = [
     "authenticate_earthdata",
     "set_credential",
     "normalize_datetime",
+    "split_datetime_range_at_cutover",
     "is_date_recent",
     "build_output_dir",
     "split_antimeridian_bbox",
     "months_touched",
     "copernicus_marine_download_kwargs",
     "prefer_ipv4_dns",
+    "run_with_timeout",
 ]
 
 # ---------------------------------------------------------------------------
@@ -938,6 +944,31 @@ def normalize_datetime(dt_str: str) -> str:
     return dt_str
 
 
+def split_datetime_range_at_cutover(
+    start: str, end: str, cutover: str,
+) -> "Tuple[Optional[Tuple[str, str]], Optional[Tuple[str, str]]]":
+    """
+    Split a (start, end) window into the portion before *cutover* and the
+    portion from *cutover* onward.
+
+    Returns (before, after); either element is None when the whole window
+    falls entirely on the other side. Used where a requested date range
+    can straddle a boundary between two data products that each cover
+    one side of it.
+    """
+    start_norm = normalize_datetime(start)
+    end_norm = normalize_datetime(end)
+    cutover_norm = normalize_datetime(cutover)
+
+    if end_norm < cutover_norm:
+        return (start, end), None
+    if start_norm >= cutover_norm:
+        return None, (start, end)
+
+    before_end = (datetime.fromisoformat(cutover_norm) - timedelta(seconds=1)).isoformat()
+    return (start, before_end), (cutover, end)
+
+
 def is_date_recent(dt_str: str, threshold_days: int = 30) -> bool:
     """
     Check if a datetime string is within the recent threshold.
@@ -1083,3 +1114,33 @@ def copernicus_marine_download_kwargs(force_download: bool) -> dict:
     the real API, so no downloader has to reason about the mapping itself.
     """
     return {"skip_existing": not force_download, "overwrite": force_download}
+
+
+def run_with_timeout(func: "Callable[[], None]", timeout_seconds: float) -> bool:
+    """
+    Run *func* (a zero-argument callable) on a background daemon thread,
+    waiting up to *timeout_seconds* for it to finish.
+
+    Returns True if *func* completed in time (any exception it raised
+    propagates normally on this calling thread); False if the timeout
+    elapsed first. There is no way to interrupt an in-flight call, so a
+    *func* that has not finished by the timeout keeps running in the
+    background -- being a daemon thread, it cannot block the interpreter
+    from exiting, and its eventual result (or exception) is discarded.
+    """
+    caught: "list[BaseException]" = []
+
+    def _wrapper() -> None:
+        try:
+            func()
+        except BaseException as exc:  # noqa: BLE001 -- re-raised on the calling thread below
+            caught.append(exc)
+
+    thread = threading.Thread(target=_wrapper, daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        return False
+    if caught:
+        raise caught[0]
+    return True

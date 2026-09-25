@@ -2640,7 +2640,7 @@ class TestPredictAltimeterTolerance:
 
         dry_collocation._predict_altimeter(source=object(), cfg=object(), sar_footprints=[footprint])
 
-        assert calls == [("altimeter_1hz", "altimeter_5hz")]
+        assert calls == [("altimeter_1hz", "altimeter_5hz", "altimeter_reprocessed")]
 
     def test_padded_window_reflects_180_minutes_end_to_end(self, monkeypatch):
         """Uses the REAL _resolve_temporal_padding_minutes (not mocked)
@@ -2740,6 +2740,12 @@ class TestAltimeterSatelliteResolver:
                 f"too wide for a nadir altimeter -- likely reusing a different instrument's orbit spec"
             )
 
+    def test_satellite_resolver_resolves_reprocessed_only_mission_codes(self):
+        from sar_validation.core.dry_collocation import _altimeter_satellite_resolver
+
+        assert _altimeter_satellite_resolver("ers-1") == "ers-1"
+        assert _altimeter_satellite_resolver("topex-poseidon") == "topex"
+        assert _altimeter_satellite_resolver("al") == "saral"  # existing NRT code, unaffected
 
 class TestAltimeterOrbitMarginKm:
     def test_predict_altimeter_passes_a_narrow_margin_not_the_wide_swath_default(self, monkeypatch):
@@ -2886,6 +2892,34 @@ class TestAltimeterOrbitCandidatesDry:
         assert "h2c" in names
 
 
+    def test_candidates_include_reprocessed_only_missions_for_a_1990s_window(self):
+        from sar_validation.core.dry_collocation import _altimeter_orbit_candidates_dry
+
+        candidates = _altimeter_orbit_candidates_dry(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="1993-01-01T00:00:00", end="1993-01-02T00:00:00",
+        )
+
+        codes = {c[0] for c in candidates}
+        assert "ers-1" in codes
+        assert "topex-poseidon" in codes
+        # No near-real-time mission was active in 1993.
+        assert "al" not in codes
+
+    def test_candidates_include_near_real_time_missions_for_a_2026_window(self):
+        from sar_validation.core.dry_collocation import _altimeter_orbit_candidates_dry
+
+        candidates = _altimeter_orbit_candidates_dry(
+            min_lon=-20.0, max_lon=0.0, min_lat=35.0, max_lat=60.0,
+            start="2026-06-01T00:00:00", end="2026-06-02T00:00:00",
+        )
+
+        codes = {c[0] for c in candidates}
+        assert "al" in codes
+        # No reprocessed-only mission was active in 2026.
+        assert "ers-1" not in codes
+
+
 class TestPredictAltimeterOrbitCorridor:
     """predict_source integration test for the altimeter source_type,
     mirroring TestPredictSmosSsm's pattern -- exercises the real
@@ -2955,6 +2989,12 @@ class TestPredictAltimeterOrbitCorridor:
 
         assert result.verdict == "none-predicted"
         assert result.bucket == "orbit-corridor"
+
+    def test_predict_altimeter_tolerance_source_types_include_reprocessed(self):
+        from sar_validation.core import dry_collocation
+
+        assert "altimeter_reprocessed" in dry_collocation._ALTIMETER_TOLERANCE_SOURCE_TYPES
+
 
 
 class TestPredictAmsrSsm:
@@ -3604,7 +3644,7 @@ class TestToNaiveUtc:
 
 class TestPredictInsitu:
     """_predict_insitu is registered under all five real
-    orchestrator._INSITU_TYPES keys (mooring, buoy, drifter, ferrybox,
+    orchestrator._INSITU_TYPES keys (mooring, buoy, drifter, ship_cmems_family,
     tidal_gauge) -- there is no source_type="insitu" anywhere in this
     codebase. predict_source is called once per individual validation
     source, so the predicate must filter its own station_ranges_dry
@@ -3644,7 +3684,8 @@ class TestPredictInsitu:
         )
 
     @pytest.mark.parametrize(
-        "source_type", ["mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"],
+        "source_type",
+        ["mooring", "buoy_cmems", "buoy_cmems_family", "drifter", "ship_cmems_family", "tidal_gauge"],
     )
     def test_registered_under_each_real_insitu_source_type(self, source_type):
         from sar_validation.core import dry_collocation
@@ -3659,7 +3700,7 @@ class TestPredictInsitu:
         assert "insitu" not in dry_collocation._PREDICATES
 
     @pytest.mark.parametrize(
-        "source_type", ["mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"],
+        "source_type", ["mooring", "buoy_cmems", "drifter", "ship_cmems_family", "tidal_gauge"],
     )
     def test_station_ranges_dry_filtered_to_single_source_type_not_full_batch(
         self, monkeypatch, source_type,
@@ -3689,7 +3730,9 @@ class TestPredictInsitu:
         )
 
         assert seen_source_types == [[source_type]]
-        assert all(st != ["mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"] for st in seen_source_types)
+        excluded_source_types = ["mooring", "buoy_cmems", "drifter",
+                                  "ship_cmems_family", "tidal_gauge"]
+        assert all(st != excluded_source_types for st in seen_source_types)
         assert result.verdict == "collocated"
         assert result.source_type == source_type
         assert result.bucket == "ground-point"
@@ -3702,7 +3745,7 @@ class TestPredictInsitu:
         monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
 
         result = dry_collocation.predict_source(
-            SimpleNamespace(source_type="buoy"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+            SimpleNamespace(source_type="buoy_cmems"), cfg=self._cfg(), sar_footprints=[self._footprint()],
         )
 
         assert result.verdict == "none-predicted"
@@ -3741,7 +3784,7 @@ class TestPredictInsitu:
         monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
 
         result = dry_collocation.predict_source(
-            SimpleNamespace(source_type="ferrybox"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+            SimpleNamespace(source_type="ship_cmems_family"), cfg=self._cfg(), sar_footprints=[self._footprint()],
         )
 
         assert result.verdict == "collocated"
@@ -3913,6 +3956,307 @@ class TestPredictInsitu:
 
         assert seen_variables == [variables_for_recipe("waves")]
         assert seen_variables != [None]
+
+
+class TestPredictBuoyGtsAndWaterfall:
+    """"buoy_gts" and "buoy_waterfall" are the two GTS-aware in-situ
+    source types (see gts_buoy_downloader.py and orchestrator.py's
+    waterfall dedup). Neither has a lightweight MARS/GTS station-index
+    endpoint to query dry, so both predicates instead run the same
+    Copernicus Marine query _predict_insitu already performs (query_
+    source_type="buoy_cmems") purely as reference data, surfaced via the
+    prediction's message field."""
+
+    def _cfg(self):
+        return SimpleNamespace(
+            variable="waves", collocation=SimpleNamespace(sar_footprint_radius_km=14.0),
+        )
+
+    def _footprint(self):
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        return SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+    def test_buoy_gts_registered(self):
+        from sar_validation.core import dry_collocation
+
+        assert dry_collocation._PREDICATES["buoy_gts"] is dry_collocation._predict_buoy_gts
+
+    def test_buoy_waterfall_registered(self):
+        from sar_validation.core import dry_collocation
+
+        assert dry_collocation._PREDICATES["buoy_waterfall"] is dry_collocation._predict_buoy_waterfall
+
+    def test_buoy_gts_verdict_is_always_unknown_with_caveat_message(self, monkeypatch):
+        """GTS coverage itself cannot be predicted without live MARS
+        access, so "buoy_gts" must always report "unknown", regardless of
+        what the Copernicus-side reference query finds -- even a real
+        Copernicus match must not upgrade the verdict."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        seen_source_types = []
+
+        def _fake_station_ranges_dry(
+            self, min_lon, max_lon, min_lat, max_lat, start, end,
+            source_types=None, dataset_part=None, variables=None,
+        ):
+            seen_source_types.append(source_types)
+            return {"S1": (45.0, 0.0, datetime(2026, 8, 1, 5, 0, 0), datetime(2026, 8, 1, 7, 0, 0))}
+
+        monkeypatch.setattr(InSituDownloader, "station_ranges_dry", _fake_station_ranges_dry)
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="buoy_gts"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+        )
+
+        assert seen_source_types == [["buoy_cmems"]]
+        assert result.verdict == "unknown"
+        assert result.source_type == "buoy_gts"
+        assert result.message is not None
+        assert "cannot be predicted without live MARS access" in result.message
+        assert "buoy_gts" in result.message
+        assert "buoy_waterfall" in result.message
+
+    def test_buoy_gts_caveat_message_present_even_with_no_copernicus_match(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        monkeypatch.setattr(InSituDownloader, "station_ranges_dry", lambda self, *a, **k: {})
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="buoy_gts"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+        )
+
+        assert result.verdict == "unknown"
+        assert result.message is not None
+        assert "cannot be predicted without live MARS access" in result.message
+
+    def test_buoy_waterfall_reflects_real_copernicus_match(self, monkeypatch):
+        """Unlike "buoy_gts", "buoy_waterfall" genuinely will include
+        Copernicus data wherever GTS does not cover a station, so its
+        verdict must be the real Copernicus-side match/no-match result,
+        not a fixed "unknown"."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        seen_source_types = []
+
+        def _fake_station_ranges_dry(
+            self, min_lon, max_lon, min_lat, max_lat, start, end,
+            source_types=None, dataset_part=None, variables=None,
+        ):
+            seen_source_types.append(source_types)
+            return {"S1": (45.0, 0.0, datetime(2026, 8, 1, 5, 0, 0), datetime(2026, 8, 1, 7, 0, 0))}
+
+        monkeypatch.setattr(InSituDownloader, "station_ranges_dry", _fake_station_ranges_dry)
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="buoy_waterfall"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+        )
+
+        assert seen_source_types == [["buoy_cmems"]]
+        assert result.verdict == "collocated"
+        assert result.source_type == "buoy_waterfall"
+        assert result.matched_stations == ["S1"]
+        assert result.message is not None
+        assert "Copernicus Marine coverage only" in result.message
+        assert "GTS" in result.message
+
+    def test_buoy_waterfall_downgrades_no_copernicus_match_to_unknown(self, monkeypatch):
+        """A Copernicus-side "none-predicted" result must be downgraded to
+        "unknown" for the overall "buoy_waterfall" verdict, not passed
+        through as-is: "buoy_waterfall" also downloads GTS, whose own
+        coverage cannot be predicted without live MARS access (see
+        _predict_buoy_gts), so Copernicus alone finding no stations must
+        not read as a confirmed absence of collocation for the source as
+        a whole. Regression test for the bug where this predicate's
+        "none-predicted" verdict let _should_skip_for_collocation
+        wrongly skip the entire "buoy_waterfall" loop -- including its
+        GTS side -- based on Copernicus-only information; see
+        TestBuoyWaterfallCopernicusOnlyVerdictNeverSkipsGts below for the
+        end-to-end skip-gating check."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        monkeypatch.setattr(InSituDownloader, "station_ranges_dry", lambda self, *a, **k: {})
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="buoy_waterfall"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+        )
+
+        assert result.verdict == "unknown"
+        assert result.source_type == "buoy_waterfall"
+        assert result.message is not None
+        assert "Copernicus Marine coverage only" in result.message
+
+
+class TestPredictShipGts:
+    """"ship_gts" is the GTS-aware ship synoptic wind source type (see
+    gts_ship_downloader.py). It has no lightweight MARS/GTS station-index
+    endpoint to query dry, so its predicate instead runs the same
+    Copernicus Marine query _predict_insitu already performs (query_
+    source_type="ship_cmems_family") purely as reference data, surfaced
+    via the prediction's message field. Unlike "buoy_gts", there is no
+    combined/deduplicated "ship_waterfall" source type, so the caveat
+    message points to using "ship_cmems_family" instead of "ship_gts"
+    rather than to a waterfall alternative."""
+
+    def _cfg(self):
+        return SimpleNamespace(
+            variable="wind", collocation=SimpleNamespace(sar_footprint_radius_km=14.0),
+        )
+
+    def _footprint(self):
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        return SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+    def test_ship_gts_registered(self):
+        from sar_validation.core import dry_collocation
+
+        assert dry_collocation._PREDICATES["ship_gts"] is dry_collocation._predict_ship_gts
+
+    def test_ship_gts_verdict_is_always_unknown_with_caveat_message(self, monkeypatch):
+        """GTS coverage itself cannot be predicted without live MARS
+        access, so "ship_gts" must always report "unknown", regardless of
+        what the Copernicus-side reference query finds -- even a real
+        Copernicus match must not upgrade the verdict."""
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        seen_source_types = []
+
+        def _fake_station_ranges_dry(
+            self, min_lon, max_lon, min_lat, max_lat, start, end,
+            source_types=None, dataset_part=None, variables=None,
+        ):
+            seen_source_types.append(source_types)
+            return {"S1": (45.0, 0.0, datetime(2026, 8, 1, 5, 0, 0), datetime(2026, 8, 1, 7, 0, 0))}
+
+        monkeypatch.setattr(InSituDownloader, "station_ranges_dry", _fake_station_ranges_dry)
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="ship_gts"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+        )
+
+        assert seen_source_types == [["ship_cmems_family"]]
+        assert result.verdict == "unknown"
+        assert result.source_type == "ship_gts"
+        assert result.message is not None
+        assert "cannot be predicted without live MARS access" in result.message
+        assert "ship_gts" in result.message
+        assert "ship_cmems_family" in result.message
+        assert "ship_waterfall" not in result.message
+
+    def test_ship_gts_caveat_message_present_even_with_no_copernicus_match(self, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        monkeypatch.setattr(InSituDownloader, "station_ranges_dry", lambda self, *a, **k: {})
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        result = dry_collocation.predict_source(
+            SimpleNamespace(source_type="ship_gts"), cfg=self._cfg(), sar_footprints=[self._footprint()],
+        )
+
+        assert result.verdict == "unknown"
+        assert result.message is not None
+        assert "cannot be predicted without live MARS access" in result.message
+
+
+class TestBuoyWaterfallCopernicusOnlyVerdictNeverSkipsGts:
+    """End-to-end regression coverage for the same bug
+    TestPredictBuoyGtsAndWaterfall.test_buoy_waterfall_downgrades_no_copernicus_match_to_unknown
+    guards at the predicate level: orchestrator.py's
+    _should_skip_for_collocation only skips a source_type on a CONFIRMED
+    "none-predicted" verdict (see its own docstring), so a
+    "buoy_waterfall" source whose real (fixed) predicate downgrades a
+    Copernicus-only "none-predicted" result to "unknown" must never be
+    skipped, keeping its GTS download attempted regardless of what
+    Copernicus alone reports. A real, positive Copernicus match keeps
+    behaving exactly as before -- it produces a "collocated" verdict,
+    which also never skips (only "none-predicted" does), so both cases
+    end up not skipped, but for different, worth-distinguishing reasons."""
+
+    def _orchestrator(self, tmp_path):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+
+        cfg = RecipeConfig(
+            name="test", variable="waves",
+            geographic_bounds=GeographicBounds(-10.0, 10.0, 35.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-08-01T00:00:00", "2026-08-01T12:00:00"),
+            validation_sources=[ValidationDataSource(source_type="buoy_waterfall")],
+        )
+        orchestrator = DataOrchestrator(Recipe(cfg), dry_run=False)
+        orchestrator.base_dir = tmp_path
+        return orchestrator
+
+    def _footprint(self):
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        return SarFootprint(
+            kind="polygon", bbox=(-10.0, 10.0, 35.0, 55.0), polygon=None, points=None,
+            sensing_start=datetime(2026, 8, 1, 6, 0, 0), sensing_end=datetime(2026, 8, 1, 6, 1, 0),
+            source_file="s1.SAFE",
+        )
+
+    def test_zero_copernicus_stations_does_not_skip_buoy_waterfall(self, tmp_path, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        monkeypatch.setattr(InSituDownloader, "station_ranges_dry", lambda self, *a, **k: {})
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        orchestrator = self._orchestrator(tmp_path)
+        monkeypatch.setattr(orchestrator, "_collocation_predictions", lambda: {
+            "buoy_waterfall": dry_collocation.predict_source(
+                SimpleNamespace(source_type="buoy_waterfall"),
+                cfg=orchestrator.recipe.config, sar_footprints=[self._footprint()],
+            ),
+        })
+
+        assert orchestrator._should_skip_for_collocation("buoy_waterfall") is False
+
+    def test_real_copernicus_match_still_does_not_skip_buoy_waterfall(self, tmp_path, monkeypatch):
+        from sar_validation.core import dry_collocation
+        from sar_validation.downloaders.insitu_downloader import InSituDownloader
+
+        monkeypatch.setattr(
+            InSituDownloader, "station_ranges_dry",
+            lambda self, *a, **k: {"S1": (45.0, 0.0, datetime(2026, 8, 1, 5, 0, 0), datetime(2026, 8, 1, 7, 0, 0))},
+        )
+        monkeypatch.setattr(dry_collocation, "_resolve_temporal_padding_minutes", lambda cfg, *st: 90)
+
+        orchestrator = self._orchestrator(tmp_path)
+        prediction = dry_collocation.predict_source(
+            SimpleNamespace(source_type="buoy_waterfall"),
+            cfg=orchestrator.recipe.config, sar_footprints=[self._footprint()],
+        )
+        monkeypatch.setattr(orchestrator, "_collocation_predictions", lambda: {"buoy_waterfall": prediction})
+
+        assert prediction.verdict == "collocated"
+        assert orchestrator._should_skip_for_collocation("buoy_waterfall") is False
 
 
 class TestPredictInsituCurrentsHistorical:

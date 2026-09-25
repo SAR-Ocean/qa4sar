@@ -64,7 +64,9 @@ class TestComputeStatistics:
         for metric in ("N", "bias", "std", "rmse", "correlation", "scatter_index"):
             assert metric in ds.data_vars, f"Missing metric: {metric}"
         assert "source" in ds.dims
-        assert set(ds["source"].values) == {"mooring", "buoy"}
+        # "mooring" and "buoy" are pooled into one "buoy_family" group for
+        # statistics purposes -- see _STATS_GROUP_ALIASES.
+        assert set(ds["source"].values) == {"buoy_family"}
         # Synthetic data has small noise so bias should be small
         assert abs(float(ds["bias"].mean())) < 1.0
         assert (ds["rmse"].values >= 0).all()
@@ -983,7 +985,20 @@ class TestRunStatisticsGrouping:
     def test_groups_by_platform_type_not_station(self, tmp_path, multi_station_collocation_ds):
         results = run_statistics(multi_station_collocation_ds, self._recipe(), tmp_path)
         stats_ds = results["owiWindSpeed_vs_WSPD"]
-        assert set(stats_ds["source"].values) == {"mooring", "buoy", "scatterometer"}
+        # "mooring" and "buoy" are pooled into one "buoy_family" group for
+        # statistics purposes -- see _STATS_GROUP_ALIASES.
+        assert set(stats_ds["source"].values) == {"buoy_family", "scatterometer"}
+
+    def test_mooring_and_buoy_pool_into_one_group_with_combined_n(
+        self, tmp_path, multi_station_collocation_ds,
+    ):
+        """multi_station_collocation_ds has 6 "mooring" rows and 4 "buoy"
+        rows -- both must land in one "buoy_family" group with N=10, not
+        two separate rows."""
+        results = run_statistics(multi_station_collocation_ds, self._recipe(), tmp_path)
+        stats_ds = results["owiWindSpeed_vs_WSPD"]
+        df = stats_ds.to_dataframe()
+        assert int(df.loc["buoy_family", "N"]) == 10
 
     def test_scatterometer_row_present_with_full_count(self, tmp_path, multi_station_collocation_ds):
         results = run_statistics(multi_station_collocation_ds, self._recipe(), tmp_path)
@@ -1304,6 +1319,24 @@ def test_group_by_columns_composite_key():
     df = pd.DataFrame({"a": ["x", "x"], "b": ["1", "2"], "v": [1, 2]})
     groups = _group_by_columns(df, ["a", "b"])
     assert sorted(groups.groups.keys()) == ["x | 1", "x | 2"]
+
+
+def test_group_by_columns_pools_mooring_and_buoy_val_source():
+    df = pd.DataFrame({
+        "val_source": ["mooring", "buoy", "scatterometer"], "v": [1, 2, 3],
+    })
+    groups = _group_by_columns(df, ["val_source"])
+    assert sorted(groups.groups.keys()) == ["buoy_family", "scatterometer"]
+    assert sorted(groups.get_group("buoy_family")["v"].tolist()) == [1, 2]
+
+
+def test_group_by_columns_does_not_alias_non_val_source_columns():
+    """The "mooring"/"buoy" pooling is specific to the val_source grouping
+    key -- a column happening to also contain those strings under a
+    different name must not be aliased."""
+    df = pd.DataFrame({"a": ["mooring", "buoy"], "v": [1, 2]})
+    groups = _group_by_columns(df, ["a"])
+    assert sorted(groups.groups.keys()) == ["buoy", "mooring"]
 
 
 def test_core_metrics_basic():

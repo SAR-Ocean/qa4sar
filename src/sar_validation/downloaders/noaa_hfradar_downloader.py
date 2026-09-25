@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -236,8 +237,23 @@ class NOAAHFRadarDownloader:
             return out_path
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        with prefer_ipv4_dns(), urllib.request.urlopen(url, timeout=15) as resp:
-            out_path.write_bytes(resp.read())
+        try:
+            with prefer_ipv4_dns(), urllib.request.urlopen(url, timeout=15) as resp:
+                out_path.write_bytes(resp.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                # ERDDAP's rolling real-time catalogue can drop a specific
+                # region/resolution dataset without warning -- not a
+                # structural "this region/resolution doesn't exist" case
+                # (that's select_erddap_dataset's job), but the same
+                # fall-through-to-THREDDS outcome applies, so it's raised
+                # as the same ValueError type hf_radar_us_downloader.py's
+                # waterfall already catches.
+                raise ValueError(
+                    f"ERDDAP dataset {dataset_id!r} returned 404 (transiently "
+                    "unavailable); falling through to the next backend."
+                ) from exc
+            raise
         return out_path
 
     def check_availability_dry(
@@ -252,13 +268,14 @@ class NOAAHFRadarDownloader:
         text), never a real griddap data subset.
 
         Returns False (never raises) when the requested date is outside
-        ERDDAP's rolling window (``select_backend``) or the region/resolution
-        combination has no ERDDAP dataset at all (``select_erddap_dataset``)
-        -- both structural "ERDDAP doesn't apply here" outcomes, not check
-        failures. Returns True (fails open) when the .das response doesn't
-        expose a parseable "time" actual_range -- can't rule out coverage
-        from an unparseable response, matching this module's
-        fail-toward-inclusion convention.
+        ERDDAP's rolling window (``select_backend``), the region/resolution
+        combination has no ERDDAP dataset at all (``select_erddap_dataset``),
+        or the dataset ID is transiently 404ing on ERDDAP's own server --
+        all "ERDDAP doesn't apply here" outcomes, not check failures.
+        Returns True (fails open) when the .das response doesn't expose a
+        parseable "time" actual_range -- can't rule out coverage from an
+        unparseable response, matching this module's fail-toward-inclusion
+        convention.
         """
         try:
             select_backend(end)
@@ -270,8 +287,17 @@ class NOAAHFRadarDownloader:
             return False
 
         das_url = f"{ERDDAP_BASE}/{dataset_id}.das"
-        with prefer_ipv4_dns(), urllib.request.urlopen(das_url, timeout=15) as resp:
-            text = resp.read().decode()
+        try:
+            with prefer_ipv4_dns(), urllib.request.urlopen(das_url, timeout=15) as resp:
+                text = resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                # Same transient-404 case _download_window() handles --
+                # ERDDAP's rolling catalogue can drop this exact dataset
+                # without warning even though select_erddap_dataset() says
+                # it should exist.
+                return False
+            raise
 
         time_range = _parse_das_time_range(text)
         if time_range is None:

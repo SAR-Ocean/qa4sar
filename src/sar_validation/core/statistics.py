@@ -92,11 +92,29 @@ def _missing_columns(collocation_ds: xr.Dataset, *cols: str) -> List[str]:
     return [c for c in cols if c not in collocation_ds]
 
 
+#: val_source values folded together before statistics grouping, regardless
+#: of whether the underlying data came from Copernicus Marine or GTS.
+#: Moored and drifting buoys are physically different platforms, but their
+#: near-surface point observations are treated as one population for
+#: aggregate error metrics rather than reported as two separate rows. Only
+#: this grouping key is affected -- point-level labeling (e.g. plot colors/
+#: markers, which read val_source directly from the collocation dataset)
+#: is untouched, since _group_by_columns only remaps its own local copy of
+#: the column.
+_STATS_GROUP_ALIASES = {"mooring": "buoy_family", "buoy": "buoy_family"}
+
+
 def _group_by_columns(df, group_by: List[str]):
     """
     Group *df* by a single column, or by a synthetic ``_group`` column
     joining all of *group_by* with ``" | "`` when there's more than one.
+
+    When ``"val_source"`` is one of the grouping columns, its values are
+    first passed through :data:`_STATS_GROUP_ALIASES`.
     """
+    if "val_source" in group_by:
+        df = df.copy()
+        df["val_source"] = df["val_source"].replace(_STATS_GROUP_ALIASES)
     if len(group_by) == 1:
         return df.groupby(group_by[0])
     df["_group"] = df[group_by].astype(str).agg(" | ".join, axis=1)

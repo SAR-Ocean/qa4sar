@@ -11,7 +11,7 @@ import logging
 import re
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, List, Literal, Optional, Tuple
@@ -1997,13 +1997,25 @@ _ALTIMETER_SATELLITE_MAP = {
 
 
 def _altimeter_satellite_resolver(candidate_name: str) -> str:
-    """satellite_resolver adapter for altimeter: candidate_name is one of
-    AltimeterDownloader's own satellite codes (e.g. "j3"), mapped to
-    orbit_coverage.py's SATELLITE_ORBIT_SPECS keys. An unrecognized code
-    still reaches orbit_overlap_windows, which itself fails open (whole
-    candidate window kept) on any key absent from SATELLITE_ORBIT_SPECS --
-    mirrors _hsaf_satellite_resolver's identical contract."""
-    return _ALTIMETER_SATELLITE_MAP.get(candidate_name, "unknown")
+    """
+    Resolve one candidate code to an orbit_coverage.py satellite key.
+
+    Accepts codes from either altimeter product: AltimeterDownloader's
+    near-real-time codes (e.g. "j3") via _ALTIMETER_SATELLITE_MAP, or
+    ReprocessedAltimeterDownloader's mission codes (e.g. "ers-1") via
+    that module's own MISSIONS table. An unrecognized code resolves to
+    "unknown", which orbit_overlap_windows treats as a fail-open match
+    (whole candidate window kept) rather than an error.
+    """
+    if candidate_name in _ALTIMETER_SATELLITE_MAP:
+        return _ALTIMETER_SATELLITE_MAP[candidate_name]
+
+    from ..downloaders.reprocessed_altimeter_downloader import MISSIONS
+
+    if candidate_name in MISSIONS:
+        return MISSIONS[candidate_name]["orbit_key"]
+
+    return "unknown"
 
 
 def _altimeter_orbit_candidates_dry(
@@ -2067,6 +2079,15 @@ def _altimeter_orbit_candidates_dry(
         if avail_end is not None and start_str > avail_end:
             continue
         candidates.append((sat_code, start_dt, end_dt))
+    from ..downloaders.reprocessed_altimeter_downloader import MISSIONS
+
+    for mission_code, spec in MISSIONS.items():
+        if end_str < f"{spec['start']}T00:00:00":
+            continue
+        if start_str > f"{spec['end']}T23:59:59":
+            continue
+        candidates.append((mission_code, start_dt, end_dt))
+
     return candidates
 
 
@@ -2079,6 +2100,11 @@ def _altimeter_orbit_candidates_dry(
 #: wide-swath-sized buffer dominating a narrow instrument's effective
 #: search corridor.
 _ALTIMETER_ORBIT_MARGIN_KM = 12.0
+
+#: Every layer-type key altimeter data can be tagged with, used to look up
+#: the correct time-tolerance padding regardless of which product or
+#: frequency a given recipe's altimeter data actually resolves to.
+_ALTIMETER_TOLERANCE_SOURCE_TYPES = ("altimeter_1hz", "altimeter_5hz", "altimeter_reprocessed")
 
 
 def _predict_altimeter(
@@ -2108,7 +2134,7 @@ def _predict_altimeter(
         satellite_resolver=_altimeter_satellite_resolver,
         list_candidates_dry=_altimeter_orbit_candidates_dry,
         source_type="altimeter",
-        tolerance_source_types=("altimeter_1hz", "altimeter_5hz"),
+        tolerance_source_types=_ALTIMETER_TOLERANCE_SOURCE_TYPES,
         margin_km=_ALTIMETER_ORBIT_MARGIN_KM,
         stop_on_first_match=stop_on_first_match,
     )
@@ -2372,15 +2398,28 @@ _PREDICATES["ismn"] = _predict_ismn
 
 def _predict_insitu(
     source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+    query_source_type: Optional[str] = None,
 ) -> SourcePrediction:
     """Predicate for the five real Copernicus Marine in-situ source
-    types (mooring, buoy, drifter, ferrybox, tidal_gauge) -- see
+    types (mooring, buoy_cmems, drifter, ship_cmems_family, tidal_gauge) -- see
     orchestrator.py's _INSITU_TYPES. Unlike those five types' real
     (non-dry) download path, which batches every requested platform type
     into one InSituDownloader.download(source_types=[...]) call,
     predict_source is called once per individual validation source, so
     this predicate filters its own station_ranges_dry call down to
     just the single source.source_type it was invoked for.
+
+    query_source_type overrides which source_types value is actually
+    sent to station_ranges_dry, while the returned prediction's own
+    source_type field still reports source.source_type unchanged. This
+    lets _predict_buoy_gts and _predict_buoy_waterfall reuse this same
+    Copernicus Marine query (passing query_source_type="buoy_cmems", the
+    "DB" platform code) for two recipe source types that are not
+    themselves real Copernicus Marine platform codes and would otherwise
+    fail station_ranges_dry's own source-type resolution; _predict_ship_gts
+    reuses the same mechanism with query_source_type="ship_cmems_family"
+    (the "FB" platform code). Defaults to source.source_type, matching
+    every other caller.
 
     Uses InSituDownloader.station_ranges_dry (real per-station
     coordinates) rather than check_availability_dry's boolean, so
@@ -2427,6 +2466,7 @@ def _predict_insitu(
 
     dl = InSituDownloader(output_dir=Path("."))
     tolerance = timedelta(minutes=_resolve_temporal_padding_minutes(cfg, source.source_type))
+    effective_source_type = query_source_type or source.source_type
 
     union_min_lon, union_max_lon = _antimeridian_aware_lon_bounds(
         [lon for fp in sar_footprints for lon in (fp.bbox[0], fp.bbox[1])]
@@ -2440,7 +2480,7 @@ def _predict_insitu(
         ranges = dl.station_ranges_dry(
             union_min_lon, union_max_lon, union_min_lat, union_max_lat,
             union_start.isoformat(), union_end.isoformat(),
-            source_types=[source.source_type],
+            source_types=[effective_source_type],
             variables=variables_for_recipe(cfg.variable),
         )
     except Exception:
@@ -2490,8 +2530,146 @@ def _predict_insitu(
     )
 
 
-for _insitu_type in ("mooring", "buoy", "drifter", "ferrybox", "tidal_gauge"):
+for _insitu_type in (
+    "mooring", "buoy_cmems", "buoy_cmems_family", "drifter", "ship_cmems_family", "tidal_gauge",
+):
     _PREDICATES[_insitu_type] = _predict_insitu
+
+
+def _predict_buoy_gts(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
+    """Predicate for "buoy_gts" -- the MARS/GTS moored+drifting buoy
+    downloader (see gts_buoy_downloader.py). Unlike the five real
+    Copernicus Marine in-situ source types, MARS has no lightweight
+    station-index endpoint: every MARS request, however small, is a full
+    BUFR retrieval, the same cost as a real download, so GTS coverage
+    itself genuinely cannot be predicted without a live MARS call -- this
+    predicate does not attempt one, and always reports verdict "unknown"
+    for that reason.
+
+    As a purely informational reference, it additionally runs
+    _predict_insitu's own Copernicus Marine query (query_source_type=
+    "buoy_cmems", the "DB" platform code) over the same bbox/window/
+    variables, and surfaces the resulting station count/coverage in the
+    returned prediction's message field -- rendered as an extra caveat
+    line under the main verdict (see render_console_table). This is
+    reference data only: since the recipe requests "buoy_gts" alone, the
+    real run includes only GTS data, never these referenced Copernicus
+    stations."""
+    reference = _predict_insitu(
+        source, cfg, sar_footprints, stop_on_first_match=stop_on_first_match,
+        query_source_type="buoy_cmems",
+    )
+    message = (
+        f"Copernicus Marine buoy coverage (reference only): {reference.detail} "
+        "This reflects Copernicus Marine buoy coverage as a reference only -- GTS coverage "
+        "itself cannot be predicted without live MARS access. Because this recipe requests "
+        "\"buoy_gts\" only, only GTS data (not the referenced Copernicus stations) will be "
+        "included in the actual run, unless the recipe is changed to \"buoy_waterfall\" or a "
+        "separate \"buoy_cmems\" source is added."
+    )
+    return SourcePrediction(
+        source_type=source.source_type, bucket="ground-point", verdict="unknown",
+        detail="GTS coverage cannot be predicted without live MARS access.",
+        message=message,
+    )
+
+
+_PREDICATES["buoy_gts"] = _predict_buoy_gts
+
+
+def _predict_ship_gts(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
+    """Predicate for "ship_gts" -- the MARS/GTS ship synoptic wind
+    downloader. Unlike the five real Copernicus Marine in-situ source
+    types, MARS has no lightweight station-index endpoint: every MARS
+    request, however small, is a full BUFR retrieval, the same cost as a
+    real download, so GTS coverage itself genuinely cannot be predicted
+    without a live MARS call -- this predicate does not attempt one, and
+    always reports verdict "unknown" for that reason.
+
+    As a purely informational reference, it additionally runs
+    _predict_insitu's own Copernicus Marine query (query_source_type=
+    "ship_cmems_family", the "FB" platform code) over the same bbox/
+    window/variables, and surfaces the resulting station count/coverage
+    in the returned prediction's message field -- rendered as an extra
+    caveat line under the main verdict (see render_console_table). This
+    is reference data only: since the recipe requests "ship_gts" alone,
+    the real run includes only GTS data, never these referenced
+    Copernicus Marine ferrybox stations."""
+    reference = _predict_insitu(
+        source, cfg, sar_footprints, stop_on_first_match=stop_on_first_match,
+        query_source_type="ship_cmems_family",
+    )
+    message = (
+        f"Copernicus Marine ferrybox coverage (reference only): {reference.detail} "
+        "This reflects Copernicus Marine ferrybox coverage as a reference only -- GTS "
+        "coverage itself cannot be predicted without live MARS access. Because this recipe "
+        "requests \"ship_gts\" only, only GTS data (not the referenced Copernicus Marine "
+        "stations) will be included in the actual run; requesting \"ship_cmems_family\" "
+        "instead of \"ship_gts\" would use the Copernicus Marine ferrybox coverage shown "
+        "here instead, since the two source types cannot both appear in the same recipe."
+    )
+    return SourcePrediction(
+        source_type=source.source_type, bucket="ground-point", verdict="unknown",
+        detail="GTS coverage cannot be predicted without live MARS access.",
+        message=message,
+    )
+
+
+_PREDICATES["ship_gts"] = _predict_ship_gts
+
+
+def _predict_buoy_waterfall(
+    source, cfg, sar_footprints: "list[SarFootprint]", *, stop_on_first_match: bool = False,
+) -> SourcePrediction:
+    """Predicate for "buoy_waterfall" -- the deduplicated combination of
+    GTS and Copernicus Marine buoy data (GTS preferred per-station, see
+    orchestrator.py's waterfall dedup). Since GTS coverage itself cannot
+    be predicted without a live MARS call (see _predict_buoy_gts), this
+    predicate instead runs _predict_insitu's own Copernicus Marine query
+    (query_source_type="buoy_cmems", the "DB" platform code) and uses its
+    real matched/no-match verdict as the actual prediction for this
+    source: Copernicus data genuinely will be included in the real
+    "buoy_waterfall" run wherever GTS does not cover a station.
+
+    Attaches a message clarifying that this prediction reflects
+    Copernicus Marine coverage only -- the actual run will additionally
+    include GTS data for whichever of these stations GTS also covers in
+    this window, replacing the Copernicus value for that station, and
+    that GTS-only coverage beyond what Copernicus reports cannot itself
+    be predicted without live MARS access.
+
+    A "none-predicted" Copernicus-side result is downgraded to "unknown"
+    before being returned, rather than passed through as-is: this
+    source's own GTS side is still, always, unpredictable without live
+    MARS access (see the message above and _predict_buoy_gts), so
+    Copernicus alone finding no stations in the window must not be
+    treated as a confirmed absence of collocation for "buoy_waterfall"
+    as a whole. _should_skip_for_collocation only skips a source on a
+    confirmed "none-predicted" verdict, never on "unknown" -- downgrading
+    here keeps that skip from firing (and silently dropping the GTS
+    download alongside the Copernicus one) based on Copernicus-only
+    information. A genuine Copernicus match ("collocated") is left
+    unchanged, since Copernicus data is then confirmed to be included in
+    the real run regardless of GTS coverage."""
+    reference = _predict_insitu(
+        source, cfg, sar_footprints, stop_on_first_match=stop_on_first_match,
+        query_source_type="buoy_cmems",
+    )
+    message = (
+        "This prediction reflects Copernicus Marine coverage only. The actual run will "
+        "additionally include GTS data for whichever of these stations GTS also covers in "
+        "this window, replacing the Copernicus value for that station; GTS-only coverage "
+        "beyond what Copernicus reports cannot itself be predicted without live MARS access."
+    )
+    verdict = "unknown" if reference.verdict == "none-predicted" else reference.verdict
+    return replace(reference, source_type=source.source_type, verdict=verdict, message=message)
+
+
+_PREDICATES["buoy_waterfall"] = _predict_buoy_waterfall
 
 
 def _predict_insitu_currents_historical(

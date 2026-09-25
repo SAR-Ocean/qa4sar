@@ -71,7 +71,8 @@ class ValidationDataSource:
     Platform / product type.
 
     Accepted values:
-      in-situ (real-time)   : mooring, buoy, ferrybox, drifter,
+      in-situ (real-time)   : buoy_cmems_family, ship_cmems_family,
+                               buoy_gts, ship_gts, buoy_waterfall,
                                tidal_gauge
       in-situ (historical)  : adcp_historical, argo_historical,
                                drifter_historical, glider_historical
@@ -186,6 +187,12 @@ DEFAULT_LAYER_TYPE_SPECS: Dict[str, Dict[str, Any]] = {
     },
     "altimeter_1hz":  {"time_tolerance_minutes": 180, "aggregation_window_km": 7.0,  "distance_weighting": "equal"},
     "altimeter_5hz":  {"time_tolerance_minutes": 180, "aggregation_window_km": 1.4,  "distance_weighting": "equal"},
+    # Reprocessed (multi-year) product: same ~7km along-track resolution
+    # as the near-real-time 1 Hz product, since it has no frequency
+    # distinction of its own.
+    "altimeter_reprocessed": {
+        "time_tolerance_minutes": 180, "aggregation_window_km": 7.0, "distance_weighting": "equal"
+    },
     "hf_radar_grid":  {
         "time_tolerance_minutes": 30, "aggregation_window_km": 6.0,
         "distance_weighting": "equal", "dedup_nearest_in_time": True,
@@ -443,6 +450,59 @@ def _build_sar_data_spec(sar: Dict[str, Any], variable: str) -> SARDataSpec:
     )
 
 
+def _check_gts_cmems_overlap(
+    validation_source_types: "set[str]",
+    gts_type: str,
+    station_description: str,
+    cmems_platform_types: "tuple[str, ...]",
+    excluded_types: "set[str]",
+    waterfall_hint: "Optional[str]",
+) -> None:
+    """
+    Raise ``ValueError`` if *gts_type* and any other requested source_type
+    in *validation_source_types* resolve to overlapping Copernicus Marine
+    platform codes.
+
+    *gts_type* retrieves the same physical stations several Copernicus
+    Marine source types can also report; combining them without
+    deduplication would double-count those stations in validation
+    statistics. *cmems_platform_types* are the Copernicus Marine
+    source_type names whose platform codes overlap with *gts_type*'s own
+    GTS coverage (looked up via ``SOURCE_TYPE_TO_PLATFORM`` rather than
+    hardcoded platform-code literals, so a future source_type that
+    resolves to the same platform code is caught automatically).
+    *excluded_types* are source_types this check never flags even if they
+    would otherwise match (*gts_type* itself, and any combined/deduplicated
+    variant of it). *waterfall_hint*, if given, names a combined
+    source_type to suggest instead; if ``None``, the error message simply
+    asks the two conflicting sources to be reconciled.
+    """
+    if gts_type not in validation_source_types:
+        return
+
+    from ..downloaders.insitu_downloader import SOURCE_TYPE_TO_PLATFORM  # noqa: PLC0415
+
+    overlap_codes: "set[str]" = set()
+    for cmems_type in cmems_platform_types:
+        overlap_codes |= set(SOURCE_TYPE_TO_PLATFORM[cmems_type])
+
+    for other_type in sorted(validation_source_types - excluded_types):
+        other_codes = set(SOURCE_TYPE_TO_PLATFORM.get(other_type, []))
+        if overlap_codes & other_codes:
+            hint = (
+                f" Use source_type {waterfall_hint!r} instead, which combines "
+                "both sources with per-station deduplication."
+            ) if waterfall_hint else " Remove one of the two conflicting validation sources."
+            raise ValueError(
+                f"source_types {gts_type!r} and {other_type!r} may not both be "
+                "listed as separate validation_sources entries -- GTS mostly "
+                f"relays the same physical {station_description} Copernicus "
+                f"Marine's {other_type!r} source_type already reports, so "
+                "combining them without deduplication would double-count "
+                "overlapping stations in validation statistics." + hint
+            )
+
+
 class Recipe:
     """Load, save, and manage a RecipeConfig."""
 
@@ -533,6 +593,44 @@ class Recipe:
                 "HYCOM has no wind/wave/soil-moisture variable. Remove the "
                 "hycom validation source, or switch the recipe's variable to "
                 "'currents'."
+            )
+        _GTS_BUOY_VALID_VARIABLES = {"wind", "waves", "currents"}
+        if data.get("variable") not in _GTS_BUOY_VALID_VARIABLES and any(
+            s.source_type in ("buoy_gts", "buoy_waterfall") for s in validation_sources
+        ):
+            raise ValueError(
+                "source_type 'buoy_gts'/'buoy_waterfall' is only valid for "
+                "'wind', 'waves', or 'currents' recipes -- GTS buoy "
+                "observations carry none of this toolbox's other supported "
+                "variables (e.g. soil moisture). Remove the GTS buoy "
+                "validation source, or switch the recipe's variable."
+            )
+        _validation_source_types = {s.source_type for s in validation_sources}
+        _CMEMS_INTERNAL_ONLY_TYPES = {"mooring", "buoy_cmems", "drifter"}
+        _rejected_cmems_types = _validation_source_types & _CMEMS_INTERNAL_ONLY_TYPES
+        if _rejected_cmems_types:
+            raise ValueError(
+                f"source_type {sorted(_rejected_cmems_types)!r} is not a valid "
+                "recipe entry -- 'mooring', 'buoy_cmems', and 'drifter' are "
+                "internal Copernicus Marine platform groupings only. Use "
+                "'buoy_cmems_family' instead, which combines moored buoys, "
+                "drifting buoys, and drifters into one source_type."
+            )
+        _check_gts_cmems_overlap(
+            _validation_source_types, "buoy_gts", "WMO buoy stations",
+            ("mooring", "buoy_cmems"), {"buoy_gts", "buoy_waterfall"}, "buoy_waterfall",
+        )
+        _check_gts_cmems_overlap(
+            _validation_source_types, "ship_gts", "WMO ship stations",
+            ("ship_cmems_family",), {"ship_gts"}, None,
+        )
+        _GTS_SHIP_VALID_VARIABLES = {"wind"}
+        if data.get("variable") not in _GTS_SHIP_VALID_VARIABLES and "ship_gts" in _validation_source_types:
+            raise ValueError(
+                "source_type 'ship_gts' is only valid for 'wind' recipes -- GTS "
+                "ship observations carry no other variable this toolbox supports. "
+                "Remove the ship_gts validation source, or switch the recipe's "
+                "variable to 'wind'."
             )
 
         config = RecipeConfig(

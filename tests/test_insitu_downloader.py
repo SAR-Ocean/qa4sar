@@ -86,7 +86,7 @@ class TestNoDataOutcome:
             out = dl.download(
                 _MIN_LON, _MAX_LON, _MIN_LAT, _MAX_LAT,
                 "2026-06-01", "2026-06-05",
-                source_types=["mooring", "buoy"],
+                source_types=["mooring", "buoy_cmems"],
             )
 
         assert out == []
@@ -157,8 +157,8 @@ class TestCheckAvailabilityDry:
 
     def test_check_availability_dry_filters_by_source_types(self, monkeypatch, tmp_path):
         """Data exists, but only from a mooring ("MO") platform -- a
-        caller asking for "buoy" ("DB") specifically must not see it as
-        available, even though the raw fetch was non-empty."""
+        caller asking for "buoy_cmems" ("DB") specifically must not see it
+        as available, even though the raw fetch was non-empty."""
         fake_copernicusmarine = _FakeCopernicusMarineModule(has_data=True, platform_type="MO")
         monkeypatch.setattr(
             "sar_validation.downloaders.insitu_downloader.InSituDownloader._get_copernicusmarine",
@@ -169,7 +169,7 @@ class TestCheckAvailabilityDry:
         result = dl.check_availability_dry(
             min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0,
             start="2026-08-01T00:00:00", end="2026-08-01T01:00:00",
-            source_types=["buoy"],
+            source_types=["buoy_cmems"],
         )
 
         assert result is False
@@ -282,8 +282,9 @@ class TestStationRangesDry:
         assert ranges["B2"][:2] == (20.0, -5.0)
 
     def test_filters_by_source_types(self, monkeypatch, tmp_path):
-        """Only "MO" (mooring) rows exist -- a caller asking for "buoy"
-        ("DB") specifically must not see that station at all."""
+        """Only "MO" (mooring) rows exist -- a caller asking for
+        "buoy_cmems" ("DB") specifically must not see that station at
+        all."""
         fake_copernicusmarine = _FakeCopernicusMarineModule(has_data=True, platform_type="MO")
         monkeypatch.setattr(
             "sar_validation.downloaders.insitu_downloader.InSituDownloader._get_copernicusmarine",
@@ -294,7 +295,7 @@ class TestStationRangesDry:
         ranges = dl.station_ranges_dry(
             min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0,
             start="2026-08-01T00:00:00", end="2026-08-01T01:00:00",
-            source_types=["buoy"],
+            source_types=["buoy_cmems"],
         )
 
         assert ranges == {}
@@ -302,12 +303,13 @@ class TestStationRangesDry:
 
 class TestFetchStationsIndexFallback:
     """_fetch_stations_uncached must fall back to the same per-platform
-    index download the real download() path uses whenever
-    read_dataframe() reports NoServiceAvailable for a non-"latest" part
-    -- confirmed live to hit the identical ARCO-service gap subset() has,
-    which otherwise leaves every historical-date dry-collocation check
-    (e.g. an older SAR scene's in-situ availability) permanently reporting
-    "unknown" regardless of the real download() path's own fix."""
+    index the real download() path uses whenever read_dataframe()
+    reports NoServiceAvailable for a non-"latest" part -- confirmed live
+    to hit the identical ARCO-service gap subset() has, which otherwise
+    leaves every historical-date dry-collocation check (e.g. an older SAR
+    scene's in-situ availability) permanently reporting "unknown"
+    regardless of the real download() path's own fix. Unlike the real
+    path, this never downloads a platform's full file."""
 
     def _fake_module_raising_no_service(self):
         from copernicusmarine.core_functions.exceptions import NoServiceAvailable
@@ -321,25 +323,24 @@ class TestFetchStationsIndexFallback:
         fake_module.read_dataframe.side_effect = fake_read_dataframe
         return fake_module, NoServiceAvailable
 
-    def test_falls_back_to_index_download_and_reads_the_result(self, monkeypatch, tmp_path):
+    def test_falls_back_to_the_dry_index_path_and_reads_the_result(self, monkeypatch, tmp_path):
         fake_module, _ = self._fake_module_raising_no_service()
         monkeypatch.setattr(
             "sar_validation.downloaders.insitu_downloader.InSituDownloader._get_copernicusmarine",
             lambda self: fake_module,
         )
 
-        def fake_download_via_index(*, dest_path, **kwargs):
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            dest_path.write_text(
-                "variable,platform_id,platform_type,time,longitude,latitude,depth,value,"
-                "value_qc,institution\n"
-                "WSPD,A1,MO,2023-06-01T00:00:00,5.5,62.0,0.0,4.2,1,Org\n"
-            )
-            return dest_path
+        fake_df = pd.DataFrame([
+            {
+                "variable": "", "platform_id": "A1", "platform_type": "MO",
+                "time": "2023-06-01T00:00:00", "longitude": 5.5, "latitude": 62.0,
+                "depth": 0.0, "value": float("nan"), "value_qc": float("nan"), "institution": "",
+            },
+        ])
 
         with patch(
-            "sar_validation.downloaders.insitu_downloader.download_via_index",
-            side_effect=fake_download_via_index,
+            "sar_validation.downloaders.insitu_downloader.dry_platform_ranges",
+            return_value=fake_df,
         ) as mock_fallback:
             dl = InSituDownloader(output_dir=tmp_path)
             ranges = dl.station_ranges_dry(
@@ -360,8 +361,11 @@ class TestFetchStationsIndexFallback:
         )
 
         with patch(
-            "sar_validation.downloaders.insitu_downloader.download_via_index",
-            return_value=None,
+            "sar_validation.downloaders.insitu_downloader.dry_platform_ranges",
+            return_value=pd.DataFrame(columns=[
+                "variable", "platform_id", "platform_type", "time",
+                "longitude", "latitude", "depth", "value", "value_qc", "institution",
+            ]),
         ):
             dl = InSituDownloader(output_dir=tmp_path)
             ranges = dl.station_ranges_dry(
@@ -383,7 +387,7 @@ class TestFetchStationsIndexFallback:
         )
 
         with patch(
-            "sar_validation.downloaders.insitu_downloader.download_via_index",
+            "sar_validation.downloaders.insitu_downloader.dry_platform_ranges",
         ) as mock_fallback, pytest.raises(NoServiceAvailable):
             dl = InSituDownloader(output_dir=tmp_path)
             dl.station_ranges_dry(
@@ -394,43 +398,53 @@ class TestFetchStationsIndexFallback:
 
         mock_fallback.assert_not_called()
 
-    def test_scratch_directory_is_cleaned_up(self, monkeypatch, tmp_path):
-        """_fetch_stations_uncached's own contract is 'no lasting
-        artifact' -- the scratch CSV used to read the fallback's result
-        back into a DataFrame must not survive the call."""
+    def test_no_full_platform_file_is_downloaded(self, monkeypatch, tmp_path):
+        """The whole point of the dry path: unlike the real download()
+        path's download_via_index, no per-platform .nc file is ever
+        fetched just to answer a dry existence/range question."""
         fake_module, _ = self._fake_module_raising_no_service()
         monkeypatch.setattr(
             "sar_validation.downloaders.insitu_downloader.InSituDownloader._get_copernicusmarine",
             lambda self: fake_module,
         )
-        captured_scratch_dir = {}
 
-        def fake_download_via_index(*, dest_path, **kwargs):
-            captured_scratch_dir["path"] = dest_path.parent
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            dest_path.write_text(
-                "variable,platform_id,platform_type,time,longitude,latitude,depth,value,"
-                "value_qc,institution\n"
-            )
-            return dest_path
+        # Create a minimal index file with a row whose bbox does not match
+        # the test's query region (200.0-201.0, -80.0 to -79.0), so the dry
+        # path exercises the real rows_matching_query logic and finds zero
+        # matches, but without requiring a network call to fetch the index.
+        minimal_index_content = (
+            "# Title : in-situ files catalog\n"
+            "# Description : catalog of available in-situ files compliant with Marine Data Store\n"
+            "# Date of update : 2023-06-01T00:00:00Z\n"
+            "# product_id,file_name,geospatial_lat_min,geospatial_lat_max,geospatial_lon_min,geospatial_lon_max,time_coverage_start,time_coverage_end,institution,date_update,data_mode,parameters\n"  # noqa: E501
+            "COP-TEST-01,history/MO/TEST_TS_MO_1.nc,10.0,15.0,0.0,5.0,2023-01-01T00:00:00Z,2023-12-31T23:59:00Z,Test Org,2023-06-01T00:00:00Z,R,VHM0 VAVH\n"  # noqa: E501
+        )
+        index_file = tmp_path / "index_history.txt"
+        index_file.write_text(minimal_index_content)
 
-        with patch(
-            "sar_validation.downloaders.insitu_downloader.download_via_index",
-            side_effect=fake_download_via_index,
+        with (
+            patch(
+                "sar_validation.downloaders.insitu_index_fallback.fetch_index_file",
+                return_value=index_file,
+            ) as mock_fetch_index,
+            patch(
+                "sar_validation.downloaders.insitu_index_fallback.download_index_files",
+            ) as mock_download_files,
         ):
             dl = InSituDownloader(output_dir=tmp_path)
             dl.station_ranges_dry(
-                min_lon=5.0, max_lon=6.0, min_lat=61.0, max_lat=63.0,
+                min_lon=200.0, max_lon=201.0, min_lat=-80.0, max_lat=-79.0,
                 start="2023-06-01T00:00:00", end="2023-06-02T00:00:00",
                 dataset_part="history",
             )
 
-        assert not captured_scratch_dir["path"].exists()
+        mock_fetch_index.assert_called_once()
+        mock_download_files.assert_not_called()
 
 
 class TestFetchStationsCache:
     """_fetch_stations_dry's own shared cache: --dry-collocation's five
-    real in-situ source types (mooring/buoy/ferrybox/drifter/tidal_gauge)
+    real in-situ source types (mooring/buoy/ship_cmems_family/drifter/tidal_gauge)
     all run concurrently via predict_collocation's own ThreadPoolExecutor,
     every one of them requesting the exact same bbox/window/dataset_part/
     variables for a single recipe run (cfg.variable is recipe-wide, not
@@ -476,7 +490,7 @@ class TestFetchStationsCache:
         dl.station_ranges_dry(
             min_lon=-10.0, max_lon=10.0, min_lat=35.0, max_lat=55.0,
             start="2026-08-01T00:00:00", end="2026-08-01T01:00:00",
-            source_types=["buoy"],
+            source_types=["buoy_cmems"],
         )
 
         assert len(calls) == 1
@@ -544,7 +558,7 @@ class TestFetchStationsCache:
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_a = executor.submit(_call, "mooring")
             barrier.wait(timeout=5)
-            future_b = executor.submit(_call, "buoy")
+            future_b = executor.submit(_call, "buoy_cmems")
             result_a = future_a.result(timeout=5)
             result_b = future_b.result(timeout=5)
 
@@ -724,3 +738,15 @@ class TestMoveSubsetOutput:
 
         assert found is False
         assert not dest_path.exists()
+
+
+class TestBuoyWaterfallPlatformCode:
+    def test_buoy_waterfall_resolves_to_db(self):
+        from sar_validation.downloaders.insitu_downloader import _resolve_platform_codes
+        assert _resolve_platform_codes(["buoy_waterfall"]) == ["DB"]
+
+
+class TestBuoyCmemsFamilyPlatformCode:
+    def test_buoy_cmems_family_resolves_to_mooring_buoy_and_drifter_codes(self):
+        from sar_validation.downloaders.insitu_downloader import _resolve_platform_codes
+        assert _resolve_platform_codes(["buoy_cmems_family"]) == ["MO", "DB", "AD"]

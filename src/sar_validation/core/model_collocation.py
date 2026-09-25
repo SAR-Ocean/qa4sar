@@ -16,7 +16,7 @@ import pandas as pd
 import xarray as xr
 from scipy.interpolate import RegularGridInterpolator
 
-from .collocation import CollocatedPoint, PointLayerCollocation
+from .collocation import CollocatedPoint, PointLayerCollocation, _sar_grid_pixel_spacing_km
 
 logger = logging.getLogger(__name__)
 
@@ -456,6 +456,7 @@ class ModelLayerCollocation:
                 collocation_type=self.collocation_type,
                 sar_y_idx=0, sar_x_idx=i,
                 sar_scene_name=sar_scene_name,
+                aggregation_window_km=None,
             ))
         return results
 
@@ -476,6 +477,12 @@ class ModelLayerCollocation:
         ny, nx = sar_lon.shape
         lons_flat = sar_lon.ravel()
         lats_flat = sar_lat.ravel()
+
+        # This SAR scene's own native pixel grid spacing, recorded on
+        # every row below in place of an aggregation window, since
+        # direct interpolation involves no spatial averaging.
+        sar_pixel_spacing_km = _sar_grid_pixel_spacing_km(sar_lon, sar_lat)
+
         obs_time = pd.Timestamp(np.atleast_1d(sar_time)[0]).to_pydatetime()
         times_flat = np.full(lons_flat.shape, np.datetime64(obs_time), dtype="datetime64[ns]")
 
@@ -512,6 +519,8 @@ class ModelLayerCollocation:
                 collocation_type=self.collocation_type,
                 sar_y_idx=y_idx, sar_x_idx=x_idx,
                 sar_scene_name=sar_scene_name,
+                aggregation_window_km=None,
+                sar_pixel_spacing_km=sar_pixel_spacing_km,
             ))
         return results
 
@@ -660,5 +669,6 @@ class ModelLayerCollocation:
                     collocation_type=self.collocation_type,
                     sar_y_idx=cy, sar_x_idx=cx,
                     sar_scene_name=sar_scene_name,
+                    aggregation_window_km=self.aggregation_window_km,
                 ))
         return results

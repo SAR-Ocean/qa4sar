@@ -290,6 +290,155 @@ that excluding only 4 let a meaningful share of untested cells through.
 > per-column QC filter, `from_hf_radar_grid`'s `QCflag` filter),
 > `core/_cf_metadata.py` (`INSITU_VARIABLE_ATTRS`'s `_QC` entries).
 
+### 3.8 GTS buoy wind/waves/currents, and the GTS/Copernicus Marine waterfall
+
+Three `source_type` values select GTS and/or Copernicus Marine buoy
+data, independent of each other -- a recipe can list any one of them
+as a `validation_sources` entry. `buoy_gts` retrieves MARS obstype 181
+(moored buoys) and 182 (drifting buoys) combined into a single request,
+so it may not be listed alongside either `buoy_cmems` (Copernicus
+Marine's drifting-buoy source_type, overlapping via obstype 182) or
+`mooring` (Copernicus Marine's moored-platform source_type, overlapping
+via obstype 181) as a separate entry in the same recipe -- each pairing
+mostly relays the same physical WMO stations, and combining either
+without deduplication would double-count overlapping stations in
+validation statistics. `buoy_waterfall` exists precisely to combine GTS
+with either Copernicus source with per-station deduplication, and a
+recipe wanting both must use it instead. All three are valid for a
+`"wind"`, `"waves"`, or `"currents"` recipe (GTS buoys carry none of
+this toolbox's other supported variables, e.g. soil moisture):
+
+- **`buoy_cmems`/`mooring`**: Copernicus Marine in-situ only, via
+  `InSituDownloader`/`from_insitu_csv`. A convenience source_type,
+  `buoy_cmems_family`, combines `mooring`, `buoy_cmems`, and `drifter`
+  into a single `validation_sources` entry (`SOURCE_TYPE_TO_PLATFORM`
+  maps it to `["MO", "DB", "AD"]`) -- exactly the three Copernicus
+  categories that overlap with `buoy_gts`'s own combined obstype
+  181/182 scope, so a recipe can switch between the two feeds by
+  changing one source_type value (`buoy_cmems_family` to `buoy_gts`,
+  or back) instead of adding or removing three separate entries. Per-point
+  labeling is unaffected -- it still comes from the platform code each
+  row actually carries (`PLATFORM_CODE_TO_SOURCE_TYPE`), not from which
+  source_type requested the download.
+- **`buoy_gts`**: WMO GTS buoy observations only, via `GTSBuoyDownloader`
+  (MARS `obstype=181/182`, moored + drifting buoys) and
+  `from_gts_buoy_bufr`. One MARS request per day already carries every
+  variable GTS reports; `from_gts_buoy_bufr`'s `product_type` argument
+  picks which of the BUFR's optional sections gets decoded for a given
+  recipe's variable: wind (`WSPD`/`WDIR`, from the always-present wind
+  block), significant wave height (`VAVH`, time-domain buoy measurement
+  -- not `VHM0`, since GTS buoys measure rather than model the sea
+  state), or near-surface currents (`EWCT`/`NSCT`, derived from current
+  speed/direction at the *shallowest* of the BUFR's depth-profiled
+  current readings -- deeper levels are discarded, matching Copernicus
+  Marine in-situ's own single-level current convention). Requires MARS
+  access, with credentials read from `~/.ecmwfapirc`.
+- **`buoy_waterfall`**: downloads both GTS and Copernicus Marine for the
+  full recipe bbox/window (no bbox-splitting or spatial coverage
+  reasoning -- both sources are always queried in full), then at
+  DataTree-build time drops any Copernicus Marine row whose
+  `platform_id` already appears among the WMO platform IDs GTS reported
+  *for that recipe's variable* in that window's `gts_buoy/*.bufr` files.
+  Matching is plain string equality on the shared 7-digit WMO
+  platform-code numbering both sources use (GTS's
+  `marineObservingPlatformIdentifier`, Copernicus Marine's
+  `platform_id`). Because a pipeline run only ever converts one
+  variable, this dedup can never drop a station's wave or current data
+  just because GTS happened to carry that station's wind instead.
+
+**Why per-station exclusion, not a spatial coverage mask:** GTS coverage
+gaps are per-station, not regional -- some coastal/regional moorings are
+Copernicus-Marine-only and never relayed onto GTS at all, while a
+station GTS does carry sits alongside them in the same bbox. Live
+comparison of one real station present in both feeds (Arkona Basin
+Buoy, WMO 6600021, 2026-08-30, wind) found the two sources agree to
+within instrument rounding wherever both report a value for the same
+hour (max 0.04 m/s, <1° difference) -- they are the same underlying
+observation relayed through two different paths, not independently
+sourced -- but GTS only carried wind for 5 of that day's 24 hours for
+that station, against Copernicus Marine's full 24/24. A spatial mask
+would have wrongly *kept* using the sparser GTS values for a station
+Copernicus Marine covers completely, purely because GTS carries some
+data for it. Per-station exclusion instead lets `buoy_waterfall` prefer
+GTS's usually-similar values where GTS actually reports, and only falls
+back to Copernicus Marine for stations GTS's own feed carries nothing
+for in this window at all.
+
+**Known gap, not fixed by this addition:** unlike Copernicus Marine's
+`WSPD_QC`/`WDIR_QC`/etc. (see the in-situ/HF-radar QC-flag-filtering
+design, `_VALID_QC_CODES` in `datatree_converter.py`), GTS BUFR's
+moored-buoy template (315008) carries no per-observation
+quality/confidence descriptor at all, for wind, waves, or currents --
+`from_gts_buoy_bufr` cannot attach a QC flag to anything it decodes,
+because the WMO template itself has none. A `buoy_gts`/`buoy_waterfall`
+point therefore has strictly less quality information available than an
+equivalent Copernicus Marine point. This reflects a different
+quality-assurance model, not an absent one: unlike Copernicus Marine
+(every observation kept, tagged with a 0-9 flag for the consumer to
+filter), GTS requires the data processing centre that owns a buoy to
+run automatic real-time quality control before an observation is ever
+transmitted, so a failing observation is simply never sent rather than
+sent and flagged (DBCP Technical Document No. 37, "Guide to Buoy Data
+Quality Control Tests to Perform in Real Time by a GTS Data Processing
+Centre"). A point that reaches this toolbox has therefore already
+passed gross-range, climatological, and location-sanity checks
+upstream -- but this toolbox has no way to attach a confidence gradient
+to it the way it can with Copernicus Marine's numeric flag, nor can it
+distinguish "this buoy reported nothing" from "this buoy reported
+something that was filtered out upstream."
+
+**Moored vs. drifting buoy labeling:** `from_gts_buoy_bufr` labels each
+point's `platform_type` as `"mooring"` or `"buoy"`, derived purely from
+the WMO international buoy identifier number's own trailing three
+digits (`platform_id % 1000`): `000`-`499` is moored, `500`-`999` is
+drifting (DBCP Technical Document No. 37, section 4.2 -- the same rule
+applies to the five- and seven-digit forms of the identifier, taking
+the mod-1000 reduction first for the seven-digit form). This recovers
+the distinction obstype 181/182's combined request otherwise loses,
+without needing a separate BUFR descriptor for it, and matches
+Copernicus Marine's own `"mooring"`/`"buoy"` vocabulary.
+
+**Statistics pool moored and drifting buoys into one group:**
+regardless of source (GTS or Copernicus Marine), `"mooring"` and
+`"buoy"` are combined into a single `"buoy_family"` group before
+computing aggregate statistics (`statistics._STATS_GROUP_ALIASES`,
+applied in `_group_by_columns`) -- moored and drifting buoys are
+physically different platforms, but their near-surface point
+observations are treated as one population for aggregate error metrics
+rather than reported as two separate rows. Point-level labeling (e.g.
+plot colors/markers, which read `val_source` directly from the
+collocation dataset) is unaffected, since only the statistics
+function's own local copy of the grouping column is remapped.
+
+**Known judgment call, not independently confirmed:** GTS's wave height
+is mapped to `VAVH` rather than `VHM0` on the assumption that a
+buoy-measured significant wave height behaves like a time-domain
+statistic; some buoy networks instead compute it from spectral moments
+(closer to `VHM0`/Hm0 semantics). Revisit if a live comparison shows a
+systematic mismatch against `VHM0`-sourced references.
+
+> Code: `downloaders/gts_buoy_downloader.py`, `core/datatree_converter.py`
+> (`from_gts_buoy_bufr`, `from_insitu_csv`'s `exclude_platform_ids`),
+> `core/orchestrator.py` (`_download_gts_buoy`, `_INSITU_TYPES`),
+> `core/statistics.py` (`_STATS_GROUP_ALIASES`, `_group_by_columns`).
+
+The same GTS/Copernicus Marine pairing exists for ship wind observations,
+with one deliberate asymmetry: `ship_cmems_family` (Copernicus Marine's
+ferrybox network, renamed from `ferrybox` for this symmetry) and
+`ship_gts` (GTS obstype 180) cannot be listed together in one recipe, the
+same overlap guard `buoy_gts`/`buoy_cmems_family` enforces -- but no
+`ship_waterfall` combiner exists. GTS identifies ships by WMO call sign
+(`shipOrMobileLandStationIdentifier`), a different BUFR key and
+identifier format than buoys' numeric WMO platform identifier, and
+whether Copernicus Marine's ferrybox platform IDs correlate with those
+call signs -- i.e. whether the two feeds report the same physical
+vessels at all -- is unconfirmed. Both `ship_cmems_family` and GTS ship
+data emit the same runtime `"ferrybox"` val_source label
+(`PLATFORM_CODE_TO_SOURCE_TYPE["FB"]` is unchanged by the rename), the
+same way GTS buoy data already reuses the `"buoy"` label Copernicus
+Marine buoy/drifter data emits -- this keeps the report color palette
+stable regardless of which feed a point came from.
+
 ---
 
 ## 4. datatree.nc content choices
@@ -797,7 +946,7 @@ invariant does not apply here):
 They're correlated but not identical — confirmed live 2026-08-10 against
 `recipes/waves_era5_and_satellites2.yaml`: mooring platform `6200442`
 reported `VAVH=1.0` and `VHM0=1.1` for the same reading. Copernicus Marine
-in-situ platforms (mooring/tidal_gauge/drifter/buoy) are the only sources
+in-situ platforms (mooring/tidal_gauge/drifter/buoy_cmems) are the only sources
 that can report both in the same row — altimeter only ever produces
 `VAVH`, ERA5 only ever produces `VHM0` — since `insitu_downloader.py`
 requests the full `ALL_VARIABLES` set regardless of which codes a given
@@ -2083,3 +2232,75 @@ bbox is always a superset of the true polygon.
 > (`orbit_overlap_windows`, `_point_in_polygon`), `core/orchestrator.py`
 > (`_collocation_predictions`, `_should_skip_for_collocation`), `cli.py`
 > (`--dry-collocation`, `--download-all-in-bbox`).
+
+## 13. In-situ download narrowing and MARS GTS concurrency/timeout
+
+A recipe's `geographic_bounds` is often much larger than the region SAR
+data was actually found in for a given run's window -- Copernicus
+Marine's in-situ TAC fallback path (`insitu_index_fallback.py`,
+used when ARCO subsetting is unavailable for a historical date)
+downloads each matched platform's entire reporting history as one file,
+so querying the full recipe bbox rather than the real SAR footprints can
+mean downloading far more platform files than the run's actual SAR
+coverage needs. `orchestrator.py`'s `_footprint_narrowed_bounds()`
+narrows the real in-situ download's query bbox to the union of the
+run's actually-downloaded SAR footprints (padded by
+`cfg.collocation.sar_footprint_radius_km`), reusing the same
+`sar_footprints_from_downloaded` helper `_collocation_predictions()`
+already calls for its own, separate boolean skip-gating. This narrowing
+is deliberately scoped to `_download_insitu` only, not every downloader
+-- extending it elsewhere is a one-line change per method (the helper is
+source-type-agnostic), left for a future need rather than done
+speculatively here.
+
+`--dry-collocation`'s own in-situ check already queried the correct,
+footprint-narrowed region (`_predict_insitu` computes that same union
+bbox from the SAR footprints it is handed before ever reaching the
+index fallback), but it answered its existence/range question by
+calling the same `download_via_index()` the real download path uses --
+downloading full platform files just to check whether a platform has
+any real observations in the window. `insitu_index_fallback.py`'s
+`dry_platform_ranges()` answers the identical question using only the
+free index file plus the lazy remote-open mechanism
+`row_overlaps_window()` already had (reading a platform's `TIME`/
+longitude/latitude coordinates via a direct HTTPS open, never
+downloading the file), so a dry check now never downloads a platform
+file.
+
+`buoy_gts`/`ship_gts` (MARS/GTS) downloads have no client-side timeout
+of their own -- `ecmwfapi.ECMWFService.execute()` blocks until MARS
+completes, with no way to cancel an in-flight request. Each individual
+per-day MARS request (both GTS downloaders already loop one request per
+calendar day) is now bounded by a fixed 6-minute timeout
+(`run_with_timeout()` in `downloaders/base.py`, a generic helper: run a
+callable on a background daemon thread, wait up to a timeout, and
+report whether it finished). A timeout abandons the remaining days in
+that `download()` call rather than continuing to try each one --
+MARS being backed up for one day's request usually means the same for
+the next. The abandoned thread, being a daemon thread, cannot block the
+process from exiting; if it eventually completes after the timeout, its
+result is discarded. Any partially-written file is removed immediately
+on timeout, so a later run always retries that day cleanly rather than
+risking a silently-truncated file being mistaken for a complete one.
+
+`download_all()` dispatches `buoy_gts`/`ship_gts` onto background
+daemon threads immediately after SAR download completes and SAR scene
+times are computed (rather than at their previous point in the
+sequential "other sources" loop), so a slow or backed-up MARS queue no
+longer serializes in front of every other validation source's download.
+Both sources still pass through the same `_already_succeeded`/
+`_should_skip_for_collocation` gates the sequential loop would have
+applied -- moving the dispatch point earlier changes only when a
+download starts, never whether it is skipped. `download_all()` joins
+each background thread (with no additional timeout at the join site --
+the per-request 6-minute timeout above already bounds each thread's
+worst-case lifetime) before returning, folding its recorded outcome
+into the run's overall success/failure the same way a synchronous
+source's outcome already is.
+
+> Code: `core/orchestrator.py` (`_footprint_narrowed_bounds`,
+> `_dispatch_gts_sources_in_background`, `_join_gts_threads`),
+> `downloaders/insitu_index_fallback.py` (`dry_platform_ranges`,
+> `_lazy_row_coordinates`), `downloaders/base.py` (`run_with_timeout`),
+> `downloaders/gts_buoy_downloader.py`/`gts_ship_downloader.py`
+> (`_MARS_REQUEST_TIMEOUT_SECONDS`).

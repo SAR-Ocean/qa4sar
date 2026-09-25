@@ -1,6 +1,6 @@
 name: wind_example
 description: 'Validate Sentinel-1 IW/EW mode wind speed and direction
-  against moorings, buoys, ASCAT scatterometer, HY-2B/HY-2C/
+  against GTS moored and drifting buoys, ASCAT scatterometer, HY-2B/HY-2C/
   Oceansat-3 scatterometer, 1 Hz altimeter, and RSS radiometer
   (AMSR2) ocean winds.'
 version: '1.0'
@@ -24,21 +24,15 @@ sar_data:
   - EW
   max_downloads: null
 validation_sources:
-- source_type: mooring
+- source_type: buoy_gts
   download_kwargs: {}
   collocation_kwargs: {}
-- source_type: buoy
+- source_type: ship_gts
   download_kwargs: {}
   collocation_kwargs: {}
-- source_type: ferrybox
-  download_kwargs: {}
-  collocation_kwargs: {}
-- source_type: drifter
-  download_kwargs: {}
-  collocation_kwargs: {}
-- source_type: tidal_gauge
-  download_kwargs: {}
-  collocation_kwargs: {}
+# - source_type: tidal_gauge  # Copernicus Marine source; excluded from the wind standard (buoy_gts/ship_gts) since its wind sensors are not QC-filtered to the same standard -- uncomment to include anyway
+#   download_kwargs: {}
+#   collocation_kwargs: {}
 - source_type: scatterometer_ascat
   download_kwargs: {}
   collocation_kwargs: {}

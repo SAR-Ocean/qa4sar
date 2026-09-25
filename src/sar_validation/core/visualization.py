@@ -8,13 +8,7 @@ Four public plot functions:
 * :func:`plot_statistics`   — bar chart of bias / RMSE / correlation per source
 * :func:`plot_residuals`    — histogram / KDE of (SAR − validation) residuals
 
-Each accepts an ``interactive=False`` keyword argument. When
-``interactive=True`` the function returns an hvplot / plotly / folium object
-instead of a matplotlib Figure. If the required optional library is not
-installed a :class:`ImportError` is raised with a friendly installation hint.
-
-Plus fallback and convenience wrappers, matplotlib-only (no ``interactive``
-option):
+Plus fallback and convenience wrappers:
 
 * :func:`plot_collocation_diagnostics` — SAR scene bounds + matched/unmatched
   validation points (one category per validation source actually present),
@@ -134,6 +128,7 @@ if TYPE_CHECKING:
 __all__ = [
     "plot_scatter",
     "plot_geographic",
+    "plot_geographic_difference",
     "plot_statistics",
     "plot_residuals",
     "plot_collocation_diagnostics",
@@ -141,7 +136,11 @@ __all__ = [
 ]
 
 # Colour palette used for validation sources (cycles if more sources than
-# colours). 
+# colours). Kept at least as long as _CANONICAL_SOURCE_ORDER (see
+# TestHycomCanonicalSourceOrder.test_source_colors_and_markers_have_enough_entries)
+# so every canonical entry -- including reserved, never-emitted slots like
+# "buoy_cmems" -- gets its own distinct (color, marker) pair rather than
+# wrapping onto an earlier entry's.
 _SOURCE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
     "#9467bd", "#8c564b", "#e377c2", "#469990",
@@ -149,16 +148,34 @@ _SOURCE_COLORS = [
     "#00ff00",
     "#808000", "#42d4f4", "#800080",
     "#bcf60c",
+    "#aaffc3",
+    "#a9a9a9",
+    "#911eb4",
+    "#17becf",
 ]
 
 _SOURCE_MARKERS = [
     "o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "8", "<", ">",
     "H", "d", "v",
     "H",
+    "o",
+    "D",
+    "p",
+    "*",
 ]
 
 # Fixed, append-only reference order for known validation source/platform
-# types. Each name's *list position* is its permanent color/marker slot
+# types. Each name's *list position* is its permanent color/marker slot.
+#
+# This list tracks the runtime-emitted val_source labels a per-point
+# observation actually carries, not the recipe source_type values a
+# validation_sources entry is configured with. A Copernicus Marine
+# drifting-buoy observation's own label comes from
+# insitu_downloader.PLATFORM_CODE_TO_SOURCE_TYPE["DB"], which is the
+# provider-agnostic instrument-category label "buoy" -- distinct from the
+# recipe source_type "buoy_cmems"/"buoy_gts"/"buoy_waterfall" that
+# requested it. "buoy" therefore keeps its own permanent slot here, at the
+# same index it has always held.
 _CANONICAL_SOURCE_ORDER = [
     "altimeter", "buoy", "drifter", "ferrybox", "hf_radar", "hf_radar_grid",
     "mooring", "radiometer", "radiometer_ssm", "scatterometer",
@@ -166,7 +183,31 @@ _CANONICAL_SOURCE_ORDER = [
     "cds_ssm",
     "era5_wind", "era5_waves", "era5_soil_moisture",
     "hycom",
+    "buoy_waterfall",
+    # "buoy_cmems", "buoy_cmems_family", and "ship_cmems_family" are recipe
+    # source types, never themselves emitted val_source labels (see the
+    # module comment above) -- they are only kept here, in reserved slots
+    # at the end, to satisfy _canonical_source_order()'s own consistency
+    # guard, which requires every _INSITU_TYPES member to appear somewhere
+    # in this list.
+    "buoy_cmems",
+    "buoy_cmems_family",
+    "ship_cmems_family",
 ]
+
+#: Names present in _CANONICAL_SOURCE_ORDER that are runtime-emitted
+#: val_source labels rather than recipe source_type values, so they are
+#: never members of LAYER_DATA_TYPES | _INSITU_TYPES. "buoy" is
+#: insitu_downloader.PLATFORM_CODE_TO_SOURCE_TYPE["DB"]'s label -- distinct
+#: from the recipe source_types "buoy_cmems"/"buoy_gts"/"buoy_waterfall"
+#: that request Copernicus Marine or GTS drifting-buoy data. "ferrybox" is
+#: insitu_downloader.PLATFORM_CODE_TO_SOURCE_TYPE["FB"]'s label -- distinct
+#: from the recipe source_type "ship_cmems_family" that requests Copernicus
+#: Marine ferrybox data. Added to _canonical_source_order()'s "registered"
+#: side of its consistency check so a genuinely known, intentional case does
+#: not trip that guard, without weakening the guard's ability to catch a
+#: real, unregistered drift.
+_EMITTED_LABEL_ONLY = {"buoy", "ferrybox"}
 
 
 # ---------------------------------------------------------------------------
@@ -185,12 +226,18 @@ def _canonical_source_order() -> List[str]:
 
     Raises ``AssertionError`` if a source type exists elsewhere in the
     codebase but is missing from this order, rather than silently
-    reshuffling every other source's color.
+    reshuffling every other source's color. _EMITTED_LABEL_ONLY entries
+    (runtime val_source labels rather than recipe source_type values) are
+    folded into the registered side of the comparison, since they are
+    never members of LAYER_DATA_TYPES/_INSITU_TYPES by design -- this does
+    not weaken the guard against a genuinely new, unregistered source
+    type, since only the known, explicitly listed exceptions in
+    _EMITTED_LABEL_ONLY are exempted.
     """
     from .collocation import LAYER_DATA_TYPES  # noqa: PLC0415
     from .orchestrator import _INSITU_TYPES  # noqa: PLC0415
 
-    registered = set(LAYER_DATA_TYPES) | set(_INSITU_TYPES)
+    registered = set(LAYER_DATA_TYPES) | set(_INSITU_TYPES) | _EMITTED_LABEL_ONLY
     known = set(_CANONICAL_SOURCE_ORDER)
     if registered != known:
         missing = sorted(registered - known)
@@ -230,20 +277,6 @@ def _source_style_map(sources: List[str]) -> Dict[str, Tuple[str, str]]:
             _SOURCE_MARKERS[idx % len(_SOURCE_MARKERS)],
         )
     return style
-
-
-def _require(package: str, extra: str = "plot") -> None:
-    """
-    Raise an ImportError if *package* is not installed.
-    """
-    try:
-        __import__(package)
-    except ImportError:
-        raise ImportError(
-            f"Package '{package}' is required for interactive plots. "
-            f"Install it with:  pip install '{package}'  or  "
-            f"pip install 'sar-l2-validation-toolbox[{extra}]'"
-        ) from None
 
 
 def _filter_by_scene(collocation_ds, scene_name: str):
@@ -352,6 +385,38 @@ def _pad_extent_to_min_aspect(ax, min_aspect: float = 1.0, bounds=None) -> None:
         ax.set_extent([x0, x1, y0, y1], crs=ax.projection)
     else:
         ax.set_ylim(y0, y1)
+
+
+def _pad_lonlat_extent(
+    lon: np.ndarray, lat: np.ndarray, crosses_dateline: bool,
+) -> Tuple[float, float, float, float]:
+    """
+    Return a (lon_min, lon_max, lat_min, lat_max) box padded by
+    matplotlib's default 5% autoscale margin around a set of point
+    coordinates, clamped to valid lon/lat ranges.
+
+    For points spanning the antimeridian, longitudes are shifted into the
+    central_longitude=180 frame before padding, so the returned box is one
+    contiguous span rather than one that wraps across both edges of a
+    plain [-180, 180] plot.
+    """
+    import matplotlib.pyplot as plt
+
+    xmargin = plt.rcParams["axes.xmargin"]
+    ymargin = plt.rcParams["axes.ymargin"]
+
+    def _pad(lo: float, hi: float, margin: float) -> Tuple[float, float]:
+        lo, hi = _pad_degenerate_range(lo, hi)
+        pad = margin * (hi - lo)
+        return lo - pad, hi + pad
+
+    lat_min, lat_max = _pad(float(lat.min()), float(lat.max()), ymargin)
+    lat_min, lat_max = max(lat_min, -90.0), min(lat_max, 90.0)
+
+    lon_for_extent = ((lon % 360.0) - 180.0) if crosses_dateline else lon
+    lon_min, lon_max = _pad(float(lon_for_extent.min()), float(lon_for_extent.max()), xmargin)
+    lon_min, lon_max = max(lon_min, -180.0), min(lon_max, 180.0)
+    return lon_min, lon_max, lat_min, lat_max
 
 
 def _fill_nan_nearest(a: np.ndarray) -> np.ndarray:
@@ -484,7 +549,6 @@ def plot_scatter(
     val_var: str,
     *,
     by_source: bool = True,
-    interactive: bool = False,
     ax=None,
     split_when_imbalanced: bool = True,
     force_split: bool = False,
@@ -502,8 +566,6 @@ def plot_scatter(
         Validation variable name *without* ``val_`` prefix (e.g. ``"WSPD"``).
     by_source : bool
         Whether per-source legend labels are shown.
-    interactive : bool
-        Return a plotly Figure instead of matplotlib.
     ax : matplotlib.axes.Axes, optional
         Axes to draw into (static only).  A new figure is created if None.
     split_when_imbalanced : bool
@@ -513,7 +575,7 @@ def plot_scatter(
         plot_residuals' by_source layout) instead of a single shared
         axes -- otherwise a dominant source (e.g. ASCAT's thousands of
         points vs. SMOS's dozens) visually buries every other source.
-        Ignored when interactive=True or ax is explicitly provided.
+        Ignored when ax is explicitly provided.
     force_split : bool
         When True, always render the per-source small multiples (as
         split_when_imbalanced would for a >70% dominant source),
@@ -521,12 +583,12 @@ def plot_scatter(
         once a source has been CDF-matched into a different reference
         domain, since piling every source into one shared axes at that
         point is too visually busy even when no single source dominates
-        by point count. Ignored when interactive=True or ax is explicitly
-        provided, same as split_when_imbalanced.
+        by point count. Ignored when ax is explicitly provided, same as
+        split_when_imbalanced.
 
     Returns
     -------
-    matplotlib.figure.Figure or plotly.graph_objects.Figure
+    matplotlib.figure.Figure
     """
     sar_col = f"sar_{sar_var}"
     val_col = f"val_{val_var}"
@@ -560,28 +622,10 @@ def plot_scatter(
         dominant_share = float(counts.max()) / float(counts.sum())
 
     if (
-        not interactive and ax is None and split_when_imbalanced
+        ax is None and split_when_imbalanced
         and len(sources_for_split) >= 2 and (dominant_share > 0.7 or force_split)
     ):
         return _plot_scatter_small_multiples(df, sar_col, val_col, sar_var, val_var, collocation_ds)
-
-    if interactive:
-        _require("plotly")
-        import plotly.express as px  # noqa: PLC0415
-
-        fig = px.scatter(
-            df, x=val_col, y=sar_col,
-            color="val_source" if by_source else None,
-            labels={val_col: val_var, sar_col: sar_var, "val_source": "Source"},
-            title=f"{sar_var} vs {val_var}",
-            opacity=0.7,
-        )
-        all_vals = np.concatenate([df[val_col].values, df[sar_col].values])
-        vmin, vmax = float(np.nanmin(all_vals)), float(np.nanmax(all_vals))
-        fig.add_scatter(x=[vmin, vmax], y=[vmin, vmax],
-                        mode="lines", line=dict(color="black", dash="dash"),
-                        name="1:1", showlegend=True)
-        return fig
 
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
@@ -745,7 +789,6 @@ def plot_geographic(
     max_raster_dim: int = 1200,
     split_by: str = "collocation_type",
     scenes: Optional[Sequence[str]] = None,
-    interactive: bool = False,
     geographic_bounds: Optional["GeographicBounds"] = None,
     two_column_by_type: bool = False,
     on_figure: Optional[Callable[[str, "Figure"], None]] = None,
@@ -804,8 +847,6 @@ def plot_geographic(
     scenes : sequence of str, optional
         Restrict plotting to these SAR scene names. Falls back to every scene
         in *datatree* if None, empty, or none of the given names match.
-    interactive : bool
-        Return a folium Map instead of matplotlib.
     geographic_bounds : GeographicBounds, optional
         Clamp each static subplot's extent to the recipe's requested bounding
         box instead of the SAR field's full native extent (e.g. CLMS SSM's grid
@@ -840,7 +881,7 @@ def plot_geographic(
 
     Returns
     -------
-    dict[str, matplotlib.figure.Figure] or folium.Map
+    dict[str, matplotlib.figure.Figure] or matplotlib.figure.Figure
         When *split_by* is not None: a dict keyed by group value, one Figure
         per group.  When *split_by* is None: a single Figure.
     """
@@ -883,49 +924,6 @@ def plot_geographic(
             group_values = None
     else:
         group_values = None
-
-    if interactive:
-        _require("folium")
-        import folium  # noqa: PLC0415
-
-        m = folium.Map(tiles="CartoDB positron")
-        bounds_list = []
-        for scene_name in scene_names:
-            scene_ds = sar_node[scene_name].to_dataset()
-            if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
-                continue
-            lon2d = scene_ds["lon"].values
-            lat2d = scene_ds["lat"].values
-            bounds_list.append([
-                [float(lat2d.min()), float(lon2d.min())],
-                [float(lat2d.max()), float(lon2d.max())],
-            ])
-            fg = folium.FeatureGroup(name=scene_name)
-            sub_coll = _filter_by_scene(collocation_ds, scene_name)
-            if "collocation" in sub_coll.dims and sub_coll.sizes["collocation"] > 0:
-                cols_needed = ["val_lat", "val_lon", "val_source"]
-                if val_col_present:
-                    assert val_col is not None   # implied by val_col_present
-                    cols_needed.append(val_col)
-                df_pts = sub_coll[cols_needed].to_dataframe()
-                for _, row in df_pts.iterrows():
-                    color = source_style.get(str(row.get("val_source", "")), ("#1f77b4", "o"))[0]
-                    tooltip = (
-                        f"{val_var}: {row[val_col]:.2f}" if val_col_present
-                        else str(row.get("val_source", ""))
-                    )
-                    folium.CircleMarker(
-                        location=[float(row["val_lat"]), float(row["val_lon"])],
-                        radius=4, color=color, fill=True, fill_opacity=0.8,
-                        tooltip=tooltip,
-                    ).add_to(fg)
-            fg.add_to(m)
-        if bounds_list:
-            all_lats = [b[0][0] for b in bounds_list] + [b[1][0] for b in bounds_list]
-            all_lons = [b[0][1] for b in bounds_list] + [b[1][1] for b in bounds_list]
-            m.fit_bounds([[min(all_lats), min(all_lons)], [max(all_lats), max(all_lons)]])
-        folium.LayerControl().add_to(m)
-        return m
 
     # ── Static matplotlib + cartopy ─────────────────────────────────────────
     try:
@@ -1124,6 +1122,23 @@ def plot_geographic(
             return point_size.get(group_label, 40)
         return point_size
 
+    def _edgecolor_for(df) -> tuple:
+        """
+        Black outlines make a handful of point_vs_layer in-situ dots
+        (e.g. ISMN stations) easy to pick out against a busy SAR field,
+        but the same outline on a dense layer_vs_layer or model_vs_layer
+        overlay (thousands of satellite or model grid points) merges
+        into a solid black mass that hides the field underneath it
+        entirely. Resolved from *df*'s own collocation_type column when
+        present, defaulting to a visible black edge when the column is
+        absent.
+        """
+        if "collocation_type" not in df.columns or df.empty:
+            return "black", 0.9
+        if df["collocation_type"].iloc[0] == "point_vs_layer":
+            return "black", 0.9
+        return "none", 0.0
+
     def _draw_scene_panel(ax, scene_name, group_coll_ds, pt_size):
         """
         Draw one SAR scene's field + collocated validation points into
@@ -1198,6 +1213,8 @@ def plot_geographic(
                 col_list.append("val_source")
             if "val_var_code" in sub_coll:
                 col_list.append("val_var_code")
+            if "collocation_type" in sub_coll:
+                col_list.append("collocation_type")
             df_pts = sub_coll[col_list].to_dataframe()
             if "val_time" in sub_coll.coords:
                 df_pts["val_time"] = sub_coll.coords["val_time"].values
@@ -1230,18 +1247,20 @@ def plot_geographic(
                 if len(valid_pts) and "val_source" in valid_pts.columns:
                     for src, grp in valid_pts.groupby("val_source"):
                         marker = source_style.get(str(src), ("#1f77b4", "o"))[1]
+                        edgecolor, edgewidth = _edgecolor_for(grp)
                         ax.scatter(
                             grp["val_lon"], grp["val_lat"],
                             c=grp[val_col], cmap=val_cmap, norm=val_norm,
                             marker=marker, s=pt_size,
-                            edgecolors="black", linewidths=0.9,
+                            edgecolors=edgecolor, linewidths=edgewidth,
                             rasterized=True, **kw_sc,
                         )
                 elif len(valid_pts):
+                    edgecolor, edgewidth = _edgecolor_for(valid_pts)
                     ax.scatter(
                         valid_pts["val_lon"], valid_pts["val_lat"],
                         c=valid_pts[val_col], cmap=val_cmap, norm=val_norm,
-                        s=pt_size, edgecolors="black", linewidths=0.9,
+                        s=pt_size, edgecolors=edgecolor, linewidths=edgewidth,
                         rasterized=True, **kw_sc,
                     )
                 if len(nan_pts):
@@ -1308,18 +1327,20 @@ def plot_geographic(
             elif "val_source" in df_pts.columns:
                 for src, grp in df_pts.groupby("val_source"):
                     color, marker = source_style.get(str(src), ("#ff0000", "o"))
+                    edgecolor, edgewidth = _edgecolor_for(grp)
                     ax.scatter(grp["val_lon"], grp["val_lat"],
                                s=pt_size, c=color, marker=marker,
-                               edgecolors="black", linewidths=0.9,
+                               edgecolors=edgecolor, linewidths=edgewidth,
                                label=str(src), rasterized=True, **kw_sc)
                 loc = _sparse_legend_corner(
                     ax, transform, (df_pts["val_lon"].to_numpy(), df_pts["val_lat"].to_numpy()),
                 )
                 ax.legend(fontsize=6, loc=loc, framealpha=0.7)
             else:
+                edgecolor, edgewidth = _edgecolor_for(df_pts)
                 ax.scatter(df_pts["val_lon"], df_pts["val_lat"],
                            s=pt_size, c="#ff7f0e",
-                           edgecolors="black", linewidths=0.9, **kw_sc)
+                           edgecolors=edgecolor, linewidths=edgewidth, **kw_sc)
 
         n_dedup = len(df_pts) if n_pts > 0 else 0
         ax.set_title(
@@ -1516,6 +1537,18 @@ def plot_geographic(
 
     # ── Build figures ────────────────────────────────────────────────────────
     if two_column_by_type and split_by == "collocation_type":
+        if "collocation_type" not in point_collocation_ds:
+            logger.warning(
+                "plot_geographic: point_collocation_ds has no collocation_type "
+                "column, so per-scene/per-type figures cannot be built. "
+                "Falling back to a single combined figure."
+            )
+            fallback_fig = _build_figure(point_collocation_ds, None)
+            if on_figure is not None:
+                on_figure("all scenes", fallback_fig)
+                return {}
+            return {"all scenes": fallback_fig}
+
         scene_figures: Dict[str, object] = {}
         for scene_name in scene_names:
             fig = _build_scene_pair_figure(scene_name)
@@ -1539,6 +1572,246 @@ def plot_geographic(
         if group_ds.sizes.get("collocation", 0) == 0:
             continue
         figures[gv] = _build_figure(group_ds, gv)
+    return figures
+
+
+def plot_geographic_difference(
+    collocation_ds,
+    sar_var: str,
+    val_var: str,
+    *,
+    cmap: str = "RdBu",
+    on_figure: Optional[Callable[[str, "Figure"], None]] = None,
+) -> Dict[str, "Figure"]:
+    """
+    Map SAR-minus-validation differences as a grid of local averages, one
+    Figure per qualifying validation source.
+
+    Only validation sources whose collocation_type is layer_vs_layer or
+    model_vs_layer are considered — dense satellite/model coverage,
+    where a spatial grid communicates the pattern of the difference far
+    better than a handful of scattered in-situ dots. There is no minimum
+    point count for a qualifying source.
+
+    Each source's own collocated points are averaged into square grid
+    cells. A source with a recorded SAR aggregation footprint
+    (aggregation_window_km, from a cell-averaging collocation) grids at
+    twice that value, the footprint's diameter, so a cell does not
+    imply meaningfully more spatial resolution than the underlying
+    collocation already has. A source with no aggregation footprint but
+    a recorded SAR native pixel spacing (sar_pixel_spacing_km, from an
+    individual-method collocation, matching each SAR pixel directly
+    with no spatial averaging) grids at that pixel spacing instead,
+    since each of its points already represents exactly one real SAR
+    pixel. The kilometer-to-degree conversion uses the source's mean
+    latitude, so actual cell width in kilometers varies somewhat across
+    a source spanning a wide latitude range. A cell with no collocated
+    points inside it is left blank rather than interpolated, so this
+    plot never draws a value between two real observations that were
+    never actually measured together. A source with no recorded
+    aggregation_window_km and no recorded sar_pixel_spacing_km at all
+    (an older collocation_results.nc saved before these columns
+    existed), or whose recorded values are all non-positive, falls back
+    to a plain colored scatter instead, so no qualifying source is ever
+    silently skipped. A source with only some rows lacking a recorded
+    value (for example a mix of cell-averaged and direct-interpolation
+    matches) still grids every row, using the cell size derived from
+    the rows that do have one.
+
+    Some acquisition modes (for example Sentinel-1 wave mode, WV) relabel
+    an otherwise dense satellite source such as a scatterometer or
+    altimeter as point_vs_layer for that mode, so that source's rows from
+    wave mode do not qualify for this plot even though the same source's
+    rows from other modes may.
+
+    Parameters
+    ----------
+    collocation_ds : xr.Dataset
+        Step-3 collocations (``collocation_results.nc``). Needs
+        ``sar_<sar_var>``, ``val_<val_var>``, ``sar_lat``, ``sar_lon``,
+        ``val_source``, and ``collocation_type`` — every one of these
+        already exists in the saved file. ``aggregation_window_km`` and
+        ``sar_pixel_spacing_km`` are each read when present and used
+        for the grid cell size (the former takes priority when both are
+        present); the absence of either does not stop a source from
+        qualifying, only from being gridded by that particular
+        source — see above.
+    sar_var : str
+        SAR variable name (e.g. ``"owiWindSpeed"``).
+    val_var : str
+        Validation variable name (e.g. ``"WSPD"``).
+    cmap : str
+        Diverging colormap for the difference values, centered at zero.
+    on_figure : callable(val_source, Figure), optional
+        If given, each qualifying source's Figure is handed to this
+        callback immediately instead of being accumulated in the
+        returned dict, so the caller owns its lifecycle (write + close)
+        instead of every source's Figure staying open at once.
+
+    Returns
+    -------
+    dict[str, matplotlib.figure.Figure]
+        Validation source name to Figure, for every source with at least
+        one qualifying row. Empty if none did, or if collocation_ds is
+        missing the columns this function needs.
+    """
+    sar_col = f"sar_{sar_var}"
+    val_col = f"val_{val_var}"
+    required = (sar_col, val_col, "sar_lat", "sar_lon", "val_source", "collocation_type")
+    if any(c not in collocation_ds for c in required):
+        return {}
+
+    import matplotlib.colors as mcolors  # noqa: PLC0415
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    try:
+        import cartopy.crs as ccrs  # noqa: PLC0415
+        HAS_CARTOPY = True
+    except ImportError:
+        HAS_CARTOPY = False
+        warnings.warn(
+            "cartopy is not installed — falling back to plain matplotlib axes.",
+            UserWarning, stacklevel=2,
+        )
+
+    from ._variable_map import CIRCULAR_VAL_VARS, circular_diff_deg  # noqa: PLC0415
+
+    has_agg_col = "aggregation_window_km" in collocation_ds
+    has_px_col = "sar_pixel_spacing_km" in collocation_ds
+    columns = (
+        list(required)
+        + (["aggregation_window_km"] if has_agg_col else [])
+        + (["sar_pixel_spacing_km"] if has_px_col else [])
+    )
+    df = collocation_ds[columns].to_dataframe()
+    if not has_agg_col:
+        df["aggregation_window_km"] = np.nan
+    if not has_px_col:
+        df["sar_pixel_spacing_km"] = np.nan
+    df = df.dropna(subset=[sar_col, val_col, "sar_lat", "sar_lon"])
+    if val_var in CIRCULAR_VAL_VARS:
+        df["diff"] = circular_diff_deg(df[sar_col].values, df[val_col].values)
+    else:
+        df["diff"] = df[sar_col] - df[val_col]
+    df = df[np.isfinite(df["diff"].to_numpy())]
+    df = df[df["collocation_type"].isin(("layer_vs_layer", "model_vs_layer"))]
+
+    figures: Dict[str, "Figure"] = {}
+    for source, sub in df.groupby("val_source"):
+        if sub.empty:
+            continue
+
+        diff = sub["diff"].to_numpy()
+        lon = sub["sar_lon"].to_numpy()
+        lat = sub["sar_lat"].to_numpy()
+        agg_km = sub["aggregation_window_km"].to_numpy()
+        px_km = sub["sar_pixel_spacing_km"].to_numpy()
+
+        vmax = float(np.nanpercentile(np.abs(diff), 98))
+        if vmax == 0.0:
+            vmax = 1e-6
+        norm = mcolors.Normalize(vmin=-vmax, vmax=vmax)
+
+        crosses_dateline = bool(lon.max() - lon.min() > 180.0)
+
+        fig = plt.figure(figsize=(9, 7))
+        if HAS_CARTOPY:
+            projection = ccrs.PlateCarree(central_longitude=180.0 if crosses_dateline else 0.0)
+            ax = fig.add_subplot(1, 1, 1, projection=projection)
+            land, coastline = _land_coastline_features()
+            ax.add_feature(land, facecolor="lightgray", zorder=0, rasterized=True)
+            ax.add_feature(coastline, linewidth=0.5, zorder=0, rasterized=True)
+            gl = ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5)
+            transform = ccrs.PlateCarree()
+        else:
+            ax = fig.add_subplot(1, 1, 1)
+            transform = None
+        kw = {"transform": transform} if transform is not None else {}
+
+        valid_windows = agg_km[np.isfinite(agg_km) & (agg_km > 0)]
+        valid_pixel_spacings = px_km[np.isfinite(px_km)]
+        if valid_windows.size > 0:
+            cell_km = 2.0 * float(np.median(valid_windows))
+        elif valid_pixel_spacings.size > 0:
+            cell_km = float(np.median(valid_pixel_spacings))
+        else:
+            cell_km = 0.0
+        mappable = None
+        if cell_km > 0:
+            mean_lat = float(np.mean(lat))
+            km_per_deg_lat = 111.32
+            km_per_deg_lon = max(111.32 * np.cos(np.radians(mean_lat)), 1e-6)
+            cell_deg_lat = cell_km / km_per_deg_lat
+            cell_deg_lon = cell_km / km_per_deg_lon
+
+            # Bin edges are computed on a continuous longitude branch for
+            # a dateline-crossing source (the same shift _pad_lonlat_extent
+            # already uses), otherwise a plain np.arange over the raw
+            # lon range would span nearly 360 degrees of mostly-empty
+            # bins. For a crossing source, those shifted edges are handed
+            # to pcolormesh directly, treated as already being native
+            # coordinates in this axes' own central_longitude=180 frame,
+            # rather than raw geographic longitude that still needs
+            # reprojecting through the base PlateCarree transform.
+            lon_for_binning = ((lon % 360.0) - 180.0) if crosses_dateline else lon
+            lon_edges_binning = np.arange(
+                lon_for_binning.min() - cell_deg_lon, lon_for_binning.max() + 2 * cell_deg_lon, cell_deg_lon,
+            )
+            lat_edges = np.arange(lat.min() - cell_deg_lat, lat.max() + 2 * cell_deg_lat, cell_deg_lat)
+
+            sum_grid = np.zeros((len(lat_edges) - 1, len(lon_edges_binning) - 1))
+            count_grid = np.zeros_like(sum_grid)
+            col_idx = np.clip(np.digitize(lon_for_binning, lon_edges_binning) - 1, 0, len(lon_edges_binning) - 2)
+            row_idx = np.clip(np.digitize(lat, lat_edges) - 1, 0, len(lat_edges) - 2)
+            np.add.at(sum_grid, (row_idx, col_idx), diff)
+            np.add.at(count_grid, (row_idx, col_idx), 1)
+            mean_grid = np.where(count_grid > 0, sum_grid / np.maximum(count_grid, 1), np.nan)
+
+            # The still-shifted lon_edges_binning values are already
+            # native coordinates for this axes' own central_longitude=180
+            # frame when crossing the dateline, so pcolormesh is told not
+            # to reproject them through the base (unshifted) PlateCarree
+            # transform -- doing so would place the mesh roughly 180
+            # degrees away from where the axes is actually zoomed.
+            mesh_kw = {"transform": (ax.projection if crosses_dateline else transform)} if HAS_CARTOPY else {}
+            mappable = ax.pcolormesh(
+                lon_edges_binning, lat_edges, mean_grid, cmap=cmap, norm=norm,
+                zorder=3, rasterized=True, **mesh_kw,
+            )
+        if mappable is None:
+            mappable = ax.scatter(
+                lon, lat, c=diff, cmap=cmap, norm=norm, s=40,
+                edgecolors="black", linewidths=0.3, zorder=3, rasterized=True, **kw,
+            )
+
+        lon_min, lon_max, lat_min, lat_max = _pad_lonlat_extent(lon, lat, crosses_dateline)
+        if HAS_CARTOPY:
+            ax.set_extent(
+                [lon_min, lon_max, lat_min, lat_max],
+                crs=(ax.projection if crosses_dateline else transform),
+            )
+        else:
+            ax.set_xlim(lon_min, lon_max)
+            ax.set_ylim(lat_min, lat_max)
+        _pad_extent_to_min_aspect(ax)
+        if HAS_CARTOPY:
+            _set_lonlat_ticks(ax, gl)
+
+        val_units = _val_units_for_source(collocation_ds, str(source))
+        if val_units is None:
+            val_units = collocation_ds[val_col].attrs.get("units")
+        cbar_label = f"SAR {sar_var} − {source} {val_var}"
+        if val_units:
+            cbar_label += f" ({val_units})"
+        cbar = fig.colorbar(mappable, ax=ax, shrink=0.8)
+        cbar.set_label(cbar_label)
+        ax.set_title(f"SAR {sar_var} − {source} difference (n={len(sub)})", fontsize=10)
+
+        if on_figure is not None:
+            on_figure(str(source), fig)
+        else:
+            figures[str(source)] = fig
+
     return figures
 
 
@@ -1612,8 +1885,6 @@ def plot_summary_table(
 def plot_statistics(
     stats_ds,
     metrics: Optional[List[str]] = None,
-    *,
-    interactive: bool = False,
 ):
     """
     Grouped bar chart of validation statistics per source.
@@ -1624,12 +1895,10 @@ def plot_statistics(
         Output of :func:`~.statistics.compute_statistics`.
     metrics : list[str], optional
         Which metrics to plot.  Defaults to ``["bias", "rmse", "correlation"]``.
-    interactive : bool
-        Return a plotly Figure instead of matplotlib.
 
     Returns
     -------
-    matplotlib.figure.Figure or plotly.graph_objects.Figure
+    matplotlib.figure.Figure
     """
     if metrics is None:
         metrics = ["bias", "rmse", "correlation"]
@@ -1643,19 +1912,6 @@ def plot_statistics(
     sar_var = stats_ds.attrs.get("sar_var", "")
     val_var = stats_ds.attrs.get("val_var", "")
     title = f"Validation statistics: {sar_var} vs {val_var}"
-
-    if interactive:
-        _require("plotly")
-        from plotly.subplots import make_subplots  # noqa: PLC0415
-
-        fig = make_subplots(rows=1, cols=len(available),
-                            subplot_titles=available)
-        for i, metric in enumerate(available, start=1):
-            vals = stats_ds[metric].values.tolist()
-            fig.add_bar(x=sources, y=vals, name=metric,
-                        showlegend=False, row=1, col=i)
-        fig.update_layout(title=title)
-        return fig
 
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
@@ -1689,7 +1945,6 @@ def plot_residuals(
     val_var: str,
     *,
     by_source: bool = True,
-    interactive: bool = False,
     ax=None,
     hist_range: Optional[Union[Tuple[float, float], Dict[str, Tuple[float, float]]]] = None,
 ):
@@ -1713,8 +1968,6 @@ def plot_residuals(
         produce a density spike that dwarfs every other source's bars, the
         way it would sharing one axes. When False, draw a single combined
         histogram instead (``ax`` honored in this case only).
-    interactive : bool
-        Return a plotly Figure instead of matplotlib.
     ax : matplotlib.axes.Axes, optional
         Axes to draw into (static, ``by_source=False`` only — the
         small-multiples grid always creates its own figure).
@@ -1734,7 +1987,7 @@ def plot_residuals(
 
     Returns
     -------
-    matplotlib.figure.Figure or plotly.graph_objects.Figure or None
+    matplotlib.figure.Figure or None
         None if *collocation_ds* has no valid (non-NaN) data for this pair.
     """
     sar_col = f"sar_{sar_var}"
@@ -1774,21 +2027,6 @@ def plot_residuals(
     else:
         df["residual"] = df[sar_col] - df[val_col]
         title = f"Residuals: {sar_var} − {val_var}"
-
-    if interactive:
-        _require("plotly")
-        import plotly.express as px  # noqa: PLC0415
-
-        fig = px.histogram(
-            df, x="residual",
-            color="val_source" if by_source else None,
-            barmode="overlay",
-            opacity=0.6,
-            nbins=40,
-            labels={"residual": residual_label, "val_source": "Source"},
-            title=title,
-        )
-        return fig
 
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
@@ -3518,6 +3756,41 @@ def validation_report(
         writer.savefig(fig, dpi=150, bbox_inches="tight")
         plt.close(fig)
 
+    def _make_geo_page_writer(figs, mark_fig, title_for_group, description):
+        """
+        Build the ``on_figure`` callback ``plot_geographic``'s
+        ``two_column_by_type`` mode invokes once per scene: append the
+        figure (after applying *mark_fig*, a section-specific banner
+        function) to *figs*, and write it as a report page. *description*
+        is only forwarded to *mark_fig* for the section's first page.
+        """
+        index = [0]
+
+        def _on_figure(group, fig):
+            marked = mark_fig(fig, description if index[0] == 0 else None)
+            figs.append(marked)
+            if base_dir is not None:
+                _write_page(title_for_group(group), _finalize_figure_for_report(marked, None))
+            index[0] += 1
+
+        return _on_figure
+
+    def _make_diff_page_writer(figs, mark_fig, title_for_source):
+        """
+        Build the ``on_figure`` callback ``plot_geographic_difference``
+        invokes once per validation source: append the figure (after
+        applying *mark_fig*, a section-specific banner function) to
+        *figs*, and write it as a report page.
+        """
+
+        def _on_figure(val_source, fig):
+            marked = mark_fig(fig)
+            figs.append(marked)
+            if base_dir is not None:
+                _write_page(title_for_source(val_source), _finalize_figure_for_report(marked, None))
+
+        return _on_figure
+
     # Collocation diagnostics plot — generated once per recipe, written
     # first (right after the cover page) so a reader sees the spatial/
     # matching overview before the per-pair detail sections below.
@@ -3566,7 +3839,7 @@ def validation_report(
 
     for sar_var, val_var in pairs:
         key = f"{sar_var}_vs_{val_var}"
-        figs = []
+        figs: List["Figure"] = []
 
         # Direction-only sources for circular variables (WDIR): drop
         # non-directional instruments (altimeter/radiometer, all-NaN
@@ -3665,47 +3938,45 @@ def validation_report(
                     geo_point_size = 5 if (n_points / n_scenes) > 300 else 15
             else:
                 geo_point_size = 40
-            is_soil_moisture_two_column = (variable == "soil_moisture")
-            _geo_scene_index = [0]
 
-            def _write_geo_figure(group, fig_geo, index):
-                if cdf_matched_suffix:
-                    fig_geo = _mark_cdf_matched(
-                        fig_geo, description=_CDF_MATCHED_DESCRIPTION if index == 0 else None,
-                    )
-                figs.append(fig_geo)
-                title = f"{sar_var} vs {val_var} — geographic [{group}]{cdf_matched_suffix}"
-                if base_dir is not None:
-                    _write_page(title, _finalize_figure_for_report(fig_geo, None))
+            _on_geo_figure = _make_geo_page_writer(
+                figs,
+                (lambda fig, desc: _mark_cdf_matched(fig, description=desc))
+                if cdf_matched_suffix else (lambda fig, desc: fig),
+                lambda group: f"{sar_var} vs {val_var} — geographic [{group}]{cdf_matched_suffix}",
+                _CDF_MATCHED_DESCRIPTION,
+            )
 
-            def _on_geo_figure(scene_name, fig_geo):
-                _write_geo_figure(scene_name, fig_geo, _geo_scene_index[0])
-                _geo_scene_index[0] += 1
-
-            geo_result = plot_geographic(
+            plot_geographic(
                 datatree, cdf_geo_pair_ds, sar_var, val_var, scenes=matched_scenes,
                 point_size=geo_point_size,
                 geographic_bounds=(
                     recipe.config.geographic_bounds if geo_clamp_bounds else None
                 ),
-                two_column_by_type=is_soil_moisture_two_column,
-                on_figure=_on_geo_figure if is_soil_moisture_two_column else None,
+                two_column_by_type=True,
+                on_figure=_on_geo_figure,
             )
-            if is_soil_moisture_two_column:
-                pass  # each scene's figure was already written+closed via _on_geo_figure
-            elif isinstance(geo_result, dict):
-                for i, (group, fig_geo) in enumerate(geo_result.items()):
-                    if fig_geo is not None:
-                        _write_geo_figure(group, fig_geo, i)
-            elif geo_result is not None:
-                if cdf_matched_suffix:
-                    geo_result = _mark_cdf_matched(geo_result, description=_CDF_MATCHED_DESCRIPTION)
-                figs.append(geo_result)
-                title = f"{sar_var} vs {val_var} — geographic{cdf_matched_suffix}"
-                if base_dir is not None:
-                    _write_page(title, _finalize_figure_for_report(geo_result, None))
         except Exception as exc:
             logger.warning("plot_geographic failed for %s: %s", sar_var, exc, exc_info=True)
+
+        # Difference — one map per validation source of (SAR minus
+        # validation) at each collocated point's own SAR-side location,
+        # right after the geographic section since both are spatial views
+        # of the same pair. Uses cdf_pair_ds (the domain the scatter/
+        # residuals plots above already use) rather than cdf_geo_pair_ds,
+        # since for soil_moisture those two live in different physical
+        # domains — plotting the difference from the wrong one would
+        # subtract two incomparable series.
+        try:
+            _on_diff_figure = _make_diff_page_writer(
+                figs,
+                _mark_cdf_matched if cdf_matched_suffix else (lambda fig: fig),
+                lambda val_source: f"{sar_var} vs {val_var} — difference [{val_source}]{cdf_matched_suffix}",
+            )
+
+            plot_geographic_difference(cdf_pair_ds, sar_var, val_var, on_figure=_on_diff_figure)
+        except Exception as exc:
+            logger.warning("plot_geographic_difference failed for %s: %s", sar_var, exc, exc_info=True)
 
         # Scatter — split into per-source small multiples not only when one
         # source dominates by point count, but also whenever harmonization 
@@ -3773,7 +4044,14 @@ def validation_report(
             # above - spatial context before the point-cloud
             # comparison, for the same reason in both sections.
             try:
-                fig_nu_geo_result = plot_geographic(
+                _on_nu_geo_figure = _make_geo_page_writer(
+                    figs,
+                    lambda fig, desc: _mark_native_units(fig, description=desc),
+                    lambda group: f"{sar_var} vs {val_var} — native units — geographic [{group}]",
+                    _NATIVE_UNITS_DESCRIPTION,
+                )
+
+                plot_geographic(
                     datatree, nu_pair_ds, sar_var, val_var, scenes=matched_scenes,
                     point_size=geo_point_size,
                     geographic_bounds=(
@@ -3792,31 +4070,21 @@ def validation_report(
                     # units mismatch and wrongly fall back to two separate
                     # colorbars.
                     skip_domain_harmonization=True,
+                    two_column_by_type=True,
+                    on_figure=_on_nu_geo_figure,
                 )
-                if isinstance(fig_nu_geo_result, dict):
-                    # One page per group (per SAR scene, or per
-                    # collocation_type) -- the section-opening description
-                    # belongs on the first page only, not every one.
-                    for i, (group, fig_nu_geo) in enumerate(fig_nu_geo_result.items()):
-                        if fig_nu_geo is not None:
-                            fig_nu_geo = _mark_native_units(
-                                fig_nu_geo,
-                                description=_NATIVE_UNITS_DESCRIPTION if i == 0 else None,
-                            )
-                            figs.append(fig_nu_geo)
-                            title = f"{sar_var} vs {val_var} — native units — geographic [{group}]"
-                            if base_dir is not None:
-                                _write_page(title, _finalize_figure_for_report(fig_nu_geo, None))
-                elif fig_nu_geo_result is not None:
-                    fig_nu_geo_result = _mark_native_units(
-                        fig_nu_geo_result, description=_NATIVE_UNITS_DESCRIPTION,
-                    )
-                    figs.append(fig_nu_geo_result)
-                    title = f"{sar_var} vs {val_var} — native units — geographic"
-                    if base_dir is not None:
-                        _write_page(title, _finalize_figure_for_report(fig_nu_geo_result, None))
             except Exception as exc:
                 logger.warning("plot_geographic failed for native-units %s: %s", sar_var, exc)
+
+            try:
+                _on_nu_diff_figure = _make_diff_page_writer(
+                    figs, _mark_native_units,
+                    lambda val_source: f"{sar_var} vs {val_var} — native units — difference [{val_source}]",
+                )
+
+                plot_geographic_difference(nu_pair_ds, sar_var, val_var, on_figure=_on_nu_diff_figure)
+            except Exception as exc:
+                logger.warning("plot_geographic_difference failed for native-units %s: %s", sar_var, exc)
 
             fig_nu_scatter = plot_scatter(nu_pair_ds, sar_var, val_var)
             if fig_nu_scatter is not None:
@@ -3867,38 +4135,36 @@ def validation_report(
             )
 
             try:
-                fig_cds_geo_result = plot_geographic(
+                _on_cds_geo_figure = _make_geo_page_writer(
+                    figs,
+                    lambda fig, desc: _mark_cds_section(fig, cds_product_type, description=desc),
+                    lambda group: f"{sar_var} vs {val_var} — C3S CDS SSM — geographic [{group}]",
+                    cds_description,
+                )
+
+                plot_geographic(
                     datatree, cds_pair_ds, sar_var, val_var, scenes=matched_scenes,
                     point_size=geo_point_size,
                     geographic_bounds=(
                         recipe.config.geographic_bounds if geo_clamp_bounds else None
                     ),
                     skip_domain_harmonization=True,
+                    two_column_by_type=True,
+                    on_figure=_on_cds_geo_figure,
                 )
-                if isinstance(fig_cds_geo_result, dict):
-                    # One page per group (per SAR scene, or per
-                    # collocation_type) -- the section-opening description
-                    # belongs on the first page only, not every one.
-                    for i, (group, fig_cds_geo) in enumerate(fig_cds_geo_result.items()):
-                        if fig_cds_geo is not None:
-                            fig_cds_geo = _mark_cds_section(
-                                fig_cds_geo, cds_product_type,
-                                description=cds_description if i == 0 else None,
-                            )
-                            figs.append(fig_cds_geo)
-                            title = f"{sar_var} vs {val_var} — C3S CDS SSM — geographic [{group}]"
-                            if base_dir is not None:
-                                _write_page(title, _finalize_figure_for_report(fig_cds_geo, None))
-                elif fig_cds_geo_result is not None:
-                    fig_cds_geo_result = _mark_cds_section(
-                        fig_cds_geo_result, cds_product_type, description=cds_description,
-                    )
-                    figs.append(fig_cds_geo_result)
-                    title = f"{sar_var} vs {val_var} — C3S CDS SSM — geographic"
-                    if base_dir is not None:
-                        _write_page(title, _finalize_figure_for_report(fig_cds_geo_result, None))
             except Exception as exc:
                 logger.warning("plot_geographic failed for C3S CDS SSM %s: %s", sar_var, exc)
+
+            try:
+                _on_cds_diff_figure = _make_diff_page_writer(
+                    figs,
+                    lambda fig: _mark_cds_section(fig, cds_product_type),
+                    lambda val_source: f"{sar_var} vs {val_var} — C3S CDS SSM — difference [{val_source}]",
+                )
+
+                plot_geographic_difference(cds_pair_ds, sar_var, val_var, on_figure=_on_cds_diff_figure)
+            except Exception as exc:
+                logger.warning("plot_geographic_difference failed for C3S CDS SSM %s: %s", sar_var, exc)
 
             fig_cds_scatter = plot_scatter(cds_pair_ds, sar_var, val_var)
             if fig_cds_scatter is not None:

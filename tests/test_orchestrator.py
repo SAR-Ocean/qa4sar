@@ -52,6 +52,388 @@ class _FakePrediction:
         self.verdict = verdict
 
 
+class TestFootprintNarrowedBounds:
+    def _orchestrator_with_footprints(self, tmp_path, footprints):
+        orchestrator = _orchestrator_with_source(tmp_path, "tidal_gauge")
+        orchestrator.metadata["downloads"]["sar"] = {"files": ["scene1.SAFE"]}
+
+        class _FakeSpec:
+            key = "sentinel1_l2_ocn"
+
+        return orchestrator, _FakeSpec()
+
+    def test_narrows_to_the_union_of_real_sar_footprints(self, tmp_path, monkeypatch):
+        from datetime import datetime
+
+        from sar_validation.core.dry_collocation import SarFootprint
+
+        orchestrator, fake_spec = self._orchestrator_with_footprints(tmp_path, None)
+        footprints = [
+            SarFootprint(
+                kind="polygon", bbox=(0.0, 2.0, 50.0, 52.0), polygon=None, points=None,
+                sensing_start=datetime(2026, 1, 1), sensing_end=datetime(2026, 1, 1, 0, 1),
+                source_file="a.SAFE",
+            ),
+            SarFootprint(
+                kind="polygon", bbox=(1.0, 3.0, 51.0, 53.0), polygon=None, points=None,
+                sensing_start=datetime(2026, 1, 1), sensing_end=datetime(2026, 1, 1, 0, 1),
+                source_file="b.SAFE",
+            ),
+        ]
+        orchestrator.recipe.config.collocation.sar_footprint_radius_km = 0.0
+        monkeypatch.setattr(
+            "sar_validation.core.sar_sources.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
+        )
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.sar_footprints_from_downloaded",
+            lambda sar_files, spec, product_type: footprints,
+        )
+
+        bounds = orchestrator._footprint_narrowed_bounds()
+
+        assert bounds.min_lon == pytest.approx(0.0)
+        assert bounds.max_lon == pytest.approx(3.0)
+        assert bounds.min_lat == pytest.approx(50.0)
+        assert bounds.max_lat == pytest.approx(53.0)
+
+    def test_falls_back_to_recipe_bounds_on_empty_footprints(self, tmp_path, monkeypatch):
+        orchestrator, fake_spec = self._orchestrator_with_footprints(tmp_path, None)
+        monkeypatch.setattr(
+            "sar_validation.core.sar_sources.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
+        )
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.sar_footprints_from_downloaded",
+            lambda sar_files, spec, product_type: [],
+        )
+
+        bounds = orchestrator._footprint_narrowed_bounds()
+
+        recipe_bounds = orchestrator.recipe.config.geographic_bounds
+        assert bounds.min_lon == recipe_bounds.min_lon
+        assert bounds.max_lon == recipe_bounds.max_lon
+        assert bounds.min_lat == recipe_bounds.min_lat
+        assert bounds.max_lat == recipe_bounds.max_lat
+
+    def test_falls_back_to_recipe_bounds_on_exception(self, tmp_path, monkeypatch):
+        orchestrator, fake_spec = self._orchestrator_with_footprints(tmp_path, None)
+        monkeypatch.setattr(
+            "sar_validation.core.sar_sources.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
+        )
+
+        def _raise(sar_files, spec, product_type):
+            raise RuntimeError("conversion failed")
+
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.sar_footprints_from_downloaded", _raise,
+        )
+
+        bounds = orchestrator._footprint_narrowed_bounds()
+
+        recipe_bounds = orchestrator.recipe.config.geographic_bounds
+        assert bounds.min_lon == recipe_bounds.min_lon
+
+    def test_is_computed_once_and_cached(self, tmp_path, monkeypatch):
+        orchestrator, fake_spec = self._orchestrator_with_footprints(tmp_path, None)
+        monkeypatch.setattr(
+            "sar_validation.core.sar_sources.SAR_SOURCES", {"sentinel1_l2_ocn": fake_spec},
+        )
+        calls = {"n": 0}
+
+        def _fake(sar_files, spec, product_type):
+            calls["n"] += 1
+            return []
+
+        monkeypatch.setattr(
+            "sar_validation.core.dry_collocation.sar_footprints_from_downloaded", _fake,
+        )
+
+        orchestrator._footprint_narrowed_bounds()
+        orchestrator._footprint_narrowed_bounds()
+
+        assert calls["n"] == 1
+
+
+class TestDownloadInsituUsesFootprintNarrowedBounds:
+    def test_insitu_download_uses_narrowed_bounds_not_recipe_bounds(self, tmp_path, monkeypatch):
+        orchestrator = _orchestrator_with_source(tmp_path, "tidal_gauge")
+        from sar_validation.core.recipe import GeographicBounds
+
+        narrowed = GeographicBounds(min_lon=1.0, max_lon=2.0, min_lat=51.0, max_lat=52.0)
+        monkeypatch.setattr(orchestrator, "_footprint_narrowed_bounds", lambda: narrowed)
+        seen_bounds = {}
+
+        class _FakeDownloader:
+            def __init__(self, **kwargs):
+                pass
+
+            def download(self, **kwargs):
+                seen_bounds.update(kwargs)
+                return []
+
+        monkeypatch.setattr(
+            "sar_validation.downloaders.insitu_downloader.InSituDownloader", _FakeDownloader,
+        )
+
+        orchestrator._download_insitu(["tidal_gauge"], min_depth=0.0, max_depth=0.0)
+
+        assert seen_bounds["min_lon"] == 1.0
+        assert seen_bounds["max_lon"] == 2.0
+        assert seen_bounds["min_lat"] == 51.0
+        assert seen_bounds["max_lat"] == 52.0
+
+
+class TestGtsBackgroundDispatch:
+    def _recipe_with_gts_and_altimeter(self, tmp_path):
+        cfg = RecipeConfig(
+            name="test", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[
+                ValidationDataSource(source_type="buoy_gts"),
+                ValidationDataSource(source_type="ship_gts"),
+                ValidationDataSource(source_type="altimeter"),
+            ],
+        )
+        orchestrator = DataOrchestrator(Recipe(cfg), dry_run=False)
+        orchestrator.base_dir = tmp_path
+        return orchestrator
+
+    def test_both_gts_sources_are_dispatched_before_the_other_sources_loop_completes(
+        self, tmp_path, monkeypatch,
+    ):
+        order = []
+
+        def fake_download_gts_buoy(self, source):
+            order.append("buoy_gts-start")
+            self.metadata["downloads"]["buoy_gts"] = {"status": "success", "files": []}
+            order.append("buoy_gts-end")
+            return True
+
+        def fake_download_gts_ship(self, source):
+            order.append("ship_gts-start")
+            self.metadata["downloads"]["ship_gts"] = {"status": "success", "files": []}
+            order.append("ship_gts-end")
+            return True
+
+        def fake_dispatch_source(self, source):
+            order.append(f"{source.source_type}-dispatched")
+            self.metadata["downloads"][source.source_type] = {"status": "success", "files": []}
+            return True
+
+        orchestrator = self._recipe_with_gts_and_altimeter(tmp_path)
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(DataOrchestrator, "_download_gts_buoy", fake_download_gts_buoy)
+        monkeypatch.setattr(DataOrchestrator, "_download_gts_ship", fake_download_gts_ship)
+        monkeypatch.setattr(DataOrchestrator, "_dispatch_source", fake_dispatch_source)
+
+        orchestrator.download_all()
+
+        assert "buoy_gts-start" in order
+        assert "ship_gts-start" in order
+        assert order.index("buoy_gts-start") < order.index("altimeter-dispatched")
+        assert order.index("ship_gts-start") < order.index("altimeter-dispatched")
+
+    def test_step_4_loop_does_not_redundantly_dispatch_buoy_gts_or_ship_gts(self, tmp_path, monkeypatch):
+        dispatched_source_types = []
+
+        def fake_dispatch_source(self, source):
+            dispatched_source_types.append(source.source_type)
+            self.metadata["downloads"][source.source_type] = {"status": "success", "files": []}
+            return True
+
+        orchestrator = self._recipe_with_gts_and_altimeter(tmp_path)
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(
+            DataOrchestrator, "_download_gts_buoy",
+            lambda self, source: self.metadata["downloads"].__setitem__(
+                "buoy_gts", {"status": "success", "files": []},
+            ) or True,
+        )
+        monkeypatch.setattr(
+            DataOrchestrator, "_download_gts_ship",
+            lambda self, source: self.metadata["downloads"].__setitem__(
+                "ship_gts", {"status": "success", "files": []},
+            ) or True,
+        )
+        monkeypatch.setattr(DataOrchestrator, "_dispatch_source", fake_dispatch_source)
+
+        orchestrator.download_all()
+
+        assert "buoy_gts" not in dispatched_source_types
+        assert "ship_gts" not in dispatched_source_types
+        assert dispatched_source_types == ["altimeter"]
+
+    def test_a_gts_thread_being_late_does_not_block_download_all_from_returning(self, tmp_path, monkeypatch):
+        import threading
+
+        release = threading.Event()
+
+        def fake_download_gts_buoy(self, source):
+            release.wait(timeout=2.0)  # released just after download_all() returns, below
+            self.metadata["downloads"]["buoy_gts"] = {"status": "success", "files": []}
+            return True
+
+        cfg = RecipeConfig(
+            name="test", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[ValidationDataSource(source_type="buoy_gts")],
+        )
+        orchestrator = DataOrchestrator(Recipe(cfg), dry_run=False)
+        orchestrator.base_dir = tmp_path
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(DataOrchestrator, "_download_gts_buoy", fake_download_gts_buoy)
+
+        thread = threading.Thread(target=orchestrator.download_all)
+        thread.start()
+        thread.join(timeout=1.0)
+        release.set()
+        thread.join(timeout=2.0)
+
+        # download_all() legitimately waits for the GTS thread (this is
+        # not a timeout scenario -- the GTS call itself is still
+        # in-flight), so it is fine for it to still be running at the
+        # 1-second mark; this test's real assertion is that it does
+        # finish soon after being released, not that it returns
+        # instantly.
+        assert not thread.is_alive()
+
+    def test_already_succeeded_prevents_a_gts_background_dispatch(self, tmp_path, monkeypatch):
+        orchestrator = self._recipe_with_gts_and_altimeter(tmp_path)
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(
+            orchestrator, "_already_succeeded",
+            lambda source_type: source_type == "buoy_gts",
+        )
+        orchestrator._previous_downloads["buoy_gts"] = {"status": "success", "files": ["x.bufr"]}
+        monkeypatch.setattr(
+            DataOrchestrator, "_download_gts_buoy",
+            lambda self, source: (_ for _ in ()).throw(
+                AssertionError("must not re-dispatch an already-succeeded source"),
+            ),
+        )
+        monkeypatch.setattr(
+            DataOrchestrator, "_download_gts_ship",
+            lambda self, source: self.metadata["downloads"].__setitem__(
+                "ship_gts", {"status": "success", "files": []},
+            ) or True,
+        )
+        monkeypatch.setattr(DataOrchestrator, "_dispatch_source", lambda self, source: True)
+
+        orchestrator.download_all()
+
+        assert orchestrator.metadata["downloads"]["buoy_gts"] == {"status": "success", "files": ["x.bufr"]}
+
+    def test_should_skip_for_collocation_prevents_a_gts_background_dispatch(self, tmp_path, monkeypatch):
+        orchestrator = self._recipe_with_gts_and_altimeter(tmp_path)
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(
+            orchestrator, "_should_skip_for_collocation",
+            lambda source_type: source_type == "ship_gts",
+        )
+        monkeypatch.setattr(
+            DataOrchestrator, "_download_gts_buoy",
+            lambda self, source: self.metadata["downloads"].__setitem__(
+                "buoy_gts", {"status": "success", "files": []},
+            ) or True,
+        )
+        monkeypatch.setattr(
+            DataOrchestrator, "_download_gts_ship",
+            lambda self, source: (_ for _ in ()).throw(
+                AssertionError("must not dispatch a none-predicted GTS source"),
+            ),
+        )
+        monkeypatch.setattr(DataOrchestrator, "_dispatch_source", lambda self, source: True)
+
+        orchestrator.download_all()
+
+        assert orchestrator.metadata["downloads"]["ship_gts"]["status"] == "skipped"
+        assert "collocation" in orchestrator.metadata["downloads"]["ship_gts"]["reason"]
+
+    def test_buoy_gts_is_not_backgrounded_when_buoy_waterfall_is_also_requested(
+        self, tmp_path, monkeypatch,
+    ):
+        """buoy_gts and buoy_waterfall's own GTS download both write into
+        the same gts_buoy/ per-day files, so when a recipe requests both,
+        buoy_gts must fall through to the main-thread "other sources" loop
+        instead of being backgrounded -- otherwise it could race
+        buoy_waterfall's GTS call for the same on-disk files."""
+        import threading
+
+        calls = []
+
+        def fake_download_gts_buoy(self, source):
+            calls.append((source.source_type, threading.current_thread() is threading.main_thread()))
+            self.metadata["downloads"][source.source_type] = {"status": "success", "files": []}
+            return True
+
+        cfg = RecipeConfig(
+            name="test", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[
+                ValidationDataSource(source_type="buoy_gts"),
+                ValidationDataSource(source_type="buoy_waterfall"),
+            ],
+        )
+        orchestrator = DataOrchestrator(Recipe(cfg), dry_run=False)
+        orchestrator.base_dir = tmp_path
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(DataOrchestrator, "_download_gts_buoy", fake_download_gts_buoy)
+        monkeypatch.setattr(DataOrchestrator, "_download_insitu", lambda self, *a, **k: True)
+
+        orchestrator.download_all()
+
+        # buoy_waterfall's GTS call (step 3) must run, on the main thread,
+        # before buoy_gts's (step 4) -- both on the main thread means they
+        # cannot overlap.
+        assert [source_type for source_type, _ in calls] == ["buoy_waterfall", "buoy_gts"]
+        assert all(on_main_thread for _, on_main_thread in calls)
+
+    def test_ship_gts_is_still_backgrounded_when_buoy_waterfall_is_present(
+        self, tmp_path, monkeypatch,
+    ):
+        """ship_gts has no waterfall counterpart sharing its target files,
+        so its background dispatch must be unaffected by buoy_waterfall
+        (or buoy_gts) being present in the same recipe."""
+        order = []
+
+        def fake_download_gts_ship(self, source):
+            order.append("ship_gts-start")
+            self.metadata["downloads"]["ship_gts"] = {"status": "success", "files": []}
+            return True
+
+        def fake_download_gts_buoy(self, source):
+            self.metadata["downloads"][source.source_type] = {"status": "success", "files": []}
+            return True
+
+        cfg = RecipeConfig(
+            name="test", variable="wind",
+            geographic_bounds=GeographicBounds(-10.0, 20.0, 40.0, 55.0),
+            temporal_bounds=TemporalBounds("2026-01-01", "2026-01-02"),
+            validation_sources=[
+                ValidationDataSource(source_type="buoy_gts"),
+                ValidationDataSource(source_type="buoy_waterfall"),
+                ValidationDataSource(source_type="ship_gts"),
+            ],
+        )
+        orchestrator = DataOrchestrator(Recipe(cfg), dry_run=False)
+        orchestrator.base_dir = tmp_path
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(DataOrchestrator, "_download_gts_ship", fake_download_gts_ship)
+        monkeypatch.setattr(DataOrchestrator, "_download_gts_buoy", fake_download_gts_buoy)
+        monkeypatch.setattr(DataOrchestrator, "_download_insitu", lambda self, *a, **k: True)
+
+        gts_threads, gts_dispatched_types = orchestrator._dispatch_gts_sources_in_background()
+
+        assert "ship_gts" in gts_dispatched_types
+        assert "buoy_gts" not in gts_dispatched_types
+        assert any(source_type == "ship_gts" for _, source_type in gts_threads)
+        for thread, _ in gts_threads:
+            thread.join(timeout=2.0)
+        assert "ship_gts-start" in order
+
+
 def test_download_all_in_bbox_defaults_to_false(tmp_path):
     """Default (no flag) means collocation-based skip-gating IS active --
     download_all_in_bbox=False is the new default, inverted from a plain
@@ -2530,6 +2912,133 @@ class TestDownloadAscatSsmWaterfall:
         )
 
 
+class TestDownloadAltimeterCutover:
+    def _make_orchestrator(self, tmp_path, start, end, variable="waves", dry_run=True):
+        from sar_validation.core.orchestrator import DataOrchestrator
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            SARDataSpec,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+
+        config = RecipeConfig(
+            name="test", variable=variable,
+            geographic_bounds=GeographicBounds(min_lon=-10, max_lon=10, min_lat=40, max_lat=55),
+            temporal_bounds=TemporalBounds(start=start, end=end),
+            sar_data=SARDataSpec(source="sentinel1_l2_ocn"),
+            validation_sources=[ValidationDataSource(source_type="altimeter")],
+            output_dir=str(tmp_path),
+        )
+        recipe = Recipe(config=config)
+        return DataOrchestrator(recipe, dry_run=dry_run)
+
+    def test_range_entirely_before_cutover_only_calls_reprocessed(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "sar_validation.downloaders.reprocessed_altimeter_downloader.ReprocessedAltimeterDownloader.download",
+            lambda self, **kw: calls.append(("reprocessed", kw)) or [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.altimeter_downloader.AltimeterDownloader.download",
+            lambda self, **kw: calls.append(("nrt", kw)) or [],
+        )
+        orch = self._make_orchestrator(tmp_path, "2023-06-01", "2023-06-02")
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_altimeter(source)
+
+        assert [c[0] for c in calls] == ["reprocessed"]
+
+    def test_range_entirely_after_cutover_only_calls_nrt(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "sar_validation.downloaders.reprocessed_altimeter_downloader.ReprocessedAltimeterDownloader.download",
+            lambda self, **kw: calls.append(("reprocessed", kw)) or [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.altimeter_downloader.AltimeterDownloader.download",
+            lambda self, **kw: calls.append(("nrt", kw)) or [],
+        )
+        orch = self._make_orchestrator(tmp_path, "2026-06-01", "2026-06-02")
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_altimeter(source)
+
+        assert [c[0] for c in calls] == ["nrt"]
+
+    def test_range_straddling_cutover_calls_both_with_split_windows(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "sar_validation.downloaders.reprocessed_altimeter_downloader.ReprocessedAltimeterDownloader.download",
+            lambda self, **kw: calls.append(("reprocessed", kw)) or [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.altimeter_downloader.AltimeterDownloader.download",
+            lambda self, **kw: calls.append(("nrt", kw)) or [],
+        )
+        start, end = "2023-12-31T22:00:00", "2024-01-01T02:00:00"
+        orch = self._make_orchestrator(tmp_path, start, end)
+        source = orch.recipe.config.validation_sources[0]
+        # Mirrors _padded_temporal_bounds's own symmetric +-180min padding
+        # for the altimeter layer types, so the split boundaries below can
+        # be asserted precisely rather than just checking both fired.
+        pad = pd.Timedelta(minutes=180)
+        padded_start = (pd.Timestamp(start) - pad).isoformat()
+        padded_end = (pd.Timestamp(end) + pad).isoformat()
+        cutover_minus_1s = "2023-12-31T23:59:59"
+        cutover = "2024-01-01T00:00:00"
+
+        orch._download_altimeter(source)
+
+        assert [c[0] for c in calls] == ["reprocessed", "nrt"]
+        reprocessed_kw = calls[0][1]
+        nrt_kw = calls[1][1]
+        assert reprocessed_kw["start"] == padded_start
+        assert reprocessed_kw["end"] == cutover_minus_1s
+        assert nrt_kw["start"] == cutover
+        assert nrt_kw["end"] == padded_end
+
+    def test_wind_variable_before_cutover_only_calls_nrt_unsplit(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "sar_validation.downloaders.reprocessed_altimeter_downloader.ReprocessedAltimeterDownloader.download",
+            lambda self, **kw: calls.append(("reprocessed", kw)) or [],
+        )
+        monkeypatch.setattr(
+            "sar_validation.downloaders.altimeter_downloader.AltimeterDownloader.download",
+            lambda self, **kw: calls.append(("nrt", kw)) or [],
+        )
+        start, end = "2023-06-01", "2023-06-02"
+        orch = self._make_orchestrator(tmp_path, start, end, variable="wind")
+        source = orch.recipe.config.validation_sources[0]
+        pad = pd.Timedelta(minutes=180)
+        padded_start = (pd.Timestamp(start) - pad).isoformat()
+        padded_end = (pd.Timestamp(end) + pad).isoformat()
+
+        orch._download_altimeter(source)
+
+        assert [c[0] for c in calls] == ["nrt"]
+        nrt_kw = calls[0][1]
+        assert nrt_kw["start"] == padded_start
+        assert nrt_kw["end"] == padded_end
+
+    def test_waves_before_cutover_aliases_altimeter_metadata_to_reprocessed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "sar_validation.downloaders.reprocessed_altimeter_downloader.ReprocessedAltimeterDownloader.download",
+            lambda self, **kw: [tmp_path / "reprocessed_file.nc"],
+        )
+        orch = self._make_orchestrator(tmp_path, "2023-06-01", "2023-06-02", dry_run=False)
+        source = orch.recipe.config.validation_sources[0]
+
+        orch._download_altimeter(source)
+
+        assert "altimeter" in orch.metadata["downloads"]
+        assert orch.metadata["downloads"]["altimeter"] == orch.metadata["downloads"]["altimeter_reprocessed"]
+
+
 class TestCollocationSkipGating:
     """download_all() gates every non-SAR source dispatch on a predicted
     collocation verdict (default on), consulting _collocation_predictions()
@@ -2659,6 +3168,27 @@ class TestCollocationSkipGating:
         orchestrator.download_all()
 
         assert "mooring" not in orchestrator.metadata["downloads"]
+
+    def test_fully_excluded_insitu_batch_records_a_skipped_metadata_entry(self, tmp_path, monkeypatch):
+        """When every in-situ source in a recipe is excluded from the
+        batch, the run must still record an "insitu" entry in
+        download_metadata.json -- otherwise a later run can never see
+        this requirement as satisfied and re-downloads everything from
+        scratch every time, even though nothing was actually missing."""
+        orchestrator = _orchestrator_with_source(tmp_path, "mooring")
+
+        monkeypatch.setattr(
+            orchestrator, "_collocation_predictions",
+            lambda: {"mooring": _FakePrediction(verdict="none-predicted")},
+        )
+        monkeypatch.setattr(orchestrator, "_download_sar", lambda: True)
+        monkeypatch.setattr(orchestrator, "_download_insitu", lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("must not batch-download a none-predicted in-situ source")
+        ))
+
+        orchestrator.download_all()
+
+        assert orchestrator.metadata["downloads"]["insitu"]["status"] == "skipped"
 
     def test_unknown_verdict_does_not_skip_insitu_batch(self, tmp_path, monkeypatch):
         orchestrator = _orchestrator_with_source(tmp_path, "mooring")

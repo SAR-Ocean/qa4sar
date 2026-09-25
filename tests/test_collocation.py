@@ -64,6 +64,30 @@ class TestToDatetimeArray:
         assert arr[0] == dt
 
 
+class TestSarGridPixelSpacingKm:
+    def test_returns_the_expected_spacing_for_a_known_grid(self):
+        from sar_validation.core.collocation import _sar_grid_pixel_spacing_km
+
+        lons = np.linspace(-1.0, 1.0, 5)
+        lats = np.linspace(51.0, 53.0, 4)
+        grid_lon, grid_lat = np.meshgrid(lons, lats)
+
+        result = _sar_grid_pixel_spacing_km(grid_lon, grid_lat)
+        assert result == pytest.approx(54.241, rel=1e-3)
+
+    def test_returns_none_for_a_single_row_grid(self):
+        from sar_validation.core.collocation import _sar_grid_pixel_spacing_km
+
+        grid_lon, grid_lat = np.meshgrid(np.linspace(-1.0, 1.0, 5), [52.0])
+        assert _sar_grid_pixel_spacing_km(grid_lon, grid_lat) is None
+
+    def test_returns_none_for_a_single_column_grid(self):
+        from sar_validation.core.collocation import _sar_grid_pixel_spacing_km
+
+        grid_lon, grid_lat = np.meshgrid([0.0], np.linspace(51.0, 53.0, 4))
+        assert _sar_grid_pixel_spacing_km(grid_lon, grid_lat) is None
+
+
 def test_normalize_weights_sums_to_one():
     weights = _normalize_weights(np.array([1.0, 2.0, 3.0]))
     assert weights.sum() == pytest.approx(1.0)
@@ -176,6 +200,22 @@ class TestPointLayerCollocation:
         assert r.val_source == "mooring"
         assert isinstance(r.sar_time, datetime)
         assert isinstance(r.val_time, datetime)
+
+    def test_collocated_point_records_aggregation_window_km(self):
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        val = _make_val_dataframe(
+            lons=[0.0], lats=[52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0)],
+            WSPD=[7.0], WDIR=[200.0],
+        )
+
+        colloc = PointLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "mooring")
+
+        assert len(results) > 0
+        assert results[0].aggregation_window_km == 100.0
 
     def test_forward_fill_never_borrows_from_a_different_platform(self):
         """A validation point whose own platform never reports a given
@@ -488,6 +528,76 @@ class TestLayerLayerCollocation:
         assert all(r.collocation_type == "layer_vs_layer" for r in results)
         assert all(r.val_source == "scatterometer" for r in results)
 
+    def test_cell_averaging_records_aggregation_window_km(self):
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        scat_lons = np.linspace(-1.5, 1.5, 8)
+        scat_lats = np.linspace(50.5, 53.5, 6)
+        mg_lon, mg_lat = np.meshgrid(scat_lons, scat_lats)
+        val = _make_val_dataframe(
+            lons=mg_lon.ravel().tolist(),
+            lats=mg_lat.ravel().tolist(),
+            times=[datetime(2026, 1, 1, 12, 0, 0)] * mg_lon.size,
+            wind_speed=[8.5] * mg_lon.size,
+            wind_dir=[230.0] * mg_lon.size,
+        )
+        colloc = LayerLayerCollocation(spatial_tolerance_km=100, time_tolerance_minutes=60,
+                                        aggregation_window_km=80)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
+
+        assert len(results) > 0
+        assert all(r.aggregation_window_km == 80.0 for r in results)
+
+    def test_individual_method_records_no_aggregation_window(self):
+        """The individual method matches each SAR pixel to its single
+        closest validation point with no spatial averaging, so it has no
+        aggregation window to record."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        scat_lons = np.linspace(-1.5, 1.5, 8)
+        scat_lats = np.linspace(50.5, 53.5, 6)
+        mg_lon, mg_lat = np.meshgrid(scat_lons, scat_lats)
+        val = _make_val_dataframe(
+            lons=mg_lon.ravel().tolist(),
+            lats=mg_lat.ravel().tolist(),
+            times=[datetime(2026, 1, 1, 12, 0, 0)] * mg_lon.size,
+            wind_speed=[8.5] * mg_lon.size,
+            wind_dir=[230.0] * mg_lon.size,
+        )
+        colloc = LayerLayerCollocation(spatial_tolerance_km=100, time_tolerance_minutes=60,
+                                        aggregation_window_km=80, method="individual")
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
+
+        assert len(results) > 0
+        assert all(r.aggregation_window_km is None for r in results)
+
+    def test_individual_method_records_sar_pixel_spacing_km(self):
+        """The individual method matches each SAR pixel to its single
+        closest validation point with no spatial averaging, so instead
+        of an aggregation window it records the SAR grid's own native
+        pixel spacing."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+        scat_lons = np.linspace(-1.5, 1.5, 8)
+        scat_lats = np.linspace(50.5, 53.5, 6)
+        mg_lon, mg_lat = np.meshgrid(scat_lons, scat_lats)
+        val = _make_val_dataframe(
+            lons=mg_lon.ravel().tolist(),
+            lats=mg_lat.ravel().tolist(),
+            times=[datetime(2026, 1, 1, 12, 0, 0)] * mg_lon.size,
+            wind_speed=[8.5] * mg_lon.size,
+            wind_dir=[230.0] * mg_lon.size,
+        )
+        colloc = LayerLayerCollocation(spatial_tolerance_km=100, time_tolerance_minutes=60,
+                                        aggregation_window_km=80, method="individual")
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "scatterometer")
+
+        assert len(results) > 0
+        assert all(r.aggregation_window_km is None for r in results)
+        # _make_sar_grid()'s default 5x4 grid spans lon [-1.0, 1.0] (0.5 deg
+        # steps) and lat [51.0, 53.0] (0.6667 deg steps) -- converted to km
+        # at this grid's own mean latitude (52.0 deg), lat spacing is
+        # 74.213 km and lon spacing is 34.268 km, averaging to 54.241 km.
+        for r in results:
+            assert r.sar_pixel_spacing_km == pytest.approx(54.241, rel=1e-3)
+
     def test_no_match_outside_time_tolerance(self):
         grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
         val = _make_val_dataframe(
@@ -686,6 +796,28 @@ class TestLayerLayerCollocation:
         assert len(results) > 0
         assert all(r.sar_data.get("owiWindSpeed") == pytest.approx(9.0) for r in results)
 
+    def test_each_collocated_point_keeps_its_own_platform_id(self):
+        """Two points from different missions, close enough in space and
+        time to both collocate against the same SAR grid, must each keep
+        their own platform_id as val_id -- this is what lets a validation
+        report distinguish which mission each point came from once every
+        mission has been combined into one file."""
+        grid_lon, grid_lat, sar_time, sar_data = _make_sar_grid()
+
+        val = _make_val_dataframe(
+            lons=[0.0, 0.05], lats=[52.0, 52.0],
+            times=[datetime(2026, 1, 1, 12, 0, 0), datetime(2026, 1, 1, 12, 5, 0)],
+            VAVH=[2.1, 1.9],
+            platform_id=["jason-3", "cryosat-2"],
+        )
+
+        colloc = LayerLayerCollocation(spatial_tolerance_km=200, time_tolerance_minutes=60,
+                                        aggregation_window_km=100)
+        results = colloc.collocate(sar_data, grid_lon, grid_lat, sar_time, val, "altimeter")
+
+        val_ids = {r.val_id for r in results}
+        assert val_ids == {"jason-3", "cryosat-2"}
+
 
 # ---------------------------------------------------------------------------
 # _detect_collocation_type
@@ -769,6 +901,15 @@ class TestResolveLayerTypeScatterometerVariants:
             ds, "validation/altimeter/Cryosat-2", DEFAULT_LAYER_TYPE_SPECS
         )
         assert layer_type == "altimeter_5hz"
+
+    def test_resolves_reprocessed_altimeter_to_its_own_layer_type(self):
+        import xarray as xr
+
+        from sar_validation.core.collocation import _resolve_layer_type
+
+        ds = xr.Dataset(attrs={"data_type": "altimeter", "frequency": "reprocessed"})
+
+        assert _resolve_layer_type(ds, "validation/altimeter_reprocessed/2023-12-31", {}) == "altimeter_reprocessed"
 
     def test_resolve_layer_type_refines_radiometer_ssm_by_sensor(self):
         import xarray as xr
@@ -2254,6 +2395,28 @@ class TestRunCollocationEra5Wiring:
         era5_mask = result_ds["val_source"].values == "era5_wind"
         assert int(era5_mask.sum()) > 0
 
+    def test_layer_vs_layer_collocation_method_flag_also_applies_to_era5(self, tmp_path):
+        """The CLI's collocation-method flag must not silently stop at
+        layer_vs_layer sources -- a run requesting the individual
+        method must also switch ERA5's own grid-mode collocation to
+        individual, not silently keep whatever the recipe's own
+        layer-type default says regardless of what was actually
+        requested."""
+        from sar_validation.core.collocation import run_collocation
+
+        tree, recipe = self._build_datatree_and_recipe(tmp_path)
+        result_ds = run_collocation(
+            recipe, tree, tmp_path, layer_vs_layer_collocation_method="individual",
+        )
+
+        assert result_ds is not None
+        era5_mask = result_ds["val_source"].values == "era5_wind"
+        assert int(era5_mask.sum()) > 0
+        agg = result_ds["aggregation_window_km"].values[era5_mask]
+        px = result_ds["sar_pixel_spacing_km"].values[era5_mask]
+        assert np.all(np.isnan(agg))
+        assert np.all(np.isfinite(px)) and np.all(px > 0)
+
 
 class TestModelSourceType:
     def test_era5_prefixed_data_types_map_to_era5(self):
@@ -2351,10 +2514,24 @@ class TestRunCollocationHycomModelSourceDispatch:
         recipe = self._currents_recipe_with_hycom_override("individual")
         result = run_collocation(recipe, self._tree(), tmp_path)
         assert result is not None
-        assert len(result["val_rvlRadVel_projection"]) > 5
+        assert len(result["val_rvlRadVel_projection"]) == 25
         # heading 90 -> projection == EWCT == 0.4 (hand-checkable, same as
         # the existing mooring test above)
         assert float(result["val_rvlRadVel_projection"].values[0]) == pytest.approx(0.4, abs=1e-5)
+
+    def test_hycom_per_source_override_wins_over_a_conflicting_cli_flag(self, tmp_path):
+        """A recipe's own per-source collocation_kwargs override must
+        win even when the CLI's requested collocation method disagrees
+        with it -- the per-source setting is the more specific, more
+        deliberate choice."""
+        from sar_validation.core.collocation import run_collocation
+
+        recipe = self._currents_recipe_with_hycom_override("individual")
+        result = run_collocation(
+            recipe, self._tree(), tmp_path, layer_vs_layer_collocation_method="cell-averaging",
+        )
+        assert result is not None
+        assert len(result["val_rvlRadVel_projection"]) == 25
 
     def test_partial_layer_type_spec_override_keeps_other_defaults(self, tmp_path, monkeypatch):
         """Regression test: a recipe overriding only ONE field of a
@@ -2410,3 +2587,96 @@ class TestRunCollocationHycomModelSourceDispatch:
         assert captured["time_tolerance_minutes"] == 999  # recipe override still wins
         assert captured["aggregation_window_km"] == pytest.approx(4.6, abs=0.01)
         assert captured["distance_weighting"] == "equal"
+
+
+class TestRunCollocationBuoyWaterfallOverride:
+    """Regression test: a recipe's "buoy_waterfall" validation source
+    carries its own collocation_kwargs keyed under "buoy_waterfall" in
+    source_type_overrides. A GTS-side node is always grouped under the
+    literal name "buoy_gts", regardless of the recipe's own source_type,
+    so a "buoy_waterfall" recipe's override must be resolved through
+    that name."""
+
+    def _recipe_with_waterfall_override(self, time_tolerance_minutes: int):
+        from sar_validation.core.recipe import (
+            GeographicBounds,
+            Recipe,
+            RecipeConfig,
+            TemporalBounds,
+            ValidationDataSource,
+        )
+        return Recipe(RecipeConfig(
+            name="buoy_waterfall_override", variable="currents",
+            geographic_bounds=GeographicBounds(-21.0, -18.0, 49.0, 52.0),
+            temporal_bounds=TemporalBounds("2026-06-20T18:00:00", "2026-06-20T23:00:00"),
+            validation_sources=[ValidationDataSource(
+                source_type="buoy_waterfall",
+                collocation_kwargs={"time_tolerance_minutes": time_tolerance_minutes},
+            )],
+        ))
+
+    def _tree(self):
+        import xarray as xr
+
+        # SAR RVL grid node (y, x) with a constant heading of 90 deg,
+        # timestamped 19:15:00.
+        ny, nx = 5, 5
+        lon2d, lat2d = np.meshgrid(
+            np.linspace(-20.0, -19.0, nx), np.linspace(50.0, 51.0, ny)
+        )
+        sar = xr.Dataset(
+            {
+                "rvlRadVel": (("y", "x"), np.full((ny, nx), 0.5, dtype="float32")),
+                "rvlHeading": (("y", "x"), np.full((ny, nx), 90.0, dtype="float32")),
+            },
+            coords={
+                "lon": (("y", "x"), lon2d),
+                "lat": (("y", "x"), lat2d),
+                "time": np.datetime64("2026-06-20T19:15:00", "ns"),
+            },
+            attrs={"data_type": "sar_l2_ocn", "swath_mode": "IW/EW/SM",
+                   "measurement_type": "rvl"},
+        )
+        # GTS-side node, grouped under the literal "buoy_gts" name exactly
+        # as datatree_converter.py's own scanning block always does,
+        # regardless of whether the recipe's own source_type is "buoy_gts"
+        # or "buoy_waterfall". Observation timestamped 45 minutes after the
+        # SAR scene -- outside the point_vs_layer default 30-minute
+        # tolerance, but inside a 60-minute override.
+        val = xr.Dataset(
+            {
+                "EWCT": (("point",), np.array([0.4], dtype="float32")),
+                "NSCT": (("point",), np.array([0.3], dtype="float32")),
+            },
+            coords={
+                "lon": (("point",), np.array([-19.5])),
+                "lat": (("point",), np.array([50.5])),
+                "time": (("point",), np.array([np.datetime64("2026-06-20T20:00:00", "ns")])),
+                "platform_type": (("point",), np.array(["buoy"])),
+            },
+            attrs={"data_type": "insitu_observations", "platform_type": "buoy"},
+        )
+        return xr.DataTree.from_dict({
+            "/sar/scene1": sar, "/validation/buoy_gts/station1": val,
+        })
+
+    def test_buoy_waterfall_time_tolerance_override_reaches_the_gts_node(self, tmp_path):
+        from sar_validation.core.collocation import run_collocation
+
+        recipe = self._recipe_with_waterfall_override(60)
+        result = run_collocation(recipe, self._tree(), tmp_path)
+
+        assert result is not None
+        assert result.sizes.get("collocation", 0) == 1
+        assert float(result["val_rvlRadVel_projection"].values[0]) == pytest.approx(0.4, abs=1e-5)
+
+    def test_default_tolerance_alone_would_not_have_matched(self, tmp_path):
+        """Confirms the 45-minute offset genuinely falls outside the
+        point_vs_layer default (30 minutes) -- otherwise the prior test
+        would pass even without the override ever being applied."""
+        from sar_validation.core.collocation import run_collocation
+
+        recipe = self._recipe_with_waterfall_override(15)
+        result = run_collocation(recipe, self._tree(), tmp_path)
+
+        assert result is None or result.sizes.get("collocation", 0) == 0

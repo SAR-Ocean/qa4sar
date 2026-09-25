@@ -52,7 +52,7 @@ recipes/*.yaml
 .idea/
 *.swp
 *.swo
-.claude/
+.development/
 
 # Testing
 .pytest_cache/

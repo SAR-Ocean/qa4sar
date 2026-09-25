@@ -28,7 +28,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-plot = ["matplotlib", "cartopy", "cmocean", "plotly", "folium"]
+# cartopy is capped below 0.26: that release changed PlateCarree's
+# internal proj4 representation of a shifted central longitude from an
+# explicit lon_0 parameter to a shifted prime meridian, which several
+# tests assert on directly (see tests/test_visualization.py's
+# antimeridian-projection checks).
+plot = ["matplotlib", "cartopy>=0.25,<0.26", "cmocean"]
 eumdac = ["eumdac"]
 gportal = ["paramiko"]
 # ERA5 reanalysis validation (wind/waves/soil_moisture recipes) needs only
@@ -36,6 +41,13 @@ gportal = ["paramiko"]
 # ERA5 user isn't pointed at soil_moisture's unrelated, much heavier
 # dependencies (pytesmo/ismn/earthaccess/ascat/pdbufr) just to get cdsapi.
 era5 = ["cdsapi"]
+# GTS/MARS buoy wind/wave/current validation needs the ECMWF Web API
+# client (for MARS access) and pdbufr (to decode the returned BUFR).
+# pdbufr is also pulled in by the soil_moisture extra for a different
+# downloader (H-SAF ASCAT SSM) -- declared again here, standalone, so a
+# GTS-only user isn't pointed at soil_moisture's unrelated heavier
+# dependencies just to get it.
+gts = ["ecmwf-api-client", "pdbufr"]
 soil_moisture = ["pytesmo", "ismn", "earthaccess", "ascat", "pdbufr", "pyorbital", "sar-l2-validation-toolbox[era5]"]
 test = ["pytest", "pytest-cov"]
 dev = [
@@ -44,10 +56,8 @@ dev = [
     "mypy",
     "ruff",
     "matplotlib",
-    "cartopy",
+    "cartopy>=0.25,<0.26",
     "cmocean",
-    "plotly",
-    "folium",
     "eumdac",
     "pytesmo",
     "ismn",
@@ -56,6 +66,7 @@ dev = [
     "pdbufr",
     "paramiko",
     "cdsapi",
+    "ecmwf-api-client",
     "pyorbital",
 ]
 
