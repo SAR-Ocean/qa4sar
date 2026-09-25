@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -76,3 +78,39 @@ def _cleanup_stray_empty_data_dirs():
     yield
 
     _remove_empty_new_entries(data_dir, before)
+
+
+_recorded_exit_status: "Optional[int]" = None
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Record pytest's own exit status for pytest_unconfigure to use --
+    see that hook's docstring for why."""
+    global _recorded_exit_status
+    _recorded_exit_status = int(exitstatus)
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    """
+    In CI (Ubuntu, both Python 3.12 and 3.13), a fully green ``pytest -q``
+    run reliably segfaults during process exit -- "N passed" is printed,
+    then the shell reports SIGSEGV with no Python traceback (faulthandler
+    never fires), the signature of a native library's own atexit/static
+    destructor crashing during interpreter shutdown rather than a
+    Python-level bug. This toolbox loads rasterio, pyproj, and cartopy in
+    the same process, each bundling its own compiled GDAL/PROJ/GEOS; their
+    exact resolved versions were confirmed identical between a clean local
+    run and a crashing CI run, so this is a native cleanup ordering issue,
+    not a dependency version to pin around.
+
+    Only applies under CI (``CI`` is set by GitHub Actions and most other
+    CI providers) -- a local pytest run keeps normal interpreter shutdown,
+    so an actual crash during local development is never masked.
+    ``os._exit()`` skips atexit callbacks and static destructors entirely,
+    which is exactly the code path that segfaults; pytest's own exit
+    status (captured by pytest_sessionfinish above) is preserved, so CI
+    still fails on a genuine test failure. Remove this once a plain
+    ``pytest -q`` run in CI no longer segfaults after printing its summary.
+    """
+    if os.environ.get("CI"):
+        os._exit(_recorded_exit_status if _recorded_exit_status is not None else 0)
