@@ -56,7 +56,7 @@ dev = [
     "mypy",
     "ruff",
     "matplotlib",
-    "cartopy",
+    "cartopy>=0.25,<0.26",
     "cmocean",
     "plotly",
     "folium",
