@@ -8,13 +8,7 @@ Four public plot functions:
 * :func:`plot_statistics`   — bar chart of bias / RMSE / correlation per source
 * :func:`plot_residuals`    — histogram / KDE of (SAR − validation) residuals
 
-Each accepts an ``interactive=False`` keyword argument. When
-``interactive=True`` the function returns an hvplot / plotly / folium object
-instead of a matplotlib Figure. If the required optional library is not
-installed a :class:`ImportError` is raised with a friendly installation hint.
-
-Plus fallback and convenience wrappers, matplotlib-only (no ``interactive``
-option):
+Plus fallback and convenience wrappers:
 
 * :func:`plot_collocation_diagnostics` — SAR scene bounds + matched/unmatched
   validation points (one category per validation source actually present),
@@ -283,20 +277,6 @@ def _source_style_map(sources: List[str]) -> Dict[str, Tuple[str, str]]:
             _SOURCE_MARKERS[idx % len(_SOURCE_MARKERS)],
         )
     return style
-
-
-def _require(package: str, extra: str = "plot") -> None:
-    """
-    Raise an ImportError if *package* is not installed.
-    """
-    try:
-        __import__(package)
-    except ImportError:
-        raise ImportError(
-            f"Package '{package}' is required for interactive plots. "
-            f"Install it with:  pip install '{package}'  or  "
-            f"pip install 'sar-l2-validation-toolbox[{extra}]'"
-        ) from None
 
 
 def _filter_by_scene(collocation_ds, scene_name: str):
@@ -569,7 +549,6 @@ def plot_scatter(
     val_var: str,
     *,
     by_source: bool = True,
-    interactive: bool = False,
     ax=None,
     split_when_imbalanced: bool = True,
     force_split: bool = False,
@@ -587,8 +566,6 @@ def plot_scatter(
         Validation variable name *without* ``val_`` prefix (e.g. ``"WSPD"``).
     by_source : bool
         Whether per-source legend labels are shown.
-    interactive : bool
-        Return a plotly Figure instead of matplotlib.
     ax : matplotlib.axes.Axes, optional
         Axes to draw into (static only).  A new figure is created if None.
     split_when_imbalanced : bool
@@ -598,7 +575,7 @@ def plot_scatter(
         plot_residuals' by_source layout) instead of a single shared
         axes -- otherwise a dominant source (e.g. ASCAT's thousands of
         points vs. SMOS's dozens) visually buries every other source.
-        Ignored when interactive=True or ax is explicitly provided.
+        Ignored when ax is explicitly provided.
     force_split : bool
         When True, always render the per-source small multiples (as
         split_when_imbalanced would for a >70% dominant source),
@@ -606,12 +583,12 @@ def plot_scatter(
         once a source has been CDF-matched into a different reference
         domain, since piling every source into one shared axes at that
         point is too visually busy even when no single source dominates
-        by point count. Ignored when interactive=True or ax is explicitly
-        provided, same as split_when_imbalanced.
+        by point count. Ignored when ax is explicitly provided, same as
+        split_when_imbalanced.
 
     Returns
     -------
-    matplotlib.figure.Figure or plotly.graph_objects.Figure
+    matplotlib.figure.Figure
     """
     sar_col = f"sar_{sar_var}"
     val_col = f"val_{val_var}"
@@ -645,28 +622,10 @@ def plot_scatter(
         dominant_share = float(counts.max()) / float(counts.sum())
 
     if (
-        not interactive and ax is None and split_when_imbalanced
+        ax is None and split_when_imbalanced
         and len(sources_for_split) >= 2 and (dominant_share > 0.7 or force_split)
     ):
         return _plot_scatter_small_multiples(df, sar_col, val_col, sar_var, val_var, collocation_ds)
-
-    if interactive:
-        _require("plotly")
-        import plotly.express as px  # noqa: PLC0415
-
-        fig = px.scatter(
-            df, x=val_col, y=sar_col,
-            color="val_source" if by_source else None,
-            labels={val_col: val_var, sar_col: sar_var, "val_source": "Source"},
-            title=f"{sar_var} vs {val_var}",
-            opacity=0.7,
-        )
-        all_vals = np.concatenate([df[val_col].values, df[sar_col].values])
-        vmin, vmax = float(np.nanmin(all_vals)), float(np.nanmax(all_vals))
-        fig.add_scatter(x=[vmin, vmax], y=[vmin, vmax],
-                        mode="lines", line=dict(color="black", dash="dash"),
-                        name="1:1", showlegend=True)
-        return fig
 
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
@@ -830,7 +789,6 @@ def plot_geographic(
     max_raster_dim: int = 1200,
     split_by: str = "collocation_type",
     scenes: Optional[Sequence[str]] = None,
-    interactive: bool = False,
     geographic_bounds: Optional["GeographicBounds"] = None,
     two_column_by_type: bool = False,
     on_figure: Optional[Callable[[str, "Figure"], None]] = None,
@@ -889,8 +847,6 @@ def plot_geographic(
     scenes : sequence of str, optional
         Restrict plotting to these SAR scene names. Falls back to every scene
         in *datatree* if None, empty, or none of the given names match.
-    interactive : bool
-        Return a folium Map instead of matplotlib.
     geographic_bounds : GeographicBounds, optional
         Clamp each static subplot's extent to the recipe's requested bounding
         box instead of the SAR field's full native extent (e.g. CLMS SSM's grid
@@ -925,7 +881,7 @@ def plot_geographic(
 
     Returns
     -------
-    dict[str, matplotlib.figure.Figure] or folium.Map
+    dict[str, matplotlib.figure.Figure] or matplotlib.figure.Figure
         When *split_by* is not None: a dict keyed by group value, one Figure
         per group.  When *split_by* is None: a single Figure.
     """
@@ -968,49 +924,6 @@ def plot_geographic(
             group_values = None
     else:
         group_values = None
-
-    if interactive:
-        _require("folium")
-        import folium  # noqa: PLC0415
-
-        m = folium.Map(tiles="CartoDB positron")
-        bounds_list = []
-        for scene_name in scene_names:
-            scene_ds = sar_node[scene_name].to_dataset()
-            if "lon" not in scene_ds.coords or "lat" not in scene_ds.coords:
-                continue
-            lon2d = scene_ds["lon"].values
-            lat2d = scene_ds["lat"].values
-            bounds_list.append([
-                [float(lat2d.min()), float(lon2d.min())],
-                [float(lat2d.max()), float(lon2d.max())],
-            ])
-            fg = folium.FeatureGroup(name=scene_name)
-            sub_coll = _filter_by_scene(collocation_ds, scene_name)
-            if "collocation" in sub_coll.dims and sub_coll.sizes["collocation"] > 0:
-                cols_needed = ["val_lat", "val_lon", "val_source"]
-                if val_col_present:
-                    assert val_col is not None   # implied by val_col_present
-                    cols_needed.append(val_col)
-                df_pts = sub_coll[cols_needed].to_dataframe()
-                for _, row in df_pts.iterrows():
-                    color = source_style.get(str(row.get("val_source", "")), ("#1f77b4", "o"))[0]
-                    tooltip = (
-                        f"{val_var}: {row[val_col]:.2f}" if val_col_present
-                        else str(row.get("val_source", ""))
-                    )
-                    folium.CircleMarker(
-                        location=[float(row["val_lat"]), float(row["val_lon"])],
-                        radius=4, color=color, fill=True, fill_opacity=0.8,
-                        tooltip=tooltip,
-                    ).add_to(fg)
-            fg.add_to(m)
-        if bounds_list:
-            all_lats = [b[0][0] for b in bounds_list] + [b[1][0] for b in bounds_list]
-            all_lons = [b[0][1] for b in bounds_list] + [b[1][1] for b in bounds_list]
-            m.fit_bounds([[min(all_lats), min(all_lons)], [max(all_lats), max(all_lons)]])
-        folium.LayerControl().add_to(m)
-        return m
 
     # ── Static matplotlib + cartopy ─────────────────────────────────────────
     try:
@@ -1972,8 +1885,6 @@ def plot_summary_table(
 def plot_statistics(
     stats_ds,
     metrics: Optional[List[str]] = None,
-    *,
-    interactive: bool = False,
 ):
     """
     Grouped bar chart of validation statistics per source.
@@ -1984,12 +1895,10 @@ def plot_statistics(
         Output of :func:`~.statistics.compute_statistics`.
     metrics : list[str], optional
         Which metrics to plot.  Defaults to ``["bias", "rmse", "correlation"]``.
-    interactive : bool
-        Return a plotly Figure instead of matplotlib.
 
     Returns
     -------
-    matplotlib.figure.Figure or plotly.graph_objects.Figure
+    matplotlib.figure.Figure
     """
     if metrics is None:
         metrics = ["bias", "rmse", "correlation"]
@@ -2003,19 +1912,6 @@ def plot_statistics(
     sar_var = stats_ds.attrs.get("sar_var", "")
     val_var = stats_ds.attrs.get("val_var", "")
     title = f"Validation statistics: {sar_var} vs {val_var}"
-
-    if interactive:
-        _require("plotly")
-        from plotly.subplots import make_subplots  # noqa: PLC0415
-
-        fig = make_subplots(rows=1, cols=len(available),
-                            subplot_titles=available)
-        for i, metric in enumerate(available, start=1):
-            vals = stats_ds[metric].values.tolist()
-            fig.add_bar(x=sources, y=vals, name=metric,
-                        showlegend=False, row=1, col=i)
-        fig.update_layout(title=title)
-        return fig
 
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
@@ -2049,7 +1945,6 @@ def plot_residuals(
     val_var: str,
     *,
     by_source: bool = True,
-    interactive: bool = False,
     ax=None,
     hist_range: Optional[Union[Tuple[float, float], Dict[str, Tuple[float, float]]]] = None,
 ):
@@ -2073,8 +1968,6 @@ def plot_residuals(
         produce a density spike that dwarfs every other source's bars, the
         way it would sharing one axes. When False, draw a single combined
         histogram instead (``ax`` honored in this case only).
-    interactive : bool
-        Return a plotly Figure instead of matplotlib.
     ax : matplotlib.axes.Axes, optional
         Axes to draw into (static, ``by_source=False`` only — the
         small-multiples grid always creates its own figure).
@@ -2094,7 +1987,7 @@ def plot_residuals(
 
     Returns
     -------
-    matplotlib.figure.Figure or plotly.graph_objects.Figure or None
+    matplotlib.figure.Figure or None
         None if *collocation_ds* has no valid (non-NaN) data for this pair.
     """
     sar_col = f"sar_{sar_var}"
@@ -2134,21 +2027,6 @@ def plot_residuals(
     else:
         df["residual"] = df[sar_col] - df[val_col]
         title = f"Residuals: {sar_var} − {val_var}"
-
-    if interactive:
-        _require("plotly")
-        import plotly.express as px  # noqa: PLC0415
-
-        fig = px.histogram(
-            df, x="residual",
-            color="val_source" if by_source else None,
-            barmode="overlay",
-            opacity=0.6,
-            nbins=40,
-            labels={"residual": residual_label, "val_source": "Source"},
-            title=title,
-        )
-        return fig
 
     import matplotlib.pyplot as plt  # noqa: PLC0415
 

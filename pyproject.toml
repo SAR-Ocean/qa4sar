@@ -33,7 +33,7 @@ dependencies = [
 # explicit lon_0 parameter to a shifted prime meridian, which several
 # tests assert on directly (see tests/test_visualization.py's
 # antimeridian-projection checks).
-plot = ["matplotlib", "cartopy>=0.25,<0.26", "cmocean", "plotly", "folium"]
+plot = ["matplotlib", "cartopy>=0.25,<0.26", "cmocean"]
 eumdac = ["eumdac"]
 gportal = ["paramiko"]
 # ERA5 reanalysis validation (wind/waves/soil_moisture recipes) needs only
@@ -58,8 +58,6 @@ dev = [
     "matplotlib",
     "cartopy>=0.25,<0.26",
     "cmocean",
-    "plotly",
-    "folium",
     "eumdac",
     "pytesmo",
     "ismn",
