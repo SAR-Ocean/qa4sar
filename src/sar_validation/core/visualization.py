@@ -1209,6 +1209,23 @@ def plot_geographic(
             return point_size.get(group_label, 40)
         return point_size
 
+    def _edgecolor_for(df) -> tuple:
+        """
+        Black outlines make a handful of point_vs_layer in-situ dots
+        (e.g. ISMN stations) easy to pick out against a busy SAR field,
+        but the same outline on a dense layer_vs_layer or model_vs_layer
+        overlay (thousands of satellite or model grid points) merges
+        into a solid black mass that hides the field underneath it
+        entirely. Resolved from *df*'s own collocation_type column when
+        present, defaulting to a visible black edge when the column is
+        absent.
+        """
+        if "collocation_type" not in df.columns or df.empty:
+            return "black", 0.9
+        if df["collocation_type"].iloc[0] == "point_vs_layer":
+            return "black", 0.9
+        return "none", 0.0
+
     def _draw_scene_panel(ax, scene_name, group_coll_ds, pt_size):
         """
         Draw one SAR scene's field + collocated validation points into
@@ -1283,6 +1300,8 @@ def plot_geographic(
                 col_list.append("val_source")
             if "val_var_code" in sub_coll:
                 col_list.append("val_var_code")
+            if "collocation_type" in sub_coll:
+                col_list.append("collocation_type")
             df_pts = sub_coll[col_list].to_dataframe()
             if "val_time" in sub_coll.coords:
                 df_pts["val_time"] = sub_coll.coords["val_time"].values
@@ -1315,18 +1334,20 @@ def plot_geographic(
                 if len(valid_pts) and "val_source" in valid_pts.columns:
                     for src, grp in valid_pts.groupby("val_source"):
                         marker = source_style.get(str(src), ("#1f77b4", "o"))[1]
+                        edgecolor, edgewidth = _edgecolor_for(grp)
                         ax.scatter(
                             grp["val_lon"], grp["val_lat"],
                             c=grp[val_col], cmap=val_cmap, norm=val_norm,
                             marker=marker, s=pt_size,
-                            edgecolors="black", linewidths=0.9,
+                            edgecolors=edgecolor, linewidths=edgewidth,
                             rasterized=True, **kw_sc,
                         )
                 elif len(valid_pts):
+                    edgecolor, edgewidth = _edgecolor_for(valid_pts)
                     ax.scatter(
                         valid_pts["val_lon"], valid_pts["val_lat"],
                         c=valid_pts[val_col], cmap=val_cmap, norm=val_norm,
-                        s=pt_size, edgecolors="black", linewidths=0.9,
+                        s=pt_size, edgecolors=edgecolor, linewidths=edgewidth,
                         rasterized=True, **kw_sc,
                     )
                 if len(nan_pts):
@@ -1393,18 +1414,20 @@ def plot_geographic(
             elif "val_source" in df_pts.columns:
                 for src, grp in df_pts.groupby("val_source"):
                     color, marker = source_style.get(str(src), ("#ff0000", "o"))
+                    edgecolor, edgewidth = _edgecolor_for(grp)
                     ax.scatter(grp["val_lon"], grp["val_lat"],
                                s=pt_size, c=color, marker=marker,
-                               edgecolors="black", linewidths=0.9,
+                               edgecolors=edgecolor, linewidths=edgewidth,
                                label=str(src), rasterized=True, **kw_sc)
                 loc = _sparse_legend_corner(
                     ax, transform, (df_pts["val_lon"].to_numpy(), df_pts["val_lat"].to_numpy()),
                 )
                 ax.legend(fontsize=6, loc=loc, framealpha=0.7)
             else:
+                edgecolor, edgewidth = _edgecolor_for(df_pts)
                 ax.scatter(df_pts["val_lon"], df_pts["val_lat"],
                            s=pt_size, c="#ff7f0e",
-                           edgecolors="black", linewidths=0.9, **kw_sc)
+                           edgecolors=edgecolor, linewidths=edgewidth, **kw_sc)
 
         n_dedup = len(df_pts) if n_pts > 0 else 0
         ax.set_title(

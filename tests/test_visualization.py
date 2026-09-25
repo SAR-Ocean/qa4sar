@@ -1059,6 +1059,55 @@ class TestPlotGeographic:
             f"SAR scatter should use point_size + 50 = 90, got {recorded_sizes!r}"
         )
 
+    def test_point_vs_layer_keeps_black_edge_dense_types_omit_it(self, monkeypatch):
+        """A sparse in-situ overlay (e.g. ISMN, point_vs_layer) needs a black
+        marker edge to distinguish individual dots, but the same edge on a
+        dense satellite or model overlay (thousands of points) merges into a
+        solid black mass that hides the SAR field underneath it."""
+        import matplotlib.axes
+        import matplotlib.pyplot as plt
+        import pandas as pd
+
+        from sar_validation.core.datatree_converter import DataTreeConverter
+        from sar_validation.core.visualization import plot_geographic
+
+        y, x = 3, 3
+        lon2d, lat2d = np.meshgrid(np.linspace(-10, -8, x), np.linspace(50, 52, y))
+        sar_ds = xr.Dataset(
+            {"sarSSM": (("y", "x"), np.full((y, x), 30.0))},
+            coords={"lon": (("y", "x"), lon2d), "lat": (("y", "x"), lat2d),
+                    "time": pd.Timestamp("2026-07-10T19:00:00")},
+        )
+        datatree = DataTreeConverter.to_datatree({"sar/sceneA": sar_ds})
+
+        rng = np.random.default_rng(0)
+        n_layer, n_point = 6, 3
+        n = n_layer + n_point
+        collocation_ds = xr.Dataset({
+            "sar_sarSSM":       ("collocation", rng.uniform(20, 40, n)),
+            "val_SOIL_MOISTURE": ("collocation", rng.uniform(0.1, 0.4, n)),
+            "val_source":       ("collocation", ["ascat_ssm"] * n_layer + ["ismn"] * n_point),
+            "collocation_type": ("collocation", ["layer_vs_layer"] * n_layer + ["point_vs_layer"] * n_point),
+            "sar_scene_name":   ("collocation", ["sceneA"] * n),
+            "val_lon":          ("collocation", rng.uniform(-9.8, -8.2, n)),
+            "val_lat":          ("collocation", rng.uniform(50.2, 51.8, n)),
+        })
+
+        recorded = []
+        original_scatter = matplotlib.axes.Axes.scatter
+
+        def recording_scatter(self, *args, **kwargs):
+            recorded.append((kwargs.get("edgecolors"), kwargs.get("linewidths")))
+            return original_scatter(self, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "scatter", recording_scatter)
+        figs = plot_geographic(datatree, collocation_ds, "sarSSM", "SOIL_MOISTURE")
+        plt.close("all")
+
+        assert set(figs.keys()) == {"layer_vs_layer", "point_vs_layer"}
+        assert ("black", 0.9) in recorded, f"point_vs_layer should keep a black edge, got {recorded!r}"
+        assert ("none", 0.0) in recorded, f"layer_vs_layer should drop its edge, got {recorded!r}"
+
     def test_gridded_scene_with_nan_geolocation_does_not_raise(
         self, geo_datatree_and_collocation,
     ):
