@@ -1027,6 +1027,17 @@ class TestBuildWindConfigGtsDefaults:
         assert "buoy_cmems_family" not in source_types
         assert "ship_cmems_family" not in source_types
 
+    def test_tidal_gauge_not_active_by_default(self):
+        """tidal_gauge's wind sensors are not QC-filtered to the same
+        standard as buoy_gts/ship_gts -- _create_recipe adds it to the
+        generated file as a commented-out line instead of an active
+        source (see TestCreateRecipeTidalGaugeComment)."""
+        from sar_validation.cli import _build_wind_config
+
+        cfg = _build_wind_config()
+        source_types = [s.source_type for s in cfg.validation_sources]
+        assert "tidal_gauge" not in source_types
+
 
 class TestBuildWavesConfigGtsDefaults:
     def test_defaults_to_buoy_gts(self):
@@ -1077,6 +1088,31 @@ class TestCreateRecipeGtsComment:
             "# if wanting Copernicus Marine in situ data instead, use buoy_cmems_family"
         ) in written
         assert "ship_gts" not in written
+
+
+class TestCreateRecipeTidalGaugeComment:
+    def test_wind_recipe_gets_tidal_gauge_as_commented_out_block(self, tmp_path, monkeypatch):
+        from sar_validation.cli import _create_recipe
+
+        monkeypatch.chdir(tmp_path)
+        _create_recipe("wind")
+
+        written = next(tmp_path.glob("recipes/*.yaml")).read_text()
+        assert "# - source_type: tidal_gauge" in written
+        assert "\n- source_type: tidal_gauge" not in written
+
+    def test_waves_recipe_keeps_tidal_gauge_active(self, tmp_path, monkeypatch):
+        """The wind-only QC concern behind commenting out tidal_gauge does
+        not apply to waves recipes -- tidal_gauge stays an active
+        validation source there."""
+        from sar_validation.cli import _create_recipe
+
+        monkeypatch.chdir(tmp_path)
+        _create_recipe("waves")
+
+        written = next(tmp_path.glob("recipes/*.yaml")).read_text()
+        assert "\n- source_type: tidal_gauge" in written
+        assert "# - source_type: tidal_gauge" not in written
 
 
 class TestBuildWavesConfigEra5:

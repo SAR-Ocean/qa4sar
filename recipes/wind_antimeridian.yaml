@@ -33,9 +33,9 @@ validation_sources:
 - source_type: ship_cmems_family
   download_kwargs: {}
   collocation_kwargs: {}
-- source_type: tidal_gauge
-  download_kwargs: {}
-  collocation_kwargs: {}
+# - source_type: tidal_gauge  # Copernicus Marine source; excluded from the wind standard (buoy_gts/ship_gts) since its wind sensors are not QC-filtered to the same standard -- uncomment to include anyway
+#   download_kwargs: {}
+#   collocation_kwargs: {}
 - source_type: scatterometer_ascat
   download_kwargs: {}
   collocation_kwargs: {}

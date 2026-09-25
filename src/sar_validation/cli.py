@@ -604,7 +604,10 @@ def _build_wind_config(limit: Optional[int] = None, sar_source: str = "sentinel1
         validation_sources=[
             ValidationDataSource(source_type="buoy_gts"),
             ValidationDataSource(source_type="ship_gts"),
-            ValidationDataSource(source_type="tidal_gauge"),
+            # tidal_gauge (Copernicus Marine) is deliberately not included
+            # active by default -- its wind sensors are not QC-filtered to
+            # the same standard as buoy_gts/ship_gts. _create_recipe adds it
+            # to the generated file as a commented-out line instead.
             ValidationDataSource(source_type="scatterometer_ascat"),
             ValidationDataSource(source_type="altimeter"),
             ValidationDataSource(source_type="radiometer"),
@@ -1015,6 +1018,20 @@ def _create_recipe(
             f"- source_type: {gts_type}\n",
             f"- source_type: {gts_type}  "
             f"# if wanting Copernicus Marine in situ data instead, use {cmems_type}\n",
+        )
+    if name == "wind":
+        # tidal_gauge (Copernicus Marine) is offered as a commented-out
+        # line rather than omitted entirely, so a user who wants it can
+        # uncomment it instead of having to know the exact block to add.
+        yaml_text = yaml_text.replace(
+            "- source_type: scatterometer_ascat\n",
+            "# - source_type: tidal_gauge  # Copernicus Marine source; excluded "
+            "from the wind standard (buoy_gts/ship_gts) since its wind sensors "
+            "are not QC-filtered to the same standard -- uncomment to include "
+            "anyway\n"
+            "#   download_kwargs: {}\n"
+            "#   collocation_kwargs: {}\n"
+            "- source_type: scatterometer_ascat\n",
         )
     out_path.write_text(yaml_text)
     print(f"Recipe created: {out_path}")
