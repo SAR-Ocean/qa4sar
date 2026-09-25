@@ -71,7 +71,8 @@ class ValidationDataSource:
     Platform / product type.
 
     Accepted values:
-      in-situ (real-time)   : mooring, buoy, ship_cmems_family, drifter,
+      in-situ (real-time)   : buoy_cmems_family, ship_cmems_family,
+                               buoy_gts, ship_gts, buoy_waterfall,
                                tidal_gauge
       in-situ (historical)  : adcp_historical, argo_historical,
                                drifter_historical, glider_historical
@@ -605,6 +606,16 @@ class Recipe:
                 "validation source, or switch the recipe's variable."
             )
         _validation_source_types = {s.source_type for s in validation_sources}
+        _CMEMS_INTERNAL_ONLY_TYPES = {"mooring", "buoy_cmems", "drifter"}
+        _rejected_cmems_types = _validation_source_types & _CMEMS_INTERNAL_ONLY_TYPES
+        if _rejected_cmems_types:
+            raise ValueError(
+                f"source_type {sorted(_rejected_cmems_types)!r} is not a valid "
+                "recipe entry -- 'mooring', 'buoy_cmems', and 'drifter' are "
+                "internal Copernicus Marine platform groupings only. Use "
+                "'buoy_cmems_family' instead, which combines moored buoys, "
+                "drifting buoys, and drifters into one source_type."
+            )
         _check_gts_cmems_overlap(
             _validation_source_types, "buoy_gts", "WMO buoy stations",
             ("mooring", "buoy_cmems"), {"buoy_gts", "buoy_waterfall"}, "buoy_waterfall",

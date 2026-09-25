@@ -109,7 +109,7 @@ class TestYAMLRoundtrip:
             geographic_bounds=GeographicBounds(-10, 5, 40, 60),
             temporal_bounds=TemporalBounds("2026-03-01", "2026-03-02"),
             validation_sources=[
-                ValidationDataSource(source_type="mooring"),
+                ValidationDataSource(source_type="buoy_cmems_family"),
                 ValidationDataSource(source_type="altimeter"),
             ],
         )
@@ -122,7 +122,7 @@ class TestYAMLRoundtrip:
         assert loaded.config.variable == "waves"
         assert loaded.config.geographic_bounds.min_lon == -10
         assert len(loaded.config.validation_sources) == 2
-        assert loaded.config.validation_sources[0].source_type == "mooring"
+        assert loaded.config.validation_sources[0].source_type == "buoy_cmems_family"
 
     def test_missing_file_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
@@ -578,45 +578,54 @@ class TestBuoyGtsVariableCheck:
         recipe = Recipe._from_dict(recipe_dict)
         assert recipe.config.validation_sources[0].source_type == "buoy_waterfall"
 
-    def test_buoy_cmems_accepted_standalone(self, tmp_path):
+class TestCmemsInternalOnlySourceTypesRejected:
+    """mooring/buoy_cmems/drifter are internal Copernicus Marine platform
+    groupings, used only via query_source_type overrides (see
+    dry_collocation.py's GTS/waterfall reference predicates) -- a recipe
+    itself must use buoy_cmems_family (or ship_cmems_family) instead, so
+    the granular and combined types cannot both appear as separate,
+    easily-confused choices."""
+
+    @pytest.mark.parametrize("source_type", ["mooring", "buoy_cmems", "drifter"])
+    def test_rejected_standalone(self, source_type):
         recipe_dict = {
             "name": "test", "variable": "wind",
             "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
             "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
-            "validation_sources": [{"source_type": "buoy_cmems"}],
+            "validation_sources": [{"source_type": source_type}],
+        }
+        with pytest.raises(ValueError, match="buoy_cmems_family"):
+            Recipe._from_dict(recipe_dict)
+
+    def test_buoy_cmems_family_still_accepted_standalone(self):
+        recipe_dict = {
+            "name": "test", "variable": "wind",
+            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
+            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
+            "validation_sources": [{"source_type": "buoy_cmems_family"}],
         }
         recipe = Recipe._from_dict(recipe_dict)
-        assert recipe.config.validation_sources[0].source_type == "buoy_cmems"
+        assert recipe.config.validation_sources[0].source_type == "buoy_cmems_family"
 
 
 class TestBuoyGtsOverlappingCombinationsRejected:
     """buoy_gts retrieves MARS obstype 181 (moored buoys) and 182
-    (drifting buoys) combined, so it overlaps with both Copernicus
-    Marine's "mooring" ("MO") and "buoy_cmems" ("DB") source types --
-    listing either alongside buoy_gts as a separate validation source
-    would double-count overlapping physical stations in validation
-    statistics. buoy_waterfall exists precisely to combine GTS with
-    either Copernicus source with per-station deduplication and must be
-    used instead."""
-
-    def test_buoy_gts_and_buoy_cmems_together_rejected(self, tmp_path):
-        recipe_dict = {
-            "name": "test", "variable": "wind",
-            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
-            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
-            "validation_sources": [
-                {"source_type": "buoy_gts"},
-                {"source_type": "buoy_cmems"},
-            ],
-        }
-        with pytest.raises(ValueError, match="buoy_waterfall"):
-            Recipe._from_dict(recipe_dict)
+    (drifting buoys) combined, so it overlaps with buoy_cmems_family's own
+    "MO"/"DB"/"AD" platform codes -- listing both as separate validation
+    sources would double-count overlapping physical stations in
+    validation statistics. buoy_waterfall exists precisely to combine GTS
+    with Copernicus Marine coverage with per-station deduplication and
+    must be used instead. mooring/buoy_cmems/drifter, the granular
+    Copernicus Marine platform groupings buoy_cmems_family combines, are
+    rejected outright as a recipe's own source_type regardless of what
+    else is present (see TestCmemsInternalOnlySourceTypesRejected), so
+    they are not exercised here."""
 
     def test_buoy_gts_with_unrelated_copernicus_source_still_accepted(self, tmp_path):
         """buoy_gts combined with a non-overlapping Copernicus source (e.g.
         tidal_gauge) is unaffected -- the rejection is specific to
-        buoy_gts + buoy_cmems together, not to buoy_gts alongside any
-        other Copernicus Marine source_type."""
+        buoy_gts + buoy_cmems_family together, not to buoy_gts alongside
+        any other Copernicus Marine source_type."""
         recipe_dict = {
             "name": "test", "variable": "wind",
             "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
@@ -629,26 +638,6 @@ class TestBuoyGtsOverlappingCombinationsRejected:
         recipe = Recipe._from_dict(recipe_dict)
         source_types = {s.source_type for s in recipe.config.validation_sources}
         assert source_types == {"buoy_gts", "tidal_gauge"}
-
-    def test_buoy_gts_and_drifter_together_rejected(self, tmp_path):
-        """SOURCE_TYPE_TO_PLATFORM maps "drifter" to ["DB", "AD"] -- "DB"
-        is the exact same Copernicus Marine platform code "buoy_cmems"
-        maps to, so "buoy_gts" + "drifter" downloads and includes the
-        same overlapping drifting-buoy rows the buoy_gts + buoy_cmems
-        rule exists to keep out, undetected unless the check is derived
-        from SOURCE_TYPE_TO_PLATFORM itself rather than hardcoding
-        "buoy_cmems" as the only forbidden pairing."""
-        recipe_dict = {
-            "name": "test", "variable": "wind",
-            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
-            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
-            "validation_sources": [
-                {"source_type": "buoy_gts"},
-                {"source_type": "drifter"},
-            ],
-        }
-        with pytest.raises(ValueError, match="buoy_waterfall"):
-            Recipe._from_dict(recipe_dict)
 
     def test_buoy_gts_and_buoy_cmems_family_together_rejected(self, tmp_path):
         """buoy_cmems_family combines mooring, buoy_cmems, and drifter's
@@ -666,62 +655,6 @@ class TestBuoyGtsOverlappingCombinationsRejected:
         }
         with pytest.raises(ValueError, match="buoy_waterfall"):
             Recipe._from_dict(recipe_dict)
-
-    def test_buoy_gts_and_mooring_together_rejected(self, tmp_path):
-        """buoy_gts's obstype 181 half (moored buoys) mostly relays the
-        same physical stations Copernicus Marine's "mooring" source_type
-        ("MO") already reports -- this overlap is independent of, and in
-        addition to, buoy_gts's overlap with "buoy_cmems"/"drifter" via
-        obstype 182 (drifting buoys, "DB")."""
-        recipe_dict = {
-            "name": "test", "variable": "wind",
-            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
-            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
-            "validation_sources": [
-                {"source_type": "buoy_gts"},
-                {"source_type": "mooring"},
-            ],
-        }
-        with pytest.raises(ValueError, match="buoy_waterfall"):
-            Recipe._from_dict(recipe_dict)
-
-    def test_buoy_waterfall_and_mooring_still_accepted(self, tmp_path):
-        """buoy_waterfall itself is excluded from the overlap check -- its
-        own per-station dedup at DataTree-build time already applies to
-        the whole Copernicus CSV regardless of which requested source
-        contributed each row, so combining it with mooring must remain
-        valid."""
-        recipe_dict = {
-            "name": "test", "variable": "wind",
-            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
-            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
-            "validation_sources": [
-                {"source_type": "buoy_waterfall"},
-                {"source_type": "mooring"},
-            ],
-        }
-        recipe = Recipe._from_dict(recipe_dict)
-        source_types = {s.source_type for s in recipe.config.validation_sources}
-        assert source_types == {"buoy_waterfall", "mooring"}
-
-    def test_buoy_waterfall_and_drifter_still_accepted(self, tmp_path):
-        """buoy_waterfall itself is excluded from the overlap check -- its
-        own per-station dedup at DataTree-build time already applies to
-        the whole Copernicus CSV regardless of which requested source
-        contributed each row, so combining it with drifter must remain
-        valid."""
-        recipe_dict = {
-            "name": "test", "variable": "wind",
-            "geographic_bounds": {"min_lon": -10, "max_lon": 10, "min_lat": 40, "max_lat": 55},
-            "temporal_bounds": {"start": "2026-08-30", "end": "2026-08-31"},
-            "validation_sources": [
-                {"source_type": "buoy_waterfall"},
-                {"source_type": "drifter"},
-            ],
-        }
-        recipe = Recipe._from_dict(recipe_dict)
-        source_types = {s.source_type for s in recipe.config.validation_sources}
-        assert source_types == {"buoy_waterfall", "drifter"}
 
 
 class TestShipGtsOverlapAndVariableCheck:
